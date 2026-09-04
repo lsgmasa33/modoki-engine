@@ -33,6 +33,58 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
+const assetScanner = path.join(repoRoot, 'engine', 'plugins', 'vite-asset-scanner.ts');
+
+/** Strip `//…` line comments and `/*…*\/` block comments from `src`, without touching
+ *  comment-LOOKING text inside a string/template literal (both subject files contain
+ *  `https://` URLs in strings, which a naive regex would truncate mid-line). Tracks
+ *  single/double/backtick string state and treats a backslash as escaping the next character, so
+ *  a quote-in-a-string doesn't end it early. Not a full JS parser — it only has to survive real
+ *  source, not arbitrary JS.
+ *
+ *  Why this exists (#685 FIX 5): the two describe blocks below locate a call by the first
+ *  TEXTUAL occurrence of its name (`src.indexOf('verifyInstalledMatchesTarball(')`). A doc-comment
+ *  MENTION of that name — placed after the real block, with the actual call moved inside it —
+ *  would satisfy every position-based assertion below while the mechanism itself is unreachable;
+ *  a mention placed before the guarding `if` would conversely turn a correct file red. Stripping
+ *  comments before locating anything closes both holes. */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    const c2 = src[i + 1];
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      out += c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) { out += src[i] + src[i + 1]; i += 2; continue; }
+        out += src[i];
+        i++;
+      }
+      if (i < n) { out += src[i]; i++; } // closing quote
+      continue;
+    }
+    if (c === '/' && c2 === '/') {
+      while (i < n && src[i] !== '\n') i++; // drop through to the newline, which is kept below
+      continue;
+    }
+    if (c === '/' && c2 === '*') {
+      i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
+        if (src[i] === '\n') out += '\n'; // keep newlines so nearby line-based reasoning survives
+        i++;
+      }
+      i += 2; // skip the closing */
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
 
 describe('build-web.mjs heals the native project on --target native (#148, #150)', () => {
   const src = fs.readFileSync(buildWeb, 'utf8');
@@ -100,6 +152,114 @@ describe('build-web.mjs heals the native project on --target native (#148, #150)
     expect(healCall).toBeGreaterThan(-1);
     expect(tscCall).toBeGreaterThan(-1);
     expect(healCall).toBeLessThan(tscCall);
+  });
+});
+
+// ── #685: node_modules can hold a PREVIOUS tarball's bytes while every signal step 4's `if` gate
+// trusts (the dep spec, the lockfiles, the install marker) agrees the current one is installed —
+// so the gate is false and step 4 does nothing. A check placed INSIDE that `if` could therefore
+// never fire in the one case it exists for: the exact unreachable-mechanism shape #148/#150
+// already burned this file on once (see the file header). This proves the check runs
+// UNCONDITIONALLY — structurally, by matching braces, not merely "the string appears somewhere"
+// (a naive `toContain` would still pass with the call nested inside the `if`).
+describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALLY, not gated on step 4 (#685)', () => {
+  // Comments stripped (#685 FIX 5) — see stripComments' own header for why a doc-comment mention
+  // of the call name would otherwise fool the position-based assertions below.
+  const src = stripComments(fs.readFileSync(buildWeb, 'utf8'));
+
+  /** Index of the `}` that closes the brace opened at `openBraceIdx` (which must itself be `{`). */
+  function matchingBraceEnd(text: string, openBraceIdx: number): number {
+    let depth = 0;
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    throw new Error('no matching close brace found');
+  }
+
+  it('calls verifyInstalledMatchesTarball', () => {
+    expect(src).toContain('verifyInstalledMatchesTarball(');
+  });
+
+  it('the call sits AFTER step 4\'s `if (depsChanged || v?.needsInstall)` block closes, not inside it', () => {
+    const ifIdx = src.indexOf('if (depsChanged || v?.needsInstall)');
+    expect(ifIdx).toBeGreaterThan(-1);
+    const openBrace = src.indexOf('{', ifIdx);
+    expect(openBrace).toBeGreaterThan(-1);
+    const closeBrace = matchingBraceEnd(src, openBrace);
+
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    expect(verifyIdx).toBeGreaterThan(-1);
+    expect(verifyIdx).toBeGreaterThan(closeBrace);
+  });
+
+  it('throws (does not merely log) when problems are found, and never auto-repairs with rm -rf', () => {
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const nextChunk = src.slice(verifyIdx, verifyIdx + 500);
+    expect(nextChunk).toMatch(/problems\.length/);
+    expect(nextChunk).toMatch(/throw new Error/);
+    // The remedy is DOCUMENTED in the message, but the script itself must never execute it.
+    expect(nextChunk).toMatch(/rm -rf/);
+
+    // Scoped to the check's OWN enclosing block (`if (vendorMod) { … }`), not "anywhere later in
+    // the file" — an unrelated step added after this one that happens to call execSync() must not
+    // turn this red (#685 FIX 5).
+    const blockStart = src.indexOf('if (vendorMod) {');
+    expect(blockStart).toBeGreaterThan(-1);
+    const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
+    expect(verifyIdx).toBeGreaterThan(blockStart);
+    expect(verifyIdx).toBeLessThan(blockEnd);
+    const execIdx = src.indexOf('execSync(', verifyIdx);
+    expect(execIdx === -1 || execIdx >= blockEnd).toBe(true);
+  });
+});
+
+// ── #685 PARITY. The editor's `/api/build` and the CLI `--target native` recipe are documented
+// as equivalent (docs/build.md), and #148 is exactly what a divergence between them costs: the
+// CLI ran NONE of the editor's heals and could ship the PREVIOUS native code with every signal
+// reporting success. A guard added to only ONE path recreates that asymmetry — and the editor's
+// Build menu is the CANONICAL path (root CLAUDE.md), so a CLI-only guard protects the path
+// fewer humans use. This pins both.
+describe('the editor /api/build runs the same #685 check as the CLI, unconditionally', () => {
+  // Comments stripped (#685 FIX 5) — see stripComments' own header for why a doc-comment mention
+  // of the call name would otherwise fool the position-based assertions below.
+  const src = stripComments(fs.readFileSync(assetScanner, 'utf8'));
+
+  function matchingBraceEnd(text: string, openBraceIdx: number): number {
+    let depth = 0;
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+    }
+    throw new Error('no matching close brace found');
+  }
+
+  it('imports and calls verifyInstalledMatchesTarball', () => {
+    expect(src).toMatch(/import\s*\{[^}]*verifyInstalledMatchesTarball[^}]*\}\s*from\s*'\.\/vendorPlugins'/);
+    expect(src).toContain('verifyInstalledMatchesTarball(');
+  });
+
+  it("the call sits AFTER the install `if (depHeal.changed || v.needsInstall)` block closes, not inside it", () => {
+    const ifIdx = src.indexOf('if (depHeal.changed || v.needsInstall)');
+    expect(ifIdx).toBeGreaterThan(-1);
+    const openBrace = src.indexOf('{', ifIdx);
+    const closeBrace = matchingBraceEnd(src, openBrace);
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    expect(verifyIdx).toBeGreaterThan(-1);
+    expect(verifyIdx).toBeGreaterThan(closeBrace);
+  });
+
+  it('fails the build on a problem and never auto-repairs with rm -rf', () => {
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const chunk = src.slice(verifyIdx, verifyIdx + 1300);
+    expect(chunk).toMatch(/stale\.length/);
+    expect(chunk).toMatch(/res\.end\(\)/);   // the build is ENDED, not merely logged
+    expect(chunk).toMatch(/rm -rf/);          // the remedy is documented to the human…
+    // …but never executed: no shell runner between the check and the end of its block.
+    expect(chunk).not.toMatch(/runScaffoldShell\(|spawnBuildCommand\(|execSync\(/);
   });
 });
 

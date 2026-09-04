@@ -103,7 +103,7 @@ async function validateProjectConfig() {
   }
 }
 
-/** Heal the native project before building it — the CLI half of #90/#148/#150.
+/** Heal the native project before building it — the CLI half of #90/#148/#150/#685.
  *
  *  `--target native` ONLY: every heal below is a native-artifact concern, so a web/playable
  *  build has nothing to keep fresh and must not pay for it (nor mutate the project).
@@ -135,6 +135,13 @@ async function validateProjectConfig() {
  *   4. `npm install`, gated on EITHER heal having changed something (`depHeal.changed ||
  *      v.needsInstall`) — a tarball or a new dep spec is inert until installed, and gating on
  *      only one of the two conditions would silently skip the other's install.
+ *   5. `verifyInstalledMatchesTarball` — runs UNCONDITIONALLY, whether or not step 4 installed
+ *      anything (#685). Every signal step 4's gate trusts (the dep spec, the lockfiles, the
+ *      install marker) can agree "nothing to do" while `node_modules/<plugin>` on disk still
+ *      holds a PREVIOUS tarball's bytes — that IS the #685 failure, and it is exactly the case a
+ *      gate keyed to "something changed" cannot see. So step 5 is a separate, unconditional read
+ *      of what's actually on disk, not part of step 4's `if`. On a mismatch it throws — no
+ *      auto-repair (see the call site's own comment for why).
  *
  *  `ensureCapacitorDeps` needs a PLATFORM, but `--target native` covers both iOS and Android with
  *  no platform of its own — so this heals whichever of `ios/`/`android/` the project already has
@@ -193,12 +200,63 @@ async function healNativeProject() {
   // unavailable would leave the project claiming a dependency that is not on disk — the same
   // shape as the #148/#150 silent-success bug, one step further along. So the install is gated on
   // what CHANGED, never on which module happened to load.
-  if (!(depsChanged || v?.needsInstall)) return;
-  const why = depsChanged ? 'healed Capacitor plugins' : 'engine plugin changed';
-  console.log(`[build-web] ${why} — installing it into the project…`);
-  execSync('npm install', { stdio: 'inherit', cwd: projectRoot, env: runEnv });
-  // The marker records the vendored spec set, so it is only meaningful when step 3 actually ran.
-  if (vendorMod && v) vendorMod.writeVendorMarker(projectRoot, v.expectedVendor);
+  //
+  // ⚠️ This is an `if`, not an early `return` — step 5 below must run on EVERY call, install or
+  // not. An early return here used to end the function; see step 5's own comment for why that
+  // shape is exactly the bug it exists to catch.
+  if (depsChanged || v?.needsInstall) {
+    const why = depsChanged ? 'healed Capacitor plugins' : 'engine plugin changed';
+    console.log(`[build-web] ${why} — installing it into the project…`);
+    execSync('npm install', { stdio: 'inherit', cwd: projectRoot, env: runEnv });
+    // The marker records the vendored spec set, so it is only meaningful when step 3 actually ran.
+    if (vendorMod && v) vendorMod.writeVendorMarker(projectRoot, v.expectedVendor);
+  }
+
+  // 5. Verify node_modules actually matches the tarball it's supposed to be installed from —
+  //    UNCONDITIONALLY, after step 4, never behind its `if` (#685).
+  //
+  //    The whole failure mode this defends against is node_modules holding a PREVIOUS tarball's
+  //    bytes while every OTHER signal — package.json's `file:` spec, package-lock.json,
+  //    node_modules/.package-lock.json, the install marker step 4 just wrote or left alone —
+  //    agrees the current one is installed. In that state `depsChanged` is false and
+  //    `v.needsInstall` is false too (the marker matches), so step 4 does nothing: `npm install`
+  //    reports "up to date" and never re-extracts. A check gated on step 4 having changed
+  //    something could therefore never fire in the one case it exists for — the exact
+  //    unreachable-mechanism shape #148/#150 already burned this file on once. So this runs
+  //    every single call, install-or-not, and reads what's actually on disk rather than trusting
+  //    the signals that said "nothing to do".
+  //
+  //    Deliberately NOT auto-repaired: an `rm -rf` inside node_modules mid-build would itself be a
+  //    mutation that could mask a different problem, and — the load-bearing reason — #685 is still
+  //    OPEN and uncharacterized. Auto-healing the state would destroy the evidence needed to work
+  //    out how it arises. Fail loud instead, with the exact manual remedy.
+  // ⚠️ `loadEnginePluginModule` returns null SILENTLY when the TS sources are absent or esbuild is
+  //    not installed (the packaged editor is exactly that case). Say so out loud rather than
+  //    skipping in silence: a guard that quietly does not run is the same unreachable-mechanism
+  //    shape this step exists to catch, one level up. Not fatal — vendoring itself already
+  //    degrades here, and failing the build would take the packaged editor's native build with it.
+  if (!vendorMod) {
+    console.warn(
+      '[build-web] ⚠️ cannot load engine/plugins/vendorPlugins.ts — the #685 stale-node_modules '
+        + 'check did NOT run, so a native build here could ship the wrong plugin bytes undetected.',
+    );
+  }
+  if (vendorMod) {
+    const problems = vendorMod.verifyInstalledMatchesTarball(projectRoot);
+    if (problems.length) {
+      throw new Error(
+        `[build-web] node_modules is STALE for ${problems.length} vendored plugin(s) — a native build `
+          + `would silently ship the WRONG native code (#685):\n${problems.map((p) => `  • ${p}`).join('\n')}\n\n`
+          + `⚠️ \`npm install\`, \`npm install --force\`, and \`rm -rf node_modules/<plugin> && npm install\` `
+          + `on their OWN do NOT fix this — measured: npm serves the stale content straight out of its own `
+          + `cache while the lockfile still pins the old integrity, so nothing ever asks it to look again. `
+          + `Fix each one, in order:\n`
+          + `  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")\n`
+          + `  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves version + integrity from the tarball\n`
+          + `  3. (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`,
+      );
+    }
+  }
 }
 
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');

@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as tar from 'tar';
-import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion } from '../../plugins/vendorPlugins';
+import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion, verifyInstalledMatchesTarball } from '../../plugins/vendorPlugins';
 import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -247,6 +247,104 @@ describe('compareTarballToSource detects a tarball whose NAME is fine and whose 
     pack();
     fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// edited tests\n');
     expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+});
+
+// ── #685: node_modules holding a PREVIOUS tarball's bytes while every OTHER signal (the `file:`
+// spec, the lockfiles, the install marker) agrees the current one is installed — the state
+// compareTarballToSource cannot see because it never opens node_modules. This drives
+// verifyInstalledMatchesTarball with a hand-built project: a real gzip tarball under
+// `<projectRoot>/plugins/`, and a real EXTRACTED copy under `<projectRoot>/node_modules/<plugin>`
+// (via `tar.extract`, the same shape npm itself produces) that a test then mutates in place to
+// simulate the poisoned state — never the tarball, only the installed copy, since that is exactly
+// what #685 found: the tarball and every book-keeping signal were already correct.
+describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes (#685)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-installed-drift-'));
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const PLUGIN = 'capacitor-installed-fixture';
+  const REL_TGZ = `plugins/${PLUGIN}-1.0.0-deadbeef.tgz`;
+
+  /** A throwaway project dir depending on PLUGIN via the exact `file:plugins/...` spec shape
+   *  vendorEnginePlugins writes — the one verifyInstalledMatchesTarball recognizes. */
+  function freshProjectRoot(): string {
+    const dir = fs.mkdtempSync(path.join(tmp, 'proj-'));
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+      name: 'installed-drift-fixture',
+      dependencies: { [PLUGIN]: `file:${REL_TGZ}`, 'not-a-vendored-plugin': '^1.0.0' },
+    }, null, 2));
+    return dir;
+  }
+
+  /** Pack a real two-entry plugin (package.json + one native source file) to REL_TGZ, npm-pack
+   *  layout (`package/...`), the same way the fixture above this block does. */
+  function packTarball(projectRoot: string, nativeBody: string) {
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-installed-drift-stage-'));
+    fs.mkdirSync(path.join(stage, 'package', 'ios', 'Sources'), { recursive: true });
+    fs.writeFileSync(path.join(stage, 'package', 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0' }, null, 2));
+    fs.writeFileSync(path.join(stage, 'package', 'ios', 'Sources', 'Plugin.swift'), nativeBody);
+    const tgzPath = path.join(projectRoot, REL_TGZ);
+    fs.mkdirSync(path.dirname(tgzPath), { recursive: true });
+    tar.create({ file: tgzPath, sync: true, gzip: true, cwd: stage }, ['package']);
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+
+  /** Extract REL_TGZ into node_modules/<PLUGIN>, stripping the `package/` prefix — the same real
+   *  npm-install shape verifyInstalledMatchesTarball's readTarball-based comparison expects. */
+  function installFromTarball(projectRoot: string) {
+    const dest = path.join(projectRoot, 'node_modules', PLUGIN);
+    fs.mkdirSync(dest, { recursive: true });
+    tar.extract({ file: path.join(projectRoot, REL_TGZ), cwd: dest, sync: true, strip: 1 });
+  }
+
+  it('reports NOTHING when the installed copy matches the tarball (the baseline this rests on)', () => {
+    const projectRoot = freshProjectRoot();
+    packTarball(projectRoot, '// v1\n');
+    installFromTarball(projectRoot);
+    expect(verifyInstalledMatchesTarball(projectRoot)).toEqual([]);
+  });
+
+  it('reports the plugin and names the differing file when the INSTALLED copy alone drifts (the #685 shape)', () => {
+    const projectRoot = freshProjectRoot();
+    packTarball(projectRoot, '// v1\n');
+    installFromTarball(projectRoot);
+    // The tarball and package.json never change — only node_modules does, exactly what #685 found.
+    fs.writeFileSync(
+      path.join(projectRoot, 'node_modules', PLUGIN, 'ios', 'Sources', 'Plugin.swift'),
+      '// STALE — bytes from a previous tarball\n',
+    );
+    const problems = verifyInstalledMatchesTarball(projectRoot);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain(PLUGIN);
+    expect(problems[0]).toContain('ios/Sources/Plugin.swift');
+  });
+
+  it('does NOT flag node_modules/<plugin> being absent — the project may simply not be installed yet', () => {
+    const projectRoot = freshProjectRoot();
+    packTarball(projectRoot, '// v1\n');
+    // Deliberately no installFromTarball() — node_modules/<PLUGIN> does not exist at all.
+    expect(verifyInstalledMatchesTarball(projectRoot)).toEqual([]);
+  });
+
+  it('reports a missing vendored tarball', () => {
+    const projectRoot = freshProjectRoot();
+    // Deliberately no packTarball() — plugins/ (and the tarball it would contain) don't exist.
+    const problems = verifyInstalledMatchesTarball(projectRoot);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain(PLUGIN);
+    expect(problems[0]).toContain(REL_TGZ);
+  });
+
+  it('ignores a dependency that is not a vendored engine plugin (not a `file:plugins/*.tgz` spec)', () => {
+    // A project depending ONLY on a normal registry dep — no `PLUGIN`, no plugins/, no
+    // node_modules/ at all. If the non-vendored dep were mis-recognized as a vendored plugin, it
+    // would report a missing tarball for it (there is no `plugins/` dir to find one in).
+    const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+    fs.writeFileSync(path.join(projectRoot, 'package.json'), JSON.stringify({
+      name: 'no-vendored-plugins-fixture',
+      dependencies: { 'not-a-vendored-plugin': '^1.0.0' },
+    }, null, 2));
+    expect(verifyInstalledMatchesTarball(projectRoot)).toEqual([]);
   });
 });
 

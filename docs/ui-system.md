@@ -262,6 +262,20 @@ Field groups (representative fields, verified against `UIElement.ts`):
   e2e (`engine/tests/e2e/editor-ui-autofit.spec.ts`) whose fixture deliberately carries a px
   `letterSpacing` — without that intercept the proportional model is exact and the spec cannot
   fail. Mounting `UINode` in jsdom to assert this would assert the mock.
+  ⚠️ **The DOM collapses runs of whitespace, and every instrument that would normally catch a
+  content bug agrees with the collapsed version.** Two, three or twenty consecutive spaces in
+  `text` render as ONE — this is default CSS (`white-space: normal`), not a `UINode` bug — so it is
+  invisible to `element.textContent` (already collapsed by the time you read it back), invisible to
+  the AUTHORED trait value (`text` still holds the extra spaces; nothing strips them there), and
+  invisible to a string-EQUALITY test comparing two authored strings that both got mangled the same
+  way. **If spacing between two pieces of text is meant to be visible, it must be LAYOUT — a flex
+  `gap` between two separate elements or a fixed-width spacer — never extra space characters inside
+  one `text` string.** This bites hardest when porting a string from a canvas-rendered origin (a
+  PixiJS/2D `Text2D`, which does NOT collapse whitespace — every space character it is given draws):
+  the ported copy can carry a multi-space run that read correctly on the 2D layer and silently loses
+  its spacing the moment the same string becomes a DOM `text` field. Sweep a ported string for
+  multi-space runs before trusting it, or replace the gap with layout at the same time.
+
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
@@ -528,6 +542,22 @@ parent (`UIAnchor.ts`):
   - **`center` is a genuine no-op** — it reaches no edge. It is the only anchor for which
     the Inspector greys the checkbox out.
 
+  ⚠️ **The padding arm moves FLOW children — it does nothing for the element's own box, and
+  nothing for an absolutely-positioned (anchored) child either.** A stretched element's safe-area
+  padding pushes normal-flow children in off the edge, the same way any CSS padding does; it does
+  not move the element's own box, and a child that carries its own `UIAnchor` (root-only by
+  convention, but nothing stops one being authored deeper) resolves against the padding **box**,
+  not inside it, so the padding never reaches it either. Reading `safeArea: true` off the trait
+  therefore tells you nothing by itself — the question is what KIND of children the element has.
+  `games/wordweave`'s `AdBannerSlot` (`bottom-stretch`) is the worked negative: its only child
+  `AdBannerLabel` is POINT-anchored, so nothing about the slot was inset by anything, and it
+  shipped rendering UNDER the iOS home indicator — measured on an iPhone Air, the slot spanned
+  device y 829–912 against the indicator's own 878–912, while reading "safe-area aware" from the
+  trait alone. The fix was to author `safeArea: false` on the slot and LIFT its box at runtime
+  (`patchAnchorPct`), not to trust the padding. Contrast `games/wordweave`'s `BottomButtonRow`,
+  also `bottom-stretch`: its two buttons are FLOW children (no `UIAnchor` of their own), so the
+  same padding arm lifts them correctly with no runtime code at all.
+
   ⚠️ **The anchor MODE is a proxy for "which edges this element reaches", and an authored
   or runtime-driven offset can falsify it.** An element anchored `top-stretch` but pushed
   to the bottom of the screen still takes a top inset — the inset is static CSS and cannot
@@ -536,6 +566,24 @@ parent (`UIAnchor.ts`):
 
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
+
+⚠️ **It is the trait's PRESENCE, not its values, that makes a child absolutely positioned** — a
+child with no `UIAnchor` at all flows in its parent; a child carrying a `UIAnchor` authored at every
+field's own default (`anchor: 'stretch'`, `top: 0`, `pivotX: 0`, …) is a DIFFERENT, absolutely
+positioned element that just happens to resolve to the same box. And a scene save **strips a trait
+field equal to its default** (the editor's own save path — a scene diff reads as data loss until you
+know this), so a `UIAnchor` authored at all-defaults serialises to `"UIAnchor": {}` — **byte-identical
+to what a
+`UIAnchor` authored with one non-default field but otherwise defaulted also produces for those other
+fields**, and structurally indistinguishable from "some other trait happens to be `{}`". The one
+fact that never disappears is the KEY: an absent `UIAnchor` has no `"UIAnchor"` entry in `traits` at
+all, while a present-at-defaults one does. **Any check for "is this element anchored" must ask
+`'UIAnchor' in traits`, never "does its `UIAnchor` differ from the defaults"** — the latter is `false`
+for a deliberately-anchored element as often as for an unanchored one, and cannot tell them apart.
+This is not a hypothetical: `games/wordweave`'s `ZoomControl` subtree (#628 Phase 5 of its DOM UI
+port) is six flex children that all carry an authored `UIAnchor` — some at genuinely default values,
+because what matters for a `center`-pivoted inner glyph like `ZoomMagnifierRing` is that it IS
+positioned relative to its parent, not that any one field differs from its default.
 
 ⚠️ **The app root is FULL-BLEED and must stay that way** (`engine/app/App.css`). It
 carried a blanket `padding: env(safe-area-inset-top/bottom)` from the initial commit,
@@ -921,6 +969,24 @@ it here.
 does it in percentages, from its own code — see the `%`-vs-px warning under `UIElement` above, and
 `games/court/runtime/sceneChrome.ts`, which keeps exactly those game-specific patchers as a thin
 layer over these engine functions.
+
+⚠️ **A DOM element (this `ui` layer) and a 2D canvas element (the `2d` layer, PixiJS) cannot be
+spaced against each other by LAYOUT — only by a runtime patcher that composes both coordinate
+spaces explicitly, the way `patchUI`/`patchAnchorPct` do here.** A DOM node's position is a `%` of
+the HOST viewport; anything drawn on the 2D canvas is a `%` of the DESIGN box the canvas is
+`contain`-fitted into. **The two boxes coincide exactly only at the design aspect ratio and in the
+editor's default preset** — so a DOM control positioned by eye to sit flush against a canvas-drawn
+element looks pixel-perfect on the machine it was authored on and drifts on any real device whose
+aspect ratio differs, with nothing in the editor able to show the mismatch (Court's own `CLAUDE.md`
+records the identical rule for a `%`-of-host value sized against a design-space one — cross-reference
+rather than re-deriving it if you land here from that direction). The fix is always a function like
+`games/wordweave`'s `designToHostPct` (`runtime/systems.ts`) that explicitly composes the canvas's
+own letterbox scale/offset AND the safe-area inset into one host-percentage answer, called every
+frame from the game's own system — never a static authored offset guessed from one screenshot.
+`games/wordweave`'s `ZoomControl` (#628) is the worked example: it re-anchors to the crossword
+panel's own corner, computed in DESIGN space and converted through `designToHostPct` every frame,
+specifically because no authored `UIAnchor` offset could track a 2D-canvas-drawn panel that itself
+moves with `boardShare`/device aspect.
 
 ---
 
@@ -1599,8 +1665,23 @@ DOM, and the reason this paragraph exists.
 nowhere is unspecified. More sharply: a scroll container needs a **definite** cross-axis size,
 and `UIElement.height` defaults to `0` = auto — so an un-anchored scroll view in flex flow grows
 forever and never scrolls, with **no error at all**. Author an explicit height (or anchor the
-view); there is no diagnostic for this yet. Nested scroll views get `overscroll` (which only
-governs chaining) and have no inner-viewport measurement story.
+view); there is no diagnostic for this yet.
+
+⚠️ **Nested scroll views WORK — read the sentence below as a scoped gap, not a prohibition.** A
+horizontal snap pager whose pages are each their own vertical scroller was proved to work, both in
+the editor (driven programmatically: the inner card reached `scrollTop 101` fully scrolled while the
+outer pager landed exactly on page 3, `scrollLeft 704` = 2 x 352, snapping intact) and **on device**
+(iPhone 8 / iOS 16.7, owner-confirmed by finger in Mobile Safari, "it works well") — `games/wordweave`'s
+dictionary panel ships exactly this shape. The outer pager needs `overscroll: 'contain'` (the field
+that stops the inner scroller chaining out to the page swipe) and the definite cross-axis size the
+paragraph above already requires. The one real gap is narrower than it reads: nested scroll views get
+`overscroll` (which only governs chaining) and have no inner-viewport measurement story — meaning
+the ENGINE's `UIScrollView.viewportHeight`/`contentHeight` read-back is not wired for the INNER view,
+which matters only if you want scroll-hint chevrons or want to drive `UIEntries` pooling off the
+inner scroller's own scroll position. A plain inner scroller holding a block of content needs
+neither and has no open question. (One real trade worth knowing going in: a pager forces UNIFORM
+page size — equal stride is what makes snapping and pooling work — so a paged panel cannot hug each
+page's own content height; that is a feel trade, not a bug.)
 
 ### Open questions
 

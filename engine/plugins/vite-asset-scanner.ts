@@ -65,7 +65,7 @@ import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spr
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
-import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
+import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarball } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
 import {
@@ -2737,6 +2737,30 @@ export function assetScannerPlugin(): Plugin {
                   return;
                 }
                 writeVendorMarker(projectRoot, v.expectedVendor);
+              }
+              // ⚠️ UNCONDITIONAL — outside the install `if` above, deliberately (#685). The state
+              // this catches is `node_modules` holding a PREVIOUS tarball's bytes while every
+              // other signal agrees the current one is installed: there `depHeal.changed` is
+              // false AND `v.needsInstall` is false, so the install block does nothing and `npm
+              // install` would report "up to date". A check gated on those flags could never fire
+              // in the one case it exists for.
+              //
+              // This MIRRORS `build-web.mjs`'s step 5. Keep the two in step: the editor's
+              // `/api/build` and the CLI `--target native` recipe are documented as equivalent
+              // (docs/build.md), and #148 is precisely what a divergence between them costs —
+              // a guard in only one path leaves the OTHER able to ship the previous native code.
+              const stale = verifyInstalledMatchesTarball(projectRoot);
+              if (stale.length) {
+                sendStatus('FAILED:stale node_modules');
+                send(`\nBuild failed — node_modules is STALE for ${stale.length} vendored plugin(s); this build would ship the WRONG native code (#685):`);
+                for (const problem of stale) send(`  • ${problem}`);
+                send(`\n⚠️ \`npm install\`, \`npm install --force\`, and \`rm -rf node_modules/<plugin> && npm install\` on their OWN do NOT fix this — measured: npm serves the stale content straight out of its own cache while the lockfile still pins the old integrity, so nothing ever asks it to look again.`);
+                send(`Fix each one, in order:`);
+                send(`  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")`);
+                send(`  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves version + integrity from the tarball`);
+                send(`  3. (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`);
+                res.end();
+                return;
               }
             }
             const total = steps.length;

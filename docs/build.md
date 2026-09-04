@@ -1242,16 +1242,18 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
-#### `--target native` runs the same three in-process heals as the editor (#148, #150)
+#### `--target native` runs the same in-process heals as the editor (#148, #150), then verifies (#685)
 
-Before its shell steps, `build-web.mjs` now runs the SAME three in-process heals as the editor's
-`/api/build`, in the same order, for the same reason each exists:
+Before its shell steps, `build-web.mjs` runs the SAME three in-process heals as the editor's
+`/api/build`, in the same order, for the same reason each exists — and then BOTH paths verify the
+result:
 
 | In-process heal | Editor `/api/build` | CLI `--target native` |
 |---|---|---|
 | `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
 | `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
 | `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
+| `verifyInstalledMatchesTarball` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
 
 Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
 tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
@@ -1260,6 +1262,22 @@ predates an engine-required Capacitor plugin (`@capacitor/preferences`, `@capaci
 gets one just by building; and `build.appleTeamId` only reaches a device build once it's synced
 into the generated native project. On `web`/`playable` none of this runs (every heal here is a
 native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
+
+⚠️ **The fourth row is a CHECK, and it runs UNCONDITIONALLY — not behind the install condition
+the three heals share.** The state it catches is `node_modules` holding a previous tarball's
+contents while the dep spec, both lockfiles and the install marker all agree the current one is
+installed. In that state nothing looks changed, `npm install` reports "up to date", and the install
+step does nothing — so a check gated on "did a heal change something?" could never fire in the one
+case it exists for. It fails the build rather than repairing: an `rm -rf` inside `node_modules`
+mid-build is itself a mutation, and #685 is still open, so auto-healing would destroy the evidence
+needed to characterise how the state arises. The remedy is printed per plugin — and it is NOT a
+bare `rm -rf <project>/node_modules/<plugin> && npm install`, which leaves the stale integrity in
+place; see the ⚠️ npm-cache-trap block a few sections below for the recipe that actually works.
+
+⚠️ **Both paths, deliberately.** A check in only one recreates #148's asymmetry — and the editor's
+Build menu is the canonical path, so a CLI-only guard would protect the path fewer humans use.
+`cliNativeBuildHeals.test.ts` pins the call's position in both, brace-matched rather than by string
+match, so the two cannot drift apart.
 
 Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
 plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
@@ -1318,6 +1336,18 @@ Guarded by `engine/tests/architecture/nativeProjectDeps.test.ts`, which asserts 
 reads the list from `ENGINE_REQUIRED_CAP_PLUGINS` rather than restating it. If it fails: run a
 native build for the named project, then `npm install` in it, and **commit the `package.json` +
 `package-lock.json`** — committing is the part that matters.
+
+⚠️ **A plain `npm install` cannot repair a plugin re-packed IN PLACE** (same content-addressed
+filename, new bytes) — npm resolves `file:` deps from the LOCKFILE, not by re-opening the tarball,
+so it reports "up to date" while `node_modules/<plugin>` keeps the OLD bytes (#685).
+`vendorEnginePlugins` now deletes that plugin's own lockfile entry whenever it re-packs one in
+place, so the `npm install` right after a re-vendor genuinely re-resolves — but a state that
+predates that fix, or one made by hand (a `git checkout` of an old tarball, an interrupted
+re-vendor), still needs the entry removed manually. `npm install`, `npm install --force`, and
+`rm -rf node_modules/<plugin> && npm install` ALONE all leave the stale integrity in place and fix
+nothing: delete `packages["node_modules/<plugin>"]` from the project's `package-lock.json`, then
+`npm install --package-lock-only` (re-resolves version + integrity from the tarball on disk), then
+`rm -rf node_modules/<plugin> && npm install`.
 
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes

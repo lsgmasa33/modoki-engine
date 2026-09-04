@@ -47,6 +47,8 @@ import {
   nonCodeText,
   stripLineRef,
 } from '../helpers/lineCitations.js';
+// The panel's OWN slug function, so a derived id and the rendered one cannot drift apart.
+import { particleFieldSlug } from '../../packages/modoki/src/editor/panels/particle/fieldIds.js';
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
@@ -330,7 +332,11 @@ export function isUnder(path: string, entry: string): boolean {
  * Forms 2 and 3 are not decoration: leaving either out reported three PERFECTLY CORRECT citations
  * as missing on the first run of this check. A guard that cries wolf gets disabled.
  */
-export function knownUiIds(sources: string[]): { ids: Set<string>; prefixes: string[] } {
+export function knownUiIds(sources: string[]): {
+  ids: Set<string>;
+  prefixes: string[];
+  patterns: RegExp[];
+} {
   const ids = new Set<string>();
   const joined = sources.join('\n');
   // `\s*` around the `=`/`:` in all four, for the same reason as the prefix regex below: a JSX
@@ -364,11 +370,89 @@ export function knownUiIds(sources: string[]): { ids: Set<string>; prefixes: str
   // today (checked 2026-08-22), so this is latent, not a live false alarm — but if a future
   // particle-editor case cites e.g. `<prefix>.min` and is reported unknown, this is why, and the
   // fix is to make the parent's id statically visible rather than to loosen the matcher here.
-  const prefixes = [...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)\s*[=:]\s*\{?`([\w.:-]*)\$/g)]
-    .map((m) => m[1])
-    .filter(Boolean);
-  return { ids, prefixes };
+  const templates = [
+    ...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)\s*[=:]\s*\{?`([\w.:-]*\$\{[^`]*)`/g),
+  ].map((m) => m[1]);
+  const prefixes = templates.map((t) => t.slice(0, t.indexOf('$'))).filter(Boolean);
+  // ⚠️ A PREFIX IS NOT A CHECK. This used to return only the static head and the caller asked
+  // `id.startsWith(prefix)`, which accepts every suffix under it: `particle.bursts.row.` is
+  // registered by ``data-ui-id={`particle.bursts.row.${i}.remove`}``, so the nonexistent
+  // `particle.bursts.row.0.time` passed the guard green while resolving to nothing at runtime —
+  // the same wasted-session cost this whole function exists to prevent, arrived at from the other
+  // side. All ~49 registered prefixes had it. Matching the WHOLE template closes it, and
+  // `templateToIdPattern`'s per-segment class is what makes that true for the 41 of 79 templates
+  // that END in a placeholder rather than a literal — read the note there before widening it.
+  //
+  // ⚠️ KNOWN GAP, measured not assumed: `Hierarchy.tsx` writes its row id as a QUOTED object key,
+  // `{ 'data-ui-id': `hierarchy.entity.${entity.guid}` }`, and none of the regexes here match that
+  // spelling (they require the bare name followed by `=` or `:`). So `hierarchy.entity.*` is not
+  // registered at all — a case citing one would be reported unknown, the false alarm this file's
+  // history says gets a guard disabled. Latent today: no case cites one. The fix is to admit the
+  // quoted form, not to loosen the matching.
+  const patterns = templates.filter((t) => !t.startsWith('$')).map(templateToIdPattern);
+  for (const src of sources) for (const id of particleFieldIds(src)) ids.add(id);
+  return { ids, prefixes, patterns };
 }
+
+/**
+ * The concrete ids `useFieldId` mints, derived the way the panel derives them.
+ *
+ * The Particle Editor tags ~60 property fields through a React context rather than a `uiId` at
+ * each call site (see `particle/fieldIds.ts` for why), so none of them appears as a literal or as
+ * a `data-ui-id={…}` template and every static scan above is blind to them. A case citing the
+ * perfectly correct `particle.general.max-particles` was reported unknown.
+ *
+ * ⚠️ **This derives the ids; it does not pattern-match them.** A first attempt registered the
+ * SHAPE instead (`/^particle\.[^.]+\.[^.]+$/`) and that was strictly worse than the blindness it
+ * fixed: the `particle.*` namespace already holds 11 statically-visible literals
+ * (`particle.bursts.add`, `particle.transport.play`, `particle.header.name`, …), so a shape
+ * blanket waved through every typo of an id the guard used to check exactly — `particle.bursts.delete`
+ * passed green. Deriving means `particle.general.max-particles` resolves and
+ * `particle.general.max-partickles` does not, which is the whole point.
+ *
+ * The scan is linear because the JSX is: a `<Section title="…">` opens a section and every
+ * labelled widget after it belongs to that section, exactly as `SectionIdContext` provides it at
+ * runtime. It uses the panel's OWN `particleFieldSlug`, so the two cannot drift. A structural
+ * change here fails LOUDLY (ids stop resolving, cases citing them go red) rather than silently
+ * widening what the guard accepts — the right direction for this to break in.
+ */
+export function particleFieldIds(source: string): string[] {
+  if (!source.includes('SectionIdContext.Provider')) return [];
+  const out: string[] = [];
+  let section = '';
+  const re = /<Section\s+title="([^"]+)"|<(?:Num|Check|Enum|Color|MinMax|Vec3Row)\s[^>]*?\blabel="([^"]+)"/g;
+  for (const m of source.matchAll(re)) {
+    if (m[1] !== undefined) section = particleFieldSlug(m[1]);
+    else if (section) out.push(`particle.${section}.${particleFieldSlug(m[2])}`);
+  }
+  return out;
+}
+
+/**
+ * A template literal (`a.b.${x}.c`) as an anchored regex over a complete id.
+ *
+ * ⚠️ **`[^.]+`, not `.+`.** A placeholder stands for ONE id segment, and the difference is the
+ * whole value of this function: 41 of the 79 templates in the editor END in a placeholder
+ * (`sceneView.toolbar.gizmo.${m.value}`, `spriteEditor.slice.${s.guid}`, `skin.bones.row.${i}`),
+ * so with `.+` there is no trailing literal to anchor against and the id matches anything under
+ * the prefix — the exact hole this replaced prefix-matching to close, surviving for ~30 of the
+ * ~49 families. Measured across all cases plus qa/README.md: narrowing to `[^.]+` false-alarms
+ * ZERO live citations while rejecting `sceneView.toolbar.gizmo.0.time`,
+ * `spriteEditor.slice.0.bogus`, `skin.bones.row.0.x` and `timeline.tracks.row.0.bogus`.
+ */
+function templateToIdPattern(template: string): RegExp {
+  const literal = template
+    .split(/\$\{[^}]*\}/)
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  // The one substitution that is legitimately a DOTTED path rather than a segment:
+  // `ProjectSettingsDialog.tsx` builds every field id from a settings key like
+  // `rendering.three.qualityTier`. An allowlist of one beats a global `.+` that pays for this
+  // family across every other. If a second such template appears, add it here — and say why the
+  // value can contain a dot, because that is what makes the looseness earn its place.
+  const cls = /^projectSettings\.\$\{/.test(template) ? '.+' : '[^.]+';
+  return new RegExp(`^${literal.join(cls)}$`);
+}
+
 
 /**
  * Paths that do not exist are acceptable when git IGNORES them — a build output like
@@ -640,6 +724,62 @@ describe('qa case guard helpers', () => {
     it('exposes the static prefix of a template-built id', () => {
       const { prefixes } = knownUiIds(['<div data-ui-id={`hierarchy.folder.${name}`} />']);
       expect(prefixes).toEqual(['hierarchy.folder.']);
+    });
+
+    it('matches a templated id on the WHOLE template, not just its static head', () => {
+      // The bug this pins: the check asked `id.startsWith(prefix)`, so `particle.bursts.row.`
+      // vouched for every id under it — including a `.time` sibling that does not exist. A case
+      // citing it went green and resolved to nothing against a live editor.
+      const { patterns } = knownUiIds([
+        '<button data-ui-id={`particle.bursts.row.${i}.remove`} />',
+      ]);
+      const matches = (id: string) => patterns.some((p) => p.test(id));
+      expect(matches('particle.bursts.row.0.remove')).toBe(true);
+      expect(matches('particle.bursts.row.12.remove')).toBe(true);
+      expect(matches('particle.bursts.row.0.time')).toBe(false);
+      expect(matches('particle.bursts.row.0')).toBe(false);
+      expect(matches('particle.bursts.row.0.remove.extra')).toBe(false);
+    });
+
+    it('keeps a dotted substitution working — the class is `.+`, not `[^.]+`', () => {
+      // `ProjectSettingsDialog.tsx` builds `projectSettings.${field.key}` from a DOTTED key, so
+      // narrowing the placeholder would report the whole settings family as unknown — the false
+      // alarm this file's history says gets a guard disabled.
+      const { patterns } = knownUiIds(['const uiId = `projectSettings.${field.key}`;']);
+      expect(patterns.some((p) => p.test('projectSettings.rendering.three.qualityTier'))).toBe(true);
+    });
+
+    it('derives the ids `useFieldId` computes, from the REAL panel source', () => {
+      // Deliberately not a hand-shaped fixture. An earlier version of this test called
+      // `knownUiIds([])` and asserted a regex the author wrote against strings the author typed —
+      // it passed whether the derivation worked or not, and it defended a shape blanket that let
+      // `particle.bursts.delete` through. Reading the actual panel is what gives it power: if the
+      // Section/label markup changes shape, this goes red.
+      const panel = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/ParticleEditor.tsx'),
+        'utf8',
+      );
+      const derived = particleFieldIds(panel);
+      expect(derived.length).toBeGreaterThan(40); // ~60 labelled fields; a broken scan returns []
+      expect(derived).toContain('particle.general.max-particles');
+      expect(derived).toContain('particle.general.looping');
+      expect(derived).toContain('particle.emission.rate-sec');
+      // A typo of a real id must NOT be produced — the point of deriving over shape-matching.
+      expect(derived).not.toContain('particle.general.max-partickles');
+      // And the derivation must not manufacture the row-repeater ids, which are NOT `useFieldId`'s
+      // (those `NumInput`s take a bare `title` and carry no `data-ui-id` at all).
+      expect(derived.some((id) => id.startsWith('particle.bursts.row.'))).toBe(false);
+    });
+
+    it('does not vouch for a typo of a statically-visible `particle.*` id', () => {
+      // The regression a shape blanket caused: `particle.*` already holds 11 literal ids, so
+      // `/^particle\.[^.]+\.[^.]+$/` waved through every misspelling of one the guard used to
+      // check exactly.
+      const { ids, patterns } = knownUiIds(['<button data-ui-id="particle.bursts.add" />']);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('particle.bursts.add')).toBe(true);
+      expect(known('particle.bursts.delete')).toBe(false);
+      expect(known('particle.zzz.qqq')).toBe(false);
     });
 
     it('sees a template id built in a LOCAL first, not only the JSX prop form', () => {
@@ -1155,7 +1295,7 @@ describeCases('QA case references', () => {
       .filter((r) => existsSync(r))
       .flatMap((r) => walk(r).filter((f) => /\.tsx?$/.test(f)))
       .map((f) => readFileSync(f, 'utf8'));
-    const { ids, prefixes } = knownUiIds(sources);
+    const { ids, patterns } = knownUiIds(sources);
     // A vacuous pass would be worse than no check — the editor really does tag its chrome.
     expect(ids.size).toBeGreaterThan(30);
 
@@ -1173,7 +1313,7 @@ describeCases('QA case references', () => {
       for (const m of c.body.matchAll(/data-ui-id=\\?["']([\w.:${}<>-]+)/g)) {
         const id = m[1];
         if (/[${}<>]/.test(id)) continue; // a placeholder the runner substitutes
-        if (ids.has(id) || prefixes.some((p) => id.startsWith(p))) continue;
+        if (ids.has(id) || patterns.some((p) => p.test(id))) continue;
         unknown.push(`${c.rel}: [data-ui-id="${id}"]`);
       }
     }
