@@ -238,12 +238,29 @@ export function readScrollMeasurement(
   };
 }
 
-/** The fractional equivalent of `clientWidth`/`clientHeight` (#665) — content box PLUS padding,
- *  read via `getComputedStyle` instead of the integer-rounded `clientWidth`/`clientHeight`.
+/** The fractional equivalent of `clientWidth`/`clientHeight` (#665), read via `getComputedStyle`
+ *  instead of the integer-rounded `clientWidth`/`clientHeight`.
  *
- *  ⚠️ **`getComputedStyle().width` is the CONTENT-box width; `clientWidth` is content + padding.**
- *  Dropping the padding term would silently shrink every padded scroll view's reported viewport
- *  below its real size, so both padding sides are added back in explicitly.
+ *  ⚠️ **`UINode.tsx` sets `boxSizing: 'border-box'` on every UI node, and for a border-box element
+ *  Chrome's resolved `cs.width` is the BORDER-box width — it already includes padding and borders,
+ *  and it does NOT subtract the scrollbar gutter.** The old formula (`cs.width + paddingLeft +
+ *  paddingRight`) assumed `cs.width` was the content box, which is backwards for this renderer and
+ *  double-counts padding. Measured in real Chromium (authored `width: 434.109px`, target
+ *  `clientWidth: 434`):
+ *
+ *  | case                                   | `cs.width` | `clientWidth` | old formula |
+ *  |-----------------------------------------|-----------:|--------------:|------------:|
+ *  | border-box, no padding                  |    434.094 |            434 |   434.094 ✓ |
+ *  | border-box + `padding: 0 12px`          |    434.094 |            434 |   458.094 ✗ |
+ *  | border-box + padding + borders          |    434.094 |            426 |   458.094 ✗ |
+ *  | content-box + padding                   |    434.094 |            458 |   458.094 ✓ |
+ *
+ *  So under `border-box`, padding must NOT be added back, and both the border widths and the
+ *  scrollbar gutter (`offsetWidth - clientWidth`, minus the borders already counted) must be
+ *  subtracted instead. The `content-box` branch is kept only because `boxSizing` is itself an
+ *  authorable `UIElement` field — nothing in this renderer sets it, but nothing stops a game from
+ *  authoring it. **Invariant: `|result - clientWidth| < 1` in every case** — this function exists
+ *  only to recover the fractional residue `clientWidth` rounds away, never to disagree with it.
  *
  *  ⚠️ **Call `getComputedStyle` on its OWNER, never as a detached reference.** `const f =
  *  view.getComputedStyle; f(el)` throws `Illegal invocation` in real Chrome — `getComputedStyle` is
@@ -262,8 +279,17 @@ export function readPreciseBoxSize(el: Element): { width: number; height: number
   if (!view || typeof view.getComputedStyle !== 'function') return null;
   const cs = view.getComputedStyle(el);
   const num = (v: string) => parseFloat(v);
-  const width = num(cs.width) + num(cs.paddingLeft) + num(cs.paddingRight);
-  const height = num(cs.height) + num(cs.paddingTop) + num(cs.paddingBottom);
+  const htmlEl = el as HTMLElement;
+  const bl = num(cs.borderLeftWidth), br = num(cs.borderRightWidth);
+  const bt = num(cs.borderTopWidth), bb = num(cs.borderBottomWidth);
+  const gutterX = htmlEl.clientWidth ? htmlEl.offsetWidth - htmlEl.clientWidth - bl - br : 0;
+  const gutterY = htmlEl.clientHeight ? htmlEl.offsetHeight - htmlEl.clientHeight - bt - bb : 0;
+  const width = (cs.boxSizing === 'border-box'
+    ? num(cs.width) - bl - br
+    : num(cs.width) + num(cs.paddingLeft) + num(cs.paddingRight)) - gutterX;
+  const height = (cs.boxSizing === 'border-box'
+    ? num(cs.height) - bt - bb
+    : num(cs.height) + num(cs.paddingTop) + num(cs.paddingBottom)) - gutterY;
   if (Number.isNaN(width) || Number.isNaN(height)) return null;
   if (!(width > 0) && !(height > 0)) return null;
   return { width, height };

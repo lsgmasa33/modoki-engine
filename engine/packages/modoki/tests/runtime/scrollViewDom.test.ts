@@ -171,18 +171,55 @@ describe('readPreciseBoxSize / ceil\'d viewport (#665)', () => {
     }, { width: 300, height: 336 })).toBeNull();
   });
 
-  it('readPreciseBoxSize sums content box PLUS padding, not just the content box', () => {
-    const el = {
-      ownerDocument: {
-        defaultView: {
-          getComputedStyle: (_target: unknown) => ({
-            width: '260.65px', height: '100px', paddingLeft: '4.2px', paddingRight: '1.1px',
-            paddingTop: '0px', paddingBottom: '0px',
-          }),
-        },
-      },
-    } as unknown as Element;
-    expect(readPreciseBoxSize(el)!.width).toBeCloseTo(265.95, 5);
+  // ⚠️ `UINode.tsx` sets `boxSizing: 'border-box'` on every UI node this engine renders, and for a
+  // border-box element `cs.width` is the BORDER-box width — it already includes padding and does
+  // NOT subtract the scrollbar gutter. Each stub below supplies `boxSizing`, `clientWidth` and
+  // `offsetWidth` (the real element shape) so the gutter/border terms are actually exercised —
+  // a bare `{width, padding}` stub with none of those cannot distinguish the correct formula from
+  // the one it replaces.
+  const stubEl = (cs: Record<string, string>, dims: { clientWidth: number; offsetWidth: number; clientHeight: number; offsetHeight: number }) => ({
+    ownerDocument: { defaultView: { getComputedStyle: (_target: unknown) => cs } },
+    ...dims,
+  } as unknown as Element);
+
+  it('border-box + padding, no border, no gutter: cs.width alone — padding is NOT added', () => {
+    const el = stubEl(
+      { width: '434.094px', height: '200px', paddingLeft: '12px', paddingRight: '12px', paddingTop: '0px', paddingBottom: '0px', borderLeftWidth: '0px', borderRightWidth: '0px', borderTopWidth: '0px', borderBottomWidth: '0px', boxSizing: 'border-box' },
+      { clientWidth: 434, offsetWidth: 434, clientHeight: 200, offsetHeight: 200 },
+    );
+    const result = readPreciseBoxSize(el)!;
+    expect(result.width).toBeCloseTo(434.094, 5);
+    expect(Math.abs(result.width - 434)).toBeLessThan(1);
+  });
+
+  it('border-box with borders: border widths are subtracted', () => {
+    const el = stubEl(
+      { width: '434.094px', height: '200px', paddingLeft: '0px', paddingRight: '0px', paddingTop: '0px', paddingBottom: '0px', borderLeftWidth: '4px', borderRightWidth: '4px', borderTopWidth: '0px', borderBottomWidth: '0px', boxSizing: 'border-box' },
+      { clientWidth: 426, offsetWidth: 434, clientHeight: 200, offsetHeight: 200 },
+    );
+    const result = readPreciseBoxSize(el)!;
+    expect(result.width).toBeCloseTo(426.094, 5);
+    expect(Math.abs(result.width - 426)).toBeLessThan(1);
+  });
+
+  it('border-box with a scrollbar gutter: the gutter (offsetWidth - clientWidth) is subtracted', () => {
+    const el = stubEl(
+      { width: '434.094px', height: '200px', paddingLeft: '0px', paddingRight: '0px', paddingTop: '0px', paddingBottom: '0px', borderLeftWidth: '0px', borderRightWidth: '0px', borderTopWidth: '0px', borderBottomWidth: '0px', boxSizing: 'border-box' },
+      { clientWidth: 419, offsetWidth: 434, clientHeight: 200, offsetHeight: 200 },
+    );
+    const result = readPreciseBoxSize(el)!;
+    expect(result.width).toBeCloseTo(419.094, 5);
+    expect(Math.abs(result.width - 419)).toBeLessThan(1);
+  });
+
+  it('content-box + padding: padding IS added — the branch that keeps the old behaviour', () => {
+    const el = stubEl(
+      { width: '434.094px', height: '200px', paddingLeft: '12px', paddingRight: '12px', paddingTop: '0px', paddingBottom: '0px', borderLeftWidth: '0px', borderRightWidth: '0px', borderTopWidth: '0px', borderBottomWidth: '0px', boxSizing: 'content-box' },
+      { clientWidth: 458, offsetWidth: 458, clientHeight: 200, offsetHeight: 200 },
+    );
+    const result = readPreciseBoxSize(el)!;
+    expect(result.width).toBeCloseTo(458.094, 5);
+    expect(Math.abs(result.width - 458)).toBeLessThan(1);
   });
 
   it('returns null on empty/unparseable computed values — the jsdom case', () => {
