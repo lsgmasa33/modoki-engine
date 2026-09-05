@@ -201,6 +201,23 @@ export interface TrailConfig {
   segments: number;
 }
 
+/** The trail segment count both the simulator and the line geometry must agree on.
+ *  Floored because a fractional value makes the simulator's `seg * 3` stride fractional,
+ *  and a fractional TypedArray index is silently DROPPED rather than throwing (#693). */
+export function resolveTrailSegments(segments: number | undefined): number {
+  return Math.max(2, Math.floor(segments ?? 8));
+}
+
+/** The sprite-sheet tile count both the SIMULATOR and every renderer must agree on. Floored for
+ *  the same reason as {@link resolveTrailSegments}: the simulator turns `tilesX * tilesY` into a
+ *  frame INDEX, and every consumer maps that index onto an integer grid — so a fractional count
+ *  makes the producer emit an index for a cell no consumer built (#693 sweep). The loader's
+ *  `normalizeParticleDef` also floors these, but only when the field is present and only on the
+ *  load path, so a def built in a test or written through an agent op can still reach here raw. */
+export function resolveTiles(tiles: number | undefined): number {
+  return Math.max(1, Math.floor(tiles ?? 1));
+}
+
 /**
  * A nested effect spawned in response to a parent particle's lifecycle event.
  * On each matching event the parent fires a burst of `count` child particles at
@@ -476,8 +493,10 @@ export function renderStructuralKey(def: ParticleEffectDef): string {
     r.offset?.[1] ?? 0,
     r.meshPrimitive ?? 'box',
     r.meshLit ?? false,
-    r.tilesX ?? 1,
-    r.tilesY ?? 1,
+    // RESOLVED, not raw (#693 sweep): the renderers build an integer grid, so 2.0 and 2.4 are the
+    // same sheet — comparing the raw values forces a full rebuild that emits identical geometry.
+    resolveTiles(r.tilesX),
+    resolveTiles(r.tilesY),
     r.softParticles ?? false,
   ].join('|');
 }

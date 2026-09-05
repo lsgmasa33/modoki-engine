@@ -14,6 +14,7 @@
 import * as THREE from 'three';
 import { uploadDenseRows } from './attributeUpload';
 import type { RenderConfig } from './types';
+import { resolveTrailSegments } from './types';
 import type { TrailOutputs } from './cpuSimulator';
 
 export interface TrailObject {
@@ -25,7 +26,7 @@ export interface TrailObject {
 }
 
 export function createTrail(maxParticles: number, segments: number, render: RenderConfig): TrailObject {
-  const seg = Math.max(2, Math.floor(segments));
+  const seg = resolveTrailSegments(segments);
   const vPer = (seg - 1) * 2; // vertices per particle (line-list)
   const positions = new Float32Array(maxParticles * vPer * 3);
   const colors = new Float32Array(maxParticles * vPer * 3);

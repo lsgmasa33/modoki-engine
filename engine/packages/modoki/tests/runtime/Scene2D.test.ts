@@ -68,11 +68,26 @@ function mockDeps() {
     class Texture {
       static EMPTY = { width: 0, height: 0 };
       static WHITE = { width: 1, height: 1, source: { style: {} }, textureMatrix: { mapCoord: {} } };
+      // Counts every FRAMED-wrapper construction (opts.frame present) — the exact allocation
+      // `mintMaterialTexture`/`frameTexture` make for an atlas slice. A whole-image mint returns
+      // `r.base` directly with no `new Texture` call, so this counter is scoped to the wrapper
+      // path on purpose (#697 regression cover — see Scene2D.test.ts's material-pass tests).
+      static frameConstructCount = 0;
       width = 0; height = 0; source: any; textureMatrix = { mapCoord: {} };
       destroy = vi.fn();
       // Framed wrapper (new Texture({ source, frame })): carry the borrowed source so the
       // material pass's source-ready guard passes; width/height come from the sub-rect.
-      constructor(opts?: any) { this.source = opts?.source; if (opts?.frame) { this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; } }
+      // `textureMatrix.mapCoord` is derived from the frame rect (not a bare `{}`) so two
+      // different atlas slices of one sheet produce genuinely DIFFERENT mapCoord values —
+      // required by the #698 uTextureMatrix-tracks-the-swap test below (an object-identity-only
+      // mock would pass even if the swap wrote the wrong frame's matrix).
+      constructor(opts?: any) {
+        this.source = opts?.source;
+        if (opts?.frame) {
+          this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; Texture.frameConstructCount++;
+          this.textureMatrix = { mapCoord: { x: opts.frame.x, y: opts.frame.y, w: opts.frame.width, h: opts.frame.height } };
+        }
+      }
     }
     // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
     // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
@@ -182,12 +197,32 @@ function mockDeps() {
     __clearSpy: clearSpy,
   }));
   let shaderSeq = 0;
+  // `omitResourcesOnce` is a one-shot knob (consumed by the NEXT makePixiShaderInstance call,
+  // like MeshGeometry.__control's throwOnCall above) letting a test mint a shader with no
+  // reachable `resources.textureUniforms.uniforms` — the #698 fast path's fallback trigger.
+  let omitResourcesOnce = false;
   vi.doMock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
     // Capture the texture the material pass bound as uTexture, and the extra-sampler map
     // (4th arg), so tests can assert the entity samples its own sprite bitmap AND that each
     // texture param resolved to its bound Texture (vs the Texture.WHITE fallback).
-    makePixiShaderInstance: (_program: any, texture: any, _values: any, extraTextures: any) =>
-      ({ id: ++shaderSeq, texture, extraTextures, destroyed: false, destroy() { this.destroyed = true; } }),
+    //
+    // `resources.textureUniforms.uniforms.uTextureMatrix` mirrors what a real Shader (built by
+    // pixiShaderBuilder.ts:470-484, then wrapped in Pixi's UniformGroup) exposes — this is the
+    // ONLY thing that makes the #698 in-place frame-swap fast path visible on screen (see
+    // Scene2D.tsx's frame-swap comment). Omitted for one call when `omitResourcesOnce` is set,
+    // to exercise the fast path's rebuild-fallback when the uniform group isn't reachable.
+    makePixiShaderInstance: (_program: any, texture: any, _values: any, extraTextures: any) => {
+      const noResources = omitResourcesOnce;
+      omitResourcesOnce = false;
+      return {
+        id: ++shaderSeq, texture, extraTextures, destroyed: false,
+        destroy() { this.destroyed = true; },
+        ...(noResources ? {} : {
+          resources: { textureUniforms: { uniforms: { uTextureMatrix: texture?.textureMatrix?.mapCoord ?? {} } } },
+        }),
+      };
+    },
+    __setOmitResourcesOnce: () => { omitResourcesOnce = true; },
   }));
 
   // Stub the asset/texture-resolver surface so the harness needs no manifest.
@@ -247,8 +282,9 @@ async function setup(opts: { start?: boolean } = {}) {
   if (opts.start) scene2d.startScene2D();
 
   const matCache: any = await import('../../src/runtime/loaders/spriteMaterialCache');
+  const shaderBuilder: any = await import('../../src/runtime/rendering/pixiShaderBuilder');
   const newWorld = () => trackWorld(createWorld());
-  return { pixi, traits, registerTrait, worldReg, pool, scene2d, world, newWorld, matReady: matCache.__ready as Set<string>, matProgram: matCache.__program as { params: any[]; textureParams: [string, any][]; manifest: any }, matClearSpy: matCache.__clearSpy };
+  return { pixi, traits, registerTrait, worldReg, pool, scene2d, world, newWorld, matReady: matCache.__ready as Set<string>, matProgram: matCache.__program as { params: any[]; textureParams: [string, any][]; manifest: any }, matClearSpy: matCache.__clearSpy, setOmitResourcesOnce: shaderBuilder.__setOmitResourcesOnce as () => void };
 }
 
 // Spawn a Canvas2D host entity (root). Returns the koota entity.
@@ -655,6 +691,143 @@ describe('Scene2D.renderFrame', () => {
       expect(mesh.kind).toBe('material');
       expect(mesh.texture).toBe(hero);                    // rebuilt Mesh still binds the live texture
       expect(pixi.Assets.__unloaded).not.toContain('http://t/hero.png'); // same-url rebuild never hit refcount 0
+    });
+
+    // #697: the material pass used to call the OLD resolver (which minted a framed `Texture`
+    // wrapper INLINE) once per material entity per FRAME, regardless of whether the Mesh needed
+    // rebuilding — the mint was dropped on the floor every steady-state frame. The split resolver
+    // (`resolveMaterialTextureRef`, allocation-free) + `mintMaterialTexture` (called only on a
+    // build or a frame swap) means a steady atlas-sliced material costs exactly ONE wrapper for
+    // its whole lifetime until something actually changes.
+    it('mints the atlas-slice Texture wrapper once on build, not once per steady-state frame (#697)', async () => {
+      const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      // 'sheet:0' resolves to an ATLAS SLICE (a frame) of one shared sheet — the case that mints
+      // a framed wrapper at all (a whole image never allocates one).
+      spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid' });
+
+      scene2d.renderFrame(); // build: exactly one wrapper minted
+      const afterBuild = pixi.Texture.frameConstructCount;
+      expect(afterBuild).toBeGreaterThan(0);
+
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // steady-state frame: ref/size/pivot/url/epoch all unchanged
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // and again
+
+      expect(pixi.Texture.frameConstructCount).toBe(afterBuild); // NOT one more per frame
+    });
+
+    // #698: `matSig` no longer carries the sprite ref, and a frame swap within one sheet takes an
+    // in-place path (swap `mesh.texture` + write `uTextureMatrix`) instead of disposing and
+    // rebuilding Mesh+Shader+Geometry. The observable is Mesh OBJECT IDENTITY: it must survive a
+    // same-sheet slice change, and it must NOT survive a genuine structural change (a size edit).
+    describe('atlas frame swap stays in place (#698)', () => {
+      it('keeps the SAME Mesh across an atlas slice change (SpriteAnimator-style ref swap)', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const texBefore = meshBefore.texture;
+        expect(meshBefore.kind).toBe('material');
+
+        // Same sheet, next slice — width/height/pivot/url/epoch all unchanged, only the sub-rect moves.
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).toBe(meshBefore);              // SAME Mesh object — no rebuild
+        expect(meshBefore.destroyed).toBe(false);       // never torn down
+        expect(kids[0].texture).not.toBe(texBefore);    // but it samples the NEW slice
+      });
+
+      it('still rebuilds (a NEW Mesh) when a structural property changes alongside the ref', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+
+        // A genuine structural change (size) alongside the ref swap — matSig moves, so this must
+        // still rebuild, not take the frame-swap fast path.
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1', width: 40 });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).not.toBe(meshBefore);          // a NEW Mesh
+        expect(meshBefore.destroyed).toBe(true);       // the old one was torn down
+      });
+
+      // The gap an adversarial review found: the mock shader used to have no `resources`, so
+      // every existing test above took the swap in-place WITHOUT ever executing the
+      // `tu.uTextureMatrix = ...` write — the one statement that makes the swap visible on a
+      // real GPU (see Scene2D.tsx's frame-swap comment: the mesh adaptors only refresh
+      // uTexture/uSampler/uTextureMatrix inside `if (!shader)`, which a material slot never
+      // hits). This pins that the fast path actually writes the NEW frame's matrix onto the
+      // SAME shader object, not just that the Mesh survives.
+      it('writes the NEW slice matrix onto the uTextureMatrix uniform, in place on the SAME shader', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderBefore = meshBefore.shader;
+        const uMatrixBefore = shaderBefore.resources.textureUniforms.uniforms.uTextureMatrix;
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).toBe(meshBefore);                       // still the in-place fast path
+        expect(meshAfter.shader).toBe(shaderBefore);              // SAME shader object — no rebuild
+        const uMatrixAfter = shaderBefore.resources.textureUniforms.uniforms.uTextureMatrix;
+        expect(uMatrixAfter).not.toEqual(uMatrixBefore);          // tracked the new slice's matrix
+        expect(uMatrixAfter).toEqual(meshAfter.texture.textureMatrix.mapCoord); // matches the new texture's own matrix
+      });
+
+      // Fallback: when the shader's uniform group is NOT reachable (a shader minted by a build
+      // path that doesn't expose `resources.textureUniforms.uniforms` — e.g. an older/foreign
+      // Shader instance), the fast path must refuse and fall through to a full rebuild, rather
+      // than silently swapping `mesh.texture` while leaving the old sub-rect's matrix bound
+      // (which would render the WRONG slice forever with nothing failing).
+      it('falls back to a full rebuild (a NEW Mesh) when the shader has no reachable uTextureMatrix uniform', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady, setOmitResourcesOnce } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        setOmitResourcesOnce(); // the NEXT makePixiShaderInstance call mints a shader with no `resources`
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshBefore.shader.resources).toBeUndefined(); // confirms the fallback trigger is actually armed
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).not.toBe(meshBefore);   // rebuilt, not swapped in place
+        expect(meshBefore.destroyed).toBe(true);
+      });
     });
 
     // Perf gate (MaterialSnap): the material pass used to force a canvas redraw EVERY running
@@ -1440,6 +1613,66 @@ describe('Scene2D.renderFrame', () => {
   });
 });
 
+// #701: an editor panel (ShaderPreview) that previews a texture-param default used to
+// `Assets.load` it with no matching release — every param edit stranded another texture for the
+// life of the editor process. `retainPanelTexture`/`releasePanelTexture` hold urls on a SEPARATE
+// map from the scene's own refcount (`spriteTextureRefs`), because that one is scene-scoped by
+// design (F3) and gets wiped wholesale on a world swap / last-renderer stop — a panel hold has to
+// survive both. `unloadSpriteTextureNow` — the single choke point both the deferred per-slot
+// release and the wholesale sweep funnel through — returns early while a panel hold exists.
+describe('panel texture holds veto the shared unload (#701)', () => {
+  it('a panel hold survives a world-swap wholesale sweep that would otherwise unload it', async () => {
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-a.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    // A scene sprite retains it too, so it's genuinely in play for the wholesale sweep
+    // (`unloadAllSpriteTextures` only iterates the scene-tracked refcount map).
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-a.png' });
+    scene2d.renderFrame();
+
+    scene2d.retainPanelTexture('http://t/panel-a.png'); // the panel holds it too
+
+    worldReg.setCurrentWorld(newWorld()); // disposes the scene slot + runs the wholesale sweep (liveRenderers<=1)
+    await new Promise((r) => setTimeout(r, 0)); // let any deferred release elapse
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/panel-a.png'); // panel hold vetoed it
+    scene2d.stopScene2D();
+  });
+
+  it('releasing the last panel hold while a scene hold remains does NOT unload', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-b.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-b.png' });
+    scene2d.renderFrame(); // scene now holds it
+
+    scene2d.retainPanelTexture('http://t/panel-b.png');
+    scene2d.releasePanelTexture('http://t/panel-b.png'); // last (only) panel hold dropped
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/panel-b.png'); // the scene still samples it
+    scene2d.stopScene2D();
+  });
+
+  it('releasing the last of both panel and scene holds DOES unload', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-c.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-c.png' });
+    scene2d.renderFrame();
+
+    scene2d.retainPanelTexture('http://t/panel-c.png');
+
+    child.destroy();
+    scene2d.renderFrame(); // scene drops its hold (deferred)
+    scene2d.releasePanelTexture('http://t/panel-c.png'); // panel drops its last hold too
+
+    await new Promise((r) => setTimeout(r, 0)); // let the scene's deferred release settle too
+    expect(pixi.Assets.__unloaded).toContain('http://t/panel-c.png');
+    scene2d.stopScene2D();
+  });
+});
+
 describe('Scene2D collider overlay (editor)', () => {
   it('draws an outline Graphics per canvas for Collider2D entities only when enabled', async () => {
     const { traits, pool, scene2d, world } = await setup();
@@ -1671,6 +1904,83 @@ describe('Mask2D teardown deferral (#455)', () => {
     // Tear the renderer down WITHOUT another renderFrame — stop() must drain the queue itself.
     scene2d.stopScene2D();
     expect(oldMaskObj.destroyed).toBe(true);
+  });
+});
+
+// #700 (second half): the orphan-warn tracker (`Orphan2DTracker`) is WORLD-lifecycle state —
+// `prune()` bounds it WITHIN a world, but across a world swap or a full stop koota recycles ids
+// as the norm, so a surviving key would wrongly silence (or wrongly re-warn) the next world's
+// occupant of a reused id. Both `stop()` and the `onWorldSwap` handler now call `orphan2D.reset()`.
+describe('Orphan-warn tracker reset at world lifecycle (#700)', () => {
+  // No EntityAttributes → no Canvas2D ancestor is reachable at all (same shape as the existing
+  // "keeps a live no-EntityAttributes orphan's frame count" test above) — the entity orphans on
+  // the very first scan and warns immediately (ORPHAN_2D_WARN_FRAMES === 1).
+  function spawnOrphan(world: any, traits: any) {
+    return world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+    );
+  }
+
+  it('reset()s the tracker on world swap', async () => {
+    const { traits, scene2d, world, worldReg, newWorld } = await setup({ start: true });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    spawnOrphan(world, traits);
+    scene2d.renderFrame(); // warns once, populating both `frames` and `warned`
+
+    const tracker = (scene2d.defaultRenderer as any).orphan2D;
+    expect(tracker.warned.size).toBeGreaterThan(0);
+    expect(tracker.frames.size).toBeGreaterThan(0);
+
+    worldReg.setCurrentWorld(newWorld()); // fires the onWorldSwap teardown
+
+    expect(tracker.frames.size).toBe(0);
+    expect(tracker.warned.size).toBe(0);
+    scene2d.stopScene2D();
+  });
+
+  it('reset()s the tracker on stop()', async () => {
+    const { traits, scene2d, world } = await setup({ start: true });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    spawnOrphan(world, traits);
+    scene2d.renderFrame();
+
+    const tracker = (scene2d.defaultRenderer as any).orphan2D;
+    expect(tracker.warned.size).toBeGreaterThan(0);
+    expect(tracker.frames.size).toBeGreaterThan(0);
+
+    scene2d.stopScene2D();
+
+    expect(tracker.frames.size).toBe(0);
+    expect(tracker.warned.size).toBe(0);
+  });
+});
+
+// #718: `stop()` used to leave every pool slot `boundBySim` — only the `onWorldSwap` handler
+// dropped the sim claim. The runtime pool never noticed (`Game.tsx`'s `destroyPool()` opens with
+// its own `releaseAll()`), but the editor pool (`editorCanvas2DPool`) has no other release caller
+// at all, so a `stop()`'d editor renderer left every allocated slot's Application + GPU context
+// alive with no way back — `reclaimIfUnclaimed` bails while `boundBySim` is still true.
+describe('Scene2DRenderer.stop() releases every pool slot (#718)', () => {
+  it('drops the sim claim so a stopped renderer leaves no slot stuck boundBySim', async () => {
+    const { traits, scene2d, pool, world } = await setup();
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start();
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+    editorRenderer.renderFrame(); // allocates the slot — boundBySim = true
+
+    const slotWhileRunning = editorPool.getSlot(canvas.id());
+    expect(slotWhileRunning).not.toBeNull();
+    expect(slotWhileRunning!.boundBySim).toBe(true);
+
+    editorRenderer.stop();
+
+    // Nothing else claims this slot (no Canvas2DMount), so releasing the sim claim must fully
+    // reclaim it — `reclaimIfUnclaimed` deletes the entityMap mapping once both claims drop.
+    expect(editorPool.getSlot(canvas.id())).toBeNull();
   });
 });
 

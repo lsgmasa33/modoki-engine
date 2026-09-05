@@ -193,9 +193,11 @@ const warnedUncached = new Set<string>();
  *  `${entityId}:${field}` rather than the view, because the fault is per pooled ROOT: the same
  *  view can have some slots authored correctly and others not.
  *
- *  ⚠️ Cleared on a world swap, like `warnedUncached` and unlike `warned`: a scene load mints
- *  fresh ecs ids for every pooled root, so anything keyed by id here is meaningless in the next
- *  scene and would otherwise grow forever. */
+ *  ⚠️ Cleared on a world swap, like `warnedUncached` and unlike `warned`. The reason stated here
+ *  used to be "a scene load mints fresh ecs ids, so anything keyed by id is meaningless" — but
+ *  this set is NOT keyed by id (see `warnAuthoredOverride`: the key is `viewGuid:slot:field`,
+ *  deliberately, because koota recycles ids). The real reason to clear is simpler: the next scene
+ *  has different views, so every entry is dead weight that would otherwise grow forever. */
 const warnedOverridden = new Set<string>();
 
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.

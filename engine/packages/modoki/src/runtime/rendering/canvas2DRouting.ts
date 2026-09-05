@@ -112,6 +112,20 @@ export function findUnrenderable2D(
  *     exact-equality trigger. `prune()` closes this the same way `clear()` closes (1): a caller
  *     that calls it once per frame/sweep with the frame's live ids keeps `frames` bounded by
  *     currently-orphaned entities, not by every entity ever orphaned. */
+/** The key an entity warns under when it has no guid. koota recycles entity ids, so this form —
+ *  and ONLY this form — can outlive its entity and silence an unrelated one that inherits the id
+ *  (#700). Exported so `Scene2D.orphan2DKey` mints it and {@link Orphan2DTracker.prune} can
+ *  recognise it: one format, one place, so the two cannot drift apart. */
+export function orphan2DFallbackKey(entityId: number): string { return `id:${entityId}`; }
+
+/** The entity id inside a fallback key, or null when `key` is a guid — which is unique for the
+ *  life of the project and therefore never recycles, so it is not prunable by id. */
+function orphan2DFallbackId(key: string): number | null {
+  if (!key.startsWith('id:')) return null;
+  const n = Number(key.slice(3));
+  return Number.isInteger(n) ? n : null;
+}
+
 export class Orphan2DTracker {
   private readonly frames = new Map<number, number>();
   private readonly warned = new Set<string>();
@@ -152,13 +166,28 @@ export class Orphan2DTracker {
    *  shape this codebase already uses for the same recycling hazard (e.g. `videoTextureSync.ts`'s
    *  `seen` set).
    *
-   *  ⚠️ Only `frames` is pruned HERE — `warned` has the SAME id-recycling collision, via its own
-   *  `id:` fallback key: `Scene2D.orphan2DKey` falls back to `` `id:${entityId}` `` whenever
-   *  `EntityAttributes.guid` is empty or unreadable, and koota recycles ids, so a guid-less
-   *  orphan's `id:` key can outlive it and silence a later, unrelated entity that recycles the
-   *  same numeric id. This is deliberately NOT fixed here — see #700, which tracks it. */
+   *  `warned` is pruned here too (#700), for the SAME collision one level down: `orphan2DKey`
+   *  falls back to {@link orphan2DFallbackKey} whenever `EntityAttributes.guid` is empty or
+   *  unreadable, so a guid-less orphan's `id:` key could outlive it and permanently silence the
+   *  unrelated entity that recycles the same numeric id. Only the `id:` form is dropped — a guid
+   *  is unique for the life of the project, so it cannot alias a different entity; guid keys are
+   *  released wholesale by {@link reset} at teardown and on world swap, which is also what bounds
+   *  `warned` across scenes (ids collide by the NORM across a swap, not by accident).
+   *
+   *  ⚠️ KNOWN REMAINING GAP, stated so nobody reads the above as complete: a GUID-keyed orphan
+   *  that DIES is not forgotten within its own world. Delete a guid-bearing orphaned entity and
+   *  undo it (same guid, same world, so `reset()` never runs) and it stays suppressed, because
+   *  `prune` is given ids and cannot tell which guids are still live. Not an id COLLISION — it
+   *  suppresses only the same entity — so it is the mild end of this shape, but it is the same
+   *  forget-on-death failure. Tracked in #738 with the rest of the family. */
   prune(aliveIds: ReadonlySet<number>): void {
-    if (this.frames.size === 0) return;
+    if (this.frames.size === 0 && this.warned.size === 0) return;
     for (const id of this.frames.keys()) if (!aliveIds.has(id)) this.frames.delete(id);
+    // Deleting the current element while iterating a Set is well-defined — visited entries are
+    // unaffected and the iterator continues from the next one.
+    for (const key of this.warned) {
+      const id = orphan2DFallbackId(key);
+      if (id !== null && !aliveIds.has(id)) this.warned.delete(key);
+    }
   }
 }

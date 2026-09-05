@@ -4,7 +4,7 @@
  *  collapsing onto the first canvas instead of its own parent canvas. */
 
 import { describe, it, expect } from 'vitest';
-import { findCanvasAncestor, Orphan2DTracker } from '../../src/runtime/rendering/canvas2DRouting';
+import { findCanvasAncestor, Orphan2DTracker, orphan2DFallbackKey } from '../../src/runtime/rendering/canvas2DRouting';
 
 describe('findCanvasAncestor', () => {
   it('returns null when the entity has no Canvas2D ancestor', () => {
@@ -172,5 +172,40 @@ describe('Orphan2DTracker', () => {
   it('prune() is a no-op on an empty tracker', () => {
     const t = new Orphan2DTracker();
     expect(() => t.prune(new Set())).not.toThrow();
+  });
+
+  // #700 (second half): `warned` has the SAME id-recycling collision as `frames` — a guid-less
+  // orphan warns under an `id:<n>` fallback key (`orphan2DFallbackKey`), dies without a
+  // recovering `clear()` call, and koota then hands its numeric id to an unrelated new entity.
+  // Before this fix, the surviving `id:<n>` key in `warned` silenced that new entity FOREVER —
+  // `note()` never returns the key a second time once it's in `warned`, and nothing ever removed
+  // it. `prune()` must drop it exactly like it drops the stale `frames` count.
+  it('prune() forgets a dead id:<n> warned key, letting the entity that recycles the id warn again', () => {
+    const t = new Orphan2DTracker();
+    const deadKey = orphan2DFallbackKey(1);
+    expect(t.note(1, () => deadKey, 1)).toBe(deadKey); // entity 1 warns once, then dies — no clear()
+
+    t.prune(new Set()); // entity 1 is no longer alive
+
+    // koota recycles id 1 for a brand-new entity, also guid-less (same fallback KEY FORM).
+    const newKey = orphan2DFallbackKey(1);
+    expect(newKey).toBe(deadKey); // same string — this is exactly the collision
+    expect(t.note(1, () => newKey, 1)).toBe(newKey); // must warn again for the new occupant
+  });
+
+  it('prune() leaves a warned GUID key alone — a guid never recycles, so it is not id-keyed', () => {
+    const t = new Orphan2DTracker();
+    expect(t.note(1, () => 'guid-1', 1)).toBe('guid-1'); // warns under a guid key
+    t.prune(new Set()); // entity 1 no longer alive by id — must NOT touch the guid key
+    // Warned-again would return null (already warned) if the guid key survived; it does.
+    expect(t.note(1, () => 'guid-1', 1)).toBeNull();
+  });
+
+  it('prune() leaves warned id:<n> keys for ids still in aliveIds untouched', () => {
+    const t = new Orphan2DTracker();
+    const key = orphan2DFallbackKey(2);
+    expect(t.note(2, () => key, 1)).toBe(key);
+    t.prune(new Set([2])); // id 2 still alive — its warned key must survive
+    expect(t.note(2, () => key, 1)).toBeNull(); // still warned — not reset by the prune
   });
 });

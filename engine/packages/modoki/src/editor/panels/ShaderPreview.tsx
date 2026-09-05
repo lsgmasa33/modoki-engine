@@ -12,7 +12,7 @@
 import { useEffect, useRef } from 'react';
 import { Application, Mesh, MeshGeometry, Texture, Assets, type Shader } from 'pixi.js';
 import { resolvePixiBackend } from '../../runtime/rendering/canvas2DPool';
-import { releaseGeometry } from '../../runtime/rendering/Scene2D';
+import { releaseGeometry, retainPanelTexture, releasePanelTexture } from '../../runtime/rendering/Scene2D';
 import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram } from '../../runtime/rendering/pixiShaderBuilder';
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
@@ -20,14 +20,17 @@ import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/co
 
 const SIZE = 132; // css px (square)
 
-/** Resolve a texture-param default (sprite/texture GUID) → a live Texture, or null. */
-async function loadPreviewTexture(ref: unknown): Promise<Texture | null> {
+/** Resolve a texture-param default (sprite/texture GUID) → a live Texture AND its url, or null.
+ *  The url comes back so `renderNow` can hold it through the shared panel refcount — this
+ *  `Assets.load` used to be unbalanced, so every param edit stranded another texture for the life
+ *  of the editor process (#701). */
+async function loadPreviewTexture(ref: unknown): Promise<{ tex: Texture; url: string } | null> {
   if (typeof ref !== 'string' || !ref) return null;
   const url = resolveImageUrl(ref);
   if (!url) return null;
   try {
     const tex = (await Assets.load(url)) as Texture;
-    return tex?.source ? tex : null;
+    return tex?.source ? { tex, url } : null;
   } catch { return null; }
 }
 
@@ -64,7 +67,7 @@ function destroyMesh(mesh: Mesh<MeshGeometry, Shader> | null): void {
 export function ShaderPreview({ path, data }: { path: string; data: Record<string, unknown> }) {
   const hostRef = useRef<HTMLDivElement>(null);
   // Live app/program/mesh, plus a serial guard so a stale async build can't touch a torn-down app.
-  const stateRef = useRef<{ app: Application | null; program: PixiShaderProgram | null; mesh: Mesh<MeshGeometry, Shader> | null; serial: number }>({ app: null, program: null, mesh: null, serial: 0 });
+  const stateRef = useRef<{ app: Application | null; program: PixiShaderProgram | null; mesh: Mesh<MeshGeometry, Shader> | null; serial: number; texUrls: string[] }>({ app: null, program: null, mesh: null, serial: 0, texUrls: [] });
   const dataRef = useRef(data);
   dataRef.current = data;
   const is2D = shaderSpace(data as { space?: '2d' | '3d' }) === '2d';
@@ -139,6 +142,10 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
       disposed = true;
       stateRef.current.serial++;
       destroyMesh(stateRef.current.mesh); // must run BEFORE nulling the ref below
+      // Hand back every texture this panel was holding (#701) — the panel is going away, so its
+      // veto on the shared unload must go with it or the texture is pinned for the process.
+      for (const u of stateRef.current.texUrls) releasePanelTexture(u);
+      stateRef.current.texUrls = [];
       stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
       if (!app.renderer) { /* init never finished */ } else app.destroy(true);
       markDestroyed();
@@ -167,7 +174,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
 
 /** Rebuild the mesh's shader from the current param defaults + resolved extra textures, then
  *  render one frame. Serial-guarded so an in-flight texture load can't draw into a dead app. */
-async function renderNow(state: { app: Application | null; program: PixiShaderProgram | null; mesh: Mesh<MeshGeometry, Shader> | null; serial: number }, data: Record<string, unknown>) {
+async function renderNow(state: { app: Application | null; program: PixiShaderProgram | null; mesh: Mesh<MeshGeometry, Shader> | null; serial: number; texUrls: string[] }, data: Record<string, unknown>) {
   const { app, program, mesh } = state;
   if (!app || !app.renderer || !program || !mesh) return;
   const serial = state.serial;
@@ -177,14 +184,35 @@ async function renderNow(state: { app: Application | null; program: PixiShaderPr
   for (const [key, p] of program.params) values[key] = coerceParamValue(p, params[key]?.default);
   // Extra samplers: resolve each texture param's default; WHITE while it loads/absent.
   const extraTextures: Record<string, Texture> = {};
+  const held: string[] = [];
   for (const [key] of program.textureParams) {
-    const tex = await loadPreviewTexture(params[key]?.default);
-    if (state.serial !== serial || !state.mesh) return; // torn down mid-load
-    extraTextures[key] = tex ?? Texture.WHITE;
+    const loaded = await loadPreviewTexture(params[key]?.default);
+    // Retain BEFORE the abort check, so a load that lands into a torn-down panel is still
+    // handed back below rather than stranded (#701).
+    if (loaded) { retainPanelTexture(loaded.url); held.push(loaded.url); }
+    if (state.serial !== serial || !state.mesh) { for (const u of held) releasePanelTexture(u); return; }
+    extraTextures[key] = loaded?.tex ?? Texture.WHITE;
   }
-  const shader = makePixiShaderInstance(program, Texture.WHITE, values, extraTextures);
-  const old = mesh.shader;
-  mesh.shader = shader;
-  old?.destroy();
-  app.renderer.render(app.stage);
+  // `held` is owned by this local until `state.texUrls` takes it over below. If anything between
+  // here and that handover throws, the `finally` gives the holds back (#701 review): a stranded
+  // PANEL hold is worse than the leak it replaced, because it is a permanent veto inside
+  // `unloadSpriteTextureNow` — `unloadAllSpriteTextures`'s F3 sweep would skip that url for the
+  // rest of the editor process, and the scene's own accounting could never free it either.
+  let committed = false;
+  try {
+    const shader = makePixiShaderInstance(program, Texture.WHITE, values, extraTextures);
+    const old = mesh.shader;
+    mesh.shader = shader;
+    old?.destroy();
+    // Release the PREVIOUS pass's holds only now the new shader is bound — retain-before-release,
+    // so a url common to both passes (the usual case: one param edited out of several) never dips
+    // to 0 and gets unloaded out from under the shader we just built.
+    const prevHeld = state.texUrls;
+    state.texUrls = held;
+    committed = true;
+    for (const u of prevHeld) releasePanelTexture(u);
+    app.renderer.render(app.stage);
+  } finally {
+    if (!committed) for (const u of held) releasePanelTexture(u);
+  }
 }

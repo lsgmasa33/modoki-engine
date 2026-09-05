@@ -10,7 +10,7 @@
  */
 
 import * as THREE from 'three';
-import { TEXTURE_WAIT_BUDGET_MS, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
+import { TEXTURE_WAIT_BUDGET_MS, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, resolveTrailSegments, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
 import { rawNow } from '../core/clock';
 import { CpuParticleSim } from './cpuSimulator';
 import { createBillboard, type BillboardObject } from './spriteBillboard';
@@ -408,7 +408,7 @@ export class CpuTslBackend implements IParticleBackend {
     const structural =
       renderStructuralKey(def) !== renderStructuralKey(e.def) ||
       (def.trail?.enabled ?? false) !== (e.def.trail?.enabled ?? false) ||
-      (def.trail?.segments ?? 8) !== (e.def.trail?.segments ?? 8) ||
+      resolveTrailSegments(def.trail?.segments) !== resolveTrailSegments(e.def.trail?.segments) ||
       (def.worldSpace ?? false) !== (e.def.worldSpace ?? false) || // clean restart, no mixed-space particles
       subSig(def) !== subSig(e.def) ||
       texChanged;

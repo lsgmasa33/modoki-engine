@@ -15,7 +15,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { makeWebGPURenderer } from '../../runtime/rendering/scene3DSync';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import { particleBackend } from '../../runtime/particles/particleBackend';
-import { defaultParticleEffect, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
+import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
@@ -573,9 +573,9 @@ export default function ParticleEditor() {
                 <Check label="Soft" hint="Fade particles where they intersect opaque geometry, hiding hard clip edges (smoke against the ground). Use the ▦ floor toggle to preview." v={def.render.softParticles ?? false} on={(v) => patch({ render: { ...def.render, softParticles: v } })} />
               </>
             )}
-            <Check label="Trail" hint="Draw a ribbon behind each particle from its recent position history. CPU sim only (forces a GPU effect to fall back)." v={def.trail?.enabled ?? false} on={(v) => patch({ trail: { enabled: v, segments: def.trail?.segments ?? 8 } })} />
+            <Check label="Trail" hint="Draw a ribbon behind each particle from its recent position history. CPU sim only (forces a GPU effect to fall back)." v={def.trail?.enabled ?? false} on={(v) => patch({ trail: { enabled: v, segments: resolveTrailSegments(def.trail?.segments) } })} />
             {def.trail?.enabled && (
-              <Num label="Trail Seg" hint="History points retained per particle (≥2). More = longer, smoother trail at higher cost." v={def.trail?.segments ?? 8} min={2} step={1} on={(v) => patch({ trail: { enabled: true, segments: Math.max(2, Math.round(v)) } })} />
+              <Num label="Trail Seg" hint="History points retained per particle (≥2). More = longer, smoother trail at higher cost." v={resolveTrailSegments(def.trail?.segments)} min={2} step={1} on={(v) => patch({ trail: { enabled: true, segments: resolveTrailSegments(Math.round(v)) } })} />
             )}
           </Section>
 

@@ -29,7 +29,7 @@
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
 import type { World } from 'koota';
-import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
+import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
@@ -68,7 +68,7 @@ import { computeGroupAlpha } from './groupAlpha';
 import { computeMaskGroups } from './maskGroups';
 import { buildMaskRamp } from './maskRamp';
 import { maskOffsetWorld } from './maskPlacement';
-import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
+import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker, orphan2DFallbackKey } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
@@ -124,7 +124,13 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // is also registered in Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
   // (additional samplers) — each retained on build + released in disposeSlot, like textureUrl.
-  matShader?: Shader; matGuid?: string; matSig?: string; materialTexUrls?: string[] }
+  // `matSpriteRef` is the SAMPLED sprite ref (`spriteRef` is taken — it holds the material GUID
+  // on this kind). It is deliberately NOT in `matSig`, so an atlas frame swap within one sheet
+  // shows up as "sig equal, ref moved" and takes the one-uniform fast path instead of a full
+  // Mesh+Shader+Geometry rebuild (#698). `builtEpoch` tracks the sampled sprite's re-slice epoch
+  // here (the sprite path's meaning), so re-slicing the sheet invalidates the slot even when the
+  // url is unchanged.
+  matShader?: Shader; matGuid?: string; matSig?: string; materialTexUrls?: string[]; matSpriteRef?: string }
 
 // ── SHARED texture refcount (global — tracks the global Assets cache) ──
 // Per-URL refcount for PixiJS Assets. When the last sprite using a URL is
@@ -144,7 +150,54 @@ const spriteTextureRefs = new Map<string, number>();
 // a genuine last release still frees the VRAM one tick later.
 const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
 
+// ── EDITOR-PANEL holds on a sprite url (#701) ──
+// Deliberately a SECOND map rather than more entries in `spriteTextureRefs`, because that one is
+// SCENE-scoped by design (F3: "no texture accounting survives a scene") and `unloadAllSpriteTextures`
+// erases it wholesale on world swap / last-renderer stop. An editor panel showing a preview outlives
+// any number of world swaps, so folding its hold into the scene map would have the swap unload a
+// texture the panel is still displaying — the mirror image of the hazard #701 exists to avoid.
+// A panel hold therefore VETOES the unload instead of participating in the scene refcount.
+const panelTextureRefs = new Map<string, number>();
+
+/** Hold a sprite url on behalf of a long-lived editor panel. Pair with {@link releasePanelTexture}. */
+export function retainPanelTexture(url: string): void {
+  if (!url) return;
+  const pending = pendingTextureUnloads.get(url);
+  if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  panelTextureRefs.set(url, (panelTextureRefs.get(url) ?? 0) + 1);
+}
+
+/** Drop a panel's hold. Frees the texture only when no OTHER panel and no scene slot holds it —
+ *  a blind `Assets.unload` here would evict a texture another live panel (or the viewport) is
+ *  still sampling, which is exactly why #701 could not be fixed with a matching unload. */
+export function releasePanelTexture(url: string): void {
+  if (!url) return;
+  const n = (panelTextureRefs.get(url) ?? 0) - 1;
+  if (n > 0) { panelTextureRefs.set(url, n); return; }
+  panelTextureRefs.delete(url);
+  if ((spriteTextureRefs.get(url) ?? 0) > 0) return;   // a scene slot still samples it
+  deferUnload(url);
+}
+
+/** Arm the deferred unload shared by both release paths. Deferred rather than immediate for the
+ *  reason `pendingTextureUnloads` documents above: a release landing in the same tick as a
+ *  refcount trough on a shared url would otherwise destroy the source out from under the rebuild
+ *  about to re-retain it. Cancels itself if EITHER a scene slot or a panel re-retains meanwhile. */
+function deferUnload(url: string): void {
+  if (pendingTextureUnloads.has(url)) return;
+  const handle = setTimeout(() => {
+    pendingTextureUnloads.delete(url);
+    if ((spriteTextureRefs.get(url) ?? 0) > 0 || panelTextureRefs.has(url)) return;
+    unloadSpriteTextureNow(url);
+  }, 0);
+  pendingTextureUnloads.set(url, handle);
+}
+
 function unloadSpriteTextureNow(url: string) {
+  // A panel hold vetoes every unload path — both `releaseSpriteTexture`'s deferred timer and
+  // `unloadAllSpriteTextures`'s wholesale sweep funnel through here, so this one check covers
+  // both without either needing to know panels exist.
+  if (panelTextureRefs.has(url)) return;
   if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
 }
 
@@ -157,14 +210,7 @@ function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
-    if (pendingTextureUnloads.has(url)) return;
-    const handle = setTimeout(() => {
-      pendingTextureUnloads.delete(url);
-      // Re-retained while we waited (the same-frame rebuild case) — the hold is live again.
-      if ((spriteTextureRefs.get(url) ?? 0) > 0) return;
-      unloadSpriteTextureNow(url);
-    }, 0);
-    pendingTextureUnloads.set(url, handle);
+    deferUnload(url);
   } else {
     spriteTextureRefs.set(url, n);
   }
@@ -258,6 +304,23 @@ function frameTexture(base: Texture, r: ResolvedSprite): Texture {
   w = Math.max(1, Math.min(w, base.width - x));
   h = Math.max(1, Math.min(h, base.height - y));
   return new Texture({ source: base.source, frame: new Rectangle(x, y, w, h) });
+}
+
+/** Mint what a material Mesh samples, from an already-resolved ref: the base texture for a whole
+ *  image, a framed WRAPPER for an atlas slice.
+ *
+ *  ⚠️ EVERY call that mints a wrapper allocates a `Texture` the shared long-lived `TextureSource`
+ *  then holds via a `source.on('resize')` backref — so the wrapper is NOT collectable once
+ *  dropped. Call this ONLY where a wrapper is actually kept: a Mesh build, or a frame swap that
+ *  stores it on the slot. The material pass used to call the resolver (which minted inline) once
+ *  per material entity per FRAME and drop the result on the floor. Only an ATLAS-SLICED sprite
+ *  allocated — a whole image borrows the base texture and always did — so the cost was 482 bytes
+ *  per frame per sliced material entity, ~1.65 MB/min (#697, measured in Node against the
+ *  vendored pixi; LATENT today because no such entity is authored in any current project). The
+ *  sprite path never had this bug: its `needResolve` guard resolves only when the ref or the
+ *  re-slice epoch actually moved. */
+function mintMaterialTexture(r: { base: Texture; resolved: ResolvedSprite | null; hasFrame: boolean }): Texture {
+  return r.hasFrame && r.resolved ? frameTexture(r.base, r.resolved) : r.base;
 }
 
 /** Collect an entity's per-instance 2D-material TEXTURE overrides — `MaterialInstance`
@@ -753,7 +816,7 @@ export class Scene2DRenderer {
    *  never happens on the healthy path — see `Orphan2DTracker`. */
   private orphan2DKey(entityId: number): string {
     const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
-    return ((attrs?.guid as string) || '') || `id:${entityId}`;
+    return ((attrs?.guid as string) || '') || orphan2DFallbackKey(entityId);
   }
 
   /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
@@ -1045,7 +1108,7 @@ export class Scene2DRenderer {
     // ⚠️ Presence in the cache is NOT the same as being usable, and this used to test only
     // `has(url)`. An entry whose source was destroyed by an in-flight `Assets.unload` is still
     // PRESENT — binding it yields a sprite that draws nothing, forever, because this branch
-    // never kicks a load. `resolveMaterialTexture` already validates `source` for the same
+    // never kicks a load. `resolveMaterialTextureRef` already validates `source` for the same
     // reason; the sprite path did not, which is the whole of Court's invisible pen marks.
     // Evict the dead entry first, or `Assets.load` would hand back the same corpse.
     const cachedBase = Assets.cache.has(url) ? (Assets.get(url) as Texture | undefined) : undefined;
@@ -1100,10 +1163,10 @@ export class Scene2DRenderer {
    *  atlas slice (`resolved.frame`) becomes a framed WRAPPER (`hasFrame`) whose
    *  textureMatrix maps the quad's 0..1 UVs into the sub-rect, so the shader samples the
    *  right pixels; a whole image borrows the base texture. */
-  private resolveMaterialTexture(spriteRef: string, wholeOnly = false): { tex: Texture; url: string; hasFrame: boolean } {
-    if (!isImagePath(spriteRef)) return { tex: Texture.WHITE, url: '', hasFrame: false };
+  private resolveMaterialTextureRef(spriteRef: string, wholeOnly = false): { base: Texture; resolved: ResolvedSprite | null; url: string; hasFrame: boolean } {
+    if (!isImagePath(spriteRef)) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
     const resolved = resolveSprite(spriteRef);
-    if (!resolved) return { tex: Texture.WHITE, url: '', hasFrame: false }; // guid not in manifest yet
+    if (!resolved) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false }; // guid not in manifest yet
     const url = resolved.url;
     if (Assets.cache.has(url)) {
       // A cached texture can still be mid-decode (or stale after a prior unload) with a
@@ -1116,7 +1179,7 @@ export class Scene2DRenderer {
         // whole image → the base texture directly. `wholeOnly` (extra samplers) always
         // borrows the base, so there's no per-slot wrapper to track/destroy for them.
         const framed = !wholeOnly && resolved.frame != null;
-        return { tex: framed ? frameTexture(base, resolved) : base, url, hasFrame: framed };
+        return { base, resolved, url, hasFrame: framed };
       }
       // ⚠️ Sourceless-but-cached is TERMINAL unless the entry is evicted. `markDirty` alone only
       // re-runs this same branch, which re-reads the same dead entry — a livelock that renders
@@ -1134,7 +1197,7 @@ export class Scene2DRenderer {
           console.warn(`[Scene2D] Material sprite texture load failed: ${url}`, e);
         });
     }
-    return { tex: Texture.WHITE, url: '', hasFrame: false };
+    return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
   }
 
   private destroyColliderOverlay(canvasId: number) {
@@ -1588,12 +1651,15 @@ export class Scene2DRenderer {
         // Sample the entity's own sprite as uTexture (Texture.WHITE + url='' while it
         // loads or when it has no image sprite). The resolved url is part of matSig so
         // the Mesh re-mints with the real texture the frame it becomes resident.
-        const { tex, url: texUrl, hasFrame: matHasFrame } = this.resolveMaterialTexture(rend.sprite);
+        // Resolve WITHOUT minting a wrapper (#697) — `matSig` only needs the url and the frame
+        // identity, and the framed `Texture` is allocated below, once per build/frame-swap.
+        const matRef = this.resolveMaterialTextureRef(rend.sprite);
+        const texUrl = matRef.url, matHasFrame = matRef.hasFrame;
         // Never hand a source-less texture to the shader — makePixiShaderInstance reads
         // `texture.source.style` and would throw, killing the whole 2D frame callback.
-        // resolveMaterialTexture already falls back to Texture.WHITE (a live source), so
+        // resolveMaterialTextureRef already falls back to Texture.WHITE (a live source), so
         // this only trips if even WHITE isn't ready yet; skip + retry next frame.
-        if (!tex.source) { this.markDirty(); return; }
+        if (!matRef.base.source) { this.markDirty(); return; }
         // Resolve the shader's extra `texture` params (additional samplers). The value is the
         // param's manifest default GUID, OR a per-instance `kind:'texture'` MaterialInstance
         // override on that target (a static ref — MaterialInstance sources drive only scalar
@@ -1603,21 +1669,30 @@ export class Scene2DRenderer {
         // must retain/release; the override ref is part of matSig (via extraSig's url) so an
         // inspector edit that swaps the texture rebuilds the Mesh with the new one.
         const texOverrides = readTextureOverrides(entity);
-        const extraTextures: Record<string, Texture> = {};
+        const extraRefs: [string, { base: Texture; resolved: ResolvedSprite | null; hasFrame: boolean }][] = [];
         const matTexUrls: string[] = [];
         let extraSig = '';
         for (const [key, param] of program.textureParams ?? []) {
           const ref = texOverrides?.get(key) ?? (coerceParamValue(param, undefined) as string);
-          const { tex: etex, url: eurl } = this.resolveMaterialTexture(ref, true);
-          extraTextures[key] = etex;
-          if (eurl) matTexUrls.push(eurl);
-          extraSig += `|${key}=${eurl}`;
+          // `wholeOnly` → `hasFrame` is always false for these, so minting one below never
+          // allocates; they are resolved per frame only to keep `extraSig` current.
+          const eref = this.resolveMaterialTextureRef(ref, true);
+          extraRefs.push([key, eref]);
+          if (eref.url) matTexUrls.push(eref.url);
+          extraSig += `|${key}=${eref.url}`;
         }
-        // matSig carries the sprite REF (not just texUrl): two atlas slices of one sheet share a
-        // url but need different frames, so a frame swap must force a rebuild (re-mints the wrapper
-        // + its uv matrix). texUrl still flips '' → url when an async load lands. extraSig moves
-        // when an extra sampler's texture becomes resident, forcing a rebuild that binds the real one.
-        const matSig = `${rend.width}|${rend.height}|${px}|${py}|${rend.sprite}|${texUrl}${extraSig}`;
+        // matSig deliberately does NOT carry the sprite REF (#698). It used to: two atlas slices
+        // of one sheet share a url but need different frames, so a frame swap had to force a
+        // rebuild. That made a SpriteAnimator-driven material rebuild its Mesh, Shader AND
+        // Geometry at clip fps for what is only a sub-rect change. The ref now lives in
+        // `matSpriteRef`, so "sig equal, ref moved" is exactly the frame-swap case and is handled
+        // in place below; everything genuinely structural still rebuilds through this sig.
+        // texUrl still flips '' → url when an async load lands. extraSig moves when an extra
+        // sampler's texture becomes resident, forcing a rebuild that binds the real one.
+        const matSig = `${rend.width}|${rend.height}|${px}|${py}|${texUrl}${extraSig}`;
+        // The sampled sprite's re-slice epoch — re-slicing the sheet must invalidate the slot even
+        // when the url is unchanged, which the ref-in-sig form could not express.
+        const matSpriteEpoch = getSpriteEpoch(rend.sprite);
         let slot = this.slots.get(id);
         // Rebuild the slot when the kind changed (was a sprite/graphics while loading),
         // the bound material GUID changed, the quad size/pivot changed, or the sampled
@@ -1638,7 +1713,8 @@ export class Scene2DRenderer {
         // so retain-before-release covers the shared-url cases for the sprite AND the samplers.
         const newUrls = texUrl ? [texUrl, ...matTexUrls] : matTexUrls;
         let preRetained = false;
-        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matSig !== matSig)) {
+        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matSig !== matSig
+          || slot.builtEpoch !== matSpriteEpoch)) {
           for (const u of newUrls) retainSpriteTexture(u);
           preRetained = true;
           disposeSlot(slot); this.slots.delete(id); this.entityShaders.delete(id);
@@ -1646,12 +1722,56 @@ export class Scene2DRenderer {
           slot = undefined;
         }
         let built = false;
+        // FRAME SWAP (#698) — the material analogue of the sprite path's fast path above. The slot
+        // survived the gate, so the material, size, pivot, resolved url, samplers and re-slice
+        // epoch are all identical and only the atlas sub-rect moved. `makePixiShaderInstance`
+        // binds `uTexture: texture.SOURCE` (and `uSampler: source.style`), which are the SAME
+        // object across slices of one sheet — the only thing a sub-rect change actually moves is
+        // `uTextureMatrix`. So the whole swap is one wrapper + one uniform write, in place: no
+        // Mesh, no Shader, no Geometry, and no texture refcount churn (the url is unchanged, so
+        // retain/release would cancel out anyway). Same in-place-uniform shape as
+        // `updateMtsdfPixiMetrics`, which is how #690 decoupled the text shader.
+        if (slot && slot.matSpriteRef !== rend.sprite) {
+          // ⚠️ `uTextureMatrix` is not an optimisation here — it is the ONLY thing that makes the
+          // swap visible. Both Pixi mesh adaptors (`GlMeshAdaptor` / `GpuMeshAdapter`) refresh the
+          // uTexture/uSampler/uTextureMatrix bindings ONLY inside `if (!shader)`, and a material
+          // slot always sets one, so `mesh.texture = newTex` alone changes nothing on screen.
+          // Hence: if the uniform group is not reachable, DO NOT take the fast path — fall through
+          // to a full rebuild, which re-mints the shader with the right `mapCoord`. Swapping the
+          // texture and skipping the uniform would animate the ECS while rendering frame 0
+          // forever, with nothing failing — the "mechanism that cannot fire" shape this whole
+          // batch of fixes is about, reintroduced by the fix for it.
+          const tu = (slot.matShader?.resources as any)?.textureUniforms?.uniforms as Record<string, unknown> | undefined;
+          if (tu) {
+            const swapMesh = slot.obj as Mesh;
+            const oldTex = swapMesh.texture;
+            const newTex = mintMaterialTexture(matRef);
+            swapMesh.texture = newTex;
+            tu.uTextureMatrix = newTex.textureMatrix?.mapCoord ?? new Matrix();
+            // Destroy the previous per-slot framed WRAPPER only. A whole-image borrow
+            // (hasFrame=false) is the SHARED base texture and must never be destroyed, and
+            // `destroy(false)` leaves the source alone in either case.
+            if (slot.hasFrame && oldTex && oldTex !== Texture.EMPTY && oldTex !== newTex) oldTex.destroy(false);
+            slot.matSpriteRef = rend.sprite;
+            slot.hasFrame = matRef.hasFrame;
+            built = true;   // the quad samples different pixels now — it must redraw
+          } else {
+            for (const u of newUrls) retainSpriteTexture(u);
+            preRetained = true;
+            disposeSlot(slot); this.slots.delete(id); this.entityShaders.delete(id);
+            this.lastRender.delete(id);
+            slot = undefined;
+          }
+        }
         if (!slot) {
+          const tex = mintMaterialTexture(matRef);
+          const extraTextures: Record<string, Texture> = {};
+          for (const [key, eref] of extraRefs) extraTextures[key] = mintMaterialTexture(eref);
           const shader = makePixiShaderInstance(program, tex, undefined, extraTextures);
           const mesh = new Mesh({ geometry: buildMaterialQuad(rend.width, rend.height, px, py), texture: tex, shader });
           this.containerFor(canvasSlot, id).addChild(mesh);
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
-          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: 0, meshVersion: -1, matShader: shader, matGuid: rend.material, matSig, materialTexUrls: matTexUrls };
+          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite };
           this.slots.set(id, slot);
           this.entityShaders.set(id, shader);
           built = true; // fresh/rebuilt Mesh → must draw at least once
@@ -2310,6 +2430,11 @@ export class Scene2DRenderer {
       // Dispose emitter handles + clear recs (the state object stays reusable for the new scene) —
       // recycled ids must not alias stale emitters.
       if (this.particleState2D) disposeParticleSync2DState(this.particleState2D);
+      // Orphan-warn bookkeeping is WORLD-lifecycle (#700). `prune()` bounds it WITHIN a world, but
+      // across a swap koota recycles ids as the norm rather than the exception, so a surviving
+      // `id:` key would silence the new world's occupant of that id on its very first orphaning —
+      // and a surviving guid key would suppress a legitimately new warning for a re-loaded scene.
+      this.orphan2D.reset();
       this.pool.releaseAll();
       // Skin/deform buffers are WORLD-lifecycle state: recycled entity ids in the new world must
       // not alias stale buffers. clearSkin2DBuffers/clearDeform2DBuffers just empty a Map, so this
@@ -2383,6 +2508,23 @@ export class Scene2DRenderer {
     this.dirtyCanvases.clear();
     this.clearAllColliderOverlays();
     if (this.particleState2D) { disposeParticleSync2DState(this.particleState2D); this.particleState2D = null; }
+    this.orphan2D.reset();   // world-lifecycle, same reason as the onWorldSwap handler (#700)
+    // Drop this renderer's sim claim on every pool slot (#718) — same call, same position as the
+    // `onWorldSwap` handler above, and for the same reason: it must run AFTER the `disposeSlot`
+    // loop, because `releaseAll` only DETACHES children and relies on Scene2D having destroyed
+    // them already (F4). Without it `stop()` left every slot `boundBySim`, so `unmount` →
+    // `reclaimIfUnclaimed` bailed and the slot kept a live Application + GPU context with its
+    // canvas detached — and nothing could ever come back for it, because `stop()` had just
+    // unregistered the frame callback that drives `renderAll`'s shrink pass AND cleared
+    // `prevCanvasIds`, so even a later `start()` diffs against an empty set. The runtime pool
+    // masked this (`Game.tsx` calls `destroyPool()`, which opens with `releaseAll()`); the EDITOR
+    // pool has no such caller — `editorCanvas2DPool` is a module singleton whose only teardown is
+    // this method. Predicted (NOT observed on a running editor) end state: stuck slots accumulate
+    // to `MAX_SLOTS` (6), after which `allocate` refuses and warns and the 2D viewport draws
+    // nothing. That consequence is derived from `canvas2DPool.ts:508`, not measured.
+    // Idempotent: it acts only on `boundBySim` slots and clears that flag, so the runtime's
+    // existing stop-then-destroyPool sequence is unaffected.
+    this.pool.releaseAll();
     // Nuke the SHARED skin buffers + texture net only when THIS was the LAST live renderer.
     // Gating on renderer count (not `this.primary`) fixes both directions: a non-primary editor
     // stop while GameView lives must not wipe shared state, AND a primary GameView stop while the

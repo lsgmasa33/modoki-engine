@@ -14,7 +14,7 @@ import { SpriteNodeMaterial } from 'three/webgpu';
 import { attribute, float, mul, texture, uv } from 'three/tsl';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteSheetUv } from './billboardTsl';
 import { uploadDenseRows } from './attributeUpload';
-import type { RenderConfig } from './types';
+import { resolveTiles, type RenderConfig } from './types';
 import type { ParticleOutputs } from './cpuSimulator';
 
 export interface BillboardObject {
@@ -87,8 +87,8 @@ export function createBillboard(maxParticles: number, render: RenderConfig, opts
   const tex = opts.texture;
   let opacityExpr;
   if (tex) {
-    const tx = Math.max(1, Math.floor(opts.tilesX ?? 1));
-    const ty = Math.max(1, Math.floor(opts.tilesY ?? 1));
+    const tx = resolveTiles(opts.tilesX);
+    const ty = resolveTiles(opts.tilesY);
     // map the quad UV into the current sprite-sheet cell (frame 0 = top-left), then flip V
     // for bottom-origin (KTX2, flipY=false) textures so the sprite reads right-side up.
     const sampleUv = orientSampleUv(

@@ -28,7 +28,7 @@ import {
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
   positionLocal, normalLocal,
 } from 'three/tsl';
-import { renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
+import { resolveTiles, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
 import { resolveCollider } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
@@ -660,8 +660,8 @@ export class GpuComputeBackend implements IParticleBackend {
     let opacityExpr = u.startOpacity.mul(scalar.g).mul(scalar.b);
 
     if (tex) {
-      const tx = Math.max(1, Math.floor(def.render.tilesX ?? 1));
-      const ty = Math.max(1, Math.floor(def.render.tilesY ?? 1));
+      const tx = resolveTiles(def.render.tilesX);
+      const ty = resolveTiles(def.render.tilesY);
       let sampleUv: ReturnType<typeof vec2> = uv();
       if (tx > 1 || ty > 1) {
         const tileCount = tx * ty;

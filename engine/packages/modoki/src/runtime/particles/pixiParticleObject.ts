@@ -14,7 +14,7 @@
  */
 
 import { ParticleContainer, Particle, Texture, Rectangle } from 'pixi.js';
-import type { RenderConfig, BlendMode } from './types';
+import { resolveTiles, type RenderConfig, type BlendMode } from './types';
 import type { ParticleOutputs } from './cpuSimulator';
 import { applyParticleOutputs, type ParticleMapOptions } from './pixiParticleMap';
 
@@ -87,8 +87,8 @@ export function createPixiParticles(
   render: RenderConfig,
   opts: PixiParticleOptions = {},
 ): PixiParticleObject {
-  const tilesX = Math.max(1, Math.floor(opts.tilesX ?? 1));
-  const tilesY = Math.max(1, Math.floor(opts.tilesY ?? 1));
+  const tilesX = resolveTiles(opts.tilesX);
+  const tilesY = resolveTiles(opts.tilesY);
   const hasFlipbook = !!opts.texture && (tilesX > 1 || tilesY > 1);
   const frames = hasFlipbook ? buildFrames(opts.texture!, tilesX, tilesY) : null;
   // The texture every particle starts with: frame 0 for a sheet, the whole texture for a single

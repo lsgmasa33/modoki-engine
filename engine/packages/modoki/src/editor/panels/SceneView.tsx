@@ -2337,7 +2337,15 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
     editorScene2DRenderer.start();
     startFrameDriver();
     editorScene2DRenderer.markDirty();
-    return () => { editorScene2DRenderer.stop(); stopFrameDriver(); };
+    // #718: `stop()` drops each slot's sim claim, but `reclaimIfUnclaimed` returns the slot to the
+    // FREE pool with its `Application` and GPU context still live — only `pendingDestroy` tears
+    // that down, and only `destroyPool()` sets it. The shrink pass that would otherwise collect it
+    // cannot run: `stop()` and `stopFrameDriver()` have just removed the callbacks that drive
+    // `renderAll`. So without this the comment above ("no GPU context is held ... when the 2D layer
+    // is toggled off") was false, and toggling the layer accumulated contexts against
+    // SOFT_CONTEXT_LIMIT. Mirrors `Game.tsx`'s `stopScene2D()` + `destroyPool()` — the runtime pool
+    // had that caller all along and the editor pool had none.
+    return () => { editorScene2DRenderer.stop(); editorCanvas2DPool.destroyPool(); stopFrameDriver(); };
   }, [show2D]);
 
   const renderCanvas2D = show2D
