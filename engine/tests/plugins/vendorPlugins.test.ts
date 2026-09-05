@@ -212,13 +212,17 @@ describe('vendorEnginePlugins', () => {
       const spy = denyLockMkdir();
 
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const started = Date.now();
       const r = vendorEnginePlugins(projectRoot, engineRoot);
-      const elapsed = Date.now() - started;
 
       spy.mockRestore();
-      // The bug slept the full 120_000ms here. Generous bound: still ~1000x under it.
-      expect(elapsed).toBeLessThan(5_000);
+      // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
+      // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
+      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
+      // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
+      // yields no verdict at all about whatever change was actually under test.
+      // The bug slept the full 120_000 ms here, which the 20 s timeout catches on its own. What
+      // proves the FIX rather than merely the absence of a hang is the STALE warning below.
       // …but proceeding with a STALE dist must be VISIBLE, not silent: canBuild is true
       // here (a dev checkout with an unwritable plugin dir), and a silently stale dist is
       // the "permanent no-op that never healed" this function's header warns about.
@@ -256,10 +260,16 @@ describe('vendorEnginePlugins', () => {
       fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
       writeProjectPkg({ [PLUGIN]: '*' });
 
-      const started = Date.now();
       const r = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
 
-      expect(Date.now() - started).toBeLessThan(5_000);
+      // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
+      // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
+      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
+      // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
+      // yields no verdict at all about whatever change was actually under test.
+      // `builds` being empty IS the property this test names ("never shells out") — it states it
+      // directly, where a duration could only ever imply it.
       const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
       expect(builds).toHaveLength(0);
       // Packing still happens — it writes into the PROJECT (writable), not the bundle.
@@ -347,12 +357,17 @@ describe('vendorEnginePlugins', () => {
       writeProjectPkg({ [PLUGIN]: '*' });
       const spy = denyLockMkdir();
 
-      const started = Date.now();
       expect(() => vendorEnginePlugins(projectRoot, engineRoot)).toThrow(/not writable \(EPERM\).*ships no dist/s);
-      const elapsed = Date.now() - started;
 
       spy.mockRestore();
-      expect(elapsed).toBeLessThan(5_000);
+      // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
+      // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
+      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
+      // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
+      // yields no verdict at all about whatever change was actually under test.
+      // The NAMED error above is the assertion; "not a 120 s hang" is the harness timeout's job.
+
     });
   });
 

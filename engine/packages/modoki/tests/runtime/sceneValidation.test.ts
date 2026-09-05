@@ -622,9 +622,12 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor 
   it('echoes the value WITH its unit, so the reader can find the field', () => {
     expect(validateSceneData(band('bottom-stretch', { width: 90, widthUnit: '%' })).warnings[0])
       .toMatch(/authored 90%$/);
-    // A missing unit means px (the trait default), not a bare number.
+    // ⚠️ A missing unit means '%' — `widthUnit` DEFAULTS to '%' and a scene save strips a field
+    // equal to its default. This line asserted `90px` until #757's close-out; it was pinning a
+    // falsehood, and the same wrong fallback was reporting 10 live false positives across
+    // games/ + demos/ (see the absent-unit describe block below).
     expect(validateSceneData(band('bottom-stretch', { width: 90 })).warnings[0])
-      .toMatch(/authored 90px$/);
+      .toMatch(/authored 90%$/);
   });
 
   it('names the top/bottom offsets for an inert height', () => {
@@ -865,5 +868,167 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor,
     const getPrefab: PrefabResolver = () => ({ id: PREFAB_GUID, version: 1, name: 'P', rootLocalId: 1 });
     const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
     expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+  });
+});
+
+
+/** Issue #757 — the margin half of the same class. `applyAnchorStyle` clears all four UIElement
+ *  margins on ANY anchored element, so an authored value is discarded. A scene read as JSON gets
+ *  the same signal the Inspector gate now gives. Schema omitted for the same reason as #16's
+ *  block: the check is cross-trait and independent of the field-type pass. */
+describe('validateSceneData — UIElement margin inert under any UIAnchor (#757)', () => {
+  const box = (anchor: string | null, el: Record<string, unknown>) => scene([
+    { id: 1, name: 'Panel', traits: anchor === null ? { UIElement: el } : { UIElement: el, UIAnchor: { anchor } } },
+  ]);
+
+  it('warns on an authored margin under an anchor', () => {
+    const res = validateSceneData(box('center', { marginTop: 20 }));
+    expect(res.warnings.join('\n')).toMatch(/UIElement\.marginTop is inert.*'center'.*all four margins.*20%/s);
+  });
+
+  it('⭐ warns under a NON-stretching anchor too — the difference from the size rule', () => {
+    // isSizeInert only fires on a stretched axis; margin dies under every mode. A test using only
+    // 'stretch' would pass against a wrongly per-mode predicate, so this pins a plain corner anchor.
+    expect(validateSceneData(box('top-left', { marginLeft: 8 })).warnings.join('\n'))
+      .toMatch(/marginLeft is inert/);
+    expect(validateSceneData(box('bottom-right', { marginBottom: 8 })).warnings.join('\n'))
+      .toMatch(/marginBottom is inert/);
+  });
+
+  it('reports all four sides independently', () => {
+    const res = validateSceneData(box('stretch', { marginTop: 1, marginRight: 2, marginBottom: 3, marginLeft: 4 }));
+    const joined = res.warnings.join('\n');
+    for (const k of ['marginTop', 'marginRight', 'marginBottom', 'marginLeft']) {
+      expect(joined).toMatch(new RegExp(`UIElement\\.${k} is inert`));
+    }
+  });
+
+  it('echoes the value WITH its unit, and an ABSENT unit means % — the trait default', () => {
+    expect(validateSceneData(box('center', { marginTop: 5, marginTopUnit: '%' })).warnings[0])
+      .toMatch(/5% is discarded$/);
+    expect(validateSceneData(box('center', { marginTop: 5, marginTopUnit: 'px' })).warnings[0])
+      .toMatch(/5px is discarded$/);
+    // ⚠️ `marginTopUnit` defaults to '%' and a scene save STRIPS a field equal to its default, so
+    // the absent-unit case is the COMMON on-disk shape for a percentage — not a px shorthand. An
+    // earlier cut of this test asserted `5px` here and was pinning a falsehood.
+    expect(validateSceneData(box('center', { marginTop: 5 })).warnings[0])
+      .toMatch(/5% is discarded$/);
+  });
+
+  it('stays SILENT on a zero margin — the defaults are 0, so reporting them buries the real ones', () => {
+    // Same noise-budget rule that excludes `0`/`100%` from the size warning. Every anchored element
+    // in the repo carries four zero margins; warning on them would produce hundreds of findings.
+    expect(validateSceneData(box('center', { marginTop: 0, marginLeft: 0 })).warnings).toEqual([]);
+  });
+
+  it('stays silent with NO anchor — flow layout is where margin actually works', () => {
+    expect(validateSceneData(box(null, { marginTop: 20 })).warnings).toEqual([]);
+  });
+});
+
+
+/** #757 close-out — the unit fallback the margin work inherited from the size check was wrong, and
+ *  it was firing on shipping scenes. Every `UIElement` length unit defaults to '%'
+ *  (`runtime/traits/UIElement.ts`), and a scene save strips a field equal to its trait default, so
+ *  an ABSENT unit means '%'. Reading it as 'px' made `isNeutralSize` miss `width: 100`.
+ *
+ *  MEASURED over the real corpus: 10 warnings across 143 tracked scene/prefab files before the fix,
+ *  0 after — `HUD`/`Chrome Buttons`/`MenuIconBar`/`AdBannerSlot` (games/court), `StatusRoot` +
+ *  `HeartsRoot` x2 (games/sling), `HudLine`/`AdBannerSlot` (games/wordweave), `Title`
+ *  (demos/particle-demo). All ten were `100` with no unit, i.e. a full-bleed 100% box the editor
+ *  itself writes. */
+describe('validateSceneData — an absent length unit means % , not px (#757 close-out)', () => {
+  const band = (anchor: string, el: Record<string, unknown>) => scene([
+    { id: 1, name: 'Band', traits: { UIElement: el, UIAnchor: { anchor } } },
+  ]);
+
+  it('⭐ width 100 with NO unit is neutral (100%) and must NOT warn — the 10 false positives', () => {
+    expect(validateSceneData(band('top-stretch', { width: 100 })).warnings).toEqual([]);
+  });
+
+  it('an explicit 100% is neutral too — unchanged behaviour', () => {
+    expect(validateSceneData(band('top-stretch', { width: 100, widthUnit: '%' })).warnings).toEqual([]);
+  });
+
+  it('⭐ but an explicit 100px is NOT neutral, and must still warn', () => {
+    // The discriminating pair: the fix must not turn "absent means %" into "100 is always fine".
+    const res = validateSceneData(band('top-stretch', { width: 100, widthUnit: 'px' }));
+    expect(res.warnings.join('\n')).toMatch(/width is inert.*100px/s);
+  });
+
+  it('⭐ a genuine finding still fires — 90 with no unit is 90%, not neutral', () => {
+    // Proof the fix suppresses only the neutral case. This is the shape the noise budget exists to
+    // FIND (court's NarrationBand was the original), and it must survive.
+    const res = validateSceneData(band('bottom-stretch', { width: 90 }));
+    expect(res.warnings.join('\n')).toMatch(/width is inert.*authored 90%/s);
+  });
+
+  it('0 stays neutral whatever the unit', () => {
+    expect(validateSceneData(band('top-stretch', { width: 0 })).warnings).toEqual([]);
+    expect(validateSceneData(band('top-stretch', { width: 0, widthUnit: 'px' })).warnings).toEqual([]);
+  });
+});
+
+
+/** #757 close-out — the prefab-instance OVERRIDE mirror for margin. The size mirror has had its own
+ *  block since #35; the margin one shipped without cover, so these pin the three branches review
+ *  named: the `prefabUel` fallback when only the unit is overridden, the `anchorFromPrefab` message
+ *  arm, and the `0` exclusion for an override that CANCELS a prefab margin. */
+describe('validateSceneData — margin inert on a prefab-instance override (#757)', () => {
+  const P = 'c3d4e5f6-1111-2222-3333-444455556666';
+
+  const instance = (overrides: Record<string, unknown>) => scene([
+    {
+      id: 1,
+      name: 'Instance',
+      traits: { PrefabInstance: { source: P, localId: 1, rootInstanceId: 1 } },
+      overrides,
+    },
+  ]);
+
+  const prefabWith = (entityTraits: Record<string, unknown>) => ({
+    id: P, version: 1, name: 'Prefab', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: entityTraits }],
+  });
+
+  it('warns on a margin the OVERRIDE introduces, with the anchor coming from the prefab', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'center' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginTop is inert.*'center'.*from its prefab, localId 1.*overridden 12px/s);
+  });
+
+  it('warns with NO resolver when anchor AND margin are in the same override group', () => {
+    const res = validateSceneData(instance({
+      1: { UIAnchor: { anchor: 'top-left' }, UIElement: { marginLeft: 6, marginLeftUnit: 'px' } },
+    }));
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginLeft is inert/);
+    expect(res.warnings.join('\n')).not.toMatch(/from its prefab/);
+  });
+
+  it('stays silent with NO resolver passed (conservative silence)', () => {
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }));
+    expect(res.warnings.filter((w) => /marginTop is inert/.test(w))).toEqual([]);
+  });
+
+  it('reads the VALUE from the prefab when the override touches only the unit', () => {
+    // The `v = prefabUel?.[key]` fallback: overriding marginTopUnit alone still makes the prefab's
+    // own value inert, and the message must quote that value rather than skipping the field.
+    const getPrefab: PrefabResolver = () => prefabWith({ UIElement: { marginTop: 7 }, UIAnchor: { anchor: 'top-left' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginTop is inert.*7px/s);
+  });
+
+  it('⭐ an override setting a margin to 0 to CANCEL a prefab margin stays silent', () => {
+    // Zeroing is how an author opts OUT. Warning there would tell them off for doing the one thing
+    // that actually works.
+    const getPrefab: PrefabResolver = () => prefabWith({ UIElement: { marginTop: 9 }, UIAnchor: { anchor: 'center' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 0 } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).not.toMatch(/marginTop is inert/);
+  });
+
+  it('stays silent when the instance is not anchored at all', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({});
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).not.toMatch(/marginTop is inert/);
   });
 });

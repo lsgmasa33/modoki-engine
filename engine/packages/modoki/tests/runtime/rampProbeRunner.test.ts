@@ -266,12 +266,29 @@ describe('the cpu ramp respects a budget already spent (close-out 2026-08-13)', 
     // exhaust PROBE_TOTAL_BUDGET_MS — the pathological launch that budget exists for. The GPU path
     // had this guard; the cpu path ran three JIT warm-up passes and a first ramp step first.
     const marks: string[] = [];
-    const started = performance.now();
     const reading = runCpuRamp((m: string) => marks.push(m), -1);
-    expect(marks).toContain('cpu:deadline-before-start');
     expect(reading.bound).toBe('none');
-    // The warm-up alone is documented at "a millisecond or two"; bailing must be far under that.
-    expect(performance.now() - started).toBeLessThan(5);
+    // ⚠️ **THE MARK SEQUENCE IS THE ASSERTION, NOT A CLOCK READING (#751).** This line used to be
+    // `expect(performance.now() - started).toBeLessThan(5)`, reasoning that the warm-up is
+    // documented at "a millisecond or two" so a bail must come in far under it. That measured the
+    // MACHINE, not the code: it failed the engine lane of `npm run verify` twice in one session on
+    // the Windows clone (5.8 ms, then 12.2 ms) and passed in isolation both times, and because
+    // `verify` aborts the lane, a green run yielded no verdict at all about the change under test.
+    // Nothing in `runCpuRamp` got slower between a pass and a fail seconds apart.
+    //
+    // `toEqual` on the whole array is strictly MORE discriminating than the timing bound ever was.
+    // `runCpuRamp` emits `cpu:warm` unconditionally after its `CPU_WARMUP_PASSES` and one
+    // `cpu:<load>` per ramp step, so deleting the deadline guard — the exact regression this test
+    // exists to catch — makes those marks appear and fails this line. The clock reading could only
+    // ever say "that was fast", which a fast machine satisfies with the guard gone.
+    //
+    // Deliberately NOT solved with the manual clock (`setManualNow`, runtime/core/clock.ts): it
+    // would pin `rawNow()` so the deadline compare stays deterministic, but a pinned clock cannot
+    // express "elapsed under N ms" either, so it buys nothing here. The property wanted is "no work
+    // happened", and the marks state that directly. See also `tests/helpers/sourceScanner.ts`,
+    // which already forbids direct `performance.now()` in `runtime/**` — this was the same hazard
+    // one level up, in the tests.
+    expect(marks).toEqual(['cpu:deadline-before-start']);
   });
 
   it('⭐ the probe discards CPU_WARMUP_RAMPS cpu passes and classifies the one after (#205)', async () => {

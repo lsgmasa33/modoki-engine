@@ -14,6 +14,7 @@
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { isSizeInert } from '../ui/anchorLayout';
+import { isElementMarginInert, MARGIN_KEYS } from '../ui/uiAuthoring';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
  *  these fields must be a GUID or an external URL — never a project-internal
@@ -197,9 +198,32 @@ export function makeAssetRefResolver(guids: Iterable<unknown>): AssetRefResolver
  *           (court's NarrationBand 90%, 3d-test's 2D 200%).
  *  Known limit: 100% is let through even under insetting offsets, where the true
  *  extent is smaller. Tightening that needs viewport math this module does not have,
- *  and would reintroduce the 102. */
+ *  and would reintroduce the 102.
+ *
+ *  ⚠️ **The "3 real traps" above is HISTORICAL — re-measured 2026-09-05 and the corpus is now at
+ *  0.** Both named scenes have since been corrected, so a sweep today reports nothing; the count is
+ *  kept because it is the evidence for the noise budget, not a current inventory. Do not read a
+ *  quiet sweep as this check being broken — verify by perturbing a value (a `90` under a
+ *  `bottom-stretch` anchor still reports), which is what the tests do. */
 function isNeutralSize(v: unknown, unit: unknown): boolean {
-  return v === 0 || (v === 100 && unit === '%');
+  return v === 0 || (v === 100 && unitOrDefault(unit) === '%');
+}
+
+/** The unit a UIElement length field ACTUALLY has, given what the scene JSON carries.
+ *
+ *  ⚠️ **An absent unit means `'%'`, not `'px'`.** Every `UIElement` length unit defaults to `'%'`
+ *  (`runtime/traits/UIElement.ts`) and a scene save STRIPS any field equal to its trait default, so
+ *  the common on-disk shape for a percentage is the number with no unit beside it. Reading that as
+ *  `px` was wrong twice over: it made `isNeutralSize` miss `width: 100` (a full-bleed box the
+ *  editor itself writes), and it made the message quote a unit the author never chose.
+ *
+ *  Measured before the fix: six live false positives across two SHIPPING games — `HUD`,
+ *  `Chrome Buttons`, `MenuIconBar` and `AdBannerSlot` in `games/court`'s main scene, `HudLine` and
+ *  `AdBannerSlot` in `games/wordweave`'s — each reported as "the authored 100px" when the author
+ *  wrote 100%. Against a noise budget whose whole point was 3 real findings versus 102 false ones,
+ *  six is not a rounding error. */
+function unitOrDefault(unit: unknown): string {
+  return typeof unit === 'string' && unit ? unit : '%';
 }
 
 /**
@@ -207,7 +231,7 @@ function isNeutralSize(v: unknown, unit: unknown): boolean {
  * `REF_FIELDS_BY_TRAIT` must be a GUID or an external URL, and (when `assetExists` is
  * injected) that GUID must name an asset the manifest actually has.
  *
- * ONE predicate serves every caller, for the reason `inertSizeWarnings` below gives: a
+ * ONE predicate serves every caller, for the reason `inertLayoutWarnings` below gives: a
  * prefab-instance's OVERRIDE group has the identical `{trait: {field: value}}` shape as a
  * scene entity's `traits`, so restating the rule per call site is how the exemptions
  * (primitive sprite keywords, external URLs) drift apart. They already had: until #292 this
@@ -287,7 +311,7 @@ export function refFieldWarnings(traits: unknown, label: string, assetExists?: A
  * `label` is prefixed to each message; the caller owns what an entity is CALLED (a scene entity by
  * name, a prefab entity by localId), because that is the only part that differs.
  */
-export function inertSizeWarnings(traits: unknown, label: string): string[] {
+export function inertLayoutWarnings(traits: unknown, label: string): string[] {
   const out: string[] = [];
   if (!traits || typeof traits !== 'object') return out;
   const uel = (traits as Record<string, unknown>).UIElement;
@@ -301,10 +325,31 @@ export function inertSizeWarnings(traits: unknown, label: string): string[] {
     if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
       // Echo the value WITH its unit — '90%' is what the author sees in the Inspector, so a
       // bare '90' makes them hunt for which field is meant.
-      const authored = `${v}${typeof unit === 'string' && unit ? unit : 'px'}`;
+      const authored = `${v}${unitOrDefault(unit)}`;
       out.push(
         `${label}.UIElement.${axis} is inert: the '${anchor}' anchor sizes that axis from its `
         + `${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, which overwrite the authored ${authored}`,
+      );
+    }
+  }
+  // Margin dies on ANY anchor, not just a stretching one (#757) — `applyAnchorStyle` clears all
+  // four unconditionally. Reported from the same function as size because they are the same class
+  // of finding on the same trait pair, and a second entry point is a second place for the
+  // "is it actually authored?" exclusions to drift. `isElementMarginInert` is the shared predicate
+  // the Inspector gate and `anchorCss` both use.
+  //
+  // ⚠️ Zero is the neutral value and is NOT reported: `UIElement`'s margin defaults are 0, so
+  // warning on them would fire on essentially every anchored element in the repo and bury the
+  // three real findings — the same reason `isNeutralSize` exists one loop up.
+  if (isElementMarginInert(anchor)) {
+    for (const key of MARGIN_KEYS) {
+      const v = (uel as Record<string, unknown>)[key];
+      if (typeof v !== 'number' || v === 0) continue;
+      const unit = (uel as Record<string, unknown>)[`${key}Unit`];
+      const authored = `${v}${unitOrDefault(unit)}`;
+      out.push(
+        `${label}.UIElement.${key} is inert: the '${anchor}' anchor positions this element from its `
+        + `own offsets, which overwrite all four margins — the authored ${authored} is discarded`,
       );
     }
   }
@@ -460,7 +505,7 @@ export function validateSceneData(
     // L=5% R=5% offsets that happen to produce the same 90%, so it looks deliberate and
     // correct. Warn rather than stay silent: the Inspector greys the field out, but
     // someone reading the JSON gets no such signal. Axes are independent.
-    warnings.push(...inertSizeWarnings(e.traits, label));
+    warnings.push(...inertLayoutWarnings(e.traits, label));
 
     // Prefab self-reference: an instance whose source is its OWN guid would recurse.
     const pi = e.traits?.PrefabInstance;
@@ -539,12 +584,30 @@ export function validateSceneData(
             const v = axis in ovUelObj ? ovUelObj[axis] : prefabUel?.[axis];
             const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
             if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
-              const authored = `${v}${typeof unit === 'string' && unit ? unit : 'px'}`;
+              const authored = `${v}${unitOrDefault(unit)}`;
               warnings.push(
                 `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
                 + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
                 + `sizes that axis from its ${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, `
                 + `which overwrite the overridden ${authored}`,
+              );
+            }
+          }
+          // The margin mirror (#757), same override-only rule: report a margin this OVERRIDE
+          // touches, not one authored purely inside the prefab.
+          if (isElementMarginInert(anchor)) {
+            for (const key of MARGIN_KEYS) {
+              const unitField = `${key}Unit`;
+              if (!(key in ovUelObj) && !(unitField in ovUelObj)) continue;
+              const v = key in ovUelObj ? ovUelObj[key] : prefabUel?.[key];
+              if (typeof v !== 'number' || v === 0) continue;
+              const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
+              const authored = `${v}${unitOrDefault(unit)}`;
+              warnings.push(
+                `${label}.overrides[${localIdKey}].UIElement.${key} is inert: the '${anchor}' anchor `
+                + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
+                + `positions this element from its own offsets, which overwrite all four margins — `
+                + `the overridden ${authored} is discarded`,
               );
             }
           }
@@ -680,7 +743,7 @@ export function validatePrefabData(data: unknown): ValidationResult {
     // localIds, not ECS ids), so that is the address a reader can act on. The name is included
     // when present because it is what they see in the Hierarchy, but the localId is the identity.
     const named = typeof e.name === 'string' && e.name ? ` "${e.name}"` : '';
-    warnings.push(...inertSizeWarnings(e.traits, `entity[localId=${String(e.localId)}]${named}`));
+    warnings.push(...inertLayoutWarnings(e.traits, `entity[localId=${String(e.localId)}]${named}`));
   }
   // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
   // would tell a caller its type checks ran when they did not.

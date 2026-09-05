@@ -181,7 +181,7 @@ import {
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
-import { adbBinary, isUsable, listAndroidDevices, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
+import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
@@ -953,7 +953,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // attached iPhone's `ProductType`, so a device that IS attached — just on the other
         // platform — read as a genuine mismatch and refused (#670 finding 3: this used to be "the
         // same gate `resolveHostSideAndroidSerial` uses", but that phrasing is what let the bug in —
-        // that gate only checks the lease is HELD, not that it is the right PLATFORM for this op).
+        // at the time that gate only checked the lease was HELD, not that it was the right PLATFORM
+        // for the op. #732 has since given the Android half its own `leaseForAndroidOps`, so the
+        // two are now genuine mirrors and the comparison is safe to make again).
         // `pickGoIosDevice` also tells "no lease" from "lease with no reported hardware" apart, so
         // `undefined` (not a hardware object with null fields) is what a non-iOS/unresolved lease
         // must produce.
@@ -967,23 +969,40 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // with three handsets plugged in, which reads whichever one adb happens to list first.
       const resolveHostSideAndroidSerial = async (): Promise<{ serial?: string } | { error: string }> => {
         const st = deviceConnection.status();
+        // Only a lease CONFIRMED Android may speak here (#732) — `deviceHardware()` is
+        // platform-agnostic, so before this gate an iPhone lease's `ProductType` was compared
+        // against adb model strings, matched nothing, and made the op refuse about an Android that
+        // was attached and answering. The exact mirror of `leaseForIosOps` on the iOS half (#670
+        // finding 3), whose own comment named THIS function as the pattern it had copied wrongly.
+        //
+        // ⚠️ The serial is read UNGATED and that is deliberate: `target.serial` exists only on the
+        // `useAdb` path, so it is Android by construction, while `devicePlatform()` swallows its
+        // errors and returns null for a perfectly good adb lease. Gating the serial on it would
+        // drop a lease we are certain about because a probe we are not certain about said nothing.
+        //
+        // ⚠️ The serial short-circuits BEFORE the inputs are gathered, and that is a cost decision,
+        // not a second copy of the precedence: `pickHostSideAndroidSerial` returns the same serial
+        // for the same input, and a test pins that. Gathering eagerly made a USB lease — the common
+        // Android case — pay `adb devices -l` plus one `adb shell` per new serial on every
+        // host-side call, to reach a serial already in hand. It also re-pays the transport deadline
+        // twice on a HALF-OPEN lease (state still `connected`, transport dead), which is precisely
+        // the app-just-died case these ops exist for, because a FAILED identity probe is
+        // deliberately not latched.
         if (st.target?.serial) return { serial: st.target.serial };
-        const attached = withFriendlyNames(listAndroidDevices().filter(isUsable));
-        // ⚠️ A WIFI lease carries NO serial — `target.serial` is set only on the `useAdb` path — so
-        // "there is a lease" does not mean "we know which handset". Falling straight through to the
-        // build resolver then reads logs off whichever OTHER phone happens to be on USB, labelled
-        // as if it were the leased one: the same silent wrong-device answer the platform gate above
-        // exists to refuse. So when a lease is live but serial-less, disambiguate the way the iOS
-        // side does — by the hardware MODEL the lease reports — and refuse rather than guess.
-        if (st.state === 'connected') {
-          const model = (await deviceConnection.deviceHardware()).deviceModel;
-          const hits = model ? attached.filter((d) => d.model === model || d.name === model) : [];
-          if (hits.length === 1) return { serial: hits[0].serial };
-          if (attached.length === 1 && !model) return { serial: attached[0].serial };
-          return { error: `the lease is over WiFi, so it names no adb serial${model ? ` (device model ${model})` : ''} — attached: ${attached.map((d) => `${d.serial}${d.name ? ` (${d.name})` : ''}`).join(', ') || 'none'}. Reconnect over adb, or pin device.androidDeviceId in Project Settings.` };
-        }
-        const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
-        return 'error' in picked ? picked : { serial: picked.serial };
+        const connected = st.state === 'connected';
+        const picked = pickHostSideAndroidSerial({
+          leasePlatform: connected ? await deviceConnection.devicePlatform() : null,
+          leaseModel: connected ? (await deviceConnection.deviceHardware()).deviceModel : null,
+          attached: withFriendlyNames(listAndroidDevices().filter(isUsable)),
+        });
+        if (!('unleased' in picked)) return picked;
+        // No Android lease to consult — the ordinary ladder. ⚠️ `listAndroidDevices()` is passed
+        // UNFILTERED here, unlike the `attached` list above: `resolveAndroidSerial` does its own
+        // usability check and its refusal names an `unauthorized`/`offline` handset as such, which
+        // is the actionable answer when the phone you meant is the one that has not trusted this
+        // Mac yet. Pre-existing, and preserved deliberately.
+        const built = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
+        return 'error' in built ? built : { serial: built.serial };
       };
       // WHICH PLATFORM these host-side ops read. The lease answers it when there is one — but these
       // ops exist precisely for when there ISN'T (the app died, so the lease died with it), and the
@@ -1053,7 +1072,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           // The package, which on Android IS the process name (unlike iOS, where every Modoki game
           // is the Capacitor `App` target). The leased app first; else the OPEN PROJECT's appId,
           // which the backend already knows and which is what you almost always mean.
-          const pkg = p.all ? undefined : (p.app || await deviceConnection.deviceAppId() || loadProjectConfig(ctx.projectRoot).app.appId);
+          //
+          // ⚠️ `deviceAppId()` is gated on the lease's PLATFORM, and #732 is why. It reads the same
+          // `app-identity` probe as `deviceHardware()` and is exactly as platform-agnostic, so an
+          // iOS lease hands back an iOS BUNDLE ID — which then filters logcat and matches nothing.
+          // Before #732 this line was unreachable with an iPhone leased, because
+          // `resolveHostSideAndroidSerial` refused first; that refusal WAS the bug, and removing it
+          // opened this door one line down. `pickHostSidePlatform` puts an explicit `platform`
+          // AHEAD of the lease, so `device_crash_reports {platform:'android'}` with an iPhone leased
+          // reaches here, picks the right Android, and then reports `matched: 0` / `filteredTo:
+          // <iOS bundle>` for a phone that has crashes. A loud refusal traded for a silent wrong
+          // answer is strictly worse — the #149/#670 class. The project's own appId below is
+          // already the platform-correct fallback.
+          const leasedPkg = (await deviceConnection.devicePlatform()) === 'android' ? await deviceConnection.deviceAppId() : null;
+          const pkg = p.all ? undefined : (p.app || leasedPkg || loadProjectConfig(ctx.projectRoot).app.appId);
           try {
             // No two-step here, and that asymmetry is real rather than an oversight: iOS lists
             // FILES you then fetch, while logcat hands back the content itself, already bounded.

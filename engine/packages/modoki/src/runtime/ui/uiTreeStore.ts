@@ -27,6 +27,13 @@ import type { AnchorMode } from '../traits/UIAnchor';
 export interface UINodeData {
   entityId: number;
   guid: string;
+  /** koota's generation for `entityId` at the time this node was built (#759/#738). Exists so a
+   *  consumer can build a recycle-safe warn-once key (`entityId:generation`) without reaching back
+   *  into the world — koota recycles ids, so `entityId` alone is not stable identity within one
+   *  world. Compared automatically by `nodesEqual` (it's a plain scalar, see `_scalarKeys` below):
+   *  a recycled id now fails equality and gets a fresh object ref, which is correct — it costs one
+   *  extra scalar compare per node. */
+  generation: number;
   // ── Layout ──
   width: number; height: number;
   widthUnit: string; heightUnit: string;
@@ -382,6 +389,7 @@ function buildTree(world: World): UINodeData[] | null {
       const node: UINodeData = {
         entityId: id,
         guid: '',
+        generation: entity.generation(),
         width: ui.width, height: ui.height,
         widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,

@@ -18,6 +18,8 @@ import {
   selectionPooledRowGate,
   isElementZIndexShadowed,
   selectionZIndexGate,
+  isElementMarginInert,
+  MARGIN_KEYS,
   type UiPreset,
 } from '../../src/runtime/ui/uiAuthoring';
 
@@ -201,5 +203,55 @@ describe('selectionZIndexGate (unanimous-or-nothing across a multi-selection, #7
     expect(selectionZIndexGate([5, 0])).toBe('mixed');
     expect(selectionZIndexGate([0, 5])).toBe('mixed');
     expect(selectionZIndexGate([5, null])).toBe('mixed');
+  });
+});
+
+
+/**
+ * #757 — `applyAnchorStyle` clears all four UIElement margins on an anchored element, so an
+ * authored value is discarded with no signal. #746's shape, found by sweeping for the pattern.
+ * The predicate is shared with `anchorCss` and the Inspector gate so they cannot drift.
+ */
+describe('isElementMarginInert (#757)', () => {
+  it('any anchor kills margin — EVERY mode, not just the stretching ones', () => {
+    // The contrast with isSizeInert is the whole point: size dies only on a stretched axis, margin
+    // dies on all four sides under any anchor at all. A per-mode predicate here would be wrong.
+    for (const a of ['center', 'top-left', 'bottom-right', 'stretch', 'top-stretch', 'left-stretch']) {
+      expect(isElementMarginInert(a)).toBe(true);
+    }
+  });
+
+  it('no anchor leaves margin live — this is flow layout, where margin is the real mechanism', () => {
+    expect(isElementMarginInert(null)).toBe(false);
+    expect(isElementMarginInert(undefined)).toBe(false);
+  });
+
+  it("an unreadable mode ('') still counts as ANCHORED — a missing mode is not a missing anchor", () => {
+    // Same distinction selectionAnchorGate draws, and the opposite of selectionSizeGate, where ''
+    // correctly stretches nothing. Getting this backwards would leave the field live on an element
+    // whose margins are in fact being cleared.
+    expect(isElementMarginInert('')).toBe(true);
+  });
+
+  it('MARGIN_KEYS names exactly the four UIElement margin fields', () => {
+    expect([...MARGIN_KEYS]).toEqual(['marginTop', 'marginRight', 'marginBottom', 'marginLeft']);
+  });
+});
+
+describe('selectionAnchorGate drives the margin fields (#757)', () => {
+  // Margin needs no gate of its own: "is every selected entity anchored?" is exactly the condition,
+  // and selectionAnchorGate already answers it. Pinned here so a later reader does not add a
+  // redundant selectionMarginGate, and so the unanimous-or-nothing rule (#34) is covered for margin
+  // specifically rather than only for zIndex and size.
+  it('unanimous anchored → inert (dim + read-only)', () => {
+    expect(selectionAnchorGate(['center', 'stretch', ''])).toBe('inert');
+  });
+
+  it('none anchored → live', () => {
+    expect(selectionAnchorGate([null, undefined])).toBe('live');
+  });
+
+  it('MIXED stays editable — blocking it would strand the flow-layout entities', () => {
+    expect(selectionAnchorGate(['center', null])).toBe('mixed');
   });
 });

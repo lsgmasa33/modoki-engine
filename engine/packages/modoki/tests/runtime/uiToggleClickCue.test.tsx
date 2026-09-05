@@ -38,7 +38,7 @@ registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fiel
  *  has no dependency on that file's module-mocked environment. */
 function makeToggleNode(over: Partial<UINodeData> = {}): UINodeData {
   return {
-    entityId: 1, guid: 'toggle-1',
+    entityId: 1, guid: 'toggle-1', generation: 0,
     width: 60, height: 30, widthUnit: 'px', heightUnit: 'px',
     flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'flex-start', alignItems: 'stretch',
     gap: 0, gapUnit: 'px', flexGrow: 0, flexShrink: 1,

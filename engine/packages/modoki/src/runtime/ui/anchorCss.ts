@@ -16,7 +16,7 @@ import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 // Same reasoning as STRETCH_X/STRETCH_Y above, one field over: the Inspector greys out
 // `UIElement.zIndex` when this line overrides it (#746), and it must not be able to disagree with
 // this line about WHEN that happens. One predicate, imported by both.
-import { isElementZIndexShadowed } from './uiAuthoring';
+import { isElementMarginInert, isElementZIndexShadowed } from './uiAuthoring';
 
 export type AnchorCssData = AnchorData & { zIndex?: number };
 
@@ -162,12 +162,27 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
     else style.left = fmtSub(style.left, a.right, a.rightUnit);
   }
 
-  // For anchored (absolute) elements, margin does not affect position — the pivot
-  // sits at the anchor point regardless. Margin is only effective in flow layout.
-  style.marginTop = undefined;
-  style.marginRight = undefined;
-  style.marginBottom = undefined;
-  style.marginLeft = undefined;
+  // All four authored `UIElement` margins are discarded on an anchored element (#757).
+  //
+  // ⚠️ This is a DECISION, not an observation, and the comment here used to overstate it: it said
+  // margin "does not affect position — the pivot sits at the anchor point regardless", which is
+  // true of the pivot but not of the box. On a STRETCHED axis (`top: 0; bottom: 0` with
+  // `height: auto`) CSS margins do participate in the over-constrained resolution and would inset
+  // the box. Upheld by the owner (2026-09-05): anchor offsets stay the ONE way to inset a stretched
+  // element, so margin does not get a second job here.
+  //
+  // The predicate is shared with the Inspector's gate (`isElementMarginInert`) rather than restated
+  // inline, so the editor cannot disagree with the layout about what is inert — the same
+  // cannot-drift rule `isSizeInert` and `isElementZIndexShadowed` already follow. Inside this
+  // function `a.anchor` is always present, so the call is always true; it is written this way so
+  // that if the condition is ever narrowed, BOTH surfaces narrow together instead of silently
+  // parting company.
+  if (isElementMarginInert(a.anchor)) {
+    style.marginTop = undefined;
+    style.marginRight = undefined;
+    style.marginBottom = undefined;
+    style.marginLeft = undefined;
+  }
 
   // Pivot (0,0) = element's top-left sits at the anchor point.
   // Pivot (0.5,0.5) = element's center sits at the anchor point.
@@ -186,8 +201,11 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   // reaches: a stretched axis spans BOTH its edges; a stretch-pinned bar (top-stretch,
   // …) also reaches its pinned edge. The inset expression is a LIVE CSS value (see
   // safeAreaInset above), so the browser re-resolves it on orientation change — and in
-  // an editor device preview on a preset change — with no runtime code. The editor
-  // disables the Safe Area checkbox for non-stretch anchors to match this. */
+  // an editor device preview on a preset change — with no runtime code. The editor greys the
+  // Safe Area checkbox out on `center` ONLY (`Inspector.tsx` `safeAreaInert`), which is correct
+  // and is NOT the same rule as "non-stretch": a point anchor like `top-left` still reaches its
+  // pinned edge and takes the offset arm below, so its Safe Area is live. This comment claimed
+  // the wider rule until #757's close-out; the code was always right. */
   //
   // ⚠️ The two arms below are MUTUALLY EXCLUSIVE BY CONSTRUCTION — a stretched anchor
   // takes the padding arm, a point anchor takes the offset arm, and nothing can take

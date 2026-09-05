@@ -1083,13 +1083,21 @@ export function registerAllTraits() {
       maxHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxHeight. Default px.', ...S('Size Constraints') },
 
       // ── Margin section (collapsed by default) ──
-      marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top', ...S('Margin', { sectionDefaultOpen: false }) },
+      // ⚠️ Collapsed ON PURPOSE — margin is deliberately de-emphasised here (owner, 2026-09-05):
+      // anchor offsets, gap and padding are the intended ways to space UI, and margin is kept for
+      // flow layout rather than encouraged. Do not promote it up the panel.
+      //
+      // The "flow layout only" caveat below is not advice, it is what the code does: on an anchored
+      // element `applyAnchorStyle` clears all four margins outright, so an authored value is
+      // discarded (#757). The Inspector greys these fields out and says which anchor is responsible
+      // (`inertMarginTooltip`), and the scene validator reports an authored non-zero one.
+      marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin', { sectionDefaultOpen: false }) },
       marginTopUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginRight: { type: 'number', step: 1, tooltip: 'Outer spacing right', ...S('Margin') },
+      marginRight: { type: 'number', step: 1, tooltip: 'Outer spacing right — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginRightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginBottom: { type: 'number', step: 1, tooltip: 'Outer spacing bottom', ...S('Margin') },
+      marginBottom: { type: 'number', step: 1, tooltip: 'Outer spacing bottom — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginBottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginLeft: { type: 'number', step: 1, tooltip: 'Outer spacing left', ...S('Margin') },
+      marginLeft: { type: 'number', step: 1, tooltip: 'Outer spacing left — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginLeftUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
 
       // ── Input section (collapsed by default) ──

@@ -53,7 +53,7 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate, selectionZIndexGate, isElementZIndexShadowed } from '../../runtime/ui/uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate, selectionZIndexGate, isElementZIndexShadowed, isElementMarginInert, selectionMarginGate, MARGIN_KEYS } from '../../runtime/ui/uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -147,6 +147,36 @@ export function shadowedZIndexTooltipMulti(): string {
   return `zIndex has no effect on ANY of the selected elements: each one is anchored, and `
     + `UIAnchor.zIndex is the stacking authority for an anchored box — it overwrites this value. `
     + `Edit each element's UIAnchor.zIndex instead, or clear it to 0 to hand stacking back here.`;
+}
+
+/** Why a `UIElement.margin*` field is greyed out: the element is anchored, and `applyAnchorStyle`
+ *  clears all four margins (#757). #746's shape, and the same wording rule applies — point at what
+ *  IS live rather than implying the precedence is a bug to route around, because it is not: anchor
+ *  offsets are deliberately the one way to inset an anchored box.
+ *
+ *  Names the anchor mode, matching `inertSizeTooltip`, so a single-select author can see which
+ *  anchor is responsible. Pure + exported so the wording is testable without mounting the panel. */
+export function inertMarginTooltip(key: string, anchor: string): string {
+  return `${key} has no effect on a '${anchor}' anchor: an anchored element is positioned by its `
+    + `anchor offsets, which overwrite all four margins. Use the UIAnchor offsets to inset it, or `
+    + `remove the anchor to put this element back in flow layout and make ${key} live again.`;
+}
+
+/** Same explanation for a multi-selection whose anchor modes DIFFER — naming one would name the
+ *  wrong one for the rest of the selection, so this names none. Mirrors
+ *  `inertSizeTooltipMultiAnchor` and `shadowedZIndexTooltipMulti`. */
+export function inertMarginTooltipMultiAnchor(key: string): string {
+  return `${key} has no effect on ANY of the selected elements: each one is anchored, and an `
+    + `anchored element is positioned by its anchor offsets, which overwrite all four margins. Use `
+    + `the UIAnchor offsets to inset them, or remove the anchors to put them back in flow layout.`;
+}
+
+/** A MIXED selection — some anchored, some in flow. The field stays editable (#34: never narrow a
+ *  write because part of the selection would ignore it), but says how many will drop the value. */
+export function partiallyInertMarginTooltip(key: string, inert: number, total: number): string {
+  return `${key} has no effect on ${inert} of the ${total} selected elements: those are anchored, `
+    + `and an anchored element's margins are overwritten by its anchor offsets. The other `
+    + `${total - inert} are in flow layout, where ${key} applies — so this field stays editable.`;
 }
 
 /** The MIXED case for the same gate: shadowed on part of the selection, live on the rest. Stays
@@ -1029,19 +1059,45 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       const isSizeKey = meta.name === 'UIElement' && (key === 'width' || key === 'height');
       const axis = key as 'width' | 'height';
       const sizeGate = isSizeKey ? selectionSizeGate(anchorModes, axis) : 'live';
-      const stretchDisabled = sizeGate === 'inert';
-      // Distinct anchor modes among the entities the axis is inert on — one means we can
+      // ── margin (#757) ───────────────────────────────────────────────────────────────────────
+      // `applyAnchorStyle` clears all four margins on ANY anchored element, so an authored value
+      // is discarded with no signal — the same failure #746 fixed for `zIndex`, found by sweeping
+      // for the pattern. The condition has no per-mode nuance (unlike size, which only dies on the
+      // stretched axis), so `selectionAnchorGate` — "is every selected entity anchored?" — already
+      // answers it exactly — but it must be asked through `selectionMarginGate`, NOT
+      // `selectionAnchorGate`: the latter carries its own inline copy of the condition, so routing
+      // margin through it would make the shared-predicate guarantee false for the very decision
+      // that sets `readOnly`. `selectionMarginGate` runs `isElementMarginInert`, the same predicate
+      // `anchorCss` and the scene validator use, so the three cannot part company.
+      const isMarginKey = meta.name === 'UIElement' && (MARGIN_KEYS as readonly string[]).includes(key);
+      const marginGate = isMarginKey ? selectionMarginGate(anchorModes) : 'live';
+      // One gate for this field, whichever kind it is — both feed the same dim/readOnly treatment.
+      const unitGate = isSizeKey ? sizeGate : marginGate;
+      const stretchDisabled = unitGate === 'inert';
+      // Distinct anchor modes among the entities the field is inert on — one means we can
       // name it (the common single-select case), several means we must not.
       const inertAnchors = isSizeKey && sizeGate !== 'live'
         ? [...new Set(anchorModes.filter((a): a is string => !!a && isSizeInert(a, axis)))]
-        : [];
-      const labelHint = sizeGate === 'inert'
-        ? { ...hint, tooltip: inertAnchors.length === 1 ? inertSizeTooltip(axis, inertAnchors[0]) : inertSizeTooltipMultiAnchor(axis) }
-        : sizeGate === 'mixed'
-          ? { ...hint, tooltip: partiallyInertSizeTooltip(axis, anchorModes.filter((a) => !!a && isSizeInert(a, axis)).length, anchorModes.length) }
-          : hint;
+        : isMarginKey && marginGate !== 'live'
+          ? [...new Set(anchorModes.filter((a): a is string => isElementMarginInert(a)))]
+          : [];
+      const labelHint = isMarginKey
+        ? marginGate === 'inert'
+          // ⚠️ `inertAnchors[0]` can be `''` — a readable UIAnchor with an unreadable MODE, which
+          // still counts as anchored. Naming it would render "has no effect on a '' anchor", so an
+          // unnamed mode falls to the multi-anchor wording, which explains the rule without
+          // pointing at a mode the author cannot see in the dropdown.
+          ? { ...hint, tooltip: inertAnchors.length === 1 && inertAnchors[0] ? inertMarginTooltip(key, inertAnchors[0]) : inertMarginTooltipMultiAnchor(key) }
+          : marginGate === 'mixed'
+            ? { ...hint, tooltip: partiallyInertMarginTooltip(key, anchorModes.filter((a) => isElementMarginInert(a)).length, anchorModes.length) }
+            : hint
+        : sizeGate === 'inert'
+          ? { ...hint, tooltip: inertAnchors.length === 1 ? inertSizeTooltip(axis, inertAnchors[0]) : inertSizeTooltipMultiAnchor(axis) }
+          : sizeGate === 'mixed'
+            ? { ...hint, tooltip: partiallyInertSizeTooltip(axis, anchorModes.filter((a) => !!a && isSizeInert(a, axis)).length, anchorModes.length) }
+            : hint;
       return (
-        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(sizeGate === 'inert' ? { opacity: 0.35 } : sizeGate === 'mixed' ? { opacity: 0.65 } : {}) }}>
+        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(unitGate === 'inert' ? { opacity: 0.35 } : unitGate === 'mixed' ? { opacity: 0.65 } : {}) }}>
           <FieldLabel label={key} hint={labelHint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
           <BufferedNumberInput value={val as number} step={hint.step ?? 1} mixed={mx} min={hint.min} max={hint.max}
             onChange={v => write(key, v)} readOnly={stretchDisabled}

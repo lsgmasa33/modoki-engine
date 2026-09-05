@@ -1097,6 +1097,53 @@ The failure mode this guards: `games/court`'s `NarrationBand` carries `width: 90
 `bottom-stretch` anchor whose `left: 5%` + `right: 5%` offsets independently produce 90%.
 It looks deliberate and correct, and editing that field to `50%` would change nothing.
 
+### Margin is inert on an anchored element, whatever the anchor mode (#757)
+
+`applyAnchorStyle` clears **all four** `UIElement` margins on an anchored element, so an authored
+`marginTop`/`marginRight`/`marginBottom`/`marginLeft` is discarded. **Anchor offsets are the one
+way to inset an anchored box.**
+
+Note how this differs from the size rule above: size dies only on a *stretched axis*, and the axes
+are independent. Margin dies on **any** anchor, in every mode, on all four sides at once — so the
+predicate is `isElementMarginInert` (*"does this entity have an anchor at all?"*), not a per-axis
+question, and the Inspector's gate is `selectionMarginGate` rather than `selectionSizeGate`. The
+same three surfaces agree through that one predicate: the layout clears the margins, the Inspector
+greys the four fields (naming the responsible anchor, unanimous-or-nothing across a selection as
+above), and the scene validator warns on an authored non-zero one — including a prefab instance's
+overridden fields. Zero is excluded from the warning for the same noise-budget reason `0` and
+`100%` are excluded from the size one: the margin defaults ARE 0, so reporting them would fire on
+nearly every anchored element.
+
+⚠️ **`selectionMarginGate` exists rather than reusing `selectionAnchorGate`, which is behaviourally
+identical today.** `selectionAnchorGate` carries its OWN inline copy of the condition, so routing
+margin through it made "one predicate, three surfaces" false for the decision that actually sets
+`readOnly` — narrow `isElementMarginInert` and the layout would stop clearing margins while the
+Inspector kept the fields greyed, leaving an author unable to type a value that had started working.
+The two also answer different questions (self-placement vs. margin) and may legitimately diverge.
+Caught in #757's own close-out review, after the first cut of this section claimed the guarantee it
+did not yet have.
+
+⚠️ **An absent length unit in scene JSON means `%`, not `px`** — every `UIElement` length unit
+defaults to `'%'` and a scene save strips a field equal to its default, so the number-with-no-unit is
+the common on-disk shape for a percentage. The validator read it as `px` until #757's close-out,
+which made `isNeutralSize` miss `width: 100` and produced **10 false positives across the 143
+tracked scene/prefab files** — four in `games/court`, three in `games/sling`, two in
+`games/wordweave`, one in `demos/particle-demo`, every one of them a full-bleed `100` the editor
+itself writes. Zero after the fix, with a genuine `90` (i.e. 90%) still reported.
+
+⚠️ **This one is a DECISION, and the code comment used to overstate it as an observation.** It read
+*"margin does not affect position — the pivot sits at the anchor point regardless"*, which is true
+of the pivot but not of the box: on a stretched axis (`top: 0; bottom: 0` with `height: auto`) CSS
+margins genuinely participate in the over-constrained resolution and would inset it. Put to the
+owner and upheld (2026-09-05): a second way to produce the same gap means an author has to know
+which one the previous author used, so anchor offsets stay the only one. This also matches why the
+Inspector's **Margin section is collapsed by default** — margin is deliberately de-emphasised, so
+the right direction for a fix here is to make its limits louder, never to give it a second job.
+
+Same ruling as `UIElement.zIndex` vs `UIAnchor.zIndex` (#746) in the § sortOrder table: the defect
+was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape when
+this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
+
 ---
 
 ## `UIRenderer` — ECS → DOM

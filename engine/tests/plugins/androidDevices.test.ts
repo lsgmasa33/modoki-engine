@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   parseAdbDevices, resolveAndroidSerial, resolveBuildAndroidSerial, adbArgs, describeAndroidDevice, isUsable,
   friendlyName, withFriendlyNames, _clearFriendlyNameCache, androidDevicesExec,
+  leaseForAndroidOps, pickHostSideAndroidSerial,
   type AndroidDevice,
 } from '../../plugins/backend/androidDevices';
 
@@ -343,5 +344,124 @@ describe('resolveBuildAndroidSerial — the BUILD path also honours the held lea
       expect(r.error).toContain('AAA');
       expect(r.error).toContain('BBB');
     }
+  });
+});
+
+
+/**
+ * #732 — the Android mirror of #670. `deviceHardware()` is platform-agnostic, so before
+ * `leaseForAndroidOps` existed an iOS lease's `ProductType` reached the adb model comparison,
+ * matched nothing, and made the host-side ops refuse about an Android that was plugged in and
+ * answering. Pure decision, no hardware — the reason this half was untestable before is that it
+ * lived inline in an I/O-shaped router closure.
+ */
+describe('androidDevices — leaseForAndroidOps (#732)', () => {
+  it('passes the model through for a confirmed Android lease', () => {
+    expect(leaseForAndroidOps('android', 'SM-S901B')).toBe('SM-S901B');
+  });
+
+  it('DROPS an iOS lease — the whole point: a ProductType can never match an adb model', () => {
+    expect(leaseForAndroidOps('ios', 'iPhone18,4')).toBeUndefined();
+  });
+
+  it('treats a null/unresolved platform as NOT Android — "not confirmed" is never "assume"', () => {
+    // devicePlatform() swallows its own errors and returns null, so null conflates "an old bridge
+    // with no platform" with "the ask failed". Neither is evidence, and the iOS half reads it the
+    // same strict way.
+    expect(leaseForAndroidOps(null, 'SM-S901B')).toBeUndefined();
+    expect(leaseForAndroidOps(undefined, 'SM-S901B')).toBeUndefined();
+  });
+
+  it('⭐ null and undefined mean DIFFERENT things, and collapsing them is a real bug', () => {
+    // `undefined` = no Android lease may speak here. `null` = an Android lease that reported no
+    // model. Only the second earns the single-attached shortcut in pickHostSideAndroidSerial, so a
+    // helper that returned null for both would hand a non-Android lease a phone to answer about.
+    expect(leaseForAndroidOps('android', null)).toBeNull();
+    expect(leaseForAndroidOps('ios', null)).toBeUndefined();
+    expect(leaseForAndroidOps('android', null)).not.toBe(leaseForAndroidOps('ios', null));
+  });
+});
+
+describe('androidDevices — pickHostSideAndroidSerial (#732)', () => {
+  const S22: AndroidDevice = { serial: 'RFCT001', state: 'device', model: 'SM_S901B', name: 'Galaxy S22' };
+  const A23: AndroidDevice = { serial: 'RFCT002', state: 'device', model: 'SC_56C', name: 'Galaxy A23 5G' };
+
+  it('⭐ an iOS lease with Androids attached FALLS THROUGH instead of refusing — the #732 bug', () => {
+    // THE regression. Inputs are exactly what the router reads: `devicePlatform()` says 'ios' and
+    // `deviceHardware()` hands back a ProductType, because it answers for whatever is leased. The
+    // gate is INSIDE the function under test, so this covers the fix rather than restating it —
+    // before it existed this returned an error naming iPhone18,4 as why no Android qualified.
+    const r = pickHostSideAndroidSerial({
+      leasePlatform: 'ios', leaseModel: 'iPhone18,4', attached: [S22],
+    });
+    expect(r).toEqual({ unleased: true });
+  });
+
+  it('an iOS lease does not steal the single-attached shortcut either', () => {
+    const r = pickHostSideAndroidSerial({ leasePlatform: 'ios', leaseModel: null, attached: [S22] });
+    expect(r).toEqual({ unleased: true });
+  });
+
+  it('a null/unresolved platform falls through — "not confirmed Android" is never "assume Android"', () => {
+    // devicePlatform() swallows its errors and returns null, so null is not evidence of anything.
+    const r = pickHostSideAndroidSerial({ leasePlatform: null, leaseModel: 'SC_56C', attached: [S22, A23] });
+    expect(r).toEqual({ unleased: true });
+  });
+
+  it('an adb lease serial wins outright, and is NOT platform-gated', () => {
+    // `target.serial` exists only on the useAdb path, so it is Android by construction. Gating it
+    // on devicePlatform() would drop a lease we are certain about because a probe that swallows
+    // its own errors said nothing. Pinned with a deliberately hostile platform value.
+    const r = pickHostSideAndroidSerial({
+      leaseSerial: 'RFCT002', leasePlatform: null, leaseModel: null, attached: [S22, A23],
+    });
+    expect(r).toEqual({ serial: 'RFCT002' });
+  });
+
+  it('a serial-less ANDROID lease still disambiguates by model — the behaviour #732 must preserve', () => {
+    const r = pickHostSideAndroidSerial({
+      leasePlatform: 'android', leaseModel: 'SC_56C', attached: [S22, A23],
+    });
+    expect(r).toEqual({ serial: 'RFCT002' });
+  });
+
+  it('matches on the friendly NAME as well as the adb model', () => {
+    const r = pickHostSideAndroidSerial({
+      leasePlatform: 'android', leaseModel: 'Galaxy S22', attached: [S22, A23],
+    });
+    expect(r).toEqual({ serial: 'RFCT001' });
+  });
+
+  it('an Android WiFi lease matching NOTHING attached still refuses, naming every candidate (#149)', () => {
+    const r = pickHostSideAndroidSerial({
+      leasePlatform: 'android', leaseModel: 'Pixel 8', attached: [S22, A23],
+    });
+    expect('error' in r).toBe(true);
+    if ('error' in r) {
+      expect(r.error).toContain('Pixel 8');
+      expect(r.error).toContain('RFCT001');
+      expect(r.error).toContain('RFCT002');
+    }
+  });
+
+  it('an Android lease with NO model and exactly one phone attached takes it', () => {
+    const r = pickHostSideAndroidSerial({ leasePlatform: 'android', leaseModel: null, attached: [S22] });
+    expect(r).toEqual({ serial: 'RFCT001' });
+  });
+
+  it('an Android lease with no model and TWO phones attached refuses rather than guessing', () => {
+    const r = pickHostSideAndroidSerial({ leasePlatform: 'android', leaseModel: null, attached: [S22, A23] });
+    expect('error' in r).toBe(true);
+  });
+
+  it('no lease at all falls through, whatever is attached', () => {
+    expect(pickHostSideAndroidSerial({ attached: [] })).toEqual({ unleased: true });
+    expect(pickHostSideAndroidSerial({ attached: [S22, A23] })).toEqual({ unleased: true });
+  });
+
+  it('an Android lease with nothing attached refuses and says so rather than naming a phantom', () => {
+    const r = pickHostSideAndroidSerial({ leasePlatform: 'android', leaseModel: 'SC_56C', attached: [] });
+    expect('error' in r).toBe(true);
+    if ('error' in r) expect(r.error).toContain('none');
   });
 });

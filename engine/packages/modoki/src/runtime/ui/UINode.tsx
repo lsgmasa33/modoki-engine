@@ -430,10 +430,14 @@ export function cssVal(value: number, unit: string): string | number | undefined
  *  this repo real time. Warn, never throw: an authoring mistake must not blank the
  *  screen mid-render. */
 const _deadToggles = new Set<string>();
-// ⚠️ Cleared on world swap, because the fallback key is an ENTITY ID and runtime ids are reassigned
-// on every scene reload — so a stale entry could swallow a DIFFERENT dead toggle's warning after a
-// reload, which is the one moment an author is most likely to be looking for it. (A guid-bearing
-// entity is unaffected; guid-less ones are the runtime-spawned case.)
+// ⚠️ The fallback key is `entityId:generation` (#759), not entityId alone — koota recycles entity
+// ids, so a guid-less (runtime-spawned) entity that despawns and respawns WITHIN one world can
+// inherit the dead entity's id, and an id-only key would silently swallow the newcomer's genuine
+// warning forever. `generation` closes that within-world hole (to koota's generation-wrap period);
+// it does NOT make the `onWorldSwap` clear below redundant — a fresh world restarts BOTH id and
+// generation from zero, so `id 2 / gen 0` can still collide ACROSS a swap, which only the clear
+// catches. Neither one subsumes the other. (A guid-bearing entity is unaffected by either hole —
+// a guid is stable across recycling, and authored entities are the common case for this warning.)
 onWorldSwap(() => _deadToggles.clear());
 
 function warnDeadToggle(key: string): void {
@@ -1015,7 +1019,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // went out of their way to suppress. `visible` is the genuinely inert one: no scroll container,
   // so `scrollTo` moves nothing and snap has nothing to apply to.
   if (import.meta.env?.DEV && node.scroll && node.overflow === 'visible') {
-    warnInertScrollView(node.guid || String(node.entityId), node.overflow);
+    warnInertScrollView(node.guid || `${node.entityId}:${node.generation}`, node.overflow);
   }
   // The snap TARGET half, stamped by the enclosing scroll view during the tree build — snapping
   // is declared on the box and honoured on the target, and those are different elements.
@@ -1259,7 +1263,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     const why = node.canvas2D ? 'a Canvas2D node renders its canvas, not text'
       : node.toggle ? 'a UIToggle draws only a track and a knob'
         : `elementType '${node.elementType}' takes its value from its inputBinding, not from 'text'`;
-    warnDroppedText(node.guid || String(node.entityId), why);
+    warnDroppedText(node.guid || `${node.entityId}:${node.generation}`, why);
   }
   // The same class one field group over: the whole text-STYLE block is gated on `node.text`, which
   // an input/range never uses, and the input branch below re-emits only `fontFamily`, `fontSize`,
@@ -1271,7 +1275,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // this is its runtime half.
   if (import.meta.env?.DEV && (node.elementType === 'input' || node.elementType === 'range')) {
     const dropped = droppedTextStyleFields(node, node.elementType);
-    if (dropped.length > 0) warnDroppedTextStyle(node.guid || String(node.entityId), node.elementType, dropped);
+    if (dropped.length > 0) warnDroppedTextStyle(node.guid || `${node.entityId}:${node.generation}`, node.elementType, dropped);
   }
 
   // Input element: render <input> instead of <div> when elementType is 'input'.
@@ -1436,7 +1440,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // button defaults to `event: 'click'` (`UIActionBindingsField.tsx`), so an author who adds a
     // binding and does not change the dropdown lands exactly here — and now gets told.
     const canFire = !!node.action?.bindings?.some(b => (b.event || 'click') === 'change');
-    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || String(node.entityId));
+    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || `${node.entityId}:${node.generation}`);
 
     // Does something OTHER than the fallback already size each axis? A definite CSS size covers
     // both the authored case and the pooled-row pin; `isSizeInert` covers the anchor-stretched

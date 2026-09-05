@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
 import { render, fireEvent, cleanup } from '@testing-library/react';
+import { createWorld } from 'koota';
 
 // vi.mock is hoisted above imports — declare the spies via vi.hoisted so the factories
 // can close over them without a TDZ error.
@@ -79,7 +80,7 @@ afterEach(() => {
 /** A complete UINodeData with neutral defaults; override per test. */
 function makeNode(over: Partial<UINodeData> = {}): UINodeData {
   return {
-    entityId: 1, guid: 'g1',
+    entityId: 1, guid: 'g1', generation: 0,
     width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
     flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'flex-start', alignItems: 'stretch',
     gap: 0, gapUnit: 'px', flexGrow: 0, flexShrink: 1,
@@ -2064,6 +2065,144 @@ describe('dropped-text DEV warnings (#745)', () => {
     try {
       renderNode(makeNode({ guid: 'dt-6', elementType: 'input', text: '' }));
       expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('the guid path still de-duplicates: same guid warns once for a dropped text-style field', () => {
+    // The corollary of the #759 fix below — qualifying the guid-LESS fallback with generation
+    // must not accidentally make the (far more common) guid-bearing path re-warn every frame.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const node = makeNode({ guid: 'dts-dedupe', elementType: 'input', text: '', textAlign: 'center' });
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// ── #759: the entityId fallback key must survive koota's id recycling ──
+//
+// All four warn-once Sets above key their guid-less fallback on `node.guid || String(node.entityId)`
+// pre-fix. koota recycles entity ids (LIFO free list), so a guid-less (runtime-spawned) UI entity
+// that despawns and a NEW, unrelated one that respawns within the SAME world can inherit the dead
+// entity's id — and an id-only warn-once silently suppressed the newcomer's genuine warning
+// forever. The fix qualifies the fallback with `node.generation` (`uiTreeStore.ts`'s buildTree
+// reads `entity.generation()`), exactly as #738 did for `lengthUnitWarningKey`.
+//
+// These use a REAL koota world (not `makeNode`'s hand-picked ids) so `entity.id()`,
+// `entity.generation()` and `entity.valueOf()` are the genuine koota mechanics — a recycling test
+// built on hand-picked ids would only prove the fix READS a generation field, not that a real
+// recycled id is actually disambiguated by it.
+describe('warn-once fallback key survives entity id recycling (#759)', () => {
+  it('sanity: DEV is genuinely truthy here, else every test below would pass vacuously', () => {
+    expect(import.meta.env?.DEV).toBeTruthy();
+  });
+
+  const _worlds: ReturnType<typeof createWorld>[] = [];
+  function newWorld() {
+    const w = createWorld();
+    _worlds.push(w);
+    return w;
+  }
+  afterEach(() => {
+    for (const w of _worlds.splice(0)) w.destroy();
+  });
+
+  /** Build a guid-less UINodeData carrying a REAL koota entity's id+generation, with `shape`
+   *  merged in last so it can complete whatever this warning needs. */
+  function nodeForEntity(entity: { id(): number; generation(): number }, shape: Partial<UINodeData>): UINodeData {
+    return makeNode({ guid: '', entityId: entity.id(), generation: entity.generation(), ...shape });
+  }
+
+  it('warnInertScrollView re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { overflow: 'visible', scroll: scrollTrait() }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      // Precondition: the id really was reused, but the packed entity differs — fail loudly
+      // rather than pass vacuously if koota's free list stops being LIFO.
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { overflow: 'visible', scroll: scrollTrait() }));
+      // B's OWN genuine warning must fire — an id-only warn-once would suppress it.
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDroppedText re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { elementType: 'input', text: 'hi' }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { elementType: 'input', text: 'hi' }));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDroppedTextStyle re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { elementType: 'input', text: '', textAlign: 'center' }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { elementType: 'input', text: '', textAlign: 'center' }));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDeadToggle re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { toggle: toggle({ value: false }) }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { toggle: toggle({ value: false }) }));
+      expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();
     }

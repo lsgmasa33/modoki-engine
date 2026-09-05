@@ -150,3 +150,54 @@ export function isElementZIndexShadowed(anchorZIndex: number | null | undefined)
 export function selectionZIndexGate(anchorZIndexes: readonly (number | null | undefined)[]): SelectionGate {
   return resolveGate(anchorZIndexes, isElementZIndexShadowed);
 }
+
+/** The four `UIElement` margin fields, as the Inspector and the scene validator both name them. */
+export const MARGIN_KEYS: readonly ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'] =
+  ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'];
+
+/** Is an authored `UIElement.margin*` INERT because the element is anchored (#757)?
+ *
+ *  `UINode` writes all four margins into the style; `applyAnchorStyle` then runs and clears every
+ *  one of them. This is #746's shape exactly — a late writer replacing an authored `UIElement`
+ *  field — and it was found by sweeping for that pattern rather than its symptom.
+ *
+ *  ⚠️ **The condition is "has an anchor at all", with NO per-mode nuance** — unlike `isSizeInert`,
+ *  which only fires on the stretched axis. `applyAnchorStyle` clears all four unconditionally for
+ *  every anchor mode, so this predicate must too. `anchorCss` imports it rather than restating the
+ *  condition, so the editor cannot disagree with the layout about what is inert.
+ *
+ *  ⚠️ **This is deliberately NOT a claim that margin could never do anything here.** The original
+ *  code comment said margin "does not affect position — the pivot sits at the anchor point
+ *  regardless", which is true of the pivot but not the whole story: on a STRETCHED axis
+ *  (`top: 0; bottom: 0` with `height: auto`) CSS margins genuinely participate in the
+ *  over-constrained resolution and would shrink the box. So for the `*-stretch` modes the engine is
+ *  DECIDING margin should not apply, not observing that it cannot.
+ *
+ *  That decision was put to the owner and upheld (2026-09-05): anchor offsets stay the ONE way to
+ *  inset a stretched element, because a second way to produce the same gap means an author has to
+ *  know which one the last author used. It also matches why the Inspector's Margin section is
+ *  collapsed by default — margin is deliberately de-emphasised here, so the acceptable direction
+ *  for a fix is to make its limits louder, never to give it a second job. Same ruling as #746: the
+ *  defect is the SILENCE, not the precedence.
+ *
+ *  Takes the entity's anchor mode, or null/undefined when it has no `UIAnchor` at all. A mode of
+ *  `''` still counts as anchored — that is a missing MODE, not a missing anchor, the same
+ *  distinction `selectionAnchorGate` draws. */
+export function isElementMarginInert(anchor: string | null | undefined): boolean {
+  return anchor !== null && anchor !== undefined;
+}
+
+/** The margin gate across a selection (#757). One entry per selected entity: its `UIAnchor.anchor`,
+ *  or null/undefined when it has no anchor. Unanimous-or-nothing per #34.
+ *
+ *  ⚠️ **Exists so the Inspector's margin decision runs through `isElementMarginInert`.** It is
+ *  behaviourally identical to `selectionAnchorGate` TODAY, and that is not a reason to reuse that
+ *  one: `selectionAnchorGate` carries its own inline copy of the condition, so routing margin
+ *  through it made "the same predicate drives the layout and the editor" false for the decision
+ *  that actually sets `readOnly` — `anchorCss` would have stopped clearing margins while the
+ *  Inspector kept the fields greyed, leaving an author unable to type a value that had started
+ *  working. The two ALSO answer different questions (self-placement vs. margin) and may diverge, so
+ *  a shared body is the wrong kind of saving. */
+export function selectionMarginGate(anchors: readonly (string | null | undefined)[]): SelectionGate {
+  return resolveGate(anchors, isElementMarginInert);
+}
