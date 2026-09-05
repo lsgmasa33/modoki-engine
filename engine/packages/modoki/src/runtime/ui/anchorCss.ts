@@ -13,12 +13,7 @@ import type { CSSProperties } from 'react';
 // STRETCH_X/STRETCH_Y come from anchorLayout so the two paths cannot disagree on WHICH
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
-// Same reasoning as STRETCH_X/STRETCH_Y above, one field over: the Inspector greys out
-// `UIElement.zIndex` when this line overrides it (#746), and it must not be able to disagree with
-// this line about WHEN that happens. One predicate, imported by both.
-import { isElementMarginInert, isElementZIndexShadowed } from './uiAuthoring';
-
-export type AnchorCssData = AnchorData & { zIndex?: number };
+import { isElementMarginInert } from './uiAuthoring';
 
 /** Compose a UIElement's tilt AND scale onto whatever transform the anchor already wrote
  *  (#234 tilt, #340 scale).
@@ -44,7 +39,7 @@ export type AnchorCssData = AnchorData & { zIndex?: number };
  *  defaults to 1 and is checked against 1 rather than falsy: `scale: 0` is a legitimate authored
  *  value (a pop-in clip's first keyframe) and must still emit `scale(0)`. */
 export function applyRotationStyle(
-  style: CSSProperties, degrees: number, a?: AnchorCssData, scale = 1,
+  style: CSSProperties, degrees: number, a?: AnchorData, scale = 1,
 ): void {
   const tilted = !!degrees;
   const scaled = scale !== 1;
@@ -81,11 +76,8 @@ function safeAreaInset(edge: 'top' | 'bottom' | 'left' | 'right'): string {
 
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
  *  (Mirrors anchorLayout.resolveAnchorRect — keep them in sync; parity-tested.) */
-export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
+export function applyAnchorStyle(style: CSSProperties, a: AnchorData): void {
   style.position = 'absolute';
-  // ⚠️ Truthiness, not presence: an anchor leaving `zIndex` at its 0 default does NOT shadow
-  // `UIElement.zIndex`, and the Inspector's gate depends on that staying true (#746).
-  if (isElementZIndexShadowed(a.zIndex)) style.zIndex = a.zIndex;
 
   // Position the element's top-left at the anchor reference point.
   // All non-stretch modes use top+left so pivot translate(-X%,-Y%) works uniformly.
@@ -173,7 +165,7 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   //
   // The predicate is shared with the Inspector's gate (`isElementMarginInert`) rather than restated
   // inline, so the editor cannot disagree with the layout about what is inert — the same
-  // cannot-drift rule `isSizeInert` and `isElementZIndexShadowed` already follow. Inside this
+  // cannot-drift rule `isSizeInert` already follows. Inside this
   // function `a.anchor` is always present, so the call is always true; it is written this way so
   // that if the condition is ever narrowed, BOTH surfaces narrow together instead of silently
   // parting company.

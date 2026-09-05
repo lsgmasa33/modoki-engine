@@ -90,6 +90,7 @@ vi.mock('../../src/runtime/loaders/assetUrl', () => ({
 
 import {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
+  ensureRiggedModelLoadedFor, getRiggedOwnerCounts,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, invalidateRiggedModel,
 } from '../../src/runtime/loaders/riggedModelCache';
 import {
@@ -228,6 +229,42 @@ describe('riggedModelCache', () => {
     // Full teardown clears it.
     disposeAllRiggedModels();
     expect(getRiggedModel(REF)).toBeUndefined();
+  });
+
+  // #747 — the scene-scoped sibling of the editor's LAZY_OWNER pin. The render sync
+  // uses this one; a scene's own release must actually reach it (unlike LAZY_OWNER,
+  // which no release can ever remove).
+  describe('ensureRiggedModelLoadedFor (scene-scoped lazy acquire, #747)', () => {
+    it('registers scene ownership, and the scene release actually reaches it', async () => {
+      ensureRiggedModelLoadedFor(1, REF);
+      await vi.waitFor(() => expect(getRiggedModel(REF)).toBeDefined());
+      // Positive control FIRST: a registry that starts empty would pass the next
+      // (post-release) assertion for the wrong reason.
+      expect(getRiggedOwnerCounts()[PATH]).toBe(1);
+
+      releaseRiggedModelsForScene(1);
+      expect(getRiggedOwnerCounts()[PATH]).toBeUndefined();
+      expect(getRiggedModel(REF)).toBeUndefined(); // disposed, not just unowned
+    });
+
+    it('does NOT change the editor pin: ensureRiggedModelLoaded still survives a scene release', async () => {
+      ensureRiggedModelLoaded(REF); // the editor session pin (LAZY_OWNER)
+      await vi.waitFor(() => expect(getRiggedModel(REF)).toBeDefined());
+      releaseRiggedModelsForScene(1); // no scene ever held it — must be a no-op here
+      expect(getRiggedModel(REF)).toBeDefined(); // still resident + cached
+      disposeAllRiggedModels();
+      expect(getRiggedModel(REF)).toBeUndefined(); // only full teardown reclaims it
+    });
+
+    it('an already-cached model still takes the new scene stamp', async () => {
+      await acquireRiggedModel(1, REF); // cached, owned by scene 1
+      ensureRiggedModelLoadedFor(2, REF); // second owner stamped on the cached model
+      expect(getRiggedOwnerCounts()[PATH]).toBe(2);
+
+      releaseRiggedModelsForScene(1); // scene 1 drops its hold
+      expect(getRiggedModel(REF)).toBeDefined();  // scene 2 still holds it
+      expect(getRiggedOwnerCounts()[PATH]).toBe(1);
+    });
   });
 
   describe('postprocessor filterMesh', () => {

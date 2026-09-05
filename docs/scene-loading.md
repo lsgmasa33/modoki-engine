@@ -202,14 +202,14 @@ a site that has only the former is unguarded.
 
 ## Scene manifest format
 
-The current scene file version is **12** (`SceneFile.version`), stamped from
+The current scene file version is **13** (`SceneFile.version`), stamped from
 `SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; the `SceneFile` interface is
 defined in `editor/scene/serialize.ts`:
 
 ```ts
 interface SceneFile {
   id: string;             // stable UUID, written once, survives renames/moves
-  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 12)
+  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 13)
   createdAt: string;      // preserved across saves, not regenerated — see "Entity-id
                            // stability on disk" below
   baseScene?: string;     // v10+: guid of a base scene this scene extends — see
@@ -1307,7 +1307,7 @@ staging world. `SceneManager`:
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
    file copy, preventing duplicates.
 4. Respawns the snapshots into the staging world (tagged `version:
-   SCENE_FORMAT_VERSION`, currently 12, so migrations don't needlessly re-run).
+   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run).
 
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
@@ -1477,7 +1477,7 @@ Findings come from four passes:
    `space-console` alone) were checked by *nothing* — not for resolution, not even for
    GUID shape. A literal asset path in an override was as silent as a deleted one. Both
    call sites now go through one exported predicate, `refFieldWarnings`, for the reason
-   `inertSizeWarnings` gives right below it: an override group has the identical
+   `inertLayoutWarnings` gives right below it: an override group has the identical
    `{trait: {field: value}}` shape, and restating the rule per call site is how the
    exemptions (primitive sprite keywords, external URLs) drift apart. It runs **before**
    the inert-size check's `UIElement` early-continue — most override groups touch no
@@ -1504,7 +1504,29 @@ Findings come from four passes:
    that is `UIElement.width`/`height` on an axis the entity's `UIAnchor`
    stretches: the offsets size that axis and overwrite the authored value, so it
    is stored, displayed, and inert (the rule itself lives in
-   [ui-system.md](./ui-system.md); the shared predicate is `isSizeInert`).
+   [ui-system.md](./ui-system.md); the shared predicate is `isSizeInert`). The size arm
+   needs the anchor's MODE, so it only runs when `UIAnchor.anchor` is an authored string.
+   The same function also carries the margin arm (#757, `isElementMarginInert` — any
+   anchor, not just a stretching one). ⚠️ Unlike size, margin is **mode-independent** —
+   `anchorCss.ts` applies it unconditionally, whatever `UIAnchor.anchor` says, so this arm
+   runs off the mere PRESENCE of a `UIAnchor`, not off `anchor` surviving as an authored
+   string. That distinction matters because `UIAnchor`'s default mode is `'stretch'` and a
+   scene save strips any field equal to its trait default — so an entity on the default mode
+   has no `anchor` key at all, and gating this arm on the string (as the original #757
+   landing did) silently missed every one of them.
+
+   A THIRD arm used to live here too: `zIndex` (#762, `isElementZIndexShadowed` — a truthy
+   sibling `UIAnchor.zIndex` shadowed `UIElement.zIndex` entirely). `UIAnchor.zIndex` and
+   `UIElement.zIndex` wrote the same CSS `z-index` onto the same DOM node, so the anchor
+   field only ever duplicated the element field; it was removed and the two unified onto
+   `UIElement.zIndex` alone (scene format **v13**). `migrateV12toV13` in `loadSceneFile.ts`
+   carries a truthy old `UIAnchor.zIndex` onto `UIElement.zIndex` (the anchor's value is
+   what rendered, so it wins on a conflict), then drops the anchor field unconditionally.
+   Prefabs have no versioned migration ladder at all — `PREFAB_FORMAT_VERSION`
+   (`editor/scene/prefab.ts`) is a writer-only stamp nothing on the loading path inspects
+   — so the same fix runs unconditionally on every prefab load instead
+   (`uiAnchorZIndexMigration.ts`, shared by `meshTemplateCache.ts`'s `fetchPrefab` and the
+   editor's `getPrefabSource`).
 
    This pass is where a **noise budget** matters most, because unlike the passes
    above it flags data that is not malformed. Two values are excluded as neutral:
@@ -1535,7 +1557,7 @@ Findings come from four passes:
    guard (`engine/tests/assets/prefabInertSize.test.ts`) that also covers prefabs written by hand
    or by an agent — which no editor hook can see. `GET /api/validate-prefab?path=…` exposes the
    same check so an agent editing prefab JSON can verify its own edit. All four share the one
-   `inertSizeWarnings` predicate, so the rule and its noise budget cannot drift between them.
+   `inertLayoutWarnings` predicate, so the rule and its noise budget cannot drift between them.
 
    The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
    restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*

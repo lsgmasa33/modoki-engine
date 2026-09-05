@@ -81,7 +81,7 @@ export function isAcceptableTypedRef(v: string, accept?: string[]): boolean {
   return false;
 }
 
-export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, editorPanel }: {
+export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, editorPanel, dataUiId, dataUiLabel }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
@@ -99,6 +99,12 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   /** This is a CSS-font-FAMILY field (`UIElement.fontFamily`, DOM/UI text), so a
    *  dropped font resolves to its family NAME. Default false: SDF font fields
    *  (`Text2D`/`Text3D.font`) store the asset GUID like every other asset ref. */
+  /** Caller-owned handle id — the same logical value renders as one of THREE mutually
+   *  exclusive states (mixed / a read-only GUID-name display / an editable text field),
+   *  so this is applied to all three rather than just the BufferedTextInput branches;
+   *  they never render together, so there is no duplicate-id collision. */
+  dataUiId?: string;
+  dataUiLabel?: string;
 }) {
   const divRef = useRef<HTMLDivElement>(null);
   const onChangeRef = useRef(onChange);
@@ -239,7 +245,8 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
       {mixed ? (
         <BufferedTextInput value="" onChange={onChange} mixed placeholder={MIXED_PLACEHOLDER}
           validate={(v) => isAcceptableTypedRef(v, accept)}
-          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
+          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }}
+          dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
       ) : refName !== null ? (
         <Tooltip text={refTooltip} style={{ flex: 1, display: 'flex' }}>
           <input type="text" readOnly value={refName}
@@ -249,12 +256,14 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
               // but Backspace/Delete clears the reference when it's focused.
               if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); onChange(''); }
             }}
-            style={{ ...inputStyle, flex: 1, width: '100%', color: inputColor, fontWeight: inputWeight, background: '#1a1a2e', cursor: 'help' }} />
+            style={{ ...inputStyle, flex: 1, width: '100%', color: inputColor, fontWeight: inputWeight, background: '#1a1a2e', cursor: 'help' }}
+            data-ui-id={dataUiId} data-ui-label={dataUiLabel} />
         </Tooltip>
       ) : (
         <BufferedTextInput value={value} onChange={onChange} placeholder={placeholder}
           validate={(v) => isAcceptableTypedRef(v, accept)}
-          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
+          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }}
+          dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
       )}
       {acceptsSprite && (
         <button

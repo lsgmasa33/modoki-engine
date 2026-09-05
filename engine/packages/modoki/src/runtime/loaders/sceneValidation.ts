@@ -317,39 +317,58 @@ export function inertLayoutWarnings(traits: unknown, label: string): string[] {
   const uel = (traits as Record<string, unknown>).UIElement;
   const uan = (traits as Record<string, unknown>).UIAnchor;
   if (!uel || typeof uel !== 'object' || !uan || typeof uan !== 'object') return out;
-  const anchor = (uan as { anchor?: unknown }).anchor;
-  if (typeof anchor !== 'string') return out;
-  for (const axis of ['width', 'height'] as const) {
-    const v = (uel as Record<string, unknown>)[axis];
-    const unit = (uel as Record<string, unknown>)[`${axis}Unit`];
-    if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
-      // Echo the value WITH its unit — '90%' is what the author sees in the Inspector, so a
-      // bare '90' makes them hunt for which field is meant.
-      const authored = `${v}${unitOrDefault(unit)}`;
-      out.push(
-        `${label}.UIElement.${axis} is inert: the '${anchor}' anchor sizes that axis from its `
-        + `${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, which overwrite the authored ${authored}`,
-      );
+  const uanObj = uan as Record<string, unknown>;
+  // ⚠️ An entity on the DEFAULT anchor mode ('stretch') has no `anchor` key at all: a scene save
+  // strips any field equal to its trait default. The size arm below still needs the mode STRING
+  // (`isSizeInert` reads it), so it stays gated on `anchor !== undefined` — but margin is
+  // mode-INDEPENDENT (see its own comment) and must run off the mere PRESENCE of a
+  // `UIAnchor` object, never off whether its `anchor` field happened to survive the strip.
+  const anchorRaw = uanObj.anchor;
+  const anchor = typeof anchorRaw === 'string' ? anchorRaw : undefined;
+  if (anchor !== undefined) {
+    for (const axis of ['width', 'height'] as const) {
+      const v = (uel as Record<string, unknown>)[axis];
+      const unit = (uel as Record<string, unknown>)[`${axis}Unit`];
+      if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
+        // Echo the value WITH its unit — '90%' is what the author sees in the Inspector, so a
+        // bare '90' makes them hunt for which field is meant.
+        const authored = `${v}${unitOrDefault(unit)}`;
+        out.push(
+          `${label}.UIElement.${axis} is inert: the '${anchor}' anchor sizes that axis from its `
+          + `${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, which overwrite the authored ${authored}`,
+        );
+      }
     }
   }
   // Margin dies on ANY anchor, not just a stretching one (#757) — `applyAnchorStyle` clears all
-  // four unconditionally. Reported from the same function as size because they are the same class
-  // of finding on the same trait pair, and a second entry point is a second place for the
-  // "is it actually authored?" exclusions to drift. `isElementMarginInert` is the shared predicate
-  // the Inspector gate and `anchorCss` both use.
+  // four unconditionally, and it does so for a DEFAULT-mode anchor exactly as it does for every
+  // other mode: the anchor MODE is irrelevant to it. So this arm is
+  // mode-independent too — gated on `isElementMarginInert`, which only asks whether a `UIAnchor`
+  // is present at all, not on `anchor` being a string (a hole left by #757; closed here).
+  // Reported from the same function as size because they are the same class of finding on the
+  // same trait pair, and a second entry point is a second place for the "is it actually
+  // authored?" exclusions to drift. `isElementMarginInert` is the shared predicate the Inspector
+  // gate and `anchorCss` both use.
   //
   // ⚠️ Zero is the neutral value and is NOT reported: `UIElement`'s margin defaults are 0, so
   // warning on them would fire on essentially every anchored element in the repo and bury the
   // three real findings — the same reason `isNeutralSize` exists one loop up.
-  if (isElementMarginInert(anchor)) {
+  //
+  // `isElementMarginInert` only asks "is this non-null/undefined", so a default-mode anchor
+  // (whose `anchor` field is stripped to `undefined`) must be passed as the mode it actually
+  // resolves to ('stretch') rather than as `anchor` itself — otherwise the presence check
+  // collapses back to the mode-string gate this arm is meant to escape.
+  const marginAnchorMode = anchor ?? 'stretch';
+  if (isElementMarginInert(marginAnchorMode)) {
     for (const key of MARGIN_KEYS) {
       const v = (uel as Record<string, unknown>)[key];
       if (typeof v !== 'number' || v === 0) continue;
       const unit = (uel as Record<string, unknown>)[`${key}Unit`];
       const authored = `${v}${unitOrDefault(unit)}`;
       out.push(
-        `${label}.UIElement.${key} is inert: the '${anchor}' anchor positions this element from its `
-        + `own offsets, which overwrite all four margins — the authored ${authored} is discarded`,
+        `${label}.UIElement.${key} is inert: the '${marginAnchorMode}' anchor positions this `
+        + `element from its own offsets, which overwrite all four margins — the authored ${authored} `
+        + `is discarded`,
       );
     }
   }
@@ -573,29 +592,46 @@ export function validateSceneData(
           const anchor = typeof ovAnchorRaw === 'string'
             ? ovAnchorRaw
             : (typeof prefabUan?.anchor === 'string' ? prefabUan.anchor : undefined);
-          if (typeof anchor !== 'string') continue;
-
-          for (const axis of ['width', 'height'] as const) {
-            const unitField = `${axis}Unit`;
-            // Only consider an axis the OVERRIDE actually touches — a size authored
-            // purely inside the prefab is a different (prefab-side) bug, out of scope
-            // here, and warning on it would duplicate across every instance.
-            if (!(axis in ovUelObj) && !(unitField in ovUelObj)) continue;
-            const v = axis in ovUelObj ? ovUelObj[axis] : prefabUel?.[axis];
-            const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
-            if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
-              const authored = `${v}${unitOrDefault(unit)}`;
-              warnings.push(
-                `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
-                + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
-                + `sizes that axis from its ${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, `
-                + `which overwrite the overridden ${authored}`,
-              );
+          // ⚠️ NOT `if (typeof anchor !== 'string') continue;` any more — that used to skip the
+          // margin mirror below too, for the exact reason the scene-side arm above was gated
+          // wrong (#757's fix here): a default ('stretch') anchor mode has no `anchor` key once
+          // either the override or its prefab is saved, but `anchorCss.ts` clears margin for it
+          // exactly as for any other mode. The size loop still needs the mode STRING, so it
+          // alone stays gated on `anchor` being defined.
+          if (typeof anchor === 'string') {
+            for (const axis of ['width', 'height'] as const) {
+              const unitField = `${axis}Unit`;
+              // Only consider an axis the OVERRIDE actually touches — a size authored
+              // purely inside the prefab is a different (prefab-side) bug, out of scope
+              // here, and warning on it would duplicate across every instance.
+              if (!(axis in ovUelObj) && !(unitField in ovUelObj)) continue;
+              const v = axis in ovUelObj ? ovUelObj[axis] : prefabUel?.[axis];
+              const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
+              if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
+                const authored = `${v}${unitOrDefault(unit)}`;
+                warnings.push(
+                  `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
+                  + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
+                  + `sizes that axis from its ${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, `
+                  + `which overwrite the overridden ${authored}`,
+                );
+              }
             }
           }
           // The margin mirror (#757), same override-only rule: report a margin this OVERRIDE
-          // touches, not one authored purely inside the prefab.
-          if (isElementMarginInert(anchor)) {
+          // touches, not one authored purely inside the prefab. Mode-independent (this fix):
+          // `marginAnchorMode` falls back to 'stretch' — the resolved default — so
+          // `isElementMarginInert` sees "anchored at all" rather than "anchor field survived
+          // the strip", matching the scene-side arm above.
+          //
+          // ⚠️ That fallback is only correct once a `UIAnchor` object is known to exist somewhere
+          // (the override or its prefab) — an instance with NEITHER carries no anchor at all, is
+          // laid out in normal flow, and must stay silent exactly like the un-anchored case
+          // always has (`hasAnchorTrait` guards that; `anchor ?? 'stretch'` alone cannot tell the
+          // two apart, since a missing string means either "unauthored default" or "no anchor").
+          const hasAnchorTrait = !!ovUanObj || !!prefabUan;
+          const marginAnchorMode = anchor ?? 'stretch';
+          if (hasAnchorTrait && isElementMarginInert(marginAnchorMode)) {
             for (const key of MARGIN_KEYS) {
               const unitField = `${key}Unit`;
               if (!(key in ovUelObj) && !(unitField in ovUelObj)) continue;
@@ -604,7 +640,7 @@ export function validateSceneData(
               const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
               const authored = `${v}${unitOrDefault(unit)}`;
               warnings.push(
-                `${label}.overrides[${localIdKey}].UIElement.${key} is inert: the '${anchor}' anchor `
+                `${label}.overrides[${localIdKey}].UIElement.${key} is inert: the '${marginAnchorMode}' anchor `
                 + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
                 + `positions this element from its own offsets, which overwrite all four margins — `
                 + `the overridden ${authored} is discarded`,

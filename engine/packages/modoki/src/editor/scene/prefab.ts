@@ -10,6 +10,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
+import { migrateUIAnchorZIndexInTraits } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { isTraitDefault } from './traitDefault';
@@ -77,8 +78,16 @@ export interface PrefabEntity {
  *  never mentioned `version` at all, so a grep for the token could not find it.
  *
  *  Scenes are the precedent: `engine/scripts/migrate-legacy-scenes.mjs` pins one number and
- *  triggers on `(doc.version ?? 0) < 12`, never on what the document contains. */
-export const PREFAB_FORMAT_VERSION = 2;
+ *  triggers on `(doc.version ?? 0) < 12`, never on what the document contains.
+ *
+ *  v3: `UIAnchor.zIndex` removed (mirrors scene v13). Prefabs still have no migration LADDER
+ *  (nothing on the loading path inspects this field at all — see above), so the fix for the
+ *  data-loss window isn't version-gated either: `getPrefabSource` and `fetchPrefab`
+ *  (meshTemplateCache.ts) both run `migrateUIAnchorZIndexInTraits` on every entity,
+ *  unconditionally, on every load — cheap and idempotent, so it costs nothing to apply to an
+ *  already-migrated (or v3-native) file. The version bump here only makes freshly-written
+ *  files honest about which serializer touched them, same as every bump before it. */
+export const PREFAB_FORMAT_VERSION = 3;
 
 export interface PrefabFile {
   /** Stable UUID — written once at save, never changes across renames/moves. */
@@ -86,10 +95,11 @@ export interface PrefabFile {
   /** The format version the file was WRITTEN by — {@link PREFAB_FORMAT_VERSION}, always, for
    *  anything this serializer produces. Not a capability floor and not content-derived.
    *
-   *  v1 and v2 share the same shape (the nested-instance fields are optional), so a v1 file
-   *  still loads unchanged and nothing on the loading path inspects this at all (#365). `1`
-   *  survives in the type for documents written before #379 that nobody has re-saved. */
-  version: 1 | 2;
+   *  v1, v2 and v3 all share the same shape (the nested-instance fields are optional, and v3
+   *  only drops a trait FIELD, not a structural shape), so an older file still loads unchanged
+   *  and nothing on the loading path inspects this at all (#365). `1`/`2` survive in the type
+   *  for documents written before #379/this change that nobody has re-saved. */
+  version: 1 | 2 | 3;
   name: string;
   rootLocalId: number;
   entities: PrefabEntity[];
@@ -442,7 +452,7 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     // ⚠️ Preserving the higher number is a floor, not a full answer — such a merge still
     // writes v2-era semantics into a file labelled v3. Whoever adds a v3 owes this call site a
     // real decision (most likely: refuse the merge loudly rather than guess).
-    version: Math.max(PREFAB_FORMAT_VERSION, existing.version) as 1 | 2,
+    version: Math.max(PREFAB_FORMAT_VERSION, existing.version) as 1 | 2 | 3,
     name: fresh.name,
     rootLocalId: fresh.rootLocalId,
     entities: [...mergedSkeleton, ...mergedUser],
@@ -666,6 +676,11 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
     const res = await fetch(url);
     if (!res.ok) return null;
     const prefab: PrefabFile = await res.json();
+    // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
+    // nothing on the loading path inspects (#365/#379). Applying the zIndex migration
+    // unconditionally here (cheap, idempotent) is the smallest thing that closes the same
+    // data-loss window a versioned migration closes for scenes — see uiAnchorZIndexMigration.ts.
+    for (const entry of prefab.entities) migrateUIAnchorZIndexInTraits(entry.traits);
     prefabCache.set(source, prefab);
     if (prefab.id) registerAsset(prefab.id, url, 'prefab');
     return prefab;

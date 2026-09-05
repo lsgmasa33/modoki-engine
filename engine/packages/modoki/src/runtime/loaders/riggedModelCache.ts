@@ -14,9 +14,17 @@
  *
  *  Ownership mirrors `meshTemplateCache`'s scene-scoped refcount (`Set<sceneId>`):
  *  acquired by `SceneManager.loadScene` from the scene's `resources` manifest,
- *  released wholesale by `releaseAllForScene` (wired in meshTemplateCache). A
- *  LAZY owner (`LAZY_OWNER`) keeps editor-authored models (drag a GLB → add a
- *  SkinnedModel, no manifest entry yet) resident until full teardown. */
+ *  released wholesale by `releaseAllForScene` (wired in meshTemplateCache).
+ *
+ *  Two acquire entry points, deliberately split (#747) so the two roles can't be
+ *  confused: `ensureRiggedModelLoadedFor(sceneId, ref)` is the SCENE-SCOPED lazy
+ *  acquire the render sync uses when it meets a ref with no manifest-driven load
+ *  yet — ownership goes to the real scene, so the scene's own release reaches it.
+ *  `ensureRiggedModelLoaded(ref)` is the EDITOR SESSION PIN (drag a GLB → add a
+ *  SkinnedModel, no manifest entry at all) — it stamps the sentinel `LAZY_OWNER`,
+ *  which no scene release can ever remove, so it stays resident until full
+ *  teardown (`disposeAllRiggedModels`). It has exactly one legitimate caller:
+ *  `editor/scene/modelImport.ts`. */
 
 import * as THREE from 'three';
 import type { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -41,8 +49,11 @@ export interface RiggedModel {
 
 export type SceneId = number;
 
-/** Sentinel owner for editor lazy-loads (no manifest entry). Negative so it can
- *  never collide with a real scene id. */
+/** Sentinel owner for the EDITOR SESSION PIN (no manifest entry) — deliberately
+ *  outlives every scene release; only `disposeAllRiggedModels` (full teardown)
+ *  reclaims it. Negative so it can never collide with a real scene id. Stamped by
+ *  `ensureRiggedModelLoaded` ONLY — runtime code acquires via
+ *  `ensureRiggedModelLoadedFor` instead, which owns with the real scene (#747). */
 const LAZY_OWNER: SceneId = -1;
 
 // INVARIANT (B2): keyed by PATH, not content hash — same contract as
@@ -306,15 +317,34 @@ export function releaseRiggedModelsForScene(sceneId: SceneId): void {
   }
 }
 
-/** Editor convenience: ensure a model is loading even without a manifest entry
- *  (drag a GLB → add a SkinnedModel). Held by LAZY_OWNER so it stays resident for
- *  the session; cleared by `disposeAllRiggedModels`. Idempotent + deduped. */
+/** EDITOR SESSION PIN — the one legitimate caller is `editor/scene/modelImport.ts`
+ *  (drag a GLB → add a SkinnedModel, no manifest entry yet). Held by LAZY_OWNER,
+ *  which no scene's `releaseRiggedModelsForScene` can ever remove (#747) — it is
+ *  deliberately reclaimed only by `disposeAllRiggedModels` (full teardown), so the
+ *  editor-authored model stays resident for the whole session. Idempotent + deduped.
+ *  ⚠️ Runtime render-sync code must NOT call this — a normal scene-scoped acquire
+ *  would get pinned forever. Use `ensureRiggedModelLoadedFor` instead. */
 export function ensureRiggedModelLoaded(modelRef: string): void {
   const path = refToPath(modelRef);
   if (!path) return;
   // Already cached → nothing to load; drop any import handoff so it can't strand.
   if (cache.has(path)) { disposePendingGltf(path); return; }
   addOwner(path, LAZY_OWNER);
+  void fetchRiggedModel(path, postprocessorFor(modelRef));
+}
+
+/** Fire-and-forget SCENE-SCOPED acquire — the render sync calls this when it first
+ *  sees a rigged-model ref it cannot resolve. Mirrors `ensureFontLoaded`: an
+ *  already-cached model still takes the scene's ownership stamp, so the scene's own
+ *  release (`releaseRiggedModelsForScene`) reaches it.
+ *  ⚠️ NOT `ensureRiggedModelLoaded` — that stamps LAZY_OWNER, which no scene release
+ *  can ever remove (#747). Runtime code must use THIS one. */
+export function ensureRiggedModelLoadedFor(sceneId: SceneId, modelRef: string): void {
+  const path = refToPath(modelRef);
+  if (!path) return;
+  addOwner(path, sceneId);
+  // Already cached → nothing to load; drop any import handoff so it can't strand.
+  if (cache.has(path)) { disposePendingGltf(path); return; }
   void fetchRiggedModel(path, postprocessorFor(modelRef));
 }
 

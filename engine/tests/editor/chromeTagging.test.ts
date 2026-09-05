@@ -190,6 +190,79 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     ids: ['ai.device.connect', 'ai.device.useAdb', 'ai.device.ip'],
     why: 'the device Connect button and its two inputs — the OTHER "Connect" in the same panel.',
   },
+  {
+    // #724 — the 15 BufferedNumberInput + 10 BufferedTextInput sites the coverage check below
+    // found untagged (26 sites, ~36 controls counting shared helpers). Listed per file.
+    file: 'panels/AnimatorClipsSection.tsx',
+    ids: ['`animator.clip.${i}.name`', '`animator.clip.${i}.speed`', '`animator.clip.${i}.fadeDuration`'],
+    why: 'the Animator clip-bank row editor (name/speed/fade) — #724.',
+  },
+  {
+    file: 'panels/MaterialOverridesField.tsx',
+    ids: [
+      '`material.override.${i}.target`', '`material.override.${i}.value`',
+      '`material.override.${i}.speed`', '`material.override.${i}.wrap`',
+      '`material.override.${i}.key`', '`material.override.${i}.scale`',
+      '`material.override.${i}.default`',
+    ],
+    why: 'the material-override row editor — target/value/time-source/store-source fields, threaded through the NumRow helper — #724.',
+  },
+  {
+    file: 'panels/NineSliceEditor.tsx',
+    ids: ['nineSlice.border.edgeScale'],
+    why: 'the 9-slice editor\'s edge-scale field — #724.',
+  },
+  {
+    file: 'panels/SpriteAnimEditor.tsx',
+    ids: ['spriteAnim.clip.fps', 'spriteAnim.clip.cycles'],
+    why: 'the active clip\'s fps/cycles fields — #724.',
+  },
+  {
+    file: 'panels/SpriteEditor.tsx',
+    ids: [
+      'spriteEditor.grid.cols', 'spriteEditor.grid.rows', 'spriteEditor.grid.cellW', 'spriteEditor.grid.cellH',
+      'spriteEditor.grid.offsetX', 'spriteEditor.grid.offsetY', 'spriteEditor.grid.paddingX', 'spriteEditor.grid.paddingY',
+      'spriteEditor.auto.threshold',
+      'spriteEditor.selected.x', 'spriteEditor.selected.y', 'spriteEditor.selected.w', 'spriteEditor.selected.h',
+      'spriteEditor.selected.pivotX', 'spriteEditor.selected.pivotY',
+    ],
+    why: 'the 15 numeric controls behind the local `Num` helper (grid slice, auto-alpha threshold, selected-sprite rect/pivot) — #724.',
+  },
+  {
+    file: 'panels/assetViews/MaterialAssetView.tsx',
+    ids: ['`assetView.material.param.${name}.${i}`'],
+    why: 'the per-component vecN shader-param fields — #724.',
+  },
+  {
+    file: 'panels/assetViews/ModelAssetView.tsx',
+    ids: ['assetView.model.rig.uastcRdoLambda'],
+    why: 'the rigged-model UASTC RDO lambda field — #724.',
+  },
+  {
+    file: 'panels/assetViews/TextureAssetView.tsx',
+    ids: ['assetView.texture.webpQuality', 'assetView.texture.uastcRdoLambda', '`assetView.texture.nineSlice.${edge}`', 'assetView.texture.nineSlice.scale'],
+    why: 'texture import\'s WebP quality / UASTC RDO lambda, and the 9-slice border+scale fields — #724.',
+  },
+  {
+    file: 'panels/assetViews/VideoAssetView.tsx',
+    ids: ['inspector.video.keyframeIntervalSec'],
+    why: 'the video import keyframe-interval field — #724.',
+  },
+  {
+    file: 'panels/assetViews/ShaderAssetView.tsx',
+    ids: ['`shaderAsset.param.${key}.label`'],
+    why: 'the per-param display-label field in the shader schema editor — #724.',
+  },
+  {
+    file: 'panels/UIActionBindingsField.tsx',
+    ids: ['`uiActions.binding.${i}.value`', '`uiActions.binding.${i}.param.${k}`', '`uiActions.binding.${i}.payload`'],
+    why: 'the binding row\'s value/param/freeform-payload fields — #724.',
+  },
+  {
+    file: 'panels/Inspector.tsx',
+    ids: ['`audio.clip.${i}.key`', '`inspector.field.${meta.name}.${key}`'],
+    why: 'the audio clip-bank row key field, and the generic string-field renderer\'s BufferedTextInput branch (same id template as the number/boolean branches) — #724.',
+  },
 ];
 
 describe('data-ui-id tagging has not rotted', () => {
@@ -270,5 +343,106 @@ describe('data-ui-id tagging has not rotted', () => {
     for (const id of statics) {
       expect(id.split('.').length, `"${id}" should have at least 3 dot segments`).toBeGreaterThanOrEqual(3);
     }
+  });
+
+  // --- #724: invert the guard for BufferedNumberInput/BufferedTextInput -------------------
+  //
+  // Everything above is an ALLOW-LIST: it fires when a known id is removed/renamed, but it can
+  // NEVER fail because a new control was added untagged — that gap is exactly how #704 closed
+  // two panels and left 26 BufferedNumberInput/BufferedTextInput sites unaddressable (#724).
+  // This section is the other half: a COVERAGE check, scoped narrowly to these two widgets
+  // (not "every input in the app") because they are the two that already know how to render
+  // data-ui-id/-label/-kind (fields.tsx) — nothing else has an established wiring to check yet.
+  //
+  // ⚠️ This is NOT a frozen-baseline/count guard (see "a-frozen-baseline-is-a-merge-hazard" —
+  // this repo has been bitten by exactly that shape before: a guard that freezes a MEASUREMENT
+  // of the code goes red the moment an unrelated branch adds a widget, with both branches green
+  // alone). It asserts an INVARIANT instead — "every element of these two tags passes a
+  // `dataUiId` prop" — which is true or false about a single element in isolation, so two
+  // branches that each add a (correctly tagged) control stay green independently and still merge
+  // green. Passing the PROP is what's checked (a static, syntactic fact about the JSX), not that
+  // the id is a non-empty literal at runtime — that mirrors `BufferedNumberInput` itself, and
+  // the shared-helper pattern (`AssetRefField`, `NumRow`, `Num`, `FieldValueWidget`) where the
+  // prop is optional and the CALLER decides whether to pass a real id.
+  //
+  // `DATA_UI_ID_EXEMPT` is the escape hatch, and it is deliberately near-empty: #724 tagged all
+  // 26 sites this test found untagged (36 controls, counting shared helpers), leaving exactly ONE
+  // entry — a control that is addressable through its WRAPPER, so tagging the input too would give
+  // one logical field two ids. That is the only reason that earns an entry. "It's awkward to
+  // thread an id through this helper" does not: thread the caller-owned id instead, the way
+  // `AssetRefField`/`NumRow`/`Num`/`FieldValueWidget` already do. Keyed by snippet prefix rather
+  // than by line number on purpose, so an exemption cannot silently widen to a whole file or go
+  // stale the moment the file shifts by a line.
+  const SCAN_ROOTS = [
+    path.resolve(__dirname, '../../packages/modoki/src/editor'),
+    path.resolve(__dirname, '../../app'),
+  ];
+
+  function listTsxFiles(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...listTsxFiles(p));
+      else if (entry.name.endsWith('.tsx')) out.push(p);
+    }
+    return out;
+  }
+
+  /** Find every `<BufferedNumberInput …>`/`<BufferedTextInput …>` JSX element in `src` and
+   *  report whether it carries a `dataUiId=` prop. Scans char-by-char from the opening tag to
+   *  its closing `>`, tracking `{}` depth so a `>` inside a JS expression (a generic, a
+   *  comparison, a nested arrow function) doesn't end the element early. */
+  function findBufferedInputs(src: string): Array<{ line: number; hasId: boolean; snippet: string }> {
+    const results: Array<{ line: number; hasId: boolean; snippet: string }> = [];
+    const re = /<(BufferedNumberInput|BufferedTextInput)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(src))) {
+      const start = m.index;
+      let depth = 0, end = -1;
+      for (let i = start; i < src.length; i++) {
+        const c = src[i];
+        if (c === '{') depth++;
+        else if (c === '}') depth--;
+        else if (c === '>' && depth === 0) { end = i; break; }
+      }
+      if (end === -1) continue; // malformed — the other assertions in this file will catch it
+      const chunk = src.slice(start, end + 1);
+      results.push({
+        line: src.slice(0, start).split('\n').length,
+        hasId: /\bdataUiId=/.test(chunk),
+        snippet: chunk.replace(/\s+/g, ' ').slice(0, 100),
+      });
+    }
+    return results;
+  }
+
+  const DATA_UI_ID_EXEMPT: Record<string, string[]> = {
+    // The entity-name header field: BufferedTextInput now forwards data-ui-id (#724), but this
+    // ONE instance is deliberately left un-passed because the surrounding <span> wrapper already
+    // carries `data-ui-id="inspector.header.name"` (asserted above, and load-bearing for
+    // `qa/cases/**`) — passing a SECOND id on the input inside it would tag the same logical
+    // field twice under two different ids. See the comment at the call site.
+    'packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput // Bind the RAW stored name'],
+  };
+
+  it('every BufferedNumberInput/BufferedTextInput passes a dataUiId prop (#724)', () => {
+    const missing: string[] = [];
+    let scanned = 0;
+    for (const root of SCAN_ROOTS) {
+      for (const file of listTsxFiles(root)) {
+        const rel = path.relative(path.resolve(__dirname, '../..'), file);
+        const src = fs.readFileSync(file, 'utf8');
+        const exempt = DATA_UI_ID_EXEMPT[rel] ?? [];
+        for (const hit of findBufferedInputs(src)) {
+          scanned++;
+          if (hit.hasId) continue;
+          if (exempt.some((prefix) => hit.snippet.startsWith(prefix.replace(/\s+/g, ' ')))) continue;
+          missing.push(`${rel}:${hit.line}  ${hit.snippet}`);
+        }
+      }
+    }
+    // This check is worthless if the scan found nothing to check.
+    expect(scanned).toBeGreaterThan(30);
+    expect(missing, `untagged BufferedNumberInput/BufferedTextInput — add dataUiId or an entry in DATA_UI_ID_EXEMPT with a reason:\n${missing.join('\n')}`).toEqual([]);
   });
 });

@@ -139,11 +139,13 @@ describe.skipIf(!hasGames)('committed scenes stay in the current serializer shap
   });
 
   /** ⚠️ No guard compared `version` against the constant until #405, and that is exactly how a
-   *  hand-authored `"version": 13` sat in `games/court/main.scene.json` undetected: 13 is a number
-   *  NOTHING emits (`SCENE_FORMAT_VERSION` is 12, and there is no v12→v13 migration step in
-   *  `loadSceneFile`). The loader only warns for a too-new file, into a console nobody reads in a
-   *  test run, and the markers above are blind to it — so the first editor save "regressed" 13 → 12
-   *  and read as data loss in a bug report.
+   *  hand-authored version number ABOVE the constant once sat undetected in a committed scene: a
+   *  number nothing emits yet. The loader only warns for a too-new file, into a console nobody
+   *  reads in a test run, and the markers above are blind to it — so the first editor save
+   *  "regressed" the hand-typed number back down and read as data loss in a bug report. (This was
+   *  written when `SCENE_FORMAT_VERSION` was 12 and a v13 migration didn't exist yet — it has
+   *  since been added, but the guard below is about ANY future gap between a hand-typed version
+   *  and what the serializer actually emits, not that specific one.)
    *
    *  A version ABOVE the constant is the failure this catches: it is unreachable by the serializer,
    *  so it can only have been typed. BELOW is legitimate and deliberately allowed — that is just a

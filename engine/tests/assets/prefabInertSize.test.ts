@@ -1,11 +1,18 @@
 /**
- * No committed `.prefab.json` authors a UI size on an axis its own anchor stretches (#42).
+ * No committed `.prefab.json` authors an inert UI trait — a value a sibling `UIAnchor` overrides
+ * in total silence (#42, widened by #757's margin arm — both fire from the same
+ * `validatePrefabData`/`inertLayoutWarnings` this test drives, so this guard now covers both, not
+ * just size).
  *
- * The third and last shape of the inert-size trap: a size authored on an axis a stretched
- * `UIAnchor` controls is stored, shown in the Inspector, and never applied. The other two shapes
- * are covered against the scene that contains them (#16 plain entity, #35 instance overrides);
- * this one lives inside the prefab file, so every instance silently inherits a dead value and the
- * trap sits one file further from whoever eventually hits it.
+ * The two shapes this can take:
+ *   - size (#42): `UIElement.width`/`height` authored on an axis a stretched `UIAnchor` sizes
+ *     from its own offsets.
+ *   - margin (#757): `UIElement.margin*` authored on ANY anchor — `applyAnchorStyle` clears all
+ *     four unconditionally, whatever the mode.
+ * Both are the same class of finding on the same trait pair, inside the prefab FILE — so
+ * every instance silently inherits a dead value, one file further from whoever eventually hits
+ * it. The other two authoring shapes are covered against the scene that contains them (#16 plain
+ * entity, #35 instance overrides).
  *
  * This is the FILE-level half of the fix. The editor also warns at prefab WRITE time (Save prefab /
  * Apply to Prefab), which reaches the person who just authored it — but a write-time hook only sees
@@ -14,9 +21,9 @@
  * existed when the check was added. Neither half subsumes the other, which is why both exist.
  *
  * Currently expected to find NOTHING: measured at the time of writing, 89 committed prefabs, only
- * 12 carrying UI traits at all, and 0 authoring an inert size. That makes this a COVERAGE guard,
- * not a bug fix — its job is to keep the count at zero, and its sanity check below is what stops
- * it from passing vacuously if the scan ever stops finding prefabs.
+ * 12 carrying UI traits at all, and 0 authoring any of the three. That makes this a COVERAGE
+ * guard, not a bug fix — its job is to keep the count at zero, and its sanity check below is what
+ * stops it from passing vacuously if the scan ever stops finding prefabs.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -48,7 +55,7 @@ const prefabs = (discoverProjects(PROJECT_ROOT) as { dir: string }[])
   .flatMap((p) => [...walk(p.dir)])
   .concat([...walk(path.join(PROJECT_ROOT, 'engine', 'templates'))]);
 
-describe('committed prefabs author no inert UI size (#42)', () => {
+describe('committed prefabs author no inert UI trait — size or margin (#42, #757)', () => {
   // Gated on the LOOSE predicate: the prefabs come from whatever projects exist (engine/templates
   // alone contributes none), so "is there anything to scan?" is exactly the question. The public
   // RELEASE snapshot on `main` ships no projects at all — unlike the `ci/main` snapshot, which
@@ -59,7 +66,7 @@ describe('committed prefabs author no inert UI size (#42)', () => {
     expect(prefabs.length).toBeGreaterThan(0);
   });
 
-  it('no prefab authors a size on an axis its anchor stretches', () => {
+  it('no prefab authors an inert size or margin against its own anchor', () => {
     const findings: string[] = [];
     for (const abs of prefabs) {
       let data: unknown;
@@ -71,12 +78,31 @@ describe('committed prefabs author no inert UI size (#42)', () => {
       const rel = path.relative(PROJECT_ROOT, abs).replace(/\\/g, '/');
       for (const w of validatePrefabData(data).warnings) findings.push(`${rel} → ${w}`);
     }
+    // Name whichever class of finding actually fired, rather than assuming it is always
+    // width/height (#42's original — and only — shape): a margin finding pointed the author at
+    // "drop the width/height" would send them hunting the wrong field entirely.
+    const isSize = (w: string) => /UIElement\.(width|height) is inert/.test(w);
+    const isMargin = (w: string) => /UIElement\.margin\w+ is inert/.test(w);
+    const guidance: string[] = [];
+    if (findings.some(isSize)) {
+      guidance.push(
+        'SIZE: a width/height authored on an axis the anchor stretches is dead — that axis is '
+        + 'sized from the anchor\'s own offsets. Drop the width/height, or use an anchor that does '
+        + 'not stretch that axis.',
+      );
+    }
+    if (findings.some(isMargin)) {
+      guidance.push(
+        'MARGIN: a margin authored on ANY anchor is dead — the anchor clears all four '
+        + 'unconditionally, whatever its mode. Drop the margin, or move the inset onto the '
+        + 'anchor\'s own offsets.',
+      );
+    }
     expect(
       findings,
-      'A size authored on a STRETCHED axis is dead: the anchor sizes that axis from its two '
-        + 'offsets, so the value is stored and displayed but never applied — and inside a prefab '
-        + 'every instance inherits it. Either drop the width/height, or use an anchor that does '
-        + 'not stretch that axis. See docs/scene-loading.md (pass 4) and docs/ui-system.md.',
+      `A trait value authored against a sibling UIAnchor is stored, shown in the Inspector, and `
+        + `never applied — and inside a prefab every instance inherits it. `
+        + `${guidance.join(' ')} See docs/scene-loading.md (pass 4) and docs/ui-system.md.`,
     ).toEqual([]);
   });
 });

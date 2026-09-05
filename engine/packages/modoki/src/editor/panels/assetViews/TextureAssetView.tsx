@@ -139,6 +139,7 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
                 step={1}
                 onChange={(v) => onChange({ webpQuality: resolveWebpQuality(v) })}
                 style={{ ...inputStyle, flex: 1 }}
+                dataUiId="assetView.texture.webpQuality" dataUiLabel="WebP Quality"
               />
             )}
           </div>
@@ -170,6 +171,7 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
                   max={4}
                   onChange={(v) => onChange({ uastcRdoLambda: resolveUastcRdoLambda(v) })}
                   style={{ ...inputStyle, flex: 1 }}
+                  dataUiId="assetView.texture.uastcRdoLambda" dataUiLabel="UASTC RDO λ"
                 />
               )}
             </div>
@@ -327,14 +329,16 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
                 <span style={labelStyle}>{{ l: 'Left', r: 'Right', t: 'Top', b: 'Bottom' }[edge]}</span>
                 <BufferedNumberInput value={border[edge] ?? 0} step={1}
                   onChange={(v) => updateBorder({ [edge]: Math.max(0, Math.round(v)) })}
-                  style={{ ...inputStyle, width: 56 }} />
+                  style={{ ...inputStyle, width: 56 }}
+                  dataUiId={`assetView.texture.nineSlice.${edge}`} dataUiLabel={{ l: 'Left', r: 'Right', t: 'Top', b: 'Bottom' }[edge]} />
               </div>
             ))}
             <div style={rowStyle}>
               <span style={labelStyle}>Edge scale</span>
               <BufferedNumberInput value={border.scale ?? 1} step={0.05}
                 onChange={(v) => updateBorder({ scale: Math.max(0.05, v || 1) })}
-                style={{ ...inputStyle, width: 56 }} />
+                style={{ ...inputStyle, width: 56 }}
+                dataUiId="assetView.texture.nineSlice.scale" dataUiLabel="Edge scale" />
             </div>
           </div>
           <button data-ui-id="assetView.texture.editNineSlice" data-ui-kind="button" data-ui-label="Edit visually" onClick={() => setNineSliceOpen(true)} style={{ ...reimportBtnStyle, marginTop: 4 }}>Edit visually…</button>

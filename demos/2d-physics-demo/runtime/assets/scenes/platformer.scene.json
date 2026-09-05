@@ -1,6 +1,6 @@
 {
   "id": "b90ac902-508b-41bb-9efc-51054dc68ca3",
-  "version": 12,
+  "version": 13,
   "createdAt": "2026-07-02T13:09:38.706Z",
   "resources": [
     {
@@ -341,7 +341,8 @@
           "text": "Credits",
           "fontSize": 12,
           "fontWeight": "bold",
-          "textAlign": "center"
+          "textAlign": "center",
+          "zIndex": 40
         },
         "UIAction": {
           "bindings": [
@@ -360,8 +361,7 @@
           "right": 14,
           "bottom": 14,
           "pivotX": 1,
-          "pivotY": 1,
-          "zIndex": 40
+          "pivotY": 1
         }
       }
     },
@@ -394,13 +394,13 @@
           "backgroundOpacity": 0.98,
           "borderRadius": 12,
           "borderWidth": 1,
-          "borderColor": 3820122
+          "borderColor": 3820122,
+          "zIndex": 50
         },
         "UIAnchor": {
           "anchor": "center",
           "pivotX": 0.5,
-          "pivotY": 0.5,
-          "zIndex": 50
+          "pivotY": 0.5
         }
       }
     },

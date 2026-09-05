@@ -65,7 +65,7 @@ async function setup() {
   const prototype = makePrototype();
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn(() => ({ prototype, animations: [] })),
-    ensureRiggedModelLoaded: vi.fn(),
+    ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
 
   const { createWorld } = await import('koota');

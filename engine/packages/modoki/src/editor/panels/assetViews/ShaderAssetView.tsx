@@ -111,7 +111,8 @@ export function ShaderAssetView({ path }: { path: string }) {
               <span style={lblStyle}>label</span>
               <div style={{ flex: 1 }}>
                 <BufferedTextInput value={param.label ?? ''} placeholder={key}
-                  onChange={(v) => writeParamMeta(key, 'label', v || undefined)} style={{ ...inputStyle, width: '100%' }} />
+                  onChange={(v) => writeParamMeta(key, 'label', v || undefined)} style={{ ...inputStyle, width: '100%' }}
+                  dataUiId={`shaderAsset.param.${key}.label`} dataUiLabel={key} />
               </div>
             </div>
           </div>

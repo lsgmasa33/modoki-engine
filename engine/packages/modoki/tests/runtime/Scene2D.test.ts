@@ -2413,7 +2413,12 @@ describe('Text2D shader reclaim (#690/#696)', () => {
     vi.doMock('../../src/runtime/rendering/text/mtsdfPixiShader', () => ({
       makeMtsdfPixiShader: (texture: any, atlas: any, style: any, fontSize: any) => ({
         id: ++shaderSeq,
-        resources: { uTexture: texture.source, uSampler: texture.source?.style },
+        // `mtsdfUniforms.uniforms.uScreenPxRange` mirrors the real shader's fontSize-derived
+        // uniform (mtsdfPixiShader.ts:502) — a #749 fast-path test asserts THIS gets updated
+        // on a fontSize-only edit. A mock without it would let that assertion pass vacuously
+        // (see #698's scar: `makePixiShaderInstance` mocked with no `resources` once made a
+        // uniform-write assertion pass whether or not the write actually happened).
+        resources: { uTexture: texture.source, uSampler: texture.source?.style, mtsdfUniforms: { uniforms: { uScreenPxRange: fontSize } } },
         _mtsdfAtlas: { ...atlas },
         _style: { ...style },
         _fontSize: fontSize,
@@ -2426,7 +2431,10 @@ describe('Text2D shader reclaim (#690/#696)', () => {
         return !!p && p.width === atlas.width && p.height === atlas.height
           && p.distanceRange === atlas.distanceRange && p.size === atlas.size && p.type === atlas.type;
       },
-      updateMtsdfPixiMetrics: (shader: any, atlas: any, fontSize: any) => { shader._mtsdfAtlas = { ...atlas }; shader._fontSize = fontSize; },
+      updateMtsdfPixiMetrics: (shader: any, atlas: any, fontSize: any) => {
+        shader._mtsdfAtlas = { ...atlas }; shader._fontSize = fontSize;
+        shader.resources.mtsdfUniforms.uniforms.uScreenPxRange = fontSize;
+      },
       updateMtsdfPixiStyle: (shader: any, style: any) => { shader._style = { ...style }; },
     }));
 
@@ -2560,17 +2568,107 @@ describe('Text2D shader reclaim (#690/#696)', () => {
     const shaderPage0 = slot1.textShaders[slot1.pageNums.indexOf(0)];
     const shaderPage1 = slot1.textShaders[slot1.pageNums.indexOf(1)];
 
-    // Force a relayout (still 'AB', so both pages rebuild) and make the mock's
-    // MeshGeometry constructor throw on the SECOND page built this frame — pages build
-    // in ascending order (0, then 1), so page 0 succeeds and reclaims shaderPage0 before
-    // the throw; page 1's construction never completes, so shaderPage1 is never reused —
-    // it must still be destroyed out of the leftover `reusable` map.
+    // Force a relayout that still spans both pages, and make the mock's MeshGeometry
+    // constructor throw on the SECOND page built this frame — pages build in ascending
+    // order (0, then 1), so page 0 succeeds and reclaims shaderPage0 before the throw;
+    // page 1's construction never completes, so shaderPage1 is never reused — it must
+    // still be destroyed out of the leftover `reusable` map.
+    // ⚠️ A `text` CHANGE, not `fontSize` (#749) — a fontSize-only edit now takes the
+    // layout-only FAST PATH (writes positions in place, never calls buildTextGeometryByPage
+    // / MeshGeometry at all), which would make this whole scenario never fire. Reordering
+    // the letters changes `buildKey` (`t.text` is part of it) so the fast path's
+    // `meshBuildKey` check misses and the full rebuild this test exists to exercise runs.
     pixi.MeshGeometry.__control.throwOnCall = pixi.MeshGeometry.__control.callCount + 2;
-    text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 33 }); // bumps layoutHash
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'BA' }); // bumps layoutHash AND buildKey
 
     expect(() => scene2d.renderFrame()).not.toThrow(); // Scene2D's own try/catch swallows it
 
     expect(shaderPage0.destroyed).toBe(false); // reclaimed before the throw
     expect(shaderPage1.destroyed).toBe(true);  // leftover — must still be destroyed
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // #749: a LAYOUT-ONLY edit (fontSize/align/maxWidth/lineSpacing/letterSpacing, with
+  // font/text/atlasVersion/textDirty unchanged) writes new quad positions into the
+  // EXISTING page geometry instead of rebuilding it — `layoutText` provably reorders
+  // nothing and drops nothing for such an edit (whitespace is the only thing word-wrap
+  // adds/removes, and it never emits a quad). See `canWriteTextPositionsInPlace` for the
+  // guard that verifies this per-frame instead of just assuming it.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('layout-only fast path reuses geometry in place (#749)', () => {
+    it('a fontSize-only change keeps the SAME geometry object, writes NEW positions, and updates uScreenPxRange', async () => {
+      const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const slot1 = renderer.slots.get(text.id());
+      const mesh1 = slot1.pageMeshes[0];
+      const geo1 = mesh1.geometry;
+      const shader1 = slot1.textShaders[0];
+      const positionsBefore = geo1.positions.slice(); // copy — geo1.positions is mutated in place below
+
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 64 }); // layout-only: buildKey unchanged
+      scene2d.renderFrame();
+
+      const slot2 = renderer.slots.get(text.id());
+      const mesh2 = slot2.pageMeshes[0];
+
+      expect(mesh2).toBe(mesh1);                        // same Mesh
+      expect(mesh2.geometry).toBe(geo1);                // same geometry OBJECT — the whole claim
+      expect(slot2.textShaders[0]).toBe(shader1);        // same Shader (already true since #690)
+      // The fast path actually WROTE — not a silent no-op, which would pass the identity
+      // check above just as well.
+      expect(Array.from(mesh2.geometry.positions)).not.toEqual(Array.from(positionsBefore));
+      expect(mesh2.geometry.getBuffer('aPosition').update).toHaveBeenCalled();
+      // Not optional (see the fast-path comment in Scene2D.tsx): uScreenPxRange is
+      // fontSize-derived, so a resized string with a stale value would antialias wrong.
+      expect(shader1.resources.mtsdfUniforms.uniforms.uScreenPxRange).toBe(64);
+    });
+
+    it('a TEXT change (buildKey change) still produces a NEW geometry object — the fast path does not fire unconditionally', async () => {
+      const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const geo1 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA' }); // buildKey changes
+      scene2d.renderFrame();
+
+      const geo2 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+      expect(geo2).not.toBe(geo1);
+    });
+
+    // Adversarial review of the #749 fast path's readiness check (9d3052167) — the
+    // `!!ptex && !ptex.destroyed` half is covered by the tests above, but nothing exercised
+    // the `canReuseMtsdfPixiShader` half added alongside it. Simulate the page texture
+    // moving to a NEW identity (same cache key, e.g. a font atlas repack) while `buildKey`
+    // stays put — the fast path's own texture lookup would see a live, non-destroyed
+    // texture and, on the old `!!ptex && !ptex.destroyed` check alone, wrongly keep writing
+    // positions into geometry built against the OLD texture. `canReuseMtsdfPixiShader`
+    // compares `shader.resources.uTexture` against the texture's CURRENT `source`, so a
+    // swapped texture correctly fails it and forces the full rebuild path instead.
+    it('a page texture that moves to a NEW identity (buildKey unchanged) forces a full rebuild, not the fast path', async () => {
+      const { traits, world, scene2d, fontLoader, renderer, fontTextures } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const geo1 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+
+      // Same cache key ('font1:0') but a brand-new texture object — same posture as an atlas
+      // repack that keeps `atlasVersion` (and so `buildKey`) unchanged but reallocates pages.
+      fontTextures.set('font1:0', { destroyed: false, source: { style: {} } });
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 64 }); // layout-only: buildKey unchanged
+      scene2d.renderFrame();
+
+      const geo2 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+      expect(geo2).not.toBe(geo1); // full rebuild, NOT the fast path's in-place write
+    });
   });
 });

@@ -1731,6 +1731,99 @@ describe('migrateV11toV12 + assignSyntheticEntityIds (scene-loading.md, Phase 3)
   });
 });
 
+describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
+  // UIAnchor.zIndex and UIElement.zIndex used to write the same CSS z-index onto the same
+  // DOM node, with the anchor value winning whenever it was truthy — so the anchor's value
+  // is what actually rendered, and the migration must carry that value forward.
+  it('a truthy UIAnchor.zIndex overwrites a sibling UIElement.zIndex and is then removed', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 15 },
+          UIElement: { zIndex: 0 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(15);
+  });
+
+  it('a value conflict resolves to the ANCHOR value (it is what rendered before this change)', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 1000 },
+          UIElement: { zIndex: 100 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(1000);
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  it('a falsy (0) UIAnchor.zIndex is dropped without touching UIElement.zIndex', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 0 },
+          UIElement: { zIndex: 42 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(42);
+  });
+
+  it('is idempotent — running it twice changes nothing further', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 7 },
+          UIElement: { zIndex: 0 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    const once = JSON.parse(JSON.stringify(data));
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data).toEqual(once);
+  });
+
+  it('an entity with UIAnchor.zIndex but no UIElement trait does not crash and does not invent one', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 15 },
+          EntityAttributes: { name: 'X', parentId: 0 },
+        },
+      }],
+    };
+    await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+      .resolves.not.toThrow();
+    expect((data.entities[0].traits as any).UIElement).toBeUndefined();
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+});
+
 /** A prefab-instance override over a SoA field with NO Inspector metadata.
  *
  *  This is the LOAD half of the reported data loss: a load→save on

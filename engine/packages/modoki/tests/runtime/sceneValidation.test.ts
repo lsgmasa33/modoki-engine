@@ -1032,3 +1032,4 @@ describe('validateSceneData — margin inert on a prefab-instance override (#757
     expect(res.warnings.join('\n')).not.toMatch(/marginTop is inert/);
   });
 });
+

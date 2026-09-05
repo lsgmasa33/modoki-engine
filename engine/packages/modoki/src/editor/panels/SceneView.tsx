@@ -50,6 +50,7 @@ import {
 } from '../../runtime/core/activeRenderer';
 import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
+import { disposeSceneViewEntityObjects } from './sceneViewResources';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
@@ -3808,30 +3809,32 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // Before the meshes go: release() restores each mesh's previous material slot.
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
-      for (const [, outline] of outlineMeshes) { scene.remove(outline); outline.geometry.dispose(); (outline.material as THREE.Material).dispose(); }
-      outlineMeshes.clear();
-      for (const [id] of colliderWires) disposeColliderWire(id);
       // Skip the persistent camGizmoPivot — it's added to scene once at init
       // and reused across world swaps. Removing it here would orphan it and
-      // make TransformControls warn every frame on next Camera select.
-      for (const [, g] of ecsGizmos) {
-        if (g === camGizmoPivot) continue;
-        scene.remove(g);
-        ((g as THREE.Mesh).material as THREE.Material)?.dispose();
-      }
-      ecsGizmos.clear();
+      // make TransformControls warn every frame on next Camera select. This also disposes
+      // descOutlineMeshes on swap (previously left to the next frame's prune) — a strict
+      // improvement, not a behaviour this issue asked for.
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights }, camGizmoPivot);
       particleGizmoIds.clear();
       particleScratchIds.clear();
       emptyGizmoIds.clear();
       emptyScratchIds.clear();
       frameGizmoIds.clear();
       frameScratchIds.clear();
+      // koota recycles entity ids across a world swap. If these weren't cleared here, a
+      // stale id (e.g. 5, a Zone3D in the OLD scene) could be reused for a different
+      // entity type in the NEW scene (a Light, even the active Camera) — the zone reap
+      // loop in the frame callback below would then wrongly tear down that other
+      // entity's gizmo for one frame
+      // (scene.remove + material.dispose + ecsGizmos.delete) before self-healing next
+      // frame. Same family as #738/#759: a structure keyed on a recyclable entity id
+      // outliving the world that minted the id.
+      zoneGizmoIds.clear();
+      zoneScratchIds.clear();
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
       lastPreviewT = 0;
-      for (const [, l] of ecsLights) { scene.remove(l); l.dispose(); }
-      ecsLights.clear();
       if (scene.environment) { scene.environment = null; }
     });
 
@@ -4870,15 +4873,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
-      for (const [, outline] of outlineMeshes) {
-        outline.geometry.dispose();
-        (outline.material as THREE.Material).dispose();
-      }
-      for (const [, gizmo] of ecsGizmos) {
-        // Some gizmos are THREE.Group containers (no material) — the onWorldSwap
-        // teardown above already uses `?.dispose()` defensively; mirror that here.
-        ((gizmo as THREE.Mesh).material as THREE.Material | undefined)?.dispose();
-      }
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights });
       grid.geometry.dispose(); (grid.material as THREE.Material).dispose();
       axes.geometry.dispose(); (axes.material as THREE.Material).dispose();
       scene.environment = null; // detach shared env — cache owns the texture
@@ -4891,6 +4886,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       GIZMO_SHAPES.particle.dispose();
       GIZMO_SHAPES.empty.dispose();
       GIZMO_SHAPES.frameBox.dispose();
+      GIZMO_SHAPES.zoneSphere.dispose();
+      GIZMO_SHAPES.zoneCircle.dispose();
+      GIZMO_SHAPES.zonePlane.dispose();
+      GIZMO_SHAPES.zoneCylinder.dispose();
       scene.clear();
       // Drop our hold instead of disposing outright. Under StrictMode this cleanup is followed
       // immediately by a remount, which re-acquires the same renderer; the lease only tears the

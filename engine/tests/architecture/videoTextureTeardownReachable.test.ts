@@ -44,7 +44,10 @@ const sites: [label: string, rel: string, regionStart: string, regionEnd: string
     'SceneView.tsx onWorldSwap',
     'engine/packages/modoki/src/editor/panels/SceneView.tsx',
     'const unsubSwap = onWorldSwap(() => {',
-    'for (const [, outline] of outlineMeshes) { scene.remove(outline);',
+    // The statement immediately after `disposeRenderState` in that handler. It used to be the
+    // inline `for (const [, outline] of outlineMeshes)` loop; #737 replaced the handler's four
+    // inline disposal loops with one call to the shared helper, so the marker moved with it.
+    'disposeSceneViewEntityObjects(scene,',
   ],
   [
     'SceneView.tsx effect-cleanup teardown',

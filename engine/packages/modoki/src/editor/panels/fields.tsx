@@ -205,7 +205,7 @@ export function useWheelStep<T extends HTMLElement>(
   }, [ref, onStep, enabled]);
 }
 
-export function BufferedTextInput({ value, onChange, style, placeholder, mixed, validate, multiline, readOnly }: { value: string; onChange: (v: string) => void; style?: React.CSSProperties; placeholder?: string; mixed?: boolean; validate?: (v: string) => boolean; multiline?: boolean; readOnly?: boolean }) {
+export function BufferedTextInput({ value, onChange, style, placeholder, mixed, validate, multiline, readOnly, dataUiId, dataUiLabel, dataUiKind }: { value: string; onChange: (v: string) => void; style?: React.CSSProperties; placeholder?: string; mixed?: boolean; validate?: (v: string) => boolean; multiline?: boolean; readOnly?: boolean; dataUiId?: string; dataUiLabel?: string; dataUiKind?: string }) {
   const { localValue, onFocus, onBlur, handleChange, valid } = useBufferedValue(value, onChange, parseString, mixed, validate);
   const invalidStyle = valid ? null : { outline: '1px solid #e06c6c', outlineOffset: -1 };
   // Read-only fields (e.g. runtimeOnly read-backs like Animator.activeClip/fadeFrom) show
@@ -217,12 +217,14 @@ export function BufferedTextInput({ value, onChange, style, placeholder, mixed, 
   if (multiline) {
     return <textarea value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : placeholder} readOnly={readOnly}
       rows={2} onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)}
-      style={{ ...style, resize: 'vertical', minHeight: '2.4em', fontFamily: 'inherit', ...invalidStyle, ...roStyle }} />;
+      style={{ ...style, resize: 'vertical', minHeight: '2.4em', fontFamily: 'inherit', ...invalidStyle, ...roStyle }}
+      data-ui-id={dataUiId} data-ui-label={dataUiLabel} data-ui-kind={dataUiKind} />;
   }
   return <input type="text" value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : placeholder} readOnly={readOnly}
     onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)}
     title={valid ? undefined : 'Not a valid asset reference — drop an asset or paste its GUID'}
-    style={{ ...style, ...invalidStyle, ...roStyle }} />;
+    style={{ ...style, ...invalidStyle, ...roStyle }}
+    data-ui-id={dataUiId} data-ui-label={dataUiLabel} data-ui-kind={dataUiKind} />;
 }
 
 export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, dataUiId, dataUiLabel, dataUiKind }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number; dataUiId?: string; dataUiLabel?: string; dataUiKind?: string }) {

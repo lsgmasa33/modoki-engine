@@ -57,7 +57,7 @@ async function setup() {
   // No real GLB fetch for the skeletal path: rig "not loaded" → skinned sync
   // skips the entity (exercises the trio without IO).
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
 
   const { createWorld } = await import('koota');
@@ -292,6 +292,12 @@ describe('syncSkinnedModels — lifecycle', () => {
   // riggedModelCache mock hands back per model ref (doMock is not hoisted, so its
   // factory closes over these holders, resolved at import time).
   async function setupSkinned() {
+    // A later test in this describe (`routes the SkinnedModel.model pin through the
+    // SCENE-SCOPED acquire...`) doMocks `SceneManager` to a fixed scene id and doMock
+    // survives `resetModules()` — restore the real module here so every OTHER test in
+    // this describe still gets the real `getCurrentSceneId() === undefined`, matching
+    // the "deliberately mocks NO SceneManager" comment below.
+    vi.doMock('../../src/runtime/scene/SceneManager', async (orig: () => Promise<unknown>) => await orig());
     vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
     vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
     vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
@@ -312,6 +318,15 @@ describe('syncSkinnedModels — lifecycle', () => {
     vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
       getRiggedModel: vi.fn((ref: string) => rigs.byRef.get(ref)),
       ensureRiggedModelLoaded: ensure,
+      // This suite deliberately mocks NO `SceneManager`, so `getCurrentSceneId()` really
+      // is undefined and `lazyAcquireRiggedModel` takes the no-scene FALLBACK to the
+      // editor pin (the spy above) — that is the case this suite exercises. It is NOT
+      // the normal path: see 'routes the SkinnedModel.model pin through the SCENE-SCOPED
+      // acquire...' below, which mocks a real current scene and covers the #747 primary
+      // call site (scene3DSync.ts's `lazyAcquireRiggedModel` call in `syncSkinnedModels`).
+      // This sibling export exists only to satisfy the import binding here — never
+      // expected to be called in THIS suite.
+      ensureRiggedModelLoadedFor: vi.fn(),
     }));
     const { createWorld } = await import('koota');
     const traits = await import('../../src/runtime/traits');
@@ -361,6 +376,66 @@ describe('syncSkinnedModels — lifecycle', () => {
 
     expect(state.skinned.size).toBe(0);
     expect(ensureSpy.fn).toHaveBeenCalledWith('pending.glb');
+  });
+
+  it('routes the SkinnedModel.model pin through the SCENE-SCOPED acquire when a scene is loaded (#747 primary call site)', async () => {
+    // Unlike the sibling test above (no scene loaded → exercises the fallback), this
+    // mocks a real current scene so the `syncSkinnedModels` → `lazyAcquireRiggedModel`
+    // call at scene3DSync.ts's "kick a SCENE-SCOPED lazy load" site takes its NORMAL
+    // path: own the model with the current scene, not the editor session pin. This is
+    // the call site #747 is actually about — it fires for every skinned entity whose
+    // manifest acquire hasn't resolved yet.
+    vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
+    vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+      worldTransforms: new Map(), deactivatedEntities: new Set(),
+    }));
+    vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+      resolveMeshTemplate: vi.fn(), resolveMaterialForMesh: vi.fn(), resolveMaterial: vi.fn(),
+      getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
+      onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+    vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
+    const ensureFor = vi.fn();     // the scene-scoped acquire — must fire
+    const ensure = vi.fn();        // the editor session pin — must NOT fire
+    vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
+      getRiggedModel: vi.fn(() => undefined), // "not loaded yet" branch
+      ensureRiggedModelLoaded: ensure,
+      ensureRiggedModelLoadedFor: ensureFor,
+    }));
+    vi.doMock('../../src/runtime/scene/SceneManager', () => ({ getCurrentSceneId: () => 7 }));
+
+    const { createWorld } = await import('koota');
+    const traits = await import('../../src/runtime/traits');
+    const sync = await import('../../src/runtime/rendering/scene3DSync');
+    const T = await import('three');
+    const { Transform, SkinnedModel } = traits;
+    const world = createWorld();
+    world.spawn(Transform(), SkinnedModel({ model: 'pending.glb', isVisible: true }));
+    const state = sync.createRenderState();
+
+    sync.syncSkinnedModels(world, new T.Scene(), state);
+
+    expect(ensureFor).toHaveBeenCalledWith(7, 'pending.glb');
+    expect(ensure).not.toHaveBeenCalled();
+    world.destroy(); // release the koota world id — this file is already near the process cap
+  });
+
+  // Declared straight after the SceneManager doMock above (which never restores it) —
+  // if `setupSkinned()` didn't restore the real module too, `getCurrentSceneId()` would
+  // still read 7 here and this would wrongly take the scene-scoped path.
+  it('still takes the no-scene fallback in a LATER test, proving the SceneManager mock above does not leak', async () => {
+    const { world, traits, sync, T } = await setupSkinned();
+    const { Transform, SkinnedModel } = traits;
+    world.spawn(Transform(), SkinnedModel({ model: 'pending.glb', isVisible: true }));
+    const state = sync.createRenderState();
+    sync.syncSkinnedModels(world, new T.Scene(), state);
+
+    expect(ensureSpy.fn).toHaveBeenCalledWith('pending.glb'); // editor-pin fallback fired
+    world.destroy(); // release the koota world id — this file is already near the process cap
   });
 
   it('rebuilds the entry when the model ref changes (old disposed, new clone added)', async () => {
@@ -511,7 +586,7 @@ describe('syncEnvironment — cached branch is change-gated', () => {
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
     vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-      getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+      getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
     }));
     const { createWorld } = await import('koota');
     const { Environment } = await import('../../src/three/traits/Environment');

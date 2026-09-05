@@ -140,8 +140,8 @@ export function EntityRefField({ label, value, onChange, hint, mixed = false }: 
 /** Renders a single typed value editor driven by a field's FieldHint — the inner
  *  "value" cell of a binding row. Reuses the same leaf widgets the Inspector uses so
  *  isVisible→checkbox, a color field→color picker, a ref field→entity drag-drop. */
-export function FieldValueWidget({ hint, value, onChange, mixed = false }: {
-  hint: FieldHint | undefined; value: unknown; onChange: (v: unknown) => void; mixed?: boolean;
+export function FieldValueWidget({ hint, value, onChange, mixed = false, dataUiId, dataUiLabel }: {
+  hint: FieldHint | undefined; value: unknown; onChange: (v: unknown) => void; mixed?: boolean; dataUiId?: string; dataUiLabel?: string;
 }) {
   if (hint?.type === 'boolean') {
     return <input type="checkbox" checked={mixed ? false : !!value}
@@ -150,7 +150,7 @@ export function FieldValueWidget({ hint, value, onChange, mixed = false }: {
   }
   if (hint?.type === 'number') {
     return <BufferedNumberInput value={typeof value === 'number' ? value : 0} step={hint.step ?? 1} mixed={mixed}
-      onChange={(v) => onChange(v)} style={{ ...inputStyle, flex: 1 }} />;
+      onChange={(v) => onChange(v)} style={{ ...inputStyle, flex: 1 }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   if (hint?.type === 'color') {
     return <ColorField label="" value={typeof value === 'number' ? value : 0} onChange={(v) => onChange(v)} mixed={mixed} />;
@@ -168,5 +168,5 @@ export function FieldValueWidget({ hint, value, onChange, mixed = false }: {
   }
   // string + unknown-type fallback
   return <BufferedTextInput value={value == null ? '' : String(value)} onChange={(v) => onChange(v)}
-    mixed={mixed} placeholder="value" style={{ ...inputStyle, flex: 1 }} />;
+    mixed={mixed} placeholder="value" style={{ ...inputStyle, flex: 1 }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
 }

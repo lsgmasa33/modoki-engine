@@ -1575,7 +1575,7 @@ function anchor(over: Partial<NonNullable<UINodeData['anchor']>> = {}): NonNulla
   return {
     anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
     bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-    pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0, ...over,
+    pivotX: 0, pivotY: 0, safeArea: false, ...over,
   };
 }
 
@@ -1638,7 +1638,7 @@ describe('UIElement.rotation (#234)', () => {
       anchor: {
         anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
         bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-        pivotX: 0.5, pivotY: 0.5, safeArea: false, zIndex: 0,
+        pivotX: 0.5, pivotY: 0.5, safeArea: false,
       },
     });
     const el = render(<UINode node={node} storeState={{}} />).container.firstElementChild as HTMLElement;
@@ -1711,7 +1711,7 @@ describe('UIToggle default-size fallback (#744)', () => {
   // size to let that happen — so the axis reads as unsized from here while being anything but.
   // `isSizeInert` is the shared predicate (Inspector + scene validator use the same one).
   it('adds no fallback min on an anchor-stretched axis, whose cleared CSS size is not "unsized"', () => {
-    const anchor = { anchor: 'stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0 };
+    const anchor = { anchor: 'stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false };
     const track = renderNode(makeNode({ guid: 'tg-744-5', width: 0, height: 0, anchor, toggle: toggle() }));
     expect(track.style.position).toBe('absolute');
     expect(track.style.minWidth).toBe('');
@@ -1763,7 +1763,7 @@ describe('UIToggle default-size fallback (#744)', () => {
   it('a HALF-stretched anchor still gets the fallback on its live axis only', () => {
     // `top-stretch` stretches X and leaves Y live (see STRETCH_X/STRETCH_Y), so width is sized by
     // the offsets and height is not — the fallback must land on exactly one of them.
-    const anchor = { anchor: 'top-stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0 };
+    const anchor = { anchor: 'top-stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false };
     const track = renderNode(makeNode({ guid: 'tg-744-6', width: 0, height: 0, anchor, toggle: toggle() }));
     expect(track.style.minWidth).toBe('');
     expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);

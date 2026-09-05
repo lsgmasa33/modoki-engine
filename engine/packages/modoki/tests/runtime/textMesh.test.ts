@@ -2,7 +2,7 @@
  *  promotion. A single quad is enough to pin every corner exactly. */
 
 import { describe, it, expect } from 'vitest';
-import { buildTextGeometry, buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from '../../src/runtime/rendering/text/textMesh';
+import { buildTextGeometry, buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from '../../src/runtime/rendering/text/textMesh';
 import type { TextQuad } from '../../src/runtime/rendering/text/layoutText';
 
 const quad: TextQuad = { unicode: 65, x0: 10, y0: 0, x1: 60, y1: 80, u0: 0, v0: 0, u1: 0.5, v1: 0.8, page: 0 };
@@ -101,6 +101,45 @@ describe('buildTextPositionsByPage (animation hot path)', () => {
 
   it('handles an empty quad list', () => {
     expect(buildTextPositionsByPage([])).toEqual([]);
+  });
+});
+
+describe('canWriteTextPositionsInPlace (#749 layout-only fast path guard)', () => {
+  const q0 = { ...quad, page: 0 };
+  const q1 = { ...quad, page: 1, x0: 100 };
+
+  it('true when pages and per-page quad counts match', () => {
+    const pages = buildTextPositionsByPage([q0, q1]);
+    const existing = pages.map((p) => ({ page: p.page, positionsLength: p.positions.length }));
+    expect(canWriteTextPositionsInPlace(pages, existing)).toBe(true);
+  });
+
+  it('false when the page COUNT differs', () => {
+    const pages = buildTextPositionsByPage([q0, q1]);
+    const existing = [{ page: 0, positionsLength: pages[0].positions.length }]; // missing page 1
+    expect(canWriteTextPositionsInPlace(pages, existing)).toBe(false);
+  });
+
+  it('false when the same count of pages carries a differing page NUMBER', () => {
+    const pages = buildTextPositionsByPage([q0, q1]); // pages 0, 1
+    const existing = [
+      { page: 0, positionsLength: pages[0].positions.length },
+      { page: 2, positionsLength: pages[1].positions.length }, // page 2, not 1
+    ];
+    expect(canWriteTextPositionsInPlace(pages, existing)).toBe(false);
+  });
+
+  it('false when a per-page quad count differs', () => {
+    const pages = buildTextPositionsByPage([q0, { ...q0 }, q1]); // page 0 has 2 quads, page 1 has 1
+    const existing = [
+      { page: 0, positionsLength: pages[0].positions.length / 2 }, // pretend page 0 used to have 1 quad
+      { page: 1, positionsLength: pages[1].positions.length },
+    ];
+    expect(canWriteTextPositionsInPlace(pages, existing)).toBe(false);
+  });
+
+  it('true when both are empty', () => {
+    expect(canWriteTextPositionsInPlace([], [])).toBe(true);
   });
 });
 

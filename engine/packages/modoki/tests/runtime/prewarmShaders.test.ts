@@ -74,7 +74,7 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),
-    ensureRiggedModelLoaded: vi.fn(),
+    ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   // A primitive factory that returns a REAL mesh, so the dedupe test can count the
   // placeholders that actually reached the compile. Each call yields a fresh object,

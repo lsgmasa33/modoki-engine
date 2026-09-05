@@ -12,9 +12,10 @@
 
 import { describe, it, expect } from 'vitest';
 import type { CSSProperties } from 'react';
-import { applyAnchorStyle, applyRotationStyle, type AnchorCssData } from '../../src/runtime/ui/anchorCss';
+import { applyAnchorStyle, applyRotationStyle } from '../../src/runtime/ui/anchorCss';
+import type { AnchorData } from '../../src/runtime/ui/anchorLayout';
 
-function anchor(over: Partial<AnchorCssData> = {}): AnchorCssData {
+function anchor(over: Partial<AnchorData> = {}): AnchorData {
   return {
     anchor: 'center',
     top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
@@ -23,7 +24,7 @@ function anchor(over: Partial<AnchorCssData> = {}): AnchorCssData {
   };
 }
 
-const styleFor = (over: Partial<AnchorCssData>): CSSProperties => {
+const styleFor = (over: Partial<AnchorData>): CSSProperties => {
   const s: CSSProperties = {};
   applyAnchorStyle(s, anchor(over));
   return s;
@@ -161,16 +162,12 @@ describe('applyAnchorStyle — emitted declarations', () => {
     expect(s.marginLeft).toBeUndefined();
   });
 
-  it('zIndex is emitted only when non-zero', () => {
-    expect(styleFor({ anchor: 'center', zIndex: 5 }).zIndex).toBe(5);
-    expect(styleFor({ anchor: 'center', zIndex: 0 }).zIndex).toBeUndefined();
-  });
 });
 
 /** #234 — the tilt. The whole risk is that it COMPOSES with the anchor rather than replacing it,
  *  and that the point it turns about is the one the anchor pinned. */
 describe('applyRotationStyle — the tilt (#234)', () => {
-  const tilted = (deg: number, over: Partial<AnchorCssData> = {}): CSSProperties => {
+  const tilted = (deg: number, over: Partial<AnchorData> = {}): CSSProperties => {
     const s: CSSProperties = {};
     const a = anchor(over);
     applyAnchorStyle(s, a);
@@ -224,7 +221,7 @@ describe('applyRotationStyle — the tilt (#234)', () => {
  *  `scale: 0` is a legitimate authored value (a pop-in's first keyframe) and must not be mistaken
  *  for "unset". */
 describe('applyRotationStyle — the scale (#340)', () => {
-  const scaled = (scale: number, over: Partial<AnchorCssData> = {}, deg = 0): CSSProperties => {
+  const scaled = (scale: number, over: Partial<AnchorData> = {}, deg = 0): CSSProperties => {
     const s: CSSProperties = {};
     const a = anchor(over);
     applyAnchorStyle(s, a);

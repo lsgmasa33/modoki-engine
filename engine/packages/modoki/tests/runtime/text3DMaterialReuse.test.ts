@@ -71,7 +71,7 @@ async function setup(opts: SetupOpts) {
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
   vi.doMock('../../src/runtime/loaders/textureResolver', () => ({

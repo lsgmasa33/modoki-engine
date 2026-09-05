@@ -42,7 +42,7 @@ import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle, canReuseMtsdfPixiShader, updateMtsdfPixiMetrics } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
-import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
+import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import type { TextQuad } from './text/layoutText';
 import { getTextDirtyVersion, onTextDirty } from './text/textDirty';
 import type { MtsdfStyle } from './text/mtsdfStyle';
@@ -95,6 +95,14 @@ type DisplayKind = 'graphics' | 'sprite' | 'mesh' | 'text' | 'material';
 // geometry — Scene2D re-uploads positions only when skin2DSystem bumps it. -1 for
 // non-mesh slots. For a mesh slot `spriteRef` holds the rig ref (change detection).
 interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; spriteRef: string; textureUrl: string; hasFrame: boolean; builtEpoch: number; meshVersion: number; meshFrameKey?: string;
+  // Text slots only (#749): the QUAD-SET half of `meshFrameKey` — [font, text, atlasVersion,
+  // textDirtyVersion], a subset of the fields in `layoutHash`. `meshFrameKey` changing but
+  // `meshBuildKey` NOT (a fontSize/align/maxWidth/lineSpacing/letterSpacing-only edit) means the
+  // quad sequence is provably unchanged (see `canWriteTextPositionsInPlace`), so positions can be
+  // written into the existing page geometry instead of rebuilding it. Undefined on a fresh slot,
+  // which can never equal a real key (same sentinel reasoning as `meshFrameKey` below), so a
+  // first build always takes the full rebuild path.
+  meshBuildKey?: string;
   // Skinned-mesh slots (kind 'mesh'): obj is a Container holding one Mesh per rig part.
   meshes?: Mesh[]; partUrls?: string[];
   // Text slots (kind 'text'): obj is a Container holding one Mesh per atlas PAGE (in
@@ -2159,74 +2167,138 @@ export class Scene2DRenderer {
               fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
               lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
             });
-            const style = textStyle2D(t);
-            // Reclaim the existing shaders BEFORE tearing anything down, indexed by PAGE
-            // NUMBER (not array index — a page can be skipped below when its texture isn't
-            // ready yet, so `pageNums` and the array index can disagree). A Shader depends
-            // only on the page texture + atlas geometry (#690); fontSize/style reach it
-            // purely through uniforms, so a plain text/fontSize edit can keep the same
-            // Shader instead of paying for a new one (and its UniformGroup — see #699).
-            // This does NOT save a GL/GPU program compile: the programs are already shared
-            // module-level via `getMtsdfPrograms` ("Program cache (fixes #590)").
-            const reusable = new Map<number, Shader>();
-            if (slot.pageNums && slot.textShaders) {
-              for (let i = 0; i < slot.pageNums.length; i++) {
-                const s = slot.textShaders[i];
-                if (s) reusable.set(slot.pageNums[i], s);
-              }
-            }
-            // Rebuild all page geometry (a layout/atlas change is infrequent). Bare
-            // `destroy()` — Mesh.destroy() sets `_shader = null` and does not destroy the
-            // shader, which is why a reclaimed shader survives its mesh being destroyed.
-            for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
-            slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
-            try {
-              for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
+
+            // #749: the QUAD-SET half of `layoutHash` — unchanged means the new layout can only
+            // differ from the old one in each quad's x/y (same count, unicodes, order, page
+            // assignment, UVs — see `canWriteTextPositionsInPlace`'s comment). Computed HERE, not
+            // per-frame — this whole branch only runs on a `meshFrameKey` miss, so the per-frame
+            // path (below, outside this `if`) gains zero string-concat allocations from this.
+            const buildKey = [t.font, t.text, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+            let fastPathApplied = false;
+            if (slot.meshBuildKey === buildKey && slot.pageMeshes?.length && slot.pageNums) {
+              const pageMeshes = slot.pageMeshes;
+              const pagePositions = buildTextPositionsByPage(layout.quads);
+              const existing = slot.pageNums.map((page, i) => ({ page, positionsLength: pageMeshes[i].geometry.positions.length }));
+              // Same "destroyed but truthy" posture as the full-rebuild page loop below (#481) —
+              // never write positions against a dead page texture. ALSO re-checks
+              // `canReuseMtsdfPixiShader` per page: `updateMtsdfPixiMetrics` below is
+              // documented to skip `uTexSize`/`uDistanceRange`/`uHasTrueSdf` ONLY because
+              // `canReuseMtsdfPixiShader` already guarantees those are unchanged — the full
+              // rebuild path only ever calls it behind that same check, and this fast path must
+              // establish the precondition itself rather than assume it. If the atlas ever moved
+              // while `buildKey` stayed put, skipping this would render with STALE atlas uniforms
+              // AND re-stash `shader._mtsdfAtlas = atlas`, so the very next
+              // `canReuseMtsdfPixiShader` would compare new-against-new and return true —
+              // keeping the wrong shader forever, a failure that conceals itself. Every path
+              // found that moves the atlas also bumps `atlasVersion` or calls `markTextDirty`
+              // (both already inside `buildKey`), so this is believed UNREACHABLE today; checked
+              // anyway because refusing is cheap and matches this block's "never apply
+              // half-way" posture. (The fast path never re-binds `mesh.texture` either — safe
+              // only because a page Texture's identity is stable for the provider's life
+              // (`fontTexturePixi.ts` caches by provider id + page); the full rebuild path
+              // self-heals a moved texture by rebuilding the Mesh, the fast path does not.)
+              const texturesReady = slot.pageNums.every((page, i) => {
                 const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
-                // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
-                // where a just-minted texture is torn down inside the same call (#481, an
-                // already-disposed provider's addDisposable running synchronously). Same posture as
-                // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
-                if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
-                // Pixi MeshGeometry wants a Uint32Array index buffer.
-                const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
-                const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
-                // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
-                // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
-                // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
-                geometry.addAttribute('aTextColor', {
-                  buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
-                  format: 'float32x4', stride: 4 * 4, offset: 0,
-                });
-                let shader = reusable.get(page);
-                if (shader && canReuseMtsdfPixiShader(shader, ptex, atlas)) {
-                  reusable.delete(page);
-                  updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
-                } else {
-                  shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
+                const shader = slot!.textShaders?.[i];
+                return !!ptex && !ptex.destroyed && !!shader && canReuseMtsdfPixiShader(shader, ptex, atlas);
+              });
+              if (texturesReady && canWriteTextPositionsInPlace(pagePositions, existing)) {
+                for (const { page, positions } of pagePositions) {
+                  const mi = slot.pageNums.indexOf(page);
+                  const mesh = pageMeshes[mi];
+                  mesh.geometry.positions.set(positions);
+                  mesh.geometry.getBuffer('aPosition').update();
                 }
-                const mesh = new Mesh({ geometry, texture: ptex, shader });
-                container.addChild(mesh);
-                slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+                // NOT optional: `uScreenPxRange` is derived from fontSize (mtsdfPixiShader.ts:502),
+                // so skipping this renders a resized string with the wrong antialiasing width, and
+                // it also re-stashes `_mtsdfAtlas` for the later shadow-offset clamp.
+                for (const shader of slot.textShaders ?? []) updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
+                slot.meshFrameKey = layoutHash;
+                slot.textW = layout.width; slot.textH = layout.height;
+                slot.baseQuads = layout.quads;
+                // ⚠️ Do NOT touch `wasMotion`/`wasColored` here. The full rebuild below clears both
+                // because it produces new geometry AND a new `aTextColor` buffer, both at base state.
+                // This fast path writes base POSITIONS only and leaves the colour buffer untouched,
+                // so clearing `wasColored` would strand an animated colour in that buffer with
+                // nothing left to restore it. Leaving both alone lets the per-glyph animation block
+                // below do exactly what it would otherwise have done (at worst one redundant
+                // base-pose write in the frame an animation stops).
+                slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good build clears the streak
+                fastPathApplied = true;
               }
-            } finally {
-              // Destroy any shaders NOT reclaimed above (a page the text no longer touches,
-              // or whose texture/atlas changed under it).
-              // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
-              // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
-              // every text entity in the process), so `destroy(true)` here would null the SHARED
-              // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
-              // every canvas too.
-              // ⚠️ `finally`, NOT a plain trailing loop: a throw inside the page loop (context loss, a
-              // failed buffer allocation — the pass's catch below expects those) would otherwise strand
-              // every reclaimed shader, unreachable AND already removed from slot.textShaders, so
-              // disposeSlot cannot free them either. That is the exact leak #690 exists to remove.
-              for (const s of reusable.values()) s.destroy();
             }
-            slot.meshFrameKey = layoutHash;
-            slot.textW = layout.width; slot.textH = layout.height;
-            slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
-            slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good rebuild clears the streak
+
+            if (!fastPathApplied) {
+              const style = textStyle2D(t);
+              // Reclaim the existing shaders BEFORE tearing anything down, indexed by PAGE
+              // NUMBER (not array index — a page can be skipped below when its texture isn't
+              // ready yet, so `pageNums` and the array index can disagree). A Shader depends
+              // only on the page texture + atlas geometry (#690); fontSize/style reach it
+              // purely through uniforms, so a plain text/fontSize edit can keep the same
+              // Shader instead of paying for a new one (and its UniformGroup — see #699).
+              // This does NOT save a GL/GPU program compile: the programs are already shared
+              // module-level via `getMtsdfPrograms` ("Program cache (fixes #590)").
+              const reusable = new Map<number, Shader>();
+              if (slot.pageNums && slot.textShaders) {
+                for (let i = 0; i < slot.pageNums.length; i++) {
+                  const s = slot.textShaders[i];
+                  if (s) reusable.set(slot.pageNums[i], s);
+                }
+              }
+              // Rebuild all page geometry (a layout/atlas change is infrequent). Bare
+              // `destroy()` — Mesh.destroy() sets `_shader = null` and does not destroy the
+              // shader, which is why a reclaimed shader survives its mesh being destroyed.
+              for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
+              slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
+              try {
+                for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
+                  const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                  // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
+                  // where a just-minted texture is torn down inside the same call (#481, an
+                  // already-disposed provider's addDisposable running synchronously). Same posture as
+                  // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
+                  if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
+                  // Pixi MeshGeometry wants a Uint32Array index buffer.
+                  const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
+                  const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
+                  // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
+                  // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
+                  // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
+                  geometry.addAttribute('aTextColor', {
+                    buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
+                    format: 'float32x4', stride: 4 * 4, offset: 0,
+                  });
+                  let shader = reusable.get(page);
+                  if (shader && canReuseMtsdfPixiShader(shader, ptex, atlas)) {
+                    reusable.delete(page);
+                    updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
+                  } else {
+                    shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
+                  }
+                  const mesh = new Mesh({ geometry, texture: ptex, shader });
+                  container.addChild(mesh);
+                  slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+                }
+              } finally {
+                // Destroy any shaders NOT reclaimed above (a page the text no longer touches,
+                // or whose texture/atlas changed under it).
+                // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
+                // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
+                // every text entity in the process), so `destroy(true)` here would null the SHARED
+                // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
+                // every canvas too.
+                // ⚠️ `finally`, NOT a plain trailing loop: a throw inside the page loop (context loss, a
+                // failed buffer allocation — the pass's catch below expects those) would otherwise strand
+                // every reclaimed shader, unreachable AND already removed from slot.textShaders, so
+                // disposeSlot cannot free them either. That is the exact leak #690 exists to remove.
+                for (const s of reusable.values()) s.destroy();
+              }
+              slot.meshFrameKey = layoutHash;
+              slot.meshBuildKey = buildKey; // stamp so a later layout-only edit can take the fast path
+              slot.textW = layout.width; slot.textH = layout.height;
+              slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
+              slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good rebuild clears the streak
+            }
           } catch (err) {
             // `layoutText`/`buildTextGeometryByPage` above can throw (a font provider not
             // ready, a malformed atlas). Left uncaught here, that throw skips `slot.meshFrameKey

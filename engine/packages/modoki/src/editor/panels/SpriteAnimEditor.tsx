@@ -246,7 +246,8 @@ export default function SpriteAnimEditor() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                 <span style={labelStyle}>fps</span>
-                <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }} />
+                <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }}
+                  dataUiId="spriteAnim.clip.fps" dataUiLabel={activeName} />
                 <span style={labelStyle}>mode</span>
                 <select data-ui-id="spriteAnim.clip.mode" data-ui-kind="field" data-ui-label="mode" value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
                   <option value="once">once</option>
@@ -256,7 +257,8 @@ export default function SpriteAnimEditor() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
                 <span style={labelStyle}>cycles</span>
-                <BufferedNumberInput value={clip!.cycles} step={1} onChange={(v) => writeClip(activeName, `cycles:${activeName}`, (c) => ({ ...c, cycles: Math.max(0, v) }))} style={{ ...inputStyle, width: 56 }} />
+                <BufferedNumberInput value={clip!.cycles} step={1} onChange={(v) => writeClip(activeName, `cycles:${activeName}`, (c) => ({ ...c, cycles: Math.max(0, v) }))} style={{ ...inputStyle, width: 56 }}
+                  dataUiId="spriteAnim.clip.cycles" dataUiLabel={activeName} />
                 <span style={{ color: '#666', fontSize: 10 }}>0 = infinite</span>
               </div>
 

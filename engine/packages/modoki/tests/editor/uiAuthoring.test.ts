@@ -16,10 +16,14 @@ import {
   selectionSizeGate,
   selectionAnchorGate,
   selectionPooledRowGate,
-  isElementZIndexShadowed,
-  selectionZIndexGate,
   isElementMarginInert,
   MARGIN_KEYS,
+  POOLED_ROW_PINNED_GROUPS,
+  POOLED_ROW_PINNED_FIELDS,
+  POOLED_ROW_GENERIC_WARN_FIELDS,
+  buildPooledRowPin,
+  pooledRowNoteText,
+  pooledRowNoteSegments,
   type UiPreset,
 } from '../../src/runtime/ui/uiAuthoring';
 
@@ -169,44 +173,6 @@ describe('selectionPooledRowGate (UIEntries pooled-row Inspector note, #651)', (
   });
 });
 
-describe('isElementZIndexShadowed (UIElement.zIndex overwritten by UIAnchor.zIndex, #746)', () => {
-  it('is shadowed by any truthy anchor zIndex', () => {
-    expect(isElementZIndexShadowed(1000)).toBe(true);
-    expect(isElementZIndexShadowed(1)).toBe(true);
-    expect(isElementZIndexShadowed(-1)).toBe(true);
-  });
-
-  // The point of the whole predicate: `anchorCss` overwrites with `if (a.zIndex) ...`, so an
-  // anchored element whose anchor leaves zIndex at its 0 DEFAULT does not shadow anything — the
-  // UIElement value is still the one that takes effect. `0`/`null`/`undefined` must all read as
-  // "not shadowed", or the Inspector would grey out a field that is genuinely live.
-  it('is NOT shadowed by a 0, null, or undefined anchor zIndex', () => {
-    expect(isElementZIndexShadowed(0)).toBe(false);
-    expect(isElementZIndexShadowed(null)).toBe(false);
-    expect(isElementZIndexShadowed(undefined)).toBe(false);
-  });
-});
-
-describe('selectionZIndexGate (unanimous-or-nothing across a multi-selection, #746/#34)', () => {
-  it('is live when nothing in the selection shadows the field', () => {
-    expect(selectionZIndexGate([])).toBe('live');
-    expect(selectionZIndexGate([0, 0])).toBe('live');
-    expect(selectionZIndexGate([null, null])).toBe('live');
-  });
-
-  it('is inert only when EVERY entity shadows the field', () => {
-    expect(selectionZIndexGate([5, 9])).toBe('inert');
-    expect(selectionZIndexGate([5])).toBe('inert');
-  });
-
-  it('is mixed when only part of the selection shadows it, regardless of order', () => {
-    expect(selectionZIndexGate([5, 0])).toBe('mixed');
-    expect(selectionZIndexGate([0, 5])).toBe('mixed');
-    expect(selectionZIndexGate([5, null])).toBe('mixed');
-  });
-});
-
-
 /**
  * #757 — `applyAnchorStyle` clears all four UIElement margins on an anchored element, so an
  * authored value is discarded with no signal. #746's shape, found by sweeping for the pattern.
@@ -253,5 +219,103 @@ describe('selectionAnchorGate drives the margin fields (#757)', () => {
 
   it('MIXED stays editable — blocking it would strand the flow-layout entities', () => {
     expect(selectionAnchorGate(['center', null])).toBe('mixed');
+  });
+});
+
+describe('POOLED_ROW_PINNED_FIELDS / POOLED_ROW_PINNED_GROUPS (#761)', () => {
+  it('flattens to exactly the fourteen fields entriesSystem pins', () => {
+    expect(POOLED_ROW_PINNED_FIELDS).toEqual([
+      'width', 'widthUnit', 'height', 'heightUnit',
+      'marginTop', 'marginRight', 'marginBottom', 'marginLeft',
+      'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
+      'flexShrink', 'isVisible',
+    ]);
+  });
+
+  it('every field appears in exactly one group — no drift between the flat list and the groups', () => {
+    const seen = new Set<string>();
+    for (const g of POOLED_ROW_PINNED_GROUPS) {
+      for (const f of g.fields) {
+        expect(seen.has(f), `'${f}' appears in more than one group`).toBe(false);
+        seen.add(f);
+      }
+    }
+    expect([...seen].sort()).toEqual([...POOLED_ROW_PINNED_FIELDS].sort());
+  });
+
+  it('buildPooledRowPin writes EXACTLY the POOLED_ROW_PINNED_FIELDS key set — bidirectional #764 guard', () => {
+    // #761's own drift guard (entriesSystem.test.ts) only checked "every field the constant
+    // names is actually corrected" — it caught a field DROPPED from the pin, but not one ADDED to
+    // it: a reviewer added `opacity: 0` to the pin's hand-typed literal and all 95 tests stayed
+    // green. Routing the literal through `buildPooledRowPin` and asserting a SET-EQUALS here
+    // (not a superset check) closes that hole — this must go red the moment the builder's
+    // returned keys stop matching the constant in EITHER direction.
+    const pin = buildPooledRowPin({ live: true, wantW: 100, wantH: 50 });
+    expect(new Set(Object.keys(pin))).toEqual(new Set(POOLED_ROW_PINNED_FIELDS));
+  });
+});
+
+describe('POOLED_ROW_GENERIC_WARN_FIELDS (#764)', () => {
+  it('is POOLED_ROW_PINNED_FIELDS minus the four specially-handled fields', () => {
+    const specially_handled = new Set(['isVisible', 'width', 'widthUnit', 'height', 'heightUnit']);
+    const expected = POOLED_ROW_PINNED_FIELDS.filter((f) => !specially_handled.has(f));
+    expect([...POOLED_ROW_GENERIC_WARN_FIELDS].sort()).toEqual([...expected].sort());
+  });
+});
+
+describe('pooledRowNoteText (#761 — widened from margin/min-max to all fourteen fields)', () => {
+  it('mentions every group label from POOLED_ROW_PINNED_GROUPS, not just margin and min/max size', () => {
+    const text = pooledRowNoteText(false);
+    for (const g of POOLED_ROW_PINNED_GROUPS) expect(text).toContain(g.label);
+  });
+
+  it('the mixed-selection text also mentions every group label', () => {
+    const text = pooledRowNoteText(true);
+    for (const g of POOLED_ROW_PINNED_GROUPS) expect(text).toContain(g.label);
+  });
+
+  it('mentions all five labels AND all five forced-to descriptions (#764 — was only 2 of 5)', () => {
+    // A prior version of this test asserted only the label loop above and the two non-constant
+    // forced-to strings ("scroll view's resolved box", "whether the slot is live") — it never
+    // pinned the three plain "0" descriptions (margin, min/max size, flex shrink) to anything, so
+    // renaming `POOLED_ROW_PINNED_GROUPS['flex shrink']`'s label (#764's reviewer mutation) broke
+    // the text (an `undefined` forced-to) without breaking this suite.
+    const text = pooledRowNoteText(false);
+    expect(POOLED_ROW_PINNED_GROUPS).toHaveLength(5);
+    for (const g of POOLED_ROW_PINNED_GROUPS) {
+      expect(text, `label '${g.label}' missing from the note`).toContain(g.label);
+      expect(text, `forcedTo '${g.forcedTo}' (for '${g.label}') missing from the note`).toContain(g.forcedTo);
+    }
+    expect(text).not.toContain('undefined');
+  });
+
+  it('does not claim "forced to 0" for size or visibility — they are forced to a resolved value', () => {
+    // The old two-group text said "forced to 0"; size and visibility are pinned to the scroll
+    // view's resolved box and the slot's live state respectively, neither a constant.
+    const text = pooledRowNoteText(false);
+    expect(text).toContain("scroll view's resolved box");
+    expect(text).toContain('whether the slot is live');
+  });
+
+  it('mixed text says fields stay editable, and non-mixed text says they are forced', () => {
+    expect(pooledRowNoteText(true)).toContain('stay editable');
+    expect(pooledRowNoteText(false)).toContain('forces');
+  });
+});
+
+describe('pooledRowNoteSegments (#764 — structured note, restores Inspector bolding)', () => {
+  it('returns one {label, forcedTo} item per POOLED_ROW_PINNED_GROUPS entry, in order', () => {
+    const { items } = pooledRowNoteSegments(false);
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('the mixed variant carries the same items — a mixed selection still names which fields are at stake', () => {
+    const { items } = pooledRowNoteSegments(true);
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('intro text matches pooledRowNoteText\'s tone for each mode', () => {
+    expect(pooledRowNoteSegments(true).intro).toContain('stay editable');
+    expect(pooledRowNoteSegments(false).intro).toContain('forces');
   });
 });

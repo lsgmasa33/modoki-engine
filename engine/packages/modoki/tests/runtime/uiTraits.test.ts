@@ -116,7 +116,6 @@ describe('UI traits', () => {
       const schema = (UIAnchor as any).schema;
       expect(schema.anchor).toBe('stretch');
       expect(schema.safeArea).toBe(true);
-      expect(schema.zIndex).toBe(0);
     });
   });
 

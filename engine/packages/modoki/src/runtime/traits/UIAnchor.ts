@@ -26,5 +26,4 @@ export const UIAnchor = trait({
   pivotX: 0,
   pivotY: 0,
   safeArea: true as boolean,
-  zIndex: 0,
 });

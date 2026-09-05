@@ -30,7 +30,12 @@ export const ENGINE_VERSION = '0.1.0';
 // field entirely (scene-loading.md, Phase 3). Nothing on disk
 // references it any more; the loader synthesizes one (array index) for its own
 // internal bookkeeping. An older file's `id` is simply ignored.
-export const SCENE_FORMAT_VERSION = 12;
+// v13: `UIAnchor.zIndex` is removed — the two fields wrote the same CSS
+// `z-index` on the same DOM node, with the anchor value winning when truthy.
+// A truthy `UIAnchor.zIndex` is migrated onto `UIElement.zIndex` (anchor wins,
+// since that's what rendered before); the anchor field is then dropped
+// unconditionally.
+export const SCENE_FORMAT_VERSION = 13;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

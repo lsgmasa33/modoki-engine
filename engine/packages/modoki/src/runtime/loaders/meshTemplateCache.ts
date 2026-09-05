@@ -36,6 +36,7 @@ import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCoun
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 import { disposeAllFontFaces } from './fontLoader';
+import { migrateUIAnchorZIndexInTraits } from './uiAnchorZIndexMigration';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -2060,7 +2061,13 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT);
       if (!res.ok) return;
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
-      const data = await parseAssetJson(res, prefabPath) as { id?: string };
+      const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };
+      // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
+      // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
+      // migration unconditionally here (cheap, idempotent) is the smallest thing that closes
+      // the same data-loss window a versioned migration closes for scenes — see
+      // uiAnchorZIndexMigration.ts.
+      for (const entry of data.entities ?? []) migrateUIAnchorZIndexInTraits(entry.traits);
       prefabCache.set(prefabPath, data);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {

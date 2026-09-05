@@ -49,7 +49,7 @@ const UI_DEFAULTS = {
 const ANCHOR_DEFAULTS = {
   anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
   bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-  pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0,
+  pivotX: 0, pivotY: 0, safeArea: false,
 };
 
 function makeWorld(ui: Record<string, unknown>, anchor: Record<string, unknown> | null) {

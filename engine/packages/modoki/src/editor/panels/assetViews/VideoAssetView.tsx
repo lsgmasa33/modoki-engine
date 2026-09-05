@@ -234,6 +234,8 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
           min={0.5}
           max={30}
           style={{ ...inputStyle, flex: 1 }}
+          dataUiId="inspector.video.keyframeIntervalSec"
+          dataUiLabel="Keyframe Interval (s)"
         />
       </div>
 

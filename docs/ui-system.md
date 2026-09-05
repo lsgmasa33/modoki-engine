@@ -752,7 +752,8 @@ parent (`UIAnchor.ts`):
   the four corners (`top-left` … `bottom-right`), and the stretch variants
   (`top-stretch`, `h-stretch`, `v-stretch`, etc.).
 - `top`/`left`/`right`/`bottom` (+ units), `pivotX`/`pivotY` (0..1 pivot relative to the
-  element's own box), `zIndex`.
+  element's own box). Stacking order is `UIElement.zIndex` — `UIAnchor` carried its own copy
+  until v13 unified them (see § sortOrder).
 - `safeArea` — clear the notch / home indicator. **Defaults to TRUE** — an absent field
   in a scene JSON is ON, not off. It takes ONE OF TWO ARMS, decided by the anchor, and
   they are mutually exclusive by construction so nothing can be inset twice:
@@ -1140,9 +1141,9 @@ which one the previous author used, so anchor offsets stay the only one. This al
 Inspector's **Margin section is collapsed by default** — margin is deliberately de-emphasised, so
 the right direction for a fix here is to make its limits louder, never to give it a second job.
 
-Same ruling as `UIElement.zIndex` vs `UIAnchor.zIndex` (#746) in the § sortOrder table: the defect
-was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape when
-this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
+Same ruling #746 made for the (now-unified) `zIndex` fields in the § sortOrder table below: the
+defect was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape
+when this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
 
 ---
 
@@ -1227,12 +1228,12 @@ in `runtime/ui/uiTreeStore.ts` (`buildTree()`): it queries all
 any node whose parent chain doesn't terminate within `nodes.size` hops is treated as a
 root and logged in dev (so the editor can flag a bad `parentId`).
 
-⚠️ **`sortOrder` is NOT the stacking authority for anything that authors `UIAnchor.zIndex`.**
-`sortOrder` decides DOM order among siblings (`buildTree`'s `sortChildren`, ascending — later
-siblings paint over earlier ones). But `UIAnchor.zIndex` is copied onto the node and written by
-`anchorCss.ts` as a real CSS `z-index` alongside `position: absolute`, and **CSS z-index beats DOM
-order** — `sortOrder` is only the tiebreak between elements at the SAME z-index. Two root-level
-anchored elements therefore stack purely by `zIndex`, whatever their `sortOrder` says.
+⚠️ **`sortOrder` is NOT the stacking authority for anything anchored.** `sortOrder` decides DOM
+order among siblings (`buildTree`'s `sortChildren`, ascending — later siblings paint over earlier
+ones). But `UIElement.zIndex` is written by `UINode` as a real CSS `z-index` alongside
+`position: absolute`, and **CSS z-index beats DOM order** — `sortOrder` is only the tiebreak
+between elements at the SAME z-index. Two root-level anchored elements therefore stack purely by
+`zIndex`, whatever their `sortOrder` says.
 
 This bites because a scene can carry two ordering tables that disagree, and only one of them is
 real. Court's modal group is the worked example (2026-08-31): by `sortOrder` it reads
@@ -1244,24 +1245,15 @@ correct behaviour on device, and concluded the edit had worked — when the pre-
 had always guaranteed it and the edit changed nothing. **Read the `zIndex` column, and when you
 assert a stacking fix, verify it by perturbing the value you actually changed.**
 
-⚠️ **There is a THIRD table, and it is the one an author reaches for first: `UIElement.zIndex`
-(#746).** `UINode` writes it into `style.zIndex`; `applyAnchorStyle` then runs and replaces it
-whenever `UIAnchor.zIndex` is non-zero. So on an anchored element the `UIElement` field is inert.
-
-That precedence is correct and is not up for revision — for an out-of-flow box the anchor is the
-stacking authority, which is what the paragraphs above are about. The defect was the **silence**:
-the Inspector shows two `zIndex` fields with nothing to say they are not independent, so an author
-could set the `UIElement` one, watch the stacking not move, and have nothing to go on. One live
-disagreement exists in the repo — `games/3d-test`'s "2D Animation" scene authors element `100`
-against anchor `1000` on the same entity; every other co-authored pair holds equal values, so
-nothing else could have been observing a difference.
-
-Both halves are now stated where an author will meet them: the Inspector greys `UIElement.zIndex`
-out and names the winning value (`shadowedZIndexTooltip`), and both field tooltips say which one
-wins. **An anchor that leaves its own `zIndex` at 0 does NOT shadow the element field** — the
-override is truthiness, not presence — so `isElementZIndexShadowed` in `uiAuthoring.ts` is the one
-predicate, applied by `anchorCss` and by the Inspector gate alike, for the same
-cannot-disagree reason `isSizeInert` exists.
+**History: there used to be a THIRD table here.** `UIAnchor` carried its own `zIndex` that
+`applyAnchorStyle` copied over `UIElement.zIndex` whenever it was truthy (#746 gave the silent
+shadowing a warning and an Inspector tooltip, since the precedence itself was correct — an
+out-of-flow box's stacking authority — and the defect was only that nothing said so). The two
+fields wrote the same CSS property onto the same DOM node, so one of them could only ever be a
+duplicate; this was unified onto `UIElement.zIndex` alone (scene format v13), and `UIAnchor` no
+longer has a `zIndex` field at all. A migration carries a truthy old `UIAnchor.zIndex` onto
+`UIElement.zIndex` (the anchor's value is what rendered, so it wins on a conflict) — see
+`docs/scene-loading.md`'s migration table.
 
 ---
 
@@ -1607,14 +1599,27 @@ input at all. Scroll is exogenous; `first` is the response. The accumulator rese
 pool actually re-drives, so it stays "the distance the pool has to cover", dropped frames folded
 in.
 
-### The engine OWNS a pooled row's box — eight authored fields are inert there (#651)
+### The engine OWNS a pooled row's box — fourteen authored fields are inert there (#651, #761)
 
-`entriesSystem` pins the resolved entry box onto every pooled entry root every tick, and that
-list is longer than it looks. Beyond `width`/`height`/`widthUnit`/`heightUnit` and
-`flexShrink: 0`, it also forces **`marginTop/Right/Bottom/Left`** and
-**`minWidth/maxWidth/minHeight/maxHeight`** to `0`.
+`entriesSystem` pins the resolved entry box onto every pooled entry root every tick, across five
+groups (`uiAuthoring.POOLED_ROW_PINNED_GROUPS`, the one place this list lives — the equality
+guard, the warn loop, the `entity.set` and the Inspector note all derive from it). ⚠️ **This claim
+was FALSE for `entity.set` until #764** — its `pinned` literal was hand-typed separately from the
+constant, so a field added there (an `opacity: 0`, say) pinned in total silence with every test
+green; `uiAuthoring.buildPooledRowPin` is now the one place the pinned VALUES are typed, called
+by `entity.set`, and `uiAuthoring.test.ts` asserts its keys SET-EQUAL
+`POOLED_ROW_PINNED_FIELDS` — a check that fails on a field added to either side, not just one
+dropped:
 
-Both groups exist for the same reason and attack the stride from opposite sides:
+| Group | Fields | Forced to |
+|---|---|---|
+| size | `width`, `widthUnit`, `height`, `heightUnit` | the scroll view's resolved box, in px |
+| margin | `marginTop/Right/Bottom/Left` | `0` |
+| min/max size | `minWidth`, `maxWidth`, `minHeight`, `maxHeight` | `0` |
+| flex shrink | `flexShrink` | `0` |
+| visibility | `isVisible` | the slot's live/parked state |
+
+Margin and min/max size exist for the same reason and attack the stride from opposite sides:
 
 - **Margin sits OUTSIDE the border box.** An authored margin on the entry prefab root makes the
   real on-screen stride `entrySize + gap + marginStart + marginEnd`, while the whole scroll
@@ -1627,9 +1632,20 @@ Both groups exist for the same reason and attack the stride from opposite sides:
   `width`/`height`; a `maxWidth` smaller than it silently wins, and the stride desyncs the same
   way. These four were missed by the original margin fix and are the same defect.
 
+⚠️ **Size, flex shrink and visibility were pinned in TOTAL SILENCE until #761** — no warning, no
+Inspector mention, for six of the fourteen fields. The naive extension of the existing warning
+(`cur !== pinned`) is actively wrong for these: `flexShrink` defaults to `1` but pins to `0`, so
+`cur !== pinned` would warn on every untouched row; `isVisible` defaults to `true` but pins to the
+slot's live state, so it would warn on every freshly-parked slot too. The rule that avoids both
+false-positive storms: **warn only when the authored value differs from BOTH the pin AND the
+trait's own default** — the default means "the author never touched this field". For the eight
+fields whose pin already equals their default (margin, min/max size — all pinned and defaulted to
+`0`) this is exactly the pre-#761 behaviour; it only changes anything for the six #761 added.
+`width`/`height` fold their companion unit into ONE warning per axis (`width=50%`) rather than two.
+
 ⚠️ **This is an "authored field that does nothing" — CLAUDE.md's partially-wired-authoring-surface
 class — and the mitigations are deliberately incomplete.** `entriesSystem` warns once per slot per
-field when it discards a non-default authored value (keyed `viewGuid:slot:field`, **not**
+field when it discards an authored value by the rule above (keyed `viewGuid:slot:field`, **not**
 `entity.id()`, because koota recycles ids and a retired id would swallow a real mistake), and the
 Inspector shows a "pooled row" note on the `UIElement` section, gated on the sibling `UIEntry`
 trait via `selectionPooledRowGate`.

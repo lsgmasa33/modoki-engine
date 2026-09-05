@@ -275,7 +275,7 @@ describe('UIAction', () => {
 });
 
 describe('UIAnchor', () => {
-  it('is defined with anchor, offset, pivot, safeArea, zIndex defaults', async () => {
+  it('is defined with anchor, offset, pivot, safeArea defaults', async () => {
     const { UIAnchor } = await getTraits();
     expect(UIAnchor).toBeDefined();
     const schema = (UIAnchor as any).schema;
@@ -291,7 +291,6 @@ describe('UIAnchor', () => {
     expect(schema.pivotX).toBe(0);
     expect(schema.pivotY).toBe(0);
     expect(schema.safeArea).toBe(true);
-    expect(schema.zIndex).toBe(0);
   });
 
   it('can be called as a function', async () => {

@@ -15,6 +15,7 @@ import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
+import { migrateUIAnchorZIndexInTraits } from './uiAnchorZIndexMigration';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -355,6 +356,20 @@ function migrateV10toV11(data: SceneData): void {
  *  it, so both shapes load identically (scene-loading.md, Phase 3). */
 function migrateV11toV12(data: SceneData): void {
   if (data.version >= 12) return;
+  data.version = 12;
+}
+
+/** Migrate v12→v13: `UIAnchor.zIndex` is removed — it and `UIElement.zIndex` wrote the
+ *  same CSS `z-index` onto the same DOM node (`applyAnchorStyle` overwrote the element's
+ *  value whenever the anchor's was truthy), so the anchor field only ever shadowed the
+ *  element field. A truthy anchor value is what actually rendered, so it wins: copy it
+ *  onto `UIElement.zIndex` (only when there IS a `UIElement` trait — an entity with a
+ *  `UIAnchor` but no `UIElement` is skipped rather than inventing one), then delete
+ *  `UIAnchor.zIndex` unconditionally, truthy or not. Idempotent — a file with no
+ *  `UIAnchor.zIndex` left is untouched. */
+function migrateV12toV13(data: SceneData): void {
+  if (data.version >= 13) return;
+  for (const entry of data.entities) migrateUIAnchorZIndexInTraits(entry.traits);
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -1433,6 +1448,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV9toV10(data);
   migrateV10toV11(data);
   migrateV11toV12(data);
+  migrateV12toV13(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   // Forward-version guard: the migration steps only upgrade OLDER files. A scene

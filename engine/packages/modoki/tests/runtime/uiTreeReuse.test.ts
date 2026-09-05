@@ -184,7 +184,7 @@ describe('uiTreeStore node reuse', () => {
   it('detects anchor, action, and canvas2D changes', async () => {
     const specs: Spec[] = [{
       id: 1, parentId: 0,
-      anchor: { anchor: 'left', top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 20, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0 },
+      anchor: { anchor: 'left', top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 20, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false },
       action: { bindings: [] },
       canvas2D: { referenceWidth: 800, referenceHeight: 600, scaleMode: 'fit' },
     }];
@@ -213,7 +213,7 @@ describe('uiTreeStore node reuse', () => {
   it('nodesEqual is exhaustive: mutating ANY scalar field breaks equality', async () => {
     const specs: Spec[] = [{
       id: 1, parentId: 0,
-      anchor: { anchor: 'left', top: 1, topUnit: 'px', right: 2, rightUnit: 'px', bottom: 3, bottomUnit: 'px', left: 4, leftUnit: 'px', pivotX: 0.1, pivotY: 0.2, safeArea: true, zIndex: 5 },
+      anchor: { anchor: 'left', top: 1, topUnit: 'px', right: 2, rightUnit: 'px', bottom: 3, bottomUnit: 'px', left: 4, leftUnit: 'px', pivotX: 0.1, pivotY: 0.2, safeArea: true },
       binding: { textBinding: 'x', inputBinding: 'y' },
       canvas2D: { referenceWidth: 800, referenceHeight: 600, scaleMode: 'fit' },
     }];

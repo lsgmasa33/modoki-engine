@@ -359,7 +359,8 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
           <div style={rowStyle}>
             <span style={labelStyle}>UASTC RDO λ</span>
             <BufferedNumberInput value={texSettings.uastcRdoLambda ?? DEFAULT_UASTC_RDO_LAMBDA} step={0.1} min={0} max={4}
-              onChange={(v) => updateTex({ uastcRdoLambda: resolveUastcRdoLambda(v) })} style={{ ...inputStyle, flex: 1 }} />
+              onChange={(v) => updateTex({ uastcRdoLambda: resolveUastcRdoLambda(v) })} style={{ ...inputStyle, flex: 1 }}
+              dataUiId="assetView.model.rig.uastcRdoLambda" dataUiLabel="UASTC RDO λ" />
           </div>
         </>)}
         <div style={{ color: '#666', fontSize: '10px', margin: '0 0 6px', lineHeight: 1.4 }}>

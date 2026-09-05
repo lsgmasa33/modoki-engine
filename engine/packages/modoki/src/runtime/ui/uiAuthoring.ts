@@ -122,38 +122,121 @@ export function selectionPooledRowGate(pooled: readonly boolean[]): SelectionGat
   return resolveGate(pooled, (p) => p);
 }
 
-/** Is an authored `UIElement.zIndex` INERT because a sibling `UIAnchor` overrides it (#746)?
- *
- *  `UINode` writes `style.zIndex` from `UIElement.zIndex`; `applyAnchorStyle` then runs and
- *  replaces it. `UIAnchor.zIndex` being the stacking authority for an out-of-flow box is
- *  deliberate and documented (`docs/ui-system.md` § sortOrder) — the defect was the SILENCE: the
- *  Inspector shows two `zIndex` fields as if they were independent, so an author could set the
- *  `UIElement` one, watch it do nothing, and have no way to tell which was in charge. One live
- *  disagreement exists (`games/3d-test`'s "2D Animation" scene: element 100 against anchor 1000).
- *
- *  ⚠️ **Having an anchor is NOT enough — the anchor's own `zIndex` must be TRUTHY.** The override
- *  is `if (a.zIndex) style.zIndex = a.zIndex`, so an anchored element whose anchor leaves `zIndex`
- *  at its 0 default keeps the `UIElement` value, and greying the field out there would be a
- *  different lie. `anchorCss` imports this predicate rather than restating the condition, so the
- *  editor cannot disagree with the layout about what is inert — the same rule `isSizeInert`
- *  already follows.
- *
- *  Takes the anchor's `zIndex`, or null/undefined when the entity has no `UIAnchor` at all. */
-export function isElementZIndexShadowed(anchorZIndex: number | null | undefined): boolean {
-  return !!anchorZIndex;
-}
-
-/** The `UIElement.zIndex` shadowing gate across a selection (#746). One entry per selected
- *  entity: its `UIAnchor.zIndex`, or null/undefined when it has no anchor. Same
- *  unanimous-or-nothing rule as every gate above (#34) — only a selection where EVERY entity is
- *  shadowed may dim the field. */
-export function selectionZIndexGate(anchorZIndexes: readonly (number | null | undefined)[]): SelectionGate {
-  return resolveGate(anchorZIndexes, isElementZIndexShadowed);
-}
-
 /** The four `UIElement` margin fields, as the Inspector and the scene validator both name them. */
 export const MARGIN_KEYS: readonly ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'] =
   ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'];
+
+/** The `UIElement` fields `entriesSystem` pins on every pooled `UIEntries` row root, every tick
+ *  (#651, #761) — grouped the way both the runtime pin and the Inspector note describe them.
+ *  Grouped instead of flat so the Inspector note can name what it pins WITHOUT a hand-written
+ *  list drifting from the pin itself: `entriesSystem.ts`'s equality guard, its `entity.set`, and
+ *  `PooledRowNote` all derive from this one constant now, so a fifteenth field added to the pin
+ *  and forgotten here fails LOUDLY (the drift-guard test) instead of silently, the way `width`,
+ *  `widthUnit`, `height`, `heightUnit`, `flexShrink` and `isVisible` did before #761.
+ *
+ *  `forcedTo` is each group's own Inspector-note copy for "what it pins TO" — NOT `'0'` for every
+ *  group (#761): `size` is pinned to the scroll view's own resolved box (in px) and `visibility`
+ *  to whether the slot is live, neither of which is a constant. It lives ON the group, not in a
+ *  separate label-keyed map (#764 close-out) — a map keyed by `label` string can rename the label
+ *  in one place and silently orphan the description in the other (a group renamed 'flex shrink' →
+ *  'flex-shrink' left the map's `'flex shrink'` key unmatched, and the note rendered `undefined`
+ *  with all tests green). A label and its forced-to text can't separate when they're one object. */
+export const POOLED_ROW_PINNED_GROUPS: readonly { label: string; fields: readonly string[]; forcedTo: string }[] = [
+  { label: 'size', fields: ['width', 'widthUnit', 'height', 'heightUnit'], forcedTo: "the scroll view's resolved box" },
+  { label: 'margin', fields: ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'], forcedTo: '0' },
+  { label: 'min/max size', fields: ['minWidth', 'maxWidth', 'minHeight', 'maxHeight'], forcedTo: '0' },
+  { label: 'flex shrink', fields: ['flexShrink'], forcedTo: '0' },
+  { label: 'visibility', fields: ['isVisible'], forcedTo: 'whether the slot is live' },
+];
+
+/** Flattened `POOLED_ROW_PINNED_GROUPS` — the exact 14-field set `entriesSystem.ts` writes on a
+ *  pooled row root every tick. Its equality guard, its `entity.set` and the drift-guard test in
+ *  `entriesSystem.test.ts` all key off this list. */
+export const POOLED_ROW_PINNED_FIELDS: readonly string[] =
+  POOLED_ROW_PINNED_GROUPS.flatMap((g) => g.fields);
+
+/** Build the exact 14-field record `entriesSystem.ts` pins onto a pooled `UIEntries` row root
+ *  every tick (#761 close-out, #764-review). This is the ONE place the pinned VALUES are typed —
+ *  `entriesSystem`'s `entity.set` calls this instead of carrying its own literal, so the keys it
+ *  writes can never drift from `POOLED_ROW_PINNED_FIELDS` again the way `opacity: 0` did in
+ *  review: that mutation added a 15th key to the hand-typed literal and every test stayed green,
+ *  because the drift guard only checked the constant's fields AGAINST the pin (one direction) —
+ *  never the reverse. Routing the literal through this single builder, and asserting
+ *  `Object.keys(buildPooledRowPin(...))` set-equals `POOLED_ROW_PINNED_FIELDS` in
+ *  `uiAuthoring.test.ts`, makes the guard BIDIRECTIONAL: a stray key added here fails that test
+ *  too, not just a key silently dropped. */
+export function buildPooledRowPin(
+  { live, wantW, wantH }: { live: boolean; wantW: number; wantH: number },
+): Record<string, unknown> {
+  return {
+    isVisible: live, flexShrink: 0,
+    width: wantW, widthUnit: 'px', height: wantH, heightUnit: 'px',
+    marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
+    minWidth: 0, maxWidth: 0, minHeight: 0, maxHeight: 0,
+  };
+}
+
+/** The `POOLED_ROW_PINNED_FIELDS` minus the four fields the warn loop handles specially — `width`
+ *  and `height` fold their companion unit into ONE warning (see `entriesSystem.ts`'s width/height
+ *  call sites), and `isVisible` compares against the slot's live state rather than a plain
+ *  equality guard. The remaining nine drive `entriesSystem`'s generic warn loop directly, so a
+ *  15th field added to `POOLED_ROW_PINNED_GROUPS` is warned-about automatically instead of
+ *  needing a second, hand-typed field list kept in sync by hand (the #761/#764 pattern this whole
+ *  module exists to stop). */
+export const POOLED_ROW_GENERIC_WARN_FIELDS: readonly string[] = POOLED_ROW_PINNED_FIELDS.filter(
+  (f) => f !== 'isVisible' && f !== 'width' && f !== 'widthUnit' && f !== 'height' && f !== 'heightUnit',
+);
+
+/** The Inspector's pooled-row note text, built from `POOLED_ROW_PINNED_GROUPS` rather than
+ *  hand-written (#761) — so it cannot drift from what `entriesSystem.ts`'s pin actually writes
+ *  the way the old two-group text (margin, min/max size) drifted from the six fields #761 added
+ *  silently. Plain text, not JSX: this is a DECISION (what the note says), so it lives in a plain
+ *  `.ts` module and carries its own test, per this repo's "editor .tsx carries no tests"
+ *  convention — `Inspector.tsx`'s `PooledRowNote` only wraps it in the note's box styling.
+ *  `mixed` = only PART of the selection is a pooled row (#34's unanimous-or-nothing rule) — the
+ *  fields stay editable either way, so this must not claim a value is ignored for entities where
+ *  it still takes effect. */
+export function pooledRowNoteText(mixed: boolean): string {
+  const labels = POOLED_ROW_PINNED_GROUPS.map((g) => g.label);
+  if (mixed) {
+    return `Partly pooled — some of the selected elements are UIEntries pooled rows and some `
+      + `aren't. ${labels.join(', ')} stay editable so the un-pooled ones can still be authored, `
+      + `but the pooled ones ignore what you write. Select them separately to be sure of the result.`;
+  }
+  const forcedTo = POOLED_ROW_PINNED_GROUPS.map((g) => `${g.label} to ${g.forcedTo}`).join('; ');
+  return `Pooled row — this UIEntries row's box is owned by the scroll view that spawned it, `
+    + `which forces ${labels.join(', ')} below every tick (${forcedTo}) — so authored values `
+    + `here will not take effect.`;
+}
+
+/** Structured form of `pooledRowNoteText` (#764 close-out) — the Inspector note lost its `<b>`
+ *  emphasis when the text moved into a plain-string function, and became one ~300-character
+ *  unbroken sentence naming the five labels twice (bare, then again with values). This gives
+ *  `PooledRowNote` a `{label, forcedTo}` per group to render as a short bolded list instead, while
+ *  still deriving every word from `POOLED_ROW_PINNED_GROUPS` — the same DECISION `pooledRowNoteText`
+ *  encodes, just not pre-flattened to a string. `intro` carries the unanimous-or-nothing `mixed`
+ *  wording (#34); `items` is the per-group `{label, forcedTo}` list either way, so a mixed
+ *  selection still shows an author WHICH fields are at stake even though none of them are forced
+ *  there. */
+export function pooledRowNoteSegments(mixed: boolean): {
+  intro: string;
+  items: readonly { label: string; forcedTo: string }[];
+} {
+  const items = POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo }));
+  if (mixed) {
+    return {
+      intro: `Partly pooled — some of the selected elements are UIEntries pooled rows and some `
+        + `aren't. The fields below stay editable so the un-pooled ones can still be authored, but `
+        + `the pooled ones ignore what you write. Select them separately to be sure of the result.`,
+      items,
+    };
+  }
+  return {
+    intro: `Pooled row — this UIEntries row's box is owned by the scroll view that spawned it, `
+      + `which forces the fields below every tick — so authored values here will not take effect.`,
+    items,
+  };
+}
 
 /** Is an authored `UIElement.margin*` INERT because the element is anchored (#757)?
  *

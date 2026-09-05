@@ -42,7 +42,7 @@ import {
   retiredEnvironments, disposeRetiredEnvironment,
   retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial, getTemplatesForModel,
 } from '../loaders/meshTemplateCache';
-import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
+import { getRiggedModel, ensureRiggedModelLoaded, ensureRiggedModelLoadedFor } from '../loaders/riggedModelCache';
 import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
 } from './renderSettings';
@@ -2064,6 +2064,16 @@ function carryOverScaleTracks(
   if (added) bound.resetDuration();
 }
 
+/** Scene-scoped lazy acquire for the render sync (#747). Owns the model with the
+ *  CURRENT scene so `releaseAllForScene` reaches it; falls back to the editor
+ *  session pin only when no scene is loaded — the one case with no owner to give
+ *  it. */
+function lazyAcquireRiggedModel(ref: string): void {
+  const sceneId = getCurrentSceneId();
+  if (sceneId === undefined) { ensureRiggedModelLoaded(ref); return; }
+  ensureRiggedModelLoadedFor(sceneId, ref);
+}
+
 /** The `AnimationLibrary` trait value (the fields the render sync reads). */
 export interface AnimationLibraryValue {
   animSets?: string[];
@@ -2078,11 +2088,26 @@ export interface AnimationLibraryValue {
 export interface LibraryMergeDeps {
   getAnimSet: (ref: string) => { source?: string } | null;
   getRiggedModel: (ref: string) => { prototype: THREE.Object3D; animations: THREE.AnimationClip[] } | undefined;
-  ensureRiggedModelLoaded: (ref: string) => void;
+  lazyAcquireRiggedModel: (ref: string) => void;
   retargetClip: typeof retargetClip;
 }
 
-const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, ensureRiggedModelLoaded, retargetClip };
+// lazyAcquireRiggedModel (the field NAME, matching the scene-scoped acquire it defaults
+// to, #747 and #749's adversarial review): an AnimationLibrary's animSet source GLB has
+// no manifest/resources entry of its own (SCALAR_RESOURCE_TYPE_BY_FIELD only covers
+// SkinnedModel.model), so this is its ONLY acquire path — it now rides the current
+// scene's release instead of pinning forever under LAZY_OWNER. The field used to be
+// named `ensureRiggedModelLoaded` after the real (session-pinning) function it was
+// carrying at the time; that name outlived the swap to the scene-scoped default, so a
+// future caller wiring its own deps would naturally reach for `ensureRiggedModelLoaded`
+// by name and silently reinstate the pin #747 removed — renamed to close that trap.
+// Known, accepted cost: on a scene swap the model is released with the outgoing scene
+// and re-fetched by the next frame's render sync (a frame of pop-in), instead of staying
+// resident. Only one authored scene uses AnimationLibrary today
+// (games/3d-test/runtime/assets/scenes/skinned-test.scene.json); acquiring animSet
+// sources transitively at scene load is the documented follow-up if that pop-in ever
+// matters.
+const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, lazyAcquireRiggedModel, retargetClip };
 
 /** P6 — merge an `AnimationLibrary`'s clips into a rig's mixer: own clips ∪
  *  library clips, keyed by clip name, OWN CLIPS WIN on a name conflict. Each
@@ -2113,7 +2138,7 @@ export function mergeAnimationLibrary(
     if (entry.libraryMerged.has(source)) continue; // already merged this GLB's clips
 
     const rig = deps.getRiggedModel(source);
-    if (!rig) { deps.ensureRiggedModelLoaded(source); continue; } // GLB loading — retry next frame
+    if (!rig) { deps.lazyAcquireRiggedModel(source); continue; } // GLB loading — retry next frame
 
     // Retarget when the global flag is set OR a per-animSet bone map exists (a map
     // means the source rig's bones are named differently → bind-by-name would fail).
@@ -2207,9 +2232,12 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (!entry && sm.model) {
       const rigged = getRiggedModel(sm.model);
       if (!rigged) {
-        // Not loaded yet — kick a lazy load (no-op once a scene has acquired it)
-        // and skip rendering this entity until the prototype is in cache.
-        ensureRiggedModelLoaded(sm.model);
+        // Not loaded yet — kick a SCENE-SCOPED lazy load (#747: this is the branch
+        // reached exactly when the scene's own manifest acquire hasn't resolved yet,
+        // so it must own with the scene, not pin forever — no-op on an already-cached
+        // model, since ensureRiggedModelLoadedFor still stamps the ownership) and skip
+        // rendering this entity until the prototype is in cache.
+        lazyAcquireRiggedModel(sm.model);
         return;
       }
       const root = cloneSkeleton(rigged.prototype);

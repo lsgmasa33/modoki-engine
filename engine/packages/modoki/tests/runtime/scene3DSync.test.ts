@@ -15,13 +15,18 @@ afterEach(() => {
 /** Mock the heavy module-level deps scene3DSync imports so the module can be
  *  loaded in the node test env without a real ECS world / DOM. */
 function mockSceneSyncDeps() {
+  // 'DEFAULT deps route the merge through the SCENE-SCOPED acquire...' below doMocks
+  // `SceneManager` to a fixed scene id and doMock survives `resetModules()` — restore
+  // the real module here so every test using this shared setup after that one still
+  // gets the real `getCurrentSceneId()` instead of the stale fixed id.
+  vi.doMock('../../src/runtime/scene/SceneManager', async (orig: () => Promise<unknown>) => await orig());
   vi.doMock('../../src/runtime/traits', () => ({
     Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {}, Tint: {},
     SkinnedModel: {}, SkeletalAnimator: {}, AnimationLibrary: {}, BoneAttachment: {},
   }));
   vi.doMock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
@@ -820,14 +825,14 @@ describe('scene3DSync', () => {
       sets?: Record<string, { source?: string } | null>;
       rigs?: Record<string, { prototype: any; animations: any[] } | undefined>;
     }) {
-      const ensureRiggedModelLoaded = vi.fn();
+      const lazyAcquireRiggedModel = vi.fn();
       const retargetClip = vi.fn((_t: any, _s: any, c: any) => ({ ...c, retargeted: true }));
       return {
-        ensureRiggedModelLoaded, retargetClip,
+        lazyAcquireRiggedModel, retargetClip,
         deps: {
           getAnimSet: (ref: string) => (opts.sets?.[ref] ?? null),
           getRiggedModel: (ref: string) => opts.rigs?.[ref],
-          ensureRiggedModelLoaded, retargetClip,
+          lazyAcquireRiggedModel, retargetClip,
         },
       };
     }
@@ -863,15 +868,72 @@ describe('scene3DSync', () => {
       mockSceneSyncDeps();
       const { mergeAnimationLibrary } = await import('../../src/runtime/rendering/scene3DSync');
       const entry = makeEntry([]);
-      // Frame 1: animset loaded but GLB not yet → ensureRiggedModelLoaded called, no merge.
+      // Frame 1: animset loaded but GLB not yet → lazyAcquireRiggedModel called, no merge.
       const ld = makeDeps({ sets: { setA: { source: 'lib.glb' } }, rigs: { 'lib.glb': undefined } });
       mergeAnimationLibrary(entry, { animSets: ['setA'] }, ld.deps);
-      expect(ld.ensureRiggedModelLoaded).toHaveBeenCalledWith('lib.glb');
+      expect(ld.lazyAcquireRiggedModel).toHaveBeenCalledWith('lib.glb');
       expect(entry.actions.size).toBe(0);
       // Frame 2: GLB now loaded → clips merge.
       const ready = makeDeps({ sets: { setA: { source: 'lib.glb' } }, rigs: { 'lib.glb': { prototype: {}, animations: [clip('Dance')] } } });
       mergeAnimationLibrary(entry, { animSets: ['setA'] }, ready.deps);
       expect(entry.actions.has('Dance')).toBe(true);
+    });
+
+    it('DEFAULT deps route the merge through the SCENE-SCOPED acquire, not the editor pin (#747)', async () => {
+      // Deliberately NOT reusing mockSceneSyncDeps() here — mergeAnimationLibrary's
+      // DEFAULT_LIBRARY_DEPS only needs traits + riggedModelCache + animSetCache +
+      // SceneManager, and this test cares about exactly WHICH riggedModelCache
+      // exports got bound, so it registers each mock exactly once.
+      vi.doMock('../../src/runtime/traits', () => ({
+        Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {}, Tint: {},
+        SkinnedModel: {}, SkeletalAnimator: {}, AnimationLibrary: {}, BoneAttachment: {},
+      }));
+      vi.doMock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
+      vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
+      vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
+      vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+        worldTransforms: new Map(), deactivatedEntities: new Set(),
+      }));
+      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(), resolveMaterialForMesh: vi.fn(),
+        resolveMaterial: vi.fn(), getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+        onModelInvalidated: vi.fn(), getMeshAsset: vi.fn(),
+      }));
+      vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+      vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
+      vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
+        setActiveRenderer: vi.fn(), loadTexture3D: vi.fn(), releaseTexture3D: vi.fn(),
+        onRendererReady: (fn: () => void) => fn(),
+      }));
+      const ensureRiggedModelLoaded = vi.fn();      // the editor session pin — must NOT fire
+      const ensureRiggedModelLoadedFor = vi.fn();   // the scene-scoped acquire — must fire
+      vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
+        getRiggedModel: vi.fn(() => undefined), // "not loaded yet" branch
+        ensureRiggedModelLoaded, ensureRiggedModelLoadedFor,
+      }));
+      vi.doMock('../../src/runtime/loaders/animSetCache', () => ({
+        ANIMSET_DEFAULTS: { speed: 1, loop: true, fadeDuration: 0 },
+        getAnimSet: (ref: string) => (ref === 'setA' ? { source: 'lib.glb' } : null),
+        resolveAnimSetParams: () => ({ speed: 1, loop: true, fadeDuration: 0 }),
+      }));
+      // Only import from SceneManager scene3DSync uses is getCurrentSceneId.
+      vi.doMock('../../src/runtime/scene/SceneManager', () => ({ getCurrentSceneId: () => 7 }));
+
+      const { mergeAnimationLibrary } = await import('../../src/runtime/rendering/scene3DSync');
+      const entry = makeEntry([]);
+      mergeAnimationLibrary(entry, { animSets: ['setA'] }); // no deps arg → DEFAULT_LIBRARY_DEPS
+      expect(ensureRiggedModelLoadedFor).toHaveBeenCalledWith(7, 'lib.glb');
+      expect(ensureRiggedModelLoaded).not.toHaveBeenCalled();
+    });
+
+    // Declared right after the SceneManager doMock above (which never restores it) —
+    // if `mockSceneSyncDeps()` didn't restore the real module too, `getCurrentSceneId()`
+    // would still read 7 here instead of the real (undefined, no scene loaded) value.
+    it('a LATER test sees the REAL SceneManager, proving the doMock above does not leak', async () => {
+      mockSceneSyncDeps();
+      const { getCurrentSceneId } = await import('../../src/runtime/scene/SceneManager');
+      expect(getCurrentSceneId()).toBeUndefined();
     });
 
     it('is idempotent: a merged source binds its clips exactly once', async () => {
@@ -937,7 +999,7 @@ describe('scene3DSync', () => {
       const deps = {
         getAnimSet: () => ({ source: 'lib.glb' }),
         getRiggedModel: () => ({ prototype: { traverse: (cb: any) => cb(skinnedMesh) }, animations: [clip('Dance')] }),
-        ensureRiggedModelLoaded: vi.fn(),
+        lazyAcquireRiggedModel: vi.fn(),
         retargetClip: vi.fn(() => ({ name: 'x', tracks: [{ name: '.bones[joint1].quaternion' }, { name: '.bones[joint0].scale' }] })),
       } as any;
       mergeAnimationLibrary(entry, { animSets: ['setA'], retarget: true }, deps);
@@ -960,7 +1022,7 @@ describe('scene3DSync', () => {
       const deps = {
         getAnimSet: () => ({ source: 'lib.glb' }),
         getRiggedModel: () => ({ prototype: { traverse: (cb: any) => cb(skinnedMesh) }, animations: [srcClip] }),
-        ensureRiggedModelLoaded: vi.fn(),
+        lazyAcquireRiggedModel: vi.fn(),
         // Mimic retargetClip: emits only a quaternion track; the scale is DROPPED.
         retargetClip: vi.fn(() => ({ name: 'x', tracks: [{ name: '.bones[joint0].quaternion' }], resetDuration: vi.fn() })),
       } as any;

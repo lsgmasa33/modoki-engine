@@ -401,7 +401,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
             <label style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
               <span style={{ color: '#888', fontSize: 10 }}>Edge scale (px/src px)</span>
               <BufferedNumberInput value={edgeScale} step={0.05}
-                onChange={(v) => setEdgeScale(Math.max(0.05, v || 1))} style={inputStyle} />
+                onChange={(v) => setEdgeScale(Math.max(0.05, v || 1))} style={inputStyle}
+                dataUiId="nineSlice.border.edgeScale" dataUiLabel="Edge scale" />
             </label>
             <div style={{ color: '#666', fontSize: 10, lineHeight: 1.4 }}>Corners stay fixed; edges + center stretch (CSS border-image). Edge scale draws the border at N CSS px per source px (Unity “pixels per unit”).</div>
           </div>

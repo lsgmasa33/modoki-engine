@@ -245,6 +245,7 @@ export {
 } from './loaders/meshTemplateCache';
 export {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
+  ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
 // GPU-memory report (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md) — 3D bytes read

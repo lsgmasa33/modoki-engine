@@ -45,7 +45,8 @@ export function ParamField({ name, param, value, onChange, mixed = false }: {
             {Array.from({ length: n }, (_, i) => (
               <BufferedNumberInput key={i} value={arr[i] ?? 0} step={param.step ?? 0.01} mixed={mixed}
                 onChange={c => { const next = arr.slice(0, n); while (next.length < n) next.push(0); next[i] = c; onChange(next); }}
-                style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+                style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+                dataUiId={`assetView.material.param.${name}.${i}`} dataUiLabel={label} />
             ))}
           </div>
         </div>

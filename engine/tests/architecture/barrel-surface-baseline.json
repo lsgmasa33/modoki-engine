@@ -349,6 +349,7 @@
   "endProfilerSample",
   "ensureManifestLoaded",
   "ensureRiggedModelLoaded",
+  "ensureRiggedModelLoadedFor",
   "entityRef",
   "entriesSystem",
   "entryPrefabProvider",

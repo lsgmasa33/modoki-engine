@@ -90,7 +90,7 @@ export interface UINodeData {
   // already a union) and the layout modules (whose switches have no `default`), so
   // widening here would hand an unrecognised mode straight through to a silently
   // unpositioned element.
-  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
+  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
   /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
    *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
@@ -498,7 +498,7 @@ function buildTree(world: World): UINodeData[] | null {
           bottom: anc.bottom || 0, bottomUnit: anc.bottomUnit || 'px',
           left: anc.left || 0, leftUnit: anc.leftUnit || 'px',
           pivotX: anc.pivotX || 0, pivotY: anc.pivotY || 0,
-          safeArea: anc.safeArea, zIndex: anc.zIndex,
+          safeArea: anc.safeArea,
         };
       }
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {

@@ -70,6 +70,7 @@ export function AnimatorClipsSection({ entityIds, meta }: {
           <BufferedTextInput
             value={c.name} onChange={(v) => setNameAt(i, v)} placeholder="name"
             style={{ ...inputStyle, width: 64, flex: '0 0 auto' }}
+            dataUiId={`animator.clip.${i}.name`} dataUiLabel={c.name || `clip ${i}`}
           />
           <div style={{ flex: 1, minWidth: 0 }}>
             <AssetRefField label="" value={c.clip} onChange={(v) => setRefAt(i, v)} accept={ANIM_EXT} />
@@ -77,10 +78,12 @@ export function AnimatorClipsSection({ entityIds, meta }: {
           <BufferedNumberInput
             value={c.speed ?? 1} onChange={(v) => setSpeedAt(i, v)} step={0.1}
             style={{ ...inputStyle, width: 40, flex: '0 0 auto' }}
+            dataUiId={`animator.clip.${i}.speed`} dataUiLabel={c.name || `clip ${i}`}
           />
           <BufferedNumberInput
             value={c.fadeDuration ?? 0} onChange={(v) => setFadeAt(i, v)} step={0.05} min={0}
             style={{ ...inputStyle, width: 40, flex: '0 0 auto' }}
+            dataUiId={`animator.clip.${i}.fadeDuration`} dataUiLabel={c.name || `clip ${i}`}
           />
           <input
             type="checkbox" checked={c.loop ?? true} onChange={(e) => setLoopAt(i, e.target.checked)}

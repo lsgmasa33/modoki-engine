@@ -166,3 +166,25 @@ export function buildTextPositionsByPage(quads: TextQuad[], opts: BuildGeometryO
     return { page, positions };
   });
 }
+
+/** Can a new layout's page positions be written into the EXISTING page geometry, or
+ *  must the geometry be rebuilt? The in-place write is only sound when the quad
+ *  SEQUENCE is unchanged — same pages in the same order, same quad count per page.
+ *  ⚠️ That invariance is a property of the FONT, not of the code: `layoutText` skips a
+ *  codepoint with no `plane`/`atlas` rect, so a provider that gave U+0020 a plane rect
+ *  would make word-wrap change the quad count. This is what VERIFIES it rather than
+ *  assuming it — refuse the fast path, never apply it half-way (#749, #698's lesson).
+ *  Both inputs are already page-ascending (`buildTextPositionsByPage` sorts; the
+ *  caller's existing-mesh list is built in that same sorted order), so an index-for-
+ *  index comparison is correct — no need to re-sort or look pages up by number. */
+export function canWriteTextPositionsInPlace(
+  pages: readonly PagePositions[],
+  existing: readonly { page: number; positionsLength: number }[],
+): boolean {
+  if (pages.length !== existing.length) return false;
+  for (let i = 0; i < pages.length; i++) {
+    if (pages[i].page !== existing[i].page) return false;
+    if (pages[i].positions.length !== existing[i].positionsLength) return false;
+  }
+  return true;
+}

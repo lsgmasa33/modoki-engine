@@ -10,8 +10,17 @@ export type UILengthUnit = 'px' | '%' | 'vw' | 'vh' | 'vmin' | 'vmax';
 /** UIElement — consolidated UI trait: layout, style, text, and image. */
 export const UIElement = trait({
   // ── Layout ──
+  /** ⚠️ **Pinned on a pooled `UIEntries` row root — authoring `width`/`height` there does
+   *  nothing.** Not to a constant: forced to the scroll view's own RESOLVED box, in `px`, every
+   *  tick — the box the view has already computed for this slot, not `0` or any other fixed value.
+   *  A `%`/`vw`/`vh`/`vmin`/`vmax` unit is the documented contract here (the pool resolves it into
+   *  that same box) and is never warned about; only a `px` value that disagrees with the resolved
+   *  box is. Mechanism, why, and what the warning/Inspector note do and do not reach:
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
   width: 0,   // 0 = auto
   height: 0,  // 0 = auto
+  /** ⚠️ Also pinned on a pooled `UIEntries` row root, to `'px'` — see the note on `width` above:
+   *  the resolved box is always written in px, whatever unit was authored. */
   widthUnit: '%' as UILengthUnit,
   heightUnit: '%' as UILengthUnit,
   flexDirection: 'column' as 'row' | 'column',
@@ -28,6 +37,13 @@ export const UIElement = trait({
    *  4-wide and 7 rows deep. Nothing was wrong with the data — only with mixing the two units. */
   gapUnit: 'px' as UILengthUnit,
   flexGrow: 0,
+  /** ⚠️ **Pinned to `0` on a pooled `UIEntries` row root — authoring `flexShrink` there does
+   *  nothing.** Not the row's own trait default (`1`) — the pool needs the row NOT to shrink, or
+   *  the row's own trailing padding squeezes every entry to nothing (the #651 bug: pages rendered
+   *  0px wide). Because the pin (`0`) differs from the default (`1`), a naive "warn when authored
+   *  ≠ pin" rule would warn on every untouched row; `entriesSystem.ts`'s `pooledFieldNeedsWarning`
+   *  checks against the default too, so only a genuinely AUTHORED `flexShrink` warns. See
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
   flexShrink: 1,
   paddingTop: 0,
   paddingTopUnit: '%' as UILengthUnit,
@@ -65,18 +81,11 @@ export const UIElement = trait({
   /**
    * Stacking order among siblings.
    *
-   * ⚠️ **Silently overridden by `UIAnchor.zIndex` on an anchored element (#746)** — `UINode`
-   * writes this into `style.zIndex`, then `applyAnchorStyle` replaces it whenever the anchor's own
-   * `zIndex` is non-zero. That precedence is DELIBERATE and documented (`docs/ui-system.md`
-   * § sortOrder): for an out-of-flow box the anchor is the stacking authority. What was wrong was
-   * only the silence — the Inspector shows two `zIndex` fields as if they were independent, so an
-   * author could set this one, watch nothing move, and have no way to tell which was in charge.
-   * `games/3d-test`'s "2D Animation" scene still holds the one live disagreement (this 100 against
-   * an anchor's 1000).
-   *
-   * An anchor that leaves its own `zIndex` at 0 does NOT shadow this field. The Inspector greys
-   * this one out and names the winning value exactly when it is shadowed, via the shared
-   * `isElementZIndexShadowed` predicate that `anchorCss` applies too.
+   * The single source of stacking order for every UI element, anchored or not — `UIAnchor` used
+   * to carry its OWN `zIndex` that silently overrode this one on an anchored element (#746 found
+   * the silence; this field's removal in the follow-up change closed the shadowing itself, since
+   * the two fields wrote the same CSS `z-index` onto the same DOM node and one of them could only
+   * ever be a duplicate).
    */
   zIndex: 0,
   /**
@@ -163,6 +172,15 @@ export const UIElement = trait({
   scrollbarThumbColor: 0x888888 as number,
   /** Track colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
   scrollbarTrackColor: 0xdddddd as number,
+  /** ⚠️ **Pinned on a pooled `UIEntries` row root — authoring `isVisible` there does nothing.**
+   *  Not to a constant: forced to whether the SLOT is live (has real data this frame) or parked
+   *  (recycled, off-window) — a parked slot pins `false` regardless of what was authored. Because
+   *  the pin is a runtime STATE rather than a fixed value, and a freshly-spawned parked slot's
+   *  `isVisible` still reads its trait default (`true`) on the very tick it parks,
+   *  `entriesSystem.ts`'s `pooledFieldNeedsWarning` checks the authored value against BOTH the pin
+   *  and the default — the naive "warn when authored ≠ pin" rule would otherwise warn on every
+   *  freshly-parked slot that was never touched. See `docs/ui-system.md` § "The engine OWNS a
+   *  pooled row's box" (#651, widened #761). */
   isVisible: true,
   /**
    * Never take the pointer: taps fall through to whatever is BEHIND this element, while its

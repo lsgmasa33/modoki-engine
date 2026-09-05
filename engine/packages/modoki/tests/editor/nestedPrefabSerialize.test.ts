@@ -115,7 +115,7 @@ describe('serializePrefab — nested prefabs', () => {
 
     const out = serializePrefab(outerRoot, OUTER)!;
     expect(out).not.toBeNull();
-    expect(out.version).toBe(2);
+    expect(out.version).toBe(3);
     // O1 + O2 + one nested-ref row (named after the inner root 'Hull') = 3.
     // The inner CHILD 'Bolt' must be gone (it expands from the child file).
     expect(out.entities).toHaveLength(3);
@@ -183,7 +183,7 @@ describe('Create-Prefab-on-a-child then save outer → nested reference (regress
 
     // --- Now save the OUTER prefab (the Ship) ---
     const out = serializePrefab(ship.id(), 'g-ship-prefab')!;
-    expect(out.version).toBe(2);
+    expect(out.version).toBe(3);
     const ref = out.entities.find((e) => e.prefab);
     expect(ref, 'Flame should be a nested reference row, not flattened').toBeTruthy();
     expect(ref!.prefab).toBe(childPrefab.id);
