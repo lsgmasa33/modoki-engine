@@ -1822,6 +1822,96 @@ describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
     expect((data.entities[0].traits as any).UIElement).toBeUndefined();
     expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
   });
+
+  // Close-out (#762 follow-up): the shallow `entry.traits`-only call used to miss THREE of the
+  // four locations a trait bag can live in — overrides[localId][UIAnchor], added[] subtrees, and
+  // nestedOverrides paths — exactly the gap `migrateV8toV9`'s `renameRenderableActiveToVisibleDeep`
+  // already had to solve one migration earlier. Mirrors that migration's own deep-helper test
+  // (`renameRenderableActiveToVisibleDeep`, above) location-for-location. A second review then
+  // found the shape-agnostic "deep" replacement for THAT gap dropped the value at every one of
+  // these locations whenever the override bag had no sibling UIElement key (the realistic shape
+  // — override bags are per-field diffs, see `migrateUIAnchorZIndexInOverrideBag`'s doc) — so this
+  // is now the structured walker, and the missing-sibling shape gets its own case below.
+  it('structured walker reaches UIAnchor.zIndex in traits / overrides / added / nestedOverrides', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      traits: { UIAnchor: { zIndex: 11 }, UIElement: { zIndex: 0 } },
+      overrides: { 5: { UIAnchor: { zIndex: 12 }, UIElement: { zIndex: 0 } } },
+      added: [{ traits: { UIAnchor: { zIndex: 13 }, UIElement: { zIndex: 0 } }, children: [] }],
+      nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 14 }, UIElement: { zIndex: 0 } } } },
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.traits.UIElement as any).zIndex).toBe(11);
+    expect((node.traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.overrides[5].UIElement as any).zIndex).toBe(12);
+    expect((node.overrides[5].UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.added[0].traits.UIElement as any).zIndex).toBe(13);
+    expect((node.added[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.nestedOverrides['3/7'][9].UIElement as any).zIndex).toBe(14);
+    expect((node.nestedOverrides['3/7'][9].UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  // The realistic override-bag shape, and the one the "deep" walker got wrong: a per-field diff
+  // that only touches UIAnchor (`captureInstanceOverrides` never writes a field an author never
+  // changed), so there is no sibling UIElement bag to fall back on. Unlike the trait-bag case
+  // above (skip — no rendered value to lose), an override CAN legitimately add a trait a member
+  // never had (`applyOverridesByRootInstance`'s added-trait branch), so the value must be carried
+  // by CREATING the UIElement bag, in every one of the three per-field-diff locations.
+  it('creates the UIElement bag when an override/added/nestedOverride diff has no UIElement sibling', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      overrides: { 5: { UIAnchor: { zIndex: 7 } } },
+      added: [{ traits: {}, children: [], overrides: { 6: { UIAnchor: { zIndex: 8 } } } }],
+      nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 9 } } } },
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.overrides[5] as any).UIElement.zIndex).toBe(7);
+    expect((node.overrides[5] as any).UIAnchor.zIndex).toBeUndefined();
+    expect((node.added[0].overrides![6] as any).UIElement.zIndex).toBe(8);
+    expect((node.added[0].overrides![6] as any).UIAnchor.zIndex).toBeUndefined();
+    expect((node.nestedOverrides['3/7'][9] as any).UIElement.zIndex).toBe(9);
+    expect((node.nestedOverrides['3/7'][9] as any).UIAnchor.zIndex).toBeUndefined();
+  });
+
+  // `added[]` nodes carry a recursive `children` tree (not just `added` — that's reserved for a
+  // node that is ITSELF a nested-prefab reference). The structured walker must descend into it.
+  it('descends into an added[] node\'s own children tree', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      added: [{
+        traits: {},
+        children: [{ traits: { UIAnchor: { zIndex: 20 }, UIElement: { zIndex: 0 } }, children: [] }],
+      }],
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.added[0].children[0].traits.UIElement as any).zIndex).toBe(20);
+    expect((node.added[0].children[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  it('migrateV12toV13 (via loadSceneFile) reaches all four locations, not just top-level traits', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: { UIAnchor: { zIndex: 11 }, UIElement: { zIndex: 0 }, EntityAttributes: { name: 'X', parentId: 0 } },
+        overrides: { 5: { UIAnchor: { zIndex: 12 }, UIElement: { zIndex: 0 } } },
+        added: [{ traits: { UIAnchor: { zIndex: 13 }, UIElement: { zIndex: 0 } }, children: [] }],
+        nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 14 }, UIElement: { zIndex: 0 } } } },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    const entry = data.entities[0] as any;
+    expect(entry.traits.UIElement.zIndex).toBe(11);
+    expect(entry.traits.UIAnchor.zIndex).toBeUndefined();
+    expect(entry.overrides[5].UIElement.zIndex).toBe(12);
+    expect(entry.overrides[5].UIAnchor.zIndex).toBeUndefined();
+    expect(entry.added[0].traits.UIElement.zIndex).toBe(13);
+    expect(entry.added[0].traits.UIAnchor.zIndex).toBeUndefined();
+    expect(entry.nestedOverrides['3/7'][9].UIElement.zIndex).toBe(14);
+    expect(entry.nestedOverrides['3/7'][9].UIAnchor.zIndex).toBeUndefined();
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+  });
 });
 
 /** A prefab-instance override over a SoA field with NO Inspector metadata.

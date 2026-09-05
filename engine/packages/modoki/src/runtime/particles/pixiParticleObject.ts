@@ -25,6 +25,13 @@ export interface PixiParticleObject {
   outputs: ParticleOutputs;
   /** Sync `aliveCount` particles from `outputs` to the pool this frame. */
   commit(aliveCount: number): void;
+  /**
+   * Rewrite `aspect`/`anchor`/`offset` in place (#769) — no rebuild, no texture reload, no
+   * lost particles. Unlike the 3D backends there's no quad geometry to guard: `aspect`/
+   * `offset` are per-frame multipliers read out of the mapping options on the next `commit()`,
+   * and `anchor` is each pooled `Particle`'s own `anchorY` (set once here, not per frame).
+   */
+  setQuad(render: RenderConfig): void;
   dispose(): void;
 }
 
@@ -142,6 +149,13 @@ export function createPixiParticles(
     outputs,
     commit(aliveCount: number) {
       prevAlive = applyParticleOutputs(pool, outputs, aliveCount, prevAlive, mapOpts);
+    },
+    setQuad(render: RenderConfig) {
+      mapOpts.aspect = render.aspect && render.aspect > 0 ? render.aspect : 1;
+      mapOpts.offsetX = render.offset?.[0] ?? 0;
+      mapOpts.offsetY = render.offset?.[1] ?? 0;
+      const anchorY = render.anchor === 'bottom' ? 1 : 0.5;
+      for (const p of pool) p.anchorY = anchorY;
     },
     dispose() {
       container.destroy();

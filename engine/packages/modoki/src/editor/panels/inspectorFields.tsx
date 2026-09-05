@@ -139,9 +139,10 @@ export function EntityRefField({ label, value, onChange, hint, mixed = false }: 
 
 /** Renders a single typed value editor driven by a field's FieldHint — the inner
  *  "value" cell of a binding row. Reuses the same leaf widgets the Inspector uses so
- *  isVisible→checkbox, a color field→color picker, a ref field→entity drag-drop. */
+ *  isVisible→checkbox, a color field→color picker, a ref field→entity drag-drop.
+ *  `dataUiId` is REQUIRED (#724 close-out) — see the note on `AssetRefField`'s. */
 export function FieldValueWidget({ hint, value, onChange, mixed = false, dataUiId, dataUiLabel }: {
-  hint: FieldHint | undefined; value: unknown; onChange: (v: unknown) => void; mixed?: boolean; dataUiId?: string; dataUiLabel?: string;
+  hint: FieldHint | undefined; value: unknown; onChange: (v: unknown) => void; mixed?: boolean; dataUiId: string; dataUiLabel?: string;
 }) {
   if (hint?.type === 'boolean') {
     return <input type="checkbox" checked={mixed ? false : !!value}

@@ -200,7 +200,8 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
               // A texture override binds a sprite/texture GUID (accept:['sprite'] gives the picker),
               // overriding the param's manifest default for this instance — no source.
               <AssetRefField label="ref" value={o.ref || ''} accept={['sprite']} placeholder="sprite/texture"
-                onChange={(v) => update(i, () => ({ ref: v }))} />
+                onChange={(v) => update(i, () => ({ ref: v }))}
+                dataUiId={`material.override.${i}.ref`} dataUiLabel={o.target || `override ${i + 1}`} />
             ) : (<>
             <DropdownField label="source" value={srcType} options={SOURCE_OPTS}
               onChange={(v) => update(i, () => ({ source: defaultSource(v) }))} />
@@ -263,8 +264,9 @@ export function defaultSource(type: string): MaterialParamSource {
 }
 
 /** A compact labelled number row. `dataUiId`/`dataUiLabel` are caller-owned (this helper backs
- *  4 rendered fields across the time/store source branches — see MaterialOverridesField). */
-function NumRow({ label, value, step, onChange, dataUiId, dataUiLabel }: { label: string; value: number; step: number; onChange: (v: number) => void; dataUiId?: string; dataUiLabel?: string }) {
+ *  4 rendered fields across the time/store source branches — see MaterialOverridesField).
+ *  `dataUiId` is REQUIRED (#724 close-out) — see the note on `AssetRefField`'s. */
+function NumRow({ label, value, step, onChange, dataUiId, dataUiLabel }: { label: string; value: number; step: number; onChange: (v: number) => void; dataUiId: string; dataUiLabel?: string }) {
   return (
     <div style={rowFlex}>
       <span style={lblStyle}>{label}</span>

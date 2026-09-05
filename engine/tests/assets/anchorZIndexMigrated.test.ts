@@ -12,34 +12,63 @@
  *  2. **The scenes that DO still carry it are migratable.** `engine/tests/e2e/fixtures/**` is
  *     deliberately left at `version: 9` — those fixtures earn their keep by driving the whole
  *     migration ladder on every e2e run, and stamping them current would have quietly retired that
- *     coverage. So instead of asserting they are clean, this runs the real migration over the real
- *     file and asserts the authored stacking SURVIVES onto `UIElement.zIndex`.
+ *     coverage. So instead of asserting they are clean, this test calls
+ *     `migrateUIAnchorZIndexInTraits` DIRECTLY on each fixture's `traits` bag and asserts the
+ *     authored stacking SURVIVES onto `UIElement.zIndex`.
  *
- *  Why this matters more than it looks: `npm run test:e2e` is not part of the local gate (the free
- *  public runner covers it), so a fixture whose z-order silently vanished would surface only after
- *  a push to main. This test puts that one question inside the local gate. */
+ *  ⚠️ What this test does NOT prove: it never calls `loadSceneFile`, so it cannot see whether the
+ *  real loader actually WIRES this helper in — it only proves the fixtures' data is migratable and
+ *  that the helper preserves the value when called. It once kept passing 2/2 after a reviewer
+ *  deleted `migrateV12toV13(data);` from `loadSceneFile.ts`. The test that DOES drive the real
+ *  loader (and goes red on that mutation) is
+ *  `engine/packages/modoki/tests/runtime/loadSceneFile.test.ts:1734-1821`
+ *  (`describe('migrateV12toV13 (UIAnchor.zIndex removal)')`) — this test is a corpus/fixture check
+ *  alongside it, not a substitute for it. */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { migrateUIAnchorZIndexInTraits } from '../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration';
+import { hasAnyProject } from '../helpers/repoLayout';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
 type Ent = { name?: string; traits?: Record<string, unknown> };
 
-function sceneFiles(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  const out: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    // Build output mirrors the source scenes; only the authored copy is the corpus.
-    if (e.isDirectory()) {
-      if (e.name === 'dist' || e.name === 'ios' || e.name === 'android' || e.name === 'node_modules') continue;
-      out.push(...sceneFiles(p));
-    } else if (e.name.endsWith('.scene.json') || e.name.endsWith('.prefab.json')) out.push(p);
-  }
-  return out;
+/** All scene/prefab files in the repo, enumerated through GIT rather than the filesystem, so
+ *  gitignored build output (`games/*\/ads/` from a `--target playable` export, `dist/`,
+ *  `release/`) can never be mistaken for authored content — a filesystem walk made this guard
+ *  MACHINE-DEPENDENT, red only on a clone that had run a playable export, which reads as "the
+ *  merge broke it" rather than "the guard is looking outside the repo". Full reasoning:
+ *  `engine/tests/architecture/docCitations.test.ts`'s `repoFiles()`. `--others
+ *  --exclude-standard` deliberately includes new UNTRACKED scenes, since an unstaged scene is
+ *  exactly when this guard is most useful. */
+let allSceneAndPrefabFiles: string[] | undefined;
+function repoSceneAndPrefabFiles(): string[] {
+  if (allSceneAndPrefabFiles) return allSceneAndPrefabFiles;
+  const out = execFileSync(
+    'git',
+    ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    { cwd: REPO, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+  )
+    .split('\0')
+    .filter(Boolean);
+  allSceneAndPrefabFiles = out
+    .filter((p) => p.endsWith('.scene.json') || p.endsWith('.prefab.json'))
+    .map((p) => path.join(REPO, p))
+    // A tracked file can be absent from the working tree mid-rebase or after a manual delete;
+    // reading it would throw and fail the guard for a reason that has nothing to do with the fix.
+    .filter((p) => fs.existsSync(p));
+  return allSceneAndPrefabFiles;
+}
+
+function sceneFiles(root: string): string[] {
+  const rootSegs = path.relative(REPO, root).split(path.sep);
+  return repoSceneAndPrefabFiles().filter((p) => {
+    const segs = path.relative(REPO, p).split(path.sep);
+    return rootSegs.every((seg, i) => segs[i] === seg);
+  });
 }
 
 function entitiesWithAnchorZIndex(file: string): { ent: Ent; anchor: Record<string, unknown> }[] {
@@ -57,12 +86,28 @@ function entitiesWithAnchorZIndex(file: string): { ent: Ent; anchor: Record<stri
 describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () => {
   it('no scene or prefab under games/ or demos/ still authors UIAnchor.zIndex', () => {
     const offenders: string[] = [];
+    const scanned: string[] = [];
     for (const root of ['games', 'demos']) {
       for (const file of sceneFiles(path.join(REPO, root))) {
+        scanned.push(file);
         for (const { ent } of entitiesWithAnchorZIndex(file)) {
           offenders.push(`${path.relative(REPO, file)} → entity ${JSON.stringify(ent.name ?? '?')}`);
         }
       }
+    }
+    // A corpus of NOTHING passes the assertion below vacuously, and enumerating through git
+    // adds a fresh way to reach that state silently (run outside a checkout, or an `ls-files`
+    // flag that stops matching) on top of the ways a filesystem walk already had. So pin that
+    // the walk found something whenever there is anything to find.
+    //
+    // `hasAnyProject()` (loose) NOT `hasInternalGames()` (strict), deliberately — see those
+    // helpers' notes on choosing between them. This guard's corpus is `games/` AND `demos/`,
+    // and while the public snapshot ships no `games/` at all it does ship two demos whose
+    // scenes this legitimately covers, so the loose check is the one that stays meaningful
+    // there instead of skipping the only corpus the public gate has.
+    if (hasAnyProject()) {
+      expect(scanned.length, 'the scene/prefab walk returned NOTHING, so the assertion below '
+        + 'cannot fail — the enumeration is broken, not the corpus clean').toBeGreaterThan(0);
     }
     expect(offenders, 'UIAnchor.zIndex no longer exists on the trait, so this value is dropped on '
       + 'the next save and ignored at spawn — both silently. Author UIElement.zIndex instead:\n'

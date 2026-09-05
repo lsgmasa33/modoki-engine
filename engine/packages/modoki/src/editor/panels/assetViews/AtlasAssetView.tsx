@@ -272,7 +272,8 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       {doc.members.map((m, i) => (
         <div key={i} style={rowStyle}>
           <div style={{ flex: 1, opacity: editingDisabled ? 0.5 : 1, pointerEvents: editingDisabled ? 'none' : undefined }}>
-            <AssetRefField label="" value={m} accept={['sprite']} onChange={(v) => setMember(i, v)} placeholder="drop / pick a sprite" />
+            <AssetRefField label="" value={m} accept={['sprite']} onChange={(v) => setMember(i, v)} placeholder="drop / pick a sprite"
+              dataUiId={`assetView.atlas.member.${i}.sprite`} dataUiLabel={`member ${i}`} />
           </div>
           <button data-ui-id={`assetView.atlas.member.${i}.remove`} data-ui-kind="button" data-ui-label="Remove" disabled={editingDisabled} onClick={() => removeMember(i)} title="Remove" style={{ ...reimportBtnStyle, width: 24, padding: 0 }}>✕</button>
         </div>

@@ -10,10 +10,10 @@
  */
 
 import * as THREE from 'three';
-import { TEXTURE_WAIT_BUDGET_MS, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, resolveTrailSegments, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
+import { TEXTURE_WAIT_BUDGET_MS, renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps, resolveTrailSegments, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
 import { rawNow } from '../core/clock';
 import { CpuParticleSim } from './cpuSimulator';
-import { createBillboard, type BillboardObject } from './spriteBillboard';
+import { createBillboard, applyQuadInPlace, type BillboardObject } from './spriteBillboard';
 import { createMeshParticles } from './meshParticles';
 import { createTrail, type TrailObject } from './trailLines';
 import { makeRng } from '../core/curves';
@@ -406,12 +406,15 @@ export class CpuTslBackend implements IParticleBackend {
     const isMesh = def.render.mode === 'mesh';
     const texChanged = newTexRef !== e.textureRef;
     const structural =
-      renderStructuralKey(def) !== renderStructuralKey(e.def) ||
+      renderBuildKey(def) !== renderBuildKey(e.def) ||
       (def.trail?.enabled ?? false) !== (e.def.trail?.enabled ?? false) ||
       resolveTrailSegments(def.trail?.segments) !== resolveTrailSegments(e.def.trail?.segments) ||
       (def.worldSpace ?? false) !== (e.def.worldSpace ?? false) || // clean restart, no mixed-space particles
       subSig(def) !== subSig(e.def) ||
       texChanged;
+    // Compared against the OLD def, before it's overwritten below — a bare aspect/anchor/
+    // offset edit is applied to the existing quad in place (#769), never a rebuild.
+    const quadChanged = !structural && renderQuadKey(def) !== renderQuadKey(e.def);
     // Timing fields drive the emission clock (the burst-crossing window is
     // `time % cycle`, cycle = looping ? duration : Infinity). Changing them while
     // keeping the accumulated `time` makes the next step straddle the old/new cycle
@@ -448,6 +451,14 @@ export class CpuTslBackend implements IParticleBackend {
       }
     } else {
       e.sim.setDef(def);
+      // Mesh mode reads none of the quad-key fields (createMeshParticles never touches
+      // aspect/anchor/offset) — a change there is a no-op, not a rebuild.
+      if (quadChanged && !isMesh) {
+        if (!applyQuadInPlace(e.billboard.mesh.geometry, def.render)) {
+          this.build(e, def); // shape guard failed — refuse a partial write, rebuild instead
+          return;
+        }
+      }
       if (timingChanged) {
         // Clean restart of the emission clock (keeps geometry/buffers + the current
         // play state; a paused emitter stays paused, empty until played).

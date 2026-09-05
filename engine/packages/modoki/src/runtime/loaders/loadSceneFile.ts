@@ -15,7 +15,7 @@ import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
-import { migrateUIAnchorZIndexInTraits } from './uiAnchorZIndexMigration';
+import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -366,10 +366,14 @@ function migrateV11toV12(data: SceneData): void {
  *  onto `UIElement.zIndex` (only when there IS a `UIElement` trait — an entity with a
  *  `UIAnchor` but no `UIElement` is skipped rather than inventing one), then delete
  *  `UIAnchor.zIndex` unconditionally, truthy or not. Idempotent — a file with no
- *  `UIAnchor.zIndex` left is untouched. */
+ *  `UIAnchor.zIndex` left is untouched. Structured walk (see `migrateUIAnchorZIndexStructured`)
+ *  — reaches `overrides[localId][UIAnchor]`, `added[]` subtrees and `nestedOverrides` paths too,
+ *  same as `migrateV8toV9`'s `renameRenderableActiveToVisibleDeep`. */
 function migrateV12toV13(data: SceneData): void {
   if (data.version >= 13) return;
-  for (const entry of data.entities) migrateUIAnchorZIndexInTraits(entry.traits);
+  // Structured walk — not just entry.traits — so overrides[localId][UIAnchor], added[] subtrees
+  // and nestedOverrides paths all get the same fix (mirrors migrateV8toV9's renameRenderableActiveToVisibleDeep).
+  for (const entry of data.entities) migrateUIAnchorZIndexStructured(entry);
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.

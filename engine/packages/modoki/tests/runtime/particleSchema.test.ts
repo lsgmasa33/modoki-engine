@@ -1,5 +1,7 @@
 /** Particle schema/data unit tests (pure, no GPU, no ECS):
- *  - renderStructuralKey: what changes force a backend rebuild vs. a cheap live edit
+ *  - renderBuildKey / renderQuadKey: what changes force a backend rebuild vs. is applied in
+ *    place vs. is a cheap live edit (#769 split renderStructuralKey in two — see
+ *    docs/particles.md)
  *  - normalizeParticleDef: partial/older JSON loads safely with defaults filled
  *  - defaultParticleEffect: a valid, self-consistent starting effect
  *  - createOverLifeLUT: size/opacity/color curves bake correctly into the GPU LUT */
@@ -8,7 +10,8 @@ import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 import {
   defaultParticleEffect,
-  renderStructuralKey,
+  renderBuildKey,
+  renderQuadKey,
   type ParticleEffectDef,
 } from '../../src/runtime/particles/types';
 import { normalizeParticleDef } from '../../src/runtime/loaders/particleCache';
@@ -16,7 +19,7 @@ import { createOverLifeLUT, LUT_WIDTH } from '../../src/runtime/particles/gpuLut
 
 const base = () => defaultParticleEffect();
 
-describe('renderStructuralKey', () => {
+describe('renderBuildKey', () => {
   it('is stable across cosmetic / simulation-only edits (no rebuild)', () => {
     const a = base();
     const b: ParticleEffectDef = {
@@ -28,25 +31,31 @@ describe('renderStructuralKey', () => {
       duration: 42,
       looping: !a.looping,
     };
-    expect(renderStructuralKey(b)).toBe(renderStructuralKey(a));
+    expect(renderBuildKey(b)).toBe(renderBuildKey(a));
+  });
+
+  it('is stable across a bare aspect/anchor/offset edit — those are the QUAD key, not the build key', () => {
+    const a = base();
+    const b: ParticleEffectDef = {
+      ...a,
+      render: { ...a.render, aspect: 0.5, anchor: 'bottom', offset: [0.2, -0.3] },
+    };
+    expect(renderBuildKey(b)).toBe(renderBuildKey(a));
   });
 
   it('treats omitted render fields as their defaults (no spurious rebuild)', () => {
     const explicit: ParticleEffectDef = {
       ...base(),
-      render: { blend: 'additive', mode: 'billboard', aspect: 1, anchor: 'center', tilesX: 1, tilesY: 1 },
+      render: { blend: 'additive', mode: 'billboard', tilesX: 1, tilesY: 1 },
     };
     const implicit: ParticleEffectDef = { ...base(), render: { blend: 'additive' } };
-    expect(renderStructuralKey(explicit)).toBe(renderStructuralKey(implicit));
+    expect(renderBuildKey(explicit)).toBe(renderBuildKey(implicit));
   });
 
   it.each([
     ['maxParticles', (d: ParticleEffectDef) => { d.maxParticles = d.maxParticles + 1; }],
     ['blend', (d: ParticleEffectDef) => { d.render.blend = 'normal'; }],
     ['mode', (d: ParticleEffectDef) => { d.render.mode = 'mesh'; }],
-    ['aspect', (d: ParticleEffectDef) => { d.render.aspect = 0.5; }],
-    ['anchor', (d: ParticleEffectDef) => { d.render.anchor = 'bottom'; }],
-    ['offset', (d: ParticleEffectDef) => { d.render.offset = [0, -1]; }],
     ['meshPrimitive', (d: ParticleEffectDef) => { d.render.meshPrimitive = 'sphere'; }],
     ['meshLit', (d: ParticleEffectDef) => { d.render.meshLit = true; }],
     ['tilesX', (d: ParticleEffectDef) => { d.render.tilesX = 4; }],
@@ -56,7 +65,36 @@ describe('renderStructuralKey', () => {
     const a = base();
     const b = base();
     mutate(b);
-    expect(renderStructuralKey(b)).not.toBe(renderStructuralKey(a));
+    expect(renderBuildKey(b)).not.toBe(renderBuildKey(a));
+  });
+});
+
+describe('renderQuadKey', () => {
+  it('treats omitted aspect/anchor/offset as their defaults', () => {
+    const explicit: ParticleEffectDef = { ...base(), render: { blend: 'additive', aspect: 1, anchor: 'center', offset: [0, 0] } };
+    const implicit: ParticleEffectDef = { ...base(), render: { blend: 'additive' } };
+    expect(renderQuadKey(explicit)).toBe(renderQuadKey(implicit));
+  });
+
+  it.each([
+    ['aspect', (d: ParticleEffectDef) => { d.render.aspect = 0.5; }],
+    ['anchor', (d: ParticleEffectDef) => { d.render.anchor = 'bottom'; }],
+    ['offset', (d: ParticleEffectDef) => { d.render.offset = [0, -1]; }],
+  ])('changes when the quad field %s changes', (_label, mutate) => {
+    const a = base();
+    const b = base();
+    mutate(b);
+    expect(renderQuadKey(b)).not.toBe(renderQuadKey(a));
+  });
+
+  it('is stable across build-key edits (maxParticles, blend, tiles)', () => {
+    const a = base();
+    const b: ParticleEffectDef = {
+      ...a,
+      maxParticles: a.maxParticles + 1,
+      render: { ...a.render, blend: 'normal', tilesX: 4, tilesY: 4 },
+    };
+    expect(renderQuadKey(b)).toBe(renderQuadKey(a));
   });
 });
 

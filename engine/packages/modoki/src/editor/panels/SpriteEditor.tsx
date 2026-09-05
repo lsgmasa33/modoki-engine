@@ -855,7 +855,10 @@ function Row({ children }: { children: React.ReactNode }) {
  *  `onBlur` sits on the LABEL, not the input: React's onBlur is `focusout`, which bubbles,
  *  and BufferedNumberInput owns the input's own focus handlers. It is an EXTRA commit signal
  *  for the click-away path — never the only one, which is what #244 was. */
-function Num({ label, v, on, step, onBlur, dataUiId }: { label: string; v: number; on: (v: number) => void; step?: number; onBlur?: () => void; dataUiId?: string }) {
+// dataUiId is REQUIRED (#724 close-out) — findBufferedInputs (chromeTagging.test.ts) sees only
+// a literal Buffered-input JSX tag, so an optional prop here would let a new caller of this
+// helper go untagged with the suite green. The type checker is the guard now.
+function Num({ label, v, on, step, onBlur, dataUiId }: { label: string; v: number; on: (v: number) => void; step?: number; onBlur?: () => void; dataUiId: string }) {
   return (
     <label style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }} onBlur={onBlur}>
       <span style={{ color: '#888', fontSize: 10 }}>{label}</span>

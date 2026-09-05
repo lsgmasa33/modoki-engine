@@ -33,7 +33,7 @@ by scene hierarchy — an emitter with a `Canvas2D` ancestor renders 2D, everyth
 
 - `runtime/particles/types.ts` — the `ParticleEffectDef` schema + the `IParticleBackend(Core)`
   interface, plus the shared scalar helpers every backend calls (`clampSimDt`, `seekSteps`,
-  `spriteFrameIndex`, `renderStructuralKey`, `gpuDefSupported`).
+  `spriteFrameIndex`, `renderBuildKey`, `renderQuadKey`, `gpuDefSupported`).
 - `runtime/particles/cpuSimulator.ts` — `CpuParticleSim`: the renderer-free, deterministic SoA
   pool. Emits, integrates, ages, recycles; writes `ParticleOutputs`/`TrailOutputs`.
 - `runtime/particles/cpuTslBackend.ts` — Three.js CPU backend: wraps `CpuParticleSim` in a stable
@@ -68,6 +68,33 @@ backends add `getObject3D(handle)` (`IParticleBackend`); the 2D backend adds `ge
 `Container`) that the sync layer mounts once; structural rebuilds swap the *inner* mesh/container
 inside it, so the scene graph never needs re-wiring — even when the router flips CPU↔GPU beneath
 the same wrapper.
+
+### Structural vs quad vs live edits
+
+`setDef` on every backend compares the incoming def against the one it's holding along three
+tiers, from most to least expensive:
+
+- **`renderBuildKey(def)`** (`types.ts`) — fields that size or shape what a backend allocates
+  (`maxParticles`, `blend`, `mode`, `meshPrimitive`, `meshLit`, sprite-sheet tile counts,
+  `softParticles`), plus backend-specific extras compared on top (trails/sub-emitters on CPU;
+  force/collision presence + collider shape on GPU; texture identity on all three). A change
+  here forces a full rebuild — a fresh mesh/container, fresh sim, `inited = false` on the GPU
+  backend (the pool restarts).
+- **`renderQuadKey(def)`** — `aspect`, `anchor`, and the two `offset` components. All four
+  billboard-pivot fields resolve to nothing but the 12 vertex-position floats of a 4-vertex
+  quad (`uv`/`index` are invariant under them) — `spriteBillboard.ts`'s
+  `resolveQuadShift`/`computeQuadCorners` is the one place that arithmetic lives, shared by
+  every builder and by `applyQuadInPlace`, the in-place rewrite each 3D backend calls when the
+  build key is unchanged but the quad key changed. The Pixi backend has no quad geometry to
+  rewrite — it just updates the per-frame mapping options and each pooled particle's `anchorY`
+  (`PixiParticleObject.setQuad`). Either way: no rebuild, no lost simulation state, no restart.
+  `applyQuadInPlace` refuses (and the caller falls back to a full rebuild) if the geometry isn't
+  the plain 4-vertex quad every billboard builder emits — the same guard posture
+  `canWriteTextPositionsInPlace` documents in `text/textMesh.ts`. Mesh mode (`render.mode ===
+  'mesh'`) reads none of these fields, so a quad-key change there is a no-op.
+- Everything else (color, physics, spawn/over-life curves, collider values, force magnitudes,
+  timing) is a **live edit** — applied straight onto the running sim/uniforms with no rebuild at
+  all, and (for timing fields) a clean re-baseline of the emission clock instead.
 
 ### Routing (3D: CPU vs GPU)
 
@@ -199,12 +226,18 @@ deliberately, guarded at every hop. **If a future three release adds a public fr
 helper's body — the call sites do not change.**
 
 **`build()` REUSES the four buffers when `count` is unchanged**, which is what makes editor tuning
-cheap: `maxParticles` is only ONE field of `renderStructuralKey`, so every blend / aspect / tiles /
-anchor / sprite-mode / texture edit also rebuilds with an identical count. Safe because a rebuild
-re-inits the pool regardless (`inited = false` → `computeInit` respawns every slot), so no stale
-particle state survives. Superseded buffers and compute nodes are freed at the **END** of `build()`,
-after the replacements are assigned — `Pipelines.delete` decrements `usedTimes` and releases the
-compute program at zero, so freeing first would drop a program the new kernel is about to ask for.
+cheap: `maxParticles` is only ONE field of `renderBuildKey`, so every blend / tiles / sprite-mode /
+texture edit also rebuilds with an identical count (`aspect`/`anchor`/`offset` no longer reach
+`build()` at all — see "Structural vs quad vs live edits" above). Safe because a rebuild re-inits
+the pool regardless (`inited = false` → `computeInit` respawns every slot), so no stale particle
+state survives. Superseded buffers, compute nodes, **the render mesh, and the over-life LUT** are
+all freed at the **END** of `build()`, after the replacements are built and assigned. ⚠️ That
+ordering is **discipline, not a leak fix**: `Pipelines.delete` does decrement `usedTimes` and
+release the compute program (and, for the mesh, the render pipeline) at zero, but the replacement
+does not acquire anything at build time — a compute program is registered at DISPATCH time and a
+render pipeline at DRAW time — so the count reaches zero under either ordering. Freeing last costs
+nothing and keeps the intent legible; it does not prevent the release, and no issue should be
+closed on the strength of it (see #715).
 
 MEASURED on `games/3d-test` (15k particles, 12 blend-only rebuilds): **before, +4 buffers and
 +780,000 B per rebuild, 9.36 MB orphaned, perfectly linear; after, zero growth.** Note the sizing is
@@ -350,7 +383,7 @@ push `speedScale`, and `update` on the **visual delta** scaled by `playbackSpeed
 - **What triggers a GPU rebuild differs from CPU.** Sprite-sheet playback (`spriteMode`/`spriteCycles`/
   `spriteRandomStart`) is *baked into the render shader* on GPU, so changing it needs a rebuild — but
   the CPU sim computes the frame live, so it doesn't (this is why sprite playback is *not* in the
-  shared `renderStructuralKey`). Likewise the **presence** of forces/collision and the collider
+  shared `renderBuildKey`). Likewise the **presence** of forces/collision and the collider
   **shape + invert** flag are baked into the compute kernel → changing them rebuilds; force values,
   collider center/radius/extents, and `kill↔bounce` are plain uniforms (no rebuild).
 - **GPU time advances even before a renderer is captured.** The GPU backend steps its noise/sim clock

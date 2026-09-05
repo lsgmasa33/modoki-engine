@@ -36,7 +36,7 @@ import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCoun
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 import { disposeAllFontFaces } from './fontLoader';
-import { migrateUIAnchorZIndexInTraits } from './uiAnchorZIndexMigration';
+import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -2066,8 +2066,11 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
       // migration unconditionally here (cheap, idempotent) is the smallest thing that closes
       // the same data-loss window a versioned migration closes for scenes — see
-      // uiAnchorZIndexMigration.ts.
-      for (const entry of data.entities ?? []) migrateUIAnchorZIndexInTraits(entry.traits);
+      // uiAnchorZIndexMigration.ts. Structured walk — reaches overrides[localId][UIAnchor],
+      // added[] subtrees and nestedOverrides paths (including a prefab FILE's own nested rows,
+      // since this runs unconditionally on every row, not just non-nested ones), not just
+      // entry.traits.
+      for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
       prefabCache.set(prefabPath, data);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {

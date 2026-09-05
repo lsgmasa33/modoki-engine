@@ -4,8 +4,9 @@
  *  resize, and on `dispose()`.
  *
  *  Before this fix `build()` allocated four fresh `instancedArray` buffers on EVERY structural
- *  rebuild (a blend/aspect/tiles/anchor/sprite-mode/texture change — anything in
- *  `renderStructuralKey`, not just `maxParticles`), and `dispose()` dropped its references without
+ *  rebuild (a blend/aspect/tiles/anchor/sprite-mode/texture change — anything in what's since
+ *  split into `renderBuildKey`/`renderQuadKey`, #769 — not just `maxParticles`), and `dispose()`
+ *  dropped its references without
  *  ever reaching `renderer._attributes.delete(...)`, three's only route to `GPUBuffer.destroy()`
  *  (see the long comment on `freeStorageBuffer` in the source). Measured on `games/3d-test`: 12
  *  blend toggles at 15k particles allocated 48 storage buffers totalling 9.36 MB, none ever freed.

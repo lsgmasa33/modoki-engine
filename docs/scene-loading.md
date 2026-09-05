@@ -465,9 +465,27 @@ Migrations chain in `loadSceneFile.ts` and run before any entity spawns:
   (and any future `FieldHint.entityId`-flagged field) is *written* — a GUID instead of
   a raw ecs id — not the shape of the data (see "Entity-id stability on disk")
 - `migrateV11toV12` — no-op passthrough; `serializeScene` stops writing the per-entity
-  `id` field entirely. This is the terminal step — it stamps `data.version =
-  SCENE_FORMAT_VERSION`, so bumping the constant without chaining a new migration
-  can't silently mislabel a freshly-migrated file as under-versioned
+  `id` field entirely
+- `migrateV12toV13` — `UIAnchor.zIndex` removed; a truthy value is carried onto
+  `UIElement.zIndex` (see `uiAnchorZIndexMigration.ts` for the carrier policy — it differs
+  between an entity's own `traits` and an override/added/nestedOverride diff bag), then the
+  anchor field is deleted unconditionally. Structured walk
+  (`migrateUIAnchorZIndexStructured`) — reaches `overrides[localId][UIAnchor]`, `added[]`
+  subtrees and `nestedOverrides` paths too, same as `migrateV8toV9`'s reach. **This is the
+  terminal step** — it stamps `data.version = SCENE_FORMAT_VERSION`, sourced from the
+  constant rather than a literal `13`, so a *correctly-extended* chain can't mislabel a
+  freshly-migrated file as under-versioned.
+  <br>⚠️ That guarantee depends on every future bump pairing the constant with a new
+  migration step guarded at the new number — it is a discipline the next migration has to
+  keep, not something this step enforces by itself. Bump `SCENE_FORMAT_VERSION` alone,
+  with no new step added, and this step's own `if (data.version >= 13) return;` guard means
+  a v13 file (this step's old terminal state) returns early and stays stamped `13` —
+  silently under-versioned against the new constant — while a v12-or-below file still runs
+  this step and gets stamped with the *new*, higher number despite receiving no migration
+  for the v13→new-number gap. The per-step guards on every migration above keep their
+  literal version numbers as intermediate "step done" markers for exactly this reason; only
+  the CURRENT terminal step's stamp follows the constant, and that stops being true the
+  moment a new terminal step is added without moving the stamp to it.
 
 ### Re-saving legacy scenes (the sha-churn migration)
 

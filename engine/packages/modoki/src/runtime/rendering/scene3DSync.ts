@@ -9,7 +9,7 @@ import type { World } from 'koota';
 import type { WebGPURenderer } from 'three/webgpu';
 import { Transform, Renderable3D, Renderable3DPrimitive, Camera, CameraFrame, Tint, isMaterialInstanced, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, Animator, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text3D, TextAnimation } from '../traits';
 import { layoutText, type TextQuad } from './text/layoutText';
-import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
+import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { makeMtsdfMaterial, updateMtsdfStyle, canReuseMtsdfMaterial, type MtsdfStyle } from './text/mtsdfShader';
 import { getFontTexture } from './text/fontTextureThree';
@@ -3428,6 +3428,13 @@ interface TextMeshEntry {
   /** The atlas half of `hash` (#692) — kept separately so a layout-only change can tell
    *  it is safe to reclaim the existing page materials rather than rebuild them. */
   atlasKey?: string;
+  /** The BUILD half of `hash` (#766) — `[font, text, atlasVersion, textDirty]`. Unchanged
+   *  means the new layout can only differ from the old one in each quad's x/y (same glyph
+   *  sequence, same page assignment, same UVs — see `canWriteTextPositionsInPlace`'s
+   *  comment), so a `hash` change coming ONLY from fontSize/align/maxWidth/lineSpacing/
+   *  letterSpacing/anchor can rewrite page positions in place instead of rebuilding
+   *  geometry + material (the direct analogue of `Scene2D.tsx`'s `meshBuildKey`, #749). */
+  buildKey?: string;
   fontId: string;
   billboard: boolean;
   /** Un-animated layout quads + anchor offset, kept so per-glyph animation can
@@ -3450,9 +3457,17 @@ interface TextMeshEntry {
 const _activeText = new Set<number>();
 
 /** Rewrite each page mesh's position attribute from `quads` (reusing the material +
- *  UVs + indices — no shader rebuild), applying the entry's anchor offset. `quads`
- *  must be the SAME length/order as the base layout (animation is length-invariant),
- *  so per-page vertex counts match and the update is in place. */
+ *  UVs + indices — no shader rebuild), applying the entry's anchor offset. Two callers
+ *  rely on this: per-glyph animation, where `quads` is the SAME length/order as the base
+ *  layout every frame (animation is length-invariant); and the #766 layout-only fast
+ *  path, where `quads` is a NEW layout whose per-page vertex counts were already checked
+ *  against the existing mesh by `canWriteTextPositionsInPlace` before this is called.
+ *  Either way the per-page vertex counts match and the update is in place.
+ *
+ *  Invalidates each written page's cached bounds — `boundingBox`/`boundingSphere` are
+ *  computed lazily by three (`Box3.expandByObject`, `Mesh.raycast`) and only when `null`,
+ *  so a surviving geometry object that keeps its old bounds would report the PRE-edit
+ *  extent for selection/picking/`get_layout_bounds` even though the glyphs moved. */
 function updateTextPagePositions3D(entry: TextMeshEntry, quads: TextQuad[]): void {
   const ax = entry.ax ?? 0, ay = entry.ay ?? 0;
   // Positions-only (UVs/indices are invariant, baked into the mesh) — keyed by PAGE.
@@ -3465,6 +3480,8 @@ function updateTextPagePositions3D(entry: TextMeshEntry, quads: TextQuad[]): voi
     if (attr.array.length === pos.length) {
       (attr.array as Float32Array).set(pos);
       attr.needsUpdate = true;
+      mesh.geometry.boundingBox = null;
+      mesh.geometry.boundingSphere = null;
     }
   }
 }
@@ -3483,15 +3500,15 @@ function updateTextPageColors3D(entry: TextMeshEntry, quads: TextQuad[]): void {
   }
 }
 
-/** Dispose an entry's page meshes. Geometry is always disposed. The MATERIAL is disposed too,
- *  unless `keep` is supplied — in which case it is moved into `keep` for the caller to reclaim or
- *  dispose (#692: a layout change needs new geometry but the same material). */
-function disposeTextPageMeshes(entry: TextMeshEntry, keep?: Map<number, THREE.Material>): void {
-  for (const [page, mesh] of entry.pages) {
+/** Dispose an entry's page meshes — geometry AND material both go. The rebuild path
+ *  (#715) no longer calls through here to reclaim a material across a layout change; it
+ *  captures `entry.pages`' materials itself before replacing them, so this is only ever
+ *  reached from `disposeTextMeshEntry` when the whole text entity goes away. */
+function disposeTextPageMeshes(entry: TextMeshEntry): void {
+  for (const [, mesh] of entry.pages) {
     entry.group.remove(mesh);
     mesh.geometry.dispose();
-    const mat = mesh.material as THREE.Material;
-    if (keep) keep.set(page, mat); else mat.dispose();
+    (mesh.material as THREE.Material).dispose();
   }
   entry.pages.clear();
 }
@@ -3573,54 +3590,133 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         scene.add(entry.group);
         textMeshes.set(id, entry);
       }
-      // Rebuild every page mesh from scratch (a layout/atlas change is infrequent). Geometry is
-      // always new; the MATERIAL is reclaimed when the atlas is unchanged — the atlas TEXTURE is
-      // baked into each TSL node graph, so a page's material can't be mutated in place across an
-      // atlas change, but a layout-only change never touches it.
-      //
-      // Reclaim the page materials when the atlas is unchanged — a layout change needs new
-      // geometry, never a new node graph (#692; the direct analogue of #690 on the 2D twin).
-      // Anything left in `reusable` after the loop is a page this text no longer touches, or one
-      // whose texture/metrics moved under it: disposed in the `finally`.
-      const reusable = new Map<number, THREE.Material>();
-      disposeTextPageMeshes(entry, entry.atlasKey === atlasKey ? reusable : undefined);
-      // Anchor: block spans x[0,width], yUp y[0,-height]. Shift so the anchor point
-      // (anchorX across width, anchorY down height) sits at the entity origin — same
-      // for every page since they share one layout.
-      const ax = -t.anchorX * layout.width, ay = t.anchorY * layout.height;
-      try {
-        for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
+
+      // #766: the BUILD half of `hash` — the fields that decide WHAT gets allocated
+      // (glyph sequence + atlas). Computed HERE, not per-frame — this whole branch only
+      // runs on a `hash` miss, so the per-frame path below gains zero string-concat
+      // allocations from this (mirrors `Scene2D.tsx`'s `meshBuildKey`, #749).
+      const buildKey = [t.font, t.text, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+      let fastPathApplied = false;
+      if (entry.buildKey === buildKey && entry.pages.size > 0) {
+        const hasTrueSdf = provider.atlas.type !== 'msdf';
+        const pagePositions = buildTextPositionsByPage(layout.quads, { yUp: true });
+        // Page-ascending, matching `buildTextPositionsByPage`'s sort — `canWriteTextPositionsInPlace`
+        // compares index-for-index (textMesh.ts:180-189). `entry.pages` is itself built in
+        // ascending order (the rebuild loop below walks `buildTextGeometryByPage`'s sorted
+        // output), so its insertion order already matches; sorted explicitly anyway since that
+        // invariant lives in a different code path than this one.
+        const sortedPages = [...entry.pages.keys()].sort((a, b) => a - b);
+        // `positionsLength` must be the EXISTING mesh's position count in `buildTextPositionsByPage`
+        // units — 2 floats/vertex — not the 3-component array `positionsTo3D` expands into, or the
+        // guard would always refuse. `attr.count` is vertex count; ×2 gets there.
+        const existing = sortedPages.map((page) => {
+          const attr = entry!.pages.get(page)!.geometry.getAttribute('position') as THREE.BufferAttribute;
+          return { page, positionsLength: attr.count * 2 };
+        });
+        const pagesReusable = sortedPages.every((page) => {
+          const mesh = entry!.pages.get(page)!;
           const ptex = getFontTexture(provider, page);
-          if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
-          const g = new THREE.BufferGeometry();
-          g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
-          g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
-          g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
-          g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
-          g.translate(ax, ay, 0);
-          const hasTrueSdf = provider.atlas.type !== 'msdf';
-          let mat = reusable.get(page);
-          if (mat && canReuseMtsdfMaterial(mat, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf)) {
-            reusable.delete(page);
-          } else {
-            mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), hasTrueSdf);
-          }
-          const mesh = new THREE.Mesh(g, mat);
-          // Per-glyph animation nudges verts past the static bounds; skip frustum
-          // culling (text is cheap) so an animated glyph never pops out at the edge.
-          mesh.frustumCulled = false;
-          entry.group.add(mesh);
-          entry.pages.set(page, mesh);
+          return !!ptex && canReuseMtsdfMaterial(mesh.material as THREE.Material, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf);
+        });
+        // Refuse rather than half-apply (#698's lesson, restated at #749 for the 2D twin): any
+        // failure here falls through to the full rebuild below instead of writing partial state.
+        if (pagesReusable && canWriteTextPositionsInPlace(pagePositions, existing)) {
+          // The anchor needs no extra machinery: `updateTextPagePositions3D` already adds
+          // `entry.ax/ay` onto freshly built positions. Setting them from the NEW layout is
+          // still required — the per-glyph animation path below reads them every frame, so a
+          // stale value would mis-anchor animated text even though the static mesh looks right.
+          entry.ax = -t.anchorX * layout.width;
+          entry.ay = t.anchorY * layout.height;
+          updateTextPagePositions3D(entry, layout.quads);
+          entry.hash = hash;
+          entry.buildKey = buildKey;
+          entry.baseQuads = layout.quads;
+          // ⚠️ Do NOT touch `wasMotion`/`wasColored` here. The full rebuild below clears both
+          // because it mints new geometry AND a new `aTextColor` buffer, both at base state.
+          // This fast path writes base POSITIONS only and leaves the colour buffer untouched, so
+          // clearing `wasColored` would strand an animated colour with nothing left to restore it
+          // (`Scene2D.tsx:2219-2228` documents the identical reasoning for the 2D twin).
+          //
+          // ⚠️ There is no 3D counterpart to 2D's "NOT optional" `updateMtsdfPixiMetrics` refresh
+          // here: `makeMtsdfMaterial` takes no `fontSize` (mtsdfShader.ts:76-84) — 3D derives
+          // `screenPxRange` in-shader from `uTexSize` (mtsdfShader.ts:136), and `updateMtsdfStyle`
+          // already runs every frame outside this branch. If #752 introduces a fontSize- or
+          // scale-derived CPU uniform on this material, THIS fast path must start refreshing it
+          // too, or resized text will render with stale antialiasing.
+          fastPathApplied = true;
         }
-      } finally {
-        for (const m of reusable.values()) m.dispose();
       }
-      entry.hash = hash;
-      entry.atlasKey = atlasKey;
-      entry.fontId = t.font;
-      entry.baseQuads = layout.quads; // for per-frame animation (positions/colours)
-      entry.ax = ax; entry.ay = ay;
-      entry.wasMotion = false; entry.wasColored = false;
+
+      if (!fastPathApplied) {
+        // Rebuild every page mesh from scratch (a layout/atlas change is infrequent). Geometry is
+        // always new; the MATERIAL is reclaimed when the atlas is unchanged — the atlas TEXTURE is
+        // baked into each TSL node graph, so a page's material can't be mutated in place across an
+        // atlas change, but a layout-only change never touches it.
+        //
+        // Anchor: block spans x[0,width], yUp y[0,-height]. Shift so the anchor point
+        // (anchorX across width, anchorY down height) sits at the entity origin — same
+        // for every page since they share one layout.
+        const ax = -t.anchorX * layout.width, ay = t.anchorY * layout.height;
+        // Capture the superseded pages/materials WITHOUT freeing anything yet (#715), the same
+        // discipline `gpuComputeBackend.ts`'s "free what this rebuild superseded" block applies to
+        // compute nodes and the render mesh: build and assign the replacements FIRST, free the
+        // superseded ones LAST. Reclaim by page number when the atlas is unchanged — a layout change needs new
+        // geometry, never a new node graph (#692; the direct analogue of #690 on the 2D twin).
+        // Anything left in `reusable` after the loop (atlas changed, or a page this text no
+        // longer touches) is disposed once the new meshes are installed.
+        const oldPages = entry.pages;
+        const atlasReusable = entry.atlasKey === atlasKey;
+        const reusable = new Map<number, THREE.Material>();
+        for (const [page, mesh] of oldPages) reusable.set(page, mesh.material as THREE.Material);
+        const newPages = new Map<number, THREE.Mesh>();
+        try {
+          for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
+            const ptex = getFontTexture(provider, page);
+            if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
+            const g = new THREE.BufferGeometry();
+            g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
+            g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
+            g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
+            g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
+            g.translate(ax, ay, 0);
+            const hasTrueSdf = provider.atlas.type !== 'msdf';
+            let mat = atlasReusable ? reusable.get(page) : undefined;
+            if (mat && canReuseMtsdfMaterial(mat, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf)) {
+              reusable.delete(page);
+            } else {
+              mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), hasTrueSdf);
+            }
+            const mesh = new THREE.Mesh(g, mat);
+            // Per-glyph animation nudges verts past the static bounds; skip frustum
+            // culling (text is cheap) so an animated glyph never pops out at the edge.
+            mesh.frustumCulled = false;
+            newPages.set(page, mesh);
+          }
+        } finally {
+          // ── free what this rebuild superseded — LAST, deliberately (#715) ──
+          // The new meshes/materials above are fully built and assigned by this point; only now
+          // do the old ones come out. This only mitigates, not eliminates, a transient zero on a
+          // shared material's `usedTimes`: three registers a render pipeline in
+          // `Pipelines.getForRender` at DRAW time, so the replacement mesh has not acquired
+          // anything yet either way when the old material is disposed below — it costs nothing
+          // and is the correct discipline, matching the particle backend next door, but by itself
+          // it does not keep `usedTimes` off zero for a material this text no longer touches.
+          entry.pages = newPages;
+          for (const mesh of newPages.values()) entry.group.add(mesh);
+          for (const [, mesh] of oldPages) {
+            entry.group.remove(mesh);
+            mesh.geometry.dispose();
+          }
+          for (const m of reusable.values()) m.dispose();
+        }
+        entry.hash = hash;
+        entry.atlasKey = atlasKey;
+        entry.buildKey = buildKey;
+        entry.fontId = t.font;
+        entry.baseQuads = layout.quads; // for per-frame animation (positions/colours)
+        entry.ax = ax; entry.ay = ay;
+        entry.wasMotion = false; entry.wasColored = false;
+      }
     }
 
     // Per-glyph animation: recompute page positions (motion effects) or colours

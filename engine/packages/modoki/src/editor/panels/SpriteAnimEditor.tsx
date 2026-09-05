@@ -270,7 +270,8 @@ export default function SpriteAnimEditor() {
                   <span style={{ width: 18, textAlign: 'right', color: '#666', fontSize: 10 }}>{i}</span>
                   <FrameThumb guid={ref} />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']} />
+                    <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']}
+                      dataUiId={`spriteAnim.frames.${i}.sprite`} dataUiLabel={`frame ${i}`} />
                   </div>
                   <button data-ui-id={`spriteAnim.frames.${i}.up`} data-ui-kind="button" data-ui-label="Move up" onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
                   <button data-ui-id={`spriteAnim.frames.${i}.down`} data-ui-kind="button" data-ui-label="Move down" onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
@@ -278,7 +279,8 @@ export default function SpriteAnimEditor() {
                 </div>
               ))}
               <div style={{ marginTop: 2 }}>
-                <AssetRefField label="+ add" value="" onChange={addFrame} accept={['sprite']} placeholder="pick (▦) or drop a sprite" />
+                <AssetRefField label="+ add" value="" onChange={addFrame} accept={['sprite']} placeholder="pick (▦) or drop a sprite"
+                  dataUiId="spriteAnim.frames.add" dataUiLabel="add frame" />
               </div>
             </>
           )}

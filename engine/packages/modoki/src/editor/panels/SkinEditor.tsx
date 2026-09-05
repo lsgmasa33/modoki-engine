@@ -948,7 +948,8 @@ export default function SkinEditor() {
                   <RigSpriteThumb guid={ap.sprite ?? ''} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ ...sectionLabel, margin: '0 0 2px' }}>Source art</div>
-                    <AssetRefField label="" value={ap.sprite ?? ''} onChange={setSprite} accept={['sprite']} placeholder="pick (▦) or drop a sprite" />
+                    <AssetRefField label="" value={ap.sprite ?? ''} onChange={setSprite} accept={['sprite']} placeholder="pick (▦) or drop a sprite"
+                      dataUiId="skin.inspector.sourceArt" dataUiLabel="Source art" />
                   </div>
                 </div>
                 {/* Transform (needs a mesh) */}

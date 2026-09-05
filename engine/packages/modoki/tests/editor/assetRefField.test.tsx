@@ -48,7 +48,7 @@ describe('AssetRefField — GUID-only drop invariant', () => {
   function renderField(props: Partial<Parameters<typeof AssetRefField>[0]> = {}) {
     const onChange = vi.fn();
     const { container } = render(
-      <AssetRefField label="Material" value="" onChange={onChange} {...props} />,
+      <AssetRefField label="Material" value="" onChange={onChange} dataUiId="test.assetRefField" {...props} />,
     );
     return { onChange, wrapper: container.firstElementChild! };
   }

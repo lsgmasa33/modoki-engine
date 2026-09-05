@@ -22,7 +22,8 @@ export function ParamField({ name, param, value, onChange, mixed = false }: {
   const label = param.label || name;
   switch (param.type) {
     case 'texture':
-      return <AssetRefField label={label} value={(value as string) ?? ''} onChange={onChange} accept={['.png', '.jpg', '.jpeg', '.webp']} mixed={mixed} />;
+      return <AssetRefField label={label} value={(value as string) ?? ''} onChange={onChange} accept={['.png', '.jpg', '.jpeg', '.webp']} mixed={mixed}
+        dataUiId={`assetView.material.param.${name}`} dataUiLabel={label} />;
     case 'color':
       return <ColorField label={label} value={(value as number) ?? (param.default as number) ?? DEFAULT_COLOR} onChange={onChange} mixed={mixed} />;
     case 'bool':
@@ -153,7 +154,8 @@ export function MaterialAssetView({ path }: { path: string }) {
   const IMG: string[] = ['.png', '.jpg', '.jpeg', '.webp'];
   const d = data as Record<string, unknown>;
   const texField = (field: string, label: string) => (
-    <AssetRefField label={label} value={(d[field] as string) ?? ''} onChange={(v) => writeField(field, v)} accept={IMG} />
+    <AssetRefField label={label} value={(d[field] as string) ?? ''} onChange={(v) => writeField(field, v)} accept={IMG}
+      dataUiId={`assetView.material.${field}`} dataUiLabel={label} />
   );
   const boolField = (field: string, label: string, dflt = false) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>

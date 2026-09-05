@@ -14,7 +14,7 @@
  *  `version` to `PREFAB_FORMAT_VERSION` (3).
  *
  *  Only touches `games/<id>/**` and `demos/<id>/**` scene/prefab JSON under
- *  `runtime/assets`, plus `engine/tests/e2e/fixtures/**` — never `dist/`, `ios/`,
+ *  `runtime/assets` — never the e2e fixtures (see the note at the push site below), `dist/`, `ios/`,
  *  `android/`, `build/`.
  *
  *  Usage:
@@ -49,22 +49,45 @@ async function walkFiles(dir, pred, out = []) {
 let changedFiles = 0, changedKeys = 0;
 const unmatchable = [];
 
-/** Migrate one entity's `traits` bag in place. Returns true if it changed anything. */
-function migrateTraits(traits) {
+/** Migrate one `UIAnchor`/`UIElement` bag in place. Returns true if it changed anything.
+ *  `context` (file/entity/location) is used ONLY to make an `unmatchable` report
+ *  actionable — it does not change what gets migrated.
+ *
+ *  ⚠️ `context.carrier` decides what happens to a truthy value with NO sibling `UIElement`,
+ *  and the two callers need OPPOSITE answers — the same split the runtime helper makes
+ *  (`uiAnchorZIndexMigration.ts`, close-out round 2):
+ *   - `'skip'` — an ENTITY's own `traits`. A full trait bag, so "no `UIElement`" really means
+ *     the entity has no `UIElement` trait; `buildTree` requires one for a node to exist at
+ *     all, so there is no rendered value to lose, and inventing the trait would change what
+ *     spawns. Report it and drop the key.
+ *   - `'create'` — an OVERRIDE bag (`overrides[localId]`, `nestedOverrides[path][localId]`).
+ *     A per-FIELD diff, so "no `UIElement`" only means this override does not touch
+ *     `UIElement` YET — the entity may well have (or gain) the trait. Deleting here loses a
+ *     real authored z-index with nowhere for it to reappear, so CREATE the carrier. This
+ *     script rewrites other people's projects on disk, so getting it wrong is unrecoverable. */
+function migrateTraits(traits, context) {
   if (!traits || typeof traits !== 'object') return false;
   const anchor = traits.UIAnchor;
   if (!anchor || typeof anchor !== 'object' || !('zIndex' in anchor)) return false;
   const anchorZIndex = anchor.zIndex;
   if (anchorZIndex) {
-    const element = traits.UIElement;
+    let element = traits.UIElement;
     if (element && typeof element === 'object') {
       element.zIndex = anchorZIndex;
     }
-    // No UIElement trait on this entity — nothing to carry the value onto. Report it
-    // rather than inventing a trait (verified: 0 counterexamples in the corpus, but
-    // the script should say so loudly if that ever changes).
+    else if (context.carrier === 'create') {
+      element = { zIndex: anchorZIndex };
+      traits.UIElement = element;
+    }
+    // No UIElement trait/bag here — nothing to carry the value onto. Report it rather
+    // than inventing a trait (verified: 0 counterexamples in the corpus, but the script
+    // should say so loudly if that ever changes) — WITH enough to actually find it:
+    // the key is about to be deleted below, so this is the only record of where it was.
     else if (!element) {
-      unmatchable.push(`truthy UIAnchor.zIndex (${anchorZIndex}) with no sibling UIElement trait`);
+      unmatchable.push(
+        `${context.file}: entity "${context.name}" (localId ${context.localId}, ${context.location}) — ` +
+        `truthy UIAnchor.zIndex (${anchorZIndex}) with no sibling UIElement trait`,
+      );
     }
   }
   delete anchor.zIndex;
@@ -75,18 +98,28 @@ function migrateTraits(traits) {
 /** Walk an entity node (and prefab-instance overrides / added subtrees / nested
  *  overrides) migrating any `UIAnchor.zIndex` found. Verified: 0 hits inside a
  *  prefab-instance `overrides` block in the current corpus, but walked anyway since
- *  it costs nothing and matches the runtime helper's reach. */
+ *  it costs nothing and matches the runtime helper's reach (`migrateUIAnchorZIndexStructured`,
+ *  `uiAnchorZIndexMigration.ts`) — same four locations: `traits`, `overrides[localId]`,
+ *  `added[]` subtrees, and `nestedOverrides[path][localId]`. `nestedOverrides` is
+ *  path-keyed over a localId map (`{path: {localId: {TraitName: fields}}}` —
+ *  `loadSceneFile.ts`'s `NestedOverridePaths`), so it needs TWO `Object.entries` calls to
+ *  reach the trait bag, unlike `overrides`'s one. */
 function visitEntry(entry, filePath, dirtyRef) {
   if (!entry || typeof entry !== 'object') return;
-  if (migrateTraits(entry.traits)) dirtyRef.dirty = true;
-  for (const bag of Object.values(entry.overrides ?? {})) {
-    if (migrateTraits(bag)) dirtyRef.dirty = true;
+  const file = filePath.slice(ROOT.length + 1);
+  const name = entry.name ?? '(unnamed)';
+  const localId = entry.localId ?? entry.id ?? '(no id)';
+  if (migrateTraits(entry.traits, { file, name, localId, location: 'traits', carrier: 'skip' })) dirtyRef.dirty = true;
+  for (const [overrideLocalId, bag] of Object.entries(entry.overrides ?? {})) {
+    if (migrateTraits(bag, { file, name, localId, location: `overrides[${overrideLocalId}]`, carrier: 'create' })) dirtyRef.dirty = true;
   }
   for (const added of entry.added ?? []) visitEntry(added, filePath, dirtyRef);
   for (const child of entry.children ?? []) visitEntry(child, filePath, dirtyRef);
-  if (entry.nestedOverrides) {
-    for (const bag of Object.values(entry.nestedOverrides)) {
-      if (migrateTraits(bag)) dirtyRef.dirty = true;
+  for (const [nestedPath, pathBag] of Object.entries(entry.nestedOverrides ?? {})) {
+    for (const [nestedLocalId, bag] of Object.entries(pathBag)) {
+      const location = `nestedOverrides['${nestedPath}'][${nestedLocalId}]`;
+      // Override bag -> CREATE the carrier; see migrateTraits' context.carrier note.
+      if (migrateTraits(bag, { file, name, localId, location, carrier: 'create' })) dirtyRef.dirty = true;
     }
   }
 }
@@ -119,7 +152,16 @@ for (const rootDir of ['games', 'demos']) {
     targets.push(...files);
   }
 }
-targets.push(...await walkFiles(join(ROOT, 'engine', 'tests', 'e2e', 'fixtures'), (p) => /\.(scene|prefab)\.json$/i.test(p)));
+// ⚠️ The e2e fixtures are DELIBERATELY left un-migrated at `version: 9` — they earn their keep by
+// driving the whole migration ladder (including v12→v13) on every e2e run, and migrating them in
+// place would quietly retire that coverage. Running this script over them would look like a
+// successful sweep and silently cost the only end-to-end proof the new step is wired up at all.
+// `engine/tests/assets/anchorZIndexMigrated.test.ts` asserts they still carry the key, so doing it
+// anyway turns the gate red rather than passing unnoticed — but do not make that test the thing
+// that catches it. Pass --include-e2e-fixtures only if that decision is being reversed on purpose.
+if (process.argv.includes('--include-e2e-fixtures')) {
+  targets.push(...await walkFiles(join(ROOT, 'engine', 'tests', 'e2e', 'fixtures'), (p) => /\.(scene|prefab)\.json$/i.test(p)));
+}
 
 for (const file of targets) await migrateFile(file);
 

@@ -477,20 +477,22 @@ import { spriteIndexFromStep } from '../core/spriteFrames';
 
 /**
  * Signature of the render fields that require a backend rebuild (mesh/material/buffers)
- * when changed — shared by both backends' `setDef` so they agree on what's "structural".
- * Backend-specific extras (trails/sub-emitters on CPU; force/collision presence on GPU)
- * are compared separately by each backend on top of this.
+ * when changed — shared by all three backends' `setDef` so they agree on what's "structural".
+ * Backend-specific extras (trails/sub-emitters on CPU; force/collision presence on GPU) are
+ * compared separately by each backend on top of this.
+ *
+ * `aspect`/`anchor`/`offset` are deliberately EXCLUDED (#769) — they reach every backend
+ * through a single quad-vertex-position computation (`resolveQuadShift`/`computeQuadCorners`
+ * in `spriteBillboard.ts`) and change nothing else a rebuild would otherwise redo (buffer
+ * sizes, materials, compute kernels). See {@link renderQuadKey} for the field split those four
+ * moved to, applied in place instead of forcing a rebuild.
  */
-export function renderStructuralKey(def: ParticleEffectDef): string {
+export function renderBuildKey(def: ParticleEffectDef): string {
   const r = def.render;
   return [
     def.maxParticles,
     r.blend,
     r.mode ?? 'billboard',
-    r.aspect ?? 1,
-    r.anchor ?? 'center',
-    r.offset?.[0] ?? 0,
-    r.offset?.[1] ?? 0,
     r.meshPrimitive ?? 'box',
     r.meshLit ?? false,
     // RESOLVED, not raw (#693 sweep): the renderers build an integer grid, so 2.0 and 2.4 are the
@@ -499,6 +501,19 @@ export function renderStructuralKey(def: ParticleEffectDef): string {
     resolveTiles(r.tilesY),
     r.softParticles ?? false,
   ].join('|');
+}
+
+/**
+ * Signature of the four billboard-quad fields (#769) that move a particle's sprite in place
+ * — `aspect`, `anchor`, and the two `offset` components. All four resolve to nothing but the
+ * 12 vertex-position floats of a 4-vertex quad (`uv`/`index` are invariant under them), so a
+ * change here is applied by rewriting that attribute in place — no rebuild, no lost sim state.
+ * Each backend's `setDef` compares this alongside {@link renderBuildKey}: unchanged build key
+ * + changed quad key means "call the in-place applier", never a rebuild.
+ */
+export function renderQuadKey(def: ParticleEffectDef): string {
+  const r = def.render;
+  return [r.aspect ?? 1, r.anchor ?? 'center', r.offset?.[0] ?? 0, r.offset?.[1] ?? 0].join('|');
 }
 
 /** Max force fields the GPU compute kernel unrolls. Effects with more must run on

@@ -361,18 +361,41 @@ describe('data-ui-id tagging has not rotted', () => {
   // `dataUiId` prop" — which is true or false about a single element in isolation, so two
   // branches that each add a (correctly tagged) control stay green independently and still merge
   // green. Passing the PROP is what's checked (a static, syntactic fact about the JSX), not that
-  // the id is a non-empty literal at runtime — that mirrors `BufferedNumberInput` itself, and
-  // the shared-helper pattern (`AssetRefField`, `NumRow`, `Num`, `FieldValueWidget`) where the
-  // prop is optional and the CALLER decides whether to pass a real id.
+  // the id is a non-empty literal at runtime — that mirrors `BufferedNumberInput` itself.
+  //
+  // ⚠️ HONEST SCOPE (found by mutation, close-out 2026-09-05): this regex scan below sees ONLY a
+  // literal `<BufferedNumberInput`/`<BufferedTextInput` JSX tag. It is BLIND to any helper that
+  // wraps one and re-exposes its own prop — a mutation adding an untagged `<Num label="Zzz" v={1}
+  // on={() => {}} />` to `SpriteEditor.tsx` (`Num` wraps `BufferedNumberInput`) passed this suite
+  // at 38/38 green, because the scan never sees inside `Num`'s own JSX from the call site. So the
+  // scan covers exactly the direct-element case; it does NOT cover the shared-helper surface.
+  // That other half is now covered a DIFFERENT way: `AssetRefField`/`NumRow`/`Num`/
+  // `FieldValueWidget` all had `dataUiId?: string` — optional, caller's choice — and now have
+  // `dataUiId: string` — REQUIRED. The type checker enforces every call site of those four passes
+  // one; `npm run typecheck` fails otherwise, and no regex can be out-parsed the way this scan
+  // was.
+  //
+  // ⚠️ This is NOT hypothetical residual risk — there IS a fifth, and it is already untagged
+  // today (found by a second adversarial review, close-out 2026-09-05, filed as #772):
+  // `NumberField` (`packages/modoki/src/editor/panels/assetViews/widgets.tsx:64`) has
+  // `dataUiId?: string`, already RENDERS `data-ui-id={dataUiId}` (plus a derived
+  // `${dataUiId}.slider`), and buffers its value via `useBufferedValue` directly rather than
+  // `<BufferedNumberInput>` — so both the regex scan above (wrong element name) and the
+  // required-prop fix above (wrong helper list) miss it. 26 of its 27 call sites pass no id (17
+  // in `MaterialAssetView.tsx`, 4 in `MaterialBatchView.tsx`, 3 in `ShaderAssetView.tsx`, 2 in
+  // `AnimSetAssetView.tsx`); only `Inspector.tsx:1082` is tagged. Tagging those 26 sites and
+  // making `NumberField.dataUiId` required is #772's own bounded, separately-claimable fix — not
+  // done here. Any future "a sixth wrapper" finding belongs in a note like this one, not silently
+  // folded into "residual risk is hypothetical."
   //
   // `DATA_UI_ID_EXEMPT` is the escape hatch, and it is deliberately near-empty: #724 tagged all
   // 26 sites this test found untagged (36 controls, counting shared helpers), leaving exactly ONE
   // entry — a control that is addressable through its WRAPPER, so tagging the input too would give
   // one logical field two ids. That is the only reason that earns an entry. "It's awkward to
   // thread an id through this helper" does not: thread the caller-owned id instead, the way
-  // `AssetRefField`/`NumRow`/`Num`/`FieldValueWidget` already do. Keyed by snippet prefix rather
-  // than by line number on purpose, so an exemption cannot silently widen to a whole file or go
-  // stale the moment the file shifts by a line.
+  // `AssetRefField`/`NumRow`/`Num`/`FieldValueWidget` already do (and, now, must). Keyed by snippet
+  // prefix rather than by line number on purpose, so an exemption cannot silently widen to a whole
+  // file or go stale the moment the file shifts by a line.
   const SCAN_ROOTS = [
     path.resolve(__dirname, '../../packages/modoki/src/editor'),
     path.resolve(__dirname, '../../app'),
@@ -444,5 +467,47 @@ describe('data-ui-id tagging has not rotted', () => {
     // This check is worthless if the scan found nothing to check.
     expect(scanned).toBeGreaterThan(30);
     expect(missing, `untagged BufferedNumberInput/BufferedTextInput — add dataUiId or an entry in DATA_UI_ID_EXEMPT with a reason:\n${missing.join('\n')}`).toEqual([]);
+  });
+
+  // The other half of #724's coverage — the shared-helper surface the scan above cannot see
+  // (see the ⚠️ HONEST SCOPE note). This does not re-run tsc (that's `npm run typecheck`'s job);
+  // it guards against the SOURCE regressing `dataUiId: string` back to `dataUiId?: string` on one
+  // of the four known wrappers, which would silently reopen the gap the type checker now closes.
+  //
+  // Structural, not a frozen text needle (close-out 2026-09-05: the prior version matched exact
+  // strings like `'dataUiId: string; dataUiLabel?: string }'`, which goes red on a pure reformat
+  // or the instant a sibling prop is added after `dataUiId` while it stays required — and its
+  // `not.toMatch(/dataUiId\?:\s*string/)` was FILE-WIDE, so an unrelated, legitimately-optional
+  // `dataUiId` on some OTHER component in the same file would fail it too). This instead extracts
+  // ONLY the named component's own parameter list (from `function <Name>(` to its matching `)` —
+  // paren-depth tracked, so a default-value arrow function inside it can't end the scan early)
+  // and checks the `dataUiId` prop declaration within THAT block alone.
+  function extractFunctionParams(src: string, name: string): string | null {
+    const m = new RegExp(`\\bfunction\\s+${name}\\s*\\(`).exec(src);
+    if (!m) return null;
+    const start = m.index + m[0].length - 1; // the '(' itself
+    let depth = 0;
+    for (let i = start; i < src.length; i++) {
+      if (src[i] === '(') depth++;
+      else if (src[i] === ')') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+    }
+    return null;
+  }
+
+  it('AssetRefField/NumRow/Num/FieldValueWidget keep dataUiId REQUIRED, not optional', () => {
+    const HELPERS: { file: string; component: string }[] = [
+      { file: 'packages/modoki/src/editor/panels/AssetRefField.tsx', component: 'AssetRefField' },
+      { file: 'packages/modoki/src/editor/panels/MaterialOverridesField.tsx', component: 'NumRow' },
+      { file: 'packages/modoki/src/editor/panels/SpriteEditor.tsx', component: 'Num' },
+      { file: 'packages/modoki/src/editor/panels/inspectorFields.tsx', component: 'FieldValueWidget' },
+    ];
+    for (const { file, component } of HELPERS) {
+      const src = fs.readFileSync(path.resolve(__dirname, '../..', file), 'utf8');
+      const params = extractFunctionParams(src, component);
+      expect(params, `${file}: could not find "function ${component}(" — has it been renamed or refactored?`).not.toBeNull();
+      const m = /\bdataUiId\s*(\??)\s*:/.exec(params!);
+      expect(m, `${file}: ${component}'s prop type has no "dataUiId:" annotation — has it been removed?`).not.toBeNull();
+      expect(m![1], `${file}: ${component}'s dataUiId prop reverted to optional ("dataUiId?:") — must stay REQUIRED`).toBe('');
+    }
   });
 });

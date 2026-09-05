@@ -158,6 +158,7 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
         accept={['scene']}
         hint="Loaded additively alongside this scene and carried across a swap to another scene sharing the same base (Time, camera, lights, rig authored once). Empty = no base."
         placeholder="drop a scene, or paste a GUID"
+        dataUiId="assetView.scene.baseScene" dataUiLabel="Base Scene"
       />
       {warning && (
         <div style={{ color: '#e74c3c', fontSize: '10px', marginTop: 2, marginBottom: 4 }}>{warning}</div>

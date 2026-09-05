@@ -102,8 +102,13 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   /** Caller-owned handle id — the same logical value renders as one of THREE mutually
    *  exclusive states (mixed / a read-only GUID-name display / an editable text field),
    *  so this is applied to all three rather than just the BufferedTextInput branches;
-   *  they never render together, so there is no duplicate-id collision. */
-  dataUiId?: string;
+   *  they never render together, so there is no duplicate-id collision.
+   *
+   *  REQUIRED (#724 close-out) — `findBufferedInputs` (chromeTagging.test.ts) can only see a
+   *  literal Buffered-input JSX tag, so it is blind to every caller of THIS helper. An optional
+   *  prop here let 8+ call sites go untagged with the suite green; making it required moves the
+   *  guard from a regex scan to the type checker, which cannot be out-parsed. */
+  dataUiId: string;
   dataUiLabel?: string;
 }) {
   const divRef = useRef<HTMLDivElement>(null);

@@ -28,7 +28,7 @@ import {
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
   positionLocal, normalLocal,
 } from 'three/tsl';
-import { resolveTiles, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
+import { resolveTiles, renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
 import { resolveCollider } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
@@ -36,6 +36,7 @@ import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
 import { poolRevealDue } from './gpuPoolReveal';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
+import { resolveQuadShift, computeQuadCorners, applyQuadInPlace } from './spriteBillboard';
 import { textureProvider } from '../core/textureProvider';
 import { rawNow } from '../core/clock';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -404,8 +405,10 @@ export class GpuComputeBackend implements IParticleBackend {
 
   /** Allocate storage buffers, compute kernels, LUTs and the render mesh for `def`. */
   private build(entry: GpuEntry, def: ParticleEffectDef): void {
-    if (entry.mesh) this.disposeMesh(entry.mesh);
-    entry.lut?.dispose();
+    // Captured, not disposed, here — see the "free what this rebuild superseded" block below,
+    // which frees the old mesh (and LUT) LAST, after the replacements are built and assigned.
+    const prevMesh = entry.mesh;
+    const prevLut = entry.lut;
 
     const count = Math.max(1, def.maxParticles);
     // Captured BEFORE `entry.count` is overwritten — the reuse decision is "is the new count the
@@ -415,10 +418,11 @@ export class GpuComputeBackend implements IParticleBackend {
     const prevUpdate = entry.computeUpdate;
     // REUSE rather than reallocate when the pool size is unchanged (#717). This is the common
     // case by a wide margin and it is what makes the editor cheap: `maxParticles` is only ONE
-    // field of `renderStructuralKey`, so every blend / aspect / tiles / anchor / sprite-mode /
-    // texture change also lands here with an identical `count`. Measured on
-    // `games/3d-test` before this change: 12 blend toggles at 15k particles allocated 48 storage
-    // buffers totalling 9.36 MB, none of it ever freed.
+    // field of `renderBuildKey`, so every blend / tiles / sprite-mode / texture change also
+    // lands here with an identical `count` (aspect/anchor/offset changes no longer reach
+    // `build()` at all — see `renderQuadKey` and the in-place applier in `setDef`, #769).
+    // Measured on `games/3d-test` before this change: 12 blend toggles at 15k particles
+    // allocated 48 storage buffers totalling 9.36 MB, none of it ever freed.
     // Safe because a rebuild re-inits the pool regardless — `entry.inited = false` below makes
     // `ensurePoolReady` dispatch `computeInit`, which respawns every slot, so no stale
     // particle state survives into the new definition.
@@ -727,8 +731,18 @@ export class GpuComputeBackend implements IParticleBackend {
     // Note the ordering only mitigates: `pipelines.has(computeNode)` is populated at DISPATCH
     // time, not here, so the new nodes are not registered yet either way — this costs nothing
     // and is the correct discipline.
+    // `disposeMesh` belongs in this set too (#769): its material carries a render pipeline with
+    // the exact same `usedTimes` bookkeeping, so disposing the OLD mesh before the new one is
+    // built and assigned risks dropping a pipeline the replacement (byte-identical, when nothing
+    // render-relevant changed) is about to ask for — the same needless recompile as the compute
+    // nodes. As with those, the ordering only mitigates: a render pipeline is registered in
+    // `Pipelines.getForRender` at DRAW time, not at mesh construction, so the new mesh has not
+    // acquired the pipeline yet either way when the old one is disposed here — this costs nothing
+    // and is the correct discipline, but it does not by itself keep `usedTimes` off zero.
     disposeComputeNode(prevInit);
     disposeComputeNode(prevUpdate);
+    if (prevMesh) this.disposeMesh(prevMesh);
+    prevLut?.dispose();
     // Only when the pool was actually reallocated. On the reuse path `prevBufs` IS `entry.bufs`
     // and freeing it would destroy the buffers the new kernel just captured.
     if (!reuseBufs) freePoolBuffers(entry.renderer, prevBufs);
@@ -743,17 +757,16 @@ export class GpuComputeBackend implements IParticleBackend {
     // `instanceIndex`). Per-particle state is read from the storage buffers via
     // `.element(instanceIndex)` — a read-only storage binding, not a vertex attribute, so it
     // sidesteps WebGPU's 8 vertex-buffer cap and reads exactly what the compute pass wrote.
-    // `aspect` (width/height) makes a non-square billboard; per-instance scale drives
-    // the height, so the quad is (aspect × 1) — matches a non-square sprite-sheet cell.
-    const aspect = def.render.aspect && def.render.aspect > 0 ? def.render.aspect : 1;
+    // `aspect` (width/height) makes a non-square billboard; per-instance scale drives the
+    // height, so the quad is (aspect × 1) — matches a non-square sprite-sheet cell. index/uv
+    // come from a throwaway PlaneGeometry (invariant under aspect/anchor/offset); position is
+    // built from computeQuadCorners so this build and applyQuadInPlace's in-place rewrite
+    // (setDef, on a bare aspect/anchor/offset change) derive the same 12 floats (#769).
+    const { aspect, shiftX, shiftY } = resolveQuadShift(def.render);
     const src = new THREE.PlaneGeometry(aspect, 1);
-    // Anchor + offset baked into the quad (units of size; scaleNode multiplies later).
-    const shiftX = def.render.offset?.[0] ?? 0;
-    const shiftY = (def.render.anchor === 'bottom' ? 0.5 : 0) + (def.render.offset?.[1] ?? 0);
-    if (shiftX !== 0 || shiftY !== 0) src.translate(shiftX, shiftY, 0);
     const geo = new THREE.InstancedBufferGeometry();
     geo.index = src.index ? src.index.clone() : null;
-    geo.setAttribute('position', src.attributes.position.clone());
+    geo.setAttribute('position', new THREE.BufferAttribute(computeQuadCorners(aspect, shiftX, shiftY), 3));
     geo.setAttribute('uv', src.attributes.uv.clone());
     src.dispose();
     geo.instanceCount = count;
@@ -1025,19 +1038,22 @@ export class GpuComputeBackend implements IParticleBackend {
       || !!e.def.collision?.invert !== !!def.collision?.invert;
     // Sprite-sheet playback (mode/cycles/random-start) is baked into the render shader on the
     // GPU path, so changing it needs a rebuild. (The CPU sim computes the frame live, so it
-    // doesn't — hence this stays out of the shared renderStructuralKey.)
+    // doesn't — hence this stays out of the shared renderBuildKey.)
     const o = e.def.render, n = def.render;
     const spriteChanged =
       (o.spriteMode ?? 'once') !== (n.spriteMode ?? 'once') ||
       (o.spriteCycles ?? 1) !== (n.spriteCycles ?? 1) ||
       (o.spriteRandomStart ?? false) !== (n.spriteRandomStart ?? false);
     const structural =
-      renderStructuralKey(def) !== renderStructuralKey(e.def) ||
+      renderBuildKey(def) !== renderBuildKey(e.def) ||
       wantForces !== hadForces ||
       wantColl !== hadColl ||
       (wantColl && shapeChanged) ||
       spriteChanged ||
       texChanged;
+    // Compared against the OLD def, before it's overwritten below — a bare aspect/anchor/
+    // offset edit is applied to the existing quad in place (#769), never a rebuild.
+    const quadChanged = !structural && renderQuadKey(def) !== renderQuadKey(e.def);
     e.def = def;
     if (texChanged) { releaseTexture3D(e.texture); e.textureRef = newTexRef; e.texture = null; } // shared, refcounted (F3) — release
     if (structural) {
@@ -1060,6 +1076,11 @@ export class GpuComputeBackend implements IParticleBackend {
     } else {
       applyUniforms(e.u, def);
       e.lut?.update(def);
+      // Mesh mode reads none of the quad-key fields (buildMeshParticles never touches
+      // aspect/anchor/offset) — a change there is a no-op, not a rebuild.
+      if (quadChanged && def.render.mode !== 'mesh' && e.mesh) {
+        if (!applyQuadInPlace(e.mesh.geometry, def.render)) this.build(e, def); // shape guard failed — refuse a partial write
+      }
     }
   }
 

@@ -21,6 +21,7 @@ import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 
 /** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
  *  save path can locate it after the loader reassigns ECS ids. Lives only in the
@@ -245,6 +246,12 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
     console.error('[PrefabEdit] fetch failed:', e);
     return;
   }
+  // This is a RAW fetch, not routed through getPrefabSource — that helper already runs this
+  // migration (structured walk, see uiAnchorZIndexMigration.ts) on every load, but this path
+  // bypasses it entirely, so it must run here too BEFORE setPrefabCache below, or the
+  // un-migrated object poisons every later getPrefabSource read of this same guid for the
+  // rest of the session.
+  for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
   const guid = prefab.id ?? getGuidForPath(asset.path) ?? asset.path;
   // Seed the editor prefab cache so override/apply paths resolve without a refetch,
   // and preload any nested children into the SAME (editor) cache — serializePrefab's

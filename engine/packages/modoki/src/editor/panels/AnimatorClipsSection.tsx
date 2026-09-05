@@ -73,7 +73,8 @@ export function AnimatorClipsSection({ entityIds, meta }: {
             dataUiId={`animator.clip.${i}.name`} dataUiLabel={c.name || `clip ${i}`}
           />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <AssetRefField label="" value={c.clip} onChange={(v) => setRefAt(i, v)} accept={ANIM_EXT} />
+            <AssetRefField label="" value={c.clip} onChange={(v) => setRefAt(i, v)} accept={ANIM_EXT}
+              dataUiId={`animator.clip.${i}.clip`} dataUiLabel={c.name || `clip ${i}`} />
           </div>
           <BufferedNumberInput
             value={c.speed ?? 1} onChange={(v) => setSpeedAt(i, v)} step={0.1}
@@ -91,7 +92,8 @@ export function AnimatorClipsSection({ entityIds, meta }: {
           />
         </div>
       ))}
-      <AssetRefField label="+ add" value="" onChange={add} accept={ANIM_EXT} placeholder="drop an .anim.json clip" />
+      <AssetRefField label="+ add" value="" onChange={add} accept={ANIM_EXT} placeholder="drop an .anim.json clip"
+        dataUiId="animator.clip.add" dataUiLabel="add clip" />
     </div>
   );
 }

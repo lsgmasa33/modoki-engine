@@ -503,6 +503,7 @@ function SkinnedMeshRendererMaterials({ entityIds, meta, data }: {
             value={overrides[slot] ?? ''}
             onChange={(v) => setSlot(slot, v)}
             accept={['.mat.json']}
+            dataUiId={`inspector.material.${slot}`} dataUiLabel={slot}
           />
         ))
       )}
@@ -668,6 +669,7 @@ function AnimationLibraryAnimSets({ entityIds, meta }: {
             value={ref}
             onChange={(v) => setAt(i, v)}
             accept={['.animset.json']}
+            dataUiId={`inspector.animSet.${i}`} dataUiLabel={`animset #${i + 1}`}
           />
           {ref && <BoneMapEditor animSetRef={ref} model={model} map={boneMaps[ref] ?? {}} onChange={(m) => setBoneMap(ref, m)} />}
         </div>
@@ -678,6 +680,7 @@ function AnimationLibraryAnimSets({ entityIds, meta }: {
         onChange={add}
         accept={['.animset.json']}
         placeholder="drop a .animset.json"
+        dataUiId="inspector.animSet.add" dataUiLabel="add animset"
       />
     </div>
   );
@@ -720,11 +723,13 @@ function AudioSourceClips({ entityIds, meta }: {
             dataUiId={`audio.clip.${i}.key`} dataUiLabel={c.key || `clip ${i}`}
           />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <AssetRefField label="" value={c.ref} onChange={(v) => setRefAt(i, v)} accept={AUDIO_EXT} />
+            <AssetRefField label="" value={c.ref} onChange={(v) => setRefAt(i, v)} accept={AUDIO_EXT}
+              dataUiId={`audio.clip.${i}.ref`} dataUiLabel={c.key || `clip ${i}`} />
           </div>
         </div>
       ))}
-      <AssetRefField label="+ add" value="" onChange={add} accept={AUDIO_EXT} placeholder="drop an audio clip" />
+      <AssetRefField label="+ add" value="" onChange={add} accept={AUDIO_EXT} placeholder="drop an audio clip"
+        dataUiId="audio.clip.add" dataUiLabel="add clip" />
     </div>
   );
 }
@@ -1114,7 +1119,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
             if (e?.type === 'sprite' && e.sprite) { write('pivotX', e.sprite.pivot.x); write('pivotY', e.sprite.pivot.y); }
           }
         : (v: string) => write(key, v);
-      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel} /></div>;
+      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel}
+        dataUiId={`inspector.field.${meta.name}.${key}`} dataUiLabel={key} /></div>;
     }
     if (hint.type === 'color') {
       // A color field can fold a sibling 0..1 field into an A slider (hint.alphaField),

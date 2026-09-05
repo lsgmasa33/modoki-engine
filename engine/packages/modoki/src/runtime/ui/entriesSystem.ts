@@ -974,7 +974,18 @@ function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): b
  *  pooled row, expecting it to hold). Any other unit — `%`, `vw`, `vh`, `vmin`, `vmax` — is
  *  resolved by the scroll view and is NEUTRAL here, mirroring `isNeutralSize` in
  *  `sceneValidation.ts`, which exists for exactly the same "don't warn on the documented
- *  contract" reason. */
+ *  contract" reason.
+ *
+ *  ⚠️ KNOWN FALSE NEGATIVE, not intended behaviour — do not cite this as evidence the `%`-is-
+ *  neutral rule is fine as written. The rule above rests on the view actually RESOLVING the `%`,
+ *  which happens for a view-authored `entryWidth`/`entryHeight` but NOT for the `entryWidth: 0`
+ *  ("read it from the prefab") case: `entryPrefabProvider.ts`'s `rootSize` returns `ui.width` raw
+ *  and ignores `widthUnit`, and `resolveEntrySize` (`entriesLayout.ts`) short-circuits on
+ *  `authored === 0` and returns it verbatim as px. So a root authored `width: 100, widthUnit:
+ *  '%'` under a view with no `entryWidth` is silently pinned to 100px and NOTHING warns here —
+ *  this function never even sees it, because the value never resolves to a differing px pin. The
+ *  fix belongs in `rootSize`/`resolveEntrySize` (#765), not here — changing the predicate in this
+ *  function would duplicate logic #765's fix must change anyway. */
 function pooledSizeNeedsWarning(curValue: unknown, curUnit: unknown, wantPx: number, def: unknown): boolean {
   if (curUnit !== 'px') return false;
   return curValue !== wantPx && curValue !== def;
