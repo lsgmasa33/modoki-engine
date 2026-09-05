@@ -187,8 +187,44 @@ export interface ScrollMeasurementSource {
  *  Caveat: jsdom reports `clientWidth: 0` for everything, so a future jsdom test of the entries DOM
  *  path records no viewport at all — assert against `readScrollMeasurement` directly rather than
  *  through a mounted node.
+ *
+ *  **#665 — `viewportWidth` used to be raw `clientWidth`, and CSSOM rounds `clientWidth` to the
+ *  nearest integer.** A `UIEntries` pager entry authored `entryWidth: 100%` resolves to 100% of
+ *  that ROUNDED number, so a viewport whose true width is (say) 434.1px reports `clientWidth: 434`
+ *  while the box actually painted is 0.1px wider — leaving a sliver of the NEXT card visible at
+ *  rest. The optional `precise` parameter is how the caller supplies the true fractional width
+ *  (via `readPreciseBoxSize`) so this can correct for that.
+ *
+ *  `viewportWidth`/`viewportHeight` are `Math.ceil(precise.width/height)` when `precise` is given,
+ *  raw `clientWidth`/`clientHeight` otherwise. Ceiling — not the fractional value itself — is the
+ *  fix, for three reasons that all follow from keeping every quantity an INTEGER:
+ *  - `entryWidth: 100%` resolves to the same integer as `viewportWidth`, so `entryW ===
+ *    viewportWidth` exactly, which is the invariant `round(scrollX / viewportWidth)` page indexing
+ *    depends on (`games/wordweave/tests/sceneChrome.test.ts` guards it; wordweave's
+ *    `dictionaryPagerIndex` and Court's level select both derive pages that way).
+ *  - Page k then sits at `k * ceil`, an integer offset — one Chrome can actually rest on.
+ *  - `ceil >= trueWidth`, so card k covers the whole visible box and no neighbour can ever peek
+ *    through. The accepted cost: up to ~1px of the CURRENT card is clipped at its right/bottom
+ *    edge instead of leaving a sliver of the NEXT one visible — that is the trade the owner chose.
+ *    When the true width is already an integer, `ceil` is a no-op: no clipping, no sliver.
+ *
+ *  ⚠️ **A FRACTIONAL `viewportWidth` was tried first and reverted** — it made the symptom WORSE.
+ *  Chrome parks this scroller's resting offset on integer CSS pixels regardless of what
+ *  `scrollTo({left})` was asked for: `scrollTo({left: 598.1875})` came to rest at exactly `598`,
+ *  and page 3's `scrollTo({left: 897.28125})` landed at `897`. A fractional stride therefore misses
+ *  every offset the view can actually rest on, so instead of one constant 0.109px sliver of the
+ *  NEXT card, each page showed a 0.19–0.28px sliver of the PREVIOUS one. Do not reintroduce a
+ *  fractional `viewportWidth` — that measurement is why this function ceils instead.
+ *
+ *  This function does NOT call `readPreciseBoxSize` itself — the caller decides when to pay for a
+ *  `getComputedStyle` read, because `readScrollMeasurement` runs on every `scroll` event (cheap by
+ *  design — see `writeScrollState`'s no-dirty write above) while the precise box only needs
+ *  refreshing on RESIZE.
  */
-export function readScrollMeasurement(el: ScrollMeasurementSource): {
+export function readScrollMeasurement(
+  el: ScrollMeasurementSource,
+  precise?: { width: number; height: number } | null,
+): {
   scrollX: number; scrollY: number;
   viewportWidth: number; viewportHeight: number;
   contentWidth: number; contentHeight: number;
@@ -196,9 +232,41 @@ export function readScrollMeasurement(el: ScrollMeasurementSource): {
   if (!(el.clientWidth > 0) && !(el.clientHeight > 0)) return null;
   return {
     scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
-    viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
+    viewportWidth: precise ? Math.ceil(precise.width) : el.clientWidth,
+    viewportHeight: precise ? Math.ceil(precise.height) : el.clientHeight,
     contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
   };
+}
+
+/** The fractional equivalent of `clientWidth`/`clientHeight` (#665) — content box PLUS padding,
+ *  read via `getComputedStyle` instead of the integer-rounded `clientWidth`/`clientHeight`.
+ *
+ *  ⚠️ **`getComputedStyle().width` is the CONTENT-box width; `clientWidth` is content + padding.**
+ *  Dropping the padding term would silently shrink every padded scroll view's reported viewport
+ *  below its real size, so both padding sides are added back in explicitly.
+ *
+ *  ⚠️ **Call `getComputedStyle` on its OWNER, never as a detached reference.** `const f =
+ *  view.getComputedStyle; f(el)` throws `Illegal invocation` in real Chrome — `getComputedStyle` is
+ *  not callable off its `Window` receiver — but jsdom does NOT reproduce that restriction, so a
+ *  detached call stays green in unit tests and only breaks in a real browser. Always invoke it as
+ *  `view.getComputedStyle(el)`.
+ *
+ *  Returns `null` when the result is unusable so the caller can fall back to `clientWidth`/
+ *  `clientHeight`: no `getComputedStyle` available at all, any parsed length is `NaN` (jsdom
+ *  returns `''` for an unset computed length, which parses to `NaN`), or both dimensions are
+ *  `<= 0`.
+ */
+export function readPreciseBoxSize(el: Element): { width: number; height: number } | null {
+  const view = el.ownerDocument?.defaultView
+    ?? (typeof getComputedStyle !== 'undefined' ? globalThis : undefined);
+  if (!view || typeof view.getComputedStyle !== 'function') return null;
+  const cs = view.getComputedStyle(el);
+  const num = (v: string) => parseFloat(v);
+  const width = num(cs.width) + num(cs.paddingLeft) + num(cs.paddingRight);
+  const height = num(cs.height) + num(cs.paddingTop) + num(cs.paddingBottom);
+  if (Number.isNaN(width) || Number.isNaN(height)) return null;
+  if (!(width > 0) && !(height > 0)) return null;
+  return { width, height };
 }
 
 /** What a pending request means for `Element.scrollTo`, or null when nothing is pending.

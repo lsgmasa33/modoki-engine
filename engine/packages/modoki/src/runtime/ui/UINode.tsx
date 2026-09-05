@@ -30,7 +30,7 @@ import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
-import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement } from './scrollViewDom';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
 import { driveEntriesFromScroll } from './entriesSystem';
@@ -1352,10 +1352,15 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
   React.useEffect(() => {
     const el = ref.current;
     if (!el || !scroll || !guid) return;
+    // #665: the true fractional box size, refreshed only on RESIZE (see `pushResize` below) —
+    // `push()` reads this cached value rather than re-measuring, so the cheap scroll path stays
+    // cheap.
+    let precise: { width: number; height: number } | null = null;
+    const refreshPrecise = () => { precise = readPreciseBoxSize(el); };
     const push = () => {
       // #413: an element with no box (a hidden editor dock tab) must not overwrite the other
       // mount's real measurement — see `readScrollMeasurement`.
-      const measured = readScrollMeasurement(el);
+      const measured = readScrollMeasurement(el, precise);
       if (!measured) return;
       const changed = writeScrollState(guid, measured);
       // Re-drive the pool NOW, in the same frame the browser is painting this offset in — a
@@ -1367,7 +1372,12 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
       // pool spawns and needs the system-tick flag for `Transient`.
       if (changed) driveEntriesFromScroll();
     };
-    push();                                   // seed, so a system sees real numbers on frame 1
+    // `refreshPrecise` calls `getComputedStyle`, which forces a style recalc — cheap once per
+    // resize, but #677 reports the `scroll` listener's path as frame-rate critical, so `push`
+    // alone (using the cached `precise`) is what runs on every scroll event, and this combined
+    // form is reserved for the resize/mutation paths below.
+    const pushResize = () => { refreshPrecise(); push(); };
+    pushResize();                              // seed, so a system sees real numbers on frame 1
     el.addEventListener('scroll', push, { passive: true });
     // The geometry stands on the viewport size, so measure it rather than assuming the authored
     // width/height resolved to what we think (percentages, flex, safe-area insets).
@@ -1383,7 +1393,7 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     // scrolled to the bottom, a row mounts, there IS more below now, and the number does not move
     // until some OTHER event happens to fire a `scroll`. Mirrors `scrollAnchor.ts`'s own fix for
     // this: watch every direct child too, and re-observe on any child-list mutation.
-    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(push) : null;
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(pushResize) : null;
     const observeAll = () => {
       if (!ro) return;
       ro.disconnect();
@@ -1392,7 +1402,7 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     };
     observeAll();
     const mo = typeof MutationObserver !== 'undefined'
-      ? new MutationObserver(() => { observeAll(); push(); })
+      ? new MutationObserver(() => { observeAll(); pushResize(); })
       : null;
     mo?.observe(el, { childList: true });
     return () => { el.removeEventListener('scroll', push); ro?.disconnect(); mo?.disconnect(); };

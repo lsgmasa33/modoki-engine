@@ -22,7 +22,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => (n === 'UIScrollView' ? { name: n, trait: UIScrollView } : undefined),
 }));
 
-import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, readScrollMeasurement, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
+import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, readScrollMeasurement, readPreciseBoxSize, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
   axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto', scrollbar: 'auto',
@@ -143,6 +143,75 @@ describe('readScrollMeasurement (#413)', () => {
     expect(readScrollMeasurement({
       clientWidth: -1, clientHeight: -1, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 0,
     })).toBeNull();
+  });
+});
+
+describe('readPreciseBoxSize / ceil\'d viewport (#665)', () => {
+  it('with no precise argument, falls back to clientWidth/clientHeight verbatim', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 434, clientHeight: 393, scrollLeft: 0, scrollTop: 0, scrollWidth: 434, scrollHeight: 393,
+    })).toMatchObject({ viewportWidth: 434, viewportHeight: 393 });
+  });
+
+  it('CEILs a fractional precise size into an integer viewport — the core #665 assertion', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 299, clientHeight: 335, scrollLeft: 0, scrollTop: 0, scrollWidth: 299, scrollHeight: 335,
+    }, { width: 299.109, height: 335.2 })).toMatchObject({ viewportWidth: 300, viewportHeight: 336 });
+  });
+
+  it('an already-integer precise size passes through unchanged — ceil is a no-op there', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 299, clientHeight: 335, scrollLeft: 0, scrollTop: 0, scrollWidth: 299, scrollHeight: 335,
+    }, { width: 299, height: 335 })).toMatchObject({ viewportWidth: 299, viewportHeight: 335 });
+  });
+
+  it('the zero-box guard still returns null even with a precise size supplied', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 0, clientHeight: 0, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 0,
+    }, { width: 300, height: 336 })).toBeNull();
+  });
+
+  it('readPreciseBoxSize sums content box PLUS padding, not just the content box', () => {
+    const el = {
+      ownerDocument: {
+        defaultView: {
+          getComputedStyle: (_target: unknown) => ({
+            width: '260.65px', height: '100px', paddingLeft: '4.2px', paddingRight: '1.1px',
+            paddingTop: '0px', paddingBottom: '0px',
+          }),
+        },
+      },
+    } as unknown as Element;
+    expect(readPreciseBoxSize(el)!.width).toBeCloseTo(265.95, 5);
+  });
+
+  it('returns null on empty/unparseable computed values — the jsdom case', () => {
+    const el = {
+      ownerDocument: {
+        defaultView: {
+          getComputedStyle: (_target: unknown) => ({
+            width: '', height: '', paddingLeft: '', paddingRight: '', paddingTop: '', paddingBottom: '',
+          }),
+        },
+      },
+    } as unknown as Element;
+    expect(readPreciseBoxSize(el)).toBeNull();
+  });
+
+  // ⚠️ A receiver-checking test: an arrow-function stub cannot catch a detached `getComputedStyle`
+  // call, which is exactly how the real-Chrome `Illegal invocation` bug ships green under jsdom.
+  // This stub is a REGULAR function so `this` reflects how it was actually invoked.
+  it('calls getComputedStyle on its OWNER, never detached — an arrow stub cannot catch this', () => {
+    const view: any = {};
+    view.getComputedStyle = function (this: unknown, _target: unknown) {
+      if (this !== view) throw new TypeError('Illegal invocation');
+      return {
+        width: '260.65px', height: '100px', paddingLeft: '4.2px', paddingRight: '1.1px',
+        paddingTop: '0px', paddingBottom: '0px',
+      };
+    };
+    const el = { ownerDocument: { defaultView: view } } as unknown as Element;
+    expect(readPreciseBoxSize(el)).toEqual({ width: 265.95, height: 100 });
   });
 });
 
