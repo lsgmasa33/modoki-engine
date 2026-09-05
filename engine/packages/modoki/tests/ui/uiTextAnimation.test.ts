@@ -33,6 +33,45 @@ describe('uiTextAnimation', () => {
     expect(uiTextAnimation(p({ effect: 'wave' }))!.style).toBeUndefined();
   });
 
+  it('rainbow hugs its text, so short strings see the WHOLE spectrum (#657)', () => {
+    // The gradient's positioning area is the span's BOX, not the glyphs, and the span is
+    // `display: block` (#646) so it fills its container. Measured on "SCORE" in a 600px host at
+    // 42px: ink/box was 0.249 — about a quarter of the rainbow, roughly red→orange — in the
+    // ordinary flex case, and #646 made the two non-flex contexts (`-webkit-box` under maxLines,
+    // and AutoFitText's span) match it at 0.249 where they had been 1.000. `fit-content`
+    // restores 1.000 in all three.
+    //
+    // Asserted here rather than left to the pixel measurement because the CSS property is the
+    // only part a headless test can see, and dropping it is a silent regression: the effect
+    // keeps animating and simply stops showing most of its colours.
+    const r = uiTextAnimation(p({ effect: 'rainbow' }))!;
+    expect(r.style?.width).toBe('fit-content');
+    // The gradient is still clipped to the glyphs — fit-content sizes the box, it does not
+    // replace the clip, and losing either one breaks the effect in a different way.
+    expect(r.style?.backgroundClip).toBe('text');
+    expect(r.style?.backgroundSize).toBe('200% auto');
+  });
+
+  it('a shrink-wrapped rainbow carries the authored textAlign (#657 follow-up)', () => {
+    // ⚠️ MEASURED ON SCREEN, and it caught a regression the plain fix shipped with.
+    // `text-align` centres INLINE content inside a box; once the span is `display: block` +
+    // `fit-content` the box is only as wide as its glyphs, so `text-align` has nothing left to
+    // centre and the box sits flush at the start of the line — a centred "SCORE" jumped to the
+    // left edge. Auto margins are what position a shrink-to-fit BLOCK, so they are what has to
+    // carry the alignment across.
+    expect(uiTextAnimation(p({ effect: 'rainbow' }), 'center')!.style?.marginInline).toBe('auto');
+    expect(uiTextAnimation(p({ effect: 'rainbow' }), 'right')!.style?.marginLeft).toBe('auto');
+    // Left/start must add NOTHING — the default position is already correct, and an auto margin
+    // there would move text that was never broken.
+    const left = uiTextAnimation(p({ effect: 'rainbow' }), 'left')!.style!;
+    expect(left.marginInline).toBeUndefined();
+    expect(left.marginLeft).toBeUndefined();
+    // Omitted textAlign behaves like left, not like a crash.
+    expect(uiTextAnimation(p({ effect: 'rainbow' }))!.style?.marginInline).toBeUndefined();
+    // The alignment must not leak onto a non-gradient effect, which has no style at all.
+    expect(uiTextAnimation(p({ effect: 'wave' }), 'center')!.style).toBeUndefined();
+  });
+
   it('fade one-shot: no loop → runs once and holds (forwards); loop → pulse (alternate)', () => {
     const once = uiTextAnimation(p({ effect: 'fade', loop: false }))!;
     expect(once.animation).toContain('mdk-ui-fade');

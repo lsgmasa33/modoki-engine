@@ -24,7 +24,7 @@ import { isGuid } from '../core/assetRefRules';
 import { onWorldSwap } from '../core/ecs/world';
 import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
-import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
+import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
@@ -197,10 +197,12 @@ const AutoFitText = React.memo(function AutoFitText(
     // single-line width at the authored size.
     el.style.fontSize = '';
     el.style.whiteSpace = 'nowrap';
-    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on every node BY DEFAULT —
-    // `node.maxLines > 0` overrides it to `display: '-webkit-box'` instead (see that branch
-    // below) — so this span (its own authored `display: block`, #646) is virtually always a
-    // FLEX ITEM of its parent, never a normal block box in flow. The default `align-items:
+    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on every node BY DEFAULT, so this
+    // span (its own authored `display: block`, #646) is virtually always a FLEX ITEM of its
+    // parent, never a normal block box in flow. (Since #655 a clamped node puts a wrapper between
+    // this span and the host — so the parent is then that BLOCK wrapper rather than the flex
+    // host. The scaffold below is still required: the stretch case is the common one, and a
+    // `max-content` width is correct in both.) The default `align-items:
     // stretch` then stretches a flex item's cross size to the parent's — so WITHOUT this line,
     // the span's measured width reads the parent's AVAILABLE width, not the span's natural
     // content width. Measured live on a `games/text_demo` fixture (42px "UI TEXT ANIMATION" in a
@@ -381,7 +383,7 @@ const AutoFitText = React.memo(function AutoFitText(
   // descendant's nearest `[data-entity-id]` ancestor is the host div, and both spans agree on
   // that answer via the same host.
   // `display: 'block'`, NOT `'inline-block'` (#646) — an `inline-block` child defeats the
-  // `node.maxLines > 0` branch's `-webkit-box` clamp below (it can't split it into lines), and
+  // `node.maxLines > 0` clamp (on the wrapper since #655 — it can't split an atomic inline), and
   // does not reopen #614's flex-stretch bug (`block` and `inline-block` compute identically as
   // a flex item). Full reasoning + verification: `docs/ui-system.md`'s `maxLines` callout.
   return (
@@ -633,6 +635,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (node.fontFamily) style.fontFamily = node.fontFamily;
 
   // ── Text styling (only when text content exists) ──
+  // Built here, applied to a wrapper around the text near the end of render — see the maxLines
+  // block below for why it cannot live on the host.
+  let clampStyle: React.CSSProperties | undefined;
   if (text) {
     // `cssVal` so a non-px `fontSizeUnit` resolves through the same `--ui-*` custom properties
     // every other length uses (#245). Default 'px' returns the bare number, i.e. unchanged.
@@ -658,12 +663,67 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // outer half shows — i.e. a true outline.
       (style as any).paintOrder = 'stroke fill';
     }
+    // ── maxLines: the clamp lives on an INNER wrapper, never on the host (#655) ──
+    // `-webkit-box` is not a flex container, so setting it here silently killed
+    // `justifyContent`/`alignItems`/`flexDirection`/`gap` authored on this same entity — while
+    // `getComputedStyle` went on REPORTING them (`center`), so the fields read alive in devtools
+    // and in the Inspector while doing nothing. That is this repo's "an unwired field is a lie
+    // with a tooltip" class, and it went from theoretical to reachable when #646 made the clamp
+    // actually engage. `clampStyle` is applied to a wrapper around the text further down.
     if (node.maxLines > 0) {
-      style.overflow = 'hidden';
-      style.display = '-webkit-box' as any;
-      (style as any).WebkitLineClamp = node.maxLines;
-      (style as any).WebkitBoxOrient = 'vertical';
-      if (node.textOverflow === 'ellipsis') style.textOverflow = 'ellipsis';
+      // `shrinkWrapAlign` for the same reason #657 needed it, one element over: this wrapper is a
+      // FLEX ITEM. In the default `column` host with `alignItems: 'stretch'` it fills the width
+      // and `text-align` still works — but in a `row` host (or `alignItems: flex-start/flex-end`)
+      // it shrink-wraps, and `text-align` then has nothing to centre. Measured pre-fix on a 400px
+      // row host with `textAlign: 'center'`: wrapper x=0 w=149 (flush left) against x~125 when the
+      // clamp lived on the host. Latent — no scene authors `row` + `maxLines` today — but #655 is
+      // precisely what makes `flexDirection` authorable on these entities, so it is newly
+      // reachable BECAUSE of this change.
+      clampStyle = { overflow: 'hidden', ...shrinkWrapAlign(node.textAlign) };
+      if (node.textOverflow === 'ellipsis') {
+        clampStyle.display = '-webkit-box';
+        (clampStyle as any).WebkitLineClamp = node.maxLines;
+        (clampStyle as any).WebkitBoxOrient = 'vertical';
+        clampStyle.textOverflow = 'ellipsis';
+      } else {
+        // `clip` is the field's DEFAULT and used to be UNHONOURABLE (#656): `-webkit-line-clamp`
+        // paints its own ellipsis unconditionally and never consults `text-overflow`, so an
+        // author who chose `clip` — or who never touched the field — got an ellipsis they could
+        // not turn off. A height cap truncates with no ellipsis instead.
+        //
+        // `lh` is the element's OWN line box, so `${maxLines}lh` is exact whether or not
+        // `lineHeight` was authored, and it cuts at a line boundary rather than through the
+        // middle of a glyph row. An authored `lineHeight` is emitted in px above, so use px
+        // there — same number, and it does not depend on the unit at all.
+        // ⚠️ `lh` needs Safari 16.4, which is EXACTLY this repo's iOS floor (CLAUDE.md § Device
+        // Info). Below it the declaration is dropped, the cap does not apply, and the text
+        // renders unclamped — more text than asked for, never a sliver.
+        // ⚠️ A HEIGHT CAP IS NOT EQUIVALENT TO COUNTING LINES, and the difference bites exactly
+        // once: when a DESCENDANT renders at a different font size than this wrapper. `lh` and
+        // `em` both resolve against the wrapper's own (authored) size, while `AutoFitText` writes
+        // a SHRUNK `font-size` onto its inner span. Measured: host 42px, span floored at 16px,
+        // `max-height: 1lh` = 48px against an 18px line box — 2.67 lines rendered where 1 was
+        // authored. `-webkit-line-clamp` counts LINE BOXES and is immune by construction.
+        //
+        // So the cap is used only where it is provably equivalent:
+        //   authored lineHeight  -> px, and a px line-height INHERITS as a fixed value, so the
+        //                           span's line boxes stay that tall whatever the font does.
+        //   no autoFitText       -> nothing changes the font below here; `lh` is exact.
+        //   otherwise            -> fall back to counting lines, and accept the ellipsis that
+        //                           comes with it (#727). Honouring `clip` there needs the cap to
+        //                           live on the element AutoFitText actually resizes, which is a
+        //                           different shape than this wrapper.
+        clampStyle.display = 'block';
+        if (node.lineHeight) {
+          clampStyle.maxHeight = `${node.lineHeight * node.maxLines}px`;
+        } else if (!node.autoFitText) {
+          clampStyle.maxHeight = `${node.maxLines}lh`;
+        } else {
+          clampStyle.display = '-webkit-box';
+          (clampStyle as any).WebkitLineClamp = node.maxLines;
+          (clampStyle as any).WebkitBoxOrient = 'vertical';
+        }
+      }
     } else if (node.textOverflow === 'ellipsis') {
       style.overflow = 'hidden';
       style.textOverflow = 'ellipsis';
@@ -1146,7 +1206,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // geometry paths), and its presence/absence drives the re-render on Play/Stop.
   let textContent: React.ReactNode = text;
   if (text && node.textAnim) {
-    const a = uiTextAnimation(node.textAnim);
+    // textAlign is passed so a shrink-wrapped rainbow span keeps the authored alignment —
+    // `fit-content` alone made a centred label jump to the left edge (#657, measured on screen).
+    const a = uiTextAnimation(node.textAnim, node.textAlign);
     if (a) {
       ensureUITextAnimStyles();
       textContent = <AnimatedText text={text} animation={a.animation} amp={a.amp} extra={a.style}
@@ -1157,6 +1219,27 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // AnimatedText span above), so it composes with text animation rather than competing with it.
   if (text && node.autoFitText) {
     textContent = <AutoFitText text={text} fontSize={node.fontSize} fontSizeMin={node.fontSizeMin}>{textContent}</AutoFitText>;
+  }
+  // The maxLines clamp (#655/#656), OUTERMOST so it clamps whatever the two wrappers above
+  // produced. Only mounted when `maxLines > 0`, so every other text node keeps byte-identical
+  // DOM — this changes the shape every game's UI text renders into, and confining it to the
+  // elements that actually clamp is what keeps that blast radius at one authored entity today.
+  //
+  // A `div`, not a `span`: `editor-ui-autofit.spec.ts` resolves the text span with
+  // `box.locator('span')`, and a second span there is a Playwright strict-mode violation, not a
+  // behavioural failure — a confusing way to learn about a wrapper.
+  //
+  // `UI_PAINT_ATTR` is load-bearing, not decoration. `isPaintOpaque` (editor/panels/
+  // uiPreviewPick.ts) credits an entity with paint via a DIRECT text-node child; a bare string
+  // moved inside this wrapper is no longer direct, so without the marker a clamped label reads
+  // as purely decorative and a SceneView click falls through to whatever sits behind it. The
+  // marker's `closest('[data-entity-id]')` is still the host, which is what that check asks.
+  // `text &&` as well as `clampStyle`: `uiVisualsHidden` blanks `text` AFTER clampStyle is built,
+  // so without it the editor's 2D-only layer mounts an EMPTY `<div data-ui-paint="text">`, which
+  // `isPaintOpaque` would credit as paint. It does not misfire today only because that same block
+  // sets `pointerEvents: 'none'` — i.e. one edit away from a blank label stealing 2D picks.
+  if (text && clampStyle) {
+    textContent = <div {...{ [UI_PAINT_ATTR]: 'text' }} style={clampStyle}>{textContent}</div>;
   }
 
   return (

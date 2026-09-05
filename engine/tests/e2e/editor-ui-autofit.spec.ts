@@ -172,8 +172,11 @@ test.describe('AutoFitText + UIElement.maxLines (#646)', () => {
     expect(boxHeight).toBeGreaterThan(AUTHORED_FONT_SIZE_PX * 0.8);
     // One line, not the ~96-99px two-line wrap an INERT clamp would let through.
     expect(boxHeight).toBeLessThan(AUTHORED_FONT_SIZE_PX * 1.8);
-    // The mechanism this fix relies on: the host's `-webkit-box` clamp only clamps LINE BOXES,
-    // so the span itself must compute as a real block, not an atomic inline-level box.
+    // The mechanism this fix relies on: the `-webkit-box` clamp only clamps LINE BOXES, so the
+    // span itself must compute as a real block, not an atomic inline-level box. (That clamp moved
+    // off the host onto an inner wrapper in #655 — the host is a flex container again — but the
+    // requirement on THIS span is unchanged, which is why the assertion below still reads the
+    // same.)
     expect(spanDisplay).toBe('block');
     // Sanity: the text genuinely doesn't fit on one line at this width/size — scrollHeight
     // reports its full (unclamped) extent, which must be taller than what actually rendered.
@@ -208,6 +211,66 @@ test.describe('AutoFitText + UIElement.maxLines (#646)', () => {
     expect(boxHeight).toBeGreaterThan(AUTHORED_FONT_SIZE_PX * 0.8);
     expect(boxHeight).toBeLessThan(AUTHORED_FONT_SIZE_PX * 1.8);
     expect(spanDisplay).toBe('block');
+  });
+});
+
+test.describe('maxLines + textOverflow: clip (#656)', () => {
+  // The gap #656 named: BOTH fixtures #646 added author `textOverflow: 'ellipsis'`, so they
+  // agreed with the rendering by accident and nothing exercised the field's DEFAULT. `clip` was
+  // unhonourable — `-webkit-line-clamp` paints its own ellipsis unconditionally and never
+  // consults `text-overflow` — so an author who chose `clip`, or who never touched the field,
+  // got an ellipsis they could not turn off. `demos/postfx-demo`'s Caption is a live instance.
+  //
+  // This is the measurement #656 itself used, inverted: pre-fix the two boxes rendered
+  // BYTE-IDENTICAL (compared with Buffer.compare), which is the defect stated as a pixel fact.
+  // Post-fix they must differ, and differ ONLY by the ellipsis — hence the height check, which
+  // is what stops this passing for the boring reason that one box is a different size.
+  // ⚠️ AN EARLIER VERSION OF THIS TEST WAS VACUOUS, and it is worth recording why. It compared
+  // the clip entity's screenshot against a separate ellipsis-authored TWIN and asserted the two
+  // differed. That passes whether or not the fix is present: the two elements sit at different
+  // sub-pixel offsets, so their rasterised glyphs differ anyway. Red-greened by restoring the
+  // `-webkit-box` clip path — the test still passed, i.e. it measured nothing.
+  //
+  // The fix is to compare ONE element against ITSELF, which is what #656 actually did. Shot A is
+  // the element as the engine renders it. Shot B is the same element after forcing the wrapper
+  // into the old `-webkit-box` clamp in-page. Same node, same position, same text — so any
+  // difference IS the ellipsis. With the fix, A (height cap, no ellipsis) and B (line-clamp,
+  // forced ellipsis) differ. WITHOUT the fix, A is already `-webkit-box`, B changes nothing,
+  // and the buffers match — a real red.
+  test('the DEFAULT clip paints no ellipsis — forcing line-clamp on the same node changes the pixels', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'MaxLinesClipDefault');
+    await switchToUIMode(page);
+
+    const clipId = await idByName(page, 'MaxLinesClipDefault');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${clipId}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+
+    // The host must still be a flex container — #655's half of the same change.
+    const hostDisplay = await host.evaluate((el) => getComputedStyle(el).display);
+    expect(hostDisplay).toBe('flex');
+
+    const hostH = await host.evaluate((el) => el.getBoundingClientRect().height);
+    expect(hostH).toBeGreaterThan(AUTHORED_FONT_SIZE_PX * 0.8);
+    expect(hostH).toBeLessThan(AUTHORED_FONT_SIZE_PX * 1.8);
+
+    const before = await host.screenshot();
+
+    // Force the pre-fix mechanism onto the very same wrapper.
+    const forced = await host.evaluate((el) => {
+      const w = el.querySelector('div') as HTMLElement | null;
+      if (!w) return false;
+      w.style.maxHeight = 'none';
+      w.style.display = '-webkit-box';
+      (w.style as unknown as Record<string, string>).webkitLineClamp = '1';
+      (w.style as unknown as Record<string, string>).webkitBoxOrient = 'vertical';
+      return true;
+    });
+    expect(forced).toBe(true);
+
+    const after = await host.screenshot();
+    // Pre-fix these are byte-identical, because the engine had already applied exactly what the
+    // evaluate above applies. Post-fix the ellipsis appears and the pixels move.
+    expect(Buffer.compare(before, after)).not.toBe(0);
   });
 });
 

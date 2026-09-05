@@ -405,12 +405,155 @@ describe('UINode text rendering', () => {
     expect(el.style.textOverflow).toBe('ellipsis');
   });
 
-  it('multi-line clamp: -webkit-line-clamp + display:-webkit-box', () => {
-    const el = renderNode(makeNode({ text: 'long', maxLines: 3, textOverflow: 'ellipsis' }));
-    expect(el.style.display).toBe('-webkit-box');
-    expect(styleAttr(el)).toMatch(/-webkit-line-clamp:\s*3/);
-    expect(el.style.overflow).toBe('hidden');
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DEFECT (#655). It asserted the clamp on the HOST —
+  // `el.style.display === '-webkit-box'` — which is exactly what killed every flex property
+  // authored on the same entity, because `-webkit-box` is not a flex container. The old
+  // assertion was not wrong about what the code did; it was wrong about what the code should do,
+  // and it would have gone red on the fix, which is the shape a test defending a bug always has.
+  // The clamp now lives on an inner wrapper and the host stays a flex container.
+  it('multi-line clamp: -webkit-line-clamp on an INNER WRAPPER, host stays display:flex', () => {
+    const el = renderNode(makeNode({
+      text: 'long', maxLines: 3, textOverflow: 'ellipsis',
+      justifyContent: 'center', alignItems: 'center', gap: 24, flexDirection: 'row',
+    }));
+    // The host keeps every flex property the author set. Before the fix these were still
+    // REPORTED by getComputedStyle while doing nothing — "an unwired field is a lie with a
+    // tooltip" — so asserting they survive is the whole point.
+    expect(el.style.display).toBe('flex');
+    expect(el.style.justifyContent).toBe('center');
+    expect(el.style.alignItems).toBe('center');
+    expect(el.style.flexDirection).toBe('row');
+
+    const clamp = el.querySelector('div[style*="-webkit-box"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('-webkit-box');
+    expect(styleAttr(clamp!)).toMatch(/-webkit-line-clamp:\s*3/);
+    expect(clamp!.style.overflow).toBe('hidden');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
     // (`-webkit-box-orient: vertical` is also set but jsdom drops it on serialization.)
+  });
+
+  // #656 — `clip` is the field's DEFAULT and was unhonourable: `-webkit-line-clamp` paints its
+  // own ellipsis unconditionally and never consults `text-overflow`. demos/postfx-demo's
+  // "Caption" (maxLines: 1, textOverflow untouched) is a live instance — it renders an ellipsis
+  // nobody asked for.
+  it('multi-line clamp with the DEFAULT clip: a height cap, and NO ellipsis anywhere', () => {
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }));  // textOverflow defaults to 'clip'
+    const clamp = el.querySelector('div[style*="max-height"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.overflow).toBe('hidden');
+    // The mechanism must NOT be -webkit-box: that is what forces the ellipsis.
+    expect(clamp!.style.display).not.toBe('-webkit-box');
+    expect(styleAttr(clamp!)).not.toMatch(/-webkit-line-clamp/);
+    expect(clamp!.style.textOverflow).toBe('');
+    // No authored lineHeight -> the `lh` unit, which is the element's own line box.
+    expect(styleAttr(clamp!)).toMatch(/max-height:\s*2lh/);
+  });
+
+  it('an authored lineHeight caps in PX — same number, no dependence on `lh` support', () => {
+    // lineHeight is authored in pixels here (UINode emits it as px), so the cap is exact and
+    // does not need the `lh` unit at all — which matters because `lh` lands exactly on this
+    // repo's iOS 16.4 floor.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 3, lineHeight: 20 }));
+    const clamp = el.querySelector('div[style*="max-height"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.maxHeight).toBe('60px');
+  });
+
+  it('no wrapper at all when maxLines is 0 — the DOM shape is unchanged for ordinary text', () => {
+    // The blast-radius guard. This change alters the DOM every game's UI text renders into, so
+    // the wrapper must exist ONLY for elements that actually clamp.
+    const el = renderNode(makeNode({ text: 'plain' }));
+    // ⚠️ Assert the text is a DIRECT text-node child, not merely that no clamp-styled div
+    // exists. The weaker version passed under mutation: making the wrapper unconditional
+    // renders `<div style={undefined}>`, which carries neither `max-height` nor `-webkit-box`,
+    // so a selector-based check sails past it while `isPaintOpaque`'s direct-child test — the
+    // thing that actually breaks — has already been defeated. This is the assertion that
+    // encodes the real invariant.
+    const directText = Array.from(el.childNodes)
+      .some((n) => n.nodeType === Node.TEXT_NODE && (n.textContent || '').trim() === 'plain');
+    expect(directText).toBe(true);
+    expect(el.querySelector('div[style*="max-height"]')).toBeNull();
+    expect(el.querySelector('div[style*="-webkit-box"]')).toBeNull();
+  });
+
+  // ⚠️ FINDINGS FROM THE CLOSE-OUT REVIEW. Each of these pins a defect the first version of the
+  // change actually had, or a wiring that no test could see.
+  it('autoFitText + clip falls back to COUNTING LINES — a height cap is not equivalent', () => {
+    // MEASURED: the `lh` cap resolves against the WRAPPER's authored font size, while
+    // `AutoFitText` writes a shrunk `font-size` onto its inner span. Host 42px, span floored at
+    // 16px: `max-height: 1lh` = 48px against an 18px line box, i.e. 2.67 lines rendered where 1
+    // was authored. `-webkit-line-clamp` counts line boxes and is immune, so that is what this
+    // combination must use — accepting the ellipsis, which is the honest trade.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 1, autoFitText: true, fontSize: 42, fontSizeMin: 16 }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('-webkit-box');
+    expect(clamp!.style.maxHeight).toBe('');           // NOT the cap — that is the bug
+    expect(styleAttr(clamp!)).toMatch(/-webkit-line-clamp:\s*1/);
+  });
+
+  it('an authored lineHeight keeps the px cap even under autoFitText', () => {
+    // A px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall
+    // whatever the font does — the cap is exact and the fallback above is not needed.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2, lineHeight: 20, autoFitText: true, fontSize: 42, fontSizeMin: 16 }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.maxHeight).toBe('40px');
+    expect(clamp!.style.display).toBe('block');
+  });
+
+  it('the clamp wrapper carries textAlign across, because it can shrink-wrap in a row host', () => {
+    // #657's bug class, one element over: the wrapper is a flex item, so in a `row` host it
+    // shrink-wraps and `text-align` has nothing left to centre. Measured pre-fix on a 400px row
+    // host: wrapper x=0 w=149 (flush left) vs x~125 when the clamp lived on the host.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2, textAlign: 'center' }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.marginInline).toBe('auto');
+    // left must add nothing — text that was never mispositioned must not move.
+    const left = renderNode(makeNode({ text: 'long', maxLines: 2, textAlign: 'left' }));
+    const lc = left.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(lc!.style.marginInline).toBe('');
+  });
+
+  it('uiVisualsHidden mounts no clamp wrapper — an empty marked div would claim paint it lacks', () => {
+    // ⚠️ MUST drive `uiVisualsHidden`, not author `text: ''`. An earlier version of this test did
+    // the latter and was VACUOUS: with no text the `if (text)` block never runs, `clampStyle` is
+    // never built, and the assertion holds with or without the guard it claims to pin. Mutation
+    // proved it — removing `text &&` left the whole suite green. `uiVisualsHidden` is the real
+    // trigger because it blanks `text` AFTER clampStyle is built, which is the only way to reach
+    // "clamped, but nothing to show".
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }), { uiVisualsHidden: true });
+    expect(el.querySelector(`div[${UI_PAINT_ATTR}="text"]`)).toBeNull();
+    // Sanity that the fixture reaches the branch at all: the same node WITHOUT the flag has one.
+    const shown = renderNode(makeNode({ text: 'long', maxLines: 2 }));
+    expect(shown.querySelector(`div[${UI_PAINT_ATTR}="text"]`)).not.toBeNull();
+  });
+
+  it('a rainbow TextAnimation reaches the DOM shrink-wrapped AND aligned (#657 wiring)', () => {
+    // The wiring `uiTextAnimation(node.textAnim, node.textAlign)` was pinned by NOTHING: the
+    // uiTextAnimation unit test reads the returned object, so deleting the second argument in
+    // UINode failed no test, and `width: fit-content` reaching the DOM was unpinned the same way.
+    const el = renderNode(makeNode({
+      text: 'SCORE', textAlign: 'center',
+      textAnim: { effect: 'rainbow', speed: 1, amplitude: 0, frequency: 1, loop: true, fadeIn: true },
+    }));
+    const span = el.querySelector(`span[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(span).not.toBeNull();
+    expect(span!.style.width).toBe('fit-content');
+    expect(span!.style.marginInline).toBe('auto');
+  });
+
+  it('the clamp wrapper carries the paint marker, so a clamped label stays clickable', () => {
+    // `isPaintOpaque` (editor/panels/uiPreviewPick.ts) credits an entity with paint via a DIRECT
+    // text-node child. A bare string moved inside the wrapper is no longer direct, so without
+    // the marker a clamped label reads as purely decorative and a SceneView click falls through
+    // to whatever sits behind it. The marker's nearest `[data-entity-id]` ancestor is the host,
+    // which is the question that check actually asks.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }));
+    const marked = el.querySelector('div[data-ui-paint]') as HTMLElement | null;
+    expect(marked).not.toBeNull();
+    expect(marked!.closest('[data-entity-id]')).toBe(el);
   });
 });
 

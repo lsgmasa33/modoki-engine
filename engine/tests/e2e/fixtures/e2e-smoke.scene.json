@@ -8,27 +8,101 @@
       "id": 1,
       "name": "CenterCube",
       "traits": {
-        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
-        "Renderable3DPrimitive": { "mesh": "cube", "color": 3447003, "size": 3, "material": "", "isVisible": true },
-        "EntityAttributes": { "name": "CenterCube", "guid": "e2e50000-0000-4000-8000-000000000001", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "3d" }
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cube",
+          "color": 3447003,
+          "size": 3,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "CenterCube",
+          "guid": "e2e50000-0000-4000-8000-000000000001",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 0,
+          "layer": "3d"
+        }
       }
     },
     {
       "id": 2,
       "name": "OffsetSphere",
       "traits": {
-        "Transform": { "x": 0, "y": 8, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
-        "Renderable3DPrimitive": { "mesh": "sphere", "color": 15158332, "size": 2, "material": "", "isVisible": true },
-        "EntityAttributes": { "name": "OffsetSphere", "guid": "e2e50000-0000-4000-8000-000000000002", "isActive": true, "sortOrder": 1, "parentId": 0, "layer": "3d" }
+        "Transform": {
+          "x": 0,
+          "y": 8,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 15158332,
+          "size": 2,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "OffsetSphere",
+          "guid": "e2e50000-0000-4000-8000-000000000002",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": 0,
+          "layer": "3d"
+        }
       }
     },
     {
       "id": 3,
       "name": "Ambient Light",
       "traits": {
-        "Transform": { "x": 0, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0, "sx": 1, "sy": 1, "sz": 1 },
-        "EntityAttributes": { "name": "Ambient Light", "guid": "e2e50000-0000-4000-8000-000000000003", "isActive": true, "sortOrder": 2, "parentId": 0, "layer": "" },
-        "Light": { "lightType": "ambient", "color": 16777215, "intensity": 1, "targetX": 0, "targetY": 0, "targetZ": 0, "distance": 0, "angle": 0.5, "penumbra": 0, "castShadow": false }
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "EntityAttributes": {
+          "name": "Ambient Light",
+          "guid": "e2e50000-0000-4000-8000-000000000003",
+          "isActive": true,
+          "sortOrder": 2,
+          "parentId": 0,
+          "layer": ""
+        },
+        "Light": {
+          "lightType": "ambient",
+          "color": 16777215,
+          "intensity": 1,
+          "targetX": 0,
+          "targetY": 0,
+          "targetZ": 0,
+          "distance": 0,
+          "angle": 0.5,
+          "penumbra": 0,
+          "castShadow": false
+        }
       }
     },
     {
@@ -36,8 +110,26 @@
       "name": "UIButton",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 140, "height": 44, "widthUnit": "px", "heightUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "E2E UI Button", "fontSize": 16, "textColor": 16777215 },
-        "EntityAttributes": { "name": "UIButton", "guid": "e2e50000-0000-4000-8000-000000000004", "isActive": true, "sortOrder": 3, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 140,
+          "height": 44,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "E2E UI Button",
+          "fontSize": 16,
+          "textColor": 16777215
+        },
+        "EntityAttributes": {
+          "name": "UIButton",
+          "guid": "e2e50000-0000-4000-8000-000000000004",
+          "isActive": true,
+          "sortOrder": 3,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -45,8 +137,26 @@
       "name": "AutoFitOff",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "textColor": 16777215, "autoFitText": false },
-        "EntityAttributes": { "name": "AutoFitOff", "guid": "e2e50000-0000-4000-8000-000000000005", "isActive": true, "sortOrder": 4, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "autoFitText": false
+        },
+        "EntityAttributes": {
+          "name": "AutoFitOff",
+          "guid": "e2e50000-0000-4000-8000-000000000005",
+          "isActive": true,
+          "sortOrder": 4,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -54,8 +164,27 @@
       "name": "AutoFitOn",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 340, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
-        "EntityAttributes": { "name": "AutoFitOn", "guid": "e2e50000-0000-4000-8000-000000000006", "isActive": true, "sortOrder": 5, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 340,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": true
+        },
+        "EntityAttributes": {
+          "name": "AutoFitOn",
+          "guid": "e2e50000-0000-4000-8000-000000000006",
+          "isActive": true,
+          "sortOrder": 5,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -63,8 +192,27 @@
       "name": "AutoFitContentParent",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 340, "widthUnit": "px", "backgroundOpacity": 0.4, "backgroundColor": 2500134, "gap": 8, "gapUnit": "px", "paddingTop": 8, "paddingTopUnit": "px", "paddingBottom": 8, "paddingBottomUnit": "px" },
-        "EntityAttributes": { "name": "AutoFitContentParent", "guid": "e2e50000-0000-4000-8000-000000000007", "isActive": true, "sortOrder": 6, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 340,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.4,
+          "backgroundColor": 2500134,
+          "gap": 8,
+          "gapUnit": "px",
+          "paddingTop": 8,
+          "paddingTopUnit": "px",
+          "paddingBottom": 8,
+          "paddingBottomUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "AutoFitContentParent",
+          "guid": "e2e50000-0000-4000-8000-000000000007",
+          "isActive": true,
+          "sortOrder": 6,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -72,8 +220,26 @@
       "name": "AutoFitContentSizedOff",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "alignSelf": "center", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": false },
-        "EntityAttributes": { "name": "AutoFitContentSizedOff", "guid": "e2e50000-0000-4000-8000-000000000008", "isActive": true, "sortOrder": 7, "parentId": 7, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "alignSelf": "center",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": false
+        },
+        "EntityAttributes": {
+          "name": "AutoFitContentSizedOff",
+          "guid": "e2e50000-0000-4000-8000-000000000008",
+          "isActive": true,
+          "sortOrder": 7,
+          "parentId": 7,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -81,8 +247,26 @@
       "name": "AutoFitContentSizedOn",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "alignSelf": "center", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
-        "EntityAttributes": { "name": "AutoFitContentSizedOn", "guid": "e2e50000-0000-4000-8000-000000000009", "isActive": true, "sortOrder": 8, "parentId": 7, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "alignSelf": "center",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": true
+        },
+        "EntityAttributes": {
+          "name": "AutoFitContentSizedOn",
+          "guid": "e2e50000-0000-4000-8000-000000000009",
+          "isActive": true,
+          "sortOrder": 8,
+          "parentId": 7,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -90,8 +274,30 @@
       "name": "MaxLinesAutoFit",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "fontSizeMin": 42, "letterSpacing": 3, "textColor": 16777215, "autoFitText": true, "maxLines": 1, "textOverflow": "ellipsis" },
-        "EntityAttributes": { "name": "MaxLinesAutoFit", "guid": "e2e50000-0000-4000-8000-000000000010", "isActive": true, "sortOrder": 9, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "fontSizeMin": 42,
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": true,
+          "maxLines": 1,
+          "textOverflow": "ellipsis"
+        },
+        "EntityAttributes": {
+          "name": "MaxLinesAutoFit",
+          "guid": "e2e50000-0000-4000-8000-000000000010",
+          "isActive": true,
+          "sortOrder": 9,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -99,9 +305,35 @@
       "name": "MaxLinesTextAnim",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "maxLines": 1, "textOverflow": "ellipsis" },
-        "TextAnimation": { "effect": "wave", "speed": 1, "amplitude": 0.1, "frequency": 1, "loop": true },
-        "EntityAttributes": { "name": "MaxLinesTextAnim", "guid": "e2e50000-0000-4000-8000-000000000011", "isActive": true, "sortOrder": 10, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "maxLines": 1,
+          "textOverflow": "ellipsis"
+        },
+        "TextAnimation": {
+          "effect": "wave",
+          "speed": 1,
+          "amplitude": 0.1,
+          "frequency": 1,
+          "loop": true
+        },
+        "EntityAttributes": {
+          "name": "MaxLinesTextAnim",
+          "guid": "e2e50000-0000-4000-8000-000000000011",
+          "isActive": true,
+          "sortOrder": 10,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     },
     {
@@ -109,8 +341,89 @@
       "name": "AutoFitPaddedBordered",
       "traits": {
         "RenderableUI": true,
-        "UIElement": { "isVisible": true, "width": 384, "widthUnit": "px", "paddingLeft": 20, "paddingLeftUnit": "px", "paddingRight": 20, "paddingRightUnit": "px", "borderWidth": 2, "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
-        "EntityAttributes": { "name": "AutoFitPaddedBordered", "guid": "e2e50000-0000-4000-8000-000000000012", "isActive": true, "sortOrder": 11, "parentId": 0, "layer": "ui" }
+        "UIElement": {
+          "isVisible": true,
+          "width": 384,
+          "widthUnit": "px",
+          "paddingLeft": 20,
+          "paddingLeftUnit": "px",
+          "paddingRight": 20,
+          "paddingRightUnit": "px",
+          "borderWidth": 2,
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": true
+        },
+        "EntityAttributes": {
+          "name": "AutoFitPaddedBordered",
+          "guid": "e2e50000-0000-4000-8000-000000000012",
+          "isActive": true,
+          "sortOrder": 11,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "name": "MaxLinesClipDefault",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "maxLines": 1
+        },
+        "EntityAttributes": {
+          "name": "MaxLinesClipDefault",
+          "guid": "e2e50000-0000-4000-8000-000000000013",
+          "isActive": true,
+          "sortOrder": 12,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "name": "MaxLinesEllipsisRef",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "maxLines": 1,
+          "textOverflow": "ellipsis"
+        },
+        "EntityAttributes": {
+          "name": "MaxLinesEllipsisRef",
+          "guid": "e2e50000-0000-4000-8000-000000000014",
+          "isActive": true,
+          "sortOrder": 13,
+          "parentId": 0,
+          "layer": "ui"
+        }
       }
     }
   ]

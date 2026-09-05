@@ -186,7 +186,9 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
   `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
-  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`),
+  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis` — ⚠️ only
+  honoured when `maxLines > 0`; on a SINGLE-LINE element `'ellipsis'` is inert, because
+  `text-overflow` does not apply to the flex container the host is. Measured, #725),
   `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
 
   ⚠️ **`autoFitText` is SHRINK-ONLY (#614)** — off by default; when on, the effective font size is
@@ -200,9 +202,45 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `elementType: 'input'` (player-entered text, not an authored label — see `UIElement.ts`). Fit
   math: `runtime/ui/autoFitText.ts`; DOM measurement: `UINode.tsx`'s `AutoFitText`.
 
+  ⚠️ **The clamp lives on an INNER WRAPPER, never on the entity div (#655).** It used to be set
+  on the host, and `-webkit-box` is not a flex container — so `justifyContent`, `alignItems`,
+  `flexDirection` and `gap` authored on that same entity silently stopped working, while
+  `getComputedStyle` went on reporting them (`center`). That is the "unwired field is a lie with
+  a tooltip" class, and #646 is what took it from theoretical to reachable by making the clamp
+  actually engage. `UINode.tsx` now builds a `clampStyle` and mounts a wrapper `<div>` around the
+  text — **only when `maxLines > 0`**, so every other text node keeps byte-identical DOM. The
+  wrapper carries `UI_PAINT_ATTR`: `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an
+  entity with paint via a DIRECT text-node child, and without the marker a clamped label would
+  read as decorative and a SceneView click would fall through it.
+
+  ⚠️ **`textOverflow: 'clip'` — the field's DEFAULT — is honoured by a HEIGHT CAP, not by
+  line-clamp (#656).** `-webkit-line-clamp` paints its own ellipsis unconditionally and never
+  consults `text-overflow`, so `clip` was unhonourable: an author who chose it, or who never
+  touched the field, got an ellipsis they could not turn off (`demos/postfx-demo`'s Caption is a
+  live instance — ⚠️ its `text` is written at RUNTIME by `renderCaption()` in that demo's
+  `setup.ts`, NOT authored in the scene, so a stopped editor shows nothing and the scene JSON
+  alone makes the claim look wrong). The clip path therefore uses `display: block` + `overflow: hidden` +
+  `max-height`. `textOverflow: 'ellipsis'` still takes the `-webkit-box` path, on the wrapper.
+
+  ⚠️ **A HEIGHT CAP IS NOT EQUIVALENT TO COUNTING LINES**, and the cap is used only where it
+  provably is. `lh`/`em` resolve against the WRAPPER's font size, so any descendant rendering at a
+  different size breaks the equivalence — which `autoFitText` does by construction. Measured: host
+  42px, span floored at 16px, `max-height: 1lh` = 48px against an 18px line box, i.e. **2.67 lines
+  where 1 was authored**. So:
+
+  | authored | mechanism | why it is safe |
+  |---|---|---|
+  | `lineHeight` set | `lineHeight × maxLines` px | a px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall whatever the font does |
+  | no `lineHeight`, no `autoFitText` | `${maxLines}lh` | nothing below changes the font, so `lh` is exact |
+  | no `lineHeight` + `autoFitText` | `-webkit-line-clamp` | counts LINE BOXES, immune by construction — and the ellipsis comes back with it (#727) |
+
+  ⚠️ `lh` needs Safari 16.4, *exactly* this repo's iOS floor — and note **Android WebView's version
+  is independent of the OS floor**, so an in-support Android device on a stale WebView can miss it.
+  Below it the declaration is dropped and the text renders unclamped: more text than asked for,
+  never a sliver. `-webkit-line-clamp`, which this replaced for the default, goes back to Chrome 6.
+
   ⚠️ **`maxLines` clamps LINE BOXES only — a `display: inline-block` text child defeats it
-  (#646).** `maxLines > 0` sets the entity div's own `display: '-webkit-box'` +
-  `-webkit-line-clamp` (`UINode.tsx`) — Chromium's legacy clamp mechanism, which only splits
+  (#646).** The wrapper's `-webkit-box` is Chromium's legacy clamp mechanism, which only splits
   BLOCK-level descendant content into lines. A plain text child works; a wrapper `<span>` around
   the text (`AutoFitText`, `AnimatedText`) does not if it is `inline-block` — the clamp treats it
   as one atomic inline-level box (like an image) and does nothing, leaving `overflow: hidden` on
@@ -212,7 +250,7 @@ Field groups (representative fields, verified against `UIElement.ts`):
   entity's normal `display: flex` (no `maxLines`), a flex item's `inline-block` is *blockified*
   to `block` regardless of what is authored, so `block` and `inline-block` compute identically
   there. Two non-flex contexts escape that blockification, not one, and both need the authored
-  value to already be `block`: the `-webkit-box` parent (exactly the `maxLines` case), and
+  value to already be `block`: the `-webkit-box` WRAPPER (exactly the `maxLines` case), and
   `AutoFitText`'s own span — itself `display: 'block'`, never flex — whenever it wraps
   `AnimatedText` (both `autoFitText` and a `TextAnimation` authored on the same node). That
   nesting makes the animation span a child of a plain block box instead of a flex item,
