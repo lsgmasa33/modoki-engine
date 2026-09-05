@@ -92,7 +92,11 @@ const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, rough
  *  this dedupe so only one ever reported, and reloading the editor to reproduce "why is my
  *  primitive invisible" warned nothing because the name was already in the set from before. */
 const _warnedUnknownPrimitives = new Set<string>();
-onWorldSwap(() => { _warnedUnknownPrimitives.clear(); });
+// `_warnedMissingClip` (declared below, keyed `modelRef:clip`) shares this same reset — it had
+// NO world-swap clear at all (#738 group B), so a clip name that warned in one scene stayed
+// silently suppressed forever after, including for an unrelated model reusing the same ref/clip
+// pair in a later scene.
+onWorldSwap(() => { _warnedUnknownPrimitives.clear(); _warnedMissingClip.clear(); });
 function warnUnknownPrimitiveOnce(id: number, meshName: string): void {
   if (_warnedUnknownPrimitives.has(meshName)) return;
   _warnedUnknownPrimitives.add(meshName);

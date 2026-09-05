@@ -60,7 +60,7 @@ function makeWorld(ui: Record<string, unknown>, anchor: Record<string, unknown> 
         data.set(UIEL, { ...UI_DEFAULTS, ...ui });
         data.set(ATTR, { parentId: 0, sortOrder: 0, guid: 'g1' });
         if (anchor) data.set(ANC, { ...ANCHOR_DEFAULTS, ...anchor });
-        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
         cb([data.get(UIEL)], entity);
       },
     }),

@@ -323,7 +323,7 @@ function probeSupport(renderer: unknown): { ok: boolean; backend?: 'WebGPU' | 'W
  *  internals — which guessing "ordinal 0 is the shadow pass" would not.
  *
  *  ⚠️ THE UID's ORDINAL IS 1-BASED. `Renderer._renderScene` does `info.render.frameCalls++` and
- *  only THEN calls `updateTimeStampUID` (three r0.184, Renderer.js:1495 and :1501), so a call
+ *  only THEN calls `updateTimeStampUID` (three r0.185.1, Renderer.js:1599 and :1605), so a call
  *  observed with the counter at `from` beforehand is stamped `from + 1`. The claimed range is
  *  therefore the HALF-OPEN-ON-THE-LEFT interval `(from, to]`, not `[from, to)`. Getting this
  *  backwards does not fail loudly — it silently shifts every label by one and drops the last

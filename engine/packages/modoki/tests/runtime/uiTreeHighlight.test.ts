@@ -72,11 +72,13 @@ function makeWorld(getClip: () => string, buttons: { guid: string; clipValue: st
     id: () => 1,
     has: (t: any) => t === ATTR || t === SKEL,
     get: (t: any) => (t === ATTR ? target[ATTR.id] : t === SKEL ? target[SKEL.id] : undefined),
+    generation: () => 0,
   };
   const mkUI = (e: any) => ({
     id: () => e.id,
     has: (t: any) => !!e.traits[(t as any).id],
     get: (t: any) => e.traits[(t as any).id],
+    generation: () => 0,
   });
 
   return {

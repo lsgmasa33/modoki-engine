@@ -55,7 +55,10 @@ vi.mock('../../src/runtime/video/UIVideoMount', () => ({
     }),
 }));
 
-import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
+import {
+  UINode, cssVal, hexToRgba, hexToColor,
+  DEFAULT_TOGGLE_TRACK_WIDTH, DEFAULT_TOGGLE_TRACK_HEIGHT, toggleKnobFloor, droppedTextStyleFields,
+} from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
 import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo } from '../../src/runtime/ui/pressOrigin';
@@ -1640,5 +1643,353 @@ describe('UIElement.rotation (#234)', () => {
     const el = render(<UINode node={node} storeState={{}} />).container.firstElementChild as HTMLElement;
     expect(el.style.transform).toBe('translate(-50%, -50%) rotate(-4deg)');
     expect(el.style.transformOrigin).toBe('50% 50%');
+  });
+});
+
+// ── #744: the knob used to collapse to zero when the track's height was unset (the DEFAULT
+// authoring shape) — a `min-*` floor on both the track and the knob fixes it. ──
+describe('UIToggle default-size fallback (#744)', () => {
+  it('toggleKnobFloor is pure arithmetic: DEFAULT_TOGGLE_TRACK_HEIGHT minus twice the inset, clamped at 0', () => {
+    expect(toggleKnobFloor(2)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT - 2 * 2);
+    expect(toggleKnobFloor(3)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT - 2 * 3);
+    expect(toggleKnobFloor(0)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT);
+    // An inset large enough to eat the whole track clamps at 0 rather than going negative.
+    expect(toggleKnobFloor(50)).toBe(0);
+  });
+
+  // The regression test that matters: render with the track height UNSET (width/height 0 — the
+  // DEFAULT authoring shape, since UIElement.height defaults to 0/auto). Testing against Court's
+  // authored 56×32 toggle instead would reproduce the ACCIDENT (a size that happened to be
+  // authored), not the bug (nothing sizes the track when nothing was authored).
+  it('an unsized toggle (width/height 0, the default) still gets a definite track and a non-zero knob floor', () => {
+    const node = makeNode({ guid: 'tg-744-1', width: 0, height: 0, toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.minWidth).toBe(`${DEFAULT_TOGGLE_TRACK_WIDTH}px`);
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+    const knob = track.firstElementChild as HTMLElement;
+    const floor = toggleKnobFloor(node.toggle!.knobInset);
+    expect(floor).toBeGreaterThan(0);
+    expect(knob.style.minWidth).toBe(`${floor}px`);
+    expect(knob.style.minHeight).toBe(`${floor}px`);
+  });
+
+  it('an AUTHORED size still wins: width/height size the box, and no fallback min is added', () => {
+    const node = makeNode({ guid: 'tg-744-2', width: 56, height: 32, toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.width).toBe('56px');
+    expect(track.style.height).toBe('32px');
+    // Skipped on a SIZED axis, not merely out-competed by it. A `min-*` can still RAISE a
+    // definite size smaller than itself, so leaving it on would clamp any authored toggle under
+    // 44×24 up to the fallback — the reverse of "the author's value wins".
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+  });
+
+  // ⚠️ The live case this guards: `entriesSystem` pins a pooled UIEntries row root to a definite
+  // `entryW`/`entryH` in px every tick, AND pins its min/max size fields to 0, because "a min/max
+  // constraint overrides the definite width/height from INSIDE the border box". A fallback
+  // invented in UINode is invisible to that block's `warnAuthoredOverride`, so on an entry
+  // smaller than 44×24 it would silently reintroduce exactly the desync the pin prevents.
+  it('adds no fallback min on any DEFINITE size smaller than the fallback (the pooled-row shape)', () => {
+    // ⚠️ Named for what it MEASURES. It drives the definite-size branch with an authored width
+    // and height rather than through `entriesSystem`, so it does not cross the pooled-row seam: if
+    // that system ever pinned the entry size in `%` instead of px, or stopped pinning width, the
+    // defect above reopens and this test stays green. An integration test through
+    // entriesSystem → uiTreeStore → UINode is the one that would catch that.
+    const track = renderNode(makeNode({ guid: 'tg-744-4', width: 30, height: 16, toggle: toggle() }));
+    expect(track.style.width).toBe('30px');
+    expect(track.style.height).toBe('16px');
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+    // The knob's own floor goes with it — on a 16px track a 20px floor would push the knob
+    // outside its own capsule.
+    expect((track.firstElementChild as HTMLElement).style.minHeight).toBe('');
+  });
+
+  // An anchor-stretched axis is sized by its two offsets, and `applyAnchorStyle` CLEARS the CSS
+  // size to let that happen — so the axis reads as unsized from here while being anything but.
+  // `isSizeInert` is the shared predicate (Inspector + scene validator use the same one).
+  it('adds no fallback min on an anchor-stretched axis, whose cleared CSS size is not "unsized"', () => {
+    const anchor = { anchor: 'stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0 };
+    const track = renderNode(makeNode({ guid: 'tg-744-5', width: 0, height: 0, anchor, toggle: toggle() }));
+    expect(track.style.position).toBe('absolute');
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+  });
+
+  // ⚠️ A `%` size is the INDETERMINATE case, not a definite one — `height: 100%` against an
+  // indefinite containing block resolves to `auto` exactly like an unset height, so treating it as
+  // "already sized" would switch the fallback off in the one shape it exists for.
+  it('a PERCENTAGE height does not count as sized — the fallback still applies', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-7', width: 0, height: 100, heightUnit: '%', toggle: toggle() }));
+    expect(track.style.height).toBe('100%');
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  // ⚠️ CSS resolves `min-*` ABOVE `max-*`, so an unclamped floor would render a 24px track under
+  // an authored 16px cap — the fallback beating the authored surface, which is the exact failure
+  // this whole change exists to remove.
+  it('the fallback is CLAMPED to an authored px maxHeight rather than overriding it', () => {
+    const node = makeNode({ guid: 'tg-744-8', width: 0, height: 0, maxHeight: 16, maxHeightUnit: 'px', toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.minHeight).toBe('16px');
+    // The knob's floor derives from the track's EFFECTIVE floor, so a cap shrinks both together.
+    expect((track.firstElementChild as HTMLElement).style.minHeight)
+      .toBe(`${toggleKnobFloor(node.toggle!.knobInset, 16)}px`);
+  });
+
+  it('a NON-px cap is left alone — it cannot be compared here, and guessing beats nothing badly', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-9', width: 0, height: 0, maxHeight: 50, maxHeightUnit: '%', toggle: toggle() }));
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  it('a HALF-stretched anchor still gets the fallback on its live axis only', () => {
+    // `top-stretch` stretches X and leaves Y live (see STRETCH_X/STRETCH_Y), so width is sized by
+    // the offsets and height is not — the fallback must land on exactly one of them.
+    const anchor = { anchor: 'top-stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0 };
+    const track = renderNode(makeNode({ guid: 'tg-744-6', width: 0, height: 0, anchor, toggle: toggle() }));
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  // ⚠️ Pinned because a previous attempt at this fix replaced `height: 100%` with
+  // `align-self: stretch` and that was MEASURED (headless Chromium) to leave the knob 0px WIDE:
+  // a flex item's main size resolves BEFORE cross-axis stretching, so `aspect-ratio` has no
+  // definite cross size yet to derive a width from. Half-fixed and still invisible — do not
+  // re-try it.
+  it('the knob keeps height:100% + aspect-ratio:1/1 — the fix depends on both', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-3', toggle: toggle() }));
+    const knob = track.firstElementChild as HTMLElement;
+    expect(knob.style.height).toBe('100%');
+    expect(knob.style.aspectRatio).toBe('1 / 1');
+  });
+});
+
+/** A minimal `UIScrollView` trait for the DOM tests below — only the fields `useScrollView` and
+ *  `scrollViewStyle` read. Matches the shape built by `uiTreeStore.ts` (see `UITreeStore.test.ts`'s
+ *  own `SCROLL` const for the sibling of this helper that skips the `wheel` field). */
+function scrollTrait(over: Partial<NonNullable<UINodeData['scroll']>> = {}): NonNullable<UINodeData['scroll']> {
+  return {
+    axis: 'y', snap: 'none', snapStop: 'always', overscroll: 'auto', scrollbar: 'auto', wheel: 'native',
+    scrollToX: -1, scrollToY: -1, scrollToBehavior: '', scrollBehavior: 'smooth',
+    ...over,
+  };
+}
+
+// ── #743: a UIScrollView on an element never opted into scrolling (UIElement.overflow !==
+// 'scroll') now warns once per entity instead of silently doing nothing — and the cross-axis
+// pin that used to half-work it is gated off a non-scrolling box. ──
+describe('UIScrollView inert-trait DEV warning (#743)', () => {
+  it('warns when overflow is visible', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-1', overflow: 'visible', scroll: scrollTrait() }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('[UIScrollView]');
+      expect(warn.mock.calls[0][0]).toContain("'visible'");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // (The `overflow: 'hidden'` case deliberately does NOT warn — it is a scroll container with no
+  //  scrolling UI, so the trait is not inert there. Covered by the pair further down.)
+
+  it('does NOT warn when overflow is scroll — the trait actually does something', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-3', overflow: 'scroll', scroll: scrollTrait() }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does NOT warn when there is no scroll trait at all', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-4', overflow: 'visible' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('dedupes per guid: rendering the same guid twice warns once', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const node = makeNode({ guid: 'sv-5', overflow: 'visible', scroll: scrollTrait() });
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // The actual #743 defect: on a non-scrolling box the cross-axis pin used to promote the
+  // author's `visible` axis to `auto` (one CSS axis set to `hidden` computes the other from
+  // `visible` to `auto`) — gone now that the pin is gated on `overflow === 'scroll'`.
+  it('the cross-axis pin is GONE from a non-scrolling box', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const el = renderNode(makeNode({ guid: 'sv-6', overflow: 'visible', scroll: scrollTrait({ axis: 'x' }) }));
+      expect(styleAttr(el)).not.toMatch(/overflow-y:\s*hidden/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // ⚠️ `overflow: 'hidden'` is NOT inert and must NOT warn — it establishes a scroll CONTAINER
+  // with no scrolling UI, so `pendingScrollTo`/`scrollTo` still drive it and snap/overscroll still
+  // apply. That is a real design (a scrollToEntry- or button-driven pager that deliberately
+  // suppresses finger-dragging), and the remedy the warning prescribes would re-enable the drag
+  // its author suppressed on purpose.
+  it('does NOT warn on overflow hidden — a scrollToEntry-driven pager is a legitimate design', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-hidden-ok', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start' }) }));
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('[UIScrollView]');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a hidden box still gets the motion fields it can actually honour', () => {
+    // The corollary of the test above: these are emitted above `scrollViewStyle`'s early return
+    // and genuinely apply to a scroll container, which is why calling them inert was wrong.
+    const el = renderNode(makeNode({ guid: 'sv-hidden-2', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start', overscroll: 'contain' }) }));
+    expect(styleAttr(el)).toMatch(/scroll-snap-type:\s*x mandatory/);
+    expect(styleAttr(el)).toMatch(/overscroll-behavior:\s*contain/);
+  });
+
+  it('the cross-axis pin still fires on a box that actually scrolls', () => {
+    const el = renderNode(makeNode({ guid: 'sv-7', overflow: 'scroll', scroll: scrollTrait({ axis: 'x' }) }));
+    expect(styleAttr(el)).toMatch(/overflow-y:\s*hidden/);
+  });
+});
+
+/** All text-style fields at their default (see `makeNode`'s own defaults) — override per case. */
+function textStyleDefaults(over: Partial<Parameters<typeof droppedTextStyleFields>[0]> = {}): Parameters<typeof droppedTextStyleFields>[0] {
+  return {
+    textAlign: 'left', lineHeight: 0, letterSpacing: 0, fontStyle: 'normal', textOverflow: 'clip', maxLines: 0,
+    textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0, textStrokeWidth: 0,
+    // The four the INPUT branch re-emits (and the range branch does not) — see the range tests.
+    fontFamily: '', fontSize: 0, fontWeight: 'normal', textOpacity: 1,
+    ...over,
+  };
+}
+
+// ── #745: authored `text` is dropped on four element shapes (Canvas2D, toggle, input, range)
+// with no warning before this fix — the styling still lands, so the element LOOKS like a text
+// node in devtools while painting nothing. ──
+describe('droppedTextStyleFields (#745)', () => {
+  it('all defaults → nothing reported', () => {
+    expect(droppedTextStyleFields(textStyleDefaults(), 'input')).toEqual([]);
+  });
+
+  it('reports each field individually once the author moves it off default', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textAlign: 'center' }), 'input')).toContain('textAlign');
+    expect(droppedTextStyleFields(textStyleDefaults({ maxLines: 2 }), 'input')).toContain('maxLines');
+    expect(droppedTextStyleFields(textStyleDefaults({ fontStyle: 'italic' }), 'input')).toContain('fontStyle');
+    expect(droppedTextStyleFields(textStyleDefaults({ lineHeight: 20 }), 'input')).toContain('lineHeight');
+    expect(droppedTextStyleFields(textStyleDefaults({ letterSpacing: 2 }), 'input')).toContain('letterSpacing');
+    expect(droppedTextStyleFields(textStyleDefaults({ textOverflow: 'ellipsis' }), 'input')).toContain('textOverflow');
+  });
+
+  it('the two gated groups report by their GATE, one entry each — not field-by-field', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowOffsetX: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowOffsetY: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowBlur: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textStrokeWidth: 3 }), 'input')).toEqual(['textStroke*']);
+  });
+
+  // ⚠️ The two control branches do NOT drop the same set, and assuming they did made this warning
+  // lie: the `input` branch re-emits fontFamily/fontSize/fontWeight/color, the `range` branch
+  // re-emits NONE of them (its only style write is `accentColor` from `textColor`). An author who
+  // set a font size on a slider, saw nothing, and read a warning calling fontSize honoured would
+  // have been sent away from the actual cause.
+  it('a RANGE additionally drops the four font fields an input re-emits', () => {
+    const authored = textStyleDefaults({ fontFamily: 'Varela Round', fontSize: 40, fontWeight: '700' });
+    expect(droppedTextStyleFields(authored, 'input')).toEqual([]);
+    expect(droppedTextStyleFields(authored, 'range')).toEqual(['fontFamily', 'fontSize', 'fontWeight']);
+  });
+
+  it('a RANGE drops textOpacity but NOT textColor — the colour survives as accentColor, its alpha does not', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 0.5 }), 'range')).toEqual(['textOpacity']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 1 }), 'range')).toEqual([]);
+  });
+});
+
+describe('dropped-text DEV warnings (#745)', () => {
+  it('text on an <input> warns, naming inputBinding as where its value actually comes from', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-1', elementType: 'input', text: 'hi' }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('[UINode]');
+      expect(msgs).toContain('inputBinding');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a toggle warns, naming the track and knob it draws instead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-2', text: 'hi', toggle: toggle() }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('track');
+      expect(msgs).toContain('knob');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a canvas2D node warns, naming the canvas it draws instead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({
+        guid: 'dt-3', text: 'hi',
+        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+      }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('canvas');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a plain div does NOT warn — the normal case stays silent', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-4', text: 'hi', elementType: 'div' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an <input> with a dropped text-STYLE field (no text) warns and names the field', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-5', elementType: 'input', text: '', textAlign: 'center' }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('textAlign');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an <input> with every text-style field at its default does NOT warn', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-6', elementType: 'input', text: '' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

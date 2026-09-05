@@ -53,7 +53,7 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate } from '../../runtime/ui/uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate, selectionZIndexGate, isElementZIndexShadowed } from '../../runtime/ui/uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -123,6 +123,38 @@ export function inertSizeTooltipMultiAnchor(axis: 'width' | 'height'): string {
   return `${axis} has no effect on ANY of the selected elements: each one's anchor stretches that `
     + `axis, so it is sized by that anchor's ${offsets} offsets, which overwrite it. Edit those `
     + `offsets to size them, or choose a non-stretched anchor to make ${axis} live again.`;
+}
+
+/** Why `UIElement.zIndex` is greyed out: a sibling `UIAnchor` carries its own `zIndex` and
+ *  overwrites it (#746). The two fields read as independent in the Inspector, and before this
+ *  nothing said which one was in charge — an author could set this one, watch the stacking not
+ *  move, and have nothing to go on.
+ *
+ *  ⚠️ The wording must NOT suggest the precedence is a bug to route around. `UIAnchor.zIndex`
+ *  being the stacking authority for an out-of-flow box is deliberate and documented, so this
+ *  points at the field that IS live rather than offering a way to win from here. Pure + exported
+ *  so the wording is unit-testable without mounting the Inspector. */
+export function shadowedZIndexTooltip(anchorZIndex: number): string {
+  return `zIndex has no effect here: this element is anchored, and UIAnchor.zIndex (${anchorZIndex}) `
+    + `is the stacking authority for an anchored box — it overwrites this value. Edit UIAnchor.zIndex `
+    + `instead, or clear it to 0 to hand stacking back to this field.`;
+}
+
+/** Same explanation, for a multi-selection whose shadowing anchors carry DIFFERENT `zIndex`
+ *  values — naming one would name the wrong one for the rest of the selection, so this names
+ *  none. Mirrors `inertSizeTooltipMultiAnchor`. */
+export function shadowedZIndexTooltipMulti(): string {
+  return `zIndex has no effect on ANY of the selected elements: each one is anchored, and `
+    + `UIAnchor.zIndex is the stacking authority for an anchored box — it overwrites this value. `
+    + `Edit each element's UIAnchor.zIndex instead, or clear it to 0 to hand stacking back here.`;
+}
+
+/** The MIXED case for the same gate: shadowed on part of the selection, live on the rest. Stays
+ *  EDITABLE for the #34 reason — disabling it would strand the entities where the value works. */
+export function partiallyShadowedZIndexTooltip(shadowed: number, total: number): string {
+  return `zIndex is live on ${total - shadowed} of the ${total} selected elements and inert on the `
+    + `other ${shadowed}, whose UIAnchor.zIndex overwrites it. Editing here writes to all of them; `
+    + `the anchored ones will discard it.`;
 }
 
 /** The MIXED case (issue #34): the axis is inert on part of the selection and live on
@@ -837,6 +869,23 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     });
   })() : [];
 
+  // The sibling UIAnchor's OWN zIndex, per selected entity — `null` when it has no anchor (#746).
+  // Read separately from `anchorModes` above, and it has to be: the shadowing is
+  // `if (a.zIndex) style.zIndex = a.zIndex`, so the anchor MODE says nothing about it and an
+  // anchored element whose anchor leaves zIndex at 0 keeps its UIElement value. Same
+  // live-sibling-read pattern as `anchorModes`; the verdict is `isElementZIndexShadowed`, which
+  // `anchorCss` applies too so the two cannot drift.
+  const anchorZIndexes: (number | null)[] = meta.name === 'UIElement' ? (() => {
+    const anchorMeta = getAllTraits().find(t => t.name === 'UIAnchor');
+    if (!anchorMeta) return entityIds.map(() => null);
+    return entityIds.map((id) => {
+      const entity = findEntity(id);
+      if (!entity || !entity.has(anchorMeta.trait)) return null;
+      return ((entity.get(anchorMeta.trait) as any)?.zIndex as number) ?? null;
+    });
+  })() : [];
+  const zIndexGate = meta.name === 'UIElement' ? selectionZIndexGate(anchorZIndexes) : 'live';
+
   // A self-placement prop (grow/shrink/align-self) is dead once the element is
   // anchored — see uiAuthoring.SELF_PLACEMENT_PROPS. Container/child-layout
   // props (direction/justify/align/gap) stay live (the Unity LayoutGroup).
@@ -1013,8 +1062,29 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     }
     if (hint.type === 'number') {
       const disabledByAnchor = selfPlacementDisabled(key);
-      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(disabledByAnchor ? { opacity: 0.35 } : {}) }}><NumberField label={key} value={val as number} step={hint.step}
-        readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx}
+      // `UIElement.zIndex` is overwritten by a sibling `UIAnchor.zIndex` (#746). Same shape as the
+      // width/height gate above — dim + read-only on a UNANIMOUS verdict, half-dim and still
+      // editable when mixed — because the failure is identical: an authored value the layout
+      // silently discards, with the Inspector showing it as live.
+      //
+      // ⚠️ NOT a precedence change. The anchor winning is the documented design; only the silence
+      // was the defect, so the tooltip points at `UIAnchor.zIndex` rather than offering a way to
+      // beat it from here.
+      const isShadowedZ = meta.name === 'UIElement' && key === 'zIndex' && zIndexGate !== 'live';
+      const shadowedZDisabled = isShadowedZ && zIndexGate === 'inert';
+      // Distinct shadowing values among the entities it is inert on — one means we can name it
+      // (the common single-select case), several means the mixed wording, which names none.
+      const shadowingZ = [...new Set(anchorZIndexes.filter((z): z is number => isElementZIndexShadowed(z)))];
+      const zHint = !isShadowedZ ? hint
+        : zIndexGate === 'inert'
+          // Naming the one value is the single-select case and by far the common one. Several
+          // distinct values means naming any of them would name the wrong one for the rest of the
+          // selection — same reason `inertSizeTooltipMultiAnchor` exists.
+          ? { ...hint, tooltip: shadowingZ.length === 1 ? shadowedZIndexTooltip(shadowingZ[0]) : shadowedZIndexTooltipMulti() }
+          : { ...hint, tooltip: partiallyShadowedZIndexTooltip(anchorZIndexes.filter(isElementZIndexShadowed).length, anchorZIndexes.length) };
+      const dim = disabledByAnchor || shadowedZDisabled ? { opacity: 0.35 } : isShadowedZ ? { opacity: 0.65 } : {};
+      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...dim }}><NumberField label={key} value={val as number} step={hint.step}
+        readOnly={hint.readOnly || disabledByAnchor || shadowedZDisabled} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={zHint} mixed={mx}
         dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
     if (hint.type === 'string') {

@@ -72,13 +72,15 @@
  *  `swallowClicks` across the scenes answers it for any given moment. An earlier version of this
  *  comment named the covered and uncovered panels individually; #728's migration invalidated it
  *  the same day, and a list that reads authoritative while being wrong is worse than no list.
- *  The one durable pointer: the eight dialog bodies tracked in #729 are the known uncovered group
- *  (#722's swallow half).
+ *  Court's bodies were the known uncovered group and are covered as of 2026-09-05 (#729);
+ *  wordweave's `HelpPanel` (#741) and `ResultPanel` (#753) are not. That is where the question was
+ *  last ASKED — it is not a roster in either direction, and the grep is what answers it.
  *
  *  The general fix would be to stamp the marker on any `overflow: 'scroll'` node too, on the
- *  grounds that a scrolling box owns gestures that begin in it. Deliberately NOT done here: it
- *  would also stop a tap on empty space inside a scrollable list from dismissing its modal,
- *  which is a feel change across a shipping game rather than a bug fix. Tracked in #722.
+ *  grounds that a scrolling box owns gestures that begin in it. Deliberately NOT done here, as a
+ *  standing non-goal rather than a pending ticket: it would also stop a tap on empty space inside
+ *  a scrollable list from dismissing its modal, which is a feel change across a shipping game
+ *  rather than a bug fix.
  *
  *  ## Why `pointercancel` counts as a release
  *

@@ -23,6 +23,9 @@ import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
 import { onWorldSwap } from '../core/ecs/world';
 import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
+// The anchor-stretched-axis predicate, shared with the Inspector and the scene validator so none
+// of them can disagree about which axes an anchor sizes (#744 reuses it — see `trackStyle`).
+import { isSizeInert } from './anchorLayout';
 import { NineSliceImage } from './NineSliceImage';
 import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
@@ -437,6 +440,116 @@ function warnDeadToggle(key: string): void {
   if (_deadToggles.has(key)) return;
   _deadToggles.add(key);
   console.warn(`[UIToggle] ${key} has no 'change' binding, so tapping it does nothing. A toggle does not write its own value — add a UIAction binding on event 'change' that sets UIToggle.value to '$value'. NOTE a 'click' binding will NOT work here (the Inspector defaults to 'click'): the switch dispatches 'change', and applyBindings skips rows whose event differs.`);
+}
+
+/** Warn ONCE per entity that a `UIScrollView` is doing nothing because the element it sits on was
+ *  never opted into scrolling (#743). Exactly the same shape, and the same reason, as
+ *  `warnDeadToggle` above: the trait renders perfectly and is inert, and inert is
+ *  indistinguishable from not-wired-yet without being told.
+ *
+ *  ⚠️ Before #743 this combination was not inert — it half-worked, which is why it needed a fix
+ *  before it needed a warning. `scrollViewStyle`'s cross-axis pin promoted the author's `visible`
+ *  axis to `auto`, so the box scrolled with unstyled scrollbars and could not take the wheel.
+ *
+ *  ⚠️ Fires on `'visible'` ONLY. `'hidden'` is a scroll container with no scrolling UI — a
+ *  legitimate `scrollToEntry`-driven pager — see the call site. */
+const _inertScrollViews = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _inertScrollViews.clear());
+
+function warnInertScrollView(key: string, overflow: string): void {
+  if (_inertScrollViews.has(key)) return;
+  _inertScrollViews.add(key);
+  console.warn(`[UIScrollView] ${key} has UIElement.overflow: '${overflow}', which establishes no scroll container — so the scroll view does nothing: the box does not scroll, scrollTo moves it nowhere, and snap/overscroll have nothing to apply to. Whether the box scrolls at all is UIElement.overflow's call, deliberately: set it to 'scroll' for a draggable view, or 'hidden' for one driven only by scrollToEntry/buttons.`);
+}
+
+/** Warn ONCE per entity that authored `text` is dropped because this element type never renders
+ *  it (#745). Same shape and same reason as `warnDeadToggle`/`warnInertScrollView`. */
+const _droppedText = new Set<string>();
+onWorldSwap(() => _droppedText.clear());
+
+function warnDroppedText(key: string, why: string): void {
+  if (_droppedText.has(key)) return;
+  _droppedText.add(key);
+  console.warn(`[UINode] ${key} authors UIElement.text, which will NOT render: ${why}. Its text STYLING is still applied to the box, so devtools and the Inspector will show a styled text element that paints nothing. Move the text to a sibling or child entity.`);
+}
+
+/** The text-STYLE fields an `<input>`/`<range>` silently drops, listed for the dev warning (#745).
+ *
+ *  Only fields the author actually moved off the default are reported: the whole point is to name
+ *  what someone authored and will not get, and a list padded with untouched defaults is noise that
+ *  gets ignored. The four the input branch DOES re-emit — `fontFamily`, `fontSize`, `fontWeight`,
+ *  `color` — are deliberately absent.
+ *
+ *  ⚠️ Keep in sync with the `if (text)` block: a field added there that an input cannot honour
+ *  belongs here too. Pure and exported so a test can pin the list without a DOM. */
+export function droppedTextStyleFields(n: Pick<UINodeData,
+  'textAlign' | 'lineHeight' | 'letterSpacing' | 'fontStyle' | 'textOverflow' | 'maxLines' |
+  'textShadowOffsetX' | 'textShadowOffsetY' | 'textShadowBlur' | 'textStrokeWidth' |
+  'fontFamily' | 'fontSize' | 'fontWeight' | 'textOpacity'>, elementType: string): string[] {
+  const out: string[] = [];
+  // ⚠️ **`input` and `range` do NOT drop the same set, and assuming they did made this warning
+  // LIE.** The `input` branch re-emits `fontFamily`/`fontSize`/`fontWeight`/`color`, so those four
+  // are honoured there and must not be reported. The `range` branch re-emits NONE of them — its
+  // only style write is `accentColor` from `textColor` — so on a slider all four are dropped too,
+  // as is `textOpacity` (`textColor` survives only as an opaque accent). Naming them as honoured
+  // on a range would have pointed an author away from the real cause of their missing font size.
+  if (elementType === 'range') {
+    if (n.fontFamily) out.push('fontFamily');
+    if (n.fontSize) out.push('fontSize');
+    if (n.fontWeight !== 'normal') out.push('fontWeight');
+    // `textColor` IS read on a range — as `accentColor` — so it is not dropped; its alpha is.
+    if (n.textOpacity !== 1) out.push('textOpacity');
+  }
+  if (n.textAlign !== 'left') out.push('textAlign');
+  if (n.lineHeight) out.push('lineHeight');
+  if (n.letterSpacing) out.push('letterSpacing');
+  if (n.fontStyle !== 'normal') out.push('fontStyle');
+  if (n.textOverflow !== 'clip') out.push('textOverflow');
+  if (n.maxLines > 0) out.push('maxLines');
+  // The two gated groups, reported by their GATE rather than field-by-field — `textShadowColor`
+  // and `textStrokeColor` are inert on their own (they do nothing until the gate opens), so
+  // naming them would report a field that is dropped and would have done nothing anyway.
+  if (n.textShadowOffsetX || n.textShadowOffsetY || n.textShadowBlur) out.push('textShadow*');
+  if (n.textStrokeWidth > 0) out.push('textStroke*');
+  return out;
+}
+
+const _droppedTextStyle = new Set<string>();
+onWorldSwap(() => _droppedTextStyle.clear());
+
+function warnDroppedTextStyle(key: string, elementType: string, dropped: string[]): void {
+  if (_droppedTextStyle.has(key)) return;
+  _droppedTextStyle.add(key);
+  // The "what IS honoured" half is per element type, because the two branches differ — see
+  // `droppedTextStyleFields`. Getting this wrong is worse than saying nothing: it tells the author
+  // their font size is fine when it is the thing that vanished.
+  const honoured = elementType === 'range'
+    ? `a range re-emits only accentColor (from textColor)`
+    : `an input re-emits only fontFamily, fontSize, fontWeight and color`;
+  console.warn(`[UINode] ${key} authors ${dropped.join(', ')}, which an elementType '${elementType}' silently drops — the text-style block is gated on UIElement.text, which a form control never uses, and ${honoured}. A form control's text rendering is the platform's, so these are not wired on purpose.`);
+}
+
+/** The size a `UIToggle` falls back to when NOTHING else sizes its track (#744) — not a tuning
+ *  knob but the value-kind table's "genuine no-scene fallback" row. `UIElement.width`/`height` are
+ *  the authored surface and win outright; these are applied as `min-*`, so any anchor stretch,
+ *  flex stretch or authored size larger than them also wins. Reached only by the shape that
+ *  previously rendered an INVISIBLE knob, so nothing that renders today can change size.
+ *
+ *  44×24 keeps the 1.75:1 capsule proportion of the repo's only authored toggle (`games/court`,
+ *  56×32) at a size that sits in a settings row; iOS's native switch is 51×31 for comparison.
+ *  Exported so a test can assert against the constant rather than restate the number. */
+export const DEFAULT_TOGGLE_TRACK_WIDTH = 44;
+export const DEFAULT_TOGGLE_TRACK_HEIGHT = 24;
+
+/** The knob's own size floor, DERIVED from the track fallback so the two cannot drift: it is the
+ *  content box the track's `minHeight` leaves once the author's `knobInset` is taken off both
+ *  sides — i.e. exactly what `height: '100%'` would have resolved to had the track been authored
+ *  at `DEFAULT_TOGGLE_TRACK_HEIGHT`. Clamped at 0 for an inset large enough to eat the track.
+ *  Pure and exported so the arithmetic is unit-testable without a DOM (jsdom computes no layout,
+ *  so the CSS half is verified in a real browser instead — see the #744 notes in `knobStyle`). */
+export function toggleKnobFloor(knobInset: number, trackHeight: number = DEFAULT_TOGGLE_TRACK_HEIGHT): number {
+  return Math.max(0, trackHeight - 2 * knobInset);
 }
 
 export function hexToRgba(hex: number, opacity: number): string {
@@ -868,7 +981,28 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one
   // owner. A UIScrollView on an element left at `overflow:'visible'` therefore does not scroll,
   // which is the honest outcome rather than two fields silently fighting.
-  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll));
+  //
+  // ⚠️ `node.overflow` is passed in because that sentence was NOT true until #743: the cross-axis
+  // pin `scrollViewStyle` emits lands AFTER the `overflow` write above, and per CSS one axis set
+  // to `hidden` promotes the other from `visible` to `auto`. See its banner for the full shape.
+  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll, node.overflow));
+  // The inert-trait warning that makes the invariant HONEST rather than merely true (#743). A
+  // `UIScrollView` on a non-scrolling element now does exactly nothing, which is the documented
+  // outcome — but "nothing" is indistinguishable from "not wired yet", and this is the same
+  // silent-authoring-failure class `warnDeadToggle` already covers one control over. Warn, never
+  // throw: an authoring mistake must not blank the screen mid-render.
+  // ⚠️ **`'visible'` ONLY — an `overflow: 'hidden'` box is NOT inert, and warning there was wrong.**
+  // `hidden` still establishes a scroll CONTAINER: it has a scrollable overflow region, just no
+  // user-facing scrolling UI. `useScrollView` gates on `node.scroll`, not on overflow, so
+  // `pendingScrollTo` → `el.scrollTo()` still drives it, and `scrollViewStyle` still emits
+  // `scrollSnapType`/`overscrollBehavior` above its own early return, where both genuinely apply.
+  // That is a real design — a button- or `scrollToEntry`-driven pager that deliberately suppresses
+  // finger-dragging — and the remedy this warning prescribes would re-enable the drag its author
+  // went out of their way to suppress. `visible` is the genuinely inert one: no scroll container,
+  // so `scrollTo` moves nothing and snap has nothing to apply to.
+  if (import.meta.env?.DEV && node.scroll && node.overflow === 'visible') {
+    warnInertScrollView(node.guid || String(node.entityId), node.overflow);
+  }
   // The snap TARGET half, stamped by the enclosing scroll view during the tree build — snapping
   // is declared on the box and honoured on the target, and those are different elements.
   if (node.snapChild) Object.assign(style, node.snapChild);
@@ -1096,6 +1230,36 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     );
   }
 
+  // ⚠️ **The fourth door, and the only one that had NO warning — which is why it is the silent
+  // one (#745).** Every branch above tells the author when a neighbouring field is dropped, but
+  // `text` itself is dropped on four element types and nothing said so: the Canvas2D return
+  // renders the nine-slice, video, canvas and children layers and never `textContent`; the toggle
+  // return draws only track + knob; `<input>`/`<range>` take their value from `inputBinding`.
+  //
+  // What makes it worse than a plain no-op is that the STYLING still lands: `style.fontSize`,
+  // `color`, `textAlign` and (since #725) the clamp wrapper are all built from this text and
+  // spread onto the element regardless. So devtools and the Inspector show a fully-styled text
+  // element that paints nothing — the one shape where reading the authored data tells you the
+  // opposite of what the screen does.
+  if (import.meta.env?.DEV && text && (node.canvas2D || node.toggle || node.elementType !== 'div')) {
+    const why = node.canvas2D ? 'a Canvas2D node renders its canvas, not text'
+      : node.toggle ? 'a UIToggle draws only a track and a knob'
+        : `elementType '${node.elementType}' takes its value from its inputBinding, not from 'text'`;
+    warnDroppedText(node.guid || String(node.entityId), why);
+  }
+  // The same class one field group over: the whole text-STYLE block is gated on `node.text`, which
+  // an input/range never uses, and the input branch below re-emits only `fontFamily`, `fontSize`,
+  // `fontWeight` and `color`. Everything else an author sets is dropped — and unlike the case
+  // above there is no text to make the omission visible, so nothing on screen hints at it.
+  //
+  // `UIElement.ts` documented this hole for `autoFitText` ALONE, which reads as "that one field is
+  // special" rather than "an entire field group does not apply here"; #745 widened that note and
+  // this is its runtime half.
+  if (import.meta.env?.DEV && (node.elementType === 'input' || node.elementType === 'range')) {
+    const dropped = droppedTextStyleFields(node, node.elementType);
+    if (dropped.length > 0) warnDroppedTextStyle(node.guid || String(node.entityId), node.elementType, dropped);
+  }
+
   // Input element: render <input> instead of <div> when elementType is 'input'.
   // In editor mode, render read-only so it looks the same but doesn't steal focus.
   //
@@ -1260,11 +1424,92 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     const canFire = !!node.action?.bindings?.some(b => (b.event || 'click') === 'change');
     if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || String(node.entityId));
 
+    // Does something OTHER than the fallback already size each axis? A definite CSS size covers
+    // both the authored case and the pooled-row pin; `isSizeInert` covers the anchor-stretched
+    // axis, whose CSS size `applyAnchorStyle` deliberately clears. See `trackStyle` below.
+    // ⚠️ A `%` size is NOT definite — it is the indeterminate case this whole fix is about. Against
+    // an indefinite containing block `height: 100%` resolves to `auto` exactly like an unset
+    // height, so treating it as "already sized" would switch the fallback off in the one shape it
+    // exists for. Every other unit resolves without the parent (px, and vw/vh/vmin/vmax via the
+    // `--ui-*` custom properties), so those are definite. The pooled-row pin writes px, so it
+    // stays covered.
+    const definite = (v: React.CSSProperties['width'], unit: string) => v !== undefined && unit !== '%';
+    const sizedW = definite(style.width, node.widthUnit) || (!!node.anchor && isSizeInert(node.anchor.anchor, 'width'));
+    const sizedH = definite(style.height, node.heightUnit) || (!!node.anchor && isSizeInert(node.anchor.anchor, 'height'));
+    // ⚠️ Clamped to an authored px `maxWidth`/`maxHeight`, because CSS resolves `min-*` ABOVE
+    // `max-*` — an unclamped 24px floor under an authored `maxHeight: 16` would render a 24px
+    // track, i.e. the fallback silently beating the authored surface, which is the exact failure
+    // this commit exists to remove. A non-px cap is left alone: it cannot be compared here, and
+    // guessing is worse than the floor.
+    const capped = (fallback: number, max: number, unit: string) =>
+      max > 0 && unit === 'px' ? Math.min(fallback, max) : fallback;
+    const trackFloorW = capped(DEFAULT_TOGGLE_TRACK_WIDTH, node.maxWidth, node.maxWidthUnit);
+    const trackFloorH = capped(DEFAULT_TOGGLE_TRACK_HEIGHT, node.maxHeight, node.maxHeightUnit);
+    // The knob's floor is skipped with the track's on a sized axis, for the same reason: on a
+    // track shorter than the floor it would push the knob outside its own capsule. It derives from
+    // the track's EFFECTIVE floor, so a cap shrinks both together rather than only the track.
+    const knobFloor = sizedH ? undefined : toggleKnobFloor(t.knobInset, trackFloorH);
     const fire = () => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: !t.value });
     const interactive = canFire && !t.disabled && !onSelectEntity;
 
     const trackStyle: React.CSSProperties = {
       ...style,
+      // ⚠️ **A definite fallback size, because the DEFAULT authoring shape was the broken one
+      // (#744).** `UIToggle`'s own contract is that "the knob is square and its size falls out of
+      // the track's height minus twice `knobInset`" — and `knobStyle` implements that as
+      // `height: '100%'` + `aspectRatio`. A percentage height resolves against the containing
+      // block's height, so with `UIElement.height` unauthored the track is a flex container of
+      // INDEFINITE height, `height: 100%` resolves to `auto` → zero content height → and
+      // `aspect-ratio` then derives zero WIDTH from it. An invisible knob. `UIElement.height`
+      // defaults to 0 (auto), so dropping a `UIToggle` on an entity and not setting a height —
+      // the thing an author does first — produced exactly that. The repo's only toggle
+      // (`games/court`, 56×32) escapes by having authored a size, i.e. by chance.
+      //
+      // Fixed HERE and not on the knob deliberately: giving the knob its own intrinsic size would
+      // make it stop tracking an AUTHORED track height, regressing Court's toggle. This keeps one
+      // rule — knob size follows the track — and only supplies a track size when nothing else did.
+      //
+      // ⚠️ **`minWidth`/`minHeight`, NOT `width`/`height`, and that is the load-bearing choice.**
+      // A definite `height` would override every shape whose size comes from somewhere other than
+      // `UIElement.height` — and two of those WORK today, so writing `height` would have fixed the
+      // default by breaking them:
+      //   - an anchor-stretched toggle (`anchorCss` clears the CSS size and sizes it from the two
+      //     offsets, giving the track a definite height the knob already resolves against);
+      //   - a toggle in a `flexDirection: 'row'` parent, where `alignItems` DEFAULTS to `'stretch'`
+      //     so a sibling label's line box makes the track's height definite — the ordinary
+      //     settings-row shape.
+      // A `min-*` can only ever raise a size, so both keep the size they have now; the clamp
+      // engages precisely in the case that had none. `knobStyle` carries a matching floor of its
+      // own, because this one cannot reach it — see there.
+      //
+      // ⚠️ **And it is skipped outright on an axis something else already SIZES**, which `min-*`
+      // alone does not cover — a min can still raise a definite size that is smaller than it. Two
+      // cases, one of them live:
+      //   - a **pooled `UIEntries` row root**, which `entriesSystem` pins to a definite
+      //     `entryW`/`entryH` in px every tick. That block pins `minWidth`/`maxWidth`/`minHeight`/
+      //     `maxHeight` to 0 for exactly this reason — "a min/max constraint overrides the
+      //     definite width/height from INSIDE the border box" — and it warns when it discards an
+      //     AUTHORED one. A fallback invented down here in `UINode` is invisible to that warning,
+      //     so on an entry smaller than 44×24 it would silently reintroduce the desync the pin
+      //     exists to prevent, with no diagnostic at all.
+      //   - an **anchor-stretched axis**, sized by its two offsets. `applyAnchorStyle` clears the
+      //     CSS size there, so the axis reads as unsized from here while being anything but —
+      //     `isSizeInert` is the shared predicate for that, the same one the Inspector and the
+      //     scene validator use.
+      // The residual this cannot see is a flex CROSS-axis stretch (a `row` parent sizing the track
+      // from a sibling's line box): nothing in the node data reports it, so a settings row whose
+      // label is under 24px tall now gets a 24px toggle instead of a ~14px one. Accepted — that
+      // size was accidental, not authored, and the measured realistic case (a 28px label → 33px
+      // line box) is unaffected.
+      //
+      // Width as well as height: with only a height, the track shrink-wraps to the knob plus its
+      // insets and comes out SQUARE, where `justifyContent`'s flip between the two ends has no
+      // slack to move through — a switch whose two states are distinguishable only by colour.
+      // 44×24 keeps Court's 1.75:1 capsule proportion at a size that sits in a settings row.
+      // These are the "genuine no-scene fallback" row of the value-kind table, not tuning knobs:
+      // `UIElement.width`/`height` are the authored surface and still win outright.
+      minWidth: sizedW ? style.minWidth : (style.minWidth ?? trackFloorW),
+      minHeight: sizedH ? style.minHeight : (style.minHeight ?? trackFloorH),
       display: 'flex',
       flexDirection: 'row',
       alignItems: 'center',
@@ -1285,6 +1530,28 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     const knobStyle: React.CSSProperties = {
       height: '100%',
       aspectRatio: '1 / 1',
+      // ⚠️ **The knob needs its OWN floor — the track's `minHeight` cannot reach it (#744).** A
+      // percentage height resolves against the containing block's COMPUTED height, and a
+      // `min-height` does not make an `auto` height computed, so on an unsized track `height:
+      // '100%'` still resolves to `auto` → 0 and `aspect-ratio` derives a zero WIDTH from it.
+      //
+      // ⚠️ **`alignSelf: 'stretch'` instead of `height: '100%'` does NOT fix this** — it was tried
+      // and measured (headless Chromium, this file's four shapes). It gives the knob the track's
+      // used cross size, so the HEIGHT came out right at 18px — and the width stayed **0**: a flex
+      // item's main size is resolved BEFORE cross-axis stretching, so `aspect-ratio` has no
+      // definite cross size to derive it from yet. Half-fixed and still invisible. Do not
+      // reintroduce it.
+      //
+      // A `min-*` pair is what works, because it constrains the knob directly rather than through
+      // a resolution order. It only ever RAISES a size, so every shape that renders today keeps
+      // the size it has: measured 26×26 authored / 27×27 row-stretched / 74×74 anchor-stretched,
+      // identical before and after, with the default shape going 0×0 → 18×18.
+      //
+      // The floor is the track fallback minus the author's own insets, so the knob lands exactly
+      // where the track's own `minHeight` puts its content box — one size, derived, not a second
+      // number to keep in sync. Clamped at 0 for an inset large enough to eat the whole track.
+      minWidth: knobFloor,
+      minHeight: knobFloor,
       flexShrink: 0,
       backgroundColor: hexToRgba(t.knobColor, t.knobOpacity),
       borderRadius: t.knobRadius,

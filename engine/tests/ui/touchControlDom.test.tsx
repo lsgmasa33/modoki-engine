@@ -51,7 +51,7 @@ function makeWorld(touch: Record<string, unknown> | null, ui?: Record<string, un
         data.set(UIEL, { ...UI_DEFAULTS, ...ui });
         data.set(ATTR, { parentId: 0, sortOrder: 0, guid: 'g1' });
         if (touch) data.set(TOUCH, { ...TOUCH_DEFAULTS, ...touch });
-        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
         cb([data.get(UIEL)], entity);
       },
     }),

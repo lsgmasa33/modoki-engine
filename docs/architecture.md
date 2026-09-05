@@ -11,7 +11,10 @@ architecture. For deeper dives, see the sibling docs:
 The engine is composed of a small set of layers:
 
 - **ECS** — [koota](https://github.com/pmndrs/koota) provides the entity/trait/world model.
-- **3D** — Three.js (`>=0.180`, app pins `^0.184`) renders the `'3d'` layer.
+- **3D** — Three.js renders the `'3d'` layer. ⚠️ Version ranges live in `package.json` (app) and
+  `engine/packages/modoki/package.json` (peer) — read them rather than trusting a copy here; a
+  duplicated version in prose goes stale on the next bump, which is exactly what happened to the
+  `^0.184` that used to be written on this line.
 - **2D** — PixiJS v8 (`^8.17`) + `@pixi/react` (`^8`) render the `'2d'` layer.
 - **UI/DOM** — React 19 renders the `'ui'` layer as plain DOM with CSS flexbox.
 - **State bridge** — Zustand (`^5`) carries state between ECS systems and React views.

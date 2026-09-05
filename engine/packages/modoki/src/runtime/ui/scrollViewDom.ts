@@ -18,8 +18,22 @@ export interface ScrollViewNodeData {
 /** CSS for the scroll BOX itself. `UIElement.overflow` is a separate authored field and is
  *  applied by UINode; this only adds what the scroll view owns, so an element that is a scroll
  *  view but was never given `overflow:'scroll'` still does not scroll — which is deliberate:
- *  two fields, one visible consequence, and the one the author already knows wins. */
-export function scrollViewStyle(s: ScrollViewNodeData): Record<string, string> {
+ *  two fields, one visible consequence, and the one the author already knows wins.
+ *
+ *  ⚠️ **`overflow` is a PARAMETER because that invariant was false without it (#743).** The
+ *  cross-axis pin below writes `overflow-x`/`overflow-y`, and per CSS **when one of the two is
+ *  not `visible`, the other computes to `auto`** — so on an element left at `overflow: 'visible'`
+ *  the pin silently promoted the OTHER axis and the box scrolled after all. Worse than merely
+ *  contradicting the doc: `UINode` gates both the scrollbar skin and the `pointerEvents: 'auto'`
+ *  force on `overflow === 'scroll'`, so the box that resulted scrolled with unstyled native
+ *  scrollbars and, under the `pointer-events: none` root, could not receive the wheel. Reached by
+ *  authoring a `UIScrollView` and forgetting `overflow`, which the docs told you was a no-op.
+ *
+ *  The pin's whole justification (the measured scrollbar theft below) only exists for a box that
+ *  scrolls, so gating it costs nothing. `scrollSnapType`/`overscrollBehavior`/`scrollbarWidth`
+ *  stay unconditional: none of them changes how `overflow` computes, so on a non-scrolling box
+ *  they are inert rather than harmful. */
+export function scrollViewStyle(s: ScrollViewNodeData, overflow: string): Record<string, string> {
   const css: Record<string, string> = {};
   css.overscrollBehavior = s.overscroll === 'auto' ? 'auto' : s.overscroll;
   // `scrollbar-width: none` is the standards property (Chromium 121+, Safari 18.2+); older
@@ -42,6 +56,12 @@ export function scrollViewStyle(s: ScrollViewNodeData): Record<string, string> {
   // This does NOT contradict "the author's `overflow` wins" above: that rule is about whether the
   // box scrolls AT ALL, which is still the author's call. `axis` is this trait's own field, and
   // saying which axis is the only thing it can mean.
+  //
+  // ⚠️ Gated on the author having opted the box into scrolling (#743) — see the banner. The gate
+  // is `=== 'scroll'` rather than `!== 'visible'` to match the two other gates over the same
+  // decision in `UINode` (the scrollbar skin, and the `pointerEvents: 'auto'` force); `'hidden'`
+  // needs no pin because it already clips both axes.
+  if (overflow !== 'scroll') return css;
   if (s.axis === 'x') css.overflowY = 'hidden';
   else if (s.axis === 'y') css.overflowX = 'hidden';
   return css;

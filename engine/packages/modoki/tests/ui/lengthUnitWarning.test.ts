@@ -94,13 +94,13 @@ describe('formatLengthUnitWarning', () => {
 });
 
 describe('lengthUnitWarningKey', () => {
-  it('is the SAME key for the same entity/field/units even when the values differ — the drag case', () => {
+  it('is the SAME key for the same entity/generation/field/units even when the values differ — the drag case', () => {
     // A resize drag calls writeUIElement per pointermove, so sizeValue/constraintValue
     // change on every sample while the units stay fixed. The key must not change either,
     // or the dedupe guard fires hundreds of times across one drag gesture.
     const s1 = findLengthUnitSuspects({ width: 5.4, maxWidth: 3.5 })[0];
     const s2 = findLengthUnitSuspects({ width: 5.6, maxWidth: 3.9 })[0];
-    expect(lengthUnitWarningKey(1, s1)).toBe(lengthUnitWarningKey(1, s2));
+    expect(lengthUnitWarningKey(1, 0, s1)).toBe(lengthUnitWarningKey(1, 0, s2));
   });
 
   it('changes when the constraint unit changes, so a real fix re-warns', () => {
@@ -109,12 +109,17 @@ describe('lengthUnitWarningKey', () => {
     // to compare the keys in isolation from the firing logic.
     const s1 = findLengthUnitSuspects({ width: 5.4, maxWidth: 3.5 })[0];
     const fixed = { ...s1, constraintUnit: 'vh' };
-    expect(lengthUnitWarningKey(1, s1)).not.toBe(lengthUnitWarningKey(1, fixed));
+    expect(lengthUnitWarningKey(1, 0, s1)).not.toBe(lengthUnitWarningKey(1, 0, fixed));
   });
 
   it('changes when the size unit changes', () => {
     const s1 = findLengthUnitSuspects({ width: 5.4, maxWidth: 3.5 })[0];
     const s2 = findLengthUnitSuspects({ width: 5.4, widthUnit: 'vmin', maxWidth: 3.5 })[0];
-    expect(lengthUnitWarningKey(1, s1)).not.toBe(lengthUnitWarningKey(1, s2));
+    expect(lengthUnitWarningKey(1, 0, s1)).not.toBe(lengthUnitWarningKey(1, 0, s2));
+  });
+
+  it('changes when the generation changes (#738) — a recycled id must not inherit the dead entity\'s key', () => {
+    const s1 = findLengthUnitSuspects({ width: 5.4, maxWidth: 3.5 })[0];
+    expect(lengthUnitWarningKey(1, 0, s1)).not.toBe(lengthUnitWarningKey(1, 1, s1));
   });
 });

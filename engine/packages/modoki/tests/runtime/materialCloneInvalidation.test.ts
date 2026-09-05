@@ -160,7 +160,7 @@ describe('MaterialInstance prop clones', () => {
     const base = await loadBase();
     const disp = vi.spyOn(base, 'dispose');
     const mesh = new THREE.Mesh(new THREE.BufferGeometry());
-    applyPropOverride(7, [mesh], base, 'opacity', 0.5);
+    applyPropOverride(7, 0, [mesh], base, 'opacity', 0.5);
     expect(mesh.material, 'the entity must be on a clone, not the shared base').not.toBe(base);
 
     const scene = new THREE.Scene();
@@ -174,7 +174,7 @@ describe('MaterialInstance prop clones', () => {
   it('rebuilds the clone from the successor once the refetch lands', async () => {
     const base = await loadBase();
     const mesh = new THREE.Mesh(new THREE.BufferGeometry());
-    applyPropOverride(8, [mesh], base, 'opacity', 0.5);
+    applyPropOverride(8, 0, [mesh], base, 'opacity', 0.5);
     const staleClone = mesh.material as THREE.Material;
 
     invalidateMaterial(MAT_PATH);
@@ -182,7 +182,7 @@ describe('MaterialInstance prop clones', () => {
     const fresh = refreshedMaterial(base)!;
     expect(fresh, 'the retired base must forward to its successor').toBeTruthy();
 
-    applyPropOverride(8, [mesh], fresh, 'opacity', 0.5);
+    applyPropOverride(8, 0, [mesh], fresh, 'opacity', 0.5);
     expect(mesh.material).not.toBe(staleClone);
   });
 });

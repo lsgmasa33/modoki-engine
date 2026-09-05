@@ -400,6 +400,32 @@ Field groups (representative fields, verified against `UIElement.ts`):
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
   `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`).
 
+⚠️ **`text` and most text STYLING do nothing on four of these shapes, and DEV now says so (#745).**
+Two holes, same class as everything else on this page — the Inspector shows every field and
+nothing errors:
+
+1. **`text` itself is dropped** on `Canvas2D`, `UIToggle`, `input` and `range` nodes: the Canvas2D
+   return renders the nine-slice/video/canvas/children layers and never `textContent`, the toggle
+   return draws only track + knob, and a form control takes its value from `inputBinding`. But the
+   STYLING built for that text — `fontSize`, `color`, `textAlign`, and since #725 the clamp
+   wrapper — still lands on the box, so devtools and the Inspector show a fully-styled text element
+   that paints nothing.
+2. **The text-style group is dropped on `input`/`range`** even with no text: the whole style block
+   is gated on `UIElement.text`. Silently lost on both: `textAlign`, `lineHeight`, `letterSpacing`,
+   `fontStyle`, `textShadow*`, `textStroke*`, `textOverflow`, `maxLines`.
+   ⚠️ **The two controls do NOT drop the same set.** The `input` branch re-emits `fontFamily`,
+   `fontSize`, `fontWeight` and `color`; the `range` branch re-emits **none** of them — its only
+   style write is `accentColor` from `textColor` — so a slider additionally drops all four, plus
+   `textOpacity` (the colour survives as an opaque accent; its alpha does not). The DEV warning is
+   per element type for exactly this reason: naming `fontSize` as honoured on a range would point
+   an author away from the real cause of their missing font size.
+
+These stay **unwired on purpose** — a form control's text rendering is the platform's, not ours —
+so the fix is a DEV warning naming what you authored and will not get, in the same family as the
+three `UINode` already carried for the neighbouring mistakes (canvas2D + `elementType`, toggle +
+canvas2D/children, video + `elementType`). ⚠️ **The combination with no warning was the one where
+the field vanished silently**, which is why it was the one worth fixing first.
+
 Colors are stored as packed hex integers (e.g. `0xffffff`) and converted to CSS at
 render time. Numeric+unit pairs are converted by `UINode`'s `cssVal()` helper, which
 also supports viewport units (`vw`/`vh`/`vmin`/`vmax`) via CSS custom properties that
@@ -495,8 +521,12 @@ transparent to `closest()` and the press resolves past it to the dismissing scri
 swallow — either way — is what OPTS a panel in. ⚠️ **Which panels are covered is a property, not a
 roster**: it is whatever carries a binding or `swallowClicks` right now, and a grep for
 `swallowClicks` across the scenes answers it — an enumeration here went stale the same day #728
-landed. The eight dialog bodies tracked in #729 are the known uncovered group (#722's swallow half).
-Stamping
+landed. Court's dialog bodies were the known uncovered group and are covered as of 2026-09-05
+(#729); **wordweave's are not** — `HelpPanel` (#741) and `ResultPanel` (#753) each sit under a
+scrim that dismisses on click and carry neither a binding nor `swallowClicks`, while
+`DictionaryPanel` beside them does, so that game did not opt out wholesale. Do not read this
+paragraph as a roster in either direction: it names where the question was last ASKED, and the grep
+is what answers it. Stamping
 the marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
 empty list space does — a feel call, not a refactor.
 
@@ -651,6 +681,47 @@ the focus ring and the pointer-events rules for free.
 The knob is positioned by flex (`justifyContent` flips between the two ends) and sized off
 the track's own height via `aspectRatio`, so a switch works at any authored size with no
 measurement and no second render pass.
+
+⚠️ **At any authored size — and the UNAUTHORED one used to render nothing (#744).** `height: 100%`
+resolves against the containing block's height, and `UIElement.height` defaults to 0 (auto), so an
+unsized track was a flex container of indefinite height: the knob's height resolved to `auto` → 0,
+and `aspect-ratio` derived a zero WIDTH from it. An invisible knob, in the shape an author reaches
+first. The repo's only toggle (`games/court`, 56×32) escaped it by having authored a size, i.e. by
+chance — the working configurations were the accident and the default was the failure.
+
+The track now carries `minWidth`/`minHeight` fallbacks (44×24, the 1.75:1 capsule proportion of
+Court's toggle) and the knob a matching floor of its own. **`min-*` rather than `width`/`height`,
+and that is the load-bearing part**: a definite size would have overridden every shape sized from
+somewhere other than `UIElement.height`, and two of those work — an anchor-stretched toggle, and a
+toggle in a `flexDirection: 'row'` parent where `alignItems` defaults to `stretch` and a sibling
+label's line box makes the height definite (the ordinary settings-row shape). Measured in headless
+Chromium at `knobInset` 3: 26×26 authored / 27×27 row-stretched / 74×74 anchor-stretched are
+byte-identical before and after, with the default shape going 0×0 → 18×18 (20×20 at the trait's
+default inset of 2).
+
+⚠️ **"A `min-*` can only raise a size" is necessary but NOT sufficient, and the first cut of this
+fix got that wrong.** A min can still raise a *definite* size that happens to be smaller than it —
+every shape measured above was simply larger than 44×24. So the fallback is additionally **skipped
+per-axis when something else already sizes that axis**: a definite CSS size (the authored case, and
+the pooled `UIEntries` row root that `entriesSystem` pins to `entryW`/`entryH` in px — where a min
+would silently reintroduce the border-box desync that pin exists to prevent, invisible to its own
+`warnAuthoredOverride`), or an anchor-stretched axis, via the shared `isSizeInert`. A `%` size does
+**not** count as definite — that is the indeterminate case the whole fix is about — and an authored
+px `maxWidth`/`maxHeight` **clamps** the floor rather than losing to it, since CSS resolves `min-*`
+above `max-*`.
+
+The one residual, stated rather than papered over: a flex CROSS-axis stretch is not visible from
+the node data, so a settings row whose label is under 24px tall now gets a 24px toggle instead of a
+~14px one. That size was accidental rather than authored, and the measured realistic case (a 28px
+label → 33px line box) is unaffected.
+
+⚠️ **The knob needs its OWN floor — the track's `minHeight` cannot reach it**, because a percentage
+height resolves against the containing block's *computed* height and a `min-height` does not make
+an `auto` height computed. **`alignSelf: 'stretch'` instead of `height: '100%'` does NOT fix this
+and was measured failing**: it gives the knob the track's used cross size, so the height came out
+right at 18px and the width stayed **0** — a flex item's main size is resolved before cross-axis
+stretching, so `aspect-ratio` has no definite cross size to derive width from yet. Do not
+reintroduce it.
 
 ⚠️ **Keyboard support is the DOM's, not `UIFocusable`'s.** The track is focusable
 (`tabIndex`) and Space/Enter flip it. Routing a toggle through the controller-nav focus
@@ -1115,6 +1186,25 @@ correct behaviour on device, and concluded the edit had worked — when the pre-
 had always guaranteed it and the edit changed nothing. **Read the `zIndex` column, and when you
 assert a stacking fix, verify it by perturbing the value you actually changed.**
 
+⚠️ **There is a THIRD table, and it is the one an author reaches for first: `UIElement.zIndex`
+(#746).** `UINode` writes it into `style.zIndex`; `applyAnchorStyle` then runs and replaces it
+whenever `UIAnchor.zIndex` is non-zero. So on an anchored element the `UIElement` field is inert.
+
+That precedence is correct and is not up for revision — for an out-of-flow box the anchor is the
+stacking authority, which is what the paragraphs above are about. The defect was the **silence**:
+the Inspector shows two `zIndex` fields with nothing to say they are not independent, so an author
+could set the `UIElement` one, watch the stacking not move, and have nothing to go on. One live
+disagreement exists in the repo — `games/3d-test`'s "2D Animation" scene authors element `100`
+against anchor `1000` on the same entity; every other co-authored pair holds equal values, so
+nothing else could have been observing a difference.
+
+Both halves are now stated where an author will meet them: the Inspector greys `UIElement.zIndex`
+out and names the winning value (`shadowedZIndexTooltip`), and both field tooltips say which one
+wins. **An anchor that leaves its own `zIndex` at 0 does NOT shadow the element field** — the
+override is truthiness, not presence — so `isElementZIndexShadowed` in `uiAuthoring.ts` is the one
+predicate, applied by `anchorCss` and by the Inspector gate alike, for the same
+cannot-disagree reason `isSizeInert` exists.
+
 ---
 
 ## Projection & the dirty flag (no per-frame work)
@@ -1338,6 +1428,34 @@ scrolling shop strip is a lie an author reads past forever.
 
 `UIElement.overflow: 'scroll'` is still what makes the box scroll — `UIScrollView` supplies the
 position and the motion fields, and does not override what the author wrote.
+
+⚠️ **That sentence was FALSE until #743, and it failed into a half-working box rather than an
+inert one.** `scrollViewStyle` emits a cross-axis pin (`overflowY: 'hidden'` for a horizontal
+view, `overflowX` for a vertical one) to stop an off-axis scrollbar stealing cross-axis space — a
+real, measured fix — and that pin was merged onto the host style AFTER the `overflow` write. Per
+CSS, **when one of `overflow-x`/`overflow-y` is not `visible`, the other computes to `auto`**, so
+the axis the author left `visible` silently became `auto` and the box scrolled. Meanwhile
+`UINode`'s scrollbar skin and its `pointerEvents: 'auto'` force both stayed gated on `overflow ===
+'scroll'` — so what you got was a box that scrolled, with unstyled native scrollbars, that could
+not receive the wheel under the `pointer-events: none` root. One forgotten field away, from docs
+that told you the field was a no-op.
+
+The pin is now gated on the author having opted the box into scrolling, which is the only case its
+justification covers. `scrollSnapType`/`overscrollBehavior`/`scrollbarWidth` stay unconditional —
+none of them changes how `overflow` computes.
+
+⚠️ **`overflow: 'hidden'` is NOT the same as `'visible'` here, and only `'visible'` is inert.**
+`hidden` still establishes a scroll CONTAINER — a scrollable overflow region with no user-facing
+scrolling UI — and `useScrollView` gates on the TRAIT, not on overflow, so `pendingScrollTo` →
+`el.scrollTo()` still drives it and `scrollSnapType`/`overscrollBehavior` genuinely apply. That is
+a real design: a `scrollToEntry`- or button-driven pager that deliberately suppresses
+finger-dragging. `visible` is the genuinely inert one — no scroll container, so `scrollTo` moves
+nothing and snap has nothing to apply to.
+
+So, because "inert" is indistinguishable from "not wired yet", `UINode` **warns once per entity in
+DEV** when a `UIScrollView` sits on an `overflow: 'visible'` element — the same way a binding-less
+`UIToggle` is reported — and says nothing on `'hidden'`, whose remedy would have been to re-enable
+the drag its author suppressed on purpose.
 
 ### The contract: the engine asks, the game answers
 
@@ -2432,9 +2550,13 @@ unchanged by #728 — but a SEPARATE flag now also earns the same click plumbing
 
 ```ts
 const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
-const swallowsClicks = node.swallowClicks === true;
+const swallowsClicks = node.swallowClicks === true && !node.pointerThrough;
 const takesClick = isInteractive || swallowsClicks;
 ```
+
+⚠️ The `!node.pointerThrough` half is load-bearing and CSS cannot express it — `pointer-events: none`
+stops this node being hit-tested but does not remove it from the event path of a click starting on a
+descendant with `auto`. It was added in #728's close-out, after this block had shipped without it.
 
 `e.stopPropagation()` in the click handler, and the #664 press-origin stamp, now key off
 `takesClick`, not `isInteractive` alone — so a node with `UIElement.swallowClicks` gets both

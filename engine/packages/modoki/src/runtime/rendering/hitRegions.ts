@@ -31,6 +31,8 @@
  *  the same space `InteractionHandle`, `InputPressRecord` and `screenBounds` all use — so a region
  *  and a recorded press can be drawn on one overlay with no transform between them. */
 
+import { onWorldSwap } from '../core/ecs/world';
+
 /** A region's geometry. Circles are not expressible as rects and the difference is exactly what
  *  was misread in the Court session, so the shape is a discriminated union rather than a
  *  lowest-common-denominator box.
@@ -109,7 +111,19 @@ export function hitRegionProviders(): string[] {
   return [...providers.keys()];
 }
 
+/** Ids already reported as duplicated, so the warning fires once per id rather than on every
+ *  `collectHitRegions` poll. NOT keyed by entity id (handle ids come from game-authored provider
+ *  code, not koota entities), so this has no id-recycling hazard — but it had NO clear at all in
+ *  production (#738): `__resetHitRegionsForTests` only runs from `hitRegions.test.ts`. Left alone
+ *  it grows forever across a session and a region id that warned once in an earlier scene stays
+ *  silently suppressed in every later one. Clear it on world swap, matching `interactionHandles.ts`'s
+ *  OWN duplicate-id set (also called `warnedDuplicates`, cleared the same way) — NOT that file's
+ *  provider-THROW set (`warnedThrowers`), which is a `WeakSet<HandleProvider>` that self-clears by
+ *  provider identity and carries no `onWorldSwap` clear at all. This module's own provider-throw
+ *  path (below, in `collectHitRegions`'s catch block) has no warn-once guard either — it
+ *  `console.error`s on every poll a bad provider is hit. */
 const warnedDuplicates = new Set<string>();
+onWorldSwap(() => { warnedDuplicates.clear(); });
 
 /** Collect regions from every provider, optionally filtered. A bad provider is skipped —
  *  one bad game cannot break the whole overlay. Sorted by `order` so the drawing order matches

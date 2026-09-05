@@ -16,6 +16,8 @@ import {
   selectionSizeGate,
   selectionAnchorGate,
   selectionPooledRowGate,
+  isElementZIndexShadowed,
+  selectionZIndexGate,
   type UiPreset,
 } from '../../src/runtime/ui/uiAuthoring';
 
@@ -162,5 +164,42 @@ describe('selectionPooledRowGate (UIEntries pooled-row Inspector note, #651)', (
   it('is mixed when only part of the selection is a pooled row, regardless of order', () => {
     expect(selectionPooledRowGate([true, false])).toBe('mixed');
     expect(selectionPooledRowGate([false, true])).toBe('mixed');
+  });
+});
+
+describe('isElementZIndexShadowed (UIElement.zIndex overwritten by UIAnchor.zIndex, #746)', () => {
+  it('is shadowed by any truthy anchor zIndex', () => {
+    expect(isElementZIndexShadowed(1000)).toBe(true);
+    expect(isElementZIndexShadowed(1)).toBe(true);
+    expect(isElementZIndexShadowed(-1)).toBe(true);
+  });
+
+  // The point of the whole predicate: `anchorCss` overwrites with `if (a.zIndex) ...`, so an
+  // anchored element whose anchor leaves zIndex at its 0 DEFAULT does not shadow anything — the
+  // UIElement value is still the one that takes effect. `0`/`null`/`undefined` must all read as
+  // "not shadowed", or the Inspector would grey out a field that is genuinely live.
+  it('is NOT shadowed by a 0, null, or undefined anchor zIndex', () => {
+    expect(isElementZIndexShadowed(0)).toBe(false);
+    expect(isElementZIndexShadowed(null)).toBe(false);
+    expect(isElementZIndexShadowed(undefined)).toBe(false);
+  });
+});
+
+describe('selectionZIndexGate (unanimous-or-nothing across a multi-selection, #746/#34)', () => {
+  it('is live when nothing in the selection shadows the field', () => {
+    expect(selectionZIndexGate([])).toBe('live');
+    expect(selectionZIndexGate([0, 0])).toBe('live');
+    expect(selectionZIndexGate([null, null])).toBe('live');
+  });
+
+  it('is inert only when EVERY entity shadows the field', () => {
+    expect(selectionZIndexGate([5, 9])).toBe('inert');
+    expect(selectionZIndexGate([5])).toBe('inert');
+  });
+
+  it('is mixed when only part of the selection shadows it, regardless of order', () => {
+    expect(selectionZIndexGate([5, 0])).toBe('mixed');
+    expect(selectionZIndexGate([0, 5])).toBe('mixed');
+    expect(selectionZIndexGate([5, null])).toBe('mixed');
   });
 });

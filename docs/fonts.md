@@ -118,6 +118,14 @@ Both traits carry the same field set (`Text3D` adds `billboard`, `Text2D` adds
 `letterSpacing`, `anchorX/Y`. All path-independent; `fontSize` is px for `Text2D` and world
 units per em for `Text3D`.
 
+⚠️ **`font`, `text`, `fontSize`, `align`, `maxWidth`, `lineSpacing` and `letterSpacing` are all part
+of Scene2D's `layoutHash` — the text-slot REBUILD KEY.** Writing any one of them per frame with a
+changing value tears down and rebuilds that entity's page meshes, geometry and GL buffers every
+frame (#677). To animate a size, animate `Transform` scale instead, never `Text2D.fontSize`. Caveat:
+on the WebGL1-without-derivatives path (iPhone 8, no `fwidth`), a `Transform` scale does not refresh
+`uScreenPxRange`, so the antialiasing term stays pinned at the authored `fontSize` instead of
+tracking the rendered size (#752). #677 is the scar; #749 tracks this residual on the engine side.
+
 **Colour** — `color` + `opacity`. A per-glyph colour animation (`TextAnimation` rainbow/fade)
 multiplies on top via a vertex attribute.
 

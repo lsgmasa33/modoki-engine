@@ -52,9 +52,14 @@ import { markMaterial3DDirty } from './materialDirty';
  *  stripe scroll, yet long enough that the wrap seam is rare in an editor session. */
 const DEFAULT_WRAP = 10000;
 
-/** Session-relative clocks, one per (entity id, target). Advanced only while unpaused
- *  (delta is 0 on pause → frozen). Cleared on world swap so they don't carry across
- *  scene loads (mirrors stripeTimeSystem's resetStripeClock). */
+/** Session-relative clocks, one per (entity id, GENERATION, override index, target). Advanced
+ *  only while unpaused (delta is 0 on pause → frozen). Cleared on world swap so they don't carry
+ *  across scene loads (mirrors stripeTimeSystem's resetStripeClock).
+ *
+ *  Generation is in the key (#738) for the same reason `_defaultBaseCache` below carries it:
+ *  koota's free list is LIFO, so a despawn+respawn onto the same id with the same override at the
+ *  same index would otherwise resume the dead entity's accumulated time instead of starting at 0.
+ *  Closes it for 255 recycles of an id; koota's generation is 8-bit and wraps. */
 const clocks = new Map<string, number>();
 
 /** Stable per-entity base for a prop override whose entity has NO material GUID but DOES carry a
@@ -70,7 +75,9 @@ const clocks = new Map<string, number>();
  *  physics systems, and the general rule in `docs/engine-concepts.md` § Entity). */
 const _defaultBaseCache = new Map<number, { mats: THREE.Material[]; gen: number }>();
 
-/** Last value written for each `prop` override, keyed `${id}:${index}:${target}`.
+/** Last value written for each `prop` override, keyed `${id}:${generation}:${index}:${target}`
+ *  (generation added for #738 — see the `clocks` map above; the milder twin of that hazard here
+ *  is a suppressed dirty-gate arm on a respawned entity's first frame, rather than a wrong pose).
  *
  *  Its ONLY job is deciding when to bump the 3D material-dirty signal — the editor SceneView is
  *  render-on-demand and nothing else in this write path arms its gate, so a changed prop that
@@ -79,17 +86,27 @@ const _defaultBaseCache = new Map<number, { mats: THREE.Material[]; gen: number 
  *  keeps a CONSTANT-source override costing one frame instead of pinning the gate open. */
 const _lastPropValue = new Map<string, number>();
 
-/** Entity ids already warned about an unsupported prop base (dev only) — one warning per entity. */
-const _noBaseWarned = new Set<number>();
+/** Entity (id, generation) pairs already warned about an unsupported prop base (dev only) —
+ *  one warning per entity. Keyed `${id}:${gen}` (not just `id`) for the same reason as
+ *  `_defaultBaseCache` above: koota's free list is LIFO, so a despawn+respawn hands a NEW
+ *  entity the dead one's id, and an id-only warn-once would silently suppress the newcomer's
+ *  genuine warning (#738). Generation closes the WITHIN-world hole — for 255 recycles of an id;
+ *  koota's generation is 8-bit and wraps — and the `onWorldSwap` clear below closes the
+ *  ACROSS-world one (a fresh world restarts both id and generation from zero, so `id 2 / gen 0`
+ *  in world B would otherwise collide with world A's). */
+const _noBaseWarned = new Set<string>();
 
-/** Entity ids already warned about a `prop` override on a 2D material (dev only). */
-const _prop2DWarned = new Set<number>();
+/** Entity (id, generation) pairs already warned about a `prop` override on a 2D material
+ *  (dev only). Keyed `${id}:${gen}` — see `_noBaseWarned` above. */
+const _prop2DWarned = new Set<string>();
 
-/** Entity ids already warned about driving a non-scalar (vec/color) 2D uniform (dev only). */
-const _vec2DWarned = new Set<number>();
+/** Entity (id, generation) pairs already warned about driving a non-scalar (vec/color) 2D
+ *  uniform (dev only). Keyed `${id}:${gen}` — see `_noBaseWarned` above. */
+const _vec2DWarned = new Set<string>();
 
-/** Entity ids already warned about a kind:'texture' override on a 3D material (dev only). */
-const _tex3DWarned = new Set<number>();
+/** Entity (id, generation) pairs already warned about a kind:'texture' override on a 3D
+ *  material (dev only). Keyed `${id}:${gen}` — see `_noBaseWarned` above. */
+const _tex3DWarned = new Set<string>();
 
 onWorldSwap(() => { clocks.clear(); _lastPropValue.clear(); _defaultBaseCache.clear(); _noBaseWarned.clear(); _prop2DWarned.clear(); _vec2DWarned.clear(); _tex3DWarned.clear(); });
 
@@ -182,8 +199,9 @@ function resolvePropBase(entity: Entity, meshes: THREE.Mesh[], id: number): THRE
   if (!mat) return undefined; // no mesh yet
   if (Array.isArray(mat)) { _defaultBaseCache.set(id, { mats: mat, gen }); return mat; }
   // Single default material, no GUID → unsupported (leak-prone on resize); warn once, skip.
-  if (import.meta.env?.DEV && !_noBaseWarned.has(id)) {
-    _noBaseWarned.add(id);
+  const noBaseKey = `${id}:${gen}`;
+  if (import.meta.env?.DEV && !_noBaseWarned.has(noBaseKey)) {
+    _noBaseWarned.add(noBaseKey);
     console.warn(`[MaterialInstance] entity ${id} has a 'prop' override but no resolvable material GUID (default-material primitive or non-mesh). Prop overrides need an explicit .mat.json material — a single default material is recreated on resize and can't be safely cloned; skipped.`);
   }
   return undefined;
@@ -195,16 +213,17 @@ function resolvePropBase(entity: Entity, meshes: THREE.Mesh[], id: number): THRE
  *  no-op + one-time warn. `shaders` is loosely typed to avoid a runtime pixi import here. */
 function applyOverrides2D(
   shaders: { resources?: { matUniforms?: { uniforms?: Record<string, unknown> } } }[],
-  overrides: MaterialParamOverride[], id: number, sim: number, vis: number,
+  overrides: MaterialParamOverride[], id: number, gen: number, sim: number, vis: number,
 ): void {
+  const warnKey = `${id}:${gen}`;
   let changed = false;
   for (let i = 0; i < overrides.length; i++) {
     const override = overrides[i];
     if (!override?.source?.type) continue;
-    const value = evalSource(override, `${id}:${i}:${override.target}`, sim, vis);
+    const value = evalSource(override, `${id}:${gen}:${i}:${override.target}`, sim, vis);
     if (override.kind === 'prop') {
-      if (import.meta.env?.DEV && !_prop2DWarned.has(id)) {
-        _prop2DWarned.add(id);
+      if (import.meta.env?.DEV && !_prop2DWarned.has(warnKey)) {
+        _prop2DWarned.add(warnKey);
         console.warn(`[MaterialInstance] entity ${id}: 'prop' overrides aren't supported on a 2D material (PixiJS has no standard-material surface to clone) — use kind:'uniform' to drive the shader's uniforms; skipped.`);
       }
       continue;
@@ -218,8 +237,8 @@ function applyOverrides2D(
       // uniform holds a Float32Array; overwriting it with a number would NaN the whole
       // vector on the next GPU sync (WebGPU) or throw (WebGL). Skip + warn once instead.
       if (typeof uniforms[override.target] !== 'number') {
-        if (import.meta.env?.DEV && !_vec2DWarned.has(id)) {
-          _vec2DWarned.add(id);
+        if (import.meta.env?.DEV && !_vec2DWarned.has(warnKey)) {
+          _vec2DWarned.add(warnKey);
           console.warn(`[MaterialInstance] entity ${id}: uniform '${override.target}' is a vec/color (non-scalar) — MaterialInstance sources drive a single number, so only scalar (float) uniforms can be driven; skipped.`);
         }
         continue;
@@ -248,7 +267,7 @@ export function materialInstanceSystem(world: World): void {
     // 2D custom-material entities: drive the per-entity Pixi Shader's uniforms. Checked
     // first — a material-bound Renderable2D has no 3D broker presence, so this is exclusive.
     const shaders2d = broker2D ? broker2D.getEntity2DMaterialShaders(id) : NO_2D_SHADERS;
-    if (shaders2d.length > 0) { applyOverrides2D(shaders2d, overrides, id, sim, vis); return; }
+    if (shaders2d.length > 0) { applyOverrides2D(shaders2d, overrides, id, entity.generation(), sim, vis); return; }
 
     const objects = getEntityObjects(world, id);
     if (objects.length === 0) return; // no 3D presence on any surface yet
@@ -262,26 +281,33 @@ export function materialInstanceSystem(world: World): void {
       // build; a per-entity swap would need a clone, like kind:'prop'). Warn once so the
       // silent no-op is discoverable, then skip.
       if (override?.kind === 'texture') {
-        if (import.meta.env?.DEV && !_tex3DWarned.has(id)) {
-          _tex3DWarned.add(id);
+        const tex3DKey = `${id}:${entity.generation()}`;
+        if (import.meta.env?.DEV && !_tex3DWarned.has(tex3DKey)) {
+          _tex3DWarned.add(tex3DKey);
           console.warn(`[MaterialInstance] entity ${id}: kind:'texture' overrides are only supported on a 2D custom material (space:'2d' shader); this entity's material is 3D — skipped.`);
         }
         continue;
       }
       if (!override?.source?.type) continue; // malformed entry → skip it (don't crash the frame)
       // Clock key includes the override INDEX so a curve driver's ':drv' suffix can never alias
-      // a sibling override's clock (even for an adversarial target name containing ':drv').
-      const value = evalSource(override, `${id}:${i}:${override.target}`, sim, vis);
+      // a sibling override's clock (even for an adversarial target name containing ':drv'), and
+      // the entity's GENERATION (#738) — koota's free list is LIFO, so a despawn+respawn onto the
+      // SAME id with the same override at the same index would otherwise read the dead entity's
+      // accumulated clock value (or `_lastPropValue`'s stale "last written" value, suppressing the
+      // dirty-gate arm on the newcomer's very first frame). Closes it for 255 recycles of an id;
+      // koota's generation is 8-bit and wraps.
+      const gen = entity.generation();
+      const value = evalSource(override, `${id}:${gen}:${i}:${override.target}`, sim, vis);
       if (override.kind === 'prop') {
         if (!baseResolved) { base = resolvePropBase(entity, objects as THREE.Mesh[], id); baseResolved = true; }
         // base is undefined for a `.mat.json` GUID still async-loading (skip this frame, retry
         // next) OR an unsupported single-default material (warned once inside resolvePropBase).
         if (base) {
-          const rebound = applyPropOverride(id, objects as THREE.Mesh[], base, override.target, value);
+          const rebound = applyPropOverride(id, gen, objects as THREE.Mesh[], base, override.target, value);
           // Arm the SceneView's render-on-demand gate — this write touches a THREE material, not a
           // trait, so no ECS dirty source sees it. Only on an ACTUAL change (or a rebind onto a
           // new clone), so a constant override settles instead of pinning the gate open.
-          const vk = `${id}:${i}:${override.target}`;
+          const vk = `${id}:${gen}:${i}:${override.target}`;
           if (rebound || _lastPropValue.get(vk) !== value) {
             _lastPropValue.set(vk, value);
             markMaterial3DDirty();

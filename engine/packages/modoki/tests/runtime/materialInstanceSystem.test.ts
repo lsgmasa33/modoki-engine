@@ -10,6 +10,7 @@ import { Time } from '../../src/runtime/core/traits/Time';
 import { MaterialInstance, type MaterialParamOverride } from '../../src/runtime/traits/MaterialInstance';
 import { Renderable3DPrimitive } from '../../src/runtime/traits/Renderable3DPrimitive';
 import { setPlayState } from '../../src/runtime/core/playState';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 // entity.id() → its fake drawable objects. The system reads this through the broker.
 const fakeObjects = new Map<number, { userData: Record<string, unknown>; material?: unknown }[]>();
@@ -283,6 +284,35 @@ describe('materialInstanceSystem', () => {
     warn.mockRestore();
   });
 
+  it('re-warns for a NEW entity that inherits a recycled id (#738), not suppressed by the dead one\'s warning', () => {
+    // `_noBaseWarned` was keyed by `entity.id()` alone — the masked index, generation stripped —
+    // so a despawn immediately followed by a same-shape respawn (koota's free list is LIFO)
+    // silently inherited the dead entity's warn-once entry and never warned for the newcomer's
+    // OWN genuinely malformed authoring. Mirrors the `_defaultBaseCache` regression test above
+    // (#336) — same recycling hazard, one step later in the same function.
+    const world = newWorld();
+    spawnTime(world);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ov = [{ target: 'roughness', kind: 'prop' as const, source: { type: 'constant' as const, value: 0.1 } }];
+
+    const a = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(a.id(), [meshWith(makeMaterial({ roughness: 0.5 }))]);
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(1);
+
+    a.destroy();
+    const b = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: '' }));
+    // Precondition: the id really was reused, but the packed entity differs — fail loudly rather
+    // than pass vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    fakeObjects.set(b.id(), [meshWith(makeMaterial({ roughness: 0.5 }))]);
+    materialInstanceSystem(world);
+    // The newcomer's OWN genuine warning must fire — an id-only warn-once would suppress it here.
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
   it('drives a prop on a BAKED multi-material mesh (no GUID, material is an array → per-slot clones)', () => {
     const world = newWorld();
     spawnTime(world);
@@ -368,6 +398,36 @@ describe('materialInstanceSystem', () => {
     expect(clone[0].tag).toBe('live');
     expect(clone[0]).not.toBe(liveSlot);          // still a clone, not the base itself
     expect(liveSlot.roughness).toBe(0.5);         // base untouched
+  });
+
+  it('a same-index respawn starts its time-driven prop clock at ZERO, not the despawned entity\'s accumulated time (#738)', () => {
+    // `clocks` used to be keyed `${id}:${index}:${target}`, with no generation. koota's free list
+    // is LIFO, so a despawn immediately followed by a same-shape respawn reclaims the exact index —
+    // and before the fix, the newcomer's `time` source would resume the dead entity's accumulated
+    // clock value instead of starting at 0.
+    const world = newWorld();
+    spawnTime(world, 7.3); // one large delta so the leaked accumulation is unmistakable
+    const guid = 'mat-recycle-clock';
+    const ov = [{ target: 'roughness', kind: 'prop' as const, source: { type: 'time' as const } }];
+
+    fakeBases.set(guid, makeMaterial({ roughness: 0 }));
+    const a = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: guid }));
+    fakeObjects.set(a.id(), [meshWith(fakeBases.get(guid))]);
+    materialInstanceSystem(world); // A's clock accumulates to 7.3
+    a.destroy();
+
+    fakeBases.set(guid, makeMaterial({ roughness: 0 })); // fresh base for B, same GUID
+    const b = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: guid }));
+    // Precondition: the id was really recycled onto a DIFFERENT entity — asserted so this fails
+    // loudly rather than passing vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    const bMesh = meshWith(fakeBases.get(guid));
+    fakeObjects.set(b.id(), [bMesh]);
+    materialInstanceSystem(world); // B's FIRST frame
+
+    // B's clock must start at this frame's delta (7.3), NOT resume A's leaked total (14.6).
+    expect((bMesh.material as { roughness: number }).roughness).toBeCloseTo(7.3, 9);
   });
 
   it('drives a prop from a time source and keeps ONE clone across frames', () => {
@@ -497,6 +557,26 @@ describe('materialInstanceSystem', () => {
     expect(obj.userData.uReveal).toBeUndefined(); // texture ref not written as a 3D uniform
     void e;
     if (import.meta.env?.DEV) expect(warn.mock.calls.filter((c) => String(c[0]).includes("kind:'texture'"))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('re-warns a kind:\'texture\' override for a NEW entity that inherits a recycled id (#738)', () => {
+    // `_tex3DWarned` was keyed by `entity.id()` alone — same recycling hazard as `_noBaseWarned`
+    // above. Despawn+respawn within one world (koota's LIFO free list) must not let the dead
+    // entity's warning silently suppress the newcomer's own.
+    const world = newWorld();
+    spawnTime(world);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const a = attach(world, [{ target: 'uReveal', kind: 'texture', ref: 'guid-metal' }]).e;
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(1);
+
+    a.destroy();
+    const { e: b } = attach(world, [{ target: 'uReveal', kind: 'texture', ref: 'guid-metal' }]);
+    expect(b.id()).toBe(a.id());              // id really was reused
+    expect(b.valueOf()).not.toBe(a.valueOf()); // but it's a different packed entity
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(2);
     warn.mockRestore();
   });
 });
@@ -655,6 +735,25 @@ describe('materialInstanceSystem — 2D materials', () => {
     warn.mockRestore();
   });
 
+  it('re-warns a 2D prop override for a NEW entity that inherits a recycled id (#738)', () => {
+    // `_prop2DWarned` (via `applyOverrides2D`'s `warnKey`) was keyed by `entity.id()` alone —
+    // same recycling hazard as the 3D warn-once sets.
+    const world = newWorld();
+    spawnTime(world);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { e: a } = attach2D(world, [{ target: 'uAmount', kind: 'prop', source: { type: 'constant', value: 1 } }], { uAmount: 0 });
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(1);
+
+    a.destroy();
+    const { e: b } = attach2D(world, [{ target: 'uAmount', kind: 'prop', source: { type: 'constant', value: 1 } }], { uAmount: 0 });
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
   it('SKIPS a non-scalar (vec/color Float32Array) uniform + warns once (no NaN corruption)', () => {
     const world = newWorld();
     spawnTime(world);
@@ -668,6 +767,26 @@ describe('materialInstanceSystem — 2D materials', () => {
     expect(sh.resources.matUniforms.uniforms.uTint).toBe(tint);
     expect(Array.from(tint)).toEqual([0, 0, 0]);
     if (import.meta.env?.DEV) expect(warn.mock.calls.filter((c) => String(c[0]).includes('non-scalar'))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('re-warns a non-scalar 2D uniform for a NEW entity that inherits a recycled id (#738)', () => {
+    // `_vec2DWarned` (via `applyOverrides2D`'s `warnKey`) shares the same recycling hazard.
+    const world = newWorld();
+    spawnTime(world);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tintA = new Float32Array([0, 0, 0]);
+    const { e: a } = attach2D(world, [{ target: 'uTint', kind: 'uniform', source: { type: 'constant', value: 0.5 } }], { uTint: tintA });
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(1);
+
+    a.destroy();
+    const tintB = new Float32Array([0, 0, 0]);
+    const { e: b } = attach2D(world, [{ target: 'uTint', kind: 'uniform', source: { type: 'constant', value: 0.5 } }], { uTint: tintB });
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    materialInstanceSystem(world);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(2);
     warn.mockRestore();
   });
 
@@ -760,5 +879,81 @@ describe('materialInstanceSystem — the 3D render-on-demand dirty signal', () =
     spawnTime(world);
     attach(world, [{ target: 'glow', kind: 'uniform', source: { type: 'constant', value: 0.7 } }]);
     expect(countDirty(() => materialInstanceSystem(world))).toBe(0);
+  });
+});
+
+describe('the PRODUCTION world-swap wiring (#738) — not the test-only reset hook', () => {
+  // Every other test in this file (and the ones above) drives cleanup through
+  // `resetMaterialInstanceClocks`/`resetMaterialInstanceClones` in `beforeEach` — never through the
+  // `onWorldSwap(...)` registration at module load that is what actually runs on a real scene swap.
+  // Deleting that registration left this whole suite green, which is the gap these two tests close:
+  // they drive a REAL `setCurrentWorld` swap, the same mechanism `hitRegions.test.ts` /
+  // `interactionHandles.test.ts` use for their own world-swap-clear tests.
+
+  it('a real world swap clears the `clocks` time accumulator', () => {
+    const world1 = newWorld();
+    spawnTime(world1, 5);
+    const { meshes: [m1] } = attachProp(world1, [{ target: 'roughness', kind: 'prop', source: { type: 'time' } }], { roughness: 0 });
+    materialInstanceSystem(world1); // accumulates the clock to 5s
+    expect((m1.material as { roughness: number }).roughness).toBeCloseTo(5, 9);
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    // A fresh world's first entity reclaims koota id/generation 0 again — the SAME key
+    // `materialInstanceSystem` builds `clocks`' key from (id, generation, override index) — so an
+    // uncleared `clocks` map would resume world1's accumulated 5s here instead of starting at 0.
+    const world2 = newWorld();
+    spawnTime(world2, 5);
+    const { meshes: [m2] } = attachProp(world2, [{ target: 'roughness', kind: 'prop', source: { type: 'time' } }], { roughness: 0 });
+    materialInstanceSystem(world2);
+    expect((m2.material as { roughness: number }).roughness).toBeCloseTo(5, 9); // NOT 10 (5 + 5)
+  });
+
+  it('a real world swap clears `_defaultBaseCache` and the `_noBaseWarned` warn-once set', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const world1 = newWorld();
+    spawnTime(world1);
+    // Entity A: a baked multi-material ARRAY base (no GUID) — caches its own slots into
+    // `_defaultBaseCache`, keyed by (id, generation).
+    const slotA = makeMaterial({ roughness: 0 });
+    const meshA = meshWith([slotA, makeMaterial({ roughness: 0 })]);
+    const eA = world1.spawn(MaterialInstance({ overrides: [{ target: 'roughness', kind: 'prop', source: { type: 'constant', value: 0.5 } }] }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(eA.id(), [meshA]);
+    materialInstanceSystem(world1);
+    expect(Array.isArray(meshA.material)).toBe(true);
+
+    // Entity B, spawned right after A (next id/generation): a SINGLE default material (no GUID,
+    // not an array) — the unsupported path that warns once via `_noBaseWarned`.
+    const eB = world1.spawn(MaterialInstance({ overrides: [{ target: 'roughness', kind: 'prop', source: { type: 'constant', value: 1 } }] }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(eB.id(), [meshWith(makeMaterial({ roughness: 0 }))]);
+    materialInstanceSystem(world1);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(1);
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    // A fresh world's first two entities reclaim the SAME ids/generations eA/eB had (both koota
+    // counters reset per world). An uncleared `_defaultBaseCache` would hand the new A-slot entity
+    // world1's STALE array instead of reading its own mesh; an uncleared `_noBaseWarned` would
+    // silently suppress B's genuine warning in the new world.
+    const world2 = newWorld();
+    spawnTime(world2);
+    const slotA2 = makeMaterial({ roughness: 0 });
+    const meshA2 = meshWith([slotA2, makeMaterial({ roughness: 0 })]);
+    const eA2 = world2.spawn(MaterialInstance({ overrides: [{ target: 'roughness', kind: 'prop', source: { type: 'constant', value: 0.5 } }] }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(eA2.id(), [meshA2]);
+    materialInstanceSystem(world2);
+    const clone = meshA2.material as { userData?: { __derivedBase?: unknown } }[];
+    // The clone must be DERIVED FROM `slotA2` (this world's own array), not `slotA` (world1's
+    // stale cached array) — value comparisons alone can't tell them apart since both slots start
+    // identical, so this checks the `cloneDerived` provenance stamp instead.
+    expect(clone[0].userData?.__derivedBase).toBe(slotA2);
+    expect(clone[0].userData?.__derivedBase).not.toBe(slotA);
+
+    const eB2 = world2.spawn(MaterialInstance({ overrides: [{ target: 'roughness', kind: 'prop', source: { type: 'constant', value: 1 } }] }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(eB2.id(), [meshWith(makeMaterial({ roughness: 0 }))]);
+    materialInstanceSystem(world2);
+    if (import.meta.env?.DEV) expect(warn).toHaveBeenCalledTimes(2); // re-warns in the new world
+    warn.mockRestore();
   });
 });

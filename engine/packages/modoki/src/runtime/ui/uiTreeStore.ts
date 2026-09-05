@@ -187,10 +187,29 @@ const _parentMap = new Map<number, number>();
 const _sortMap = new Map<number, number>();
 
 /** Warned-once guard for `lengthUnitWarning` (#529/#549). This projection re-runs on
- *  every UI-dirty rebuild, so this dedupes; the key is entity+field+UNITS (see
- *  `lengthUnitWarningKey`), not the offending values — a resize drag rewrites the
+ *  every UI-dirty rebuild, so this dedupes; the key is entity+generation+field+UNITS
+ *  (see `lengthUnitWarningKey`), not the offending values — a resize drag rewrites the
  *  values on every pointermove, so keying on them re-warned hundreds of times mid-drag.
- *  Cleared on world swap, same as `_prevById`. */
+ *
+ *  Keyed with `generation()` (#738), not id alone — koota recycles entity ids, so a
+ *  despawn+respawn within one world hands a new, unrelated UI entity the dead one's id,
+ *  and an id-only warn-once would silently suppress that newcomer's genuine warning
+ *  forever. `generation()` narrows that WITHIN-world hole to koota's 256-generation wrap
+ *  (`GENERATION_BITS = 8`) — the 257th incarnation of a recycled id re-inherits the
+ *  1st's warn-once entry, but that is a dev-only missed warning once per 256 recycles,
+ *  not the every-respawn collision #738 fixed.
+ *
+ *  ⚠️ This is ALSO world-local — a fresh world restarts both id and generation from
+ *  zero, so `id 2 / gen 0` in a second world would otherwise collide with the first.
+ *  Generation does NOT make the `onWorldSwap` clear below redundant — it closes the
+ *  ACROSS-world hole that generation cannot. Cleared on world swap, same as `_prevById`.
+ *
+ *  A latent seam worth flagging, not chasing: `entriesSystem`'s `releaseViewPool`
+ *  destroys and respawns a view's whole entity pool on hide/show (its own comment
+ *  measures 809 entities for Court's level selector), so with generation in the key a
+ *  pooled entry carrying a length-unit mismatch would re-warn on every open. A scan of
+ *  all 746 `UIElement` blocks across `games/**` and `demos/**` scenes/prefabs found ZERO
+ *  instances of the suspect pattern today, so this is a latent seam, not a live defect. */
 const _warnedLengthUnitMismatches = new Set<string>();
 
 // Previous frame's emitted nodes, keyed by entityId. buildTree reconciles the
@@ -550,7 +569,7 @@ function buildTree(world: World): UINodeData[] | null {
       // raw entity id for its label.
       if (import.meta.env?.DEV) {
         for (const suspect of findLengthUnitSuspects(node)) {
-          const key = lengthUnitWarningKey(id, suspect);
+          const key = lengthUnitWarningKey(id, entity.generation(), suspect);
           if (!_warnedLengthUnitMismatches.has(key)) {
             _warnedLengthUnitMismatches.add(key);
             console.warn(formatLengthUnitWarning(attr?.name || node.guid || String(id), suspect));

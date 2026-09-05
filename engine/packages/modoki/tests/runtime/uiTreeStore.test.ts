@@ -184,6 +184,7 @@ describe('uiTreeStore', () => {
                 id: () => ent.id,
                 has: () => true,
                 get: () => ({ parentId: ent.parentId, sortOrder: ent.sortOrder ?? 0 }),
+                generation: () => 0,
               };
               cb([uiElDefaults], entity);
             }
@@ -266,7 +267,7 @@ describe('uiTreeStore', () => {
       return {
         query: () => ({
           updateEach: (cb: (data: any[], entity: any) => void) => {
-            cb([uiEl], { id: () => 1, has: () => true, get: () => ({ parentId: 0, sortOrder: 0 }) });
+            cb([uiEl], { id: () => 1, has: () => true, get: () => ({ parentId: 0, sortOrder: 0 }), generation: () => 0 });
           },
         }),
       } as any;
@@ -343,6 +344,7 @@ describe('uiTreeStore', () => {
                 id: () => ent.id,
                 has: () => true,
                 get: () => ({ parentId: ent.parentId, sortOrder: ent.sortOrder ?? 0 }),
+                generation: () => 0,
               };
               cb([uiElDefaults], entity);
             }
@@ -450,6 +452,7 @@ describe('uiTreeStore', () => {
                   : t === textAnim
                     ? taData
                     : { parentId: 0, sortOrder: 0 },
+              generation: () => 0,
             };
             cb([uiEl], entity);
           },
@@ -523,6 +526,7 @@ describe('uiTreeStore', () => {
                 t === attr ? { parentId: 0, guid: 'g1', layer: 'ui', isActive: true, sortOrder: 0 }
                   : t === bindingTrait ? bind
                     : { parentId: 0, sortOrder: 0 },
+              generation: () => 0,
             };
             cb([uiEl], entity);
           },

@@ -124,9 +124,18 @@ export function formatLengthUnitWarning(entityLabel: string, suspect: LengthUnit
   );
 }
 
-/** Dedupe key for the module-level warned-once guard. Keys on entity+field+UNITS, not
- *  values — see the module doc comment for why values would re-warn hundreds of times
- *  mid-drag, and why keying on units still re-warns once a fix actually changes one. */
-export function lengthUnitWarningKey(entityId: number, suspect: LengthUnitSuspect): string {
-  return `${entityId}:${suspect.constraintField}:${suspect.sizeUnit}:${suspect.constraintUnit}`;
+/** Dedupe key for the module-level warned-once guard. Keys on entity+GENERATION+field+UNITS,
+ *  not values — see the module doc comment for why values would re-warn hundreds of times
+ *  mid-drag, and why keying on units still re-warns once a fix actually changes one.
+ *
+ *  `generation` (#738), not id alone — koota recycles entity ids, so a despawn+respawn within
+ *  one world hands a new, unrelated UI entity the dead one's id, and an id-only warn-once
+ *  would silently suppress that newcomer's genuine warning forever. `generation` narrows that
+ *  WITHIN-world hole to koota's 256-generation wrap (`GENERATION_BITS = 8`), rather than
+ *  closing it outright — the 257th incarnation of a recycled id re-inherits the 1st's entry,
+ *  a dev-only missed warning once per 256 recycles. The caller's `onWorldSwap` clear closes
+ *  the ACROSS-world hole that generation cannot (a fresh world restarts both id and
+ *  generation from zero). */
+export function lengthUnitWarningKey(entityId: number, generation: number, suspect: LengthUnitSuspect): string {
+  return `${entityId}:${generation}:${suspect.constraintField}:${suspect.sizeUnit}:${suspect.constraintUnit}`;
 }

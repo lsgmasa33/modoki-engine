@@ -6,7 +6,8 @@ export const Text2D = trait({
   text: 'Text' as string,
   /** Font asset GUID (imported + baked). */
   font: '' as string,
-  /** Pixels per em. */
+  /** Pixels per em. Part of the text rebuild key — do not animate this per frame; animate
+   *  `Transform` scale instead. See docs/fonts.md. */
   fontSize: 32 as number,
   color: 0xffffff as number,
   opacity: 1 as number,

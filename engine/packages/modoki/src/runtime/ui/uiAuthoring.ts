@@ -121,3 +121,32 @@ export function selectionAnchorGate(anchors: readonly (string | null | undefined
 export function selectionPooledRowGate(pooled: readonly boolean[]): SelectionGate {
   return resolveGate(pooled, (p) => p);
 }
+
+/** Is an authored `UIElement.zIndex` INERT because a sibling `UIAnchor` overrides it (#746)?
+ *
+ *  `UINode` writes `style.zIndex` from `UIElement.zIndex`; `applyAnchorStyle` then runs and
+ *  replaces it. `UIAnchor.zIndex` being the stacking authority for an out-of-flow box is
+ *  deliberate and documented (`docs/ui-system.md` § sortOrder) — the defect was the SILENCE: the
+ *  Inspector shows two `zIndex` fields as if they were independent, so an author could set the
+ *  `UIElement` one, watch it do nothing, and have no way to tell which was in charge. One live
+ *  disagreement exists (`games/3d-test`'s "2D Animation" scene: element 100 against anchor 1000).
+ *
+ *  ⚠️ **Having an anchor is NOT enough — the anchor's own `zIndex` must be TRUTHY.** The override
+ *  is `if (a.zIndex) style.zIndex = a.zIndex`, so an anchored element whose anchor leaves `zIndex`
+ *  at its 0 default keeps the `UIElement` value, and greying the field out there would be a
+ *  different lie. `anchorCss` imports this predicate rather than restating the condition, so the
+ *  editor cannot disagree with the layout about what is inert — the same rule `isSizeInert`
+ *  already follows.
+ *
+ *  Takes the anchor's `zIndex`, or null/undefined when the entity has no `UIAnchor` at all. */
+export function isElementZIndexShadowed(anchorZIndex: number | null | undefined): boolean {
+  return !!anchorZIndex;
+}
+
+/** The `UIElement.zIndex` shadowing gate across a selection (#746). One entry per selected
+ *  entity: its `UIAnchor.zIndex`, or null/undefined when it has no anchor. Same
+ *  unanimous-or-nothing rule as every gate above (#34) — only a selection where EVERY entity is
+ *  shadowed may dim the field. */
+export function selectionZIndexGate(anchorZIndexes: readonly (number | null | undefined)[]): SelectionGate {
+  return resolveGate(anchorZIndexes, isElementZIndexShadowed);
+}

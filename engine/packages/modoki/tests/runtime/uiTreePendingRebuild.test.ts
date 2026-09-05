@@ -48,7 +48,7 @@ function makeWorld() {
         const data = new Map<unknown, unknown>();
         data.set(UIEL, { ...UI_DEFAULTS });
         data.set(ATTR, { parentId: 0, sortOrder: 0, guid: 'g1' });
-        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
         cb([data.get(UIEL)], entity);
       },
     }),

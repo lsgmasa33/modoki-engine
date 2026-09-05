@@ -62,6 +62,22 @@ export const UIElement = trait({
   maxHeight: 0,  // 0 = none
   maxHeightUnit: 'px' as UILengthUnit,
   alignSelf: 'auto' as 'auto' | 'flex-start' | 'center' | 'flex-end' | 'stretch',
+  /**
+   * Stacking order among siblings.
+   *
+   * ⚠️ **Silently overridden by `UIAnchor.zIndex` on an anchored element (#746)** — `UINode`
+   * writes this into `style.zIndex`, then `applyAnchorStyle` replaces it whenever the anchor's own
+   * `zIndex` is non-zero. That precedence is DELIBERATE and documented (`docs/ui-system.md`
+   * § sortOrder): for an out-of-flow box the anchor is the stacking authority. What was wrong was
+   * only the silence — the Inspector shows two `zIndex` fields as if they were independent, so an
+   * author could set this one, watch nothing move, and have no way to tell which was in charge.
+   * `games/3d-test`'s "2D Animation" scene still holds the one live disagreement (this 100 against
+   * an anchor's 1000).
+   *
+   * An anchor that leaves its own `zIndex` at 0 does NOT shadow this field. The Inspector greys
+   * this one out and names the winning value exactly when it is shadowed, via the shared
+   * `isElementZIndexShadowed` predicate that `anchorCss` applies too.
+   */
   zIndex: 0,
   /**
    * Tilt, in DEGREES clockwise. 0 = square, the pre-existing behaviour of every authored element.
@@ -328,6 +344,19 @@ export const UIElement = trait({
    *
    * ⚠️ Does nothing on `elementType: 'input'` — an input's text is player-entered, not an
    * authored label, and shrinking it as the user types is a different feature (out of scope here).
+   *
+   * ⚠️ **And it is not alone: an ENTIRE field group is dropped on a form control (#745).** This
+   * note used to name `autoFitText` only, which read as "that one field is special" rather than
+   * "these do not apply here". The whole text-style block in `UINode` is gated on `UIElement.text`,
+   * which an `input`/`range` never uses (its value comes from `inputBinding`), and the control
+   * branch re-emits only `fontFamily`, `fontSize`, `fontWeight` and `color`. So on an `<input>` or
+   * `<range>` these are silently dropped as well: `textAlign`, `lineHeight`, `letterSpacing`,
+   * `fontStyle`, `textShadow*` (all five), `textStroke*`, `textOverflow`, `maxLines`.
+   *
+   * They stay unwired on purpose — a form control's text rendering is the platform's, not ours —
+   * so `UINode` warns once per entity in DEV naming the fields you authored and will not get,
+   * rather than pretending to honour them. `text` ITSELF is dropped on `input`/`range`/`Canvas2D`/
+   * `UIToggle` nodes too, with its styling still applied to the box, and warns the same way.
    */
   autoFitText: false,
   /**

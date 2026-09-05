@@ -74,7 +74,7 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.video) data.set(VID, {});
           if (s.toggle) data.set(TGL, s.toggle);
           if (s.touch) data.set(TCH, s.touch);
-          const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+          const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
           cb([data.get(UIEL)], entity);
         }
       },

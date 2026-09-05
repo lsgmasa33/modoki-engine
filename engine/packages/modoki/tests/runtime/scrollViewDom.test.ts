@@ -32,30 +32,65 @@ const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
 
 describe('scrollViewStyle', () => {
   it('does NOT set overflow — that stays UIElement.overflow, one owner per visible consequence', () => {
-    expect(scrollViewStyle(base())).not.toHaveProperty('overflow');
+    expect(scrollViewStyle(base(), 'scroll')).not.toHaveProperty('overflow');
   });
 
   it('emits no snap type while snap is none', () => {
-    expect(scrollViewStyle(base())).not.toHaveProperty('scrollSnapType');
+    expect(scrollViewStyle(base(), 'scroll')).not.toHaveProperty('scrollSnapType');
   });
 
   it('maps each axis onto the matching snap axis', () => {
-    expect(scrollViewStyle(base({ snap: 'start', axis: 'y' })).scrollSnapType).toBe('y mandatory');
-    expect(scrollViewStyle(base({ snap: 'start', axis: 'x' })).scrollSnapType).toBe('x mandatory');
-    expect(scrollViewStyle(base({ snap: 'start', axis: 'both' })).scrollSnapType).toBe('both mandatory');
+    expect(scrollViewStyle(base({ snap: 'start', axis: 'y' }), 'scroll').scrollSnapType).toBe('y mandatory');
+    expect(scrollViewStyle(base({ snap: 'start', axis: 'x' }), 'scroll').scrollSnapType).toBe('x mandatory');
+    expect(scrollViewStyle(base({ snap: 'start', axis: 'both' }), 'scroll').scrollSnapType).toBe('both mandatory');
   });
 
   it('always carries overscroll-behavior', () => {
-    expect(scrollViewStyle(base({ overscroll: 'contain' })).overscrollBehavior).toBe('contain');
-    expect(scrollViewStyle(base({ overscroll: 'none' })).overscrollBehavior).toBe('none');
+    expect(scrollViewStyle(base({ overscroll: 'contain' }), 'scroll').overscrollBehavior).toBe('contain');
+    expect(scrollViewStyle(base({ overscroll: 'none' }), 'scroll').overscrollBehavior).toBe('none');
   });
 
   it('hides the classic scrollbar when scrollbar is hidden', () => {
-    expect(scrollViewStyle(base({ scrollbar: 'hidden' })).scrollbarWidth).toBe('none');
+    expect(scrollViewStyle(base({ scrollbar: 'hidden' }), 'scroll').scrollbarWidth).toBe('none');
   });
 
   it('emits no scrollbar-width at all under the "auto" default — a classic scrollbar is left alone', () => {
-    expect(scrollViewStyle(base())).not.toHaveProperty('scrollbarWidth');
+    expect(scrollViewStyle(base(), 'scroll')).not.toHaveProperty('scrollbarWidth');
+  });
+
+  // ── #743: the cross-axis pin must not reach a box the author never opted into scrolling ──
+  it('pins the cross axis on a scrolling box — the measured scrollbar-theft fix, intact', () => {
+    expect(scrollViewStyle(base({ axis: 'x' }), 'scroll').overflowY).toBe('hidden');
+    expect(scrollViewStyle(base({ axis: 'y' }), 'scroll').overflowX).toBe('hidden');
+  });
+
+  it('leaves BOTH axes alone on a non-scrolling box, so the documented invariant holds (#743)', () => {
+    // The defect: `overflowY: 'hidden'` merged onto an element left at `overflow: 'visible'`
+    // promotes overflow-X to `auto` per CSS, so the box scrolled — while UINode's scrollbar skin
+    // and `pointerEvents: 'auto'` force both stayed gated on `overflow === 'scroll'`, leaving it
+    // scrolling, unstyled, and unable to take the wheel.
+    for (const axis of ['x', 'y', 'both']) {
+      for (const overflow of ['visible', 'hidden']) {
+        const css = scrollViewStyle(base({ axis }), overflow);
+        expect(css).not.toHaveProperty('overflowX');
+        expect(css).not.toHaveProperty('overflowY');
+      }
+    }
+  });
+
+  it('still emits the axis-independent fields on a non-scrolling box — they cannot promote overflow', () => {
+    // Deliberately NOT gated: none of these changes how `overflow` computes, so on a
+    // non-scrolling box they are inert rather than harmful, and gating them would be a second
+    // rule to keep in sync for no gain.
+    const css = scrollViewStyle(base({ snap: 'start', axis: 'y', overscroll: 'contain', scrollbar: 'hidden' }), 'visible');
+    expect(css.scrollSnapType).toBe('y mandatory');
+    expect(css.overscrollBehavior).toBe('contain');
+    expect(css.scrollbarWidth).toBe('none');
+  });
+
+  it('never pins on axis "both", scrolling or not — there is no cross axis to pin', () => {
+    expect(scrollViewStyle(base({ axis: 'both' }), 'scroll')).not.toHaveProperty('overflowX');
+    expect(scrollViewStyle(base({ axis: 'both' }), 'scroll')).not.toHaveProperty('overflowY');
   });
 });
 

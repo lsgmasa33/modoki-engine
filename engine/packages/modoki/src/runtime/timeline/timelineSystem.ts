@@ -244,8 +244,15 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
       // The warning now fires exactly when the soft-lock really occurs, and `track` names the track
       // that produced the winning `desired`. Kept noisy-when-real over noisy-always on purpose — a
       // warning that cries wolf is a warning that gets ignored.
-      if (cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(rootId)) {
-        _warnedSelfDeact.add(rootId);
+      // `?? '?'` is a SENTINEL, not a real fallback: this branch is currently UNREACHABLE — by the
+      // time `targetId === rootId` is true here, phase 1 already required `idx.byId.get(rootId)`
+      // to be live to set `decision.hasUnmuted`, and `rootEntity` above is that same lookup, so the
+      // `?.generation()` miss can't actually happen. `0` would be a real generation value, so if a
+      // future change ever made this reachable, a plain `?? 0` would silently alias a genuine
+      // generation-0 entity under this key; `'?'` cannot collide with any real generation.
+      const selfDeactKey = `${rootId}:${rootEntity?.generation() ?? '?'}`;
+      if (cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(selfDeactKey)) {
+        _warnedSelfDeact.add(selfDeactKey);
         console.warn(
           `[timeline] activation track "${track.name}" targets its OWN Director (entity ${rootId}) and is ` +
           `switching it OFF at t=${t.toFixed(3)}. A deactivated entity freezes its Director, so this ` +
@@ -510,14 +517,30 @@ function controlParticle(world: World, director: Entity, targetId: number, actio
  *  cycles; an activation track switching off its own Director). Both would otherwise log every
  *  frame — an editor scrub drags across the same boundary dozens of times a second.
  *
- *  ⚠️ These are keyed by ENTITY ID, which is world-local and REASSIGNED on every scene load, so
- *  they MUST NOT survive a world swap: a stale id would silently suppress a genuine warning for
- *  an unrelated entity in the next scene — a warn-once that degrades into a warn-never, which is
- *  precisely the silent-failure class this system keeps getting bitten by. (Measured: a second
- *  test world reusing id 1 got no warning at all.) Hence the `onWorldSwap` reset below, mirroring
- *  `controlSpawnRegistry`. */
-const _warnedSubCycle = new Set<number>();
-const _warnedSelfDeact = new Set<number>();
+ *  Keyed `${id}:${generation()}` (#738), not id alone — an id-only key carries the SAME hazard
+ *  `trackMuteKey` documents below, one step worse: koota's free list is LIFO, so a despawn+respawn
+ *  within one world hands a new, unrelated entity the dead one's id, and an id-only warn-once
+ *  would silently suppress that newcomer's genuine warning forever. `generation()` closes that
+ *  WITHIN-world hole — for 255 recycles of an id; koota's generation is 8-bit and wraps.
+ *
+ *  ⚠️ These are ALSO world-local — a fresh world restarts both id and generation from zero, so
+ *  `id 2 / gen 0` in a second world would otherwise collide with the first. Generation does NOT
+ *  make the `onWorldSwap` reset below redundant — it closes the ACROSS-world hole that generation
+ *  cannot (the same pairing as `_trackMuted` + `_trackMutedEpoch`). (Measured pre-generation: a
+ *  second test world reusing id 1 got no warning at all.) Hence both mechanisms, mirroring
+ *  `controlSpawnRegistry`.
+ *
+ *  ⚠️ NEITHER warn site below is DEV-gated (unlike `materialInstanceSystem`'s `_noBaseWarned` &
+ *  co.) — these two log in every build. Keying them on generation is therefore a SHIPPED BEHAVIOUR
+ *  change, not just a test fix: before #738 a foot-gun warned once per (world-local) id, so
+ *  respawning the SAME prefab onto a recycled id suppressed the warning after the first spawn; now
+ *  it warns once per (id, generation) — i.e. once per spawned INSTANCE. A game spawning a Director
+ *  prefab per VFX instance with a self-deactivating activation track (or a sub-director
+ *  cycle/self-reference) now warns once per spawn instead of once per id. This is the intended
+ *  trade-off (a real per-instance authoring mistake should not go silent after the id's first
+ *  occupant), but it was not written down before, so it is here now. */
+const _warnedSubCycle = new Set<string>();
+const _warnedSelfDeact = new Set<string>();
 
 /** Drop the warn-once bookkeeping (scene swap / test teardown) — see the note above. */
 export function clearTimelineWarnings(): void {
@@ -540,7 +563,9 @@ onWorldSwap(() => clearTimelineWarnings());
  *     unmuted frame left `2:vid -> false` behind, and a BRAND NEW Director spawning onto id 2 with
  *     that track authored `muted:true` read it as a flip and paused a video it never started. No
  *     world swap is involved, so the `onWorldSwap` reset below cannot cover it — the same hazard
- *     the warn-once sets above carry, one step worse. Hence `generation()` in the key.
+ *     the warn-once sets above now also carry generation to close (#738), one step worse here
+ *     since a mute-state read-back is wrong rather than merely under-warned. Hence `generation()`
+ *     in the key.
  *   - **A timeline swap on one Director.** Reassigning `Director.timeline` from a def whose track
  *     `vid` is unmuted to one whose `vid` is muted read as a flip for the same reason. Hence
  *     `def.id` in the key — see `trackMuteKey` for why that is the asset GUID and emphatically
@@ -678,7 +703,17 @@ function driveSubdirector(
   // A director can't be its own sub-director (target "" / itself): recursing would rewind its own
   // playhead via the read-back below. Guard both self and any A→…→A chain already on the stack.
   if (childId === p.rootId || visited.has(childId)) {
-    if (!_warnedSubCycle.has(childId)) { _warnedSubCycle.add(childId); console.warn(`[timeline] sub-director cycle/self-reference at entity ${childId} — skipping to avoid infinite recursion`); }
+    // Look the entity up here (rather than reuse the `child` lookup below, which never runs on
+    // this early-return path) so the warn-once key can carry its generation — see _warnedSubCycle.
+    const cycleEntity = index.byId.get(childId) as unknown as Entity | undefined;
+    // `?? '?'` is a SENTINEL, not a real fallback: this branch is currently UNREACHABLE — `childId`
+    // here is either `p.rootId` (the Director already driving this pass, so live by construction)
+    // or an id already in `visited` (added only for an entity this same walk already found live),
+    // so `cycleEntity` can't actually be undefined. `0` would be a real generation value, so if a
+    // future change ever made this reachable, a plain `?? 0` would silently alias a genuine
+    // generation-0 entity under this key; `'?'` cannot collide with any real generation.
+    const subCycleKey = `${childId}:${cycleEntity?.generation() ?? '?'}`;
+    if (!_warnedSubCycle.has(subCycleKey)) { _warnedSubCycle.add(subCycleKey); console.warn(`[timeline] sub-director cycle/self-reference at entity ${childId} — skipping to avoid infinite recursion`); }
     return;
   }
   const child = index.byId.get(childId) as unknown as Entity | undefined;

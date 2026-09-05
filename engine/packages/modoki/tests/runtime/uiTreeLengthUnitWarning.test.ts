@@ -23,6 +23,10 @@
  *    things that happens as a result. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createWorld } from 'koota';
+import { RenderableUI } from '../../src/runtime/traits/RenderableUI';
+import { UIElement } from '../../src/runtime/traits/UIElement';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 
 beforeEach(() => { vi.resetModules(); });
 
@@ -64,7 +68,7 @@ function makeWorld(specs: Spec[]) {
           const data = new Map<unknown, unknown>();
           data.set(UIEL, { ...UI_DEFAULTS, ...(s.ui || {}) });
           data.set(ATTR, { parentId: s.parentId, sortOrder: 0, guid: '', name: s.name || '' });
-          const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+          const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
           cb([data.get(UIEL)], entity);
         }
       },
@@ -144,5 +148,110 @@ describe('length-unit mismatch warning fires inside a hidden subtree', () => {
 
     const messages = warnSpy.mock.calls.map(c => String(c[0]));
     expect(messages.some(m => m.includes('RulesPanel'))).toBe(false);
+  });
+});
+
+describe('length-unit mismatch warning re-fires for a NEW entity that inherits a recycled id (#738)', () => {
+  // These use a REAL koota world (not the fake `makeWorld` above) so `entity.generation()`,
+  // `entity.destroy()` and `entity.valueOf()` are the genuine koota mechanics — a recycling
+  // test built on a fake entity would only prove the fake models recycling, not that the real
+  // one does. `_warnedLengthUnitMismatches` used to be keyed on `entity.id()` alone: koota's
+  // free list is LIFO, so a despawn immediately followed by a same-shape respawn silently
+  // inherited the dead entity's warn-once entry and never warned for the newcomer's OWN
+  // genuinely malformed authoring — the exact hazard #738 fixed at six sibling sites.
+
+  // koota caps at 16 live worlds/process — track and destroy each test's world.
+  const _worlds: ReturnType<typeof createWorld>[] = [];
+  function newWorld() {
+    const w = createWorld();
+    _worlds.push(w);
+    return w;
+  }
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const w of _worlds.splice(0)) w.destroy();
+  });
+
+  function mockRealDeps() {
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
+    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+    vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
+      getAllTraits: () => [
+        { name: 'RenderableUI', trait: RenderableUI, category: 'component', fields: {} },
+        { name: 'UIElement', trait: UIElement, category: 'component', fields: {} },
+        { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} },
+      ],
+    }));
+  }
+
+  async function loadReal() {
+    mockRealDeps();
+    return import('../../src/runtime/ui/uiTreeStore');
+  }
+
+  it('re-warns a RulesClose-shaped mismatch for a NEW entity after the dead one is despawned', async () => {
+    expect(import.meta.env?.DEV).toBeTruthy(); // else this test would pass vacuously — the warn site is DEV-gated
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { uiTreeProjection, markUIDirty } = await loadReal();
+    const world = newWorld();
+
+    const a = world.spawn(
+      RenderableUI(),
+      UIElement({ width: 5.4, height: 5.4, maxWidth: 3.5, maxHeight: 3.5 }),
+      EntityAttributes({ name: 'RulesClose', parentId: 0 }),
+    );
+    markUIDirty();
+    uiTreeProjection(world as never);
+    expect(warnSpy.mock.calls.filter(c => String(c[0]).includes('RulesClose')).length).toBeGreaterThan(0);
+    const firstWarnCount = warnSpy.mock.calls.length;
+
+    a.destroy();
+    const b = world.spawn(
+      RenderableUI(),
+      UIElement({ width: 5.4, height: 5.4, maxWidth: 3.5, maxHeight: 3.5 }),
+      EntityAttributes({ name: 'RulesClose2', parentId: 0 }),
+    );
+    // Precondition: the id really was reused, but the packed entity differs — fail loudly
+    // rather than pass vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    markUIDirty();
+    uiTreeProjection(world as never);
+    // The newcomer's OWN genuine warning must fire — an id-only warn-once would suppress it.
+    const messagesAfter = warnSpy.mock.calls.map(c => String(c[0]));
+    expect(messagesAfter.filter(m => m.includes('RulesClose2')).length).toBeGreaterThan(0);
+    expect(warnSpy.mock.calls.length).toBeGreaterThan(firstWarnCount);
+  });
+
+  it('does not re-warn the SAME entity across a second rebuild with no destroy in between (#529/#549)', async () => {
+    // This is the other half of the contract the file above pins: keying on entity+generation
+    // (not the offending values) means a rebuild that changes nothing about this entity must
+    // NOT re-warn. A key that churns every rebuild (e.g. by accident reintroducing a counter
+    // or a value into the key) would satisfy every other test in this file — they only assert
+    // the count went UP somewhere — while re-warning on every single frame.
+    expect(import.meta.env?.DEV).toBeTruthy(); // else this test would pass vacuously
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { uiTreeProjection, markUIDirty } = await loadReal();
+    const world = newWorld();
+
+    world.spawn(
+      RenderableUI(),
+      UIElement({ width: 5.4, height: 5.4, maxWidth: 3.5, maxHeight: 3.5 }),
+      EntityAttributes({ name: 'RulesClose', parentId: 0 }),
+    );
+
+    markUIDirty();
+    uiTreeProjection(world as never);
+    // Two suspects on one entity (maxWidth AND maxHeight) each warn once — that is the
+    // baseline this test locks, not the count itself.
+    const countAfterFirst = warnSpy.mock.calls.filter(c => String(c[0]).includes('RulesClose')).length;
+    expect(countAfterFirst).toBeGreaterThan(0);
+
+    // Second rebuild, no destroy/respawn — same entity, same generation.
+    markUIDirty();
+    uiTreeProjection(world as never);
+    const countAfterSecond = warnSpy.mock.calls.filter(c => String(c[0]).includes('RulesClose')).length;
+    expect(countAfterSecond).toBe(countAfterFirst);
   });
 });

@@ -999,7 +999,10 @@ export function registerAllTraits() {
       scrollbarStyle: { type: 'enum', options: ['auto', 'tinted', 'hidden'], tooltip: 'How the scrollbar looks when overflow:scroll actually overflows.\nauto = the platform\'s own bar\ntinted = use the two colours below\nhidden = no bar (it still scrolls by drag)\n⚠️ Only applies when overflow is scroll.\n⚠️ hidden removes the only hint that content continues below.', ...S('Layout') },
       scrollbarThumbColor: { type: 'color', tooltip: 'Scrollbar thumb colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
       scrollbarTrackColor: { type: 'color', tooltip: 'Scrollbar track colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
-      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      // #746: say that an anchor takes this over, because the Inspector shows both zIndex fields
+      // and nothing else distinguishes them. The gate in Inspector.tsx additionally greys this one
+      // out and names the winning value when an anchor is actually shadowing it.
+      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings.\nIgnored on an anchored element whose UIAnchor.zIndex is non-zero — that field is the stacking authority for an anchored box.', ...S('Layout') },
       rotation: { type: 'number', step: 1, tooltip: 'Tilt in degrees, clockwise. 0 = square.\nRotates about the ANCHOR PIVOT (the point that sits on the anchor point), so the anchor stays put as the angle changes; an unanchored or stretched element turns about its centre.\n\u26a0\ufe0f A non-zero rotation creates a stacking context, which traps the zIndex of everything inside it \u2014 tilt the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays axis-aligned; the render is still correct.', ...S('Layout') },
       scale: { type: 'number', step: 0.05, tooltip: 'Uniform scale. 1 = natural size.\nScales the RENDER, not the layout \u2014 the box keeps its laid-out size, so siblings do not reflow and text scales with the card (unlike keying width/height).\nScales about the ANCHOR PIVOT, so the anchor stays put as it grows; an unanchored or stretched element scales about its centre.\n\u26a0\ufe0f A scale other than 1 creates a stacking context, which traps the zIndex of everything inside it \u2014 scale the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays at the unscaled rect; the render is still correct.', ...S('Layout') },
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
@@ -1444,7 +1447,7 @@ export function registerAllTraits() {
       pivotX: { type: 'number', step: 0.1, tooltip: 'Horizontal pivot (0 = left edge, 0.5 = center, 1 = right edge).\nShifts which point of this element sits at the anchor position.' },
       pivotY: { type: 'number', step: 0.1, tooltip: 'Vertical pivot (0 = top edge, 0.5 = center, 1 = bottom edge).\nShifts which point of this element sits at the anchor position.' },
       safeArea: { type: 'boolean', tooltip: 'Add padding for device notch, Dynamic Island, and home indicator bar' },
-      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order. Higher values render on top' },
+      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order. Higher values render on top.\nWhen non-zero this OVERRIDES UIElement.zIndex on the same entity (#746); leave it 0 to let that field decide.' },
     },
   });
 }

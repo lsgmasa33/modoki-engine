@@ -13,6 +13,10 @@ import type { CSSProperties } from 'react';
 // STRETCH_X/STRETCH_Y come from anchorLayout so the two paths cannot disagree on WHICH
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
+// Same reasoning as STRETCH_X/STRETCH_Y above, one field over: the Inspector greys out
+// `UIElement.zIndex` when this line overrides it (#746), and it must not be able to disagree with
+// this line about WHEN that happens. One predicate, imported by both.
+import { isElementZIndexShadowed } from './uiAuthoring';
 
 export type AnchorCssData = AnchorData & { zIndex?: number };
 
@@ -79,7 +83,9 @@ function safeAreaInset(edge: 'top' | 'bottom' | 'left' | 'right'): string {
  *  (Mirrors anchorLayout.resolveAnchorRect — keep them in sync; parity-tested.) */
 export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   style.position = 'absolute';
-  if (a.zIndex) style.zIndex = a.zIndex;
+  // ⚠️ Truthiness, not presence: an anchor leaving `zIndex` at its 0 default does NOT shadow
+  // `UIElement.zIndex`, and the Inspector's gate depends on that staying true (#746).
+  if (isElementZIndexShadowed(a.zIndex)) style.zIndex = a.zIndex;
 
   // Position the element's top-left at the anchor reference point.
   // All non-stretch modes use top+left so pivot translate(-X%,-Y%) works uniformly.

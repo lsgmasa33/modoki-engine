@@ -650,6 +650,25 @@ describe('scene3DSync', () => {
       warn.mockRestore();
     });
 
+    it('re-warns for the same modelRef:clip after a world swap (#738 group B)', async () => {
+      // `_warnedMissingClip` had NO world-swap clear at all — a clip name that warned in one
+      // scene stayed silently suppressed forever after, including for an unrelated model that
+      // happens to reuse the same modelRef:clip pair in a later scene.
+      mockSceneSyncDeps();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { driveAnimator } = await import('../../src/runtime/rendering/scene3DSync');
+      const { setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+      const { createWorld } = await import('koota');
+      const entry = entryWith(['Idle']);
+      driveAnimator(entry, anim('Nonexistent'));
+      driveAnimator(entry, anim('Nonexistent'));
+      expect(warn).toHaveBeenCalledTimes(1);
+      setCurrentWorld(createWorld()); // world swap — should reset the warn-once memory
+      driveAnimator(entry, anim('Nonexistent'));
+      expect(warn).toHaveBeenCalledTimes(2);
+      warn.mockRestore();
+    });
+
     it('does NOT warn while the rig has no clips yet (library still loading)', async () => {
       // A bare rig that gets its clips from an AnimationLibrary has an empty action
       // set for the first frames until the library's source GLB lazy-loads + merges.
