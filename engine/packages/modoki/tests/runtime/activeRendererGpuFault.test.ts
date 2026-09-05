@@ -34,6 +34,20 @@ function makeRenderer(device?: ReturnType<typeof makeGpuDevice>, domElement?: un
   return { backend: device ? { device } : undefined, domElement: domElement ?? { addEventListener: vi.fn() } };
 }
 
+/** A `domElement` fake that actually tracks + removes listeners (unlike the bare `vi.fn()` stub
+ *  above), so `#720`'s disposer tests can prove `removeEventListener` was really called and that
+ *  a subsequent dispatch no longer reaches the handler. */
+function makeDomElement() {
+  const listeners: Record<string, Array<(e: unknown) => void>> = {};
+  return {
+    addEventListener: vi.fn((type: string, cb: (e: unknown) => void) => { (listeners[type] ??= []).push(cb); }),
+    removeEventListener: vi.fn((type: string, cb: (e: unknown) => void) => {
+      listeners[type] = (listeners[type] ?? []).filter((fn) => fn !== cb);
+    }),
+    emit: (type: string, evt: unknown = {}) => { for (const cb of [...(listeners[type] ?? [])]) cb(evt); },
+  };
+}
+
 let errSpy: ReturnType<typeof vi.spyOn>;
 /** A RECOVERABLE loss logs `warn`, not `error` — the severity now carries meaning: `warn` is
  *  "rebuilding, expect a hitch", `error` is "recovery abandoned, nothing will render". */
@@ -383,5 +397,176 @@ describe('activeRenderer recovery policy', () => {
     await flush();
 
     expect(attempts.at(-1)).toBe(1); // counting starts over
+  });
+});
+
+/**
+ * DISPOSER (#720). Before this, `activeRenderer`/`attachedRenderer` were assigned and never
+ * cleared — a teardown left `getActiveRenderer()` handing consumers (the GPU particle backend,
+ * tier calibration, the memory report, the draw-call probe) a DISPOSED renderer, and the
+ * `webglcontextlost` listener from `attachWebGlContextLostListener` had no removal path at all.
+ * `setActiveRendererHandle` now returns a disposer pairing every register with an unregister,
+ * matching the convention `onRendererLost` already uses.
+ */
+describe('activeRenderer disposer (#720)', () => {
+  it('clears getActiveRenderer() to null after the disposer runs', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const renderer = makeRenderer();
+    const dispose = setActiveRendererHandle(renderer as never);
+
+    expect(getActiveRenderer()).toBe(renderer);
+    dispose();
+    expect(getActiveRenderer()).toBeNull();
+  });
+
+  it('identity guard: an OLD renderer\'s disposer must not clear a NEWER renderer\'s handle', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const r1 = makeRenderer();
+    const r2 = makeRenderer();
+    const disposeR1 = setActiveRendererHandle(r1 as never);
+    setActiveRendererHandle(r2 as never);
+
+    disposeR1(); // a late disposer from the SUPERSEDED renderer
+
+    expect(getActiveRenderer()).toBe(r2);
+  });
+
+  it('is idempotent: calling a disposer twice does not throw and does not clear a newer renderer', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const r1 = makeRenderer();
+    const disposeR1 = setActiveRendererHandle(r1 as never);
+    disposeR1();
+    expect(getActiveRenderer()).toBeNull();
+
+    // A newer renderer takes over after the first disposed cleanly.
+    const r2 = makeRenderer();
+    setActiveRendererHandle(r2 as never);
+
+    expect(() => disposeR1()).not.toThrow();
+    expect(getActiveRenderer()).toBe(r2); // the second (stale) call must not clear r2
+  });
+
+  /** ⚠️ THE SEAM THE DISPOSER ACTUALLY LIVES ON, and the regression it nearly shipped.
+   *
+   *  THREE surfaces register through the ONE `activeRenderer` global — `SceneView`, `Scene3D`
+   *  (GameView) and `ParticleEditor` — and they are alive simultaneously. A disposer that nulls the
+   *  handle whenever it still points at its own renderer is WRONG: closing the Particle Editor
+   *  panel would null it while two renderers are still drawing, and nothing re-registers
+   *  (`setActiveRenderer` runs only at renderer CREATION). Consumers then degrade silently —
+   *  `gpuEligible` routes every GPU particle effect onto the CPU sim, and `gpuMemoryReport` reads
+   *  zero, i.e. a live leak reports as no leak. That is strictly worse than the stale handle the
+   *  fix replaced, which at least still answered `isWebGPUBackend === true`.
+   *
+   *  The handle must fall back to the most recent SURVIVOR, reaching null only when the last
+   *  registrant goes. */
+  it('hands the handle to the surviving registrant when a LATER one tears down (3 live surfaces)', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const sceneView = makeRenderer();
+    const gameView = makeRenderer();
+    const particleEditor = makeRenderer();
+
+    setActiveRendererHandle(sceneView as never);
+    setActiveRendererHandle(gameView as never);
+    const closePanel = setActiveRendererHandle(particleEditor as never);
+
+    closePanel(); // the Particle Editor panel closes; the other two are still drawing
+
+    expect(getActiveRenderer()).toBe(gameView);
+    expect(getActiveRenderer()).not.toBeNull();
+  });
+
+  it('only reaches null once the LAST registrant is gone', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const a = makeRenderer();
+    const b = makeRenderer();
+    const disposeA = setActiveRendererHandle(a as never);
+    const disposeB = setActiveRendererHandle(b as never);
+
+    disposeB();
+    expect(getActiveRenderer()).toBe(a);
+    disposeA();
+    expect(getActiveRenderer()).toBeNull();
+  });
+
+  /** A repeat registration of the SAME renderer must leave ONE entry — two would mean its disposer
+   *  removes only one and the corpse stays reachable through the survivor fallback. */
+  it('re-seats rather than duplicating when the same renderer registers twice', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const older = makeRenderer();
+    const repeat = makeRenderer();
+    setActiveRendererHandle(older as never);
+    setActiveRendererHandle(repeat as never);
+    const disposeRepeat = setActiveRendererHandle(repeat as never); // registered TWICE
+
+    disposeRepeat();
+
+    expect(getActiveRenderer()).toBe(older); // not `repeat` again from a duplicate entry
+  });
+
+  /** Pins the `disposed` latch specifically. Review found the old idempotence test passed with the
+   *  latch deleted (the identity guard alone satisfied it), so it named a flag it did not cover.
+   *  This is the case only the latch can survive: a renderer that is disposed and then REGISTERS
+   *  AGAIN. Without the latch, the stale first disposer removes the live re-registration and the
+   *  handle falls back past a renderer that is still drawing. */
+  it('a stale disposer cannot unregister its renderer\'s LATER re-registration', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const r = makeRenderer();
+    const staleDispose = setActiveRendererHandle(r as never);
+    staleDispose();
+    expect(getActiveRenderer()).toBeNull();
+
+    // The SAME renderer comes back (a viewport remount reusing the renderer lease).
+    setActiveRendererHandle(r as never);
+    expect(getActiveRenderer()).toBe(r);
+
+    staleDispose(); // the first disposer fires late — it must be inert now
+
+    expect(getActiveRenderer()).toBe(r);
+  });
+
+  it('removes the webglcontextlost listener — a dispatch after dispose() reports nothing', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle } = await import('../../src/runtime/core/activeRenderer');
+    const domElement = makeDomElement();
+    const renderer = makeRenderer(undefined, domElement);
+    const dispose = setActiveRendererHandle(renderer as never);
+
+    dispose();
+    domElement.emit('webglcontextlost');
+
+    // A live listener would call reportRendererLoss(), which warns. No warn ⇒ nothing fired.
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(domElement.removeEventListener).toHaveBeenCalledWith('webglcontextlost', expect.any(Function));
+  });
+
+  it('does NOT reset lossTimes on dispose — loss count keeps counting across the teardown', async () => {
+    vi.resetModules();
+    const { setActiveRendererHandle, onRendererLost } = await import('../../src/runtime/core/activeRenderer');
+    const attempts: number[] = [];
+    onRendererLost((info) => attempts.push(info.attempt));
+
+    const a = makeGpuDevice();
+    const rendererA = makeRenderer(a);
+    const disposeA = setActiveRendererHandle(rendererA as never);
+    a.resolveLost({ reason: 'unknown' });
+    await flush();
+    expect(attempts).toEqual([1]);
+
+    disposeA(); // teardown of the viewport that owned the now-dead renderer
+
+    const b = makeGpuDevice();
+    setActiveRendererHandle(makeRenderer(b) as never); // the recovery rebuild
+    b.resolveLost({ reason: 'unknown' });
+    await flush();
+
+    // If the disposer had reset lossTimes, this would read back as attempt 1 again.
+    expect(attempts).toEqual([1, 2]);
   });
 });

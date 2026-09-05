@@ -423,6 +423,10 @@ describe('attachInvalidationListener — re-import eviction', () => {
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: (cb: (p: string, t: Set<string>) => void) => { inval.listener = cb; return () => { inval.listener = undefined; }; },
       getMeshAsset: (ref: string) => inval.assets.get(ref),
+      // #719: the listener reads the invalidated model's templates to know which materials
+      // `invalidateModel` will actually dispose. Empty here — this fixture asserts EVICTION,
+      // not variant retirement (that has its own file, invalidationVariantRetire.test.ts).
+      getTemplatesForModel: () => new Map(),
     }));
     // resolveRef is identity here (asset.model already a path) so targets.has matches.
     vi.doMock('../../src/runtime/loaders/assetManifest', () => ({ resolveRef: (r: string) => r, onFontInvalidated: () => () => {} }));

@@ -2775,6 +2775,28 @@ sliding budget (`MAX_RECOVERY_ATTEMPTS` in `RECOVERY_WINDOW_MS`), then abandon l
 Scheduling (defer out of the loss event, one rebuild at a time, coalesce a loss that lands
 mid-rebuild) is `rendering/rendererRecovery.ts`.
 
+**`setActiveRenderer` returns a DISPOSER, and every viewport must call it on teardown (#720).**
+Both module handles — `activeRenderer` and `attachedRenderer` — used to be assigned and never
+cleared, so after a teardown `getActiveRenderer()` handed consumers a **disposed** renderer:
+`particleBackend`'s `gpuEligible` would route new effects onto a dead device, `tierCalibration`
+wrote `shadowMap.enabled` into a corpse, and — worst for diagnosis — `gpuMemoryReport` reported the
+dead renderer's `info`, so *GPU-memory investigation itself could be reading a disposed renderer*.
+The `webglcontextlost` listener also had no removal path.
+
+Three properties are load-bearing, and each corresponds to a real hazard:
+- **Identity-guarded.** The disposer clears a handle only if it still points at *that* renderer, so
+  a late disposer from an old renderer cannot clear a newer one's — the same superseded-renderer
+  discipline the two false-positive filters in the detection paths already enforce.
+- **It does NOT reset `lossTimes`/`recoveryAbandoned`.** Every recovery installs a new renderer, so
+  clearing loss history on a routine swap would zero the counter on the very event it exists to
+  count, and a hard rebuild loop would read as an unbroken series of first-time losses.
+- **It does NOT clear `gpuFaultState`.** If a device loss *caused* the teardown, clearing it would
+  erase the fault recovery is responding to. Only a new renderer attaching resets it.
+
+A repeat registration of the SAME renderer hands back the *existing* detach rather than a no-op —
+otherwise a caller keeping only the latest disposer (a `bringUp()` retry does exactly that) would
+clear `activeRenderer` while leaving `attachedRenderer` pinned to the corpse.
+
 **A rebuild that REJECTS is now retried (#156), not dropped.** It used to be reported and abandoned,
 which was terminal by construction: the only thing that can ask for another attempt is a further
 `onRendererLost`, and once a rebuild has failed there is no live renderer left to lose — so that

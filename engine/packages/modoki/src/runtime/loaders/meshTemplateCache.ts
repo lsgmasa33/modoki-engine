@@ -46,6 +46,19 @@ export interface MeshTemplate {
   geometry: THREE.BufferGeometry;
   material: THREE.Material;
   name: string;
+  /** True for a template registered by GAME code via `registerRuntimeMeshTemplate`, whose
+   *  `material` is **borrowed, not owned** — typically a scene material resolved by GUID, or a
+   *  shared module-level constant (`games/sling`'s `COLLIDER_ONLY_MAT`).
+   *
+   *  ⚠️ **This flag is what stops `invalidateModel` from disposing a material it does not own
+   *  (#719).** One `cache` map holds two kinds of template with OPPOSITE material ownership: a
+   *  GLB template owns its embedded material (dispose it), a runtime one borrows (never).
+   *  Before the flag, the only thing keeping them apart was that no runtime key happened to
+   *  contain `::` — so `modelPathOfKey` indexed them under themselves and a GLB path never
+   *  matched. That is a coincidence of naming, not an invariant: one runtime key derived from a
+   *  model path (`${glbPath}::custom`) would have made `invalidateModel` dispose a live scene's
+   *  shared material. Make the ownership explicit rather than relying on the key format. */
+  runtimeOwnedMaterial?: boolean;
 }
 
 /** Hierarchy entry extracted during loadModelTemplates — stores baked world
@@ -443,6 +456,24 @@ export function invalidateModel(modelPath: string) {
   emitAssetInvalidated('model', modelPath, targets);
 
   const disposedGeo = new Set<string>();
+  // #719: the GLB-EMBEDDED material and its textures, which this walk used to drop on the floor.
+  // `tmpl.material` is `mesh.material` straight off the GLTFLoader parse (see `cacheSet` below),
+  // carrying the model's base-colour / normal / ORM textures — and textures dominate GPU bytes,
+  // so the outgoing model's whole texture set used to survive every scene swap. MEASURED on
+  // `games/3d-test` before this change: swapping tropical-island <-> empty leaked +9 textures and
+  // +75.6 MB per cycle, reaching 398 MB after four swaps — clear of the `com.apple.WebKit.GPU`
+  // jetsam band (#590) in four scene transitions.
+  //
+  // `disposeMaterial` is the walk `disposeAllCachedResources` already uses: it disposes a material
+  // AND its textures, releasing refcounted shared ones and directly disposing the rest. GLB-embedded
+  // textures are never in the shared cache (`isSharedTexture` is stamped only inside `loadTexture3D`,
+  // which a GLTFLoader parse never goes through), so they take the direct-dispose branch — exactly
+  // what `riggedModelCache.disposePrototype` already does for its own GLB prototypes.
+  //
+  // Both dedupes are load-bearing: several templates in one model share a material, and several
+  // materials share a texture.
+  const disposedMat = new Set<string>();
+  const disposedTex = new Set<string>();
   for (const target of targets) {
     // O(meshes-in-model) via the per-model index instead of scanning all keys.
     for (const key of [...(modelTemplateKeys.get(target) ?? [])]) {
@@ -450,6 +481,13 @@ export function invalidateModel(modelPath: string) {
       if (!disposedGeo.has(tmpl.geometry.uuid)) {
         tmpl.geometry.dispose();
         disposedGeo.add(tmpl.geometry.uuid);
+      }
+      // `runtimeOwnedMaterial` = the material is borrowed (a scene material, or a shared
+      // module constant). Disposing it would break a LIVE scene, so skip it — geometry above is
+      // still freed, which this cache does own.
+      if (!tmpl.runtimeOwnedMaterial && !disposedMat.has(tmpl.material.uuid)) {
+        disposeMaterial(tmpl.material, disposedTex);
+        disposedMat.add(tmpl.material.uuid);
       }
       cacheDelete(key);
     }
@@ -473,7 +511,7 @@ export function invalidateModel(modelPath: string) {
     const assetModelPath = refToPath(asset.model);
     if (assetModelPath === modelPath) meshAssetCache.delete(path);
   }
-  console.log(`[MeshCache] Invalidated + disposed cache for ${modelPath} (${targets.size} GLBs, ${disposedGeo.size} geometries)`);
+  console.log(`[MeshCache] Invalidated + disposed cache for ${modelPath} (${targets.size} GLBs, ${disposedGeo.size} geometries, ${disposedMat.size} materials, ${disposedTex.size} textures)`);
 }
 
 /** Load a GLB and extract mesh templates into the cache.
@@ -774,7 +812,10 @@ export function registerRuntimeMeshTemplate(key: string, geometry: THREE.BufferG
   }
   const prev = cache.get(key);
   if (prev && prev.geometry !== geometry) prev.geometry.dispose();
-  cacheSet(key, { geometry, material, name: key });
+  // `runtimeOwnedMaterial` marks the material as BORROWED — see `MeshTemplate`. Without it,
+  // `invalidateModel` would treat this like a GLB template and dispose a material this cache
+  // does not own.
+  cacheSet(key, { geometry, material, name: key, runtimeOwnedMaterial: true });
 }
 
 /** Remove a runtime mesh template registered via `registerRuntimeMeshTemplate` and
@@ -1307,9 +1348,15 @@ function fetchMaterial(matPath: string): Promise<void> {
  *  ⚠️ **IT DOES NOT KNOW ABOUT MATERIAL CLONES, AND IT CANNOT.** Tint, MaterialInstance,
  *  light-mask, video and prewarm clones all hold this cache's materials as their base and share
  *  their texture references (#318, `rendering/derivedMaterials.ts`), and this function releases
- *  every one of those textures unconditionally. It cannot drain them itself: those caches live in
- *  `rendering/` (L2) and this module is `loaders/` (L3), so reaching them would invert the layer
- *  contract.
+ *  every one of those textures unconditionally. It cannot sensibly drain them itself: it does not
+ *  know which entities are bound to what, and the invalidation LISTENER on the rendering side does
+ *  (that is where #719's `retireVariantsOf` call lives).
+ *
+ *  ⚠️ **This used to say reaching those caches "would invert the layer contract". That is wrong,
+ *  and it was repeated into #719's first draft before being caught in review.** `loaders` is in
+ *  `L3_FOLDERS` and `rendering/scene3DSync.ts` is in `L3_RECLASSIFIED_FILES`
+ *  (`engine/eslint.config.js`) — both L3-unrestricted, so the import would be legal in either
+ *  direction. The reason is ownership and knowledge, not layering.
  *
  *  Today that is harmless because **nothing in production calls this** — `releaseAllForScene` is
  *  the release entry point app/editor code uses (see CLAUDE.md § Resource Management), and the

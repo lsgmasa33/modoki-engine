@@ -2599,7 +2599,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       releaseRenderer(container);
       return;
     }
-    await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
+    const disposeActiveRenderer = await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
+    // Compose onto the renderer's own `dispose()` rather than adding a second teardown path:
+    // `rendererLease.ts`'s `releaseRenderer`/`discardRenderer` are the only callers of
+    // `renderer.dispose()` for a leased renderer, so wrapping it here makes both correct for
+    // free, the same pattern `scene3DSync.ts`'s `createRenderer` already uses.
+    const priorDispose = renderer.dispose.bind(renderer);
+    renderer.dispose = (...args: Parameters<typeof priorDispose>) => {
+      disposeActiveRenderer();
+      return priorDispose(...args);
+    };
     noteRendererProgress('renderer registered (setActiveRenderer called)');
     // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
     // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so

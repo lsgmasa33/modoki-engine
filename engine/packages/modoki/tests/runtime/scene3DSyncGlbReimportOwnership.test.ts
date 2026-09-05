@@ -47,6 +47,10 @@ async function setup() {
     retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
     onModelInvalidated: (cb: (p: string, t: Set<string>) => void) => { inval.listener = cb; return () => { inval.listener = undefined; }; },
     getMeshAsset: (ref: string) => inval.assets.get(ref),
+    // #719: the listener reads the invalidated model's templates to decide which materials
+    // are about to be disposed. Empty here — this fixture is about ownedMaterials staying at
+    // 0, and variant retirement has its own file (invalidationVariantRetire.test.ts).
+    getTemplatesForModel: () => new Map(),
   }));
   vi.doMock('../../src/runtime/loaders/assetManifest', () => ({
     resolveRef: (r: string) => r, onFontInvalidated: () => () => {},

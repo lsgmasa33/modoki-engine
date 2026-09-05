@@ -75,12 +75,17 @@ const setActiveRendererEpoch = createSupersessionToken();
 
 /** Register the active renderer so the KTX2Loader can detect which compressed
  *  formats the GPU supports. Must run after `renderer.init()` for WebGPU.
- *  Idempotent + cheap — safe to call from every renderer creation site. */
-export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<void> {
+ *  Idempotent + cheap — safe to call from every renderer creation site.
+ *
+ *  Returns a disposer (from `setActiveRendererHandle`) for the caller to invoke at viewport
+ *  teardown. A superseded call (either early-return below) registered nothing with
+ *  `activeRenderer.ts`, so it hands back a no-op disposer rather than `undefined` — the caller
+ *  always has *something* to store and call, without needing to know it was superseded. */
+export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<() => void> {
   const stillLatest = setActiveRendererEpoch.begin();
   try {
     const loader = await getKTX2Loader();
-    if (!stillLatest()) return; // superseded — a newer call already owns `detectedCaps`
+    if (!stillLatest()) return () => {}; // superseded — a newer call already owns `detectedCaps`
     loader.detectSupport(renderer as never);
     const cfg = (loader as unknown as { workerConfig?: { astcSupported?: boolean } }).workerConfig;
     detectedCaps = { astc: !!cfg?.astcSupported };
@@ -89,11 +94,12 @@ export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRe
   }
   // Re-check: the catch path above resumes from the same `await` with no further guard yet, so a
   // superseded call must not activate its (possibly discarded) renderer either.
-  if (!stillLatest()) return;
-  setActiveRendererHandle(renderer);
+  if (!stillLatest()) return () => {};
+  const dispose = setActiveRendererHandle(renderer);
   // A 3D renderer exists, so a GLB parse is likely imminent — start fetching the on-demand
   // loader chunks now rather than on the critical path of the first model load (#254).
   prewarmGlbLoaders();
+  return dispose;
 }
 
 /** Default delay before `ensureKtx2Caps` gives up waiting for a real viewport and stands up a

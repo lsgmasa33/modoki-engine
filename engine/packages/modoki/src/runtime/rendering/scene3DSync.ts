@@ -40,7 +40,7 @@ import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
   retiredEnvironments, disposeRetiredEnvironment,
-  retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial,
+  retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial, getTemplatesForModel,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import {
@@ -695,6 +695,22 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
  *  every mesh. It's visually inert: unused by scene-environment materials, and ±1e-4 on
  *  a real envMap material is imperceptible. Call this on the frame `environmentIntensity`
  *  changes, before rendering. */
+/** Every distinct material bound anywhere under `obj`, deduped.
+ *
+ *  Walks the subtree because an evicted entity's root is often a `Group`/`LOD` whose materials
+ *  live on child meshes — reading `obj.material` alone would miss every one of them. Handles the
+ *  material-ARRAY form (multi-material meshes) the same way the other walks in this file do. */
+function materialsOf(obj: THREE.Object3D): THREE.Material[] {
+  const seen = new Set<THREE.Material>();
+  obj.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.material) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const mat of mats) if (mat) seen.add(mat);
+  });
+  return [...seen];
+}
+
 export function refreshEnvIntensityObserver(scene: THREE.Scene): void {
   // Dedupe: materials are shared across meshes (cached per GUID). Cycle each material's
   // tick exactly ONCE — cycling per-mesh would advance a material used by N meshes N
@@ -1346,9 +1362,50 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       const modelPath = resolveRef(asset.model);
       if (modelPath && targets.has(modelPath)) toEvict.push(id);
     }
+    // Exactly the materials `invalidateModel` will dispose: the OWNED template materials of the
+    // invalidated models. Read before the eviction loop because it is also read per object, and
+    // safe to read at all only because this listener runs before `invalidateModel` clears the
+    // cache. `runtimeOwnedMaterial` templates are excluded — their material is borrowed, so
+    // `invalidateModel` leaves it alone and nothing derived from it is at risk.
+    const disposedMats = new Set<THREE.Material>();
+    for (const t of targets) {
+      for (const tmpl of getTemplatesForModel(t).values()) {
+        if (!tmpl.runtimeOwnedMaterial) disposedMats.add(tmpl.material);
+      }
+    }
+
     for (const id of toEvict) {
       const obj = state.ecsObjects.get(id);
-      if (obj) scene.remove(obj);
+      if (obj) {
+        // #719: retire any light-mask variant derived from a material `invalidateModel` is about
+        // to dispose, BEFORE it disposes it.
+        //
+        // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
+        // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
+        // light-mask variant is such a clone. On a scene swap the variant caches are already
+        // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
+        // re-import of a live model swaps no world at all, so without this a variant would sit in
+        // `owned` sampling textures that are about to be freed.
+        //
+        // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
+        // A mesh with a material override binds the shared cached `.mat.json`
+        // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
+        // disposes. Retiring on that base would delete variants belonging to other, still-live
+        // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
+        // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
+        // about to be freed.
+        //
+        // Runs on this side because this listener is what knows WHICH objects are being evicted —
+        // not for layering reasons: `loaders/` and this file are both L3-unrestricted
+        // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
+        // would have been legal. The ordering holds because `invalidateModel` fires
+        // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
+        for (const mat of materialsOf(obj)) {
+          const base = baseOf(mat);
+          if (disposedMats.has(base)) retireVariantsOf(base);
+        }
+        scene.remove(obj);
+      }
       state.ecsObjects.delete(id);
       state.ecsSprites.delete(id);
       state.ecsMaterials.delete(id);
@@ -4517,6 +4574,15 @@ export async function createRenderer(
   const r = await makeWebGPURenderer(container, { applyWebSizeMode: true });
   // Awaited: registering now imports three's KTX2Loader on demand (#254), and the caps it
   // detects must be in place before anything this renderer draws asks for a KTX2 texture.
-  await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
+  const disposeActiveRenderer = await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
+  // Compose onto the dispose wrapper above (the `noteGpuContextDestroyed` one) — same pattern,
+  // same reason: every existing `renderer.dispose()` call site (Scene3D's unmount/rebuild, the
+  // KTX2 probe, the editor viewports) stays correct for free instead of needing a second call
+  // site to keep in sync.
+  const priorDispose = r.dispose.bind(r);
+  r.dispose = (...args: Parameters<typeof priorDispose>) => {
+    disposeActiveRenderer();
+    return priorDispose(...args);
+  };
   return r;
 }

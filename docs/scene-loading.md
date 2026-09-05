@@ -78,6 +78,35 @@ anything — a scene's resources stay resident until the scene changes. (Verifie
 per-entity `releaseModel`/`releaseMesh`/`releaseMaterial` calls outside the cache module
 itself.)
 
+⚠️ **`invalidateModel` disposes the GLB-EMBEDDED material and its textures, and the safety of that
+rests on an ORDERING plus a clone drain (#719).** The material is `mesh.material` straight off the
+GLTFLoader parse, so it is the model's own and nothing else owns it — but `Material.clone()` copies
+texture *references*, so any derived clone still alive would be left sampling freed textures.
+
+- **On a scene swap this is safe by ordering:** `SceneManager` fires `onWorldSwap` — which drains the
+  tint, MaterialInstance, light-mask and retired-derived caches — *strictly before*
+  `releaseAllForScene`.
+- **On a RE-IMPORT it is not.** The property that matters — not a list of call sites, which goes
+  stale on the next one added — is: **any caller of `invalidateModel` that is neither last-owner-gated
+  nor world-swapping**. Every editor re-import path is one, and nothing drains the clone caches for
+  them. `scene3DSync`'s invalidation listener therefore calls `retireVariantsOf` before the dispose.
+  It runs on that side because it is what knows *which objects are being evicted* — **not** for
+  layering reasons: `loaders/` is in `L3_FOLDERS` and `scene3DSync.ts` is in
+  `L3_RECLASSIFIED_FILES` (`engine/eslint.config.js`), so both are L3-unrestricted and either
+  direction would have been legal.
+- ⚠️ **It retires only materials `invalidateModel` will actually dispose**, not every material on an
+  evicted object. A mesh with a material override binds the shared cached `.mat.json`
+  (`resolveMaterialForMesh(...) || template.material`), which is never disposed here; retiring on
+  that base would delete variants belonging to other still-live entities sharing the override, and
+  each would re-mint a clone + pipeline and render **unlit** until it compiled.
+
+⚠️ **A `.processed.glb` template material usually carries NO textures at all**, because the importer
+extracts them into `.mat.json` + shared refcounted textures. So this fix is invisible on any model
+that went through the converter — measured on `games/3d-test`'s island: 114 templates, 11 materials,
+**zero** textures. It matters for GLBs that keep their embedded materials. Do not mistake a flat
+texture count after a swap for this fix working or failing; the scene-swap growth measured on that
+fixture is a *different*, still-undiagnosed leak (#739).
+
 **Transitive deps** (a `.mesh.json` → its `.glb` model + `.mat.json` material; a material → its
 textures) are acquired/released under the same `sceneId`, captured in a per-(scene,mesh) snapshot
 at acquire time so a mid-scene editor **re-import** (`invalidateModel`, which evicts cache
@@ -116,8 +145,9 @@ a site that has only the former is unguarded.
   a member and a non-empty set containing the caller trivially implies the set is non-empty. Keep
   both anyway: it's the same shape as `acquireMesh`'s established guard, and a future edit that adds
   code after the check would restore the distinction. On a positive hit, the guard invalidates via
-  `invalidateModel`, which is the complete disposal answer (geometry, cache entries, hierarchy
-  cache, in-flight `loading` entries, dependent `meshAssetCache` entries, LOD siblings, and it
+  `invalidateModel`, which is the complete disposal answer (geometry, **the GLB-embedded material
+  and its textures**, cache entries, hierarchy cache, in-flight `loading` entries, dependent
+  `meshAssetCache` entries, LOD siblings, and it
   broadcasts `emitAssetInvalidated` before disposing). Because the owner is added before the await,
   every other concurrent `acquireModel` for the same path has *also* already added its owner by the
   time this guard runs — so "is the owner set now empty" can never free something a live scene owns.

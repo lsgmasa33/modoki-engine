@@ -566,7 +566,7 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
   it('swallows a detectSupport throw with a warn (renderer still set)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(() => { throw new Error('no gpu'); });
-    await expect(setActiveRenderer({} as never)).resolves.toBeUndefined();
+    await expect(setActiveRenderer({} as never)).resolves.toEqual(expect.any(Function));
     expect(warn).toHaveBeenCalled();
     expect(getActiveRenderer()).toBeDefined();
     detect.mockRestore();

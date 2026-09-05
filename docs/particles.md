@@ -181,6 +181,36 @@ The render mesh is an `InstancedBufferGeometry` whose per-instance state comes f
 over-life size/opacity/color are sampled from small baked LUT textures (`gpuLut.ts`). Compute is
 dispatched against the renderer that actually draws the mesh, captured via `onBeforeRender`.
 
+⚠️ **The four storage buffers are owned by `GpuEntry` and MUST be freed by hand — three exposes no
+public API for it (#717).** They used to be locals in `build()`, reachable only from the TSL closures
+that captured them, so `dispose()` ran cleanly, reported success and freed **nothing**. Two facts make
+this non-obvious, both checked in three r0.184's source rather than assumed:
+
+- **`geometry.dispose()` cannot reach them.** `Geometries.initGeometry`'s `onDispose` deletes only
+  the render object's *attributes* and index; these are **storage bindings**, never geometry
+  attributes (`buildMesh` sets only `position`/`uv`/`index`).
+- **`computeNode.dispose()` cannot either.** It *is* public and wired — `Renderer.compute()`
+  registers a listener that drops the pipeline, bind groups and node cache — but
+  `Bindings.deleteForCompute` frees the *binding*, not the buffer behind it.
+
+The only route to `GPUBuffer.destroy()` is `Attributes.delete(attr)` → `backend.destroyAttribute`,
+and `Renderer` has no `attributes` getter, so `freeStorageBuffer` reaches the private `_attributes`
+deliberately, guarded at every hop. **If a future three release adds a public free, replace that
+helper's body — the call sites do not change.**
+
+**`build()` REUSES the four buffers when `count` is unchanged**, which is what makes editor tuning
+cheap: `maxParticles` is only ONE field of `renderStructuralKey`, so every blend / aspect / tiles /
+anchor / sprite-mode / texture edit also rebuilds with an identical count. Safe because a rebuild
+re-inits the pool regardless (`inited = false` → `computeInit` respawns every slot), so no stale
+particle state survives. Superseded buffers and compute nodes are freed at the **END** of `build()`,
+after the replacements are assigned — `Pipelines.delete` decrements `usedTimes` and releases the
+compute program at zero, so freeing first would drop a program the new kernel is about to ask for.
+
+MEASURED on `games/3d-test` (15k particles, 12 blend-only rebuilds): **before, +4 buffers and
++780,000 B per rebuild, 9.36 MB orphaned, perfectly linear; after, zero growth.** Note the sizing is
+**13 floats per particle, not 11** — WebGPU pads each `vec3` storage element to 16 B, so `pos` and
+`vel` cost 4 floats each. Any estimate derived from the element types alone understates by 18%.
+
 ⚠️ **That capture creates an ordering hole, and a fresh pool must therefore stay HIDDEN for its
 first frames (#338).** The renderer is only obtainable from `onBeforeRender` — i.e. from a DRAW —
 so the first draw necessarily happens *before* the first `update()` that can dispatch anything.

@@ -15,6 +15,23 @@ import { rawNow } from './clock';
 
 let activeRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
 
+/** Every renderer currently registered, oldest first; `activeRenderer` is always the LAST entry.
+ *
+ *  ⚠️ **A STACK, not a single slot, because three surfaces register through one global** —
+ *  `SceneView`, `Scene3D` (GameView) and `ParticleEditor` — and they are alive at the same time.
+ *  The obvious teardown ("null it if it is still mine") is WRONG here, and worse than the leak it
+ *  fixes: closing the Particle Editor panel would null the handle while SceneView and GameView are
+ *  still drawing every frame, and nothing re-registers (`setActiveRenderer` runs only at renderer
+ *  CREATION). Everything reading the handle then degrades silently — `gpuEligible` routes every
+ *  `simulation: 'gpu'` effect onto the CPU sim, `applyLightMask` stops masking, and
+ *  `gpuMemoryReport` reports zero GPU bytes, i.e. **a live leak reads as no leak**. Before the
+ *  disposer existed the stale handle at least still answered `isWebGPUBackend === true`.
+ *
+ *  So a disposer removes its OWN entry and hands the handle back to the most recent survivor,
+ *  reaching null only when the last registrant goes. Membership is by identity, so a repeat
+ *  registration re-seats rather than duplicating. */
+const registrants: Array<WebGPURenderer | THREE.WebGLRenderer> = [];
+
 /** Resolves on the FIRST `setActiveRendererHandle` call. Editor bootstrap awaits this before
  *  calling `sceneManager.loadScene()` so the KTX2 transcoder has the GPU caps it needs before
  *  any texture load fires — without that ordering, scene preload races renderer init and
@@ -62,15 +79,38 @@ export function isRendererReadyFired(): boolean {
  *  Idempotent + cheap — safe to call from every renderer creation site. Every call site
  *  (`loaders/textureResolver.ts`'s `setActiveRenderer` wrapper — the only caller) runs
  *  `KTX2Loader.detectSupport` before reaching here, so a real viewport registering always
- *  implies KTX2 caps are ready too; mark that channel alongside this one. */
-export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
+ *  implies KTX2 caps are ready too; mark that channel alongside this one.
+ *
+ *  Returns a disposer: on teardown it clears `activeRenderer`/`attachedRenderer` and detaches
+ *  the GPU-fault listeners, but ONLY if they still point at THIS renderer (the same
+ *  superseded-renderer identity guard the fault-detection paths already use) — a late disposer
+ *  from an old renderer must never clear a newer one's handle. Idempotent; never throws. */
+export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
+  // Re-seat rather than duplicate: a repeat registration of the same renderer must leave ONE entry,
+  // or its disposer would remove only one of them and the corpse would stay reachable.
+  const existing = registrants.indexOf(renderer);
+  if (existing >= 0) registrants.splice(existing, 1);
+  registrants.push(renderer);
   activeRenderer = renderer;
   if (!rendererReadyFired) {
     rendererReadyFired = true;
     _rendererReadyResolve();
   }
   markKtx2CapsReady('viewport');
-  attachGpuFaultListeners(renderer);
+  const detachFaultListeners = attachGpuFaultListeners(renderer);
+
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    // Drop THIS renderer and hand the handle to the most recent survivor — null only when the
+    // last registrant goes. See `registrants`: nulling unconditionally breaks the viewports that
+    // are still drawing.
+    const at = registrants.indexOf(renderer);
+    if (at >= 0) registrants.splice(at, 1);
+    activeRenderer = registrants[registrants.length - 1] ?? null;
+    try { detachFaultListeners(); } catch { /* a disposer must never throw */ }
+  };
 }
 
 // ── GPU fault channel ──────────────────────────────────────────────────────────────────────
@@ -116,6 +156,9 @@ let gpuFaultState: GpuFaultState | null = null;
  *  viewport remount) get a clean slate instead of inheriting a previous renderer's fault state,
  *  and lets attaching to the SAME renderer twice stay a no-op (idempotent). */
 let attachedRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
+/** The detach paired with `attachedRenderer` — handed back to a REPEAT registration of the same
+ *  renderer so every disposer for it detaches for real (#720). Cleared by that detach. */
+let attachedDetach: (() => void) | null = null;
 
 /** Current GPU fault, or null when nothing has gone wrong. Read by the editor-state payload
  *  (`agentEditorOps.ts`) and by `explainCaptureFailure` via the same channel `frameLoop`/
@@ -254,9 +297,23 @@ function reportRendererLoss(api: 'WebGL' | 'WebGPU', reason?: string, message?: 
 /** Attach GPU fault listeners to a newly-activated renderer. NEVER throws into the caller — the
  *  device/backend shape is version-dependent (three's WebGPU internals are not a stable public
  *  API), so every hop is guarded; a failure here just means faults go unreported, not that
- *  `setActiveRendererHandle` fails. */
-function attachGpuFaultListeners(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
-  if (renderer === attachedRenderer) return; // already attached — idempotent
+ *  `setActiveRendererHandle` fails.
+ *
+ *  Returns a detach function (composed into `setActiveRendererHandle`'s disposer): it removes the
+ *  `webglcontextlost` listener and clears `attachedRenderer`, both ONLY if still pointing at THIS
+ *  renderer — the same identity guard the loss-detection callbacks above already use. Deliberately
+ *  does NOT touch `gpuFaultState` or `lossTimes`/`recoveryAbandoned`: see the module-level comments
+ *  on those — clearing fault/loss history on teardown would erase the very fault a teardown might
+ *  be responding to, or zero the counter that detects a rebuild loop. */
+function attachGpuFaultListeners(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
+  // Already attached — hand back the EXISTING detach, not a fresh no-op. A no-op here would
+  // reopen #720 on the double-registration path: `setActiveRendererHandle` is documented as safe
+  // to call twice for the same renderer (a `bringUp()` retry does), and a caller that keeps only
+  // the LATEST disposer would then clear `activeRenderer` while leaving `attachedRenderer` pinned
+  // to the corpse and the `webglcontextlost` listener still on its canvas — the exact leak this
+  // change exists to close. The returned detach is itself idempotent, so both disposers running
+  // is harmless.
+  if (renderer === attachedRenderer) return attachedDetach ?? (() => {});
   attachedRenderer = renderer;
   gpuFaultState = null; // a new renderer starts with a clean slate
 
@@ -264,9 +321,20 @@ function attachGpuFaultListeners(renderer: WebGPURenderer | THREE.WebGLRenderer)
     attachWebGpuDeviceListeners(renderer);
   } catch { /* must never throw into setActiveRendererHandle */ }
 
+  let removeWebGlListener = () => {};
   try {
-    attachWebGlContextLostListener(renderer);
+    removeWebGlListener = attachWebGlContextLostListener(renderer);
   } catch { /* must never throw into setActiveRendererHandle */ }
+
+  let detached = false;
+  const detach = (): void => {
+    if (detached) return;
+    detached = true;
+    try { removeWebGlListener(); } catch { /* must never throw into the disposer */ }
+    if (attachedRenderer === renderer) { attachedRenderer = null; attachedDetach = null; }
+  };
+  attachedDetach = detach;
+  return detach;
 }
 
 /** Reach through three's WebGPU backend to the raw `GPUDevice` and attach `device.lost` +
@@ -330,15 +398,20 @@ function attachWebGpuDeviceListeners(renderer: WebGPURenderer | THREE.WebGLRende
  *  the same event changes nothing; believing it was the fix would have been the trap. Note we
  *  are a SECOND listener on this canvas: three's fires too and flips its private `_isDeviceLost`,
  *  which is precisely why the old renderer is unusable and a rebuild is the only route back. */
-function attachWebGlContextLostListener(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
+function attachWebGlContextLostListener(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
   const el = (renderer as unknown as { domElement?: EventTarget })?.domElement;
-  el?.addEventListener?.('webglcontextlost', (e: Event) => {
+  const handler = (e: Event): void => {
     // Superseded-renderer guard, matching the WebGPU path: a canvas belonging to a renderer we
     // have already replaced must not report — its death is expected teardown, not a live fault.
     if (renderer !== attachedRenderer) return;
     const message = (e as unknown as { statusMessage?: string })?.statusMessage || undefined;
     reportRendererLoss('WebGL', 'webglcontextlost', message);
-  });
+  };
+  el?.addEventListener?.('webglcontextlost', handler);
+  // Returned so `attachGpuFaultListeners`' detach function can take this listener back off the
+  // canvas on teardown — otherwise a disposed renderer's `domElement` (which can outlive the
+  // renderer, or be reused) keeps a stale listener alive whose renderer is already gone.
+  return () => { el?.removeEventListener?.('webglcontextlost', handler); };
 }
 
 // ── KTX2 transcoder-caps channel ───────────────────────────────────────────────────────────
