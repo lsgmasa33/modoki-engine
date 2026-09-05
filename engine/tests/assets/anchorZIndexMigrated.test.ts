@@ -71,15 +71,66 @@ function sceneFiles(root: string): string[] {
   });
 }
 
-function entitiesWithAnchorZIndex(file: string): { ent: Ent; anchor: Record<string, unknown> }[] {
-  const data = JSON.parse(fs.readFileSync(file, 'utf8')) as { entities?: Ent[] };
-  const hits: { ent: Ent; anchor: Record<string, unknown> }[] = [];
-  for (const ent of data.entities ?? []) {
-    const anchor = ent.traits?.['UIAnchor'];
-    if (anchor && typeof anchor === 'object' && 'zIndex' in (anchor as object)) {
-      hits.push({ ent, anchor: anchor as Record<string, unknown> });
+type Hit = { ent: Ent; anchor: Record<string, unknown>; location: string };
+
+function anchorZIndexBag(bag: unknown): Record<string, unknown> | undefined {
+  if (!bag || typeof bag !== 'object') return undefined;
+  const anchor = (bag as Record<string, unknown>)['UIAnchor'];
+  if (anchor && typeof anchor === 'object' && 'zIndex' in (anchor as object)) {
+    return anchor as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+/** Walks the same five places `migrate-anchor-zindex.mjs`'s `visitEntry()` does — that function is
+ *  the canonical statement of where a `UIAnchor.zIndex` can hide (`traits`, `overrides[localId]`,
+ *  `added[]`/`children[]` subtrees, `nestedOverrides[path][localId]`) and why each one is live; this
+ *  just mirrors its reach instead of re-deriving it. One shape it's worth flagging here because it's
+ *  easy to get wrong reading this function alone: `nestedOverrides` is path-keyed over a localId map
+ *  (`{path: {localId: {TraitName: fields}}}`), so unlike `overrides` it takes TWO `Object.entries`
+ *  calls to reach the trait bag. Every step is `typeof x === 'object'`-guarded because entities and
+ *  override bags are arbitrary JSON on disk — a malformed file must produce zero hits, not a throw
+ *  that takes the whole gate down for an unrelated reason. */
+function visitEntity(entry: unknown, hits: Hit[]): void {
+  if (!entry || typeof entry !== 'object') return;
+  const ent = entry as Ent;
+
+  const traitsAnchor = anchorZIndexBag(ent.traits);
+  if (traitsAnchor) hits.push({ ent, anchor: traitsAnchor, location: 'traits' });
+
+  const overrides = (entry as Record<string, unknown>)['overrides'];
+  if (overrides && typeof overrides === 'object') {
+    for (const [overrideLocalId, bag] of Object.entries(overrides)) {
+      const anchor = anchorZIndexBag(bag);
+      if (anchor) hits.push({ ent, anchor, location: `overrides[${overrideLocalId}]` });
     }
   }
+
+  const added = (entry as Record<string, unknown>)['added'];
+  if (Array.isArray(added)) {
+    for (const child of added) visitEntity(child, hits);
+  }
+  const children = (entry as Record<string, unknown>)['children'];
+  if (Array.isArray(children)) {
+    for (const child of children) visitEntity(child, hits);
+  }
+
+  const nestedOverrides = (entry as Record<string, unknown>)['nestedOverrides'];
+  if (nestedOverrides && typeof nestedOverrides === 'object') {
+    for (const [nestedPath, pathBag] of Object.entries(nestedOverrides)) {
+      if (!pathBag || typeof pathBag !== 'object') continue;
+      for (const [nestedLocalId, bag] of Object.entries(pathBag)) {
+        const anchor = anchorZIndexBag(bag);
+        if (anchor) hits.push({ ent, anchor, location: `nestedOverrides['${nestedPath}'][${nestedLocalId}]` });
+      }
+    }
+  }
+}
+
+function entitiesWithAnchorZIndex(file: string): Hit[] {
+  const data = JSON.parse(fs.readFileSync(file, 'utf8')) as { entities?: Ent[] };
+  const hits: Hit[] = [];
+  for (const ent of data.entities ?? []) visitEntity(ent, hits);
   return hits;
 }
 
@@ -90,8 +141,12 @@ describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () =>
     for (const root of ['games', 'demos']) {
       for (const file of sceneFiles(path.join(REPO, root))) {
         scanned.push(file);
-        for (const { ent } of entitiesWithAnchorZIndex(file)) {
-          offenders.push(`${path.relative(REPO, file)} → entity ${JSON.stringify(ent.name ?? '?')}`);
+        for (const { ent, location } of entitiesWithAnchorZIndex(file)) {
+          // `traits` is the common case and reads the same as before this widening; every other
+          // location gets a suffix naming exactly which override/subtree carried it, matching the
+          // codemod's own location vocabulary (`migrate-anchor-zindex.mjs`'s `visitEntry`).
+          const suffix = location === 'traits' ? '' : ` (${location})`;
+          offenders.push(`${path.relative(REPO, file)} → entity ${JSON.stringify(ent.name ?? '?')}${suffix}`);
         }
       }
     }
