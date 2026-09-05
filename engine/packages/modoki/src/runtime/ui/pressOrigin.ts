@@ -64,9 +64,11 @@
  *  interactive — ones carrying a click binding. So a panel with NO binding of its own is
  *  transparent to `closest()`, the press resolves straight past it to the dismissing scrim, and
  *  the gate passes. wordweave's dictionary is covered because `dictionaryPanelSwallow` (a
- *  deliberate no-op) already made its panel interactive; Court's `StorePanel` and `RulesPanel`
- *  carry nothing, so neither is covered — a drag that starts on Court's scrollable
- *  `StoreItemList` and releases on the scrim still dismisses the store (#722).
+ *  deliberate no-op) already made its panel interactive; authoring a swallow is what OPTS a panel
+ *  in. Court's `StorePanel` now carries one (`court.storePanelSwallow`), so a drag that starts on
+ *  its scrollable `StoreItemList` and releases on the scrim no longer dismisses the store.
+ *  Court's remaining card dialogs — `RulesPanel` and others — still carry nothing and remain
+ *  uncovered; tracked in #722.
  *
  *  The general fix would be to stamp the marker on any `overflow: 'scroll'` node too, on the
  *  grounds that a scrolling box owns gestures that begin in it. Deliberately NOT done here: it

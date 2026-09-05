@@ -411,9 +411,11 @@ because `focusManager` calls `applyBindings` directly rather than through a DOM 
 ⚠️ **It protects a panel only where that panel is ALREADY interactive.** The marker goes on nodes
 with a click binding, so a panel carrying none is transparent to `closest()` and the press resolves
 past it to the dismissing scrim. wordweave's dictionary is covered only because its no-op
-`dictionaryPanelSwallow` made the panel interactive; Court's `StorePanel`/`RulesPanel` have none and
-are not covered (#722). Stamping the marker on `overflow: 'scroll'` nodes would generalise it, at
-the cost of changing what a tap on empty list space does — a feel call, not a refactor.
+`dictionaryPanelSwallow` made the panel interactive; authoring a swallow is what OPTS a panel in.
+Court's `StorePanel` is now covered (it authors `court.storePanelSwallow`); its remaining card
+dialogs — `RulesPanel` and others — still carry none and remain uncovered (#722). Stamping the
+marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
+empty list space does — a feel call, not a refactor.
 
 #### Engine built-in `UIAction`s
 
