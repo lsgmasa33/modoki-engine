@@ -481,6 +481,68 @@ describe('player-prefs-write refuses mid-swap; player-prefs-read does not (#438)
   });
 });
 
+describe('player-prefs-write vs a protected key (#630 review findings 4 & 5)', () => {
+  /** Seeds one key under an envelope version this build has no migration for — `has()`/`keys()`
+   *  report it as absent (same as any other #630-protected key), but `isProtected()` sees it. */
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-protected:save', JSON.stringify({ v: 2, d: { fromNewerBuild: true } }));
+    await PlayerPrefs.init({ namespace: 'unit-protected', backend });
+  });
+
+  it("delete removes a protected key and reports success — set()'s own refusal message says to do exactly this", async () => {
+    // Before the fix: `has()` is false for a protected key (by design — see playerPrefs.ts), so
+    // the op's NOT_FOUND guard refused this as a missing key, and the only remaining escape
+    // hatch reachable from the agent surface was `action:'clear' confirm:true`, which wipes the
+    // whole namespace rather than the one key that needed clearing.
+    expect(PlayerPrefs.has('save')).toBe(false);
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+
+    const r = await write({ action: 'delete', key: 'save' });
+    expect(r.ok).toBe(true);
+    expect(r.deleted).toBe(true);
+    expect(r.saved).toBe(true);
+    expect(PlayerPrefs.isProtected('save')).toBe(false); // the protection is gone too
+
+    // And the escape hatch actually works end to end — a fresh set() on the same key now lands.
+    const setResult = await write({ action: 'set', key: 'save', value: { fromThisBuild: true } });
+    expect(setResult.ok).toBe(true);
+    expect((await read({ key: 'save' })).value).toEqual({ fromThisBuild: true });
+  });
+
+  it('delete of a GENUINELY absent (never-written) key still reports NOT_FOUND — the protected check must not swallow real typos', async () => {
+    const r = await write({ action: 'delete', key: 'neverWritten' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('NOT_FOUND');
+  });
+
+  it('set on a protected key reports the PROTECTED cause, not "rejected as non-JSON-serializable"', async () => {
+    // Before the fix: `has()` is false after the refused set() (same signal as the genuinely
+    // non-serializable case), and the op's own comment called that branch unreachable — so it
+    // reported a value that was perfectly valid JSON as non-serializable, a false cause stated
+    // authoritatively.
+    const r = await write({ action: 'set', key: 'save', value: { fromThisBuild: true } });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).not.toMatch(/non-JSON-serializable/);
+    expect(String(r.error)).toMatch(/newer build/);
+    expect(String(r.hint)).toMatch(/delete/);
+    // And the backend bytes are genuinely untouched — this really was refused, not merely
+    // misreported.
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+  });
+
+  it('set still reports the genuine non-serializable cause for an actual cycle (sanity: the two causes stay distinguishable)', async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const r = await write({ action: 'set', key: 'freshKey', value: cyclic });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).toMatch(/non-JSON-serializable/);
+  });
+});
+
 describe('clear: pendingWrites is sorted even when the dirty order is not alphabetical', () => {
   class ReverseRejectingBackend implements PrefsBackend {
     async getAll(): Promise<Record<string, string>> {

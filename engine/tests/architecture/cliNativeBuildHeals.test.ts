@@ -28,8 +28,10 @@
 
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
@@ -131,7 +133,7 @@ describe('build-web.mjs heals the native project on --target native (#148, #150)
     // had already written into package.json — leaving the project claiming a dependency that is
     // not on disk, the same silent-success shape as the bug this whole guard is about.
     const installCall = src.indexOf("execSync('npm install'");
-    const vendorLoad = src.indexOf("loadEnginePluginModule(repoRoot, path.join('plugins', 'vendorPlugins.ts'))");
+    const vendorLoad = src.indexOf("loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'vendorPlugins.ts'))");
     expect(installCall).toBeGreaterThan(-1);
     expect(vendorLoad).toBeGreaterThan(-1);
     // Nothing between loading the vendor module and the install may bail out on it being null.
@@ -370,6 +372,64 @@ describe('loadEnginePluginModule degrades instead of throwing', () => {
     const emptyRepo = path.join(repoRoot, 'engine', 'tests');
     expect(await loadEnginePluginModule(emptyRepo, path.join('plugins', 'healNativeConfig.ts'))).toBeNull();
     expect(await loadVendorPlugins(emptyRepo)).toBeNull();
+  });
+
+  it('loadEnginePluginModuleResult reports WHY (#714) while the old null-returning wrapper is unchanged', async () => {
+    const { loadEnginePluginModule, loadEnginePluginModuleResult } = await import('../../scripts/loadVendorPlugins.mjs');
+    const emptyRepo = path.join(repoRoot, 'engine', 'tests');
+    const rel = path.join('plugins', 'healNativeConfig.ts');
+
+    const result = await loadEnginePluginModuleResult(emptyRepo, rel);
+    expect(result).toEqual({ module: null, reason: 'no-source' });
+
+    // Same input through the old contract must still yield a bare null — proving
+    // loadEnginePluginModule is a thin wrapper, not a second implementation that could drift.
+    expect(await loadEnginePluginModule(emptyRepo, rel)).toBeNull();
+  });
+
+  it('returns no-esbuild when the entry .ts exists but esbuild cannot be imported (the packaged-editor case)', () => {
+    // The `no-esbuild` branch is only reachable when the entry file DOES exist (the no-source
+    // check above returns first otherwise) and `import('esbuild')` genuinely fails — the
+    // packaged-editor case (#714): esbuild is a devDependency, pruned by electron-builder, while
+    // the plugin source ships. Faking that hermetically without touching this repo's real
+    // node_modules: copy loadVendorPlugins.mjs's OWN source into a scratch dir under the OS temp
+    // root, then run it in a PLAIN `node` subprocess (not through vitest/vite-node, whose SSR
+    // dynamic-import is resolved through Vite's own module graph and refuses a file outside
+    // `server.fs.allow` even past `@vite-ignore`). Node resolves a bare `import('esbuild')` by
+    // walking up node_modules directories from the IMPORTING module's own location, not from the
+    // `repoRoot` argument passed in — so the copy, sitting outside this repo's ancestry, hits no
+    // node_modules/esbuild at all and the import genuinely throws, with the real function running
+    // unmodified.
+    const importerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-no-esbuild-'));
+    const fakeRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-repo-'));
+    try {
+      const importerPath = path.join(importerDir, 'loadVendorPlugins.mjs');
+      fs.copyFileSync(path.join(repoRoot, 'engine', 'scripts', 'loadVendorPlugins.mjs'), importerPath);
+
+      const rel = path.join('plugins', 'fakePlugin.ts');
+      fs.mkdirSync(path.join(fakeRepo, 'engine', 'plugins'), { recursive: true });
+      fs.writeFileSync(path.join(fakeRepo, 'engine', rel), 'export const x = 1;\n');
+
+      const runnerPath = path.join(importerDir, 'runner.mjs');
+      fs.writeFileSync(runnerPath, `
+        import { loadEnginePluginModule, loadEnginePluginModuleResult } from ${JSON.stringify(pathToFileURL(importerPath).href)};
+        const repo = ${JSON.stringify(fakeRepo)};
+        const rel = ${JSON.stringify(rel)};
+        const result = await loadEnginePluginModuleResult(repo, rel);
+        const bare = await loadEnginePluginModule(repo, rel);
+        console.log(JSON.stringify({ result, bare }));
+      `);
+
+      const output = execFileSync(process.execPath, [runnerPath], { encoding: 'utf8', cwd: importerDir });
+      const { result, bare } = JSON.parse(output);
+
+      expect(result).toEqual({ module: null, reason: 'no-esbuild' });
+      // Same input through the old contract must still yield a bare null.
+      expect(bare).toBeNull();
+    } finally {
+      fs.rmSync(importerDir, { recursive: true, force: true });
+      fs.rmSync(fakeRepo, { recursive: true, force: true });
+    }
   });
 });
 

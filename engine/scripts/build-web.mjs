@@ -17,7 +17,7 @@ import { isProjectDir } from './projectRoots.mjs';
 import { parseBuildTarget } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
-import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
+import { loadEnginePluginModule, loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 
 // --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
 // WHY there is no default in either direction (#40).
@@ -87,8 +87,9 @@ const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEn
  *
  *  Gated on `proj`: that's the only case with a `project.config.json` to check (a bare
  *  `npm run build:editor` never reaches this script at all). Degrades to a no-op like the heals
- *  below when the engine plugin can't be loaded — the packaged editor ships no engine sources, and
- *  in THAT case the SOURCE route already validated before spawning this script as a build step. */
+ *  below when the engine plugin can't be loaded — in the packaged editor that's esbuild pruned as
+ *  a devDependency, not missing engine sources — and in THAT case the SOURCE route already
+ *  validated before spawning this script as a build step. */
 async function validateProjectConfig() {
   if (!proj) return;
   const cfgMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'load-project-config.ts'));
@@ -149,17 +150,21 @@ async function validateProjectConfig() {
  *  scaffold-then-build path (`addNativeTarget` scaffolds an empty native folder as part of adding
  *  the target), which this CLI script has no equivalent entry point for.
  *
- *  Each heal degrades to a no-op (not a crash) when its module can't be loaded — the packaged
- *  editor ships no engine sources; on that path `main.ts` already healed/vendored on project
- *  open, and the packaged app can't rebuild a plugin's `dist/` anyway (`canBuild:false`).
+ *  Each heal degrades to a no-op (not a crash) when its module can't be loaded — in the packaged
+ *  editor that's because esbuild is pruned as a devDependency, NOT because engine sources are
+ *  missing (measured, #714: `engine/plugins/*.ts` IS present there). Either way `main.ts` already
+ *  healed/vendored on project open, and the packaged app can't rebuild a plugin's `dist/` anyway
+ *  (`canBuild:false`).
  *
  *  NOT defended, deliberately: a HALF-present engine checkout (`addNativeTarget.ts` loadable but
  *  `vendorPlugins.ts` not) would let step 2 write the placeholder `capacitor-game-debug: '*'` spec
  *  and then install it, resolving against the public registry instead of the local tarball. There
- *  is no operational path into that state — a dev checkout has both files and the packaged editor
- *  has neither, so they appear and disappear together — and guarding it would mean gating the
- *  install on which module loaded, which is exactly the coupling step 4 exists to avoid. Recorded
- *  because it was raised and dismissed on reasoning, not because it was never considered.
+ *  is no operational path into that state — both loads go through the same esbuild-gated seam
+ *  (`loadEnginePluginModule`), so esbuild's presence gates both identically, and a source checkout
+ *  has both `.ts` files, so the two modules still appear and disappear together — and guarding it
+ *  would mean gating the install on which module loaded, which is exactly the coupling step 4
+ *  exists to avoid. Recorded because it was raised and dismissed on reasoning, not because it was
+ *  never considered.
  *
  *  ⚠️ npm ships `README.md` regardless of the `files` field, so editing a plugin's DOCS re-hashes
  *  its tarball too. Nothing to do differently here — just don't be surprised by a re-vendor after
@@ -189,7 +194,8 @@ async function healNativeProject() {
   }
 
   // 3. Vendor engine plugins — MUST run after step 2 (see ordering note above).
-  const vendorMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'vendorPlugins.ts'));
+  const vendorLoad = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'vendorPlugins.ts'));
+  const vendorMod = vendorLoad.module;
   const v = vendorMod ? vendorMod.vendorEnginePlugins(projectRoot, repoRoot) : null;
   if (v?.vendored.length) console.log(`[build-web][heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
 
@@ -235,15 +241,23 @@ async function healNativeProject() {
   //    it would install wrong bytes confidently and erase the only signal that the committed state
   //    is inconsistent. Fail loud instead, with the exact manual remedy, and let a human decide
   //    which side is authoritative.
-  // ⚠️ `loadEnginePluginModule` returns null SILENTLY when the TS sources are absent or esbuild is
-  //    not installed (the packaged editor is exactly that case). Say so out loud rather than
-  //    skipping in silence: a guard that quietly does not run is the same unreachable-mechanism
-  //    shape this step exists to catch, one level up. Not fatal — vendoring itself already
-  //    degrades here, and failing the build would take the packaged editor's native build with it.
+  // ⚠️ `loadEnginePluginModuleResult` degrades SILENTLY (as far as its return value goes) when the
+  //    TS sources are absent or esbuild is not installed. Say so out loud rather than skipping in
+  //    silence — a guard that quietly does not run is the same unreachable-mechanism shape this
+  //    step exists to catch, one level up — and say WHICH cause it was (#714): the two mean
+  //    different things to a developer, and a single "cannot load" warning couldn't tell them
+  //    apart. Not fatal either way — vendoring itself already degrades here, and failing the build
+  //    would take the packaged editor's native build with it.
   if (!vendorMod) {
+    const why = vendorLoad.reason === 'no-esbuild'
+      ? 'esbuild is not installed, so vendorPlugins.ts could not be loaded (expected inside a '
+        + 'packaged editor, which ships no devDependencies; on a source checkout it means the '
+        + 'install is incomplete — run `npm install` at the repo root)'
+      : 'there is no engine/plugins/vendorPlugins.ts here — this is not a source checkout, so '
+        + 'there is nothing to check';
     console.warn(
-      '[build-web] ⚠️ cannot load engine/plugins/vendorPlugins.ts — the #685 stale-node_modules '
-        + 'check did NOT run, so a native build here could ship the wrong plugin bytes undetected.',
+      `[build-web] ⚠️ ${why}. The #685 stale-node_modules check did NOT run, so a native build `
+        + 'here could ship the wrong plugin bytes undetected.',
     );
   }
   if (vendorMod) {

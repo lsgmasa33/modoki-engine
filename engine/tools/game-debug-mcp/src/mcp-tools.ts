@@ -473,6 +473,16 @@ async function deviceRequestFull(method: string, params: Record<string, unknown>
   return (await backendPost('/api/device/request', { method, params })) as Record<string, unknown>;
 }
 
+/** The `⚠️` caveat line for a host-side reply the router could not tie to the lease
+ *  (`unverified` on the `crashReports`/`nativeLogs` route bodies — editorBackendRouter.ts,
+ *  `pickGoIosDevice`). Same tone/shape as `wdaLauncher.ts`'s `launchWarning`: reported, not
+ *  refused, and stated plainly so the answer isn't mistaken for one confirmed against the leased
+ *  device — it may be about a different phone. '' when the field is absent (the common,
+ *  confirmed case), so callers can prepend it unconditionally. */
+function unverifiedNote(body: Record<string, unknown>): string {
+  return typeof body.unverified === 'string' ? `[⚠️ ${body.unverified}]\n` : '';
+}
+
 // ── Tool registration ────────────────────────────────────────
 
 export function registerTools(server: McpServer) {
@@ -2145,13 +2155,15 @@ async function coordScaleOrRefusal(
         // result, and `raw:true` legitimately returns a string too — so without this check a refusal
         // would be handed back as if it were the report text.
         if (isDeviceError(result)) return deviceReplyFailure('device_crash_reports', 'read the device crash reports', result);
-        // `raw` — the route already appends its own truncation marker to the text, so nothing to add.
-        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: result }] };
+        // `raw` — the route already appends its own truncation marker to the text, so nothing to add
+        // beyond the unverified caveat (still worth stating: a raw report is exactly as likely to be
+        // about the wrong phone as a summarized one).
+        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: unverifiedNote(body) + result }] };
         // A listing says what it HID. "19 reports" when 99 exist is a different answer from "19
         // reports exist", and only one of them is true.
-        const note = Array.isArray(result)
+        const note = (Array.isArray(result)
           ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
-          : '';
+          : '') + unverifiedNote(body);
         return { content: [{ type: 'text' as const, text: note + JSON.stringify(result, null, 2) }] };
       } catch (e) {
         return caughtFailure('device_crash_reports', 'read the device crash reports', e);
@@ -2225,13 +2237,14 @@ async function coordScaleOrRefusal(
         // Say what the read actually WAS when it was a forward capture — an empty system result is
         // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
         // opposite next moves. Truncation is stated for the same reason.
-        const note = source !== 'system' ? ''
+        const note = (source !== 'system' ? ''
           // Android dumps a ring buffer (backward); iOS streams (forward). Saying WHICH read you
           // got is the difference between "nothing was logged" and "nothing happened while I
           // watched", and those lead to opposite next moves.
           : body.backward
             ? `[system log (logcat dump, backward)${body.device ? ` · ${String(body.device)}` : ''}${body.clamped ? ' · limit capped at 400 lines (response budget)' : ''}]\n`
-            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`;
+            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`)
+          + unverifiedNote(body);
         return { content: [{ type: 'text' as const, text: note + text }] };
       } catch (e) {
         return caughtFailure('device_native_logs', 'read the native device logs (logcat / os_log)', e);

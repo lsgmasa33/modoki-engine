@@ -45,6 +45,14 @@ export function createPrefsDocStore(key: string): PrefsDocStore {
     // native I/O error) `drain()` re-queues it, warns, and lets `flush()` settle fulfilled anyway
     // — while `get()` keeps returning the cached value. A read-back check therefore confirms
     // itself. The pending-write flag is the only signal that distinguishes the two.
-    durable: () => !PlayerPrefs.hasPendingWrite(key),
+    //
+    // ⚠️ **A PROTECTED key is a second, distinct way to be non-durable, and `hasPendingWrite`
+    // alone cannot see it (#630 review finding 2).** `PlayerPrefs.set()` on a key holding a save
+    // this build cannot read REFUSES the write outright — it never touches `cache`, `dirty` or
+    // the in-flight ledger — so `hasPendingWrite(key)` is `false` for a write that never
+    // happened, and this would report `true`. There genuinely is no pending write to report; the
+    // honest fix is here, not in `hasPendingWrite`: a document this store could not write is not
+    // durable, whichever of the two reasons is why.
+    durable: () => !PlayerPrefs.hasPendingWrite(key) && !PlayerPrefs.isProtected(key),
   };
 }

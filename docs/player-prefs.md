@@ -127,8 +127,31 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   since a read during the window answers truthfully about the (still fully hydrated) outgoing
   store.
 - **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. The version
-  guards the on-disk format (not the game's data shape) so a future migration is possible; a
-  corrupt/unparseable entry fails soft to `undefined`, never a throw.
+  describes the on-disk format, not the game's data shape. `readEnvelope` **enforces** it (#630 —
+  before that it was stamped on every write and read by nothing, while a comment claimed
+  otherwise). Three outcomes: a version this build understands is read; a corrupt/unparseable
+  entry fails soft to `undefined`, never a throw; an intact envelope under a version this build
+  has **no migration for** — i.e. a save written by a NEWER build — reads as absent *and is
+  protected from being overwritten*.
+- ⚠️ **`set()` can refuse, and a game author should know why.** On a key holding an unreadable
+  (newer-format) save, `set()` warns and does nothing. This is deliberate: the game reads its
+  defaults and plays normally, but must not stomp a save it cannot read, so the player's progress
+  survives if they return to the build that wrote it. Reachable in practice via TestFlight → App
+  Store, a rollback, or reinstalling an older version. The protection is against *silent
+  clobbering*, not the player's intent — `delete()` and `clear()` still remove such a key, and
+  `delete()` frees it for a subsequent `set()`. `get()`/`has()`/`keys()` all report it as absent,
+  deliberately: `has(k) === true` implies `get(k) !== undefined`, and game code relies on that.
+  ⚠️ **That same asymmetry means the durability accessors can disagree with each other** (#630
+  review) — `PlayerPrefs.isProtected(key)` is the way to ask "absent, or present-but-unreadable?"
+  where `has()` cannot answer. A refused `set()` never touches `cache`/`dirty`/the in-flight
+  ledger, so `hasPendingWrite(key)` correctly reports `false` — there genuinely is no pending
+  write — but that made `createPrefsDocStore(key).durable()` (`!hasPendingWrite(key)` alone)
+  report `true` for a write that never happened. `durable()` now also checks `isProtected(key)`,
+  so it is `false` for a refused write; `hasPendingWrite()` is unchanged and still answers its own
+  question correctly. The agent surface's `player-prefs-write` op uses `isProtected` the same way:
+  `action:'delete'` on a protected key proceeds instead of a false `NOT_FOUND` (the key reads as
+  absent from `has()`, same as any other key this protects), and `action:'set'` on one reports the
+  protected cause instead of misdiagnosing it as a non-serializable value.
 - **Write pipeline.** The cache stores the serialized envelope string per key (so `get()`
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;

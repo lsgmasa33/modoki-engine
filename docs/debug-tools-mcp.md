@@ -451,7 +451,7 @@ that cannot contain the answer:
 |---|---|---|
 | Where it reads | `OSLogStore(.currentProcessIdentifier)` **inside the app** (`GameDebugPlugin.swift`), logcat in-process on Android | **host-side**: `ios syslog` over USB (iOS) / `adb logcat -d` (Android) |
 | Direction | **backward** — a query over stored logs, `seconds` looks back | **iOS: forward** (a stream; `seconds` is how long it captures, and you wait it out). **Android: backward** (a ring-buffer dump; `seconds` is ignored) |
-| Needs | the app running **and** the debug lease connected | nothing: no lease, no claim, app may be dead or uninstalled |
+| Needs | the app running **and** the debug lease connected | no lease, no claim; app may be dead or uninstalled. ⚠️ Not *required* is not *ignored*: a lease that IS held and names a different phone is respected — see "Which iPhone these two ops read" |
 | Sees | only this process's own logging | everything the device logs, including what the system says *about* us |
 
 ⚠️ **That direction split is real, not an inconsistency to smooth over.** logcat is a ring buffer
@@ -508,6 +508,37 @@ includes **`<pkg>:sub` processes**, because a Capacitor game's WebView runs in i
 Deliberately not used: `adb bugreport` (tens of MB, a minute-plus, for a superset that mostly does
 not answer "why did my app die") and `/data/tombstones` (root-only on a production device).
 
+### Which iPhone these two ops read (#670)
+
+`device_native_logs source:'system'` and `device_crash_reports` are host-side and can read ANY
+attached iPhone, not just the leased one. Getting this wrong looks exactly right — the same-shaped
+log/report comes back, just about the wrong device. `pickGoIosDevice` (`goIosDevice.ts`) picks, in
+order:
+
+1. `MODOKI_IOS_DEVICE_UDID` — wins even over a contradicting lease.
+2. A lease naming a hardware model → the attached device whose `ProductType` confirms it. If every
+   attached device is identified and none confirms → **refuses**, naming the lease's model and
+   every candidate, rather than reading the wrong phone.
+3. Exactly one candidate that could not be identified at all (the info probe returned no
+   `ProductType`) → used, with an `unverified` field on the response — a device that cannot be
+   described can never be confirmed, but must never be treated as a contradiction either.
+4. A lease that reports no hardware (a bridge older than #146) → guesses from what's attached,
+   also flagged `unverified`.
+5. No lease at all, one attached device → used with no warning, exactly as before — no lease means
+   no wrong-phone risk.
+
+⚠️ **An `unverified` field means the answer is about "the phone that happened to be attached," not
+provably the leased one.** Weigh a log/crash-report answer accordingly when you see it — both
+`device_native_logs` and `device_crash_reports` render it as a `[⚠️ …]` line prepended to the reply
+text, so it isn't an HTTP-body-only field you'd otherwise have to know to check.
+
+⚠️ **No lease is not the same as a contradicting lease.** With no lease at all, one attached iPhone
+answers as cleanly as it always has (case 5 above). With a lease naming a DIFFERENT model, these ops
+now refuse instead of silently reading that phone — don't read "needs no lease" (the table above) as
+"never consults the lease."
+
+This is unit-tested (`pickGoIosDevice`'s own test suite), not confirmed against two live iPhones.
+
 ### Which phone a host-side op talks to — ask the TRANSPORT
 
 On Android these read through `adb`, targeted by the LEASE's serial when there is one, else the
@@ -523,10 +554,12 @@ asking Apple's tools whether go-ios can reach something is asking the wrong part
 The rule generalises: **resolve a device through the transport the op will use.** A build still
 resolves through `devicectl`/`xctrace` — correctly, because `xcodebuild` targets *that* listing.
 
-Selection order is the usual one: `MODOKI_IOS_DEVICE_UDID` → the only attached device → the one
-whose `ProductType` matches the leased app's reported model (the lease never learns a UDID by
-design, #146) → **refuse, naming every candidate**. Reading logs off the wrong phone produces a
-confidently wrong answer that looks right.
+Which device, once the transport is settled, is **"Which iPhone these two ops read" above** — not
+repeated here. That order used to be written out in this paragraph as *"pin → the only attached
+device → the one whose `ProductType` matches"*, and the middle step was the #670 defect itself: the
+count shortcut ran **before** the lease was ever consulted, so one iPhone on USB was returned
+whatever the lease said. Reading logs off the wrong phone produces a confidently wrong answer that
+looks right, which is why the lease is now consulted first and a contradiction is refused.
 
 **The same rule binds the PLATFORM, and that was a real defect** (close-out review). These ops exist
 for when the app has died — which is exactly when the lease is gone and cannot say what platform it

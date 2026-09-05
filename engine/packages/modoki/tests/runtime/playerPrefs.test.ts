@@ -9,6 +9,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   PlayerPrefs, InMemoryBackend, resetPlayerPrefsForTest, type PrefsBackend,
 } from '../../src/runtime/storage';
+import { createPrefsDocStore } from '../../src/runtime/storage/prefsDocStore';
 
 afterEach(() => {
   resetPlayerPrefsForTest();
@@ -177,6 +178,188 @@ describe('PlayerPrefs — hydration & durability', () => {
     await PlayerPrefs.init({ namespace: 'g1', backend });
     expect(PlayerPrefs.get('broken')).toBeUndefined();
     expect(PlayerPrefs.get('ok')).toBe(7);
+  });
+});
+
+describe('PlayerPrefs — schema version protection (#630)', () => {
+  it('reads an envelope stamped v:1 normally', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:k', JSON.stringify({ v: 1, d: 'hello' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    expect(PlayerPrefs.get('k')).toBe('hello');
+    expect(PlayerPrefs.has('k')).toBe(true);
+  });
+
+  it('reads a legacy envelope with no v field normally', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:k', JSON.stringify({ d: 'legacy' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    expect(PlayerPrefs.get('k')).toBe('legacy');
+    expect(PlayerPrefs.has('k')).toBe(true);
+  });
+
+  it('a v:2 envelope (written by a newer build) reads as absent', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:k', JSON.stringify({ v: 2, d: 'from the future' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    expect(PlayerPrefs.get('k')).toBeUndefined();
+    expect(PlayerPrefs.has('k')).toBe(false);
+    expect(PlayerPrefs.keys()).toEqual([]);
+  });
+
+  it('set() on a v:2-protected key does not overwrite the backend, even across flush', async () => {
+    // This is the actual protection, end to end: the whole point of #630 is that a build which
+    // cannot read a newer save must not stomp it just because game code calls set() on the same
+    // key while playing with defaults. Asserting only that the in-memory cache was left alone is
+    // not enough — the write pipeline is debounced/async, so this must survive an awaited flush().
+    const backend = new InMemoryBackend();
+    const original = JSON.stringify({ v: 2, d: { fromNewerBuild: true } });
+    await backend.set('mk:g1:k', original);
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    PlayerPrefs.set('k', { fromThisBuild: true });
+    await PlayerPrefs.flush();
+    warn.mockRestore();
+
+    expect(PlayerPrefs.get('k')).toBeUndefined(); // still reads as absent — defaults, not clobbered
+    const raw = await backend.getAll('mk:g1:');
+    expect(raw['mk:g1:k']).toBe(original); // and the BACKEND bytes are untouched
+  });
+
+  it('del() removes a protected key, and a later set() on it then works normally', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:k', JSON.stringify({ v: 2, d: 'protected' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    PlayerPrefs.delete('k');
+    await PlayerPrefs.flush();
+    expect(Object.keys(await backend.getAll('mk:g1:'))).toEqual([]);
+
+    PlayerPrefs.set('k', 'fresh');
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.get('k')).toBe('fresh');
+    const raw = await backend.getAll('mk:g1:');
+    expect(JSON.parse(raw['mk:g1:k'])).toEqual({ v: 1, d: 'fresh' });
+  });
+
+  it('clear() removes a protected key from the backend too', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:protected', JSON.stringify({ v: 2, d: 'nope' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('ordinary', 1);
+    await PlayerPrefs.flush();
+
+    PlayerPrefs.clear();
+    await PlayerPrefs.flush();
+    expect(Object.keys(await backend.getAll('mk:g1:'))).toEqual([]);
+  });
+
+  it('a non-numeric v and unparseable JSON are still dropped as corrupt, not protected', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:badV', JSON.stringify({ v: 'x', d: 'nope' }));
+    await backend.set('mk:g1:badJson', '{not valid json');
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    // Corrupt, not protected — a set() on either must succeed (no warn, no refusal).
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    PlayerPrefs.set('badV', 'replaced');
+    PlayerPrefs.set('badJson', 'replaced');
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+    expect(PlayerPrefs.get('badV')).toBe('replaced');
+    expect(PlayerPrefs.get('badJson')).toBe('replaced');
+  });
+
+  it('isProtected() tells "absent" apart from "present but unreadable" — false, true, false (review finding 2)', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:protected', JSON.stringify({ v: 2, d: 'from the future' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    expect(PlayerPrefs.isProtected('neverWritten')).toBe(false); // genuinely absent
+    expect(PlayerPrefs.isProtected('protected')).toBe(true); // present but this build can't read it
+    PlayerPrefs.set('readable', 1);
+    expect(PlayerPrefs.isProtected('readable')).toBe(false); // present and readable
+  });
+
+  it('durable() on a PrefsDocStore is FALSE for a protected key after a refused write — a refused write must never report as durable (review finding 2, "the money one")', async () => {
+    const backend = new InMemoryBackend();
+    const original = JSON.stringify({ v: 2, d: { fromNewerBuild: true } });
+    await backend.set('mk:g1:ledger', original);
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    const store = createPrefsDocStore('ledger');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    store.write({ fromThisBuild: true }); // refused — never touches cache/dirty/inFlight
+    await store.flush();
+    warn.mockRestore();
+
+    // Before the fix: hasPendingWrite('ledger') is false (there genuinely is no pending write),
+    // so a stale durable() reading only that would say `true` for a write that never happened.
+    expect(PlayerPrefs.hasPendingWrite('ledger')).toBe(false);
+    expect(store.durable()).toBe(false);
+    // The backend bytes are untouched — the write really was refused, not merely unreported.
+    const raw = await backend.getAll('mk:g1:');
+    expect(raw['mk:g1:ledger']).toBe(original);
+  });
+});
+
+describe('PlayerPrefs — unreadable.clear() sites (#630 review finding 8)', () => {
+  it('a protected key does not leak across a SUCCESSFUL namespace swap — a same-named key in the new namespace is writable', async () => {
+    const shared = new InMemoryBackend();
+    await shared.set('mk:g1:k', JSON.stringify({ v: 2, d: 'from the future' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend: shared });
+    expect(PlayerPrefs.isProtected('k')).toBe(true);
+
+    // Swap to a namespace that has never seen this key at all.
+    await PlayerPrefs.init({ namespace: 'g2', backend: shared });
+    expect(PlayerPrefs.isProtected('k')).toBe(false); // the stale protection did not leak in
+    PlayerPrefs.set('k', 'fresh in g2');
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.get('k')).toBe('fresh in g2');
+  });
+
+  it('a protected key does not leak across a FAILED init() (getAll throws) — the incoming namespace stays writable once init() succeeds', async () => {
+    const backend1 = new InMemoryBackend();
+    await backend1.set('mk:g1:k', JSON.stringify({ v: 2, d: 'from the future' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend: backend1 });
+    expect(PlayerPrefs.isProtected('k')).toBe(true);
+
+    const throwing: PrefsBackend = {
+      getAll: async () => { throw new Error('backend unavailable (simulated)'); },
+      set: async () => {},
+      remove: async () => {},
+    };
+    await expect(PlayerPrefs.init({ namespace: 'g2', backend: throwing })).rejects.toThrow();
+    // The failure path installs the incoming namespace unhydrated but must still have dropped
+    // the outgoing namespace's protection — a stale entry here would make 'k' permanently
+    // unwritable in g2 even after a later successful init(), since `unreadable` is never
+    // re-populated for a key the incoming backend doesn't actually hold.
+    expect(PlayerPrefs.isProtected('k')).toBe(false);
+
+    const backend2 = new InMemoryBackend();
+    await PlayerPrefs.init({ namespace: 'g2', backend: backend2 });
+    expect(PlayerPrefs.isProtected('k')).toBe(false);
+    PlayerPrefs.set('k', 'fresh in g2');
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.get('k')).toBe('fresh in g2');
+  });
+
+  it('resetPlayerPrefsForTest() drops protection — a key protected in one test is not protected in the next', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:k', JSON.stringify({ v: 2, d: 'from the future' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    expect(PlayerPrefs.isProtected('k')).toBe(true);
+
+    resetPlayerPrefsForTest();
+    expect(PlayerPrefs.isProtected('k')).toBe(false);
+
+    // And the namespace stays fully usable afterward — this is what "leaking between tests"
+    // would break.
+    await PlayerPrefs.init({ namespace: 'g1' });
+    PlayerPrefs.set('k', 'fresh');
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.get('k')).toBe('fresh');
   });
 });
 

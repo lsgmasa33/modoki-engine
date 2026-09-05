@@ -98,17 +98,113 @@ export function pickHostSidePlatform(o: {
 
 export interface LeaseHardwareHint { deviceModel: string | null; osVersion: string | null }
 
-/**
- * Pick the device a go-ios op should target.
+/** Should a lease's hardware be handed to an iOS host-side op (system logs / crash reports)?
  *
- * Order: an explicit `MODOKI_IOS_DEVICE_UDID` pin → the only attached device → the one whose
- * `ProductType` matches the leased app's reported model → refuse, naming every candidate.
+ *  `deviceConnection.deviceHardware()` is platform-agnostic — it answers for whatever is leased,
+ *  Android included. Passing an Android lease's `deviceModel` (e.g. `'SM-S901B'`) straight into
+ *  `pickGoIosDevice` hands it a value that can never match any attached iPhone's `ProductType`, so
+ *  a device that IS attached — just on the other platform — reads as a genuine mismatch: `confirmed
+ *  = []`, and the refusal names the Android model as if it were the reason no iPhone qualifies
+ *  (#670 finding 3). The honest answer when the lease isn't iOS is the same as having no lease at
+ *  all: `undefined`, so `resolveGoIosDevice` takes its no-lease path instead of guessing across
+ *  platforms. A null/unresolved platform is treated the same way — "not confirmed iOS" is never
+ *  "assume iOS" (see `devicePlatform()`'s own doc). */
+export function leaseForIosOps(platform: string | null | undefined, hardware: LeaseHardwareHint | undefined): LeaseHardwareHint | undefined {
+  return platform === 'ios' ? hardware : undefined;
+}
+
+/** The chosen device, plus a warning when the choice could not be tied to the lease. */
+export interface GoIosChoice { device: GoIosDevice; unverified?: string }
+
+/** Names every candidate the same way, whatever info the probe returned. */
+function describeGoIosDevices(devices: GoIosDevice[]): string {
+  return devices.map((d) => `${d.name ?? d.productType ?? 'unidentified'} (${d.udid})`).join(', ');
+}
+
+/**
+ * Pick the device a go-ios op should target, as a pure decision — the I/O (listing attached
+ * devices, probing each one's `ProductType`) is the caller's, the same split as
+ * `pickHostSidePlatform`.
+ *
+ * Order: an explicit `MODOKI_IOS_DEVICE_UDID` pin → the one whose `ProductType` confirms the
+ * leased app's reported model → refuse if several/none confirm, unless exactly one candidate is
+ * unidentifiable (degrade rather than refuse — see below) → with no lease at all, the only
+ * attached device.
+ *
+ * ⚠️ **#670, the bug this replaces.** The old code took the single-attached-device shortcut
+ * BEFORE ever looking at the lease, so with one iPhone plugged in and a DIFFERENT phone leased,
+ * a syslog/crash-report read silently answered about the wrong one, labelled as if it were the
+ * leased device. `resolveIosDevice` (wdaLauncher.ts) and `resolveHostSideAndroidSerial`
+ * (editorBackendRouter.ts) both already gate their single-device shortcut on there being no lease
+ * to contradict it; this one didn't.
+ */
+export function pickGoIosDevice(o: {
+  pinned?: string;
+  /** Every attached device. `productType`/`name` are present only when the info probe succeeded. */
+  devices: GoIosDevice[];
+  /** The lease's hardware — ABSENT when there is no lease at all (see the router). */
+  lease?: LeaseHardwareHint;
+}): GoIosChoice | { error: string } {
+  if (o.pinned) {
+    const hit = o.devices.find((d) => d.udid === o.pinned);
+    return hit
+      ? { device: hit }
+      // Name what IS attached: "your pin matches nothing" plus an empty room is a dead end, and the
+      // most common cause is a pin left over from a phone that has since been unplugged.
+      : { error: `MODOKI_IOS_DEVICE_UDID=${o.pinned} is not attached (go-ios sees: ${o.devices.map((d) => d.udid).join(', ') || 'nothing'})` };
+  }
+  if (o.devices.length === 0) return { error: 'no iOS device is attached (go-ios sees none) — check the cable and that the device is unlocked and trusted' };
+
+  if (o.lease?.deviceModel) {
+    // The lease knows the app's MODEL (never a UDID — #146: a UDID is a fact no app is allowed to
+    // assert), so match on that; it is the same evidence `resolveIosDevice` uses.
+    const confirmed = o.devices.filter((d) => d.productType === o.lease?.deviceModel);
+    if (confirmed.length === 1) return { device: confirmed[0] };
+    if (confirmed.length > 1) {
+      return { error: `several attached iPhones are a ${o.lease.deviceModel} — set MODOKI_IOS_DEVICE_UDID to one of: ${describeGoIosDevices(confirmed)}` };
+    }
+    // Zero confirmed. A device with no `productType` (the info probe failed, or a handset old
+    // enough that go-ios can't identify it) can never be confirmed and must never be treated as
+    // a contradiction either — mirrors `leaseMatch`'s `'unknown'` verdict in wdaLauncher.ts.
+    const unknown = o.devices.filter((d) => !d.productType);
+    if (unknown.length === 1) {
+      return { device: unknown[0], unverified: `no attached iPhone reports the leased device's model (${o.lease.deviceModel}), so this device could not be confirmed as the leased one` };
+    }
+    if (unknown.length > 1) {
+      return { error: `${unknown.length} attached iPhones could not be identified, and none confirms the leased ${o.lease.deviceModel} — set MODOKI_IOS_DEVICE_UDID to one of: ${describeGoIosDevices(unknown)}` };
+    }
+    // Every attached device WAS identified, and none of them is the leased model — a genuine
+    // contradiction, not just missing evidence. Refuse rather than read logs off the wrong phone.
+    return {
+      error: `the leased device is a ${o.lease.deviceModel}, which matches none of the attached iPhones `
+        + `(${describeGoIosDevices(o.devices)}). Refusing rather than reading the wrong phone — attach `
+        + 'the leased device, or set MODOKI_IOS_DEVICE_UDID if one of these really is it.',
+    };
+  }
+
+  if (o.lease) {
+    // A lease exists but reports no hardware (a bridge older than #146). Guess from what's
+    // attached — deliberately, same as `resolveIosDevice` step 5 — but SAY it is a guess.
+    if (o.devices.length === 1) {
+      return { device: o.devices[0], unverified: 'the leased device did not report its hardware, so this is a guess from what is attached, not from the lease' };
+    }
+    return { error: `${o.devices.length} iOS devices are attached and the lease reports no hardware to pick by — set MODOKI_IOS_DEVICE_UDID to one of: ${describeGoIosDevices(o.devices)}` };
+  }
+
+  // No lease at all: no wrong-phone risk to guard against, so the single-device case stays exactly
+  // as quiet as it always was.
+  if (o.devices.length === 1) return { device: o.devices[0] };
+  return { error: `several iOS devices are attached and none is pinned — set MODOKI_IOS_DEVICE_UDID to one of: ${describeGoIosDevices(o.devices)}` };
+}
+
+/**
+ * Pick the device a go-ios op should target — I/O only; the decision is `pickGoIosDevice`.
  */
 export async function resolveGoIosDevice(opts: {
   goIos: string;
   env?: NodeJS.ProcessEnv;
   lease?: LeaseHardwareHint;
-}): Promise<{ device: GoIosDevice } | { error: string }> {
+}): Promise<GoIosChoice | { error: string }> {
   const env = opts.env ?? process.env;
   let udids: string[];
   try {
@@ -117,24 +213,14 @@ export async function resolveGoIosDevice(opts: {
     return { error: `could not list iOS devices via go-ios (${e instanceof Error ? e.message : String(e)})` };
   }
 
-  const pinned = env.MODOKI_IOS_DEVICE_UDID?.trim();
-  if (pinned) {
-    return udids.includes(pinned)
-      ? { device: { udid: pinned } }
-      // Name what IS attached: "your pin matches nothing" plus an empty room is a dead end, and the
-      // most common cause is a pin left over from a phone that has since been unplugged.
-      : { error: `MODOKI_IOS_DEVICE_UDID=${pinned} is not attached (go-ios sees: ${udids.join(', ') || 'nothing'})` };
-  }
-  if (udids.length === 0) return { error: 'no iOS device is attached (go-ios sees none) — check the cable and that the device is unlocked and trusted' };
-  if (udids.length === 1) return { device: { udid: udids[0] } };
+  // Pay for the `info` probe when its result is worth having: a lease that names a model needs it
+  // to confirm/contradict, or several attached devices need it to name/disambiguate them for the
+  // caller. A PIN with a single attached device and no lease needs neither — the response then
+  // names that device by its UDID, not by name — and that's the common case, so it stays as cheap
+  // as it always was.
+  const devices: GoIosDevice[] = (opts.lease?.deviceModel || udids.length > 1)
+    ? await Promise.all(udids.map(async (u) => ({ udid: u, ...await goIosDeviceInfo(opts.goIos, u) })))
+    : udids.map((u) => ({ udid: u }));
 
-  // Several attached. The lease knows the app's MODEL (never a UDID — #146: a UDID is a fact no app
-  // is allowed to assert), so match on that; it is the same evidence `resolveIosDevice` uses.
-  const infos = await Promise.all(udids.map(async (u) => ({ udid: u, ...await goIosDeviceInfo(opts.goIos, u) })));
-  if (opts.lease?.deviceModel) {
-    const hits = infos.filter((d) => d.productType === opts.lease?.deviceModel);
-    if (hits.length === 1) return { device: hits[0] };
-  }
-  const described = infos.map((d) => `${d.name ?? d.productType ?? 'unidentified'} (${d.udid})`).join(', ');
-  return { error: `several iOS devices are attached and none is pinned — set MODOKI_IOS_DEVICE_UDID to one of: ${described}` };
+  return pickGoIosDevice({ pinned: env.MODOKI_IOS_DEVICE_UDID?.trim(), devices, lease: opts.lease });
 }

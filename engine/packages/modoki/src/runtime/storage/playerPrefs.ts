@@ -42,10 +42,15 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Bumped only if the on-disk envelope shape changes (not the game's data shape). */
+/** Bumped only if the on-disk envelope shape changes (not the game's data shape). Bumping this
+ *  requires adding a migration in `readEnvelope` (see its "future migration slot") that upgrades
+ *  every older version this build still knows how to read up to the new one — a version with no
+ *  migration path is `unreadable`, not silently dropped. */
 const SCHEMA_VERSION = 1;
 
-/** Persisted wrapper: `v` guards the envelope format, `d` is the game's document. */
+/** Persisted wrapper: `d` is the game's document, `v` is the envelope format version it was
+ *  written under. `readEnvelope` enforces `v` (#630) — a version this build has no migration for
+ *  is reported as `unreadable` rather than loaded, so `set()` can refuse to overwrite it. */
 interface Envelope {
   v: number;
   d: JsonValue;
@@ -95,6 +100,14 @@ const cache = new Map<string, string>();
 
 /** Logical keys awaiting a backend write. A dirty key absent from `cache` ⇒ remove. */
 const dirty = new Set<string>();
+
+/** Logical key → the envelope version we could not read (#630). Populated during hydration for
+ *  an entry whose `v` this build has no migration for — see `readEnvelope`'s doc comment. These
+ *  keys are deliberately absent from `cache`: `set()` consults this map to refuse a write that
+ *  would clobber data a newer build wrote, while `get()`/`has()`/`keys()` see nothing here at all
+ *  (see the comment on `has()`) — the protection is against silent clobbering, not against the
+ *  player's stated intent, so `del()`/`clear()` can still remove a protected key. */
+const unreadable = new Map<string, number>();
 
 /**
  * Keys a drain has taken OUT of `dirty` but whose backend call has not settled yet (#559).
@@ -222,16 +235,54 @@ function prefixFor(ns: string): string {
 }
 
 // ── Envelope ──────────────────────────────────────────────────────
-/** Parse a stored envelope string → its document. Returns `undefined` on any
- *  malformed / unparseable value (fail soft — never throw into game code). */
-function readEnvelope(str: string): JsonValue | undefined {
+/** Result of parsing one stored envelope string — see `readEnvelope`'s doc comment for what each
+ *  variant means and who acts on it. */
+type EnvelopeRead =
+  | { ok: true; value: JsonValue }
+  | { ok: false; reason: 'corrupt' }
+  | { ok: false; reason: 'unreadable'; version: number };
+
+/** Parse a stored envelope string → its document, or say WHY it couldn't be read.
+ *
+ *  Distinguishing `'corrupt'` from `'unreadable'` is load-bearing (#630): a `'corrupt'` entry
+ *  (bad JSON, or no recognizable envelope shape) is safe to overwrite — there was never anything
+ *  readable there. An `'unreadable'` entry is a STRUCTURALLY INTACT envelope written under a
+ *  version this build does not understand — most often a save from a NEWER build (TestFlight →
+ *  App Store, a rollback, a reinstall of an older version) — and the owner's rule is: read
+ *  defaults and play normally, but never overwrite data this build cannot read, so the player's
+ *  progress is still there if they return to a build that understands it. Only the write path
+ *  (`set()`) acts on this distinction; `get()`/`has()`/`keys()` treat both the same way — see the
+ *  comment on `has()`.
+ *
+ *  FUTURE MIGRATION SLOT: when `SCHEMA_VERSION` is next bumped, a version this build used to
+ *  write (and therefore still knows how to read) gets a migration here that upgrades the parsed
+ *  `d` from the old shape to the new one and returns `{ ok: true, value: migrated }` — it does
+ *  NOT become `unreadable`. Only a version with no migration path in this build — because it's
+ *  newer than anything this build ever shipped — is `unreadable`. */
+function readEnvelope(str: string): EnvelopeRead {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(str) as Envelope;
-    if (parsed && typeof parsed === 'object' && 'd' in parsed) return parsed.d;
+    parsed = JSON.parse(str);
   } catch {
-    /* corrupt entry — treat as absent */
+    return { ok: false, reason: 'corrupt' };
   }
-  return undefined;
+  if (parsed === null || typeof parsed !== 'object' || !('d' in parsed)) {
+    return { ok: false, reason: 'corrupt' };
+  }
+  const v = (parsed as { v?: unknown }).v;
+  if (v === undefined || v === SCHEMA_VERSION) {
+    // Absent `v` counts as version 1 — `writeEnvelope` has always stamped it, so this is
+    // defensive, and being permissive here cannot break existing data. (A migration for an older
+    // readable version would also return `ok: true` here — see the migration slot above.)
+    return { ok: true, value: (parsed as { d: JsonValue }).d };
+  }
+  if (typeof v === 'number') {
+    // A numeric `v` we don't recognize — covers both nonsense versions (0, negatives) and
+    // genuinely future ones. The document parsed and is structurally intact, so this is data we
+    // cannot interpret, not garbage.
+    return { ok: false, reason: 'unreadable', version: v };
+  }
+  return { ok: false, reason: 'corrupt' };
 }
 
 /** Serialize a document into an envelope string. Returns `undefined` if the value
@@ -702,6 +753,8 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
       // store's write as pending against the INCOMING one, which is the wrong answer to the
       // question `hasPendingWrite` asks.
       inFlight.clear();
+      unreadable.clear(); // #630 — same reasoning as `cache.clear()` above: a stale entry from the
+                          // outgoing namespace must not leak into the incoming (unhydrated) one.
       hydrated = false;
       // Close the landing-tracking window and reclassify (#454 B) — same shape as the
       // successful-install path below; see the comment there for the reasoning.
@@ -743,13 +796,24 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     dirty.clear();
     inFlight.clear();   // #559 — see the identical clear on the failure path above, incl. why it
                         // is defensive and uncovered.
+    unreadable.clear(); // #630 — same reasoning as `cache.clear()` above: a stale entry from the
+                        // previous namespace must not leak into the incoming one.
     // Populate from a freshly-cleared cache (not layered on top of whatever was already
     // there) — clearing immediately before repopulating from `raw` means a key that survived
     // in the old cache but is absent from the incoming namespace's `getAll` result cannot
     // leak through.
     for (const [full, str] of Object.entries(raw)) {
-      if (readEnvelope(str) === undefined) continue; // skip corrupt entries
-      cache.set(full.slice(prefix.length), str);
+      const read = readEnvelope(str);
+      const logicalKey = full.slice(prefix.length);
+      if (read.ok) {
+        cache.set(logicalKey, str);
+      } else if (read.reason === 'unreadable') {
+        // #630 — a structurally intact envelope this build cannot understand (most often a save
+        // written by a NEWER build). Leave it OUT of `cache` (so it reads as absent) and record
+        // it so `set()` refuses to clobber it.
+        unreadable.set(logicalKey, read.version);
+      }
+      // else: corrupt — skip, exactly as before.
     }
     hydrated = true;
     // Close the landing-tracking window and reclassify (#454 B). Set membership alone (whether a
@@ -824,7 +888,8 @@ function init(opts: PlayerPrefsInitOptions = {}): Promise<PlayerPrefsInitResult>
 function get<T extends JsonValue = JsonValue>(key: string): T | undefined {
   const env = cache.get(key);
   if (env === undefined) return undefined;
-  return readEnvelope(env) as T | undefined;
+  const read = readEnvelope(env);
+  return read.ok ? (read.value as T) : undefined;
 }
 
 /** Write a value (atomic per key). `undefined` deletes the key. Synchronous into the
@@ -832,6 +897,17 @@ function get<T extends JsonValue = JsonValue>(key: string): T | undefined {
 function set<T extends JsonValue>(key: string, value: T | undefined): void {
   if (value === undefined) {
     del(key);
+    return;
+  }
+  // #630 — refuse to clobber a save this build cannot read (most likely written by a NEWER
+  // build). This is the actual protection: without it, the owner's rule ("read defaults and
+  // play normally, but never destroy data a newer build can read") has no enforcement point.
+  if (unreadable.has(key)) {
+    console.warn(
+      `[PlayerPrefs] refusing to write "${key}" — an existing save under version ` +
+        `${unreadable.get(key)} could not be read by this build and would be overwritten; ` +
+        `call PlayerPrefs.delete("${key}") first if this is intentional`,
+    );
     return;
   }
   const env = writeEnvelope(value);
@@ -844,17 +920,35 @@ function set<T extends JsonValue>(key: string, value: T | undefined): void {
   scheduleFlush();
 }
 
+/** #630: deliberately reports a key protected by an unreadable save as ABSENT, same as `get()`
+ *  and `keys()` — do not "fix" this asymmetry. Today `has(k) === true` implies `get(k) !==
+ *  undefined`, and game code relies on that pattern (`if (prefs.has(k)) prefs.get(k)!`); making
+ *  `has()` see a key `get()` cannot return would break every such call site. */
 function has(key: string): boolean {
   return cache.has(key);
 }
 
+/** #630 review finding 2 — the way to tell "absent" from "present but unreadable", which
+ *  `has()` deliberately cannot: `has()` reports both as `false` (see its own doc comment), so a
+ *  caller that needs to know WHY a key reads as absent — a refused `set()` reported as durable,
+ *  an agent's `delete` refusing to remove the one thing blocking it — has no other way to ask.
+ *  `true` means this build hydrated a structurally intact envelope under a version it has no
+ *  migration for (most likely a save written by a NEWER build); `set()` on such a key is refused
+ *  (see its own comment). `del()`/`clear()` are unaffected — both drop the protection. */
+function isProtected(key: string): boolean {
+  return unreadable.has(key);
+}
+
 function del(key: string): void {
   cache.delete(key);
+  unreadable.delete(key); // #630 — explicit deletion is allowed even for a protected key; a
+                          // later set() on this key must then behave normally again.
   dirty.add(key); // dirty with no cache entry ⇒ backend.remove
   scheduleFlush();
 }
 
-/** The logical keys currently stored (this namespace only). */
+/** The logical keys currently stored (this namespace only). #630: a key protected by an
+ *  unreadable save is deliberately omitted — see the comment on `has()`. */
 function keys(): string[] {
   return [...cache.keys()];
 }
@@ -862,7 +956,13 @@ function keys(): string[] {
 /** Remove every key in this namespace. */
 function clear(): void {
   for (const k of cache.keys()) dirty.add(k);
+  // #630 — a key protected by an unreadable save is not in `cache`, so the loop above would
+  // silently leave it behind. "Remove every key in this namespace" must mean every key,
+  // including one this build can't read — explicit deletion is allowed even for a protected key
+  // (see `del()`), so mark it dirty too and drop the protection.
+  for (const k of unreadable.keys()) dirty.add(k);
   cache.clear();
+  unreadable.clear();
   scheduleFlush();
 }
 
@@ -1012,6 +1112,7 @@ export const PlayerPrefs = {
   namespace: getNamespace,
   hasPendingWrite,
   pendingKeys,
+  isProtected,
 } as const;
 
 // ── Test seam ─────────────────────────────────────────────────────
@@ -1049,6 +1150,7 @@ export function resetPlayerPrefsForTest(): void {
   cache.clear();
   dirty.clear();
   inFlight.clear();
+  unreadable.clear(); // #630 — else a protected key leaks between tests
   writeChain = Promise.resolve();
   initChain = Promise.resolve();
 }

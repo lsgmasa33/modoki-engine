@@ -1679,7 +1679,15 @@ registerAgentOp('player-prefs-write', async (params) => {
     // A no-op is a failure when the caller asked for a change (§5) — and the refusal is more
     // useful than the no-op would have been, because a delete that hits nothing is almost always
     // a mistyped key and the real ones are right here.
-    if (!PlayerPrefs.has(p.key)) {
+    // #630 review finding 4 — a PROTECTED key also reads as absent from `has()` (deliberately —
+    // see its doc comment), but it is not missing: it holds a save this build could not read, and
+    // `set()`'s own refusal message tells the caller to `PlayerPrefs.delete(key)` first to clear
+    // it. Without this check that escape hatch is unreachable from the agent surface — `has()`
+    // says the key isn't there, so the delete falls straight into NOT_FOUND below, and the only
+    // way left to clear a protected key is `action:'clear'`, which wipes the whole namespace.
+    // `PlayerPrefs.delete()` itself already treats a protected key like any other (it drops the
+    // protection unconditionally), so falling through to the ordinary delete path below is correct.
+    if (!PlayerPrefs.has(p.key) && !PlayerPrefs.isProtected(p.key)) {
       // A key absent from the cache but still DIRTY is not a missing key — but it is NOT proof of
       // a rejection either. `PlayerPrefs.delete()` does `cache.delete; dirty.add; scheduleFlush()`
       // on a 150ms debounce, so an ordinary in-flight delete (the game's own `PlayerPrefs.delete()`,
@@ -1741,10 +1749,20 @@ registerAgentOp('player-prefs-write', async (params) => {
     };
   }
   PlayerPrefs.set(p.key, p.value as JsonValue);
-  // `set()` SKIPS a value it cannot serialize (it warns and returns), so a bare ok:true would be a
-  // false success for exactly the inputs most likely to be wrong. The wire is JSON so this should
-  // be unreachable — assert it rather than assume it.
+  // `set()` SKIPS a value in TWO distinct cases, both leaving `has()` false: a value it cannot
+  // serialize (it warns and returns), and — #630 review finding 5 — a key PROTECTED by a save
+  // this build could not read (it refuses to clobber it and returns). The wire is JSON, so the
+  // non-serializable case should be unreachable — asserted here rather than assumed — but the
+  // protected case is very much reachable, and reporting it as "rejected as non-JSON-serializable"
+  // states a false cause authoritatively. Distinguish them with `isProtected` instead.
   if (!PlayerPrefs.has(p.key)) {
+    if (PlayerPrefs.isProtected(p.key)) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', namespace, key: p.key,
+        error: `'${p.key}' holds a save written by a newer build that this build cannot read, so the write was refused rather than overwriting it`,
+        hint: `call player-prefs-write action:'delete' key:'${p.key}' first if overwriting it is intentional`,
+      };
+    }
     return { ok: false, code: 'REFUSED_BY_OP', namespace, key: p.key, error: `the value for '${p.key}' was rejected as non-JSON-serializable and NOT stored` };
   }
   // Flush rather than leaving the 150ms debounce running: an agent's next act is usually to verify

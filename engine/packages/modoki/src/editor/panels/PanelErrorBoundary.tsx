@@ -77,7 +77,7 @@ export default class PanelErrorBoundary extends Component<Props, State> {
           height: '100%', color: '#e74c3c', background: '#1a1a2e', textAlign: 'center', padding: 16,
         }}>
           <p style={{ fontSize: 12, marginBottom: 8 }}>{this.props.label} crashed</p>
-          <p style={{ fontSize: 10, color: '#888', marginBottom: 12, wordBreak: 'break-all' }}>{this.state.error}</p>
+          <p style={{ fontSize: 10, color: '#888', marginBottom: 12, wordBreak: 'break-all', userSelect: 'text', WebkitUserSelect: 'text' }}>{this.state.error}</p>
           {!remountFailed && (
             <button onClick={this.handleReset} style={btn} data-ui-id="panel-error.reload-panel">Reload Panel</button>
           )}

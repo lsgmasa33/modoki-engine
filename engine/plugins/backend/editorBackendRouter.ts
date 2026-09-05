@@ -188,7 +188,7 @@ import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDevi
 import { isDeviceFailureReply } from './deviceAim';
 import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
 import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
-import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform } from './goIosDevice';
+import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform, leaseForIosOps } from './goIosDevice';
 import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
 import { listCrashReports, fetchCrashReport, filterCrashReports, summarizeCrashReport, RAW_CHARS_MAX } from './deviceCrashReports';
 import { resolveModules } from '../detect-modules';
@@ -947,7 +947,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         if (!goIos) {
           return { error: "go-ios is not installed. Install it from the editor's Build Support dialog (iOS Build Support → go-ios), or set MODOKI_GO_IOS." };
         }
-        return resolveGoIosDevice({ goIos, env: process.env, lease: await deviceConnection.deviceHardware() });
+        // Pass a lease only when it is actually HELD *and confirmed iOS* — `leaseForIosOps` is the
+        // gate (goIosDevice.ts). `deviceHardware()` is platform-agnostic: an ANDROID lease's
+        // `deviceModel` (e.g. `'SM-S901B'`) fed straight into `pickGoIosDevice` can never match an
+        // attached iPhone's `ProductType`, so a device that IS attached — just on the other
+        // platform — read as a genuine mismatch and refused (#670 finding 3: this used to be "the
+        // same gate `resolveHostSideAndroidSerial` uses", but that phrasing is what let the bug in —
+        // that gate only checks the lease is HELD, not that it is the right PLATFORM for this op).
+        // `pickGoIosDevice` also tells "no lease" from "lease with no reported hardware" apart, so
+        // `undefined` (not a hardware object with null fields) is what a non-iOS/unresolved lease
+        // must produce.
+        const connected = deviceConnection.status().state === 'connected';
+        const lease = connected ? leaseForIosOps(await deviceConnection.devicePlatform(), await deviceConnection.deviceHardware()) : undefined;
+        return resolveGoIosDevice({ goIos, env: process.env, lease });
       };
       // WHICH Android, for the host-side adb ops. The LEASE's serial wins (it is the phone the
       // caller is already driving); otherwise the same rule a build follows — the project pin, else
@@ -1020,7 +1032,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           const cap = await captureIosSyslog({
             udid: picked.device.udid, seconds: p.seconds, limit: p.limit, filter: p.filter,
           });
-          return json({ result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid });
+          return json({
+            result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid,
+            ...(picked.unverified ? { unverified: picked.unverified } : {}),
+          });
         } catch (e) {
           return json({ error: e instanceof Error ? e.message : String(e) }, 409);
         }
@@ -1066,9 +1081,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             const text = await fetchCrashReport({ udid, name: p.name });
             if (p.raw) {
               const clipped = text.length > RAW_CHARS_MAX;
-              return json({ result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped });
+              return json({
+                result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped,
+                ...(picked.unverified ? { unverified: picked.unverified } : {}),
+              });
             }
-            return json({ result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid });
+            return json({
+              result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid,
+              ...(picked.unverified ? { unverified: picked.unverified } : {}),
+            });
           }
           const all = await listCrashReports({ udid });
           const refs = filterCrashReports(all, appProcess);
@@ -1080,6 +1101,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             result: refs.slice(0, limit), device: picked.device.name ?? picked.device.udid,
             totalOnDevice: all.length, matched: refs.length, shown: Math.min(limit, refs.length),
             filteredTo: appProcess ?? null,
+            ...(picked.unverified ? { unverified: picked.unverified } : {}),
           });
         } catch (e) {
           return json({ error: e instanceof Error ? e.message : String(e) }, 409);
