@@ -715,6 +715,110 @@ describe('UINode text rendering', () => {
     expect(marked).not.toBeNull();
     expect(marked!.closest('[data-entity-id]')).toBe(el);
   });
+
+  // ── The no-wrapper path (#742) ──
+  describe('the no-wrapper path (#742): textAlign on a shrink-wrapped bare string', () => {
+    const clampDiv = (el: HTMLElement) => el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+
+    it('mounts for center in a column host with non-stretch alignItems, carrying marginInline:auto', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('mounts for right in a column host with non-stretch alignItems, carrying marginLeft:auto', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'right', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginLeft).toBe('auto');
+    });
+
+    it('mounts for center in a ROW host even under the default alignItems:stretch — stretch never reaches the main axis', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'stretch', flexDirection: 'row',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('mounts for the DEGENERATE combination Court/Wordweave actually author: center + alignItems:center', () => {
+      // This is the zero-pixel-change case the brief cares about most: `align-items: center`
+      // already centres the shrink-wrapped box exactly where `text-align: center` would put the
+      // glyphs, so the wrapper mounts but changes no geometry. jsdom can't measure layout — the
+      // e2e spec is the guard that actually verifies "unchanged"; this only pins that the wrapper
+      // mounts (so the fix is live) and carries the expected margin.
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'center', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('does NOT mount for the default stretch column box — text-align already works there', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'stretch', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('does NOT mount for textAlign:left, even under a shrink-wrapping alignItems — shrinkWrapAlign(left) is a no-op', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'left', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('does NOT mount when autoFitText is set — AutoFitText mounts its own span/handling', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+        autoFitText: true, fontSize: 20,
+      }));
+      expect(clampDiv(el)).toBeNull();
+      expect(el.querySelector(`span[${UI_PAINT_ATTR}="text"]`)).not.toBeNull();
+    });
+
+    it('does NOT mount when a textAnim actually resolves — AnimatedText carries shrinkWrapAlign itself', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+        textAnim: { effect: 'rainbow', speed: 1, amplitude: 0, frequency: 1, loop: true, fadeIn: true },
+      } as Partial<UINodeData>));
+      expect(clampDiv(el)).toBeNull();
+      const span = el.querySelector(`span[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+      expect(span).not.toBeNull();
+      expect(span!.style.marginInline).toBe('auto');
+    });
+
+    it('does NOT mount when already clamped (maxLines > 0) — the existing clamp wrapper owns the alignment there', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column', maxLines: 2,
+      }));
+      // Exactly one marked wrapper, not two competing ones.
+      expect(el.querySelectorAll(`[${UI_PAINT_ATTR}="text"]`).length).toBe(1);
+    });
+
+    it('does NOT mount for empty text', () => {
+      const el = renderNode(makeNode({
+        text: '', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('the mounted wrapper carries the paint marker, so a shrink-wrapped label stays clickable', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.closest('[data-entity-id]')).toBe(el);
+    });
+  });
 });
 
 // ── Image (F3) — the production-only-breakage guard ──

@@ -572,3 +572,111 @@ test.describe('AutoFitText scale invariance (contentWidthOf, transform-aware fix
     ).toBeLessThan(0.05);
   });
 });
+
+test.describe('textAlign on the no-wrapper path (#742)', () => {
+  // The common text path (no `maxLines`, no `ellipsis`, no `autoFitText`, no `TextAnimation`) is a
+  // BARE STRING — an anonymous flex item. `alignItems !== 'stretch'` (or a `row` host) shrink-wraps
+  // that item to its content, and a shrink-wrapped box has no leftover inline space for
+  // `text-align` — written on the HOST — to work with. `uiTextAnimation.ts`'s #657 comment already
+  // measured this mechanism for the wrapper paths; this fixes the no-wrapper one.
+  //
+  // jsdom has no layout, so this is entirely a real-browser measurement: compare the rendered
+  // text's box against the HOST's box, not `getComputedStyle` (which reported the authored value
+  // both before and after the fix — that IS how #742 hid).
+  function centerOffset(hostRect: { x: number; width: number }, textRect: { x: number; width: number }) {
+    return (textRect.x - hostRect.x) - (hostRect.width - textRect.width) / 2;
+  }
+
+  // Measures the RENDERED TEXT's rect regardless of whether a wrapper mounts — required so the
+  // mutation check below (fix reverted, no wrapper) can still measure something instead of timing
+  // out on a locator that no longer exists. Post-fix, that's the `data-ui-paint="text"` wrapper
+  // div; pre-fix (or the `left`/degenerate cases that never needed one), it's a `Range` around the
+  // host's own bare text-node child — the same rect the browser paints the glyphs into either way.
+  async function textRect(host: Locator) {
+    return host.evaluate((el) => {
+      const paintDiv = el.querySelector('div[data-ui-paint="text"]') as HTMLElement | null;
+      const r = paintDiv
+        ? paintDiv.getBoundingClientRect()
+        : (() => {
+          const textNode = Array.from(el.childNodes).find((n) => n.nodeType === Node.TEXT_NODE);
+          if (!textNode) return null;
+          const range = document.createRange();
+          range.selectNodeContents(textNode);
+          return range.getBoundingClientRect();
+        })();
+      return r ? { x: r.x, width: r.width } : null;
+    });
+  }
+
+  test('column host, alignItems:flex-start, textAlign:center — the text centers within the host', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'NoWrapCenterFlexStart');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'NoWrapCenterFlexStart');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const hostRect = await host.boundingBox();
+    const rect = await textRect(host);
+    if (!hostRect || !rect) throw new Error('a box has no bounding box');
+
+    // Pre-fix, the bare text shrink-wraps flush to the LEFT edge (no wrapper existed to carry the
+    // alignment) — the text's left edge sits at the host's left edge, not centered within it.
+    expect(rect.width).toBeLessThan(hostRect.width - 4); // genuinely shrink-wrapped, not stretched
+    expect(Math.abs(centerOffset(hostRect, rect))).toBeLessThan(2);
+  });
+
+  test('column host, alignItems:flex-start, textAlign:right — the text sits flush against the host\'s right edge', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'NoWrapRightFlexStart');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'NoWrapRightFlexStart');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const hostRect = await host.boundingBox();
+    const rect = await textRect(host);
+    if (!hostRect || !rect) throw new Error('a box has no bounding box');
+
+    expect(rect.width).toBeLessThan(hostRect.width - 4);
+    expect(Math.abs((rect.x + rect.width) - (hostRect.x + hostRect.width))).toBeLessThan(2);
+  });
+
+  test('row host, default alignItems:stretch, textAlign:center — stretch never reaches the main axis, text still centers', async ({ page }) => {
+    // A `row` host content-sizes its items along the MAIN axis regardless of `alignItems`
+    // (`alignItems` governs the CROSS axis) — so this shrink-wraps even under the default
+    // `stretch`, the case the brief calls out separately from the column cases above.
+    await gotoEditorWithScene(page, SCENE, 'NoWrapCenterRow');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'NoWrapCenterRow');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+
+    expect(await host.evaluate((el) => getComputedStyle(el).flexDirection)).toBe('row');
+
+    const hostRect = await host.boundingBox();
+    const rect = await textRect(host);
+    if (!hostRect || !rect) throw new Error('a box has no bounding box');
+
+    expect(rect.width).toBeLessThan(hostRect.width - 4);
+    expect(Math.abs(centerOffset(hostRect, rect))).toBeLessThan(2);
+  });
+
+  // The guard that keeps Court and Wordweave safe: EVERY authored `textAlign:'center'` instance in
+  // both shipping games also authors `alignItems:'center'` — a combination where `align-items:
+  // center` already centres the shrink-wrapped box exactly where `text-align:center` would put the
+  // glyphs. This must measure IDENTICALLY (still centred) whether or not the fix's wrapper mounts —
+  // that is the zero-pixel-change claim the brief makes about the blast radius, and the mutation
+  // check (fix reverted) is expected to leave this one passing.
+  test('DEGENERATE: column host, alignItems:center, textAlign:center — geometry is centered either way (zero-pixel guard)', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'NoWrapCenterAlignCenterDegenerate');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'NoWrapCenterAlignCenterDegenerate');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const hostRect = await host.boundingBox();
+    const rect = await textRect(host);
+    if (!hostRect || !rect) throw new Error('a box has no bounding box');
+
+    expect(Math.abs(centerOffset(hostRect, rect))).toBeLessThan(2);
+  });
+});

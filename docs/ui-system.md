@@ -232,6 +232,40 @@ Field groups (representative fields, verified against `UIElement.ts`):
   fit-content collapses to the available width and the auto margin is harmless there; this is a
   `nowrap`-only difference, not an inconsistency to "fix" by symmetry.
 
+  ⚠️ **The NO-WRAPPER path — the common case, no `maxLines`/`ellipsis`/`autoFitText`/`textAnim` —
+  gets the same `shrinkWrapAlign` treatment as the wrapper paths above (#742).** `style.textAlign`
+  is written onto the HOST, whose `display: 'flex'` is forced unconditionally; with no wrapper, the
+  text content is a bare string, i.e. an anonymous flex item. `align-items` other than the default
+  `stretch` (or a `row` host, where the text sits on the MAIN axis instead) shrink-wraps that box to
+  its content, and a shrink-wrapped box has no leftover inline space for `text-align` to work with
+  — the same mechanism #657 fixed for `AnimatedText`, one element over. `UINode.tsx` now mounts the
+  same `clampStyle`/wrapper-`<div>` machinery for this case too, carrying `shrinkWrapAlign
+  (node.textAlign)`, but ONLY when: `textAlign` is `'center'`/`'right'` (`shrinkWrapAlign('left')`
+  is `{}`, so a wrapper would be pure DOM churn); the box actually shrink-wraps
+  (`alignItems !== 'stretch'` or `flexDirection === 'row'`); and the text is a genuine bare string
+  (`!autoFitText` and no resolved `textAnim` — both mount their own span with their own handling).
+  Safe to reuse `shrinkWrapAlign` here despite the #725→#727 stretch-disabling trap above precisely
+  *because* of the shrink-wrap condition: this branch only ever fires when the box is already not
+  being stretched, so disabling `stretch` is a no-op. Measured blast radius (Court + Wordweave):
+  82 entities meet the conditions, and every one of them ALSO authors `alignItems: 'center'` with
+  `textAlign: 'center'` — a degenerate combination where `align-items: center` already centres the
+  shrink-wrapped box exactly where `text-align: center` would put the glyphs, so this is a
+  zero-pixel change in both shipping games today; other games' alignment is left as-is until a
+  problem is actually seen there.
+
+  ⚠️ **Two residual gaps #742 does NOT close, left deliberately:**
+  - **The parent-shrink-wrap case.** An entity whose OWN `alignItems` is `stretch` (so its text box
+    stretches to fill its own div) but whose DIV is itself a content-sized flex item of ITS parent
+    (e.g. a `flexDirection: 'row'` parent holding several text children) hits the identical
+    "no leftover inline space" problem one level up — not decidable from the node's own fields, so
+    this fix cannot reach it.
+  - **`textAlign: 'left'` under a centring `alignItems`** still renders centred (`shrinkWrapAlign`
+    returns `{}` for `'left'`, so the wrapper doesn't help without a `marginRight: 'auto'` arm).
+    Left alone on purpose: `'left'` is the trait default, and a scene save strips an authored field
+    equal to its default (see the memory-index scar on this), so an authored `'left'` is
+    indistinguishable in the JSON from "never touched the field" — adding the arm would silently
+    change nodes nobody explicitly configured.
+
   ⚠️ **`minWidth: 0` on the single-line `clampStyle` was believed load-bearing and was a no-op
   (#727 review).** `clampStyle` always carries `overflow: hidden`, which makes the wrapper a SCROLL
   CONTAINER — and a scroll container's automatic minimum size is already 0 (CSS Flexbox §4.5), so

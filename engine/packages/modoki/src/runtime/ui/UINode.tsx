@@ -800,6 +800,54 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         whiteSpace: 'nowrap',
         maxWidth: '100%',
       };
+    } else {
+      // ── The no-wrapper path (#742) ──
+      // Every branch above wraps the text because it needs to (a clamp, an ellipsis). The bare
+      // string here needs NO wrapper for its own sake — it only needs one because `text-align`,
+      // written on the HOST a few lines up, is inert on a shrink-wrapped anonymous flex item
+      // (`uiTextAnimation.ts`'s #657 comment: "a shrink-wrapped block has no inline content left
+      // to align"). The three wrapper paths above (and `AnimatedText`, `AutoFitText`) each carry
+      // `shrinkWrapAlign` already; this is the common path that didn't, so `textAlign: 'center'`/
+      // `'right'` painted flush-left whenever the host didn't stretch the text box for it.
+      //
+      // Mount ONLY when it can matter and can't be handled elsewhere:
+      //   - `textAlign` is `'center'`/`'right'` — `shrinkWrapAlign('left')` returns `{}`, so a
+      //     wrapper would be pure DOM churn for no visual effect. (`'left'` under a centring
+      //     `alignItems` is a separate, KNOWN, deliberately-unfixed gap — see `docs/ui-system.md`:
+      //     `left` is the trait default, and the scene serializer strips a field equal to its
+      //     default, so an authored `left` is indistinguishable from "never touched the field".)
+      //   - the box actually shrink-wraps: `alignItems !== 'stretch'` (the default) OR
+      //     `flexDirection === 'row'` (where a column's `stretch` doesn't reach — the text sits on
+      //     the MAIN axis instead, which content-sizes regardless of `alignItems`).
+      //   - the text is a genuine bare string: not `autoFitText` (mounts its own span, its own
+      //     handling) and not a text node whose `textAnim` actually resolves (mounts `AnimatedText`
+      //     with `shrinkWrapAlign` already carried via `rainbowStyleFor`).
+      //
+      // ⚠️ `shrinkWrapAlign` disables `align-items: stretch` via its auto cross-axis margin (CSS
+      // Flexbox §8.3) — the same mechanism the #725→#727 trap above warns is a cure worse than the
+      // disease on an alignItems:stretch box. It is SAFE here specifically because the shrink-wrap
+      // condition above only lets this branch fire when the box is already not being stretched (or
+      // stretch doesn't apply on this axis) — so disabling stretch is a no-op, not a regression.
+      // Don't drop that guard thinking it's redundant with the alignment check.
+      //
+      // Measured (Court + Wordweave, #742): 82 entities meet these conditions, and every one of
+      // them also authors `alignItems: 'center'` with `textAlign: 'center'` — a degenerate
+      // combination where `align-items: center` already centres the shrink-wrapped box exactly
+      // where `text-align: center` would put the glyphs. Zero-pixel change in both shipping games;
+      // guarded by an e2e case that measures that exact combination's geometry is unchanged.
+      // ⚠️ That 82 is COURT + WORDWEAVE ONLY, not a repo total — the other games were deliberately
+      // NOT swept (owner, 2026-09-05: their alignment gets corrected later, when a problem is
+      // actually seen). So a game outside those two MAY move when this branch starts firing, and
+      // that is an accepted, known consequence rather than an oversight. Nothing guards the count.
+      const resolvedTextAnim = !!(node.textAnim && uiTextAnimation(node.textAnim, node.textAlign));
+      if (
+        (node.textAlign === 'center' || node.textAlign === 'right') &&
+        (node.alignItems !== 'stretch' || node.flexDirection === 'row') &&
+        !node.autoFitText &&
+        !resolvedTextAnim
+      ) {
+        clampStyle = shrinkWrapAlign(node.textAlign);
+      }
     }
   }
 

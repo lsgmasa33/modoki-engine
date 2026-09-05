@@ -599,6 +599,126 @@
           "layer": "ui"
         }
       }
+    },
+    {
+      "id": 21,
+      "name": "NoWrapCenterFlexStart",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 300,
+          "widthUnit": "px",
+          "height": 80,
+          "heightUnit": "px",
+          "alignItems": "flex-start",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "HI",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textAlign": "center"
+        },
+        "EntityAttributes": {
+          "name": "NoWrapCenterFlexStart",
+          "guid": "e2e50000-0000-4000-8000-000000000021",
+          "isActive": true,
+          "sortOrder": 20,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "name": "NoWrapRightFlexStart",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 300,
+          "widthUnit": "px",
+          "height": 80,
+          "heightUnit": "px",
+          "alignItems": "flex-start",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "HI",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textAlign": "right"
+        },
+        "EntityAttributes": {
+          "name": "NoWrapRightFlexStart",
+          "guid": "e2e50000-0000-4000-8000-000000000022",
+          "isActive": true,
+          "sortOrder": 21,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "name": "NoWrapCenterRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 300,
+          "widthUnit": "px",
+          "height": 80,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "HI",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textAlign": "center"
+        },
+        "EntityAttributes": {
+          "name": "NoWrapCenterRow",
+          "guid": "e2e50000-0000-4000-8000-000000000023",
+          "isActive": true,
+          "sortOrder": 22,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "name": "NoWrapCenterAlignCenterDegenerate",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 300,
+          "widthUnit": "px",
+          "height": 80,
+          "heightUnit": "px",
+          "alignItems": "center",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "HI",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textAlign": "center"
+        },
+        "EntityAttributes": {
+          "name": "NoWrapCenterAlignCenterDegenerate",
+          "guid": "e2e50000-0000-4000-8000-000000000024",
+          "isActive": true,
+          "sortOrder": 23,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
     }
   ]
 }
