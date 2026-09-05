@@ -3460,7 +3460,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     if (!getFontTexture(provider, 0)) { if (entry) entry.group.visible = false; return; }
 
     const hash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
-      t.letterSpacing, t.anchorX, t.anchorY, provider.atlasVersion, getTextDirtyVersion()].join('|');
+      t.letterSpacing, t.anchorX, t.anchorY, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
 
     if (!entry || entry.hash !== hash) {
       provider.ensureGlyphs(codepointsOf(t.text));

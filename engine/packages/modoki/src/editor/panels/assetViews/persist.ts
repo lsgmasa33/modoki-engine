@@ -15,6 +15,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import { invalidateMaterial } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateAnimSet, setAnimSet, type AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { clearSpriteMaterialCache } from '../../../runtime/loaders/spriteMaterialCache';
+import { invalidatePixiShaderProgram } from '../../../runtime/rendering/pixiShaderBuilder';
 import { fireDirtyListeners } from '../../../runtime/core/ecs/entityUtils';
 import { useEditorStore } from '../../store/editorStore';
 
@@ -106,7 +107,14 @@ export const invalidateMaterialFile = (path: string) => invalidateMaterial(path)
 // cache is keyed by GUID, so clearing all is the simplest correct invalidation; they
 // recompile lazily.) An already-mounted material Mesh caches its bound uniforms, so a
 // default change fully reflects on the next scene load / material rebuild.
-export const invalidateShaderFile = () => clearSpriteMaterialCache();
+//
+// This is the ONE call site where a shader's SOURCE has genuinely changed (a param default,
+// range, etc. was edited and written to disk — see ShaderAssetView), so it's also the one call
+// site allowed to evict `pixiShaderBuilder`'s module-level program cache (#716) — everywhere
+// else (world swap, viewport teardown) that cache MUST survive `clearSpriteMaterialCache()`,
+// which is the whole point of the fix. `persistAssetEdit` calls `invalidate(path, updated)`, so
+// `path` is right here — evict just that path rather than the whole program cache.
+export const invalidateShaderFile = (path: string) => { clearSpriteMaterialCache(); invalidatePixiShaderProgram(path); };
 // Live-update the running scene: drop the stale entry, seed the new one so the
 // next driveAnimator frame resolves the edited params (path === cache key).
 export const invalidateAnimSetFile = (path: string, updated: unknown) => { invalidateAnimSet(path); setAnimSet(path, updated as { source?: string; clips?: AnimSetClipDef[] }); };

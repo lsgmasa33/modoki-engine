@@ -40,7 +40,7 @@ import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
-import { makeMtsdfPixiShader, updateMtsdfPixiStyle } from './text/mtsdfPixiShader';
+import { makeMtsdfPixiShader, updateMtsdfPixiStyle, canReuseMtsdfPixiShader, updateMtsdfPixiMetrics } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
 import type { TextQuad } from './text/layoutText';
@@ -111,6 +111,10 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // on deactivation; `animStart` is the smoothedElapsed captured at (re)activation so
   // each Play restarts the effect from t=0.
   baseQuads?: TextQuad[]; pageNums?: number[]; wasMotion?: boolean; wasColored?: boolean; animStart?: number; animEffect?: string;
+  // Text slots only: consecutive failed rebuild attempts (see the `meshFrameKey` sentinel
+  // comment below) — bounds the retry so a PERMANENT failure degrades to a quiet blank
+  // instead of churning every frame forever.
+  textRebuildFails?: number; textRebuildFailHash?: string;
   // Material slots (kind 'material'): obj is a Mesh (quad geometry + a per-entity
   // pixiShaderBuilder Shader) sampling the entity's OWN sprite bitmap as `uTexture`
   // (or Texture.WHITE when it has no sprite). `matGuid` is the bound 2D-material GUID;
@@ -196,6 +200,13 @@ function unloadAllSpriteTextures() {
  *  The residual risk — a mid-load scan catching a child before its canvas — is a single
  *  console line, against the alternative of the silence this whole change exists to end. */
 const ORPHAN_2D_WARN_FRAMES = 1;
+
+// A Text2D rebuild that keeps throwing (malformed atlas, a font provider stuck not-ready)
+// gets this many consecutive attempts before giving up for the current layout hash — see
+// the `textRebuildFails` catch in the Text2D draw pass below. Small on purpose: a
+// transient failure (the common case — a texture arriving next frame) clears in one or
+// two, so this exists only to cap the PERMANENT case, not to smooth over real flakiness.
+const TEXT_REBUILD_MAX_RETRIES = 3;
 
 // ── Trait metadata cache (global — the trait registry is process-wide) ──
 let traitsCached = false;
@@ -338,11 +349,12 @@ function disposeSlot(slot: Slot) {
     mesh.destroy();
     releaseGeometry(geo);
     // ⚠️ BARE `destroy()` ON PURPOSE — Pixi's `Shader.destroy(destroyPrograms = false)` leaves the
-    // shared program alone, and `ensureSpriteMaterial` caches ONE program per material GUID that
-    // every entity using that material holds a Shader built from. Changing this to `destroy(true)`
-    // would free a GlProgram that other live Meshes STILL IN THE GRAPH point at, from inside the
-    // pass that renders them — the #455 class, with a worse blast radius than the mask that found
-    // it. Same for the text shaders below.
+    // shared program alone, and (post-#716) `pixiShaderBuilder`'s program cache is MODULE-scope,
+    // shared by every entity using that material across every canvas, for the rest of the session
+    // — not just a per-GUID cache `ensureSpriteMaterial` itself owns. Changing this to
+    // `destroy(true)` would free a GlProgram that other live Meshes STILL IN THE GRAPH point at,
+    // from inside the pass that renders them — the #455 class, with a worse blast radius than the
+    // mask that found it. Same for the text shaders below.
     slot.matShader?.destroy();
     if (tex && tex !== Texture.WHITE) tex.destroy(false);
     if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);
@@ -1880,7 +1892,7 @@ export class Scene2DRenderer {
         this.activeIds.add(id);
 
         const layoutHash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
-          t.letterSpacing, provider.atlasVersion, getTextDirtyVersion()].join('|');
+          t.letterSpacing, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
         const styleHash = [t.color, t.opacity, t.weight, t.outlineColor, t.outlineWidth, t.outlineOpacity,
           t.glowColor, t.glowSize, t.glowStrength, t.shadowColor, t.shadowOpacity,
           t.shadowOffsetX, t.shadowOffsetY, t.shadowSoftness].join('|');
@@ -1904,53 +1916,118 @@ export class Scene2DRenderer {
         // is a single page. All page meshes are children of the slot Container, so the
         // anchor/pivot/transform below apply to the whole block at once.
         if (!slot || slot.meshFrameKey !== layoutHash) {
-          provider.ensureGlyphs(textCodepoints(t.text));
-          const layout = layoutText(provider, t.text, {
-            fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
-            lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
-          });
-          const style = textStyle2D(t);
           if (!slot) {
             const container = new Container();
             this.containerFor(canvasSlot, id).addChild(container);
-            slot = { kind: 'text', obj: container, spriteRef: t.font, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: layoutHash, pageMeshes: [], textShaders: [], textW: layout.width, textH: layout.height };
+            // `meshFrameKey` starts at the SENTINEL '', not `layoutHash` — pre-existing, not
+            // introduced by #716. The sentinel can never equal a real hash (the join always has
+            // literal `|` separators against real field values), so a slot that never reaches
+            // the real stamp below (the catch just below explains when) keeps being seen as
+            // stale and gets retried, rather than silently reading as already-built.
+            slot = { kind: 'text', obj: container, spriteRef: t.font, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: '', pageMeshes: [], textShaders: [], textW: 0, textH: 0 };
             this.slots.set(id, slot);
           }
           const container = slot.obj as Container;
-          // Rebuild all page meshes (a layout/atlas change is infrequent).
-          for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
-          // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
-          // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
-          // every text entity in the process), so `destroy(true)` here would null the SHARED
-          // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
-          // every canvas too.
-          for (const s of slot.textShaders ?? []) s.destroy();
-          slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
-          for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
-            const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
-            // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
-            // where a just-minted texture is torn down inside the same call (#481, an
-            // already-disposed provider's addDisposable running synchronously). Same posture as
-            // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
-            if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
-            // Pixi MeshGeometry wants a Uint32Array index buffer.
-            const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
-            const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
-            // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
-            // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
-            // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
-            geometry.addAttribute('aTextColor', {
-              buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
-              format: 'float32x4', stride: 4 * 4, offset: 0,
+          try {
+            provider.ensureGlyphs(textCodepoints(t.text));
+            const layout = layoutText(provider, t.text, {
+              fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
+              lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
             });
-            const shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
-            const mesh = new Mesh({ geometry, texture: ptex, shader });
-            container.addChild(mesh);
-            slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+            const style = textStyle2D(t);
+            // Reclaim the existing shaders BEFORE tearing anything down, indexed by PAGE
+            // NUMBER (not array index — a page can be skipped below when its texture isn't
+            // ready yet, so `pageNums` and the array index can disagree). A Shader depends
+            // only on the page texture + atlas geometry (#690); fontSize/style reach it
+            // purely through uniforms, so a plain text/fontSize edit can keep the same
+            // Shader instead of paying for a new one (and its UniformGroup — see #699).
+            // This does NOT save a GL/GPU program compile: the programs are already shared
+            // module-level via `getMtsdfPrograms` ("Program cache (fixes #590)").
+            const reusable = new Map<number, Shader>();
+            if (slot.pageNums && slot.textShaders) {
+              for (let i = 0; i < slot.pageNums.length; i++) {
+                const s = slot.textShaders[i];
+                if (s) reusable.set(slot.pageNums[i], s);
+              }
+            }
+            // Rebuild all page geometry (a layout/atlas change is infrequent). Bare
+            // `destroy()` — Mesh.destroy() sets `_shader = null` and does not destroy the
+            // shader, which is why a reclaimed shader survives its mesh being destroyed.
+            for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
+            slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
+            try {
+              for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
+                const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
+                // where a just-minted texture is torn down inside the same call (#481, an
+                // already-disposed provider's addDisposable running synchronously). Same posture as
+                // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
+                if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
+                // Pixi MeshGeometry wants a Uint32Array index buffer.
+                const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
+                const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
+                // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
+                // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
+                // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
+                geometry.addAttribute('aTextColor', {
+                  buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
+                  format: 'float32x4', stride: 4 * 4, offset: 0,
+                });
+                let shader = reusable.get(page);
+                if (shader && canReuseMtsdfPixiShader(shader, ptex, atlas)) {
+                  reusable.delete(page);
+                  updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
+                } else {
+                  shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
+                }
+                const mesh = new Mesh({ geometry, texture: ptex, shader });
+                container.addChild(mesh);
+                slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+              }
+            } finally {
+              // Destroy any shaders NOT reclaimed above (a page the text no longer touches,
+              // or whose texture/atlas changed under it).
+              // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
+              // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
+              // every text entity in the process), so `destroy(true)` here would null the SHARED
+              // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
+              // every canvas too.
+              // ⚠️ `finally`, NOT a plain trailing loop: a throw inside the page loop (context loss, a
+              // failed buffer allocation — the pass's catch below expects those) would otherwise strand
+              // every reclaimed shader, unreachable AND already removed from slot.textShaders, so
+              // disposeSlot cannot free them either. That is the exact leak #690 exists to remove.
+              for (const s of reusable.values()) s.destroy();
+            }
+            slot.meshFrameKey = layoutHash;
+            slot.textW = layout.width; slot.textH = layout.height;
+            slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
+            slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good rebuild clears the streak
+          } catch (err) {
+            // `layoutText`/`buildTextGeometryByPage` above can throw (a font provider not
+            // ready, a malformed atlas). Left uncaught here, that throw skips `slot.meshFrameKey
+            // = layoutHash` above, so `meshFrameKey` stays at whatever it was (the sentinel, or
+            // the last successful hash) — always ≠ `layoutHash`, so the NEXT frame re-enters
+            // this whole block: destroys the page meshes/geometry just rebuilt, re-runs
+            // `layoutText`/the page loop, and throws again. For a TRANSIENT cause (a texture
+            // arriving next frame) that self-heals in a frame or two and is exactly the retry
+            // wanted. For a PERMANENT one it never terminates — silent per-frame teardown/
+            // rebuild churn on top of the silent blank (the outer catch below logs only once
+            // per session, so nothing surfaces this). Bound it: after `TEXT_REBUILD_MAX_RETRIES`
+            // consecutive failures for this hash, stamp `meshFrameKey` anyway so the retry
+            // stops and the entity settles into a quiet blank — the same outcome a permanent
+            // failure always had, just without the unbounded churn. A later change to the
+            // actual inputs (text/fontSize/atlas/textDirty) computes a different hash and gets
+            // a fresh set of attempts.
+            // The streak is per-HASH. Without this reset the counter is global to the slot, so a
+            // permanent failure that burned it to the cap would leave a genuinely DIFFERENT layout
+            // (new text, new fontSize, a grown atlas) with a single attempt before being stamped
+            // off — contradicting the paragraph above, which promises a changed input gets a fresh
+            // set. Keyed on the hash, each distinct layout gets its own budget.
+            if (slot.textRebuildFailHash !== layoutHash) { slot.textRebuildFails = 0; slot.textRebuildFailHash = layoutHash; }
+            slot.textRebuildFails = (slot.textRebuildFails ?? 0) + 1;
+            if (slot.textRebuildFails >= TEXT_REBUILD_MAX_RETRIES) slot.meshFrameKey = layoutHash;
+            throw err;
           }
-          slot.meshFrameKey = layoutHash;
-          slot.textW = layout.width; slot.textH = layout.height;
-          slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
         }
 
         // Per-glyph animation: recompute page positions from the base quads each frame
@@ -2209,14 +2286,16 @@ export class Scene2DRenderer {
       this.entityShaders.clear();
       this._materialTexLoading.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
-      // gated like the texture net): clearSpriteMaterialCache never destroys a GlProgram/
-      // GpuProgram, and every live per-entity Shader holds its OWN program reference, so wiping
-      // the shared cache can't strand the other viewport's already-drawn frame. It ALSO bumps a
-      // generation that supersedes any in-flight compile — what keeps a sibling safe from THAT
-      // is that the clear fires the pending waiters (#523), not that it's maps-only. Gating this
-      // on liveRenderers<=1 was the bug that left an EDITED .shader.json serving its stale
-      // compiled program on hot-reload whenever both GameView + SceneView were live (the default
-      // editor).
+      // gated like the texture net): every live per-entity Shader holds its OWN program
+      // reference, so wiping the shared cache can't strand the other viewport's already-drawn
+      // frame, AND (#716) the compiled GlProgram/GpuProgram itself now survives this clear —
+      // it's memoised at module scope in `pixiShaderBuilder`'s program cache, keyed on the
+      // manifest path, and this clear never evicts it — so the clear no longer forces a
+      // recompile at all. It ALSO bumps a generation that supersedes any in-flight compile —
+      // what keeps a sibling safe from THAT is that the clear fires the pending waiters (#523),
+      // not that it's maps-only. Gating this on liveRenderers<=1 was the bug that left an
+      // EDITED .shader.json serving its stale compiled program on hot-reload whenever both
+      // GameView + SceneView were live (the default editor).
       clearSpriteMaterialCache();
       this.activeIds.clear();
       this.prevCanvasIds.clear();

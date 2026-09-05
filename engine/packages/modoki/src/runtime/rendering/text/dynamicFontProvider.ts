@@ -589,7 +589,7 @@ export class DynamicFontProvider implements FontProvider {
     }
 
     this.atlasVersion++;
-    markTextDirty();
+    markTextDirty(this.id);
   }
 
   /** Warn once when the atlas is so saturated a glyph can't be placed even after

@@ -81,8 +81,27 @@ function mockDeps() {
       buffers: unknown[] | null = [];
       unload = vi.fn();
       destroy = vi.fn(() => { this.buffers = null; });
-      constructor(public opts?: any) {}
+      addAttribute = vi.fn();
+      constructor(public opts?: any) {
+        MeshGeometry.__control.callCount++;
+        if (MeshGeometry.__control.callCount === MeshGeometry.__control.throwOnCall) {
+          throw new Error('[mock] MeshGeometry construction failed');
+        }
+      }
+      // Test-only knob (Fix 1 regression cover): make the Nth constructed MeshGeometry
+      // throw, to simulate a mid-loop failure (context loss, a failed buffer allocation)
+      // inside Scene2D's text page-rebuild loop.
+      static __control = { callCount: 0, throwOnCall: -1 };
     }
+    // Minimal stand-ins for the two pixi.js exports Scene2D's text pass constructs
+    // directly (`new Buffer(...)`, `BufferUsage.VERTEX | BufferUsage.COPY_DST`) — no
+    // other pass in this harness touches them.
+    class Buffer {
+      data: any; label?: string; usage?: number;
+      constructor(opts?: any) { this.data = opts?.data; this.label = opts?.label; this.usage = opts?.usage; }
+      update = vi.fn();
+    }
+    const BufferUsage = { VERTEX: 1, COPY_DST: 2 };
     class Mesh extends Display {
       kind = 'material';
       geometry: any; texture: any; shader: any; tint = 0xffffff; blendMode = 'normal';
@@ -139,7 +158,7 @@ function mockDeps() {
     };
     // extensions.add(loadKTX2) is called by ensurePixiKtxTranscoder during startScene2D
     // (v8 doesn't auto-register the KTX2 parser); stub both so the transcoder setup is a no-op.
-    return { Application, Container, Texture, Rectangle, Graphics, Sprite, Mesh, MeshGeometry, Assets, isWebGPUSupported: () => Promise.resolve(false), setKTXTranscoderPath: () => {}, extensions: { add: () => {} }, loadKTX2: {} };
+    return { Application, Container, Texture, Rectangle, Graphics, Sprite, Mesh, MeshGeometry, Buffer, BufferUsage, Assets, isWebGPUSupported: () => Promise.resolve(false), setKTXTranscoderPath: () => {}, extensions: { add: () => {} }, loadKTX2: {} };
   });
 
   vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({
@@ -1652,5 +1671,209 @@ describe('Mask2D teardown deferral (#455)', () => {
     // Tear the renderer down WITHOUT another renderFrame — stop() must drain the queue itself.
     scene2d.stopScene2D();
     expect(oldMaskObj.destroyed).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Text2D shader-reclaim pass (#690/#696 adversarial review). `canReuseMtsdfPixiShader`
+// itself is unit-tested in `mtsdfPixiShaderReuse.test.ts` in isolation — what's missing
+// there is proof the MECHANISM in Scene2D actually fires: deleting the reclaim loop, or
+// mis-keying `reusable` by array index instead of page number, leaves every test in that
+// file green while the optimization (and the #690 leak fix it protects) silently reverts.
+//
+// Font provider / texture loading are mocked (this is a rendering-glue test, not a font
+// pipeline test); `layoutText`/`buildTextGeometryByPage` and the reclaim loop itself in
+// Scene2D.tsx are REAL. `mtsdfPixiShader` is mocked with a lightweight fake Shader (same
+// pattern as the `pixiShaderBuilder` mock above, for the 2D material pass) — its own
+// contract (`canReuseMtsdfPixiShader` field comparison) is covered by
+// `mtsdfPixiShaderReuse.test.ts`, so re-asserting it here would duplicate that file.
+// ─────────────────────────────────────────────────────────────────────────
+describe('Text2D shader reclaim (#690/#696)', () => {
+  function mockTextDeps() {
+    mockDeps();
+
+    const fontTextures = new Map<string, any>();
+    vi.doMock('../../src/runtime/rendering/text/fontTexturePixi', () => ({
+      getFontTexturePixi: (provider: any, page = 0) => {
+        const key = `${provider.id}:${page}`;
+        if (!fontTextures.has(key)) fontTextures.set(key, { destroyed: false, source: { style: {} } });
+        return fontTextures.get(key);
+      },
+    }));
+
+    let currentProvider: any;
+    vi.doMock('../../src/runtime/loaders/fontAtlasLoader', () => ({
+      ensureFontLoaded: () => {},
+      getLoadedFont: (_guid: string) => currentProvider,
+      __setProvider: (p: any) => { currentProvider = p; },
+    }));
+
+    // A lightweight fake Shader mirroring the real `mtsdfPixiShader.ts` contract closely
+    // enough to prove the RECLAIM LOOP's bookkeeping (identity kept/dropped, destroy called)
+    // — not to re-derive the atlas-field comparison itself (that's the real module's job,
+    // covered separately).
+    let shaderSeq = 0;
+    vi.doMock('../../src/runtime/rendering/text/mtsdfPixiShader', () => ({
+      makeMtsdfPixiShader: (texture: any, atlas: any, style: any, fontSize: any) => ({
+        id: ++shaderSeq,
+        resources: { uTexture: texture.source, uSampler: texture.source?.style },
+        _mtsdfAtlas: { ...atlas },
+        _style: { ...style },
+        _fontSize: fontSize,
+        destroyed: false,
+        destroy: vi.fn(function (this: any) { this.destroyed = true; }),
+      }),
+      canReuseMtsdfPixiShader: (shader: any, texture: any, atlas: any) => {
+        if (shader.resources.uTexture !== texture.source) return false;
+        const p = shader._mtsdfAtlas;
+        return !!p && p.width === atlas.width && p.height === atlas.height
+          && p.distanceRange === atlas.distanceRange && p.size === atlas.size && p.type === atlas.type;
+      },
+      updateMtsdfPixiMetrics: (shader: any, atlas: any, fontSize: any) => { shader._mtsdfAtlas = { ...atlas }; shader._fontSize = fontSize; },
+      updateMtsdfPixiStyle: (shader: any, style: any) => { shader._style = { ...style }; },
+    }));
+
+    return { fontTextures };
+  }
+
+  async function setupText() {
+    const { fontTextures } = mockTextDeps();
+    const pixi: any = await import('pixi.js');
+    const traits = await import('../../src/runtime/traits');
+    const { registerTrait } = await import('../../src/runtime/core/ecs/traitRegistry');
+    const worldReg = await import('../../src/runtime/core/ecs/worldRegistry');
+    const pool = await import('../../src/runtime/rendering/canvas2DPool');
+    const scene2d = await import('../../src/runtime/rendering/Scene2D');
+    const fontLoader: any = await import('../../src/runtime/loaders/fontAtlasLoader');
+    const { createWorld } = await import('koota');
+
+    registerTrait({ name: 'Canvas2D', trait: traits.Canvas2D, category: 'component', fields: {} });
+    registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: {} });
+
+    trackWorld(worldReg.getCurrentWorld());
+    const world = trackWorld(createWorld());
+    worldReg.setCurrentWorld(world);
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    return { pixi, traits, world, pool, scene2d, fontLoader, fontTextures, renderer };
+  }
+
+  // A 2-page font: 'A' lives on page 0, 'B' on page 1 — lets a test span pages, or drop
+  // back to one, by choosing which letters the text contains.
+  function makeFontProvider(id = 'font1') {
+    const metrics = { emSize: 1, lineHeight: 1.2, ascender: -0.8, descender: 0.2 };
+    const atlas = { type: 'mtsdf', distanceRange: 4, width: 256, height: 256, size: 32, yOrigin: 'top' as const };
+    const glyphs = new Map<number, any>([
+      [65, { unicode: 65, advance: 0.6, plane: { left: 0, top: -0.7, right: 0.6, bottom: 0.05 }, atlas: { left: 0, top: 0, right: 32, bottom: 32 }, page: 0 }], // 'A'
+      [66, { unicode: 66, advance: 0.6, plane: { left: 0, top: -0.7, right: 0.6, bottom: 0.05 }, atlas: { left: 32, top: 0, right: 64, bottom: 32 }, page: 1 }], // 'B'
+    ]);
+    return {
+      id, atlasVersion: 0, pageCount: 2, metrics, atlas,
+      getGlyph: (cp: number) => glyphs.get(cp),
+      kerning: () => 0,
+      ensureGlyphs: () => {},
+      addDisposable: () => {},
+      dispose: () => {},
+    };
+  }
+
+  function spawnText(world: any, traits: any, canvasId: number, text2d: any = {}, sortOrder = 0) {
+    return world.spawn(
+      traits.Transform({}),
+      traits.Text2D({ text: 'A', font: 'font1', fontSize: 32, ...text2d }),
+      traits.EntityAttributes({ name: 'text', parentId: canvasId, sortOrder, layer: '2d' }),
+    );
+  }
+
+  it('reuses the SAME shader across a layout rebuild, on a NEW Mesh', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'A' });
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    const shader1 = slot1.textShaders[0];
+    const mesh1 = slot1.pageMeshes[0];
+    expect(shader1).toBeDefined();
+
+    // A text/layout change (still page 0 only) — the geometry rebuilds, but the shader
+    // should be RECLAIMED, not rebuilt (#690).
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA' });
+    scene2d.renderFrame();
+    const slot2 = renderer.slots.get(text.id());
+    const shader2 = slot2.textShaders[0];
+    const mesh2 = slot2.pageMeshes[0];
+
+    expect(shader2).toBe(shader1);      // same Shader instance — reclaimed, not rebuilt
+    expect(mesh2).not.toBe(mesh1);      // but a fresh Mesh (geometry always rebuilds)
+    expect(shader1.destroyed).toBe(false);
+  });
+
+  it('destroys a LEFTOVER shader for a page the text no longer touches', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    // 'AB' spans page 0 ('A') and page 1 ('B').
+    const text = spawnText(world, traits, canvas.id(), { text: 'AB' });
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    expect(slot1.pageNums).toEqual([0, 1]);
+    const shaderPage0 = slot1.textShaders[slot1.pageNums.indexOf(0)];
+    const shaderPage1 = slot1.textShaders[slot1.pageNums.indexOf(1)];
+
+    // Drop to page-0-only text — page 1 is no longer touched.
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'A' });
+    scene2d.renderFrame();
+
+    expect(shaderPage1.destroyed).toBe(true);   // leftover — destroyed
+    expect(shaderPage0.destroyed).toBe(false);  // reclaimed onto the new page-0 mesh
+    const slot2 = renderer.slots.get(text.id());
+    expect(slot2.textShaders).toEqual([shaderPage0]);
+  });
+
+  it('a reused shader still picks up a STYLE change made in the same frame as a layout change', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'A', color: 0xffffff });
+
+    scene2d.renderFrame();
+    const shader1 = renderer.slots.get(text.id()).textShaders[0];
+    expect(shader1._style.color).toBe(0xffffff);
+
+    // Layout AND style change in the same update, same frame.
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA', color: 0xff0000 });
+    scene2d.renderFrame();
+
+    const shader2 = renderer.slots.get(text.id()).textShaders[0];
+    expect(shader2).toBe(shader1);            // reused
+    expect(shader2._style.color).toBe(0xff0000); // but carries the NEW colour
+  });
+
+  it('a throw mid page-rebuild loop still destroys every reclaimed shader (Fix 1 regression)', async () => {
+    const { traits, world, scene2d, fontLoader, renderer, pixi } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'AB' }); // pages 0 and 1
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    const shaderPage0 = slot1.textShaders[slot1.pageNums.indexOf(0)];
+    const shaderPage1 = slot1.textShaders[slot1.pageNums.indexOf(1)];
+
+    // Force a relayout (still 'AB', so both pages rebuild) and make the mock's
+    // MeshGeometry constructor throw on the SECOND page built this frame — pages build
+    // in ascending order (0, then 1), so page 0 succeeds and reclaims shaderPage0 before
+    // the throw; page 1's construction never completes, so shaderPage1 is never reused —
+    // it must still be destroyed out of the leftover `reusable` map.
+    pixi.MeshGeometry.__control.throwOnCall = pixi.MeshGeometry.__control.callCount + 2;
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 33 }); // bumps layoutHash
+
+    expect(() => scene2d.renderFrame()).not.toThrow(); // Scene2D's own try/catch swallows it
+
+    expect(shaderPage0.destroyed).toBe(false); // reclaimed before the throw
+    expect(shaderPage1.destroyed).toBe(true);  // leftover — must still be destroyed
   });
 });

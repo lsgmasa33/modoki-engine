@@ -213,11 +213,131 @@ function variantPath(manifestPath: string, ext: 'wgsl' | 'glsl'): string {
   return manifestPath.replace(/\.shader\.json$/i, `.${ext}`);
 }
 
-/** Fetch + compile a `space:'2d'` shader program from its manifest path. Returns null
- *  (caller falls back to the default texture shader) when the manifest is missing, is
- *  not a 2D shader, or the backend-matched body is absent. Compiles ONE gl + one gpu
- *  program; call once per asset and reuse across entities. */
-export async function buildPixiShaderProgram(manifestPath: string): Promise<PixiShaderProgram | null> {
+// Program cache (fixes #716; re-keyed on CONTENT in the #716 close-out review) — mirrors
+// `mtsdfPixiShader.ts`'s `getMtsdfPrograms` (see its "Program cache (fixes #590)" comment block
+// for the full mechanism writeup). The uncached-compile problem this fixes is GL-only:
+// `compileHighShaderGlProgram(...)` ends in `new GlProgram(...)` directly — NOT
+// `GlProgram.from()`, which is the only constructor PixiJS content-caches — so without this cache
+// every call mints a fresh `GlProgram`. Our generated GLSL declares no `#define SHADER_NAME`, so
+// Pixi's own `setProgramName` stamps an incrementing one into the source, the program's `_key` is
+// computed from that mutated source, `GlShaderSystem`'s internal cache misses every time, and a
+// brand-new `WebGLProgram` is compiled and linked — PixiJS has no `gl.deleteProgram` call site
+// anywhere, so every one of those is stranded on the GPU permanently. `clearSpriteMaterialCache()`
+// (called on every world swap, `Scene2D.stop()`, AND every `.shader.json` inspector edit/undo/
+// redo) used to force exactly this: a fresh GL compile on every one of those.
+// `compileHighShaderGpuProgram(...)`, by contrast, already returns `GpuProgram.from({...})` —
+// Pixi's own content cache — so the GPU path was never at risk of the stranded-program leak (see
+// `docs/plans/ios-rendering-update-wedge.md`'s "#716 ... GL-only" note, added in this same body of
+// work). This module cache still earns its place on the GPU path too, though: it skips the
+// manifest+body FETCH and the string assembly (`customBit`, uniform/sampler block generation) on
+// every call, not just the program compile — that work is backend-agnostic and worth memoizing
+// either way.
+//
+// ⚠️ THE TRAP: the fix here must be THIS memo, never "just add a stable `#define SHADER_NAME`"
+// like `mtsdfBitGl` does. With a stable key, a SECOND `GlProgram` constructed over identical
+// source would hit `GlShaderSystem`'s cache, `generateProgram` would never run for it, and
+// `GlGeometrySystem.initGeometryVao` would then throw on `aPosition` (see the mtsdf file's own
+// comment above `mtsdfBitGl`). Memoising means a second `GlProgram`/`GpuProgram` is never
+// constructed for the same source, which is what makes this safe — a future reader must not
+// "simplify" this into a define.
+//
+// Keyed on backend + manifest PATH + the actual CONTENT that reaches the generated source (the
+// fetched body text, plus the manifest's `params` and `name` — see `contentCacheKey`), NOT on
+// the path alone. Path-only keying missed every write route except the Inspector's
+// `persistAssetEdit` (the only caller of `invalidatePixiShaderProgram`): editing the sibling
+// `.glsl`/`.wgsl` BODY directly (the documented way to edit a body — see `ShaderAssetView.tsx`)
+// gets no evictor and no HMR event (the vite asset scanner returns `[]` for asset-root files), so
+// a body edit + scene reload used to keep running the OLD compiled program. Content-keying makes
+// the cache self-heal from EVERY route: a genuinely changed body or manifest field naturally
+// computes a different key, so the edit takes effect with no evictor needed, while an unchanged
+// refetch (world swap, `Scene2D.stop()`) computes the SAME key and reuses the SAME compiled
+// program — #716's original guarantee, preserved. The one accepted cost: a real source change
+// orphans the old program (PixiJS never calls `gl.deleteProgram`) — bounded and intentional, the
+// same cost #716 already accepted for the invalidate-on-edit path.
+// The promise itself is cached (not just the resolved value) so concurrent callers that land on
+// the SAME content key share ONE in-flight compile. A fetch-time failure (missing manifest/body,
+// wrong space, a reserved name) never even reaches `programCache.set` — see the `if (!source)
+// return null;` early-out in `buildPixiShaderProgram` below — and a REJECTED compile (the
+// decorator-in-a-comment throw the FIX-1 comment on `.then` below explains) is evicted the moment
+// it settles, so neither kind of failure is ever left sitting in the cache: it can be fixed by
+// editing the source file, and caching it would make the failure permanent even after the fix.
+const programCache = new Map<string, Promise<PixiShaderProgram | null>>();
+// Reverse index (path → the content keys it has ever produced) so `invalidatePixiShaderProgram`
+// can still evict by path even though the cache is no longer keyed on path alone. Purely an
+// optimisation/cleanup now (see that function's comment) — nothing above relies on it for
+// correctness, since a real content change already computes a fresh key on its own.
+const pathKeys = new Map<string, Set<string>>();
+
+function trackPathKey(manifestPath: string, key: string): void {
+  let set = pathKeys.get(manifestPath);
+  if (!set) { set = new Set(); pathKeys.set(manifestPath, set); }
+  set.add(key);
+}
+
+/** Drop exactly one (path, key) entry — used to evict a single failed/rejected build without
+ *  touching any OTHER content key concurrently tracked under the same path. */
+function untrackPathKey(manifestPath: string, key: string): void {
+  programCache.delete(key);
+  const set = pathKeys.get(manifestPath);
+  if (!set) return;
+  set.delete(key);
+  if (set.size === 0) pathKeys.delete(manifestPath);
+}
+
+/** The result of the cheap I/O half of a build — the manifest + the backend-matched body text,
+ *  fetched and validated but not yet compiled. Everything a build derives that could ever change
+ *  the generated source lives here, so {@link contentCacheKey} can hash exactly this. */
+interface FetchedShaderSource {
+  manifest: ShaderManifest;
+  body: string;
+}
+
+/** Cache key from CONTENT, not path: two fetches (of the same or different paths) that yield the
+ *  same backend + body + params + name produce the SAME key, so a world swap's refetch reuses
+ *  the existing compiled program and an actually-edited file computes a new one automatically.
+ *  `manifest.name` IS included, even though it never affects `customBit`'s generated header/main:
+ *  on WebGL it still reaches the emitted source a level up — `compileHighShaderGlProgram({name})`
+ *  passes it into `new GlProgram({name})`, whose `setProgramName` prepends `#define SHADER_NAME
+ *  <name>-fragment` to the actual compiled text (see the TRAP comment above). Omitting it would
+ *  let a `name`-only edit rebuild to the SAME key and keep serving a program stamped with the OLD
+ *  name, and leave `program.manifest.name` itself stale — exactly the class of staleness this
+ *  content-keying exists to prevent, so it belongs in the key even though nothing reads
+ *  `program.manifest.name` today. `space` is NOT part of the key: it never reaches `customBit`/
+ *  `compileHighShader*`, and `fetchPixiShaderSource` only returns a source when
+ *  `shaderSpace(manifest) === '2d'`, so at this point it is always the constant `'2d'` — including
+ *  it would add a component that never varies rather than guard anything. `params` (both uniform
+ *  and `texture` kinds — `customBit` reads all of `manifest.params`) does feed the generated bits
+ *  and is included. `manifestPath` is included too, but only so two assets with byte-identical
+ *  bodies stay distinguishable in logs/debugging — it plays no role in whether reuse is SAFE; the
+ *  content does. No cryptographic hash needed — a stable string over content that's already in
+ *  memory is enough. */
+function contentCacheKey(webgpu: boolean, manifestPath: string, source: FetchedShaderSource): string {
+  return `${webgpu ? 'gpu' : 'gl'}|${manifestPath}|${source.manifest.name ?? ''}|${JSON.stringify(source.manifest.params)}|${source.body}`;
+}
+
+/** Evict this path's cached program(s) from the module cache. Historically the ONLY thing
+ *  standing between a `.shader.json` Inspector edit and a stale compiled program; now that
+ *  {@link programCache} is keyed on CONTENT (see the block comment above), a changed file
+ *  computes a fresh key on its own the next time it's fetched, so this call is an OPTIMISATION —
+ *  it drops the now-orphaned entry for the OLD content immediately (freeing it, and giving the
+ *  Inspector's own next rebuild one less stale entry to skip past) rather than leaving it to sit
+ *  in the map until process end. With no argument, clears the whole cache (+ the path index).
+ *  Do NOT call this for anything that isn't a source edit — a world swap or a viewport teardown
+ *  must NOT evict, which is the entire point of this cache existing. */
+export function invalidatePixiShaderProgram(manifestPath?: string): void {
+  if (manifestPath == null) { programCache.clear(); pathKeys.clear(); return; }
+  const keys = pathKeys.get(manifestPath);
+  if (!keys) return;
+  for (const key of keys) programCache.delete(key);
+  pathKeys.delete(manifestPath);
+}
+
+/** Fetch + validate a `space:'2d'` shader manifest + its backend-matched body, WITHOUT
+ *  compiling. Returns null (already having warned/errored) for every reason a build can fail:
+ *  missing manifest, wrong space, a reserved param name, or a missing body for the active
+ *  backend. Split out from the compile step so {@link buildPixiShaderProgram} can compute the
+ *  content cache key BEFORE deciding whether to compile at all. */
+async function fetchPixiShaderSource(manifestPath: string, webgpu: boolean): Promise<FetchedShaderSource | null> {
   const manifest = await assetPlumbing.get()?.fetchShaderManifest(manifestPath) ?? null;
   if (!manifest) return null;
   if (shaderSpace(manifest) !== '2d') {
@@ -247,12 +367,10 @@ export async function buildPixiShaderProgram(manifestPath: string): Promise<Pixi
     console.warn(`[pixiShader] ${manifestPath}: ${issue}`);
   }
 
-  // Compile ONLY the active backend's program. Fetch just that backend's body; a
-  // missing variant → fall back to the default sprite shader. Backend is resolved
-  // the SAME way the Canvas2D pool picks its renderer (honors the pixi.backend
-  // override), so the compiled program always matches the live renderer.
-  const ext: 'wgsl' | 'glsl' = (await resolvePixiBackend()) === 'webgpu' ? 'wgsl' : 'glsl';
-  const webgpu = ext === 'wgsl';
+  // Fetch ONLY the active backend's body; a missing variant → fall back to the default sprite
+  // shader. `webgpu` was already resolved by the caller before the cache lookup — see
+  // `buildPixiShaderProgram`'s comment.
+  const ext: 'wgsl' | 'glsl' = webgpu ? 'wgsl' : 'glsl';
   const plumbing = assetPlumbing.get();
   const bodyRes = plumbing ? await fetch(plumbing.assetUrl(variantPath(manifestPath, ext)), plumbing.fetchInit).catch(() => null) : null;
   const body = bodyRes?.ok ? (await bodyRes.text()).trim() : '';
@@ -260,7 +378,18 @@ export async function buildPixiShaderProgram(manifestPath: string): Promise<Pixi
     console.warn(`[pixiShader] ${manifestPath}: missing ${ext.toUpperCase()} body for the active backend — falling back to the default sprite shader.`);
     return null;
   }
+  return { manifest, body };
+}
 
+/** Compile a fetched+validated source into a program for one backend. An `async` function on
+ *  purpose even though nothing here awaits: `compileHighShaderGlProgram`/`GpuProgram` run
+ *  synchronously and CAN throw (e.g. a decorator-shaped token inside a WGSL body comment reaches
+ *  Pixi's `extractStructAndGroups`, where `item.match(bindingPattern)[1]` throws on a null match)
+ *  — wrapping the call in an `async` function turns that throw into a REJECTED promise instead of
+ *  an uncaught synchronous throw, so it settles {@link buildPixiShaderProgram}'s cached promise
+ *  the same way a fetch failure would, and the FIX-1 `.then` there evicts it either way. */
+async function compilePixiShaderProgram(source: FetchedShaderSource, webgpu: boolean): Promise<PixiShaderProgram> {
+  const { manifest, body } = source;
   const params = uniformParams(manifest.params);
   const texParams = textureParams(manifest.params);
   const name = manifest.name || 'pixi-material';
@@ -270,6 +399,46 @@ export async function buildPixiShaderProgram(manifestPath: string): Promise<Pixi
   }
   const glProgram = compileHighShaderGlProgram({ name, bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, customBit('glsl', body, params, texParams)] });
   return { manifest, glProgram, params, textureParams: texParams };
+}
+
+/** Fetch + compile a `space:'2d'` shader program from its manifest path. Returns null
+ *  (caller falls back to the default texture shader) when the manifest is missing, is
+ *  not a 2D shader, or the backend-matched body is absent. Compiles ONE gl + one gpu
+ *  program; call once per asset and reuse across entities. Memoised at module scope by
+ *  {@link programCache}, keyed on CONTENT — see the comment there for why. */
+export async function buildPixiShaderProgram(manifestPath: string): Promise<PixiShaderProgram | null> {
+  // Backend is resolved up front so the fetch below always reaches the body that matches the
+  // ACTUAL live renderer — same resolution the Canvas2D pool itself uses.
+  const webgpu = (await resolvePixiBackend()) === 'webgpu';
+  // Fetch (cheap I/O — browser-cached in prod, no-store in dev) BEFORE the cache lookup, so the
+  // key can be computed from CONTENT rather than path. This function is only reached on
+  // `spriteMaterialCache`'s own cache miss (roughly once per material per world swap), so the
+  // extra fetch here is negligible next to a program compile.
+  const source = await fetchPixiShaderSource(manifestPath, webgpu);
+  if (!source) return null; // already warned/errored inside fetchPixiShaderSource
+  const key = contentCacheKey(webgpu, manifestPath, source);
+  const cached = programCache.get(key);
+  if (cached) return cached;
+  const built: Promise<PixiShaderProgram | null> = compilePixiShaderProgram(source, webgpu);
+  programCache.set(key, built);
+  trackPathKey(manifestPath, key);
+  // FIX 1: evict on a REJECTION too, not just on fulfilment. `.then(onFulfilled)` alone (the
+  // pre-fix shape — it existed to evict a null RESULT, back when the fetch+build were one
+  // function and could fulfil with null) never runs when the promise REJECTS instead. A
+  // `.wgsl`/`.glsl` body whose compile throws (see `compilePixiShaderProgram`'s comment — Pixi's
+  // `extractStructAndGroups` throws on a decorator-shaped token inside a body comment) left the
+  // poisoned promise cached forever: the author fixes the file, reloads the scene, and gets the
+  // SAME rejected promise back for the rest of the session — the throw path is exactly the one
+  // "never cache a failure" (the comment on `programCache` above) was written to protect against,
+  // and a rejection is a failure too. The `.then` here also OWNED the derived promise it created
+  // with no handler on rejection, so the rejection additionally surfaced as an unhandled
+  // rejection even though `spriteMaterialCache` attaches its OWN `.catch` to the promise it gets
+  // back from us. `onFulfilled` is `undefined` now (fetch-time nulls never reach `programCache` —
+  // see the `if (!source) return null;` above, which returns before any set) so only rejection
+  // needs handling, but the shape stays a two-arg `.then` so a future null-on-fulfil path (should
+  // one ever return) is handled the same way as a matter of course.
+  void built.then(undefined, () => { untrackPathKey(manifestPath, key); });
+  return built;
 }
 
 /** Build the per-entity UniformGroup values from a program's params + a material's

@@ -309,6 +309,9 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
     // canvas scale is not known here — so on a downscaled canvas this over-estimates the range,
     // which errs toward a crisper edge rather than a blurry one. Anything is an improvement on
     // the alternative, which is a shader that does not compile and text that does not exist.
+    // ⚠️ This expression MUST stay identical to the one in `updateMtsdfPixiMetrics` below
+    // (#690) — that function refreshes this same uniform on a REUSED shader without going
+    // through this factory, and a drift between the two would silently change edge sharpness.
     uScreenPxRange: { value: Math.max(1, (fontSize / Math.max(1, atlasSize)) * distanceRange), type: 'f32' },
     // Atlas-derived, not style-derived — so updateMtsdfPixiStyle leaves it alone.
     uHasTrueSdf: { value: hasTrueSdf ? 1 : 0, type: 'f32' },
@@ -449,6 +452,57 @@ export function updateMtsdfPixiStyle(shader: Shader, style: MtsdfStyle): void {
   u.uGlowSize = (style.glowSize ?? 0) * GLOW_MAX_SPREAD;
   u.uGlowStrength = style.glowStrength ?? 0;
   u.uShadowSoftness = style.shadowSoftness ?? 0;
+}
+
+/** Every `MtsdfPixiAtlas` field that reaches a uniform in `mtsdfUniformValues`. Declared as a
+ *  `Record<keyof MtsdfPixiAtlas, boolean>` so ADDING a field to the atlas type fails to compile
+ *  here until it is classified — the hand-written five-field list this replaces is the same
+ *  shape that silently dropped `type` for a commit (see `MtsdfPixiAtlas` above). Set a field to
+ *  false only if it genuinely reaches no uniform, with a comment saying why.
+ *
+ *  All five current fields feed `mtsdfUniformValues` directly: `width`/`height` → `uTexSize`
+ *  (also the shadow-offset scale), `distanceRange` → `uDistanceRange`/`uScreenPxRange`, `size`
+ *  → `uScreenPxRange`, `type` → `uHasTrueSdf`. */
+const ATLAS_UNIFORM_FIELDS: Record<keyof MtsdfPixiAtlas, boolean> = {
+  width: true, height: true, distanceRange: true, size: true, type: true,
+};
+
+/** Can an existing shader be kept for this page rather than rebuilt (#690)? The
+ *  Shader depends only on the page TEXTURE and the ATLAS geometry — `fontSize`
+ *  reaches it solely through the `uScreenPxRange` uniform ({@link updateMtsdfPixiMetrics})
+ *  and style reaches it solely through the uniforms {@link updateMtsdfPixiStyle} already
+ *  updates in place — so a plain text/fontSize/style change never needs a new `Shader`.
+ *
+ *  Compares atlas FIELDS, not object identity: callers (Scene2D) pass `{ ...provider.atlas }`,
+ *  a fresh object every frame, so `===` would always be false. */
+export function canReuseMtsdfPixiShader(shader: Shader, texture: Texture, atlas: MtsdfPixiAtlas): boolean {
+  if (shader.resources.uTexture !== texture.source) return false;
+  // `uSampler` is bound once at construction from `texture.source.style` (see
+  // `makeMtsdfPixiShader`'s `resources`) and, with a custom mesh shader, Pixi never rewrites
+  // it. Checked alongside `uTexture` for the same reason — belt and suspenders, not a live bug:
+  // no code in this repo currently REPLACES `source.style` (it mutates the object in place), so
+  // this identity check cannot fire today.
+  if (shader.resources.uSampler !== texture.source.style) return false;
+  const prev = (shader as any)._mtsdfAtlas as MtsdfPixiAtlas | undefined;
+  if (!prev) return false;
+  return (Object.keys(ATLAS_UNIFORM_FIELDS) as (keyof MtsdfPixiAtlas)[])
+    .filter((k) => ATLAS_UNIFORM_FIELDS[k])
+    .every((k) => prev[k] === atlas[k]);
+}
+
+/** Refresh the fontSize-derived uniform on a shader kept via {@link canReuseMtsdfPixiShader}
+ *  (#690). Does NOT touch `uTexSize`/`uDistanceRange`/`uHasTrueSdf` — `canReuseMtsdfPixiShader`
+ *  already guarantees those are unchanged (they come from the atlas fields it compares).
+ *
+ *  ⚠️ This expression MUST stay identical to the `uScreenPxRange` line in
+ *  `mtsdfUniformValues` above — if they drift, a reused shader renders at a different
+ *  edge sharpness than a freshly built one, and nothing will fail to tell you. */
+export function updateMtsdfPixiMetrics(shader: Shader, atlas: MtsdfPixiAtlas, fontSize: number): void {
+  const u = (shader.resources.mtsdfUniforms as UniformGroup).uniforms as any;
+  u.uScreenPxRange = Math.max(1, (fontSize / Math.max(1, atlas.size)) * atlas.distanceRange);
+  // Re-stash the fresh atlas object so the later updateMtsdfPixiStyle (which reads
+  // _mtsdfAtlas for the shadow-offset clamp) doesn't hold a stale reference.
+  (shader as any)._mtsdfAtlas = atlas;
 }
 
 /** Test-only accessor for the two generated shader bits (see the note above `mtsdfBit`). */

@@ -145,7 +145,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
       providers.set(guid, provider);
       // Text that was waiting on this font can now lay out — nudge dirty-gated
       // renderers (Scene2D) to repaint. (Scene3D re-queries every frame anyway.)
-      markTextDirty();
+      markTextDirty(guid);
       return provider;
     } catch (e) {
       console.warn(`[fontAtlasLoader] failed to load font ${guid}:`, e);
@@ -183,7 +183,7 @@ export function invalidateFont(guid: string): void {
   providers.delete(guid);
   loadPromises.delete(guid);
   liveness.invalidateAll();
-  markTextDirty();
+  markTextDirty(guid);
 }
 // Re-acquire on any Font-Inspector mode flip or re-bake (no editor restart needed).
 onFontInvalidated(invalidateFont);
