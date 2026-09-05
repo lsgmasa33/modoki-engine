@@ -189,7 +189,9 @@ function describeGameView() {
       panelNote: 'The Game panel is mounted but COLLAPSED to zero area. Anything derived from its '
         + 'extent — a capture size, a letterbox rect, an aim inside the preview — is unusable until '
         + 'the panel is given room: drag its splitter open, or un-maximise whichever panel is '
-        + 'squeezing it. On a FREE screen `panelSize` is omitted for this reason rather than '
+        + 'squeezing it — or, if the editor has only just started, the panel has MOUNTED but not '
+        + 'yet been measured (the store seeds this size to zero), in which case simply read again. '
+        + 'On a FREE screen `panelSize` is omitted for this reason rather than '
         + 'reported as {0, 0}; on a fixed device `logical` is still the screen being emulated and '
         + 'stays correct, but it no longer describes anything visible. This is NOT the same as '
         + 'unmounted: the panel is live and still rendering.',

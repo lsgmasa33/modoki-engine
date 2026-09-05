@@ -15,7 +15,7 @@
  *  mounted but never been measured hits this path too, not just a dragged-flat splitter. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useEditorStore } from '@modoki/engine/editor';
+import { useEditorStore, DEVICE_PRESETS, FREE_PRESET } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -33,7 +33,11 @@ const readGameView = async () =>
   ((await runAgentOp('editor-state', {})) as { gameView: GameView }).gameView;
 
 beforeEach(() => {
-  useEditorStore.setState({ gameViewMounted: true, gameAreaSize: { width: 640, height: 360 } });
+  // gameViewDevice is reset too — the fixed-device test below swaps it, and `panelSize` is
+  // free-only, so a leaked preset would make the other tests assert against the wrong branch.
+  useEditorStore.setState({
+    gameViewMounted: true, gameAreaSize: { width: 640, height: 360 }, gameViewDevice: FREE_PRESET,
+  });
 });
 
 describe('describeGameView panelSize (#688)', () => {
@@ -63,6 +67,26 @@ describe('describeGameView panelSize (#688)', () => {
     expect((await readGameView()).panelSize).toBeUndefined();
     useEditorStore.setState({ gameAreaSize: { width: 640, height: 0 } });
     expect((await readGameView()).panelSize).toBeUndefined();
+  });
+
+  it('emits the collapsed note on a FIXED device too, where panelSize was never reported', async () => {
+    // The seam the first version of this file missed: `panelCollapsed` is computed WITHOUT
+    // `sel.free`, so a fixed device reaches the same branch — and the note's own wording had to be
+    // corrected once because it claimed `panelSize` was "omitted", which on a fixed device it
+    // never was. `logical` stays correct there (it is the screen being emulated, not a
+    // measurement), but it no longer describes anything visible, and that is what the note has to
+    // say without lying about panelSize.
+    const fixed = DEVICE_PRESETS.find((p) => p.logicalW > 0);
+    if (!fixed) throw new Error('no fixed-size preset available');
+    useEditorStore.setState({ gameViewDevice: fixed, gameAreaSize: { width: 0, height: 0 } });
+    const gv = await readGameView();
+    expect(gv.free).toBe(false);
+    expect(gv.panelMounted).toBe(true);
+    expect(gv.panelSize).toBeUndefined();       // never reported for a fixed device, collapsed or not
+    // Assert presence BEFORE content: gating panelCollapsed on sel.free makes panelNote undefined,
+    // and a bare toContain() on undefined reports a chai argument-type error rather than the miss.
+    expect(gv.panelNote).toBeDefined();
+    expect(gv.panelNote).toContain('COLLAPSED');
   });
 
   it('keeps the two notes DISTINCT — unmounted and collapsed are different repairs', async () => {

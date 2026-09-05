@@ -1091,6 +1091,11 @@ if (canGameViewDevice) {
       // Distinguish the two reasons panelSize can be absent on Free, because they need opposite
       // responses: a COLLAPSED panel is the operator's layout (open the splitter and re-run),
       // while a missing panelSize with no note is the #688/stale-gameViewSize defect.
+      // ⚠️ This branch TRUSTS a note produced by the very code it is testing. The named
+      // stale-gameViewSize regression cannot reach here (it reports a present, positive
+      // panelSize), but a FUTURE defect that zeroes gameAreaSize on a visibly-open panel — the
+      // observer detaching, a store reset — would land here and be reported as an operator
+      // layout problem. If this fires and the panel looks fine on screen, disbelieve the note.
       if (typeof freeBack.panelNote === 'string' && freeBack.panelNote.includes('COLLAPSED')) {
         throw new Error(`the Game panel is mounted but COLLAPSED to zero area — give it room and re-run; this is a HARNESS precondition, not a tool defect. Note: ${freeBack.panelNote}`);
       }
