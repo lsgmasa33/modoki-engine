@@ -13,20 +13,25 @@
  *  Also bumps each rewritten scene's `version` to 13, and each rewritten prefab's
  *  `version` to `PREFAB_FORMAT_VERSION` (3).
  *
- *  Only touches `games/<id>/**` and `demos/<id>/**` scene/prefab JSON under
- *  `runtime/assets` — never the e2e fixtures (see the note at the push site below), `dist/`, `ios/`,
- *  `android/`, `build/`.
+ *  Only touches scene/prefab JSON under `games/<id>/runtime/assets` and
+ *  `demos/<id>/runtime/assets`, and never the e2e fixtures (see the note at the push site
+ *  below). Two independent filters do that, and neither one is a directory blocklist any more:
+ *  the path PATTERN below restricts it to `runtime/assets`, and git's own view excludes ignored
+ *  files. Note what that does NOT say — a TRACKED directory under `runtime/assets` is migrated
+ *  whatever it is called, `build/` included, because `--exclude-standard` filters only
+ *  `--others`.
  *
  *  Usage:
  *    node engine/scripts/migrate-anchor-zindex.mjs            # dry-run (report only)
  *    node engine/scripts/migrate-anchor-zindex.mjs --write    # apply the rewrites
  */
 
-import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join, dirname, resolve, sep } from 'node:path';
+import { join, dirname, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -38,15 +43,15 @@ const PREFAB_FORMAT_VERSION = 3;
 /** Every scene/prefab file the REPO knows about, enumerated through GIT rather than by walking
  *  the filesystem.
  *
- *  ⚠️ This used to be a directory walk with a blocklist (`dist`, `ads`, `ios`, `android`, …), and
- *  that is the wrong shape for a script that WRITES: a blocklist only excludes the directory
- *  names somebody thought of, so the first gitignored build directory nobody listed gets its
- *  generated copies rewritten in place — silently, and for nothing. The identical defect went
- *  red in `engine/tests/assets/anchorZIndexMigrated.test.ts` (#762), whose walk excluded
- *  `dist`/`ios`/`android` but not `games/*\/ads/` from a `--target playable` export, making that
- *  guard machine-dependent; `work-ai2` fixed it by enumerating through git, and the same
- *  reasoning applies here with more at stake. Measured on this clone at the time of the change:
- *  **176** `.scene.json`/`.prefab.json` files existed on disk that git does not track.
+ *  ⚠️ **Read the honest version of why, because the commit that made this change overstated
+ *  it.** The sibling guard `engine/tests/assets/anchorZIndexMigrated.test.ts` really was bitten
+ *  by a blocklist walk that missed `games/*\/ads/` — but ITS walk was rooted at `games/`, where
+ *  build output lives. This script's walk was always rooted at `<proj>/runtime/assets`, and
+ *  build output (`dist/`, `ads/`, `.cache/`) lands at the PROJECT root, a sibling that root can
+ *  never reach. Measured when this changed: the old walk and this enumeration select a
+ *  byte-identical set. So this is not a bug fix — it removes a second way of answering "which
+ *  files are ours" and reuses the one the gates already use, which is worth doing on its own,
+ *  and is all it is.
  *
  *  `--cached --others --exclude-standard` is deliberate: tracked files PLUS untracked-but-not-
  *  ignored ones, so a scene a developer has just authored and not yet staged is still migrated,
@@ -55,21 +60,78 @@ const PREFAB_FORMAT_VERSION = 3;
 let repoFilesCache;
 function repoSceneAndPrefabFiles() {
   if (repoFilesCache) return repoFilesCache;
-  const listed = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-    { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-    .split('\0').filter(Boolean);
-  repoFilesCache = listed
-    .filter((p) => /\.(scene|prefab)\.json$/i.test(p))
-    .map((p) => join(ROOT, p))
-    // A tracked file can be absent mid-rebase or after a manual delete; reading it would throw.
-    .filter((p) => existsSync(p));
+  // ⚠️ `execFileSync` THROWS when git is missing or `ROOT` is not a work tree, so it has to be
+  // caught here: an empty-enumeration abort can only fire on an empty RESULT, and a throw never
+  // reaches it. Left uncaught this printed a raw Node stack trace — and, worse, the guard that was
+  // supposed to make the failure legible was unreachable.
+  let listed;
+  try {
+    listed = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+      { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+      .split('\0').filter(Boolean);
+  } catch (e) {
+    console.error(`ABORT: could not enumerate files through git in ${ROOT} — ${e.message.split('\n')[0]}.\n`
+      + 'This script identifies its targets with `git ls-files`, so it needs git on PATH and a '
+      + 'work tree at the repo root. Nothing was written.');
+    process.exit(1);
+  }
+  // `listed` empty means git ran but the work tree has nothing at all (wrong cwd, a bare repo, an
+  // index that was never populated) — a DIFFERENT failure than "ran fine but nothing was a scene
+  // or prefab", which the pattern-match abort below (`targets.length === 0`) covers instead.
+  if (listed.length === 0) {
+    console.error(`ABORT: \`git ls-files\` listed 0 files in ${ROOT} at all — this repo always has `
+      + 'tracked files, so an empty listing means the enumeration itself is broken (wrong cwd, a '
+      + 'bare repo, or an index that was never populated), not a clean corpus. Nothing was written.');
+    process.exit(1);
+  }
+
+  const sceneOrPrefab = [...new Set(listed)]   // `--cached` emits an UNMERGED path once per merge
+    // stage (1/2/3), so a conflicted scene would otherwise be processed — and counted — three
+    // times. Writing is idempotent, but the COUNT is the artifact this script is trusted on.
+    .filter((p) => /\.(scene|prefab)\.json$/i.test(p));
+
+  // Dedupe on a case-FOLDED absolute path, after mapping — not on the raw index string above.
+  // Two index entries differing only in case (`games/Sling/x.scene.json` vs
+  // `games/sling/x.scene.json`) are distinct strings but the SAME physical file on every clone's
+  // case-insensitive filesystem (macOS, Windows); `existsSync` passes on both, so without this
+  // fold the file would be read — and counted — twice. The raw `Set` above stays: it dedupes the
+  // unmerged-stage case, where two entries are byte-IDENTICAL strings, which this fold would also
+  // catch but the raw one is cheaper and already proven correct for that case.
+  const seenAbs = new Set();
+  const abs = [];
+  for (const p of sceneOrPrefab) {
+    const full = join(ROOT, p);
+    const key = full.toLowerCase();
+    if (seenAbs.has(key)) continue;
+    seenAbs.add(key);
+    abs.push(full);
+  }
+
+  // A tracked file can be absent mid-rebase or after a manual delete; reading it would throw.
+  repoFilesCache = abs.filter((p) => existsSync(p));
   return repoFilesCache;
 }
 
-/** The repo's scene/prefab files that live under `dir`. */
-function filesUnder(dir) {
-  const prefix = dir.endsWith(sep) ? dir : dir + sep;
-  return repoSceneAndPrefabFiles().filter((p) => p.startsWith(prefix));
+/** The repo's scene/prefab files whose REPO-RELATIVE path matches `re`.
+ *
+ *  ⚠️ Matches on the git-relative path, NOT on a prefix built from `readdir`. Mixing the two is
+ *  a real defect and it was reproduced: the prefix would come from the on-disk name and the
+ *  candidates from the git index, so on a case-insensitive filesystem (macOS and Windows — i.e.
+ *  every clone) a case-only rename like `mv games/Sling games/sling` leaves the index holding
+ *  `games/Sling/...` while the prefix reads `games/sling/...`. `startsWith` then matches
+ *  NOTHING, `existsSync` still passes, and the script reports a clean sweep over a project it
+ *  silently skipped.
+ *
+ *  ⚠️ Single-sourcing the path on git alone does NOT, by itself, "remove the whole class" — that
+ *  was claimed here once and it was false in the same shape as the bug above. Fixing the
+ *  prefix-vs-index mismatch left the CALLER's regex free to be a case-sensitive literal
+ *  (`(games|demos)`), so an index holding `Games/...` against a worktree holding `games/...`
+ *  still matched nothing — same silent skip, different cause. `re` itself must therefore be
+ *  case-insensitive (an `i` flag) for every literal segment it names, not just the project
+ *  segment; this function does not lower-case anything on its own, so that is on each `re` this
+ *  is called with. */
+function filesMatching(re) {
+  return repoSceneAndPrefabFiles().filter((p) => re.test(relative(ROOT, p).split(sep).join('/')));
 }
 
 let changedFiles = 0, changedKeys = 0;
@@ -169,14 +231,13 @@ async function migrateFile(file) {
   if (WRITE) await writeFile(file, JSON.stringify(json, null, 2));
 }
 
-const targets = [];
-for (const rootDir of ['games', 'demos']) {
-  const projects = await readdir(join(ROOT, rootDir), { withFileTypes: true }).catch(() => []);
-  for (const proj of projects.filter((d) => d.isDirectory())) {
-    const assetsDir = join(ROOT, rootDir, proj.name, 'runtime', 'assets');
-    targets.push(...filesUnder(assetsDir));
-  }
-}
+// One pattern instead of a readdir of project directories: the project list IS whatever git
+// reports under these roots, so a project cannot be missed because its directory name and its
+// indexed name disagree (see `filesMatching`). Built from `PROJECT_ROOT_DIRS`
+// (engine/scripts/projectRoots.mjs), the single source of truth for the project roots — not a
+// second, unpointered `(games|demos)` literal. Case-insensitive (`i`): see `filesMatching`'s note.
+const PROJECT_PATTERN = new RegExp(`^(${PROJECT_ROOT_DIRS.join('|')})/[^/]+/runtime/assets/`, 'i');
+const targets = [...filesMatching(PROJECT_PATTERN)];
 // ⚠️ The e2e fixtures are DELIBERATELY left un-migrated at `version: 9` — they earn their keep by
 // driving the whole migration ladder (including v12→v13) on every e2e run, and migrating them in
 // place would quietly retire that coverage. Running this script over them would look like a
@@ -185,7 +246,27 @@ for (const rootDir of ['games', 'demos']) {
 // anyway turns the gate red rather than passing unnoticed — but do not make that test the thing
 // that catches it. Pass --include-e2e-fixtures only if that decision is being reversed on purpose.
 if (process.argv.includes('--include-e2e-fixtures')) {
-  targets.push(...filesUnder(join(ROOT, 'engine', 'tests', 'e2e', 'fixtures')));
+  targets.push(...filesMatching(/^engine\/tests\/e2e\/fixtures\//i));
+}
+
+// ⚠️ An enumeration that returns NOTHING reports "0 keys would be rewritten" and exits 0 —
+// indistinguishable from a corpus that is already clean, which is exactly how a silently broken
+// walk presents. Asserting on the REPO-WIDE scene/prefab count (as this once did) is too weak: it
+// stays green for ANY failure of the PATTERN above — e.g. a typo in `runtime/assets` — because
+// that count doesn't touch the pattern at all. Assert on `targets` instead, and report both
+// numbers so the operator can tell "the pattern broke" (targets 0, enumerated > 0) from "git
+// broke" (enumerated 0 too — see the abort inside `repoSceneAndPrefabFiles`). This repo always has
+// scene/prefab files under `games/**/runtime/assets` or `demos/**/runtime/assets`, so `targets`
+// is never legitimately 0. The sibling guard pins the same thing
+// (`anchorZIndexMigrated.test.ts`); it belongs here MORE, because a wrong answer here is a
+// rewrite that silently did not happen.
+if (targets.length === 0) {
+  const enumerated = repoSceneAndPrefabFiles().length;
+  console.error(`ABORT: the path pattern matched 0 of ${enumerated} enumerated scene/prefab `
+    + 'file(s). This repo always has scene/prefab files under games/**/runtime/assets or '
+    + 'demos/**/runtime/assets, so a match count of 0 means the pattern stopped matching, not a '
+    + 'clean corpus. Nothing was written.');
+  process.exit(1);
 }
 
 for (const file of targets) await migrateFile(file);
