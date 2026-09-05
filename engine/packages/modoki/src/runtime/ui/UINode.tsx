@@ -29,6 +29,7 @@ import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
+import { UI_PRESS_ORIGIN_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
@@ -750,6 +751,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     : isInteractive
       ? (e: React.MouseEvent) => {
           e.stopPropagation();
+          // #664 — a press that started on a descendant control and released past this node
+          // (a horizontal swipe outrunning a panel's edge, say) must not fire this node's
+          // bindings just because the browser resolved the click to this common ancestor. See
+          // pressOrigin.ts's module doc for why per-control stopPropagation can't cover this.
+          if (!pressBelongsTo(e.currentTarget as Element)) return;
           // Run every click binding (set writes + call actions). Inert in edit mode.
           applyBindings(node.action!.bindings, 'click', { selfGuid: node.guid });
         }
@@ -907,6 +913,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           onClick={(e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); onSelectEntity(node.entityId); }}
           onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
           data-entity-id={node.entityId}
+          {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
         />
       );
     }
@@ -937,8 +944,13 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         // Same contract as the range below and the toggle further down: focusing a text field is
         // not a click on whatever sits behind it. Latent rather than reported — no shipped game
         // has yet put a text input inside a dismiss-on-backdrop panel — but it is the same bug.
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        // `clearPressOrigin()` because this stops propagation WITHOUT consulting `pressBelongsTo`
+        // — see pressOrigin.ts's "The rule for a handler that swallows a click": left uncleared,
+        // React's synthetic stopPropagation also stops the native event at the React root, so the
+        // document-level sweep never runs and the pair survives to be misread by a later click.
+        onClick={(e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); }}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       />
     );
   }
@@ -970,6 +982,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           onClick={(e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); onSelectEntity(node.entityId); }}
           onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
           data-entity-id={node.entityId}
+          {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
         />
       );
     }
@@ -991,8 +1004,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         // click-the-backdrop-to-dismiss panel closes that panel on every adjustment — reported on
         // games/court's settings sliders, which dismissed the dialog mid-drag. The toggle branch
         // below has always done this; `range` and the text input above simply never did.
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        // `clearPressOrigin()` for the same reason as the text input above: this stops
+        // propagation without consulting the gate, so it must clear the pair itself.
+        onClick={(e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); }}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       />
     );
   }
@@ -1076,7 +1092,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         onClick={onSelectEntity
           ? (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
           : interactive
-            ? (e: React.MouseEvent) => { e.stopPropagation(); fire(); }
+            // `clearPressOrigin()` for the same reason as the range/text-input branches above:
+            // this stops propagation without consulting `pressBelongsTo`, so it must clear the
+            // pair itself or a later click could misread it as its own.
+            ? (e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); fire(); }
             : undefined}
         onKeyDown={interactive
           ? (e: React.KeyboardEvent) => {
@@ -1084,6 +1103,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           }
           : undefined}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       >
         <div style={knobStyle} />
       </div>
@@ -1108,7 +1128,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
-      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(isInteractive ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -1140,7 +1160,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   }
 
   return (
-    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(isInteractive ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}

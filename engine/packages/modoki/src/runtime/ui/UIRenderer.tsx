@@ -12,6 +12,7 @@ import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
+import { installPressOriginTracking } from './pressOrigin';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
 
 interface UIRendererProps {
@@ -72,6 +73,10 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // viewport mounted this component, not a per-render toggle, so closing over it
   // inside this ref (recreated only when it changes) is safe.
   const unblockRef = useRef<(() => void) | null>(null);
+  // #664 — tracks which element a press/release pair started/ended on (see pressOrigin.ts), so
+  // UINode's click handler can refuse a click the browser resolved to an ancestor a swipe merely
+  // passed through. Same runtime-only gating as unblockRef, and disposed alongside it.
+  const pressOriginRef = useRef<(() => void) | null>(null);
 
   const measureRef = useCallback((el: HTMLDivElement | null) => {
     roRef.current?.disconnect();
@@ -79,8 +84,11 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
     unblockRef.current?.();
     unblockRef.current = null;
+    pressOriginRef.current?.();
+    pressOriginRef.current = null;
     if (!el) return;
     if (!onSelectEntity) unblockRef.current = registerPointerBlocker(el);
+    if (!onSelectEntity) pressOriginRef.current = installPressOriginTracking(el.ownerDocument);
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;

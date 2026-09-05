@@ -357,6 +357,26 @@ number straight into a field with zero game code.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
+⚠️ **A click only fires a node's bindings when the PRESS that produced it also started on that
+node** (`pressOrigin.ts`, #664). A DOM `click` fires on the nearest common ancestor of the
+`pointerdown` and `pointerup` targets, so a drag whose two ends straddle a panel's edge resolves to
+an ANCESTOR of that panel — which is how a horizontal swipe to page wordweave's dictionary was
+dismissing it, by landing on the scrim that owns the close binding. `pressBelongsTo` gates the
+runtime click branch on both ends mapping back to the same node, using
+`closest('[data-press-origin]')`. ⚠️ **Per-control `stopPropagation` cannot cover this** — the
+technique the `range` and text-input branches use works only while the release stays ON the
+control, because then that control's own handler is the one that runs. When the release leaves,
+no descendant handler is invoked at all and there is nothing to stop the bubble from. ⚠️ The gate
+**fails OPEN** when no pointer pair was recorded, so a programmatic or assistive-technology
+activation is never suppressed; controller/keyboard activation does not reach it either way,
+because `focusManager` calls `applyBindings` directly rather than through a DOM click.
+⚠️ **It protects a panel only where that panel is ALREADY interactive.** The marker goes on nodes
+with a click binding, so a panel carrying none is transparent to `closest()` and the press resolves
+past it to the dismissing scrim. wordweave's dictionary is covered only because its no-op
+`dictionaryPanelSwallow` made the panel interactive; Court's `StorePanel`/`RulesPanel` have none and
+are not covered (#722). Stamping the marker on `overflow: 'scroll'` nodes would generalise it, at
+the cost of changing what a tap on empty list space does — a feel call, not a refactor.
+
 #### Engine built-in `UIAction`s
 
 Four stateless lifecycle/animator handlers are registered once at startup by
@@ -1444,6 +1464,26 @@ rebuild and is never per-frame.
   size by construction; the residual hazard is a MIXED measurement instead — a real viewport from
   one mount paired with `scrollX: 0` from the other while the two trees disagree on scroll offset,
   which can still land the pool's window outside the visible band and blank the view.
+- **`viewportWidth`/`viewportHeight` are `clientWidth`/`clientHeight`, which CSSOM ROUNDS to an
+  integer CSS pixel — and that rounding must STAY (#665).** An entry authored at `entryWidth: 100%`
+  is sized as a percentage of that rounded number, so it can be up to 0.5px narrower than the box it
+  should fill, leaving a sliver of the next entry visible at rest. ⚠️ **The obvious fix — measure the
+  box precisely with `getComputedStyle` and size the entry to the fractional value — was built,
+  measured live, and REVERTED.** Chrome parks a scroll offset on an INTEGER CSS pixel here: a
+  `scrollTo({left: 598.1875})` issued by `consumeEntryRequest` (`2 x` a fractional stride) landed at
+  exactly `598`, and the page-3 request at `897.28125` landed at `897`. So a fractional stride puts
+  every card start off the offsets the scroller can actually rest on, converting a CONSTANT 0.109px
+  sliver of the NEXT card into a per-page 0.19-0.28px sliver of the PREVIOUS one — measured on the
+  iPhone Air preset, worse than the defect it set out to fix. Two further limits found the same way,
+  worth knowing before anyone retries: Chrome quantises a used width to its 1/64px LayoutUnit
+  (an authored 299.109375 renders as 299.09375), so exact entry/viewport equality is unreachable
+  through CSS px anyway; and `offsetLeft`/`scrollWidth` are integer-rounded DOM APIs, so neither can
+  measure the residue — only `getBoundingClientRect` and `getComputedStyle` can.
+  **If this is retried, the direction that fits the constraint is INTEGER, not fractional**: size
+  the entry to `ceil` of the true box and report that same integer as `viewportWidth`, so stride,
+  viewport and scroll offsets all stay integers and agree. The cost is a real trade — ~0.9px of the
+  current card clipped at the right edge instead of ~0.1px of the next one showing — so it is an
+  owner call, not a refactor.
 - **`contentWidth`/`contentHeight` are DIAGNOSTICS the engine writes and does not read (#414).** They
   carry the box's `scrollWidth`/`scrollHeight` — its full content extent — and every consumer in the
   repo is a human or an agent reading the trait through Percept: `contentWidth === viewportWidth`
