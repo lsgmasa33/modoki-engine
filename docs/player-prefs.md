@@ -184,6 +184,73 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 
 ## Gotchas
 
+- ⚠️ **A game's own document format must be ADDITIVE — owner's ruling, 2026-09-05.** This is about a
+  layer *above* the envelope described in "Envelope" above, and the two are easy to conflate. The
+  scenario: a player leaves TestFlight for the App Store, or reinstalls an older build (a rollback),
+  and the OLD app opens a document a NEWER build wrote. If the old app's reader rebuilds the document
+  from the named fields it knows about and writes that rebuilt object back, every field the newer
+  build added is destroyed — permanently, at the next write. The ruling: an old build's reader must
+  read the fields it understands and **carry through untouched the ones it does not**, rather than
+  stripping them.
+
+  **This is a different exposure than the envelope's own protection, not the same one restated.**
+  #630's envelope protection (above) fires only when the NEWER build also bumped the envelope
+  `SCHEMA_VERSION` — the whole entry then hydrates as unreadable and `set()` refuses outright, so
+  nothing is destroyed. The case this rule is about is the ORDINARY one: an additive change to a
+  game's *own* document shape that does **not** bump the envelope version. The envelope hydrates the
+  document just fine; the game's own reader is what silently drops the fields it doesn't recognise.
+
+  **Reference implementation:** `games/wordweave/runtime/store.ts` (landed in #735, commit
+  `3b78c9425`). `readPurchases` populates an explicit `unknownFields` bag from any top-level key it
+  doesn't recognise; the single `serializePurchases()` is the only place a `StoredPurchases` becomes
+  the plain object PlayerPrefs stores, and it spreads `unknownFields` **first** so the known fields
+  (written last) always win on a colliding key. `IapAppliedEntry` carries an index signature so
+  `readIapApplied`'s `{ ...v, seq, coins }` preserves per-entry additions the same way. `readPurchases`
+  also writes the version back as `Math.max(PURCHASES_SCHEMA_VERSION, raw.v)`, never down — so a v2
+  document read by this v1 build still reports v2 when serialized, and a newer build can tell its
+  document was never downgraded.
+
+  **This is not "trust everything read back."** `readIapApplied` still rejects a per-entry
+  `seq`/`coins` that isn't a finite, non-negative number, exactly as before the fix — a foreign or
+  corrupted document still cannot hand the game a fake "already applied" marker or a negative
+  balance. Only fields the reader has no opinion about ride through untouched.
+
+  ⚠️ **Validation and preservation are NOT cleanly orthogonal — they fork at ENTRY granularity, and
+  additivity loses.** The paragraph above is true field-by-field on the top-level document, but
+  `iapApplied` is a *map* of entries, and the unit `readIapApplied` preserves-or-drops is the whole
+  ENTRY, not the field. An entry failing the `seq`/`coins` check is **dropped in full** — including
+  any per-entry fields a newer build added that this build cannot otherwise read (`IapAppliedEntry`'s
+  index signature) — because there is no way to keep "the parts we don't recognise" of an entry
+  without also keeping the marker itself, and an unvalidatable marker is exactly the fake-marker risk
+  this reader exists to refuse. So the additive rule's real shape here is **additive per FIELD, bounded
+  by validation per ENTRY**: a newer build's *shape* survives being read by an older build only for
+  entries the older build can still validate; an entry it cannot validate is destroyed, not carried.
+  Confirmed by probe: crediting a document holding one already-validated entry (`sub1`) alongside one
+  the reader cannot validate (missing `coins`) writes back `sub1` intact and the other entry gone.
+  This is latent, not live, today — nothing currently writes an `iapApplied` entry in a shape this
+  build cannot validate — but it is the fork the next consumer of this rule will hit, and the reason
+  is documented on `PURCHASES_SCHEMA_VERSION` in `store.ts` as the reference implementation's own
+  exception.
+
+  **The floor knob is a separate question, and it deliberately does not do this job.**
+  `MIN_READABLE_PURCHASES_VERSION` (`store.ts`) and the older `MIN_READABLE_SESSION_VERSION`
+  (`games/wordweave/runtime/save.ts`) exist to refuse a document too OLD to trust, or as the knob to
+  raise the day a bump changes what an EXISTING field *means* (not merely adds one). In `store.ts`
+  today's floor lets a too-NEW document through untouched — the additive pass-through above is what
+  handles it, not the floor. ⚠️ `save.ts`'s floor is currently the OTHER shape: its
+  `isReadableVersion` check is a **two-sided** range (`v >= MIN_READABLE_SESSION_VERSION && v <=
+  SAVE_SCHEMA_VERSION`), so `readLevelSession` still refuses a too-new session document outright
+  today, by a reasoned pre-existing decision (no replayable action log to salvage against, unlike
+  Court's daily state) — that file has not yet been brought in line with this ruling; see the open
+  instances below.
+
+  **Known open instances**, tracked as issues rather than restated here: **#760** (Court — twelve
+  readers rebuild named fields instead of preserving unknowns, three of them on the money key).
+  **#763** (wordweave's own `progress` and `session` documents — `saveProgress`
+  (`games/wordweave/runtime/systems.ts`) writes a literal without reading the stored document at
+  all, and `readLevelSession`'s refusal of a too-new session is not paired with a refusal to
+  overwrite it).
+
 - **`await flush()` resolving is NOT evidence the writes landed — check `pendingKeys()` after it.**
   `drain()` catches every backend rejection, re-queues the key onto `dirty` and warns, precisely so
   one failing write cannot poison `writeChain` for the rest of the session. The flush promise
