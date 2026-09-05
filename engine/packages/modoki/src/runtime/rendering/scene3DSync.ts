@@ -11,7 +11,7 @@ import { Transform, Renderable3D, Renderable3DPrimitive, Camera, CameraFrame, Ti
 import { layoutText, type TextQuad } from './text/layoutText';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
-import { makeMtsdfMaterial, updateMtsdfStyle, type MtsdfStyle } from './text/mtsdfShader';
+import { makeMtsdfMaterial, updateMtsdfStyle, canReuseMtsdfMaterial, type MtsdfStyle } from './text/mtsdfShader';
 import { getFontTexture } from './text/fontTextureThree';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getTextDirtyVersion } from './text/textDirty';
@@ -3393,6 +3393,9 @@ interface TextMeshEntry {
   pages: Map<number, THREE.Mesh>;
   /** Layout-input hash — geometry rebuilds only when it changes. */
   hash: string;
+  /** The atlas half of `hash` (#692) — kept separately so a layout-only change can tell
+   *  it is safe to reclaim the existing page materials rather than rebuild them. */
+  atlasKey?: string;
   fontId: string;
   billboard: boolean;
   /** Un-animated layout quads + anchor offset, kept so per-glyph animation can
@@ -3448,11 +3451,15 @@ function updateTextPageColors3D(entry: TextMeshEntry, quads: TextQuad[]): void {
   }
 }
 
-function disposeTextPageMeshes(entry: TextMeshEntry): void {
-  for (const mesh of entry.pages.values()) {
+/** Dispose an entry's page meshes. Geometry is always disposed. The MATERIAL is disposed too,
+ *  unless `keep` is supplied — in which case it is moved into `keep` for the caller to reclaim or
+ *  dispose (#692: a layout change needs new geometry but the same material). */
+function disposeTextPageMeshes(entry: TextMeshEntry, keep?: Map<number, THREE.Material>): void {
+  for (const [page, mesh] of entry.pages) {
     entry.group.remove(mesh);
     mesh.geometry.dispose();
-    (mesh.material as THREE.Material).dispose();
+    const mat = mesh.material as THREE.Material;
+    if (keep) keep.set(page, mat); else mat.dispose();
   }
   entry.pages.clear();
 }
@@ -3518,6 +3525,10 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
 
     const hash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
       t.letterSpacing, t.anchorX, t.anchorY, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+    // The atlas half of `hash` (#692). When only the LAYOUT half moved, every page material is
+    // still valid — its node graph closes over the atlas texture and metrics and nothing else that
+    // a layout change touches. Style is re-applied by `updateMtsdfStyle` below, every frame.
+    const atlasKey = [t.font, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
 
     if (!entry || entry.hash !== hash) {
       provider.ensureGlyphs(codepointsOf(t.text));
@@ -3530,32 +3541,50 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         scene.add(entry.group);
         textMeshes.set(id, entry);
       }
-      // Rebuild every page mesh from scratch (a layout/atlas change is infrequent, and
-      // the atlas TEXTURE is baked into each TSL node graph so a page's material can't
-      // be mutated in place anyway).
-      disposeTextPageMeshes(entry);
+      // Rebuild every page mesh from scratch (a layout/atlas change is infrequent). Geometry is
+      // always new; the MATERIAL is reclaimed when the atlas is unchanged — the atlas TEXTURE is
+      // baked into each TSL node graph, so a page's material can't be mutated in place across an
+      // atlas change, but a layout-only change never touches it.
+      //
+      // Reclaim the page materials when the atlas is unchanged — a layout change needs new
+      // geometry, never a new node graph (#692; the direct analogue of #690 on the 2D twin).
+      // Anything left in `reusable` after the loop is a page this text no longer touches, or one
+      // whose texture/metrics moved under it: disposed in the `finally`.
+      const reusable = new Map<number, THREE.Material>();
+      disposeTextPageMeshes(entry, entry.atlasKey === atlasKey ? reusable : undefined);
       // Anchor: block spans x[0,width], yUp y[0,-height]. Shift so the anchor point
       // (anchorX across width, anchorY down height) sits at the entity origin — same
       // for every page since they share one layout.
       const ax = -t.anchorX * layout.width, ay = t.anchorY * layout.height;
-      for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
-        const ptex = getFontTexture(provider, page);
-        if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
-        const g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
-        g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
-        g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
-        g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
-        g.translate(ax, ay, 0);
-        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), provider.atlas.type !== 'msdf');
-        const mesh = new THREE.Mesh(g, mat);
-        // Per-glyph animation nudges verts past the static bounds; skip frustum
-        // culling (text is cheap) so an animated glyph never pops out at the edge.
-        mesh.frustumCulled = false;
-        entry.group.add(mesh);
-        entry.pages.set(page, mesh);
+      try {
+        for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
+          const ptex = getFontTexture(provider, page);
+          if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
+          g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
+          g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
+          g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
+          g.translate(ax, ay, 0);
+          const hasTrueSdf = provider.atlas.type !== 'msdf';
+          let mat = reusable.get(page);
+          if (mat && canReuseMtsdfMaterial(mat, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf)) {
+            reusable.delete(page);
+          } else {
+            mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), hasTrueSdf);
+          }
+          const mesh = new THREE.Mesh(g, mat);
+          // Per-glyph animation nudges verts past the static bounds; skip frustum
+          // culling (text is cheap) so an animated glyph never pops out at the edge.
+          mesh.frustumCulled = false;
+          entry.group.add(mesh);
+          entry.pages.set(page, mesh);
+        }
+      } finally {
+        for (const m of reusable.values()) m.dispose();
       }
       entry.hash = hash;
+      entry.atlasKey = atlasKey;
       entry.fontId = t.font;
       entry.baseQuads = layout.quads; // for per-frame animation (positions/colours)
       entry.ax = ax; entry.ay = ay;

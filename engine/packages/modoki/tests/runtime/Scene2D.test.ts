@@ -43,9 +43,20 @@ function mockDeps() {
       destroyCount = 0;        // catches double-teardown (F4)
       zIndex = 0;
       rotation = 0;
-      _x = 0; _y = 0; _sx = 1; _sy = 1;
-      position = { set: (x: number, y: number) => { this._x = x; this._y = y; } };
-      scale = { set: (x: number, y: number) => { this._sx = x; this._sy = y; } };
+      // `position`/`scale` hold the values DIRECTLY and `_x`/`_y`/`_sx`/`_sy` read through to them
+      // (that direction, rather than the reverse, so there is no `this` alias to lint at).
+      // ⚠️ `x`/`y` must be READABLE: `Scene2D.tsx`'s mask-transform dirty check reads
+      // `obj.position.x`/`.y` off the display object itself rather than from a snapshot field, so a
+      // write-only mock made that comparison read `undefined !== wantX` — permanently "changed",
+      // so the steady-state branch it gates (#692's mask scale/position dirty gate) was never
+      // exercised by anything. Same shape as the `MeshGeometry` mock hole below: a property the
+      // source reads and the mock omits makes a whole branch invisible, with every test green.
+      position = { x: 0, y: 0, set(x: number, y: number) { this.x = x; this.y = y; } };
+      scale = { x: 1, y: 1, set(x: number, y: number) { this.x = x; this.y = y; } };
+      get _x() { return this.position.x; }
+      get _y() { return this.position.y; }
+      get _sx() { return this.scale.x; }
+      get _sy() { return this.scale.y; }
       removeFromParent() {
         if (this.parent) {
           const i = this.parent.children.indexOf(this);
@@ -94,10 +105,24 @@ function mockDeps() {
     // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
     class MeshGeometry {
       buffers: unknown[] | null = [];
+      positions: Float32Array;
+      // One Buffer per geometry, so a test can assert `update()` was called for an in-place
+      // resize — mirrors real pixi, where `getBuffer('aPosition')` returns the geometry's own
+      // position Buffer and `.update()` is what re-uploads it.
+      private _posBuffer = { update: vi.fn() };
+      // Validates the NAME, like the real thing: Pixi's `getBuffer(id)` is
+      // `this.getAttribute(id).buffer`, which throws a TypeError on an unknown attribute. A mock
+      // that ignored the argument would let `getBuffer('aPositions')` (a typo) pass every test
+      // while throwing inside `renderFrame` in a browser and taking the whole 2D frame down.
+      getBuffer = (name: string) => {
+        if (name !== 'aPosition') throw new TypeError(`[mock] no attribute '${name}' on this geometry`);
+        return this._posBuffer;
+      };
       unload = vi.fn();
       destroy = vi.fn(() => { this.buffers = null; });
       addAttribute = vi.fn();
       constructor(public opts?: any) {
+        this.positions = opts?.positions ?? new Float32Array(8);
         MeshGeometry.__control.callCount++;
         if (MeshGeometry.__control.callCount === MeshGeometry.__control.throwOnCall) {
           throw new Error('[mock] MeshGeometry construction failed');
@@ -330,6 +355,86 @@ describe('Scene2D.renderFrame', () => {
     expect(obj.clear).toHaveBeenCalled();
     expect(obj.rect).toHaveBeenCalled();          // square → rect
     expect(obj.fill).toHaveBeenCalledWith(0x123456);
+  });
+
+  // #684: a primitive's Graphics geometry depends on shape/size/pivot/colour only, never on its
+  // transform — yet the outer `changed` gate (which decides whether to touch the display object
+  // at all) trips on x/y/rz/sx/sy too, and used to re-run `gfx.clear()` + redraw on every one of
+  // those frames. A `gfx.clear()` is not free: it emits a Pixi view-update that re-batches the
+  // WHOLE render group, so a single drifting primitive re-tessellated and re-batched every sibling
+  // around it. `geomSig` (on the slot) gates the clear+redraw separately from the transform apply.
+  describe('a primitive move does not re-issue its shape (#684)', () => {
+    it('T1: a pure move does not call clear() again, but the transform still applies', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+      expect(callsAfterBuild).toBeGreaterThan(0);
+
+      child.set(traits.Transform, { ...child.get(traits.Transform), x: 42 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBe(callsAfterBuild); // shape NOT re-issued
+      expect(obj._x).toBe(42);                                   // but the frame did run — the move applied
+    });
+
+    // The fast path must not over-widen: a genuine geometry input (size) still re-issues the
+    // shape. This passes both before and after the fix — it exists to pin the fast path against
+    // a future over-widening, not as evidence the change works (see T3 for that).
+    it('T2: a resize DOES re-issue the shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), width: 30 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBeGreaterThan(callsAfterBuild);
+    });
+
+    // Unlike size, colour reaches the geometry through `fill(color)`, not through any transform
+    // property — this genuinely fails if `color` is ever dropped from `geomSig`.
+    it('T3: a colour change DOES re-issue the shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', color: 0x123456, width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), color: 0x654321 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBeGreaterThan(callsAfterBuild);
+    });
+
+    // The biggest win of the change: `forceAll` (an editor trait write / gizmo drag on ANY
+    // entity) used to re-tessellate EVERY primitive in the scene, whether or not its own geometry
+    // moved. Nothing else pins this.
+    it('T4: forceAll alone does not re-issue an unchanged primitive\'s shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      // The external-dirty path the harness already uses to simulate an editor ECS write /
+      // gizmo drag on ANY entity — nothing about THIS entity's own geometry moved.
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBe(callsAfterBuild); // not re-issued
+    });
   });
 
   it('creates a Sprite for an image ref and binds the cached texture + tint', async () => {
@@ -749,7 +854,19 @@ describe('Scene2D.renderFrame', () => {
         expect(kids[0].texture).not.toBe(texBefore);    // but it samples the NEW slice
       });
 
-      it('still rebuilds (a NEW Mesh) when a structural property changes alongside the ref', async () => {
+      // #692 changed this: a size/pivot change no longer forces a rebuild (it resizes the quad
+      // in place via `matQuadSig`, regardless of whether a ref swap happens in the same frame) —
+      // only a genuine BUILD input (`matBuildSig`: resolved url / extra-sampler set) still does.
+      // A same-sheet ref swap alongside a size change now takes the in-place frame-swap path
+      // (texture + uTextureMatrix written in place) AND the in-place quad resize, on the SAME
+      // Mesh+Shader — see 'material quad resize is in-place, not a rebuild (#692)' → T5/T6 above.
+      //
+      // The OLD expectation here ("a size change alongside a ref swap forces a NEW Mesh") was only
+      // ever true because size sat in the (now-split) build signature — it was an accident of the
+      // old sig's shape, not a real requirement. With `matBuildSig`/`matQuadSig` split, a combined
+      // frame legitimately takes BOTH in-place paths at once: the frame swap writes the new slice's
+      // `uTextureMatrix`, then the resize writes the 8 position floats — and both still apply.
+      it('resizes in place (still the frame-swap Mesh) when a size change accompanies a same-sheet ref swap', async () => {
         const { pixi, traits, pool, scene2d, world, matReady } = await setup();
         matReady.add('matGuid');
         pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
@@ -758,17 +875,19 @@ describe('Scene2D.renderFrame', () => {
 
         scene2d.renderFrame();
         const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderIdBefore = meshBefore.shader.id;
 
-        // A genuine structural change (size) alongside the ref swap — matSig moves, so this must
-        // still rebuild, not take the frame-swap fast path.
+        // Same sheet (matBuildSig unchanged) + a size change (matQuadSig changed) + a ref swap
+        // (matSpriteRef changed) all in one frame.
         child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1', width: 40 });
         scene2d.markScene2DDirty();
         scene2d.renderFrame();
 
         const kids = pool.getSlot(canvas.id())!.container.children as any[];
         expect(kids).toHaveLength(1);
-        expect(kids[0]).not.toBe(meshBefore);          // a NEW Mesh
-        expect(meshBefore.destroyed).toBe(true);       // the old one was torn down
+        expect(kids[0]).toBe(meshBefore);              // SAME Mesh — no rebuild
+        expect(kids[0].shader.id).toBe(shaderIdBefore); // SAME Shader
+        expect(meshBefore.destroyed).toBe(false);       // never torn down
       });
 
       // The gap an adversarial review found: the mock shader used to have no `resources`, so
@@ -830,6 +949,62 @@ describe('Scene2D.renderFrame', () => {
       });
     });
 
+    // #692 site 2: `matSig` used to include width/height/pivot, so an animated size rebuilt the
+    // whole Mesh+Shader+Geometry every frame — and every Shader rebuild leaks a permanent entry
+    // into WebGPU's BindGroupSystem._hash (#699) and pixi's GCManagedHash (#707), making an
+    // animated size an unbounded grow. `matBuildSig`/`matQuadSig` split the two: a size/pivot
+    // change now resizes the existing quad's 8 position floats in place instead.
+    describe('material quad resize is in-place, not a rebuild (#692)', () => {
+      it('T5: a size change resizes the quad in place — same Mesh, same Shader, geometry updated', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        const { computePivotOffset } = await import('../../src/runtime/rendering/render2DUtils');
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/hero.png', { width: 64, height: 64, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderIdBefore = meshBefore.shader.id;
+        const geomBefore = meshBefore.geometry;
+
+        const rendAfter = child.get(traits.Renderable2D);
+        child.set(traits.Renderable2D, { ...rendAfter, width: 30 });
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).toBe(meshBefore);                  // SAME Mesh object — no rebuild
+        expect(meshAfter.shader.id).toBe(shaderIdBefore);    // SAME Shader — this is the #699/#707 pin
+        expect(meshAfter.geometry).toBe(geomBefore);         // SAME geometry object, resized in place
+        expect((geomBefore.getBuffer('aPosition') as any).update).toHaveBeenCalled();
+        // x1 reflects the NEW width, via the same pivot-offset derivation production uses.
+        const { ox } = computePivotOffset(30, rendAfter.height, 0.5, 0.5);
+        expect(geomBefore.positions[2]).toBe(ox + 30 * 2);
+      });
+
+      // Proves the split did not make the rebuild gate too narrow: a genuine build input
+      // (the resolved sprite url) must still force a real rebuild.
+      it('T6: a url change still rebuilds (matBuildSig still forces it)', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/hero.png', { width: 64, height: 64, source: { style: {} } });
+        pixi.Assets.__seed('http://t/villain.png', { width: 64, height: 64, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/villain.png' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).not.toBe(meshBefore); // a NEW Mesh — matBuildSig still gates a rebuild
+        expect(meshBefore.destroyed).toBe(true);
+      });
+    });
+
     // Perf gate (MaterialSnap): the material pass used to force a canvas redraw EVERY running
     // frame. Now it dirties the canvas only on a (re)build, a transform/appearance change, a
     // driver uniform change (sprite2DMaterialBroker flag), or an external dirty — so a static
@@ -864,6 +1039,70 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // uniform change forces a redraw
       broker.clearEntity2DMaterialDirty();
+    });
+
+    // #211 review finding: the MaterialSnap `changed` gate compared `snap.opacity !== rend.opacity`
+    // while the write below it stores the COMPOSED value (`snap.opacity = alpha`, where
+    // `alpha = rend.opacity * groupAlpha`) — the sprite and skinned passes both compare `alpha`;
+    // the material pass was the lone outlier. Under a steady `GroupAlpha` of 0.5 (rend.opacity
+    // staying its default 1), `snap.opacity` holds 0.5 forever but was compared against `1`, so
+    // the mismatch never clears and the gate never settles — a full GPU pass every frame with
+    // nothing moving, the exact cost the gate above exists to avoid.
+    it('a material entity under a steady GroupAlpha settles (does not redraw forever) (#211)', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const group = world.spawn(
+        traits.GroupAlpha({ alpha: 0.5 }),
+        traits.EntityAttributes({ name: 'group', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+      );
+      world.spawn(
+        traits.Transform({}),
+        traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10, material: 'matGuid' }),
+        traits.EntityAttributes({ name: 'child', parentId: group.id(), sortOrder: 0, layer: '2d' }),
+      );
+
+      const dirtied: Set<number>[] = [];
+      vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+      scene2d.renderFrame();                                   // first frame: Mesh built
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+      scene2d.renderFrame();                                   // nothing changed
+      scene2d.renderFrame();
+      // Before the fix this stayed true forever — the raw-vs-composed mismatch never resolves.
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+    });
+
+    // The other half of #211: holding `rend.opacity` constant and fading only the ANCESTOR
+    // GroupAlpha must still mark the canvas dirty. Before the fix this read as UNCHANGED
+    // (`snap.opacity` 1.0 compared against `rend.opacity` 1.0, both untouched by the fade), so
+    // the new alpha was written to `mesh.alpha` below but the canvas was never re-presented — a
+    // fade that does not paint.
+    it('a group FADE on a material entity marks the canvas dirty (#211)', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const group = world.spawn(
+        traits.GroupAlpha({ alpha: 1 }),
+        traits.EntityAttributes({ name: 'group', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+      );
+      world.spawn(
+        traits.Transform({}),
+        traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10, material: 'matGuid' }),
+        traits.EntityAttributes({ name: 'child', parentId: group.id(), sortOrder: 0, layer: '2d' }),
+      );
+
+      const dirtied: Set<number>[] = [];
+      vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+      scene2d.renderFrame();                                   // build
+      scene2d.renderFrame();                                   // settle
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+
+      group.set(traits.GroupAlpha, { alpha: 0.5 });            // fade — rend.opacity untouched
+      scene2d.renderFrame();
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // before the fix: silently unchanged
     });
 
     // Review finding (HIGH): with the redraw gate, a co-resident static material no longer
@@ -1539,7 +1778,17 @@ describe('Scene2D.renderFrame', () => {
       expect(obj.clear).toHaveBeenCalledTimes(2);     // color change → redraw
     });
 
-    it('redraws when the transform moves (an animating sprite)', async () => {
+    // #684 changed this: a primitive's Graphics geometry does not depend on its transform, so a
+    // pure move no longer re-issues the shape (see 'a primitive move does not re-issue its shape
+    // (#684)' → T1 above) — the entity still redraws (position.set still runs every changed
+    // frame), it just does so without a wasted clear()+redraw of an unmoved shape.
+    //
+    // The OLD expectation here ("a move redraws the shape") was wrong on its own terms, not just
+    // superseded: it pinned "clear() is called again on a pure move" as CORRECT behaviour, when
+    // that call was exactly #684's defect (a manufactured view change that re-batches the whole
+    // render group for a shape that never moved). This test was defending the bug it should have
+    // caught.
+    it('moves without re-clearing the shape (an animating sprite) — #684', async () => {
       const { traits, pool, scene2d, world } = await setup();
       const canvas = spawnCanvas(world, traits);
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
@@ -1550,7 +1799,8 @@ describe('Scene2D.renderFrame', () => {
 
       child.set(traits.Transform, { ...child.get(traits.Transform), x: 50 });
       scene2d.renderFrame();
-      expect(obj.clear).toHaveBeenCalledTimes(2);
+      expect(obj.clear).toHaveBeenCalledTimes(1); // geometry unchanged → not re-issued
+      expect(obj._x).toBe(50);                    // but the move still applied
     });
 
     it('skips the whole frame while the sim is stopped and nothing is externally dirty', async () => {
@@ -1702,6 +1952,70 @@ describe('Scene2D collider overlay (editor)', () => {
     scene2d.setShowColliders2D(false);
     scene2d.renderFrame();
     expect(g.clear).toHaveBeenCalled();
+  });
+
+  // #684 (site 2, close-out sweep): `drawColliderOverlays` used to unconditionally
+  // `g.clear()` every overlay Graphics at the top of EVERY frame, even an empty one nothing
+  // had drawn into since the last clear. `GraphicsContext.clear()` has no empty early-out — it
+  // unconditionally emits the same 'update' → whole-render-group re-batch #684's main fix
+  // was about. So once a session had ever shown colliders, every canvas holding a (now empty)
+  // overlay paid a full re-batch on every subsequent frame forever, with the overlay OFF.
+  // `_colliderOverlaysDrawn` gates the clear loop on "something was actually drawn since the
+  // last clear", so an idle/disabled overlay is cleared exactly once, not every frame.
+  it('clears the overlay once after the toggle goes off, not every frame after (#684 site 2)', async () => {
+    const { traits, pool, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    world.spawn(
+      traits.Transform({ x: 100, y: 100 }),
+      traits.Collider2D({ shape: 'box', halfW: 50, halfH: 50 }),
+      traits.EntityAttributes({ name: 'wall', parentId: canvas.id(), layer: '2d' }),
+    );
+
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame(); // drawn
+    const slot = pool.getSlot(canvas.id())!;
+    const g = (slot.container.children as any[]).find((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
+
+    scene2d.setShowColliders2D(false);
+    scene2d.renderFrame(); // cleared once — the existing test above already pins this call
+    expect(g.clear).toHaveBeenCalled();
+
+    g.clear.mockClear();
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+    expect(g.clear).not.toHaveBeenCalled(); // nothing was drawn since the last clear → not re-cleared
+  });
+
+  // Guard against the flag latching the feature off entirely. The realistic trigger is a rapid
+  // UI toggle: OFF then back ON again before the next renderFrame() — so the clear-loop's
+  // `_colliderOverlaysDrawn` is still true (something WAS drawn last frame) at the moment
+  // `_showColliders` is ALREADY true again too. A plausible-but-wrong implementation returns
+  // early right after the clear-and-reset block (treating "something needed clearing" as "this
+  // frame is done"), which would swallow the re-enable until a SECOND frame. It must draw in
+  // the very same frame that clears.
+  it('drawing resumes in the SAME frame that clears, after an off-then-back-on toggle (#684 site 2)', async () => {
+    const { traits, pool, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    world.spawn(
+      traits.Transform({ x: 100, y: 100 }),
+      traits.Collider2D({ shape: 'box', halfW: 50, halfH: 50 }),
+      traits.EntityAttributes({ name: 'wall', parentId: canvas.id(), layer: '2d' }),
+    );
+
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame(); // drawn — _colliderOverlaysDrawn is now true
+    const slot = pool.getSlot(canvas.id())!;
+    const g = (slot.container.children as any[]).find((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
+    g.stroke.mockClear(); g.moveTo.mockClear(); g.lineTo.mockClear(); g.clear.mockClear();
+
+    // Off then back on, BEFORE the next render — no intervening frame sees the off state.
+    scene2d.setShowColliders2D(false);
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame();
+
+    expect(g.clear).toHaveBeenCalled();      // the pending clear from the off-toggle still ran
+    expect(g.stroke).toHaveBeenCalled();     // AND the re-enable drew in the SAME frame
+    expect(g.moveTo.mock.calls.length + g.lineTo.mock.calls.length).toBeGreaterThan(0);
   });
 });
 
@@ -1904,6 +2218,79 @@ describe('Mask2D teardown deferral (#455)', () => {
     // Tear the renderer down WITHOUT another renderFrame — stop() must drain the queue itself.
     scene2d.stopScene2D();
     expect(oldMaskObj.destroyed).toBe(true);
+  });
+});
+
+// #692 (site 3, close-out sweep): WHERE a mask's size lands decides whether a resize needs a
+// rebuild. The stencil path bakes it into `roundRect` (an absolute cornerRadius, a genuine shape
+// change) and the feathered path rasterises a ramp bitmap of that size (also genuine) — both stay
+// in `sizeSig`. But a RESOLVED `texture`-mode mask only ever routes the size into
+// `slot.baseScaleX/Y` via `setMaskBaseScale` (a matrix), so rebuilding the Sprite (plus a
+// refcount drop/re-take and a re-resolve) to change two floats was pure waste. `sizeSig` is now
+// empty for that one path and `setMaskBaseScale` applies in place every frame instead.
+describe('Mask2D texture-mode resize is in-place, not a rebuild (#692)', () => {
+  it('a resized texture-mode mask keeps its Sprite and updates its scale', async () => {
+    const { pixi, traits, scene2d, world } = await setup();
+    pixi.Assets.__seed('http://t/mask.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, mode: 'texture', sprite: 'http://t/mask.png', feather: 0, width: 10, height: 10 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame(); // frame 1: mask slot built, resolved texture → 'alpha' kind
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot.kind).toBe('alpha');
+    const maskObjBefore = slot.maskObj;
+    const baseScaleXBefore = slot.baseScaleX;
+
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), width: 30 });
+    scene2d.renderFrame(); // frame 2: sizeSig is empty for this path → no rebuild, scale updates
+
+    expect(slot.maskObj).toBe(maskObjBefore);          // SAME Sprite — no rebuild
+    expect(maskObjBefore.destroyed).toBe(false);       // never torn down
+    expect(slot.baseScaleX).not.toBe(baseScaleXBefore); // but the size DID apply, as scale
+    expect(slot.baseScaleX).toBeCloseTo((30 * 2) / 64, 10);
+  });
+
+  // The existing #455 "a SHAPE change (not just disable) also defers the outgoing mask object
+  // destroy" test (above) already exercises a resized RECT/stencil mask rebuilding — that is why
+  // `width` stays in `sizeSig` for the stencil path: `roundRect`'s absolute cornerRadius makes a
+  // resize a genuine shape change, not a uniform scale. Not duplicated here.
+
+  // Pre-existing gap this change exposed rather than introduced: comparing only position/rotation
+  // meant a mask that only SCALES (no rebuild, no reposition) never marked its canvas dirty. That
+  // was invisible while every scale-affecting input (a texture-mode size change included) forced a
+  // rebuild that marked the canvas itself — removing that rebuild for the resolved-texture path
+  // would have made an animated-scale mask silently stop repainting.
+  it('a mask that only scales (Transform.sx) marks its canvas dirty', async () => {
+    const { traits, scene2d, pool, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    const dirtied: Set<number>[] = [];
+    const renderAllSpy = vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+    scene2d.renderFrame(); // frame 1: built — dirtied
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+    scene2d.renderFrame(); // frame 2: settled — nothing changed
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+
+    // Scale ONLY — no position/rotation change, no shape/sig change.
+    mask.set(traits.Transform, { ...mask.get(traits.Transform), sx: 2 });
+    scene2d.renderFrame(); // frame 3: must still mark the canvas dirty
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+    renderAllSpy.mockRestore();
   });
 });
 

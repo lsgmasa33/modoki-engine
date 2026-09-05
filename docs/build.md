@@ -1428,6 +1428,21 @@ there would not check. The editor's own **Build menu is unaffected**: `/api/buil
 `verifyInstalledMatchesTarball` statically and fails before it ever spawns the CLI. What stays reachable otherwise is a mis-resolved `.tgz` binary merge conflict (tarball
 from one side, lockfile from the other) or hand-editing.
 
+⚠️ **That gap is a DECISION, not an oversight — do not "fix" it without new evidence** (owner,
+2026-09-05, closing #714). The skip stays non-fatal, and the prebuilt-JS-twin option that would let
+the check run without esbuild was declined. The reason is reach: the exposed path is the bare
+`node engine/scripts/build-web.mjs` invocation, which is the one *fewer humans use* — and #685's own
+history is that a CLI-only guard recreated #148's asymmetry, so a second implementation to cover the
+less-used path risks buying that defect class again. Reopening it needs evidence that the bare-CLI
+path is actually used for native builds, which is the premise the decision rests on.
+
+What #714 DID change is the diagnosis. `loadEnginePluginModule` used to return a bare `null` for two
+different causes, so the warning could not say which fired — "nothing to check" and "cannot check"
+were indistinguishable and the gate failed open either way. `loadEnginePluginModuleResult` now
+reports `no-source` vs `no-esbuild`, and the warning names the cause and the remedy: inside a
+packaged editor `no-esbuild` is expected, while on a source checkout it means the install is
+incomplete (`npm install` at the repo root).
+
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
   its tarball. Expect a re-vendor after a docs-only plugin edit.

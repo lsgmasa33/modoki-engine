@@ -166,6 +166,50 @@ export const UIElement = trait({
    * in the band's stacking context and made it silently unclickable.
    */
   pointerThrough: false,
+  /**
+   * Consume a click that lands on this element or on a non-interactive descendant, instead of
+   * letting it bubble to an ancestor — "stop the tap here, but I am not a button." Children that
+   * carry their own bindings keep working normally; this only intercepts what would otherwise
+   * fall through untouched.
+   *
+   * Why this exists instead of authoring a no-op `call` binding to get the same
+   * `stopPropagation`: a no-op binding is still a discrete click binding, so `UINode.tsx` runs it
+   * through `applyBindings` — which fires the UI click cue and takes the global input lock
+   * (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`, 300ms) for nothing. A tap on a dialog's body
+   * audibly clicked and then deafened the next tap in that dialog for 300ms (#728).
+   *
+   * Canonical use: a modal card whose scrim dismisses on tap. Without this, a tap on the card's
+   * own text falls through to the scrim and closes the dialog.
+   *
+   * ⚠️ Also opts this node into the #664 press-origin gate (`pressOrigin.ts`) — not incidental,
+   * half the reason the field exists. A press that starts on this card and releases past its edge
+   * onto the scrim must not read as a tap on the scrim, and that gate only protects nodes it
+   * considers interactive.
+   *
+   * ⚠️ **Contradicts `pointerThrough`, which WINS** — authoring both is an authoring error, not a
+   * combination with a meaning. `UINode.tsx` enforces that IN CODE (`swallowClicks === true &&
+   * !pointerThrough`), and it has to, because CSS cannot: `pointer-events: none` stops this node
+   * being hit-tested but does NOT remove it from the event path of a click that starts on a
+   * descendant with `auto` — which is the very case `pointerThrough` exists for (a decorative
+   * panel that still holds a working button). Before that gate, a band authored with both fields
+   * swallowed every tap beginning on a Canvas2D mount or scroll box inside it. Do not "simplify"
+   * the gate away on the grounds that `pointer-events: none` already handles it; it does not, and
+   * this comment claimed otherwise for a while before anyone measured it.
+   *
+   * ⚠️ **Not for a `canvas2D` container.** In the editor's click-to-select mode a `canvas2D` node
+   * deliberately gets no click handler (clicks pass through to the canvas), but `swallowClicks`
+   * would still take the pointer — so the click resolves to the container and selects its parent
+   * instead of descending. Nothing authors this today; if you need it, fix the editor branch
+   * rather than authoring around it.
+   *
+   * A node that ALSO carries a real click binding is a different story — that combination is
+   * redundant, not a trap. An interactive node's click handler already calls `stopPropagation`
+   * unconditionally before anything else, so the tap is stopped either way; `UINode.tsx` runs the
+   * interactive path (the `pressBelongsTo` gate, then the binding) and leaves the cursor as
+   * `pointer`. Nothing the author asked for is silently dropped — `swallowClicks` means precisely
+   * "swallow even though I have no binding of my own."
+   */
+  swallowClicks: false,
 
   // ── Style (box visuals) ──
   /** Background fill colour. ⚠️ **Inert on its own** — see `backgroundOpacity` below, which

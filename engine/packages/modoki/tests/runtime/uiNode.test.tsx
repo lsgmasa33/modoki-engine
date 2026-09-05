@@ -58,6 +58,7 @@ vi.mock('../../src/runtime/video/UIVideoMount', () => ({
 import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
 import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
+import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo } from '../../src/runtime/ui/pressOrigin';
 import { isPaintOpaque } from '../../src/editor/panels/uiPreviewPick';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
 
@@ -86,6 +87,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, rotation: 0, scale: 1, overflow: 'visible', isVisible: true, pointerThrough: false,
+    swallowClicks: false,
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
@@ -328,6 +330,120 @@ describe('UINode pointerThrough', () => {
   });
 });
 
+// ── swallowClicks (#728) ──
+// "Stop the tap here, but I am not a button" — split out of `isInteractive` so a container can
+// consume a click without paying for a fake button binding (the click cue + the 300ms input lock).
+describe('UINode swallowClicks (#728)', () => {
+  it('takes the pointer so it can receive the click at all', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.style.pointerEvents).toBe('auto');
+  });
+
+  it('does NOT show a pointer cursor — it is not a button', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.style.cursor).not.toBe('pointer');
+  });
+
+  it('is stamped with the press-origin marker, so #664 protects it too', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.hasAttribute(UI_PRESS_ORIGIN_ATTR)).toBe(true);
+  });
+
+  it('a real click binding alongside swallowClicks still gets the pointer cursor AND still runs — redundant, not lost', () => {
+    // The combination is not a trap like pointerThrough+swallowClicks: an interactive node's
+    // handler already calls stopPropagation unconditionally before anything else, so the tap is
+    // swallowed either way. `swallowClicks` here asks for nothing the binding doesn't already do.
+    const node = makeNode({
+      swallowClicks: true,
+      action: { bindings: [{ event: 'click', kind: 'call', action: 'x' }] },
+    } as Partial<UINodeData>);
+    const el = renderNode(node);
+    expect(el.style.cursor).toBe('pointer');
+    fireEvent.click(el);
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'click', { selfGuid: 'g1' });
+  });
+
+  it('pointerThrough wins when both are authored — that combination is an authoring error', () => {
+    const el = renderNode(makeNode({ swallowClicks: true, pointerThrough: true }));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('pointerThrough wins for a click STARTING ON A DESCENDANT too — the half CSS cannot express', () => {
+    // ⚠️ The assertion above is true under BOTH hypotheses and therefore proves nothing on its
+    // own: `pointer-events: none` is set by the `pointerThrough` block either way. This is the
+    // distinguishing observation, and until #728's close-out it FAILED.
+    //
+    // `pointer-events: none` stops the band being hit-tested; it does not take the band out of
+    // the event path of a click that starts on a descendant with `auto` — exactly the shape
+    // `pointerThrough` is FOR (a decorative panel over something that must stay tappable). So the
+    // band's React onClick still fires for that click, and an ungated swallow would stop it.
+    const onBehind = vi.fn();
+    const child = makeNode({ entityId: 2, guid: 'g2', overflow: 'scroll' });
+    const band = makeNode({ pointerThrough: true, swallowClicks: true, children: [child] });
+    const { container } = render(
+      <div onClick={onBehind}>
+        <UINode node={band} storeState={{}} />
+      </div>,
+    );
+    const bandEl = container.querySelector('[data-entity-id="1"]') as HTMLElement;
+    const childEl = container.querySelector('[data-entity-id="2"]') as HTMLElement;
+    expect(bandEl.style.pointerEvents, 'fixture: the band is transparent').toBe('none');
+    expect(childEl.style.pointerEvents, 'fixture: a scroll child is forced back to auto').toBe('auto');
+
+    fireEvent.click(childEl);
+
+    expect(onBehind, 'the band must NOT swallow a click that began on its auto descendant — '
+      + 'that is the pointer-blocker passthrough bug pointerThrough exists to prevent')
+      .toHaveBeenCalledTimes(1);
+    expect(bandEl.hasAttribute(UI_PRESS_ORIGIN_ATTR),
+      'and it must not become a press-origin boundary either — a press starting inside it and '
+      + 'released on a real interactive ancestor would make pressBelongsTo(ancestor) false and '
+      + 'silently kill that ancestor\'s binding').toBe(false);
+  });
+
+  it('clicking it does NOT call applyBindings — a swallow is not a button', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('stops the click from reaching an ancestor', () => {
+    const onAncestorClick = vi.fn();
+    const node = makeNode({ swallowClicks: true });
+    const { container } = render(
+      <div onClick={onAncestorClick}>
+        <UINode node={node} storeState={{}} />
+      </div>,
+    );
+    const el = container.querySelector('[data-entity-id]') as HTMLElement;
+    fireEvent.click(el);
+    expect(onAncestorClick).not.toHaveBeenCalled();
+  });
+
+  it('clears the press-origin pair on click — a pure swallow stops propagation WITHOUT consulting pressBelongsTo, so it must clear the pair itself (mirrors pressOrigin.test.ts\'s #defect-B)', () => {
+    const dispose = installPressOriginTracking(document);
+    try {
+      // renderNode already mounts into a container RTL appends to document.body, so `el` is
+      // already reachable from document-level listeners without moving it there.
+      const el = renderNode(makeNode({ swallowClicks: true }));
+      // A real press+release landing on the swallow node.
+      el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, pointerId: 1 }));
+      el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, isPrimary: true, pointerId: 1 }));
+      fireEvent.click(el);
+      // If the pair were left uncleared, it would sit there for a LATER, unrelated click to
+      // misread. Consult pressBelongsTo against an unrelated element with no new pointer events:
+      // cleared → fails open (true); left dangling → the stale pair's closest() lookup misses
+      // this unrelated element and wrongly reports false.
+      const unrelated = document.createElement('div');
+      document.body.appendChild(unrelated);
+      expect(pressBelongsTo(unrelated)).toBe(true);
+      unrelated.remove();
+    } finally {
+      dispose();
+    }
+  });
+});
+
 // ── gapUnit ──
 // `gap` was the only length on UIElement with no unit. A wrap-based grid whose ITEMS scale (vh)
 // while its GAPS do not has a viewport size below which an item silently reflows onto the next
@@ -417,11 +533,10 @@ describe('UINode text rendering', () => {
     expect(clamp!.style.overflow).toBe('hidden');
     expect(clamp!.style.whiteSpace).toBe('nowrap');
     expect(clamp!.style.textOverflow).toBe('ellipsis');
-    // Load-bearing (see the code comment): the wrapper is a flex item, and a flex item's default
-    // `min-width: auto` resolves to its min-content size — for `nowrap` text that's the ENTIRE
-    // line — so without this a `row` host (or any non-stretch cross axis) could never shrink
-    // below that and would overflow instead of ellipsizing.
-    expect(clamp!.style.minWidth).toBe('0px');
+    // The wrapper must be able to STRETCH to fill the host for the ellipsis to ever engage
+    // (`shrinkWrapAlign` must not be spread in here — see the code comment) — `maxWidth: 100%`
+    // caps it even when the host authors a non-stretch `alignItems`.
+    expect(clamp!.style.maxWidth).toBe('100%');
   });
 
   it('single-line ellipsis (#725): the wrapper style is identical in a row host, where the bug bit', () => {
@@ -433,7 +548,7 @@ describe('UINode text rendering', () => {
       text: 'long', textOverflow: 'ellipsis', maxLines: 0, flexDirection: 'row',
     }));
     const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
-    expect(clamp!.style.minWidth).toBe('0px');
+    expect(clamp!.style.maxWidth).toBe('100%');
     expect(clamp!.style.textOverflow).toBe('ellipsis');
   });
 

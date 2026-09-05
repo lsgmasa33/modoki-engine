@@ -48,7 +48,8 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
   `overflow`
   (`visible | hidden | scroll`), `scrollbarStyle` (`auto | tinted | hidden`) with
-  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below).
+  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below),
+  `swallowClicks` (see below).
 
   **The scrollbar skin is `scrollbar-color` + `scrollbar-width` and nothing else**, because these
   are INLINE styles and `::-webkit-scrollbar` is a pseudo-element that cannot be written inline at
@@ -191,7 +192,9 @@ Field groups (representative fields, verified against `UIElement.ts`):
   both when `maxLines > 0` (the clamp wrapper below) and on a SINGLE-LINE element (`maxLines: 0`):
   `text-overflow` does not apply to the flex container the host always is, so the same wrapper the
   clamp uses is mounted for a single-line `ellipsis` too, carrying `overflow`/`text-overflow`/
-  `white-space` instead of the host (#725)), `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
+  `white-space` instead of the host (#725)) — **but NOT unconditionally: it stays inert on a
+  single-line element that also carries `autoFitText` or a `textAnim`** (see the residual-gap
+  callout below) — `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
 
   ⚠️ **`autoFitText` is SHRINK-ONLY (#614)** — off by default; when on, the effective font size is
   reduced, never grown past the authored `fontSize`, until the text fits its box on one line, down
@@ -211,14 +214,38 @@ Field groups (representative fields, verified against `UIElement.ts`):
   a tooltip" class, and #646 is what took it from theoretical to reachable by making the clamp
   actually engage. `UINode.tsx` now builds a `clampStyle` and mounts a wrapper `<div>` around the
   text — **only when `maxLines > 0`, or when `maxLines === 0` and `textOverflow === 'ellipsis'`
-  (#725)** — so every other text node keeps byte-identical DOM. `minWidth: 0` is part of the
-  single-line `clampStyle` for the same reason #657 needed it one element over: the wrapper is a
-  flex ITEM, and a flex item's default `min-width: auto` resolves to its min-content size — for
-  `white-space: nowrap` text that's the ENTIRE line — so without it a `row` host (or any
-  non-stretch cross axis) could never shrink below that and would overflow instead of ellipsizing.
-  The wrapper carries `UI_PAINT_ATTR`: `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an
-  entity with paint via a DIRECT text-node child, and without the marker a clamped label would
-  read as decorative and a SceneView click would fall through it.
+  (#725)** — so every other text node keeps byte-identical DOM. The wrapper carries `UI_PAINT_ATTR`:
+  `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an entity with paint via a DIRECT
+  text-node child, and without the marker a clamped label would read as decorative and a SceneView
+  click would fall through it.
+
+  ⚠️ **The single-line `ellipsis` wrapper must STRETCH to fill the host, not shrink-wrap (#727
+  fixup).** A flex item stops stretching the moment either cross-axis margin is `auto` (CSS
+  Flexbox §8.3), so a `shrinkWrapAlign(node.textAlign)` spread on this wrapper — which returns
+  exactly such a margin for `center`/`right` — disables the very stretch the ellipsis needs, and
+  the wrapper falls back to fit-content: for `white-space: nowrap` text that is the WHOLE line,
+  spilling past the host uncropped (`overflow: hidden` lives on the wrapper, not the host).
+  Measured live (120px host, 24px text, `textAlign: 'center'`): 345.1px wide, no ellipsis, 225px of
+  overflow. `text-align` still inherits onto a stretched block, so alignment survives dropping the
+  spread; `maxWidth: '100%'` additionally caps the wrapper against a host authoring a non-stretch
+  `alignItems`. The `maxLines > 0` clamp wrapper above keeps `shrinkWrapAlign` — it WRAPS, so its
+  fit-content collapses to the available width and the auto margin is harmless there; this is a
+  `nowrap`-only difference, not an inconsistency to "fix" by symmetry.
+
+  ⚠️ **`minWidth: 0` on the single-line `clampStyle` was believed load-bearing and was a no-op
+  (#727 review).** `clampStyle` always carries `overflow: hidden`, which makes the wrapper a SCROLL
+  CONTAINER — and a scroll container's automatic minimum size is already 0 (CSS Flexbox §4.5), so
+  `min-width: auto` never entered the picture. Measured both ways in a row host: wrapper 120,
+  scrollWidth 345, ellipsizes — identical. Removed; the shrink is entirely explained by the
+  scroll-container minimum.
+
+  ⚠️ **Known residual gap, not fixed:** single-line `ellipsis` stays inert when the node also
+  carries `autoFitText` or a `textAnim`. Either wraps the text in a span authored `display: block;
+  white-space: pre-wrap` (`AutoFitText`/`AnimatedText`), and that inner `pre-wrap` overrides this
+  wrapper's `nowrap` — `text-overflow` only ellipsizes inline content laid out directly in the
+  block container, not a nested block's overflow. Measured: a bare string ellipsizes at 28px (one
+  line); the same text through either wrapper renders 84px (three wrapped lines, no ellipsis).
+  Confirmed not a regression of #725/#727 — it measured 84px before either change too.
 
   ⚠️ **`textOverflow: 'clip'` — the field's DEFAULT — is honoured by a HEIGHT CAP, not by
   line-clamp (#656).** `-webkit-line-clamp` paints its own ellipsis unconditionally and never
@@ -245,12 +272,19 @@ Field groups (representative fields, verified against `UIElement.ts`):
   |---|---|---|
   | `lineHeight` set | `lineHeight × maxLines` px, on the wrapper | a px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall whatever the font does |
   | no `lineHeight`, no `autoFitText` | `${maxLines}lh`, on the wrapper | nothing below changes the font, so `lh` is exact |
-  | no `lineHeight` + `autoFitText` | `${maxLines}lh`, on `AutoFitText`'s own span (`clampLines` prop) | `lh` there resolves against the size `fit()` actually wrote — exact whatever the shrink lands on, and `clip` is honoured instead of falling back to an unwanted ellipsis (#727) |
+  | no `lineHeight` + `autoFitText` | `${maxLines}lh`, on `AutoFitText`'s own span (`clampLines` prop) | `lh` there resolves against the size `fit()` actually wrote — exact whatever the shrink lands on, and `clip` is honoured instead of falling back to an unwanted ellipsis (#727) — **but #727 traded away the `-webkit-line-clamp` fallback this row used to fall back to: pre-#727 it silently accepted the unwanted ellipsis on a browser too old for `lh`, which worked everywhere WebKit/Blink ships; post-#727 there is no fallback at all, so the `lh`/Safari-16.4 caveat below now covers TWO of these three rows, not one |
 
   ⚠️ `lh` needs Safari 16.4, *exactly* this repo's iOS floor — and note **Android WebView's version
   is independent of the OS floor**, so an in-support Android device on a stale WebView can miss it.
   Below it the declaration is dropped and the text renders unclamped: more text than asked for,
   never a sliver. `-webkit-line-clamp`, which this replaced for the default, goes back to Chrome 6.
+
+  ⚠️ `maxLines: 1` + `clip` + `autoFitText` + a vertical `textAnim` (bounce/wave/jitter) has less
+  travel room than before #727: the old `-webkit-line-clamp` box was one line box at the AUTHORED
+  size (~48px) around shrunk content (~18px), leaving ~30px of slack the animation's translate
+  lived in; the exact `${clampLines}lh` cap on the shrunk span removes that slack, so the animation
+  is now clipped by `overflow: hidden` at the shrunk size — the same cost the non-autoFit `lh` row
+  already pays.
 
   ⚠️ **`maxLines` clamps LINE BOXES only — a `display: inline-block` text child defeats it
   (#646).** The wrapper's `-webkit-box` is Chromium's legacy clamp mechanism, which only splits
@@ -422,12 +456,14 @@ no descendant handler is invoked at all and there is nothing to stop the bubble 
 activation is never suppressed; controller/keyboard activation does not reach it either way,
 because `focusManager` calls `applyBindings` directly rather than through a DOM click.
 ⚠️ **It protects a panel only where that panel is ALREADY interactive.** The marker goes on nodes
-with a click binding, so a panel carrying none is transparent to `closest()` and the press resolves
-past it to the dismissing scrim. wordweave's dictionary is covered only because its no-op
-`dictionaryPanelSwallow` made the panel interactive; authoring a swallow is what OPTS a panel in.
-Court's `StorePanel` is now covered (it authors `court.storePanelSwallow`); its remaining card
-dialogs — `RulesPanel` and others — still carry none and remain uncovered (#722). Stamping the
-marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
+with a click binding **or `UIElement.swallowClicks`** (#728), so a panel carrying neither is
+transparent to `closest()` and the press resolves past it to the dismissing scrim. Authoring a
+swallow — either way — is what OPTS a panel in. ⚠️ **Which panels are covered is a property, not a
+roster**: it is whatever carries a binding or `swallowClicks` right now, and a grep for
+`swallowClicks` across the scenes answers it — an enumeration here went stale the same day #728
+landed. The eight dialog bodies tracked in #729 are the known uncovered group (#722's swallow half).
+Stamping
+the marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
 empty list space does — a feel call, not a refactor.
 
 #### Engine built-in `UIAction`s
@@ -990,6 +1026,30 @@ tap-catcher. Being a container (and a `scroll` one) it swallowed every tap meant
 putting the catcher on top instead buried Skip inside the band's stacking context and made it
 silently unclickable. Neither ordering works, because the two controls need opposite answers —
 `pointerThrough` is what breaks the tie.
+
+#### `swallowClicks` — its opposite number
+
+`UIElement.swallowClicks` (#728) is the same *kind* of field pointing the other way: where
+`pointerThrough` says "let taps through to what is behind me", `swallowClicks` says "**stop the tap
+here, but I am not a button**" — the shape the structural rules equally cannot express, because the
+only way to consume a tap used to be to author a click binding, and that makes the node a button.
+
+The rule it is defined by, rather than a list of the panels using it: **any container that must
+consume a tap it has no behaviour for** — canonically a modal card whose scrim dismisses on tap,
+where without it a tap on the card's own text falls through and closes the dialog.
+
+The full treatment — what it costs to hand-roll instead, why the node must also be stamped as a
+press origin, and the two authoring combinations — is in
+[§ Dialog dismissal](#dialog-dismissal--the-house-rule-for-every-game), which owns this fact. The
+two rules worth having here, next to its sibling:
+
+- **`pointerThrough` WINS if both are authored** — it sets `pointer-events: none` later in the
+  cascade, so no handler on the node can run and `swallowClicks` is silently inert. That
+  combination is an authoring error, not a meaning.
+- **A real click binding alongside it is REDUNDANT, not lost.** An interactive node's handler
+  already calls `stopPropagation()` unconditionally, so the tap is stopped either way; the binding
+  still runs and the cursor stays `pointer`. `swallowClicks` means precisely "swallow *even though
+  I have no binding of my own*".
 
 `UINode` (`runtime/ui/UINode.tsx`) translates one `UINodeData` into a styled DOM
 element, applying the trait fields in order (layout → box style → image → text →
@@ -2333,16 +2393,22 @@ part the engine cannot yet express cleanly: see the gap below before you author 
 
 ### Why a dialog body dismisses today, if nothing is done about it
 
-`UINode.tsx` treats a node as interactive only if it carries a click binding:
+`UINode.tsx` treats a node as interactive only if it carries a click binding — `isInteractive` is
+unchanged by #728 — but a SEPARATE flag now also earns the same click plumbing:
 
 ```ts
 const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
+const swallowsClicks = node.swallowClicks === true;
+const takesClick = isInteractive || swallowsClicks;
 ```
 
-Only an interactive node gets `e.stopPropagation()` in its click handler, and only an interactive
-node is stamped as a press origin for the #664 gate. So a panel with no `UIAction` is *transparent*:
-a tap on the dialog body bubbles to the scrim behind it and triggers the scrim's dismiss. Authoring
-the panel with no binding is not "no behaviour" — it is "the scrim's behaviour".
+`e.stopPropagation()` in the click handler, and the #664 press-origin stamp, now key off
+`takesClick`, not `isInteractive` alone — so a node with `UIElement.swallowClicks` gets both
+without carrying any `UIAction` binding at all (and without the finger cursor, the click cue, or the
+input lock `isInteractive` also implies — see the next section). A panel with **neither** a
+`UIAction` **nor** `swallowClicks` is still *transparent*: a tap on the dialog body bubbles to the
+scrim behind it and triggers the scrim's dismiss. Authoring the panel with neither is not "no
+behaviour" — it is "the scrim's behaviour".
 
 ⚠️ **Both halves are needed, and neither is sufficient alone** (measured live in wordweave, #662/#664):
 - a **swallow** on the panel body fixes the plain TAP;
@@ -2350,19 +2416,21 @@ the panel with no binding is not "no behaviour" — it is "the scrim's behaviour
   panel and releases on the scrim — the browser resolves that click to the common ancestor, so the
   panel's own handler never runs and a swallow cannot see it.
 
-### ⚠️ The gap — do not hand-roll the swallow (#728)
+### The swallow is `UIElement.swallowClicks` — do not hand-roll it (#728)
 
-The only way to make a container swallow a tap today is to give it a no-op `call` binding, and
+**The gap this section used to describe is CLOSED.** `UIElement.swallowClicks` is the supported way
+to make a container swallow a tap without being a button: it stops propagation and stamps the press
+origin directly, with no `UIAction` binding at all.
+
+The retired workaround — giving the container a no-op `call` binding — should not be authored
+anymore, and the reason it was bad is worth keeping even though the workaround itself is gone:
 `bindings.ts` charges every discrete activation the same way whether or not the handler does
-anything: it takes the global input lock (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`, 300 ms) and fires
-the click cue. So a hand-rolled swallow makes **the middle of a dialog play the button click sound**,
-and swallows the next discrete tap for 300 ms — a control tapped straight after the body reads as
-dead.
-
-**#728 tracks the fix**: a first-class `UIElement.swallowClicks` that stops propagation and stamps
-the press origin *without* routing through `applyBindings`. Prefer waiting for it over adding a
-tenth no-op action. Sliders are not affected either way — a range drag is `continuous` and takes
-neither the lock nor the cue.
+anything, so a no-op binding took the global input lock (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`,
+300 ms) and fired the click cue for nothing. A hand-rolled swallow made **the middle of a dialog
+play the button click sound**, and swallowed the next discrete tap for 300 ms — a control tapped
+straight after the body read as dead. `swallowClicks` takes neither the lock nor the cue, because it
+never routes through `applyBindings`. Sliders are unaffected either way — a range drag is
+`continuous` and takes neither the lock nor the cue.
 
 ## Quick reference
 

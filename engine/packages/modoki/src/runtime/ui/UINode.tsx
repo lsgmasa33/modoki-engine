@@ -138,10 +138,10 @@ function contentWidthOf(elem: HTMLElement): number {
  *  past the authored `fontSize`, until the text fits its box on one line, down to `fontSizeMin`.
  *  Same `React.memo`-on-primitives reason as `AnimatedText` above: the game UI re-renders every
  *  frame, and an un-memoized layout read here would force a reflow per frame. Memoized on
- *  `fontSize`/`fontSizeMin`/`text`/`children` (React.memo shallow-compares every prop, so
- *  `children`'s identity still matters here even though `fit()` itself never keys off it — see
- *  `text` below), so a per-frame re-render that changes none of these bails out before `fit()`
- *  is even considered.
+ *  `fontSize`/`fontSizeMin`/`text`/`children`/`clampLines` (React.memo shallow-compares every
+ *  prop, so `children`'s identity still matters here even though `fit()` itself never keys off
+ *  it — see `text` below), so a per-frame re-render that changes none of these bails out before
+ *  `fit()` is even considered.
  *
  *  `fit()` re-runs on: a `fontSize`/`fontSizeMin`/`text` prop change (its own `useCallback`
  *  deps); the parent's box actually resizing (`ResizeObserver`, guarded against the write
@@ -199,9 +199,10 @@ const AutoFitText = React.memo(function AutoFitText(
     el.style.whiteSpace = 'nowrap';
     // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on every node BY DEFAULT, so this
     // span (its own authored `display: block`, #646) is virtually always a FLEX ITEM of its
-    // parent, never a normal block box in flow. (Since #655 a clamped node puts a wrapper between
-    // this span and the host — so the parent is then that BLOCK wrapper rather than the flex
-    // host. The scaffold below is still required: the stretch case is the common one, and a
+    // parent, never a normal block box in flow. (Since #655 a clamped node — and, since #725/#727,
+    // a single-line `textOverflow: 'ellipsis'` node too — puts a wrapper between this span and the
+    // host, so the parent is then that BLOCK wrapper rather than the flex host. The scaffold below
+    // is still required: the stretch case is the common one, and a
     // `max-content` width is correct in both.) The default `align-items:
     // stretch` then stretches a flex item's cross size to the parent's — so WITHOUT this line,
     // the span's measured width reads the parent's AVAILABLE width, not the span's natural
@@ -750,26 +751,54 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // nothing while every other ellipsis field (`overflow`, `whiteSpace`) kept reading back
       // from `getComputedStyle` as set — the same "lie with a tooltip" class as #656.
       //
-      // `minWidth: 0` is load-bearing, not a stray reset. The wrapper mounted below is a FLEX
-      // ITEM of the host. A flex item's default `min-width: auto` resolves to its MIN-CONTENT
-      // size, which for `white-space: nowrap` text is the text's entire natural width — so in a
-      // `row` host (or any non-stretch cross axis) the item could never shrink below that, and
-      // would overflow its box instead of ellipsizing. The default `column` host with
-      // `alignItems: 'stretch'` already fills the box width regardless, which is why this bug
-      // shipped invisibly: nothing authors `row` + single-line `ellipsis` today, so the failing
-      // axis was never exercised. `shrinkWrapAlign` only ever returns margins, never `alignSelf`
-      // (see its own header), so it composes safely with this.
+      // ⚠️ Do NOT spread `shrinkWrapAlign(node.textAlign)` in here (it was here briefly, #725→#727
+      // fixup). `align-items: stretch` — the DEFAULT `alignItems` on every host — only applies when
+      // NEITHER cross-axis margin is `auto` (CSS Flexbox §8.3), and `shrinkWrapAlign('center'|'right')`
+      // returns exactly such a margin. With it present the wrapper falls back to fit-content, which
+      // for `white-space: nowrap` text is the ENTIRE line — i.e. it disables the very stretch the
+      // ellipsis needs to ever engage, and does so worse than having no fix at all, since `overflow:
+      // hidden` lives on this wrapper, not the host: the un-stretched line spills past the host
+      // uncropped. Measured live (Chromium, 120px host, 24px text, `textAlign: 'center'`): wrapper
+      // 345.1px wide, no ellipsis, 225px of overflow outside the host. Removing the spread and
+      // stretching the wrapper full-width is not a loss of alignment — `text-align` inherits onto a
+      // stretched block and centres/right-aligns the text exactly as before, just without shrinking
+      // the box around it. (This is a `nowrap`-only difference from the `maxLines > 0` clamp branch
+      // above, which keeps `shrinkWrapAlign` — that wrapper WRAPS, so its fit-content collapses to
+      // the available width and the auto margin is harmless there. Don't re-add it here "for
+      // symmetry" with that branch.)
+      //
+      // `maxWidth: '100%'` is the second half of the fix: it caps the wrapper even when the HOST
+      // authors a non-stretch `alignItems` (e.g. `flex-start`), which would otherwise reproduce the
+      // same shrink-wrap-to-the-whole-line spill by a different route (no auto margin needed — a
+      // flex item with `align-items` other than `stretch` just never gets a cross-size in the first
+      // place).
       //
       // Zero blast radius today: no `games/**`/`demos/**` entity authors `textOverflow: 'ellipsis'`
       // with `maxLines: 0` — the only authored instances (`e2e-smoke.scene.json`) all set
-      // `maxLines: 1` and already go through the `maxLines > 0` branch above.
+      // `maxLines: 1` and already go through the `maxLines > 0` branch above. Unlike the #725 zero-
+      // blast-radius note this replaces, nothing GUARDS that this stays true — it is today's fact,
+      // not a standing invariant a test enforces.
+      //
+      // `minWidth: 0` was here too and was a no-op, not load-bearing (#727 review): `clampStyle`
+      // always carries `overflow: hidden`, which makes this a SCROLL CONTAINER, and a scroll
+      // container's automatic minimum size is already 0 (CSS Flexbox §4.5) — `min-width: auto`
+      // never entered the picture. Measured both ways in a row host: wrapper 120, scrollWidth 345,
+      // ellipsizes — identical. Left out; don't re-add it thinking it does something.
+      //
+      // ⚠️ KNOWN RESIDUAL GAP, not fixed here: this stays inert when the node ALSO has
+      // `autoFitText` or `textAnim`. Either wraps `textContent` in a span authored
+      // `display: block; white-space: pre-wrap` (`AutoFitText`/`AnimatedText` above), and that
+      // span's own `pre-wrap` overrides this wrapper's `nowrap` — `text-overflow` only ellipsizes
+      // inline content laid out directly in the block container, not a nested block's overflow.
+      // Measured: a bare string ellipsizes at 28px (one line); the same text through either wrapper
+      // renders 84px (three wrapped lines, no ellipsis). Confirmed NOT a regression of this fix —
+      // it measured 84px before this change too. No code fix attempted; see `docs/ui-system.md`.
       clampStyle = {
         display: 'block',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         whiteSpace: 'nowrap',
-        minWidth: 0,
-        ...shrinkWrapAlign(node.textAlign),
+        maxWidth: '100%',
       };
     }
   }
@@ -844,6 +873,25 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // A button is interactive if it dispatches an action OR applies declarative
   // bindings — any click-event binding (set write or call action).
   const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
+  // #728 — an author's explicit "consume a tap that lands here, but I am NOT a button". Kept
+  // separate from `isInteractive` on purpose: a swallow takes the pointer and stops the bubble,
+  // but it must not paint a finger cursor, must not run bindings, and so must not fire the click
+  // cue or take the input lock — which is the whole reason the field exists.
+  //
+  // ⚠️ `&& !node.pointerThrough` is load-bearing, and it is here rather than in the style cascade
+  // below because CSS cannot express it. `pointer-events: none` stops this node being HIT-TESTED;
+  // it does NOT remove it from the event path of a click that starts on a descendant with `auto`
+  // — which is the case `pointerThrough`'s own doc advertises ("a decorative panel that still
+  // holds a working button"). So a React `onClick` on a `pointer-events: none` node still fires
+  // for such a click, and without this gate a band authored with BOTH fields swallowed every tap
+  // that began on a Canvas2D mount or a scroll box inside it, never reaching what the band was
+  // supposed to be transparent to. MEASURED, not reasoned: with the gate removed, a
+  // `pointerThrough` band holding one `overflow:'scroll'` child received the child's click and
+  // stopped it dead (ancestor handler calls: 0). That is the pointer-blocker passthrough bug
+  // `pointerThrough` exists to prevent. The docs claimed `pointerThrough` won here long before
+  // the code did — see #728's close-out.
+  const swallowsClicks = node.swallowClicks === true && !node.pointerThrough;
+  const takesClick = isInteractive || swallowsClicks;
 
   // In editor mode, skip click handler on canvas2D containers — they're just mount points,
   // not something worth selecting. Let clicks pass through to children.
@@ -851,9 +899,18 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     ? node.canvas2D
       ? undefined
       : (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
-    : isInteractive
+    : takesClick
       ? (e: React.MouseEvent) => {
           e.stopPropagation();
+          if (!isInteractive) {
+            // A pure swallow (#728) stops propagation WITHOUT consulting `pressBelongsTo` — see
+            // pressOrigin.ts's "The rule for a handler that swallows a click": left uncleared,
+            // React's synthetic stopPropagation also stops the native event at the React root, so
+            // the document-level sweep never runs and the pair survives to be misread by a later
+            // click. Same contract as the text-input/range/toggle branches below.
+            clearPressOrigin();
+            return;
+          }
           // #664 — a press that started on a descendant control and released past this node
           // (a horizontal swipe outrunning a panel's edge, say) must not fire this node's
           // bindings just because the browser resolved the click to this common ancestor. See
@@ -870,6 +927,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   } else if (isInteractive) {
     style.pointerEvents = 'auto';
     style.cursor = 'pointer';
+  } else if (swallowsClicks) {
+    // A pure swallow still needs the pointer to receive the click at all (a container otherwise
+    // left at its structural default), but it is not a button — no cursor. `pointerThrough`
+    // below runs AFTER this and still wins if both are authored.
+    style.pointerEvents = 'auto';
   } else if (node.children.length === 0) {
     // Only disable pointer events on leaf nodes (containers must pass events to children)
     style.pointerEvents = 'none';
@@ -1231,7 +1293,14 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
-      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(isInteractive ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+      // `takesClick`, not `isInteractive` (#728) — a `swallowClicks` node must ALSO get the
+      // press-origin marker below. If it didn't, the TAP case would still look fixed
+      // (propagation stops, the panel doesn't dismiss — a tap test passes), but the DRAG case
+      // would silently regress to #664: a press starting on this panel and released on the scrim
+      // resolves past the unstamped panel to the scrim, `pressBelongsTo` returns true (fail-open,
+      // nothing recorded belongs to the panel), and the dialog dismisses. See pressOrigin.ts's
+      // "⚠️ LIMIT" section — the gate only protects nodes carrying the marker.
+      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -1291,7 +1360,8 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   }
 
   return (
-    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(isInteractive ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+    // `takesClick`, not `isInteractive` — see the canvas2D return above for why (#728).
+    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}

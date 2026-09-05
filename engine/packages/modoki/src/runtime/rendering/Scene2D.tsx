@@ -118,19 +118,28 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // Material slots (kind 'material'): obj is a Mesh (quad geometry + a per-entity
   // pixiShaderBuilder Shader) sampling the entity's OWN sprite bitmap as `uTexture`
   // (or Texture.WHITE when it has no sprite). `matGuid` is the bound 2D-material GUID;
-  // `matSig` gates a rebuild (size/pivot AND the resolved sprite-texture url, so the
-  // Mesh re-mints with the real texture the frame it lands). `textureUrl` holds the
-  // retained sprite url (shared spriteTextureRefs — released in disposeSlot). The shader
-  // is also registered in Scene2DRenderer.entityShaders for MaterialInstance driving.
+  // `matBuildSig` gates a full Mesh+Shader+Geometry rebuild (the resolved sprite-texture url and
+  // the extra-sampler set — see `matBuildSig` at its use site). `matQuadSig` gates a cheaper
+  // in-place resize of just the quad's 8 position floats (size/pivot only, #692) — split from
+  // `matBuildSig` because a Shader rebuild adds two permanent entries to WebGPU's
+  // `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707), so an
+  // animated size must never force one. `textureUrl` holds the retained sprite url (shared
+  // spriteTextureRefs — released in disposeSlot). The shader is also registered in
+  // Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
   // (additional samplers) — each retained on build + released in disposeSlot, like textureUrl.
   // `matSpriteRef` is the SAMPLED sprite ref (`spriteRef` is taken — it holds the material GUID
-  // on this kind). It is deliberately NOT in `matSig`, so an atlas frame swap within one sheet
-  // shows up as "sig equal, ref moved" and takes the one-uniform fast path instead of a full
+  // on this kind). It is deliberately NOT in `matBuildSig`, so an atlas frame swap within one
+  // sheet shows up as "sig equal, ref moved" and takes the one-uniform fast path instead of a full
   // Mesh+Shader+Geometry rebuild (#698). `builtEpoch` tracks the sampled sprite's re-slice epoch
   // here (the sprite path's meaning), so re-slicing the sheet invalidates the slot even when the
   // url is unchanged.
-  matShader?: Shader; matGuid?: string; matSig?: string; materialTexUrls?: string[]; matSpriteRef?: string }
+  matShader?: Shader; matGuid?: string; matBuildSig?: string; matQuadSig?: string; materialTexUrls?: string[]; matSpriteRef?: string;
+  // 'graphics' slots only (#684): the last geometry signature ISSUED into this Graphics. Lives on
+  // the SLOT, not on the `lastRender` snapshot, because slot lifetime === Graphics lifetime — a
+  // freshly built or rebuilt slot has `geomSig === undefined` and therefore always draws, with no
+  // dependence on whichever rebuild path created it.
+  geomSig?: string }
 
 // ── SHARED texture refcount (global — tracks the global Assets cache) ──
 // Per-URL refcount for PixiJS Assets. When the last sprite using a URL is
@@ -274,18 +283,38 @@ function makeGraphics(container: Container): Graphics {
   return g;
 }
 
+/** The 8 position floats of a material quad (two triangles, top-left origin at the pivot),
+ *  written into `out`. The ONE derivation shared by {@link buildMaterialQuad} and
+ *  {@link resizeMaterialQuad} — a second copy would drift the moment a pivot rule changes. */
+function writeMaterialQuadPositions(out: Float32Array, w: number, h: number, px: number, py: number): void {
+  const { ox, oy } = computePivotOffset(w, h, px, py); // top-left corner in local space
+  const x0 = ox, y0 = oy, x1 = ox + w * 2, y1 = oy + h * 2;
+  out[0] = x0; out[1] = y0; out[2] = x1; out[3] = y0; out[4] = x1; out[5] = y1; out[6] = x0; out[7] = y1;
+}
+
 /** A pivot-offset quad (two triangles) sized to a Renderable2D's width/height, with
  *  0..1 UVs — the geometry a 2D-material Mesh is drawn on. Matches the primitive
  *  convention (width/height are half-extents; full size is ×2), so a material quad
  *  lines up with the same entity rendered as a primitive. */
 export function buildMaterialQuad(w: number, h: number, px: number, py: number): MeshGeometry {
-  const { ox, oy } = computePivotOffset(w, h, px, py); // top-left corner in local space
-  const x0 = ox, y0 = oy, x1 = ox + w * 2, y1 = oy + h * 2;
+  const positions = new Float32Array(8);
+  writeMaterialQuadPositions(positions, w, h, px, py);
   return new MeshGeometry({
-    positions: new Float32Array([x0, y0, x1, y0, x1, y1, x0, y1]),
+    positions,
     uvs: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
     indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
   });
+}
+
+/** Resize an EXISTING material quad in place (#692). Only the 8 position floats move: the uvs,
+ *  the indices, the texture bindings and the shader are all independent of the quad's size, so a
+ *  size/pivot edit never needs a new Mesh — and never needs a new Shader, which is the part that
+ *  matters, because every Shader rebuild adds two permanent entries to WebGPU's
+ *  `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707).
+ *  Same in-place shape the skinned-mesh deform and the text animation passes already use. */
+export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: number, py: number): void {
+  writeMaterialQuadPositions(geo.positions as Float32Array, w, h, px, py);
+  geo.getBuffer('aPosition').update();
 }
 
 /** Build the per-slot texture for a sprite: the base texture for a whole image, or a
@@ -749,6 +778,13 @@ export class Scene2DRenderer {
   // ── Collider debug overlay (editor-only) ──
   private readonly colliderOverlays = new Map<number, Graphics>();
   private _showColliders = false;
+  // Whether the collider overlays currently hold any drawn outline (#684). `Graphics.clear()` is
+  // NEVER free — `GraphicsContext.clear()` has no empty early-out, it unconditionally calls
+  // `onUpdate()` (dirty = true + emit 'update'), which is exactly the view change that forces a
+  // full instruction rebuild of the whole render group. So clearing an ALREADY-EMPTY overlay
+  // re-batched every canvas that had ever shown colliders, on EVERY frame, for the rest of the
+  // session — with the display switched OFF, which is when it cost the most and helped least.
+  private _colliderOverlaysDrawn = false;
   // Collider-ONLY mode: sprites hide entirely and every Collider2D outline draws (in purple),
   // regardless of `_showColliders` — the 2D counterpart of the 3D SceneView's collider-only
   // toggle. Implies `_showColliders` is effectively on too (see isShowColliders()/drawColliderOverlays).
@@ -900,8 +936,23 @@ export class Scene2DRenderer {
       // ref that later resolves, or vice versa). Neither is folded into `stillPlaceholder` —
       // that only covers an in-flight ASYNC load of an already-resolved sprite — so without this
       // a re-slice or a fixed/broken ref would never trigger a rebuild (round 2, Fix 2).
-      const texSig = d.mode === 'texture' ? `${getSpriteEpoch(d.sprite)}|${resolveSprite(d.sprite) ? 1 : 0}` : '';
-      const sig = `${d.mode}|${d.width}|${d.height}|${d.pivotX}|${d.pivotY}|${d.cornerRadius}|${d.feather}|${d.sprite}|${texSig}`;
+      const texResolves = d.mode === 'texture' && !!resolveSprite(d.sprite);
+      const texSig = d.mode === 'texture' ? `${getSpriteEpoch(d.sprite)}|${texResolves ? 1 : 0}` : '';
+      // #692 — WHERE the size lands decides whether a resize needs a rebuild at all:
+      //  · stencil (`rect`, feather 0): baked into the geometry — `roundRect(ox, oy, w*2, h*2, r)`
+      //    with an ABSOLUTE `cornerRadius` clamped to `min(w,h)`, so a resize genuinely changes the
+      //    shape and is not a uniform scale.
+      //  · feathered ramp: `buildMaskRamp(w, h, ...)` rasterises a bitmap OF THAT SIZE (~50k
+      //    iterations plus a fresh GPU upload).
+      //  · resolved `texture` mode: the size only ever reaches `slot.baseScaleX/Y` via
+      //    `setMaskBaseScale` — a matrix. Rebuilding there destroyed the Sprite, dropped and
+      //    re-took the texture refcount and re-resolved the ref, all to change two scale floats.
+      // So the size is in the signature for the first two and applied in place for the third.
+      // `texResolves` is exactly the discriminator: an UNRESOLVED texture mask falls through to the
+      // ramp/stencil below, which do bake the size — and it is already in `texSig`, so a change in
+      // resolvability forces a rebuild and the two can never disagree about which path is live.
+      const sizeSig = texResolves ? '' : `${d.width}|${d.height}`;
+      const sig = `${d.mode}|${sizeSig}|${d.pivotX}|${d.pivotY}|${d.cornerRadius}|${d.feather}|${d.sprite}|${texSig}`;
 
       let slot = this.maskSlots.get(maskId);
       if (!slot) {
@@ -928,6 +979,12 @@ export class Scene2DRenderer {
         slot.sig = sig;
         this.dirtyCanvases.add(canvasId);
       }
+      // Size-as-scale for the resolved-texture path (#692 — see the signature note above). Cheap
+      // (two divisions) and unconditional for that path, so it is also what settles `baseScale`
+      // once an async load replaces the placeholder with a real bitmap, rather than depending on
+      // the rebuild to do it. The `kind` guard is belt-and-braces: `texSig` already forces a
+      // rebuild when resolvability flips, so a resolving texture mask is always an 'alpha' slot.
+      if (texResolves && slot.kind === 'alpha') setMaskBaseScale(slot, slot.maskObj as Sprite, d);
 
       // Re-home the container if its canvas or its enclosing mask changed.
       const parentMaskId = this.parentMaskOf.get(maskId);
@@ -959,10 +1016,17 @@ export class Scene2DRenderer {
       const wantX = d.x + ox, wantY = d.y + oy;
       const obj = slot.maskObj;
       const px = obj.position.x, py = obj.position.y;
-      if (px !== wantX || py !== wantY || obj.rotation !== d.rz) this.dirtyCanvases.add(canvasId);
+      // ⚠️ SCALE belongs in this comparison (#692). It was absent, which was invisible only because
+      // every input to it forced a rebuild that marked the canvas dirty itself: a mask animating
+      // `Transform.scale` alone already failed to repaint, and dropping the size out of `sig` above
+      // would have added a resized texture mask to that. Both are covered by comparing what is
+      // about to be WRITTEN, rather than the fields it is derived from.
+      const wantSX = slot.baseScaleX * d.sx * comp.x, wantSY = slot.baseScaleY * d.sy * comp.y;
+      if (px !== wantX || py !== wantY || obj.rotation !== d.rz
+        || obj.scale.x !== wantSX || obj.scale.y !== wantSY) this.dirtyCanvases.add(canvasId);
       obj.position.set(wantX, wantY);
       obj.rotation = d.rz;
-      obj.scale.set(slot.baseScaleX * d.sx * comp.x, slot.baseScaleY * d.sy * comp.y);
+      obj.scale.set(wantSX, wantSY);
     }
   }
 
@@ -1208,12 +1272,23 @@ export class Scene2DRenderer {
   private clearAllColliderOverlays() {
     for (const g of this.colliderOverlays.values()) if (!g.destroyed) g.destroy();
     this.colliderOverlays.clear();
+    this._colliderOverlaysDrawn = false; // nothing left to clear — and nothing left to clear INTO
   }
 
   /** Draw (or clear) collider outlines for every Collider2D entity, into a per-canvas
    *  overlay Graphics. Called at the end of renderFrame; marks touched canvases dirty. */
   private drawColliderOverlays(world: World) {
-    for (const g of this.colliderOverlays.values()) if (!g.destroyed) g.clear();
+    // Only clear an overlay that actually has something in it (#684 — see `_colliderOverlaysDrawn`).
+    // The canvases being emptied must redraw, so mark them here rather than relying on the toggle's
+    // own `_externalDirty`: this also fires when the last Collider2D entity leaves the scene, which
+    // no setter observes.
+    if (this._colliderOverlaysDrawn) {
+      for (const [canvasId, g] of this.colliderOverlays) {
+        if (!g.destroyed) g.clear();
+        this.dirtyCanvases.add(canvasId);
+      }
+      this._colliderOverlaysDrawn = false;
+    }
     if (!this._showColliders && !this._collidersOnly) return;
 
     world.query(Transform, Collider2D).updateEach(([tf, col]: [any, any], entity: any) => {
@@ -1236,6 +1311,7 @@ export class Scene2DRenderer {
       const cos = Math.cos(wt.rz), sin = Math.sin(wt.rz);
       const xf = (lx: number, ly: number) => ({ x: wt.x + lx * cos - ly * sin, y: wt.y + lx * sin + ly * cos });
       drawColliderOutlineGfx(g, col, this._collidersOnly ? COLLIDER_ONLY_STROKE : OUTLINE_STROKE, xf, wt.rz, { sx: wt.sx ?? 1, sy: wt.sy ?? 1 });
+      this._colliderOverlaysDrawn = true;
       this.dirtyCanvases.add(canvasId);
     });
   }
@@ -1580,15 +1656,29 @@ export class Scene2DRenderer {
 
         if (displaySlot.kind === 'graphics') {
           const gfx = displaySlot.obj as Graphics;
-          gfx.clear();
-          // Pivot offset + shape vertices come from the shared render2DUtils helpers so
-          // the runtime (Pixi) and editor Canvas2D preview derive geometry from one
-          // source and can't silently drift (F7).
-          if (colliderMode) {
-            drawColliderFillGfx(gfx, entity.get(Collider2D) as never, rend.color);
-          } else {
-            const { ox, oy } = computePivotOffset(rend.width, rend.height, px, py);
-            drawPrimitiveShapeGfx(gfx, resolvePrimitiveShape(rend.sprite), rend.width, rend.height, ox, oy, rend.color);
+          // #684 — a primitive's geometry depends on shape/size/pivot/colour ONLY, never on its
+          // transform, yet the `changed` gate above trips on x/y/rz/sx/sy (and on `forceAll`, i.e.
+          // an editor trait write on ANY entity). Re-issuing the shape for a pure move is not
+          // merely wasted tessellation: `gfx.clear()` emits GraphicsContext 'update' →
+          // Graphics.onViewUpdate → RenderGroup.onChildViewUpdate → the VIEW list, where
+          // `validateRenderable` returns true for anything batchable (GraphicsPipe.js:34-42) →
+          // `structureDidChange` → `_buildInstructions` for the WHOLE render group
+          // (RenderGroupSystem.js:104-108). One drifting square re-batches every sibling around it.
+          // PixiJS is right to do that with a view change — we were manufacturing the view change.
+          // `geomSig` lives on the SLOT, so a rebuilt slot (undefined) always draws.
+          const geomSig = `${colliderMode ? 'c' : rend.sprite}|${rend.width}|${rend.height}|${px}|${py}|${rend.color}|${colliderSig}`;
+          if (displaySlot.geomSig !== geomSig) {
+            gfx.clear();
+            // Pivot offset + shape vertices come from the shared render2DUtils helpers so
+            // the runtime (Pixi) and editor Canvas2D preview derive geometry from one
+            // source and can't silently drift (F7).
+            if (colliderMode) {
+              drawColliderFillGfx(gfx, entity.get(Collider2D) as never, rend.color);
+            } else {
+              const { ox, oy } = computePivotOffset(rend.width, rend.height, px, py);
+              drawPrimitiveShapeGfx(gfx, resolvePrimitiveShape(rend.sprite), rend.width, rend.height, ox, oy, rend.color);
+            }
+            displaySlot.geomSig = geomSig;
           }
         } else {
           const sp = displaySlot.obj as Sprite;
@@ -1681,15 +1771,13 @@ export class Scene2DRenderer {
           if (eref.url) matTexUrls.push(eref.url);
           extraSig += `|${key}=${eref.url}`;
         }
-        // matSig deliberately does NOT carry the sprite REF (#698). It used to: two atlas slices
-        // of one sheet share a url but need different frames, so a frame swap had to force a
-        // rebuild. That made a SpriteAnimator-driven material rebuild its Mesh, Shader AND
-        // Geometry at clip fps for what is only a sub-rect change. The ref now lives in
-        // `matSpriteRef`, so "sig equal, ref moved" is exactly the frame-swap case and is handled
-        // in place below; everything genuinely structural still rebuilds through this sig.
-        // texUrl still flips '' → url when an async load lands. extraSig moves when an extra
-        // sampler's texture becomes resident, forcing a rebuild that binds the real one.
-        const matSig = `${rend.width}|${rend.height}|${px}|${py}|${texUrl}${extraSig}`;
+        // Split in two (#692). `matBuildSig` is what genuinely forces a new Mesh+Shader: the
+        // resolved sprite url and the extra-sampler set. The quad's SIZE/PIVOT is not in it —
+        // resizing a quad moves 8 position floats and nothing else, so it is applied in place
+        // below instead of rebuilding (a Shader rebuild is what grows #699/#707 without bound).
+        // Neither carries the sprite REF (#698) — that lives in `slot.matSpriteRef`.
+        const matBuildSig = `${texUrl}${extraSig}`;
+        const matQuadSig = `${rend.width}|${rend.height}|${px}|${py}`;
         // The sampled sprite's re-slice epoch — re-slicing the sheet must invalidate the slot even
         // when the url is unchanged, which the ref-in-sig form could not express.
         const matSpriteEpoch = getSpriteEpoch(rend.sprite);
@@ -1713,7 +1801,7 @@ export class Scene2DRenderer {
         // so retain-before-release covers the shared-url cases for the sprite AND the samplers.
         const newUrls = texUrl ? [texUrl, ...matTexUrls] : matTexUrls;
         let preRetained = false;
-        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matSig !== matSig
+        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matBuildSig !== matBuildSig
           || slot.builtEpoch !== matSpriteEpoch)) {
           for (const u of newUrls) retainSpriteTexture(u);
           preRetained = true;
@@ -1771,10 +1859,19 @@ export class Scene2DRenderer {
           const mesh = new Mesh({ geometry: buildMaterialQuad(rend.width, rend.height, px, py), texture: tex, shader });
           this.containerFor(canvasSlot, id).addChild(mesh);
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
-          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite };
+          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matBuildSig, matQuadSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite };
           this.slots.set(id, slot);
           this.entityShaders.set(id, shader);
           built = true; // fresh/rebuilt Mesh → must draw at least once
+        }
+
+        // Quad size/pivot changed but nothing that needs a new Mesh did (#692) — resize in place.
+        // Placed after the build block so a freshly built slot (already at the right size, with
+        // `matQuadSig` stamped at construction) skips it.
+        if (slot.matQuadSig !== matQuadSig) {
+          resizeMaterialQuad((slot.obj as Mesh).geometry as MeshGeometry, rend.width, rend.height, px, py);
+          slot.matQuadSig = matQuadSig;
+          built = true;   // the quad covers different pixels now — the canvas must redraw
         }
 
         // Ensure parented to the right canvas (an entity can move between canvases).
@@ -1808,7 +1905,15 @@ export class Scene2DRenderer {
         const snap = this.lastMaterialRender.get(id);
         const changed = forceAll || built || isEntity2DMaterialDirty(id) || !snap ||
           snap.canvasId !== canvasId || snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz ||
-          snap.sx !== wt.sx || snap.sy !== wt.sy || snap.color !== rend.color || snap.opacity !== rend.opacity ||
+          // ⚠️ `alpha`, NOT `rend.opacity` — the snapshot STORES the product below (#211), so
+          // comparing the raw field made the two halves disagree. Both directions were wrong: a
+          // material entity under a `GroupAlpha` of 0.5 read as "changed" on every frame forever
+          // (a full GPU pass per frame with nothing moving — the exact cost this gate exists to
+          // avoid), while a group FADE over a still `rend.opacity` read as unchanged and never
+          // marked the canvas dirty, so the fade was written to `mesh.alpha` and never presented.
+          // The sprite (`snap.opacity !== alpha`) and skinned passes always had this right; the
+          // material pass was the lone outlier, under a comment pointing at the sprite path.
+          snap.sx !== wt.sx || snap.sy !== wt.sy || snap.color !== rend.color || snap.opacity !== alpha ||
           snap.blend !== blend || snap.paint !== paint || snap.flipX !== rend.flipX || snap.flipY !== rend.flipY ||
           snap.compX !== comp.x || snap.compY !== comp.y;
         if (changed) {

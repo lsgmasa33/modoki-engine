@@ -61,14 +61,19 @@
  *
  *  The gate asks whether the press's nearest `[data-press-origin]` ancestor is the node
  *  handling the click, and `UINode.tsx` stamps that marker only on nodes it considers
- *  interactive — ones carrying a click binding. So a panel with NO binding of its own is
- *  transparent to `closest()`, the press resolves straight past it to the dismissing scrim, and
- *  the gate passes. wordweave's dictionary is covered because `dictionaryPanelSwallow` (a
- *  deliberate no-op) already made its panel interactive; authoring a swallow is what OPTS a panel
- *  in. Court's `StorePanel` now carries one (`court.storePanelSwallow`), so a drag that starts on
- *  its scrollable `StoreItemList` and releases on the scrim no longer dismisses the store.
- *  Court's remaining card dialogs — `RulesPanel` and others — still carry nothing and remain
- *  uncovered; tracked in #722.
+ *  interactive — ones carrying a click binding, OR ones authoring `UIElement.swallowClicks`
+ *  (#728, the first-class way to opt a panel in without a no-op binding's side effects: the click
+ *  cue and the input lock). So a panel with neither is transparent to `closest()`, the press
+ *  resolves straight past it to the dismissing scrim, and the gate passes. Authoring a swallow —
+ *  either way — is what OPTS a panel in.
+ *
+ *  ⚠️ **Which panels are covered is a PROPERTY, not a roster — do not enumerate them here.** The
+ *  covered set is "every UI node carrying a click binding or `swallowClicks`", and a grep for
+ *  `swallowClicks` across the scenes answers it for any given moment. An earlier version of this
+ *  comment named the covered and uncovered panels individually; #728's migration invalidated it
+ *  the same day, and a list that reads authoritative while being wrong is worse than no list.
+ *  The one durable pointer: the eight dialog bodies tracked in #729 are the known uncovered group
+ *  (#722's swallow half).
  *
  *  The general fix would be to stamp the marker on any `overflow: 'scroll'` node too, on the
  *  grounds that a scrolling box owns gestures that begin in it. Deliberately NOT done here: it

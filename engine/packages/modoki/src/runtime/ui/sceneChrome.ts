@@ -75,6 +75,18 @@ export interface ChromeUIPatch {
    * nothing — so the two fields are set together at that call site, and neither is much use alone.
    */
   pointerThrough?: boolean;
+  /**
+   * ⚠️ **`swallowClicks` is deliberately NOT here, and that asymmetry with `pointerThrough` above
+   * is a decision, not an oversight** (#728). A swallow is a property of what a panel IS — a
+   * dialog body is never sometimes-a-dialog-body — so it is authored in the scene and read from
+   * there, per `CLAUDE.md` § "Author values in the SCENE and the PREFAB". `pointerThrough` earned
+   * its slot here because Court genuinely toggles it at runtime (hiding a control by `opacity`
+   * while keeping it in the flow, so it must stop eating taps for exactly that period).
+   *
+   * ⚠️ If a game ever DOES need a conditional swallow, add the field here — do NOT go back to
+   * authoring a no-op `call` binding to get it. That workaround is what #728 removed, and it
+   * costs the click cue and the global 300ms input lock on every tap of the panel body.
+   */
   backgroundColor?: number;
   /**
    * The `backgroundColor` companion — and effectively REQUIRED alongside it.

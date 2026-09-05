@@ -359,10 +359,11 @@ test.describe('single-line textOverflow: ellipsis (#725)', () => {
 
   // The case #725 named as the one a naive fix would miss: the wrapper is a FLEX ITEM, and in a
   // `row` host (main axis horizontal) it is not stretched to the host's width the way the
-  // default `column` host stretches it on the cross axis — without `min-width: 0` it would
-  // shrink-wrap to its `nowrap` text's full min-content width and overflow the host instead of
-  // ellipsizing inside it.
-  test('row host: min-width:0 lets the wrapper actually shrink and ellipsize instead of overflowing', async ({ page }) => {
+  // default `column` host stretches it on the cross axis — it must still shrink to the host's
+  // width and ellipsize inside it rather than overflow. (A row host's shrink comes from the
+  // scroll-container automatic-minimum-size-zero the wrapper's own `overflow: hidden` already
+  // gives it — see the code comment; `min-width: 0` never had anything to do with it.)
+  test('row host: the wrapper still shrinks to the host and ellipsizes instead of overflowing', async ({ page }) => {
     await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineRow');
     await switchToUIMode(page);
     const id = await idByName(page, 'EllipsisSingleLineRow');
@@ -377,8 +378,93 @@ test.describe('single-line textOverflow: ellipsis (#725)', () => {
       host.evaluate((el) => el.getBoundingClientRect().width),
       wrapper.evaluate((el) => el.getBoundingClientRect().width),
     ]);
-    // Without `min-width: 0` the wrapper would sit at its min-content size (the whole nowrap
-    // line) and push past the host's own width instead of staying inside it.
+    // The wrapper must stay within the host's own width rather than shrink-wrapping to its
+    // `nowrap` text's full min-content width and pushing past it.
+    expect(wrapperWidth).toBeLessThanOrEqual(hostWidth + 1);
+
+    const [scrollWidth, clientWidth] = await Promise.all([
+      wrapper.evaluate((el) => el.scrollWidth),
+      wrapper.evaluate((el) => el.clientWidth),
+    ]);
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+
+    await assertEllipsisPainted(wrapper);
+  });
+
+  // #727 fixup: both fixtures above default to `textAlign: 'left'`, the ONE alignment the broken
+  // `...shrinkWrapAlign(node.textAlign)` spread happened not to break (it returns `{}` for
+  // 'left'). `center`/`right` return an auto cross-axis margin, which disables the DEFAULT
+  // `align-items: stretch` (CSS Flexbox §8.3) — this is the case the mutation-check below proves
+  // these tests would have caught.
+  test('column host + textAlign center: the wrapper still stretches to the host and ellipsizes', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineCenter');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'EllipsisSingleLineCenter');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+    const wrapper = host.locator('div').first();
+    await wrapper.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const [hostWidth, wrapperWidth] = await Promise.all([
+      host.evaluate((el) => el.getBoundingClientRect().width),
+      wrapper.evaluate((el) => el.getBoundingClientRect().width),
+    ]);
+    // The broken code shrink-wrapped to the whole nowrap line instead of stretching — the wrapper
+    // must stay within the host's own width.
+    expect(wrapperWidth).toBeLessThanOrEqual(hostWidth + 1);
+
+    const [scrollWidth, clientWidth] = await Promise.all([
+      wrapper.evaluate((el) => el.scrollWidth),
+      wrapper.evaluate((el) => el.clientWidth),
+    ]);
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+
+    await assertEllipsisPainted(wrapper);
+  });
+
+  test('column host + textAlign right: the wrapper still stretches to the host and ellipsizes', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineRight');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'EllipsisSingleLineRight');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+    const wrapper = host.locator('div').first();
+    await wrapper.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const [hostWidth, wrapperWidth] = await Promise.all([
+      host.evaluate((el) => el.getBoundingClientRect().width),
+      wrapper.evaluate((el) => el.getBoundingClientRect().width),
+    ]);
+    expect(wrapperWidth).toBeLessThanOrEqual(hostWidth + 1);
+
+    const [scrollWidth, clientWidth] = await Promise.all([
+      wrapper.evaluate((el) => el.scrollWidth),
+      wrapper.evaluate((el) => el.clientWidth),
+    ]);
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+
+    await assertEllipsisPainted(wrapper);
+  });
+
+  // `maxWidth: '100%'` guards a host authoring a non-stretch `alignItems` directly (no auto
+  // margin needed there — a flex item with `align-items` other than `stretch` on the cross axis
+  // just never gets a cross-size at all, so it would reproduce the same shrink-wrap-to-the-whole-
+  // line spill by a different route).
+  test('column host + alignItems flex-start: the wrapper is still capped to the host and ellipsizes', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineFlexStart');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'EllipsisSingleLineFlexStart');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+    const wrapper = host.locator('div').first();
+    await wrapper.waitFor({ state: 'visible', timeout: 10_000 });
+
+    expect(await host.evaluate((el) => getComputedStyle(el).alignItems)).toBe('flex-start');
+
+    const [hostWidth, wrapperWidth] = await Promise.all([
+      host.evaluate((el) => el.getBoundingClientRect().width),
+      wrapper.evaluate((el) => el.getBoundingClientRect().width),
+    ]);
     expect(wrapperWidth).toBeLessThanOrEqual(hostWidth + 1);
 
     const [scrollWidth, clientWidth] = await Promise.all([
