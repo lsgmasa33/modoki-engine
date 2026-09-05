@@ -9,7 +9,8 @@ UI scene graph — the ECS world *is* the UI document.
 This page documents the runtime UI traits, the renderer, the projection/dirty-flag
 model that keeps it off the per-frame path, anchor positioning, directional
 controller/keyboard focus, text animation, nine-slice backgrounds, fonts, an image-ref
-gotcha, and the per-game custom-React-UI escape hatch.
+gotcha, the per-game custom-React-UI escape hatch, and the cross-game
+[dialog-dismissal rule](#dialog-dismissal--the-house-rule-for-every-game).
 
 Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md) ·
 [Prefabs](./prefabs.md) · [Materials & Textures](./textures.md) · [Visual Editor](./editor.md)
@@ -2299,6 +2300,57 @@ fields to the shared UI bindings without prop-drilling. (Source: `games/CUSTOM_U
 verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 
 ---
+
+## Dialog dismissal — the house rule for every game
+
+**Owner's ruling, 2026-09-05. This is a cross-game convention, not a per-game style choice** — it
+was settled on Court (#722) and applies to any modoki game that puts a dialog over the screen.
+
+1. **Pressing the ✕ dismisses the dialog.**
+2. **Tapping outside the dialog dismisses it — UNLESS the dialog has an explicit dismiss button of
+   its own besides the ✕.**
+3. **Do not put an ✕ on a dialog that already has a dedicated dismiss button.**
+
+The shape underneath the three rules: the ✕ is the *explicit* affordance, tapping outside is a
+*convenience shortcut*, and a dialog that exists to make the player decide something gets neither
+shortcut nor a second way to say "no". A destructive confirm therefore has exactly two exits, both
+of them worded and deliberate.
+
+⚠️ **A tap on the dialog BODY must do nothing** — it is neither the ✕ nor "outside". This is the
+part the engine cannot yet express cleanly: see the gap below before you author it.
+
+### Why a dialog body dismisses today, if nothing is done about it
+
+`UINode.tsx` treats a node as interactive only if it carries a click binding:
+
+```ts
+const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
+```
+
+Only an interactive node gets `e.stopPropagation()` in its click handler, and only an interactive
+node is stamped as a press origin for the #664 gate. So a panel with no `UIAction` is *transparent*:
+a tap on the dialog body bubbles to the scrim behind it and triggers the scrim's dismiss. Authoring
+the panel with no binding is not "no behaviour" — it is "the scrim's behaviour".
+
+⚠️ **Both halves are needed, and neither is sufficient alone** (measured live in wordweave, #662/#664):
+- a **swallow** on the panel body fixes the plain TAP;
+- the **press-origin gate** (`runtime/ui/pressOrigin.ts`) fixes the SWIPE that presses inside the
+  panel and releases on the scrim — the browser resolves that click to the common ancestor, so the
+  panel's own handler never runs and a swallow cannot see it.
+
+### ⚠️ The gap — do not hand-roll the swallow (#728)
+
+The only way to make a container swallow a tap today is to give it a no-op `call` binding, and
+`bindings.ts` charges every discrete activation the same way whether or not the handler does
+anything: it takes the global input lock (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`, 300 ms) and fires
+the click cue. So a hand-rolled swallow makes **the middle of a dialog play the button click sound**,
+and swallows the next discrete tap for 300 ms — a control tapped straight after the body reads as
+dead.
+
+**#728 tracks the fix**: a first-class `UIElement.swallowClicks` that stops propagation and stamps
+the press origin *without* routing through `applyBindings`. Prefer waiting for it over adding a
+tenth no-op action. Sliders are not affected either way — a range drag is `continuous` and takes
+neither the lock nor the cue.
 
 ## Quick reference
 
