@@ -23,7 +23,9 @@
  */
 
 import { readFile, writeFile, readdir } from 'node:fs/promises';
-import { join, dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,17 +35,41 @@ const WRITE = process.argv.includes('--write');
 const SCENE_FORMAT_VERSION = 13;
 const PREFAB_FORMAT_VERSION = 3;
 
-async function walkFiles(dir, pred, out = []) {
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      if (['node_modules', 'dist', '.cache', 'ios', 'android', 'ads', 'build'].includes(e.name)) continue;
-      await walkFiles(p, pred, out);
-    } else if (pred(p)) out.push(p);
-  }
-  return out;
+/** Every scene/prefab file the REPO knows about, enumerated through GIT rather than by walking
+ *  the filesystem.
+ *
+ *  ⚠️ This used to be a directory walk with a blocklist (`dist`, `ads`, `ios`, `android`, …), and
+ *  that is the wrong shape for a script that WRITES: a blocklist only excludes the directory
+ *  names somebody thought of, so the first gitignored build directory nobody listed gets its
+ *  generated copies rewritten in place — silently, and for nothing. The identical defect went
+ *  red in `engine/tests/assets/anchorZIndexMigrated.test.ts` (#762), whose walk excluded
+ *  `dist`/`ios`/`android` but not `games/*\/ads/` from a `--target playable` export, making that
+ *  guard machine-dependent; `work-ai2` fixed it by enumerating through git, and the same
+ *  reasoning applies here with more at stake. Measured on this clone at the time of the change:
+ *  **176** `.scene.json`/`.prefab.json` files existed on disk that git does not track.
+ *
+ *  `--cached --others --exclude-standard` is deliberate: tracked files PLUS untracked-but-not-
+ *  ignored ones, so a scene a developer has just authored and not yet staged is still migrated,
+ *  while everything in `.gitignore` is not. Same flags as the guard above and as
+ *  `docCitations.test.ts`'s `repoFiles()`. */
+let repoFilesCache;
+function repoSceneAndPrefabFiles() {
+  if (repoFilesCache) return repoFilesCache;
+  const listed = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    .split('\0').filter(Boolean);
+  repoFilesCache = listed
+    .filter((p) => /\.(scene|prefab)\.json$/i.test(p))
+    .map((p) => join(ROOT, p))
+    // A tracked file can be absent mid-rebase or after a manual delete; reading it would throw.
+    .filter((p) => existsSync(p));
+  return repoFilesCache;
+}
+
+/** The repo's scene/prefab files that live under `dir`. */
+function filesUnder(dir) {
+  const prefix = dir.endsWith(sep) ? dir : dir + sep;
+  return repoSceneAndPrefabFiles().filter((p) => p.startsWith(prefix));
 }
 
 let changedFiles = 0, changedKeys = 0;
@@ -148,8 +174,7 @@ for (const rootDir of ['games', 'demos']) {
   const projects = await readdir(join(ROOT, rootDir), { withFileTypes: true }).catch(() => []);
   for (const proj of projects.filter((d) => d.isDirectory())) {
     const assetsDir = join(ROOT, rootDir, proj.name, 'runtime', 'assets');
-    const files = await walkFiles(assetsDir, (p) => /\.(scene|prefab)\.json$/i.test(p));
-    targets.push(...files);
+    targets.push(...filesUnder(assetsDir));
   }
 }
 // ⚠️ The e2e fixtures are DELIBERATELY left un-migrated at `version: 9` — they earn their keep by
@@ -160,7 +185,7 @@ for (const rootDir of ['games', 'demos']) {
 // anyway turns the gate red rather than passing unnoticed — but do not make that test the thing
 // that catches it. Pass --include-e2e-fixtures only if that decision is being reversed on purpose.
 if (process.argv.includes('--include-e2e-fixtures')) {
-  targets.push(...await walkFiles(join(ROOT, 'engine', 'tests', 'e2e', 'fixtures'), (p) => /\.(scene|prefab)\.json$/i.test(p)));
+  targets.push(...filesUnder(join(ROOT, 'engine', 'tests', 'e2e', 'fixtures')));
 }
 
 for (const file of targets) await migrateFile(file);
