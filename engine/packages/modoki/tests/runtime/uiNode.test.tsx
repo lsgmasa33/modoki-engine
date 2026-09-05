@@ -1738,6 +1738,22 @@ describe('UIToggle default-size fallback (#744)', () => {
       .toBe(`${toggleKnobFloor(node.toggle!.knobInset, 16)}px`);
   });
 
+  // ⚠️ The knob is square with `flexShrink: 0`, so it must fit the track's content box on BOTH
+  // axes. Deriving its floor from the height alone let an authored `maxWidth` shrink the track
+  // while the knob kept an 18px floor — spilling 4px past the capsule with `justify-content`'s
+  // flip in NEGATIVE slack, so the two states became indistinguishable. Nothing covered the width
+  // axis; only maxHeight was tested.
+  it('an authored px maxWidth shrinks the KNOB too, so it still fits inside the capsule', () => {
+    const node = makeNode({ guid: 'tg-744-10', width: 0, height: 0, maxWidth: 20, maxWidthUnit: 'px', toggle: toggle() });
+    const track = renderNode(node);
+    const inset = node.toggle!.knobInset;
+    const knobFloor = parseFloat((track.firstElementChild as HTMLElement).style.minWidth);
+    expect(track.style.minWidth).toBe('20px');
+    // The floor must fit the content box the cap leaves: 20 - 2*inset.
+    expect(knobFloor).toBeLessThanOrEqual(20 - 2 * inset);
+    expect(knobFloor).toBe(toggleKnobFloor(inset, 20));
+  });
+
   it('a NON-px cap is left alone — it cannot be compared here, and guessing beats nothing badly', () => {
     const track = renderNode(makeNode({ guid: 'tg-744-9', width: 0, height: 0, maxHeight: 50, maxHeightUnit: '%', toggle: toggle() }));
     expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
@@ -1776,9 +1792,10 @@ function scrollTrait(over: Partial<NonNullable<UINodeData['scroll']>> = {}): Non
   };
 }
 
-// ── #743: a UIScrollView on an element never opted into scrolling (UIElement.overflow !==
-// 'scroll') now warns once per entity instead of silently doing nothing — and the cross-axis
-// pin that used to half-work it is gated off a non-scrolling box. ──
+// ── #743: a UIScrollView on an `overflow: 'visible'` element — the one value that establishes no
+// scroll container — now warns once per entity instead of silently doing nothing, and the
+// cross-axis pin that used to half-work it is gated off any non-scrolling box. `'hidden'` warns
+// NOT AT ALL: it is a scroll container with no scrolling UI, which scrollTo still drives. ──
 describe('UIScrollView inert-trait DEV warning (#743)', () => {
   it('warns when overflow is visible', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -1876,8 +1893,10 @@ function textStyleDefaults(over: Partial<Parameters<typeof droppedTextStyleField
   return {
     textAlign: 'left', lineHeight: 0, letterSpacing: 0, fontStyle: 'normal', textOverflow: 'clip', maxLines: 0,
     textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0, textStrokeWidth: 0,
-    // The four the INPUT branch re-emits (and the range branch does not) — see the range tests.
-    fontFamily: '', fontSize: 0, fontWeight: 'normal', textOpacity: 1,
+    // ⚠️ `fontSize: 16`, NOT 0. `uiTreeStore` normalises `fontSize: ui.fontSize || 16`, so 0 is a
+    // value the projection cannot hand this function — a fixture using it made an impossible
+    // input look like the default and hid a warning that fired on every slider.
+    fontFamily: '', fontSize: 16, fontWeight: 'normal', textOpacity: 1,
     ...over,
   };
 }
@@ -1911,15 +1930,72 @@ describe('droppedTextStyleFields (#745)', () => {
   // re-emits NONE of them (its only style write is `accentColor` from `textColor`). An author who
   // set a font size on a slider, saw nothing, and read a warning calling fontSize honoured would
   // have been sent away from the actual cause.
-  it('a RANGE additionally drops the four font fields an input re-emits', () => {
+  it('a RANGE additionally drops the font fields an input re-emits — but NOT fontFamily', () => {
     const authored = textStyleDefaults({ fontFamily: 'Varela Round', fontSize: 40, fontWeight: '700' });
     expect(droppedTextStyleFields(authored, 'input')).toEqual([]);
-    expect(droppedTextStyleFields(authored, 'range')).toEqual(['fontFamily', 'fontSize', 'fontWeight']);
+    // `fontFamily` is emitted near the top of UINode, above the branch split, so it reaches a
+    // range like every other node — reporting it would be the same false claim in the other
+    // direction. See the render test below, which is what actually pins this.
+    expect(droppedTextStyleFields(authored, 'range')).toEqual(['fontSize', 'fontWeight']);
+  });
+
+  // ⚠️ The regression that matters most: `uiTreeStore` normalises `fontSize: ui.fontSize || 16`,
+  // so `UINodeData.fontSize` is NEVER falsy in production. A truthiness test therefore fired on
+  // EVERY slider in every project and named a field its author never touched — the exact "sent
+  // away from the cause" failure these warnings exist to prevent. `textStyleDefaults` used to set
+  // `fontSize: 0`, a value the projection cannot produce, which is why nothing caught it.
+  it('a default RANGE reports NOTHING — fontSize 16 is the default, not an authored value', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ fontSize: 16 }), 'range')).toEqual([]);
+    expect(droppedTextStyleFields(textStyleDefaults({ fontSize: 40 }), 'range')).toEqual(['fontSize']);
   });
 
   it('a RANGE drops textOpacity but NOT textColor — the colour survives as accentColor, its alpha does not', () => {
     expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 0.5 }), 'range')).toEqual(['textOpacity']);
     expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 1 }), 'range')).toEqual([]);
+  });
+});
+
+// ⚠️ **RENDER tests, not pure-helper ones — this is the guard that was missing.** The pure tests
+// above assert the author's MODEL of the range branch; two false claims shipped because nothing
+// compared that model to what the branch actually emits. These render a real `<input type=range>`
+// and check the DOM against the reported list, so a change to either side breaks them.
+describe('the range branch\'s real emissions vs what the warning reports (#745)', () => {
+  const renderRange = (over: Partial<UINodeData> = {}) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const el = renderNode(makeNode({ elementType: 'range', ...over } as Partial<UINodeData>));
+      const warned = warn.mock.calls.flat().join(' ');
+      // ⚠️ Only the REPORTED list, not the whole message. The message's "what is honoured" clause
+      // names `accentColor (from textColor)`, so a substring check over the full string reads
+      // `textColor` as reported when it says the opposite — asserting on the prose, not the finding.
+      const reported = /authors ([^,]+(?:, [^,]+)*), which an elementType/.exec(warned)?.[1] ?? '';
+      return { el, warned, reported };
+    } finally { warn.mockRestore(); }
+  };
+
+  it('a DEFAULT range warns nothing at all', () => {
+    // Pre-fix this emitted "authors fontSize" on every slider in every scene, once per entity per
+    // world load, naming a field nobody touched.
+    const { warned } = renderRange({ guid: 'rng-1' });
+    expect(warned).not.toContain('[UINode]');
+  });
+
+  it('fontFamily REACHES the range, so it is not reported as dropped', () => {
+    const { el, reported } = renderRange({ guid: 'rng-2', fontFamily: 'Varela Round' });
+    expect(styleAttr(el)).toContain('Varela Round');   // the DOM half
+    expect(reported).not.toContain('fontFamily');      // the report half — the two must agree
+  });
+
+  it('fontSize does NOT reach the range, and IS reported', () => {
+    const { el, reported } = renderRange({ guid: 'rng-3', fontSize: 40 });
+    expect(styleAttr(el)).not.toMatch(/font-size:\s*40px/);
+    expect(reported).toContain('fontSize');
+  });
+
+  it('textColor reaches it as accentColor — so the colour is honoured and only its alpha is reported', () => {
+    const { el, reported } = renderRange({ guid: 'rng-4', textColor: 0xff0000, textOpacity: 0.5 });
+    expect(styleAttr(el)).toMatch(/accent-color/);
+    expect(reported).toBe('textOpacity');
   });
 });
 

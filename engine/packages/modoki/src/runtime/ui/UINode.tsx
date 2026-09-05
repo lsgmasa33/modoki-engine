@@ -489,16 +489,24 @@ export function droppedTextStyleFields(n: Pick<UINodeData,
   'fontFamily' | 'fontSize' | 'fontWeight' | 'textOpacity'>, elementType: string): string[] {
   const out: string[] = [];
   // ⚠️ **`input` and `range` do NOT drop the same set, and assuming they did made this warning
-  // LIE.** The `input` branch re-emits `fontFamily`/`fontSize`/`fontWeight`/`color`, so those four
-  // are honoured there and must not be reported. The `range` branch re-emits NONE of them — its
-  // only style write is `accentColor` from `textColor` — so on a slider all four are dropped too,
-  // as is `textOpacity` (`textColor` survives only as an opaque accent). Naming them as honoured
-  // on a range would have pointed an author away from the real cause of their missing font size.
+  // LIE.** The `input` branch re-emits `fontSize`/`fontWeight`/`color`; the `range` branch re-emits
+  // none of those three — its only style write is `accentColor` from `textColor` — so a slider
+  // drops them too, along with `textOpacity` (`textColor` survives only as an OPAQUE accent, so
+  // the colour is honoured and its alpha is not).
+  //
+  // ⚠️ **`fontFamily` is NOT in that set, and claiming it was is a mistake this function already
+  // made once.** It is emitted unconditionally near the top of `UINode`, far above the branch
+  // split, precisely so a container can set the typeface for its subtree — so it reaches a `range`
+  // like everything else and must not be reported as dropped. (The `input` branch's own
+  // `style.fontFamily` write is redundant for the same reason.)
   if (elementType === 'range') {
-    if (n.fontFamily) out.push('fontFamily');
-    if (n.fontSize) out.push('fontSize');
+    // ⚠️ Compared against the DEFAULT, not tested for truthiness. `uiTreeStore` normalises
+    // `fontSize: ui.fontSize || 16`, so this field is NEVER falsy by the time it reaches here —
+    // `if (n.fontSize)` fired on every slider in every project and told its author they had
+    // authored a font size they had not touched. The other entries in this function all compare
+    // against their default; this one now does too.
+    if (n.fontSize !== UI_DEFAULT_FONT_SIZE) out.push('fontSize');
     if (n.fontWeight !== 'normal') out.push('fontWeight');
-    // `textColor` IS read on a range — as `accentColor` — so it is not dropped; its alpha is.
     if (n.textOpacity !== 1) out.push('textOpacity');
   }
   if (n.textAlign !== 'left') out.push('textAlign');
@@ -525,8 +533,8 @@ function warnDroppedTextStyle(key: string, elementType: string, dropped: string[
   // `droppedTextStyleFields`. Getting this wrong is worse than saying nothing: it tells the author
   // their font size is fine when it is the thing that vanished.
   const honoured = elementType === 'range'
-    ? `a range re-emits only accentColor (from textColor)`
-    : `an input re-emits only fontFamily, fontSize, fontWeight and color`;
+    ? `a range re-emits only accentColor (from textColor), on top of the fontFamily every node gets`
+    : `an input re-emits only fontSize, fontWeight and color, on top of the fontFamily every node gets`;
   console.warn(`[UINode] ${key} authors ${dropped.join(', ')}, which an elementType '${elementType}' silently drops — the text-style block is gated on UIElement.text, which a form control never uses, and ${honoured}. A form control's text rendering is the platform's, so these are not wired on purpose.`);
 }
 
@@ -539,6 +547,12 @@ function warnDroppedTextStyle(key: string, elementType: string, dropped: string[
  *  44×24 keeps the 1.75:1 capsule proportion of the repo's only authored toggle (`games/court`,
  *  56×32) at a size that sits in a settings row; iOS's native switch is 51×31 for comparison.
  *  Exported so a test can assert against the constant rather than restate the number. */
+/** `UIElement.fontSize`'s trait default, and what `uiTreeStore` normalises an unset value TO
+ *  (`fontSize: ui.fontSize || 16`) — which is why "did the author set this?" has to be a comparison
+ *  against it rather than a truthiness test. Kept beside its one consumer with the coupling named,
+ *  the way this function's other default comparisons (`'left'`, `'normal'`, `'clip'`) already are. */
+const UI_DEFAULT_FONT_SIZE = 16;
+
 export const DEFAULT_TOGGLE_TRACK_WIDTH = 44;
 export const DEFAULT_TOGGLE_TRACK_HEIGHT = 24;
 
@@ -1446,9 +1460,17 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     const trackFloorW = capped(DEFAULT_TOGGLE_TRACK_WIDTH, node.maxWidth, node.maxWidthUnit);
     const trackFloorH = capped(DEFAULT_TOGGLE_TRACK_HEIGHT, node.maxHeight, node.maxHeightUnit);
     // The knob's floor is skipped with the track's on a sized axis, for the same reason: on a
-    // track shorter than the floor it would push the knob outside its own capsule. It derives from
-    // the track's EFFECTIVE floor, so a cap shrinks both together rather than only the track.
-    const knobFloor = sizedH ? undefined : toggleKnobFloor(t.knobInset, trackFloorH);
+    // track shorter than the floor it would push the knob outside its own capsule.
+    //
+    // ⚠️ It derives from the SMALLER of the two effective floors, and taking the height alone was
+    // wrong. The knob is square (`aspectRatio: 1/1`) with `flexShrink: 0`, so it must fit the
+    // track's content box on BOTH axes — an authored `maxWidth: 20` leaves a 14px content width
+    // (20 − 2×3 inset) while a height-derived floor is 18px, and the knob then spills 4px past the
+    // capsule edge with `justify-content`'s flip left in NEGATIVE slack: the two states become
+    // indistinguishable, which is the same "one wrong render traded for another" this fallback
+    // exists to avoid. Normally `min(44, 24) = 24` is the height anyway, so this changes nothing
+    // outside an authored cap.
+    const knobFloor = sizedH ? undefined : toggleKnobFloor(t.knobInset, Math.min(trackFloorW, trackFloorH));
     const fire = () => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: !t.value });
     const interactive = canFire && !t.disabled && !onSelectEntity;
 

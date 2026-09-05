@@ -413,12 +413,20 @@ nothing errors:
 2. **The text-style group is dropped on `input`/`range`** even with no text: the whole style block
    is gated on `UIElement.text`. Silently lost on both: `textAlign`, `lineHeight`, `letterSpacing`,
    `fontStyle`, `textShadow*`, `textStroke*`, `textOverflow`, `maxLines`.
-   ⚠️ **The two controls do NOT drop the same set.** The `input` branch re-emits `fontFamily`,
-   `fontSize`, `fontWeight` and `color`; the `range` branch re-emits **none** of them — its only
-   style write is `accentColor` from `textColor` — so a slider additionally drops all four, plus
-   `textOpacity` (the colour survives as an opaque accent; its alpha does not). The DEV warning is
-   per element type for exactly this reason: naming `fontSize` as honoured on a range would point
-   an author away from the real cause of their missing font size.
+   ⚠️ **The two controls do NOT drop the same set.** The `input` branch re-emits `fontSize`,
+   `fontWeight` and `color`; the `range` branch re-emits none of those three — its only style write
+   is `accentColor` from `textColor` — so a slider additionally drops them, plus `textOpacity` (the
+   colour survives as an OPAQUE accent, so the colour is honoured and its alpha is not). The DEV
+   warning is per element type for exactly this reason: naming `fontSize` as honoured on a range
+   would point an author away from the real cause of their missing font size.
+   ⚠️ **`fontFamily` is in neither dropped set**, and an earlier version of this paragraph said it
+   was. It is emitted unconditionally near the top of `UINode`, far above the branch split — so a
+   container can set the typeface for its subtree — and therefore reaches a `range` like any other
+   node. A second trap in the same place: `uiTreeStore` normalises `fontSize: ui.fontSize || 16`,
+   so that field is never falsy by the time the check runs, and "did the author set this?" must be
+   a comparison against the default rather than a truthiness test. Both halves are pinned by RENDER
+   tests that assert the real DOM against the reported list, because the pure-helper tests that
+   preceded them only ever asserted the author's model of the branch.
 
 These stay **unwired on purpose** — a form control's text rendering is the platform's, not ours —
 so the fix is a DEV warning naming what you authored and will not get, in the same family as the
@@ -696,8 +704,9 @@ somewhere other than `UIElement.height`, and two of those work — an anchor-str
 toggle in a `flexDirection: 'row'` parent where `alignItems` defaults to `stretch` and a sibling
 label's line box makes the height definite (the ordinary settings-row shape). Measured in headless
 Chromium at `knobInset` 3: 26×26 authored / 27×27 row-stretched / 74×74 anchor-stretched are
-byte-identical before and after, with the default shape going 0×0 → 18×18 (20×20 at the trait's
-default inset of 2).
+byte-identical before and after, with the default shape going 0×0 → 18×18. (At the trait's default
+`knobInset` of 2 that floor is 20×20 — arithmetic from `toggleKnobFloor`, not a separate
+measurement.)
 
 ⚠️ **"A `min-*` can only raise a size" is necessary but NOT sufficient, and the first cut of this
 fix got that wrong.** A min can still raise a *definite* size that happens to be smaller than it —
@@ -708,7 +717,9 @@ would silently reintroduce the border-box desync that pin exists to prevent, inv
 `warnAuthoredOverride`), or an anchor-stretched axis, via the shared `isSizeInert`. A `%` size does
 **not** count as definite — that is the indeterminate case the whole fix is about — and an authored
 px `maxWidth`/`maxHeight` **clamps** the floor rather than losing to it, since CSS resolves `min-*`
-above `max-*`.
+above `max-*` — clamping by the SMALLER of the two effective floors, because the knob is square with
+`flexShrink: 0` and must fit the track's content box on both axes (a height-only clamp let an
+authored `maxWidth` spill the knob past its own capsule).
 
 The one residual, stated rather than papered over: a flex CROSS-axis stretch is not visible from
 the node data, so a settings row whose label is under 24px tall now gets a 24px toggle instead of a
