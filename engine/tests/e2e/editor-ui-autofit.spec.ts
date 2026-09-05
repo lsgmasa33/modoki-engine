@@ -37,7 +37,7 @@
  *  `alignItems:'stretch'`), so the span's own immediate parent — the label's own div — is what
  *  goes content-sized, one level down from `AutoFitOn`'s case. */
 
-import { test, expect } from '@playwright/test';
+import { test, expect, type Locator } from '@playwright/test';
 import { gotoEditorWithScene, switchToUIMode, idByName, SCENE, stableBoundingBox, waitForFrames } from './helpers';
 
 const AUTHORED_FONT_SIZE_PX = 42;
@@ -271,6 +271,123 @@ test.describe('maxLines + textOverflow: clip (#656)', () => {
     // Pre-fix these are byte-identical, because the engine had already applied exactly what the
     // evaluate above applies. Post-fix the ellipsis appears and the pixels move.
     expect(Buffer.compare(before, after)).not.toBe(0);
+  });
+});
+
+test.describe('maxLines + textOverflow: clip under autoFitText (#727)', () => {
+  // `MaxLinesAutoFit` above pins `fontSizeMin === fontSize` deliberately (no shrink possible) —
+  // that is why the #727 gap existed uncaught. This fixture is the same shape with `fontSizeMin`
+  // well below `fontSize`, so a real shrink engages, and `textOverflow` left at its `clip`
+  // default (unlike `MaxLinesAutoFit`, which authors `ellipsis`).
+  test('clip is honoured with autoFitText: one line at the SHRUNK size, not 2.67 at the authored one', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'MaxLinesClipAutoFit');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'MaxLinesClipAutoFit');
+    const box = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await box.waitFor({ state: 'visible', timeout: 10_000 });
+    const span = box.locator('span');
+    await span.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const [boxHeight, fontSizePx] = await Promise.all([
+      box.evaluate((el) => el.getBoundingClientRect().height),
+      span.evaluate((el) => parseFloat(getComputedStyle(el).fontSize)),
+    ]);
+
+    // The shrink actually engaged — fontSizeMin (16) is well below the authored 42px.
+    expect(fontSizePx).toBeLessThan(AUTHORED_FONT_SIZE_PX);
+    // Pre-fix, `max-height: 1lh` on the WRAPPER resolved against the wrapper's authored 42px
+    // (48px) against an 18px line box at the shrunk 16px — 2.67 lines rendered where 1 was
+    // authored. Post-fix the cap lives on the span itself, so it tracks the shrunk size exactly:
+    // one line box, comfortably under a 1.8x-of-the-SHRUNK-size ceiling (well below the ~2.67x
+    // multiple the bug rendered).
+    expect(boxHeight).toBeGreaterThan(fontSizePx * 0.8);
+    expect(boxHeight).toBeLessThan(fontSizePx * 1.8);
+
+    // No ellipsis painted — same technique as the `#656` test above (one element down, on the
+    // span rather than the wrapper): force the OLD fallback mechanism onto the very same node and
+    // confirm the pixels move, which is the only way to tell "no ellipsis" from "an ellipsis that
+    // happens to render invisibly".
+    const before = await span.screenshot();
+    const forced = await span.evaluate((el) => {
+      el.style.maxHeight = 'none';
+      el.style.display = '-webkit-box';
+      (el.style as unknown as Record<string, string>).webkitLineClamp = '1';
+      (el.style as unknown as Record<string, string>).webkitBoxOrient = 'vertical';
+      return true;
+    });
+    expect(forced).toBe(true);
+    const after = await span.screenshot();
+    expect(Buffer.compare(before, after)).not.toBe(0);
+  });
+});
+
+test.describe('single-line textOverflow: ellipsis (#725)', () => {
+  // `text-overflow` never applies to a flex container, and the host entity div is ALWAYS
+  // `display: flex` — so pre-fix this was inert on EVERY single-line ellipsis node. The fix
+  // moves it onto the same inner wrapper `maxLines` already uses. Same distinguishing technique
+  // as the `#656` test above: force the property OFF on the live wrapper and confirm the pixels
+  // move, which is the only way `getComputedStyle` alone cannot lie about (it reports the
+  // property as set either way — that IS how this bug hid).
+  async function assertEllipsisPainted(wrapper: Locator) {
+    const before = await wrapper.screenshot();
+    const forced = await wrapper.evaluate((el: HTMLElement) => { el.style.textOverflow = 'clip'; return true; });
+    expect(forced).toBe(true);
+    const after = await wrapper.screenshot();
+    expect(Buffer.compare(before, after)).not.toBe(0);
+  }
+
+  test('column host: text overflows its box and paints a real ellipsis', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineColumn');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'EllipsisSingleLineColumn');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+    const wrapper = host.locator('div').first();
+    await wrapper.waitFor({ state: 'visible', timeout: 10_000 });
+
+    // The host stays a plain flex container — nothing ellipsis-related leaks onto it.
+    expect(await host.evaluate((el) => getComputedStyle(el).display)).toBe('flex');
+
+    const [scrollWidth, clientWidth] = await Promise.all([
+      wrapper.evaluate((el) => el.scrollWidth),
+      wrapper.evaluate((el) => el.clientWidth),
+    ]);
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+
+    await assertEllipsisPainted(wrapper);
+  });
+
+  // The case #725 named as the one a naive fix would miss: the wrapper is a FLEX ITEM, and in a
+  // `row` host (main axis horizontal) it is not stretched to the host's width the way the
+  // default `column` host stretches it on the cross axis — without `min-width: 0` it would
+  // shrink-wrap to its `nowrap` text's full min-content width and overflow the host instead of
+  // ellipsizing inside it.
+  test('row host: min-width:0 lets the wrapper actually shrink and ellipsize instead of overflowing', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'EllipsisSingleLineRow');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'EllipsisSingleLineRow');
+    const host = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await host.waitFor({ state: 'visible', timeout: 10_000 });
+    const wrapper = host.locator('div').first();
+    await wrapper.waitFor({ state: 'visible', timeout: 10_000 });
+
+    expect(await host.evaluate((el) => getComputedStyle(el).flexDirection)).toBe('row');
+
+    const [hostWidth, wrapperWidth] = await Promise.all([
+      host.evaluate((el) => el.getBoundingClientRect().width),
+      wrapper.evaluate((el) => el.getBoundingClientRect().width),
+    ]);
+    // Without `min-width: 0` the wrapper would sit at its min-content size (the whole nowrap
+    // line) and push past the host's own width instead of staying inside it.
+    expect(wrapperWidth).toBeLessThanOrEqual(hostWidth + 1);
+
+    const [scrollWidth, clientWidth] = await Promise.all([
+      wrapper.evaluate((el) => el.scrollWidth),
+      wrapper.evaluate((el) => el.clientWidth),
+    ]);
+    expect(scrollWidth).toBeGreaterThan(clientWidth);
+
+    await assertEllipsisPainted(wrapper);
   });
 });
 

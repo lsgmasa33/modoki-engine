@@ -187,10 +187,11 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
   `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
-  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis` — ⚠️ only
-  honoured when `maxLines > 0`; on a SINGLE-LINE element `'ellipsis'` is inert, because
-  `text-overflow` does not apply to the flex container the host is. Measured, #725),
-  `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
+  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis` — honoured
+  both when `maxLines > 0` (the clamp wrapper below) and on a SINGLE-LINE element (`maxLines: 0`):
+  `text-overflow` does not apply to the flex container the host always is, so the same wrapper the
+  clamp uses is mounted for a single-line `ellipsis` too, carrying `overflow`/`text-overflow`/
+  `white-space` instead of the host (#725)), `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
 
   ⚠️ **`autoFitText` is SHRINK-ONLY (#614)** — off by default; when on, the effective font size is
   reduced, never grown past the authored `fontSize`, until the text fits its box on one line, down
@@ -209,8 +210,13 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `getComputedStyle` went on reporting them (`center`). That is the "unwired field is a lie with
   a tooltip" class, and #646 is what took it from theoretical to reachable by making the clamp
   actually engage. `UINode.tsx` now builds a `clampStyle` and mounts a wrapper `<div>` around the
-  text — **only when `maxLines > 0`**, so every other text node keeps byte-identical DOM. The
-  wrapper carries `UI_PAINT_ATTR`: `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an
+  text — **only when `maxLines > 0`, or when `maxLines === 0` and `textOverflow === 'ellipsis'`
+  (#725)** — so every other text node keeps byte-identical DOM. `minWidth: 0` is part of the
+  single-line `clampStyle` for the same reason #657 needed it one element over: the wrapper is a
+  flex ITEM, and a flex item's default `min-width: auto` resolves to its min-content size — for
+  `white-space: nowrap` text that's the ENTIRE line — so without it a `row` host (or any
+  non-stretch cross axis) could never shrink below that and would overflow instead of ellipsizing.
+  The wrapper carries `UI_PAINT_ATTR`: `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an
   entity with paint via a DIRECT text-node child, and without the marker a clamped label would
   read as decorative and a SceneView click would fall through it.
 
@@ -223,17 +229,23 @@ Field groups (representative fields, verified against `UIElement.ts`):
   alone makes the claim look wrong). The clip path therefore uses `display: block` + `overflow: hidden` +
   `max-height`. `textOverflow: 'ellipsis'` still takes the `-webkit-box` path, on the wrapper.
 
-  ⚠️ **A HEIGHT CAP IS NOT EQUIVALENT TO COUNTING LINES**, and the cap is used only where it
-  provably is. `lh`/`em` resolve against the WRAPPER's font size, so any descendant rendering at a
-  different size breaks the equivalence — which `autoFitText` does by construction. Measured: host
-  42px, span floored at 16px, `max-height: 1lh` = 48px against an 18px line box, i.e. **2.67 lines
-  where 1 was authored**. So:
+  ⚠️ **A HEIGHT CAP ON THE WRAPPER IS NOT EQUIVALENT TO COUNTING LINES**, because `lh`/`em` resolve
+  against the WRAPPER's font size while `AutoFitText` writes a SHRUNK `font-size` onto its own
+  inner span, one level down. Measured: host 42px, span floored at 16px, `max-height: 1lh` on the
+  WRAPPER = 48px against an 18px line box, i.e. **2.67 lines where 1 was authored**. The fix (#727)
+  is not a different cap on the same element — it moves the cap to the element whose font size
+  actually determines the line box: `AutoFitText` takes an optional `clampLines` prop and puts
+  `max-height: ${clampLines}lh` + `overflow: hidden` on its OWN span, where `lh` resolves against
+  whatever `fit()` actually wrote there, tracking a shrink exactly instead of over- or
+  under-capping. No explicit `line-height` is set anywhere to make this work — `line-height`
+  inherits, so authoring one would change the shrunk text's line spacing, a visual change nobody
+  asked for. So:
 
-  | authored | mechanism | why it is safe |
+  | authored | mechanism | why it is correct |
   |---|---|---|
-  | `lineHeight` set | `lineHeight × maxLines` px | a px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall whatever the font does |
-  | no `lineHeight`, no `autoFitText` | `${maxLines}lh` | nothing below changes the font, so `lh` is exact |
-  | no `lineHeight` + `autoFitText` | `-webkit-line-clamp` | counts LINE BOXES, immune by construction — and the ellipsis comes back with it (#727) |
+  | `lineHeight` set | `lineHeight × maxLines` px, on the wrapper | a px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall whatever the font does |
+  | no `lineHeight`, no `autoFitText` | `${maxLines}lh`, on the wrapper | nothing below changes the font, so `lh` is exact |
+  | no `lineHeight` + `autoFitText` | `${maxLines}lh`, on `AutoFitText`'s own span (`clampLines` prop) | `lh` there resolves against the size `fit()` actually wrote — exact whatever the shrink lands on, and `clip` is honoured instead of falling back to an unwanted ellipsis (#727) |
 
   ⚠️ `lh` needs Safari 16.4, *exactly* this repo's iOS floor — and note **Android WebView's version
   is independent of the OS floor**, so an in-support Android device on a stale WebView can miss it.

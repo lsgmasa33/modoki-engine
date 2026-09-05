@@ -425,6 +425,93 @@
           "layer": "ui"
         }
       }
+    },
+    {
+      "id": 15,
+      "name": "MaxLinesClipAutoFit",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "UI TEXT ANIMATION",
+          "fontSize": 42,
+          "fontSizeUnit": "px",
+          "fontSizeMin": 16,
+          "letterSpacing": 3,
+          "textColor": 16777215,
+          "autoFitText": true,
+          "maxLines": 1
+        },
+        "EntityAttributes": {
+          "name": "MaxLinesClipAutoFit",
+          "guid": "e2e50000-0000-4000-8000-000000000015",
+          "isActive": true,
+          "sortOrder": 14,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "name": "EllipsisSingleLineColumn",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 120,
+          "widthUnit": "px",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "THIS TEXT SHOULD ELLIPSIZE",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textOverflow": "ellipsis",
+          "maxLines": 0
+        },
+        "EntityAttributes": {
+          "name": "EllipsisSingleLineColumn",
+          "guid": "e2e50000-0000-4000-8000-000000000016",
+          "isActive": true,
+          "sortOrder": 15,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "name": "EllipsisSingleLineRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 120,
+          "widthUnit": "px",
+          "flexDirection": "row",
+          "backgroundOpacity": 0.9,
+          "backgroundColor": 3447003,
+          "text": "THIS TEXT SHOULD ELLIPSIZE",
+          "fontSize": 24,
+          "fontSizeUnit": "px",
+          "textColor": 16777215,
+          "textOverflow": "ellipsis",
+          "maxLines": 0
+        },
+        "EntityAttributes": {
+          "name": "EllipsisSingleLineRow",
+          "guid": "e2e50000-0000-4000-8000-000000000017",
+          "isActive": true,
+          "sortOrder": 16,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
     }
   ]
 }

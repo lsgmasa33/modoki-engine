@@ -398,11 +398,43 @@ describe('UINode text rendering', () => {
     // width/color above is the observable signal that the stroke branch ran.
   });
 
-  it('single-line ellipsis: overflow hidden + nowrap + text-overflow ellipsis', () => {
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DEFECT (#725). It asserted the three properties on the
+  // HOST — but the host is ALWAYS `display: flex` (`text-overflow` never applies to a flex
+  // container), so `text-overflow: ellipsis` there painted nothing while `getComputedStyle` went
+  // on reporting it as set. The fix moves all three onto the same inner wrapper #655 already
+  // mounts for the clamp, with the host left untouched.
+  it('single-line ellipsis (#725): lives on the wrapper, not the flex host', () => {
     const el = renderNode(makeNode({ text: 'long', textOverflow: 'ellipsis', maxLines: 0 }));
-    expect(el.style.overflow).toBe('hidden');
-    expect(el.style.whiteSpace).toBe('nowrap');
-    expect(el.style.textOverflow).toBe('ellipsis');
+    // The host stays a plain flex container — nothing ellipsis-related leaks onto it.
+    expect(el.style.display).toBe('flex');
+    expect(el.style.overflow).toBe('visible'); // node.overflow default — untouched by this fix
+    expect(el.style.whiteSpace).toBe('');
+    expect(el.style.textOverflow).toBe('');
+
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.overflow).toBe('hidden');
+    expect(clamp!.style.whiteSpace).toBe('nowrap');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
+    // Load-bearing (see the code comment): the wrapper is a flex item, and a flex item's default
+    // `min-width: auto` resolves to its min-content size — for `nowrap` text that's the ENTIRE
+    // line — so without this a `row` host (or any non-stretch cross axis) could never shrink
+    // below that and would overflow instead of ellipsizing.
+    expect(clamp!.style.minWidth).toBe('0px');
+  });
+
+  it('single-line ellipsis (#725): the wrapper style is identical in a row host, where the bug bit', () => {
+    // The default `column` host with `alignItems: 'stretch'` already fills the box width, which
+    // is why this shipped invisibly — nothing exercises the failing (non-stretch/row) axis. This
+    // pins that the emitted style does not depend on flexDirection; the real geometry is verified
+    // live in `editor-ui-autofit.spec.ts`.
+    const el = renderNode(makeNode({
+      text: 'long', textOverflow: 'ellipsis', maxLines: 0, flexDirection: 'row',
+    }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.minWidth).toBe('0px');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
   });
 
   // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DEFECT (#655). It asserted the clamp on the HOST —
@@ -480,18 +512,31 @@ describe('UINode text rendering', () => {
 
   // ⚠️ FINDINGS FROM THE CLOSE-OUT REVIEW. Each of these pins a defect the first version of the
   // change actually had, or a wiring that no test could see.
-  it('autoFitText + clip falls back to COUNTING LINES — a height cap is not equivalent', () => {
-    // MEASURED: the `lh` cap resolves against the WRAPPER's authored font size, while
-    // `AutoFitText` writes a shrunk `font-size` onto its inner span. Host 42px, span floored at
-    // 16px: `max-height: 1lh` = 48px against an 18px line box, i.e. 2.67 lines rendered where 1
-    // was authored. `-webkit-line-clamp` counts line boxes and is immune, so that is what this
-    // combination must use — accepting the ellipsis, which is the honest trade.
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DOCUMENTED LIMITATION (#727), not the defect itself —
+  // the `lh` cap resolves against the WRAPPER's authored font size, while `AutoFitText` writes a
+  // shrunk `font-size` onto its own inner span one level down (host 42px, span floored at 16px:
+  // `max-height: 1lh` on the wrapper = 48px against an 18px line box, i.e. 2.67 lines rendered
+  // where 1 was authored). The old fallback (`-webkit-line-clamp` on the wrapper) sidestepped
+  // that by counting line boxes instead — correct line count, but it paints an ellipsis `clip`
+  // explicitly asked not to have. The fix moves the cap to the span AutoFitText itself resizes.
+  it('autoFitText + clip (#727): the cap moves to the span AutoFitText resizes, not the wrapper', () => {
     const el = renderNode(makeNode({ text: 'long', maxLines: 1, autoFitText: true, fontSize: 42, fontSizeMin: 16 }));
     const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
     expect(clamp).not.toBeNull();
-    expect(clamp!.style.display).toBe('-webkit-box');
-    expect(clamp!.style.maxHeight).toBe('');           // NOT the cap — that is the bug
-    expect(styleAttr(clamp!)).toMatch(/-webkit-line-clamp:\s*1/);
+    // The wrapper itself now carries no cap of its own — it can't; see the code comment on why.
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.maxHeight).toBe('');
+    expect(clamp!.style.display).not.toBe('-webkit-box');
+    expect(styleAttr(clamp!)).not.toMatch(/-webkit-line-clamp/);
+
+    // The cap lands on AutoFitText's own span instead — `lh` there resolves against the size
+    // `fit()` actually wrote to THIS element, so it tracks a shrink exactly instead of over- or
+    // under-capping. No ellipsis anywhere: `clip` is finally honoured in this combination.
+    const span = clamp!.querySelector('span') as HTMLElement | null;
+    expect(span).not.toBeNull();
+    expect(span!.style.overflow).toBe('hidden');
+    expect(styleAttr(span!)).toMatch(/max-height:\s*1lh/);
+    expect(styleAttr(span!)).not.toMatch(/-webkit-line-clamp/);
   });
 
   it('an authored lineHeight keeps the px cap even under autoFitText', () => {

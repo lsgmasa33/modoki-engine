@@ -167,8 +167,8 @@ function contentWidthOf(elem: HTMLElement): number {
  *  is what makes a bad/contaminated measurement SAFE: the worst a wrong answer can do is fail to
  *  shrink, never make the box worse than the feature being off would have. */
 const AutoFitText = React.memo(function AutoFitText(
-  { children, text, fontSize, fontSizeMin }:
-  { children: React.ReactNode; text: string; fontSize: number; fontSizeMin: number },
+  { children, text, fontSize, fontSizeMin, clampLines }:
+  { children: React.ReactNode; text: string; fontSize: number; fontSizeMin: number; clampLines?: number },
 ) {
   const ref = React.useRef<HTMLSpanElement | null>(null);
   // The `availablePx` the last COMPLETED fit() was computed at — set at the end of every fit()
@@ -386,8 +386,19 @@ const AutoFitText = React.memo(function AutoFitText(
   // `node.maxLines > 0` clamp (on the wrapper since #655 — it can't split an atomic inline), and
   // does not reopen #614's flex-stretch bug (`block` and `inline-block` compute identically as
   // a flex item). Full reasoning + verification: `docs/ui-system.md`'s `maxLines` callout.
+  // `clampLines` (#727): the `clip` + `autoFitText` maxLines cap, put on THIS span instead of the
+  // `clampStyle` wrapper above it in the tree — `fit()` above writes a SHRUNK `font-size` onto
+  // this exact span, so `${clampLines}lh` resolves against the size that actually rendered,
+  // instead of the wrapper's authored (larger) one. `fit()` only ever measures WIDTH (this
+  // component's whole docblock), so this `maxHeight`/`overflow` addition cannot contaminate it —
+  // it is inert during every `fit()` measurement pass and only ever affects paint. No explicit
+  // `line-height` is set here (nor anywhere for this purpose): `line-height` inherits, and setting
+  // one would change the shrunk text's line spacing, a visual change #727 explicitly rules out.
+  const clampStyleProps: React.CSSProperties | undefined = clampLines != null
+    ? { maxHeight: `${clampLines}lh`, overflow: 'hidden' }
+    : undefined;
   return (
-    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap' }}>
+    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap', ...clampStyleProps }}>
       {children}
     </span>
   );
@@ -638,6 +649,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // Built here, applied to a wrapper around the text near the end of render — see the maxLines
   // block below for why it cannot live on the host.
   let clampStyle: React.CSSProperties | undefined;
+  // Set only in the `clip` + `autoFitText` + `maxLines > 0` + no-authored-`lineHeight` combination
+  // (#727) — the one case where the cap can't live on `clampStyle`'s wrapper (see the block below)
+  // and instead has to live on the span `AutoFitText` itself resizes. `undefined` everywhere else,
+  // so `AutoFitText`'s `clampLines` prop stays absent and every other text node is unaffected.
+  let autoFitClampLines: number | undefined;
   if (text) {
     // `cssVal` so a non-px `fontSizeUnit` resolves through the same `--ui-*` custom properties
     // every other length uses (#245). Default 'px' returns the bare number, i.e. unchanged.
@@ -709,25 +725,52 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         //   authored lineHeight  -> px, and a px line-height INHERITS as a fixed value, so the
         //                           span's line boxes stay that tall whatever the font does.
         //   no autoFitText       -> nothing changes the font below here; `lh` is exact.
-        //   otherwise            -> fall back to counting lines, and accept the ellipsis that
-        //                           comes with it (#727). Honouring `clip` there needs the cap to
-        //                           live on the element AutoFitText actually resizes, which is a
-        //                           different shape than this wrapper.
+        //   otherwise (#727)     -> the cap can't live here at all: `lh`/`em` on THIS wrapper
+        //                           resolve against ITS font size, but `AutoFitText` writes the
+        //                           shrunk size onto its own inner span one level down, so a cap
+        //                           here is too tall (measured: host 42px, span floored at 16px,
+        //                           `1lh` here = 48px against an 18px line box — 2.67 lines
+        //                           rendered where 1 was authored). Leave this wrapper uncapped
+        //                           and hand `maxLines` down as `autoFitClampLines` instead, so
+        //                           `AutoFitText` can put `${maxLines}lh` on the SPAN it resizes,
+        //                           where `lh` resolves against the size it actually wrote.
         clampStyle.display = 'block';
         if (node.lineHeight) {
           clampStyle.maxHeight = `${node.lineHeight * node.maxLines}px`;
         } else if (!node.autoFitText) {
           clampStyle.maxHeight = `${node.maxLines}lh`;
         } else {
-          clampStyle.display = '-webkit-box';
-          (clampStyle as any).WebkitLineClamp = node.maxLines;
-          (clampStyle as any).WebkitBoxOrient = 'vertical';
+          autoFitClampLines = node.maxLines;
         }
       }
     } else if (node.textOverflow === 'ellipsis') {
-      style.overflow = 'hidden';
-      style.textOverflow = 'ellipsis';
-      style.whiteSpace = 'nowrap';
+      // Moved off the host onto `clampStyle`'s wrapper (#725) — `text-overflow` never did
+      // anything here because the host entity div is ALWAYS `display: flex` (`style.display`
+      // above), and `text-overflow` does not apply to a flex container. It silently painted
+      // nothing while every other ellipsis field (`overflow`, `whiteSpace`) kept reading back
+      // from `getComputedStyle` as set — the same "lie with a tooltip" class as #656.
+      //
+      // `minWidth: 0` is load-bearing, not a stray reset. The wrapper mounted below is a FLEX
+      // ITEM of the host. A flex item's default `min-width: auto` resolves to its MIN-CONTENT
+      // size, which for `white-space: nowrap` text is the text's entire natural width — so in a
+      // `row` host (or any non-stretch cross axis) the item could never shrink below that, and
+      // would overflow its box instead of ellipsizing. The default `column` host with
+      // `alignItems: 'stretch'` already fills the box width regardless, which is why this bug
+      // shipped invisibly: nothing authors `row` + single-line `ellipsis` today, so the failing
+      // axis was never exercised. `shrinkWrapAlign` only ever returns margins, never `alignSelf`
+      // (see its own header), so it composes safely with this.
+      //
+      // Zero blast radius today: no `games/**`/`demos/**` entity authors `textOverflow: 'ellipsis'`
+      // with `maxLines: 0` — the only authored instances (`e2e-smoke.scene.json`) all set
+      // `maxLines: 1` and already go through the `maxLines > 0` branch above.
+      clampStyle = {
+        display: 'block',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        minWidth: 0,
+        ...shrinkWrapAlign(node.textAlign),
+      };
     }
   }
 
@@ -1218,12 +1261,17 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // Shrink-only auto-fit (#614) — wraps whatever textContent already is (a bare string, or the
   // AnimatedText span above), so it composes with text animation rather than competing with it.
   if (text && node.autoFitText) {
-    textContent = <AutoFitText text={text} fontSize={node.fontSize} fontSizeMin={node.fontSizeMin}>{textContent}</AutoFitText>;
+    // `clampLines` (#727) is only ever set for the `clip` + `autoFitText` + `maxLines > 0` +
+    // no-authored-`lineHeight` combination — see where `autoFitClampLines` is assigned above.
+    textContent = <AutoFitText text={text} fontSize={node.fontSize} fontSizeMin={node.fontSizeMin} clampLines={autoFitClampLines}>{textContent}</AutoFitText>;
   }
   // The maxLines clamp (#655/#656), OUTERMOST so it clamps whatever the two wrappers above
-  // produced. Only mounted when `maxLines > 0`, so every other text node keeps byte-identical
-  // DOM — this changes the shape every game's UI text renders into, and confining it to the
-  // elements that actually clamp is what keeps that blast radius at one authored entity today.
+  // produced. Mounted when `maxLines > 0`, and ALSO for a single-line `textOverflow: 'ellipsis'`
+  // since #725 (the host is a flex container, where `text-overflow` does nothing) — every other
+  // text node still keeps byte-identical DOM. This changes the shape every game's UI text renders
+  // into, so confining it to the elements that actually clamp or ellipsize is what keeps that
+  // blast radius small: one authored entity for the clamp, and ZERO for the single-line case —
+  // no `games/**`/`demos/**` entity authors `ellipsis` with `maxLines: 0` today.
   //
   // A `div`, not a `span`: `editor-ui-autofit.spec.ts` resolves the text span with
   // `box.locator('span')`, and a second span there is a Playwright strict-mode violation, not a
