@@ -104,7 +104,18 @@ const FROM_CONSTANT = /\b(version|schema)\s*:\s*[A-Z][A-Z0-9_]+|\.(version|schem
 const IGNORE_MARKER = 'format-version-guard: ignore-line';
 
 function violationsIn(relPath: string): { line: number; text: string }[] {
-  const src = fs.readFileSync(path.join(ENGINE, relPath), 'utf-8');
+  // `resolve`, not `join`, and the Windows CI is what forced it. The ignore-marker test below
+  // builds its synthetic file under `os.tmpdir()` and hands us `path.relative(ENGINE, file)`.
+  // On the Windows runner the repo is on `D:` and the temp dir on `C:`, and there IS no relative
+  // path across drives — `path.relative` hands back an ABSOLUTE `C:\…` path, which `join`
+  // happily glued onto the engine root to make `D:\a\…\engine\C:\…\synthetic.mjs` and
+  // ENOENT'd. (Spelled with an ellipsis on purpose: the literal Windows temp path trips
+  // `scan-publish-safety`'s home-dir-username rule, and the drive letter is the whole point
+  // here anyway.) `resolve` returns an already
+  // absolute argument unchanged, and is identical to `join` for the relative producer paths
+  // (`..` segments included). Green on every POSIX clone either way — this is only reachable
+  // where the tree and the temp dir sit on different volumes.
+  const src = fs.readFileSync(path.resolve(ENGINE, relPath), 'utf-8');
   const hits: { line: number; text: string }[] = [];
   src.split('\n').forEach((line, idx) => {
     const trimmed = line.trim();
