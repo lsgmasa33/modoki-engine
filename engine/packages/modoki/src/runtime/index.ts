@@ -7,6 +7,15 @@ import './core/instanceGuard';
 import './loaders/registerProviders';
 
 export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION, SUBGAME_MANIFEST_SCHEMA_VERSION } from './core/version';
+// The whole format-versioning module (docs/format-versioning.md § 2a), not just the unknown-field
+// bag — a PRESERVE-disposition writer (§ 2b-bis) needs the classifier and `preservedVersion` too,
+// and hand-rolling the bag is exactly what § 2b-bis warns against (wordweave did it twice in one
+// game, and review still caught a real defect in the second one, #763).
+export {
+  classifyFormatVersion, classifyJsonFormatVersion, isReadable, preservedVersion,
+  collectUnknownFields, mergeUnknownFields,
+  type FormatVerdict, type UnreadableReason, type ClassifyOptions,
+} from './core/formatVersion';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';

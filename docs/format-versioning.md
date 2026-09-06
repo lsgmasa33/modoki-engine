@@ -136,6 +136,40 @@ PRESERVE additionally needs the unknown-field bag (`collectUnknownFields` / `mer
 same module). ⚠️ **Do not hand-roll it.** `wordweave` rolled it twice, in the same game, and review
 still caught a real defect in the second one (#763).
 
+⚠️ **A PRESERVE writer that ALSO syncs to the cloud must carry the bag on the WIRE too, IN PLACE —
+never as a side-car field** (#760 phase G; Court's `saveSync.ts`/`systems.ts` is the worked example).
+The disc write alone is not enough for a signed-in player: a build that only preserves locally still
+loses an unrecognised field the moment it rolls back AND syncs, because the sync layer's own document
+shape is typically a second, narrower named-field projection of the same data (Court's `CourtSave`)
+that never carried the bag through. The fix is the SAME shape twice — hoist the bag out of every
+sub-document as one field for the whole in-memory journey (never smeared across the pieces it came
+from, or every comparison downstream has to know to look in several places), and re-nest it back onto
+the DISC/WIRE position it came from at every write, never at a new top-level key. A side-car would
+sit at the WRONG position for a build that later adds a REAL field of that name, and would never stop
+being carried forward as a shadow copy once one did.
+
+⚠️ **Exception: a group whose WIRE format is FLATTER than its disc shape cannot round-trip every
+level, and that is not a bug in the rule above — it is a limit the rule must state rather than
+promise past.** A wire key this build does not recognise always lands back in the single deepest
+bucket the flatter wire shape can represent, because that is the only place left for it once the
+nesting the disc side carries has been collapsed away for the wire. Such a group carries only the
+bucket the wire can express, and its own documentation must say which level stays LOCAL-only and
+does not survive a round trip through the wire. Court's `court.settings` is the worked example —
+`nestSettingsSave` writes the flat wire shape, `collectSettingsWirePreserved` is the bag collector
+on that shallower side — and its own accounts doc names the local-only level explicitly rather than
+leaving a reader to assume the general rule above covers it whole.
+
+**The obligation this places on every future build:** a field a synced PRESERVE document adds must
+also be added to `stableSections` (or whichever function decides that document's sync
+DIRTINESS/fingerprint) **conditionally** — the `dailySpend`/login-bonus idiom in Court's
+`stableSections` (`saveSync.ts`), added via `...(x.length ? [x] : [])` rather than unconditionally, so
+a save that has never touched the new field fingerprints BYTE-IDENTICALLY to one from before the
+field existed. Skipping this is not silently safe in the other direction either: a field that never
+joins `stableSections` will not upload from a rolled-back build EITHER, exactly the gap this phase
+closes for everything that predates it — the bag preserves it locally and across an ordinary sync,
+but a device that never independently dirties for a REASON having nothing to do with the new field
+may sit on it without ever being asked to upload.
+
 ### 2c. The refusal channel — LOCAL, deliberately
 
 This is the part that legitimately differs, and pretending otherwise would make this a bad
@@ -151,9 +185,25 @@ abstraction. What a site does with a `too-new` verdict is dictated by its caller
 What must be uniform is the **verdict** and the **decision table in §3** — not the plumbing. A new
 document picks a channel that fits its caller and records the choice in that table.
 
-## 3. The decision table — every versioned document in the repo
+## 3. The decision table — every ENGINE-owned versioned document
 
-The corpus. A new versioned document adds a row here in the same change that introduces it.
+The corpus of documents the engine itself defines and reads/writes. A new versioned document owned
+by the engine adds a row here in the same change that introduces it.
+
+⚠️ **A game can own versioned documents of its own, and this table does not enumerate them** — Court's
+`SESSION_SCHEMA_VERSION` (`games/court/runtime/session.ts`) and wordweave's `SAVE_SCHEMA_VERSION`/
+`PURCHASES_SCHEMA_VERSION` (`games/wordweave/runtime/save.ts`, `store.ts`) are all real, live
+constants and none of them is a row below. A game records its own documents' disposition in its own
+feature doc — Court's is `games/court/accounts.md` § "PRESERVE at the write — surviving a build
+rollback (#760)", covering `court.purchases`/`court.progress`/`court.settings`/
+`court.analytics.install`/`court.account`/the wipe-pending marker/**`court.session.<levelId>`**.
+**`court.session.<levelId>`'s disposition is now decided (#760 phase F, corrected by review fix #1):
+PRESERVE an unknown top-level field, but always stamp `v` to the CURRENT build's own version, never
+a loaded document's** — see `serializeSession`'s own banner in `session.ts` for the full reasoning.
+The reason it is NOT simply "PRESERVE, like the rest of the table": `log` is version-GATED (exactly
+the case § 2b-bis's `preservedVersion` helper is the wrong tool for), and this build always rewrites
+that field wholesale rather than merely re-serializing an untranslated one, so `v` must describe what
+THIS build wrote, not what an unreadable newer document claimed.
 
 | Document | Constant | Disposition | Reads it? | On `too-new` |
 |---|---|---|---|---|
@@ -280,10 +330,53 @@ it is load-bearing does not.
    `.meta.json` sidecar quarantines to `<file>.corrupt`. Following steps 1-3 and 6 alone will pass a
    green gate and reproduce #778 exactly.
 5. Stamp on write from the constant (`preservedVersion` if PRESERVE); never echo the stored value.
+   ⚠️ **`preservedVersion` is the wrong tool the moment your document has a version-GATED field that
+   this build REWRITES**, and its own docblock says so — *"check that every field you are about to
+   write is one this build actually implements at the version being claimed."* Court's session
+   document is the worked example, and it was got wrong first (#760 phase F, caught in review):
+   `deserializeSession` DROPS the undo log on a version mismatch, so the log written back is this
+   build's own — and preserving the stored higher version made a future build see its own number,
+   trust the document, and replay a log written under semantics it does not share. The rule that
+   falls out: **the version must describe the content you actually wrote.** Preserving a higher
+   version is right when you carried everything through unread; stamping your own is right when you
+   rewrote the field the version gates. Nothing is lost by stamping down in that case, because the
+   unknown fields are preserved either way — the two halves are independent.
 6. Pick a refusal channel that fits your caller, and **add a row to §3** including its disposition.
 7. Add a test that seeds a `too-new` document and asserts the bytes are unchanged after the refusal
-   (REFUSE) or that its fields and version SURVIVE a write (PRESERVE) — not merely that the call
-   failed. A cache-only or return-value assertion passes without the fix.
+   (REFUSE) or that its fields SURVIVE a write (PRESERVE) — not merely that the call failed. A
+   cache-only or return-value assertion passes without the fix. **The version half of that
+   assertion is conditional on step 5's caveat**: assert the version survives too ONLY when the
+   document has no version-gated field this build rewrites; when it does, the version being
+   asserted is THIS build's own stamped-down value, not the loaded one, and a test asserting
+   "survives" would be pinning the exact regression step 5 describes (Court's session document,
+   #760 phase F/review fix #1, is the worked example both ways — `session.test.ts`'s "must stamp
+   THIS build's own version, not preserve the newer one").
+
+## 6. The `family/persisted-schema` label — a summary, not the boundary
+
+The tracker groups this work under `family/persisted-schema`. Two things about that label have
+already caused a wrong call each, so they are recorded here rather than in the label text, which has
+a hard 100-character cap and can only ever be a summary.
+
+**Membership is about the MECHANISM a design must address, not a patch the members share.** The
+members' fixes genuinely differ — #760 carries unknown fields through a write; #807 stops stamping a
+version it did not earn; #767 reads a `too-new` document instead of discarding it. They are one
+family because **one design has to answer all of them**, which is the whole reason the owner ruled
+(2026-09-06) that a family is designed across rather than fixed member by member. Reading the label
+as "these share a patch" is what makes a member look like it belongs somewhere else.
+
+**Measure a candidate against the membership, not against the label's wording.** #807 was excluded
+from this family on the strength of the description alone — and the description at the time
+(*"old build reading a NEWER doc drops what it doesn't know"*) matched only three of the nine
+members. It was describing one member's symptom. The corrected description covers two mechanisms
+deliberately: *loses* (unknown fields destroyed — #760, #767, #778, #821) and *misstates* (a version
+written that the content does not satisfy, in either direction — #734 lowering, #807 raising).
+
+⚠️ **Two members fit "misstates" only loosely, and knowing which ones is the point.** #730 and #629
+are neither: nothing is lost and nothing is stated wrongly. Their defect is a version that guards
+**nothing** — written on every publish and read by no branch; two constants that never meet. Call it
+**"written but unbranched"** if it needs a name. It is arguably a third mechanism in this family, and
+a reader measuring a new issue against the two-word description will not find it there.
 
 Related: [player-prefs.md](./player-prefs.md) · [ota-updates.md](./ota-updates.md) ·
 [ota-subgame-modules.md](./ota-subgame-modules.md) · [editor.md](./editor.md) ·
