@@ -453,7 +453,15 @@ describe('data-ui-id tagging has not rotted', () => {
     let scanned = 0;
     for (const root of SCAN_ROOTS) {
       for (const file of listTsxFiles(root)) {
-        const rel = path.relative(path.resolve(__dirname, '../..'), file);
+        // POSIX-normalised before the lookup below. `DATA_UI_ID_EXEMPT` is keyed with forward
+        // slashes, but `path.relative` yields `packages\modoki\...` on Windows — so the key
+        // missed there, the one legitimate exemption reported as untagged, and this went red on
+        // the public Windows leg while every Mac/Linux clone stayed green. That is this repo's
+        // recurring path-separator class; see docs/windows.md.
+        const rel = path
+          .relative(path.resolve(__dirname, '../..'), file)
+          .split(path.sep)
+          .join('/');
         const src = fs.readFileSync(file, 'utf8');
         const exempt = DATA_UI_ID_EXEMPT[rel] ?? [];
         for (const hit of findBufferedInputs(src)) {

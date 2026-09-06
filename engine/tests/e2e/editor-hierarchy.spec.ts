@@ -117,11 +117,17 @@ test('Create Prefab serializes the subtree and POSTs a .prefab.json (write inter
   await expect.poll(() => write).not.toBeNull();
   expect(write!.path).toMatch(/\/games\/3d-test\/assets\/prefabs\/CenterCube\.prefab\.json$/);
   const prefab = JSON.parse(write!.content!);
-  // 2 since #379. The serializer used to stamp 1 on a flat prefab (`nestedRefs.size > 0 ? 2 : 1`),
-  // a rule that could DECREASE the field; it now always writes the current format version. The
-  // literal is deliberate here — this spec asserts the BYTES that reached disk, so importing the
-  // constant would let a wrong constant vouch for itself.
-  expect(prefab.version).toBe(2);
+  // 3 since the #762 follow-up (`613dc5909`) migrated `UIAnchor.zIndex` onto `UIElement`; 2 since
+  // #379, when the serializer stopped stamping 1 on a flat prefab (`nestedRefs.size > 0 ? 2 : 1`) —
+  // a rule that could DECREASE the field — and started always writing the current format version.
+  // The literal is deliberate here — this spec asserts the BYTES that reached disk, so importing
+  // the constant would let a wrong constant vouch for itself.
+  //
+  // ⚠️ BUMPING `PREFAB_FORMAT_VERSION` MEANS UPDATING THIS LINE, and nothing local will say so:
+  // e2e is not part of `npm run verify`, so the bump goes green on every clone and this assertion
+  // fails only on the public runner AFTER the push. That is exactly how `main` reached 3 with this
+  // line still reading 2 — two public runs red before the hub noticed.
+  expect(prefab.version).toBe(3);
   expect(prefab.name).toBe('CenterCube');
 });
 
