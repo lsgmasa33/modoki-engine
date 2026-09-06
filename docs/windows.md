@@ -147,6 +147,33 @@ load-bearing and commented as such).
     set rather than that it is empty, so broken matching over-reports instead of going quiet. The
     sweep that followed found `updateEachFanoutGuard`'s `ALLOWLIST` keyed the same way — latent only
     because that list is empty today, fixed in the same commit.
+  - Instances 7 and 8 landed 2026-09-06 on the `win` clone, found in a sweep the same day `main`
+    fixed instances 5-6 (`f5e40a1e9` chromeTagging, `2ed8b6035` formatVersionFromConstant):
+    `textDirtyAttribution.test.ts`'s definition-site exemption (`rel.endsWith('text/textDirty.ts')`
+    against `path.relative()` output) never fired on Windows, so the guard silently fell through
+    into the callers-only assertion instead of skipping; and `show-refs.mjs`'s
+    `full.includes('/scenes/')` never matched, so `--all` printed no scene sections at all despite
+    scene files existing. (The `entries: 0` line it also prints is the MANIFEST count, a
+    separate and NOT Windows-specific defect — issue #805, where the same file's walk root also
+    turns out to reach 2 of ~226 candidate files. It reads 0 before and after this fix.) Both fixed with the same normaliser,
+    and the guard got a non-vacuity companion assertion
+    per the prescription above (`textDirtyAttribution.test.ts` now separately asserts the scan
+    reaches the definition file AND that the skip predicate matches it).
+  - **SSOT note, which the four entries above do not say and is the reason this class keeps
+    recurring**: the normalisation itself was hand-rolled FIVE times in THREE spellings before
+    instances 7/8 — `importClosure.ts`'s exported `toPosix` (`split(/[\\/]/)`, the only one
+    previously exported — and reachable from `engine/tests/`, so that was never the barrier; the
+    real one is that it is a `.ts` helper and the plain-`.mjs` scripts cannot import it, which is
+    why a second copy had to exist at all), `materialCloneStamp.test.ts`'s local `toPosix`
+    (`split(sep)`), `consoleRingOptionsWiring.test.ts`'s `relPosix` (`split(path.sep)`), and
+    `qaCaseReferences.test.ts` / `skillReferences.test.ts`'s local `toPosix`es (both
+    `replace(/\\/g,'/')`) — plus roughly 60 more inline copies across the repo. ⚠️ Only the
+    `split(path.sep)` spelling actually MISBEHAVES (it is separator-dependent, so it leaves a
+    Windows-shaped path unnormalised on POSIX); the other two are extensionally identical, so
+    "three spellings" is a duplication problem, not three behaviours.
+    `engine/scripts/pathPosix.mjs` (`toPosix`) is now the shared one for **new** code; the existing
+    ~66 sites were deliberately left as-is — they're churn with no defect behind them, not a
+    backlog to migrate.
 
 ## Never shell out to a platform binary whose shape you assumed
 

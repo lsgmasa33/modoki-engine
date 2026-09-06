@@ -15,6 +15,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { toPosix } from './pathPosix.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -130,7 +131,7 @@ async function findAllScenesAndPrefabs(dir, out = []) {
     if (ent.isDirectory()) {
       await findAllScenesAndPrefabs(full, out);
     } else if (ent.name.endsWith('.prefab.json')
-      || (ent.name.endsWith('.json') && full.includes('/scenes/'))) {
+      || (ent.name.endsWith('.json') && toPosix(full).includes('/scenes/'))) {
       out.push(full);
     }
   }
