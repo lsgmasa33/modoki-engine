@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
  * A `--target playable` build ALIASES every `@<game>/app-services` import to
@@ -47,19 +47,22 @@ function stubExports(): Set<string> {
 /** ⚠️ Listed broadly and filtered HERE, not with a `**` pathspec. git's wildmatch made
  *  `games/*\/runtime/**\/*.ts` require an intermediate directory, so it silently skipped
  *  `games/court/runtime/systems.ts` — the very file that broke the build. The first draft of
- *  this guard passed happily with the stub's `track` export renamed away. */
+ *  this guard passed happily with the stub's `track` export renamed away.
+ *
+ *  `includeUntracked: false` — this guard's own reasoning (below, `git ls-files` lists what is
+ *  TRACKED) is a statement about tracked-only semantics being deliberate, not incidental: a
+ *  brand-new, not-yet-committed game file legitimately has nothing wired to it yet. `repoFiles()`
+ *  already drops a tracked-but-deleted file via its own `statSync().isFile()` filter, which is
+ *  what the removed explicit `existsSync` re-check used to do by hand. */
 function scannableFiles(): string[] {
-  return execFileSync('git', ['ls-files', 'games', 'demos'], { cwd: repoRoot, encoding: 'utf8' })
-    .trim().split('\n').filter(Boolean)
-    .filter((f) => /\.tsx?$/.test(f))
+  return repoFiles({
+    under: ['games', 'demos'],
+    match: /\.tsx?$/,
     // The app-services package DEFINES these names; it is not a consumer of the stub.
-    .filter((f) => !f.includes('/packages/'))
-    .filter((f) => !f.includes('/tests/'))
-    // `git ls-files` lists what is TRACKED, which includes a file deleted in the working tree but
-    // not yet staged — an ordinary mid-refactor state. Reading it threw ENOENT and the guard died
-    // with a stack trace instead of an answer, which reads as a broken test rather than as a file
-    // that is on its way out. Skipping it is right: a deleted file imports nothing.
-    .filter((f) => existsSync(path.join(repoRoot, f)));
+    exclude: ['packages', 'tests'],
+    floor: 0,
+    includeUntracked: false,
+  }).map((f) => f.rel);
 }
 
 /**

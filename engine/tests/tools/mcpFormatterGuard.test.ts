@@ -20,14 +20,24 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
 const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf-8');
-/** Every .ts under src, recursively — relative paths, so failures name the file. */
-const sources = (dir = SRC, prefix = ''): string[] =>
-  fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory() ? sources(path.join(dir, e.name), `${prefix}${e.name}/`)
-      : e.name.endsWith('.ts') ? [`${prefix}${e.name}`] : []);
+
+/** Every `.ts` under `SRC`, recursively — SRC-relative paths, so failures name the file. Via
+ *  the shared corpus producer (#799/#771/#805 Phase 4); `repoFiles()`'s own `rel` is
+ *  repo-root-relative, so the prefix up to and including `SRC` is stripped by a plain string
+ *  search, THROWING rather than tolerating a miss (same reasoning as
+ *  `materialCloneStamp.test.ts`'s `runtimeFiles()`) — floored well under the 22 measured today. */
+const SRC_PREFIX = 'engine/tools/modoki-mcp/src/';
+const sources = (): string[] =>
+  repoFiles({ under: SRC, match: /\.ts$/, floor: 15 }).map(({ rel }) => {
+    if (!rel.startsWith(SRC_PREFIX)) {
+      throw new Error(`mcpFormatterGuard: ${rel} is not under "${SRC_PREFIX}", but \`under\` is SRC.`);
+    }
+    return rel.slice(SRC_PREFIX.length);
+  });
 
 describe('MCP result formatting flows through result.ts', () => {
   it('the tool context builds its ok/err from createFormatter', () => {

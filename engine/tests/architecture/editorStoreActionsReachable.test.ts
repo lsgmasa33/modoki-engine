@@ -26,6 +26,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const root = path.resolve(__dirname, '../..');
 const storeFile = path.join(root, 'packages/modoki/src/editor/store/editorStore.ts');
@@ -71,26 +72,18 @@ function actionNames(block: string): string[] {
   return out;
 }
 
+/** Every `.ts`/`.tsx` under the consumer roots, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 2144 measured today.
+ *
+ *  THIS FILE is excluded as well as the store: `knownOrphans` names the orphans as string
+ *  literals, so counting itself as a corpus would make every entry look like it had acquired a
+ *  consumer the moment it was listed — the allowlist would launder the very thing it documents. */
 function sourceFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    if (!fs.existsSync(dir)) return;
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'node_modules' || e.name === 'dist') continue;
-        walk(p);
-      // THIS FILE is excluded as well as the store: `knownOrphans` names the orphans as
-      // string literals, so counting itself as a corpus would make every entry look like
-      // it had acquired a consumer the moment it was listed — the allowlist would
-      // launder the very thing it documents.
-      } else if (/\.tsx?$/.test(e.name) && p !== storeFile && p !== __filename) {
-        out.push(p);
-      }
-    }
-  };
-  for (const d of consumerRoots) walk(d);
-  return out;
+  return repoFiles({
+    under: consumerRoots, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 1500,
+  })
+    .map(({ abs }) => abs)
+    .filter((p) => p !== storeFile && p !== __filename);
 }
 
 describe('editor store actions are reachable', () => {

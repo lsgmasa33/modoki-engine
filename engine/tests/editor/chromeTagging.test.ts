@@ -16,6 +16,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const ED = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => fs.readFileSync(path.join(ED, rel), 'utf8');
@@ -401,14 +402,12 @@ describe('data-ui-id tagging has not rotted', () => {
     path.resolve(__dirname, '../../app'),
   ];
 
-  function listTsxFiles(dir: string): string[] {
-    const out: string[] = [];
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, entry.name);
-      if (entry.isDirectory()) out.push(...listTsxFiles(p));
-      else if (entry.name.endsWith('.tsx')) out.push(p);
-    }
-    return out;
+  /** Every `.tsx` under `dir`, via the shared corpus producer (#799/#771/#805 Phase 4). Called
+   *  once per SCAN_ROOT, the smaller of which (`app`) measures 11 today — floored under that,
+   *  not under the 101 combined total (the aggregate non-vacuity pin below is `scanned > 30`). */
+  function listTsxFiles(dir: string): { abs: string; rel: string }[] {
+    return repoFiles({ under: dir, match: /\.tsx$/, floor: 5 })
+      .map(({ abs, rel }) => ({ abs, rel }));
   }
 
   /** Find every `<BufferedNumberInput …>`/`<BufferedTextInput …>` JSX element in `src` and
@@ -445,23 +444,17 @@ describe('data-ui-id tagging has not rotted', () => {
     // carries `data-ui-id="inspector.header.name"` (asserted above, and load-bearing for
     // `qa/cases/**`) — passing a SECOND id on the input inside it would tag the same logical
     // field twice under two different ids. See the comment at the call site.
-    'packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput // Bind the RAW stored name'],
+    //
+    // Keyed with `repoFiles()`'s own `rel` — repo-root-relative, git POSIX (#799/#771/#805 Phase
+    // 4) — not the engine-relative form this used before migrating off a hand-rolled walker.
+    'engine/packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput // Bind the RAW stored name'],
   };
 
   it('every BufferedNumberInput/BufferedTextInput passes a dataUiId prop (#724)', () => {
     const missing: string[] = [];
     let scanned = 0;
     for (const root of SCAN_ROOTS) {
-      for (const file of listTsxFiles(root)) {
-        // POSIX-normalised before the lookup below. `DATA_UI_ID_EXEMPT` is keyed with forward
-        // slashes, but `path.relative` yields `packages\modoki\...` on Windows — so the key
-        // missed there, the one legitimate exemption reported as untagged, and this went red on
-        // the public Windows leg while every Mac/Linux clone stayed green. That is this repo's
-        // recurring path-separator class; see docs/windows.md.
-        const rel = path
-          .relative(path.resolve(__dirname, '../..'), file)
-          .split(path.sep)
-          .join('/');
+      for (const { abs: file, rel } of listTsxFiles(root)) {
         const src = fs.readFileSync(file, 'utf8');
         const exempt = DATA_UI_ID_EXEMPT[rel] ?? [];
         for (const hit of findBufferedInputs(src)) {

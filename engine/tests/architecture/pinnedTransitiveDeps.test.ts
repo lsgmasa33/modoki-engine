@@ -23,10 +23,10 @@
  *       `@capacitor/cli` is, so a structural rule there would be wrong.
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { REPO_ROOT, hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = REPO_ROOT;
 
@@ -59,10 +59,12 @@ const PACKAGE_JSON_FLOOR = hasInternalGames() ? 10 : 5;
 const UUID_LOCKFILE_DETECTION_FLOOR = 8;
 const CLI_MANIFEST_DETECTION_FLOOR = 15;
 
-const tracked = (...args: string[]): string[] =>
-  execFileSync('git', ['ls-files', ...args], { cwd: repoRoot, encoding: 'utf8' })
-    .split('\n')
-    .filter(Boolean);
+// `includeUntracked: false` — the resolution/declaration invariants below are about what a
+// clone/CI actually INSTALLS FROM, i.e. the committed lockfile/manifest; an uncommitted edit is
+// not yet what `npm install` resolves against on any other clone. Preserves this guard's original
+// (tracked-only) `git ls-files` behaviour, which never passed `--others`.
+const trackedMatching = (match: RegExp): string[] =>
+  repoFiles({ match, floor: 0, includeUntracked: false }).map((f) => f.rel);
 
 /** `package-lock.json`'s `packages` map keys look like `"node_modules/foo/node_modules/uuid"` — the
  *  installed package name is whatever follows the LAST `node_modules/` segment. */
@@ -105,7 +107,7 @@ function versionBelow(version: string, floor: string): boolean {
 
 describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "Pinned transitive deps" (#177)', () => {
   describe('(a) resolution floor — no tracked lockfile resolves a known-vulnerable pinned version', () => {
-    const lockfiles = tracked('*package-lock.json');
+    const lockfiles = trackedMatching(/(^|\/)package-lock\.json$/);
 
     it('finds lockfiles to check — a vacuous pass is a failure', () => {
       // Floor well under the real count for whichever tree this is (29 private / 4 snapshot), so
@@ -165,7 +167,7 @@ describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "P
     // No carve-outs on purpose. An earlier draft skipped `*/plugins/*`, which matched nothing
     // tracked — an exemption covering no citation reads as enforcement and enforces nothing, the
     // failure mode docCitations.test.ts checks its own allowlists in both directions to avoid.
-    const packageJsons = tracked('*package.json');
+    const packageJsons = trackedMatching(/(^|\/)package\.json$/);
 
     it('finds package.json files to check — a vacuous pass is a failure', () => {
       // Floor well under the real count for whichever tree this is (42 private / 12 snapshot).

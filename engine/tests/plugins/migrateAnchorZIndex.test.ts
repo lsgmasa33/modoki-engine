@@ -24,8 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-const REAL_SCRIPT = path.resolve(__dirname, '../../scripts/migrate-anchor-zindex.mjs');
-const REAL_PROJECT_ROOTS = path.resolve(__dirname, '../../scripts/projectRoots.mjs');
+const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
 
 /** Whether this filesystem collapses two paths differing only in case onto the same file —
  *  macOS (APFS default) and Windows do; Linux ext4 does not. Tests 2 and 4 reproduce a defect
@@ -45,14 +44,22 @@ const CASE_INSENSITIVE_FS = (() => {
 
 let tmp: string;
 
-/** Sets up `<tmp>/engine/scripts/{migrate-anchor-zindex.mjs,projectRoots.mjs}` — the exact
- *  relative depth the real script expects from its own location, so `ROOT` inside the copy
- *  resolves to `tmp`, not this repo. `gitInit` is skippable for the "not a work tree" case. */
+/** Sets up `<tmp>/engine/scripts/**` — the exact relative depth the real script expects from its
+ *  own location, so `ROOT` inside the copy resolves to `tmp`, not this repo. `gitInit` is
+ *  skippable for the "not a work tree" case.
+ *
+ *  ⚠️ **Copies the whole directory, deliberately, rather than naming the script's imports.** This
+ *  used to copy exactly two files — the script and `projectRoots.mjs` — which is a hand-maintained
+ *  dependency list, and it broke the moment the script gained a third import (`repoCorpus.mjs`,
+ *  #771): all 7 tests here died with ERR_MODULE_NOT_FOUND. A per-file list drifting from what the
+ *  code actually needs is the SAME failure this whole family of changes exists to remove, so the
+ *  fix is not a third `copyFileSync` — that just resets the timer. The directory copy has nothing
+ *  to keep in step. It costs ~80 small files per test, which is not measurable next to the `git
+ *  init` this function already does. */
 function makeRepo({ gitInit = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-migrate-anchor-'));
-  fs.mkdirSync(path.join(dir, 'engine', 'scripts'), { recursive: true });
-  fs.copyFileSync(REAL_SCRIPT, path.join(dir, 'engine', 'scripts', 'migrate-anchor-zindex.mjs'));
-  fs.copyFileSync(REAL_PROJECT_ROOTS, path.join(dir, 'engine', 'scripts', 'projectRoots.mjs'));
+  fs.mkdirSync(path.join(dir, 'engine'), { recursive: true });
+  fs.cpSync(REAL_SCRIPTS_DIR, path.join(dir, 'engine', 'scripts'), { recursive: true });
   if (gitInit) {
     git(dir, ['init', '-q']);
     git(dir, ['config', 'user.email', 'test@example.com']);
@@ -196,7 +203,18 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
 
     const { status, out } = runAllowFail(tmp);
     expect(status).toBe(1);
-    expect(out).toMatch(/ABORT: could not enumerate files through git/);
+    // The wording moved when the script adopted the shared producer (#771): the abort is now
+    // raised by `repoCorpus.mjs` and translated to a CLI line, and outside a work tree the FIRST
+    // thing to fail is resolving the repo root, not listing files — so it names
+    // `git rev-parse --show-toplevel` rather than the old enumerate-files phrasing. Asserted on
+    // the three things that actually matter to the operator, so this stays load-bearing rather
+    // than being loosened to `/ABORT/`: it aborted, it says GIT is why, and it says nothing was
+    // written. The last clause is the one that matters most — this script rewrites other people's
+    // scenes on disk, so "it failed" and "it failed without touching anything" are different
+    // promises, and only the second one makes an abort safe.
+    expect(out).toMatch(/ABORT: /);
+    expect(out).toMatch(/git rev-parse --show-toplevel/);
+    expect(out).toMatch(/Nothing was written\./);
     expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
 

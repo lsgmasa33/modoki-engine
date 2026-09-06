@@ -19,60 +19,28 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { orderEntitiesForSave } from '../../packages/modoki/src/runtime/core/ecs/entityOrder';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 
-/** Path segments that mark a file as a build-output COPY of a source scene, not the
- *  authored file itself — a stale duplicate would double-report or false-positive on
- *  content the real fix already fixed. */
-/*  `/ads/` is the `--target playable` output dir (`games/<id>/ads/`), gitignored at
- *  `.gitignore:7` and tracked nowhere in the repo — so it holds a COPY of scenes this
- *  guard already checks at their authored path, frozen at whatever the export ran on.
- *  Without it here the gate goes red on any clone that has ever run a playable build,
- *  citing files git does not even know about; the hub stays green only because it has
- *  not run one. `/subgame-dist/` (`.gitignore:8`) is the sibling build-output dir under the
- *  same roots and is listed for the same reason — the sibling guard in
- *  `engine/tests/architecture/claudeMdBudget.test.ts` already excludes both. It is not
- *  established that a subgame build ever emits a `.scene.json`; it is here so the next
- *  person does not rediscover this the way `/ads/` was rediscovered. */
-const EXCLUDED_SEGMENTS = ['/node_modules/', '/dist/', '/android/', '/ios/', '/build/', '/ads/', '/subgame-dist/'];
-
 /** Where authored scenes and prefabs live: games, demos, the scaffolder template, and the
- *  engine's own test fixtures. */
-const ASSET_ROOTS = [
-  path.join(REPO, 'games'),
-  path.join(REPO, 'demos'),
-  path.join(REPO, 'engine/templates'),
-  path.join(REPO, 'engine/tests/fixtures'),
-];
-
-function isExcluded(absPath: string): boolean {
-  const normalized = absPath.split(path.sep).join('/');
-  return EXCLUDED_SEGMENTS.some((seg) => normalized.includes(seg));
-}
-
-function* walk(dir: string, suffix: string): Generator<string> {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    const full = path.join(dir, e.name);
-    if (isExcluded(full)) continue;
-    if (e.isDirectory()) yield* walk(full, suffix);
-    else if (e.isFile() && e.name.endsWith(suffix)) yield full;
-  }
-}
+ *  engine's own test fixtures.
+ *
+ *  Git-enumerated (#771/#799) rather than a hand-rolled recursive walk with its own
+ *  build-output skip list. `android`/`ios` are excluded explicitly because they are TRACKED
+ *  native mirrors that would hold a COPY of an authored scene/prefab; `node_modules`/`dist`/
+ *  `build`/`ads`/`subgame-dist` need no entry at all — every one of them is gitignored
+ *  (`ads/` at `.gitignore:7`, `subgame-dist/` at `.gitignore:8`), so git enumeration excludes
+ *  a build-output copy for free rather than needing a segment on this list. */
+const ASSET_ROOTS = ['games', 'demos', 'engine/templates', 'engine/tests/fixtures'];
 
 function filesWithSuffix(suffix: string): string[] {
-  const out: string[] = [];
-  for (const root of ASSET_ROOTS) {
-    if (!fs.existsSync(root)) continue;
-    for (const f of walk(root, suffix)) out.push(f);
-  }
-  return out;
+  return repoFiles({
+    under: ASSET_ROOTS,
+    match: (rel) => rel.endsWith(suffix),
+    exclude: ['android', 'ios'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 const sceneFiles = (): string[] => filesWithSuffix('.scene.json');

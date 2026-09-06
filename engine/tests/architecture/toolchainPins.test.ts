@@ -35,6 +35,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { hasOssOverlay } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
@@ -83,21 +84,17 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
 };
 
 /** Engine-owned manifests only: the root, plus everything under `engine/` that is not an
- *  installed dependency. `games/`/`demos/` are excluded on purpose (see KNOWN GAP above). */
+ *  installed dependency. `games/`/`demos/` are excluded on purpose (see KNOWN GAP above). Via
+ *  the shared corpus producer (#799/#771/#805 Phase 4); floored well under the 10 measured
+ *  under `engine/` today. */
 function engineOwnedManifests(): string[] {
-  const found: string[] = ['package.json'];
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue;
-      const abs = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(abs);
-      else if (entry.name === 'package.json') {
-        found.push(path.relative(repoRoot, abs).split(path.sep).join('/'));
-      }
-    }
-  };
-  walk(path.join(repoRoot, 'engine'));
-  return found;
+  const underEngine = repoFiles({
+    under: path.join(repoRoot, 'engine'),
+    match: /(^|\/)package\.json$/,
+    exclude: ['node_modules', 'dist'],
+    floor: 5,
+  }).map(({ rel }) => rel);
+  return ['package.json', ...underEngine];
 }
 
 function typescriptPin(rel: string): string | undefined {

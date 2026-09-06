@@ -29,11 +29,30 @@
  *  the way a redundant literal can. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readFileSync(path.join(SRC, rel), 'utf-8');
+
+/** `repoFiles()`'s own `rel` is repo-root-relative (`engine/packages/modoki/src/editor/...`);
+ *  WRITERS is keyed SRC-relative (`panels/Inspector.tsx`). Stripped by a plain prefix check, not
+ *  a `path.relative`/`sep` round-trip (#799/#771/#805 Phase 4) — THROW rather than tolerate a
+ *  miss, same reasoning as `materialCloneStamp.test.ts`'s `runtimeFiles()`: a silent truncation
+ *  would make every WRITERS lookup quietly stop matching. */
+const EDITOR_PREFIX = 'engine/packages/modoki/src/editor/';
+function editorSourceFiles(): { rel: string }[] {
+  return repoFiles({ under: SRC, match: /\.tsx?$/, floor: 150 }).map(({ rel }) => {
+    if (!rel.startsWith(EDITOR_PREFIX)) {
+      throw new Error(
+        `metaMergeNotClobber: ${rel} is not under "${EDITOR_PREFIX}", but \`under\` is SRC — the `
+        + 'enumeration root and this prefix strip have drifted apart.',
+      );
+    }
+    return { rel: rel.slice(EDITOR_PREFIX.length) };
+  });
+}
 
 /** Files that write a meta sidecar and must therefore merge rather than replace. Derived by
  *  grepping `engine/packages/modoki/src/editor/**` for the write call itself
@@ -338,18 +357,9 @@ describe('meta sidecar writers merge instead of replacing', () => {
     // stale the way the list it verifies did (6 files, per the brief that added this test).
     const EXCLUDED = ['panels/assetViews/widgets.tsx']; // defines writeMetaOrWarn, builds no payload of its own
 
-    const discovered: string[] = [];
-    const walk = (dir: string) => {
-      for (const entry of readdirSync(path.join(SRC, dir), { withFileTypes: true })) {
-        const rel = dir ? `${dir}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          walk(rel);
-        } else if (/\.tsx?$/.test(entry.name) && hasMetaWriteCall(read(rel))) {
-          discovered.push(rel);
-        }
-      }
-    };
-    walk('');
+    const discovered = editorSourceFiles()
+      .map(({ rel }) => rel)
+      .filter((rel) => hasMetaWriteCall(read(rel)));
 
     expect(discovered.sort()).toEqual([...WRITERS, ...EXCLUDED].sort());
   });

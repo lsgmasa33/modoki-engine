@@ -53,6 +53,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const engineRoot = path.resolve(__dirname, '../..');
 const repoRoot = path.resolve(engineRoot, '..');
@@ -188,38 +189,26 @@ function findFanoutChain(
 }
 
 const SCAN_EXT = /\.tsx?$/;
-const EXCLUDE_DIRS = new Set(['node_modules', 'dist']);
 
-function walk(dir: string, out: string[]): void {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (EXCLUDE_DIRS.has(e.name)) continue;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else if (SCAN_EXT.test(e.name) && !e.name.endsWith('.d.ts') && !/\.test\.tsx?$/.test(e.name)) {
-      out.push(p);
-    }
-  }
-}
-
-function scanRoots(): string[] {
-  const roots = [
-    path.join(engineRoot, 'packages/modoki/src/runtime'),
-    path.join(engineRoot, 'app'),
-  ];
+/** Every project's `runtime/` root, as a repo-relative POSIX prefix — `games/<id>/runtime`, one
+ *  per game. Listing the project directories themselves is a plain one-level `readdirSync`, not a
+ *  recursive walk, so it stays as-is; only the RECURSIVE descent below moves onto `repoFiles()`. */
+function gameRuntimeRoots(): string[] {
   const gamesDir = path.join(repoRoot, 'games');
-  if (fs.existsSync(gamesDir)) {
-    for (const e of fs.readdirSync(gamesDir, { withFileTypes: true })) {
-      if (e.isDirectory()) roots.push(path.join(gamesDir, e.name, 'runtime'));
-    }
-  }
-  return roots;
+  if (!fs.existsSync(gamesDir)) return [];
+  return fs.readdirSync(gamesDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => `games/${e.name}/runtime`);
 }
 
+/** Git-enumerated (#771/#799) rather than a hand-rolled recursive `readdirSync` walk.
+ *  `node_modules`/`dist` need no exclude entry — both are gitignored. */
 function sourceFiles(): string[] {
-  const out: string[] = [];
-  for (const r of scanRoots()) walk(r, out);
-  return out;
+  return repoFiles({
+    under: ['engine/packages/modoki/src/runtime', 'engine/app', ...gameRuntimeRoots()],
+    match: (rel) => SCAN_EXT.test(rel) && !rel.endsWith('.d.ts') && !/\.test\.tsx?$/.test(rel),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 function findViolations(): Violation[] {

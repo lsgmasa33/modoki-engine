@@ -26,20 +26,14 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments as stripJsComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
 
+/** Every reap-relevant script under `engine/scripts`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 90 measured today. */
 function scriptFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/\.(sh|mjs|js|ts)$/.test(e.name)) out.push(p);
-    }
-  };
-  walk(scriptsDir);
-  return out;
+  return repoFiles({ under: scriptsDir, match: /\.(sh|mjs|js|ts)$/, floor: 60 }).map(({ abs }) => abs);
 }
 
 /** Strip comments so the many prose mentions of `pkill` in these files (they explain this

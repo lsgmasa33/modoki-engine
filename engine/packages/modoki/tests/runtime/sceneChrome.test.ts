@@ -278,6 +278,24 @@ describe('patchAnchorPct', () => {
     expect(patchAnchorPct(tw!.world, 'Plain', { bottomPct: 5 })).toBe(false);
     expect(isUIDirty()).toBe(false);
   });
+
+  // rightPct — #806: the horizontal-letterbox inset a stretched/right-anchored element needs, and
+  // which the scene cannot author (it's a runtime fact about how much letterbox exists this frame).
+  it('writes right onto UIAnchor as a percentage', () => {
+    tw!.spawn(UIAnchor({}), EntityAttributes({ name: 'Banner' }));
+    expect(patchAnchorPct(tw!.world, 'Banner', { rightPct: 12.5 })).toBe(true);
+    const anchor = readAnchor('Banner')!;
+    expect(anchor.right).toBe(12.5);
+    expect(anchor.rightUnit).toBe('%');
+  });
+
+  it('does NOT write, and returns false, when a rightPct change is inside the 0.01 deadband', () => {
+    tw!.spawn(UIAnchor({ right: 12.5, rightUnit: '%' }), EntityAttributes({ name: 'Banner' }));
+    clearUIDirty();
+    expect(patchAnchorPct(tw!.world, 'Banner', { rightPct: 12.505 })).toBe(false);
+    expect(readAnchor('Banner')!.right, 'the deadbanded value must not overwrite the stored one').toBe(12.5);
+    expect(isUIDirty(), 'a deadbanded no-op must not reproject the tree').toBe(false);
+  });
 });
 
 describe('findChromeEntity — self-heal', () => {

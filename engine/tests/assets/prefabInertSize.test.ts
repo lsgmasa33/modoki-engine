@@ -30,30 +30,32 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { validatePrefabData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
-import { hasAnyProject } from '../helpers/repoLayout';
+import { hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 
-function* walk(dir: string): Generator<string> {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    // dist/ and the native mirrors (ios/, android/) contain BUILD COPIES of the same prefabs —
-    // scanning them would double-report every finding and, worse, report a stale copy that no
-    // longer matches its source.
-    if (e.isDirectory()) {
-      if (['dist', 'node_modules', 'ios', 'android'].includes(e.name)) continue;
-      yield* walk(path.join(dir, e.name));
-    } else if (e.name.endsWith('.prefab.json')) {
-      yield path.join(dir, e.name);
-    }
-  }
-}
-
-const prefabs = (discoverProjects(PROJECT_ROOT) as { dir: string }[])
-  .flatMap((p) => [...walk(p.dir)])
-  .concat([...walk(path.join(PROJECT_ROOT, 'engine', 'templates'))]);
+// git-backed enumeration replaces the hand-rolled walker (#771/#799). That walker's own
+// `dist`/`node_modules`/`ios`/`android` skip list was missing `ads` — a gitignored playable-export
+// build dir that can leave STALE prefab copies on disk after a local build — so a from-source
+// re-scan could silently double-report a finding against a copy that no longer matches its
+// source. `repoFiles()` enumerates tracked-or-untracked-but-not-ignored files, so `ads/` (and any
+// OTHER gitignored build dir nobody thought to list) is excluded for free rather than needing a
+// sixth skip-list entry; `ios`/`android` are excluded explicitly below because they ARE tracked
+// (native mirrors carrying build copies of the same prefabs, not ignored).
+//
+// `floor: 0` deliberately — the module-scope enumeration must not throw on a checkout that ships
+// no games/demos content at all (the public RELEASE snapshot); throwing here would fail COLLECTION
+// rather than skip the file. The non-vacuity pin therefore lives in the `hasAnyProject()`-gated
+// sanity test below, where it can be skipped — and it is a real floor, not the `> 0` it was before
+// this migration, because a shared producer taking `under`/`match` has more ways to return a
+// nearly-empty list than the hand-rolled walker did.
+const prefabs = repoFiles({
+  under: ['games', 'demos', 'engine/templates/starter'],
+  match: /\.prefab\.json$/,
+  exclude: ['ios', 'android'],
+  floor: 0,
+}).map(({ abs }) => abs);
 
 describe('committed prefabs author no inert UI trait — size or margin (#42, #757)', () => {
   // Gated on the LOOSE predicate: the prefabs come from whatever projects exist (engine/templates
@@ -63,7 +65,22 @@ describe('committed prefabs author no inert UI trait — size or margin (#42, #7
   it.skipIf(!hasAnyProject())('found prefabs to scan (sanity: the guard is not passing vacuously)', () => {
     // Without this, a broken walk or a moved project root turns the whole file into a silent
     // pass — the failure mode that makes a coverage guard worse than none.
-    expect(prefabs.length).toBeGreaterThan(0);
+    //
+    // A bare `> 0` is too weak to be that pin WHERE A REAL CORPUS EXISTS, now that the enumeration
+    // is a shared producer taking `under`/`match`: a typo'd prefix or a `match` that stops matching
+    // most of the corpus would leave a handful of files and still pass, which reads identically to
+    // health. So the games branch floors far under its real count (85 here = 58 games + 27 demos).
+    //
+    // ⚠️ The non-games branch is 0, and cannot be raised: it covers TWO snapshot shapes, not one.
+    // `scripts/publish-engine-oss.sh` is INCLUDE-ONLY and takes `--with-demos`, so the demos it
+    // ships are an argument, not a constant -- the free `ci/main` stage takes all of them (27
+    // prefabs), while the hub's `npm run verify:publish` names exactly two (3d-physics-demo,
+    // 2d-physics-demo) which between them author exactly ONE prefab (measured in the assembled
+    // stage, which is where a floor of 5 went red and blocked a `main` push). Any floor above 0
+    // here is really a floor on the caller's demo list, which this file cannot see.
+    // `repoFiles`'s own `floor` cannot carry this: it runs at MODULE scope, where throwing on a
+    // projectless RELEASE snapshot would fail collection rather than skip.
+    expect(prefabs.length).toBeGreaterThan(hasInternalGames() ? 30 : 0);
   });
 
   it('no prefab authors an inert size or margin against its own anchor', () => {

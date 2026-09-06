@@ -21,8 +21,9 @@
  *  only way a new provider cannot quietly rejoin the hole is to check the source. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const SRC_ROOTS = [
   join(__dirname, '../../packages/modoki/src'),
@@ -39,14 +40,12 @@ const EXEMPT: Record<string, string> = {
     + 'does not hold.',
 };
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === 'dist') continue;
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (/\.tsx?$/.test(p)) out.push(p);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `SRC_ROOTS`, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 855 measured today. */
+function sourceFiles(): string[] {
+  return repoFiles({
+    under: SRC_ROOTS, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 600,
+  }).map(({ abs }) => abs);
 }
 
 /** Every object literal that builds an InteractionHandle, found by anchoring on the `kind:`
@@ -84,7 +83,7 @@ function handleLiterals(src: string): string[] {
 }
 
 describe('interaction-handle providers name their owning element', () => {
-  const files = SRC_ROOTS.flatMap((r) => walk(r))
+  const files = sourceFiles()
     // The registry declares the field; the dump reads it. Neither builds a handle.
     .filter((f) => !/interactionHandles\.ts$|handlesDump\.ts$/.test(f))
     .map((f) => ({ file: f, src: readFileSync(f, 'utf8') }))

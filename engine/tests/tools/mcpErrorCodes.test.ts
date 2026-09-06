@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ERROR_CODES } from '../../tools/shared/mcpResult';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const DOC_PATH = path.join(REPO_ROOT, 'docs/mcp-tool-conventions.md');
@@ -39,13 +40,10 @@ function docCodes(): string[] {
  *  itself). Matches the four surfaces named in the QA-TOOL-0003 brief. */
 const SCAN_DIRS = ['tools/modoki-mcp/src', 'tools/shared', 'app', 'plugins'].map((d) => path.join(REPO_ROOT, 'engine', d));
 
-function allSourceFiles(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) return allSourceFiles(full);
-    return /\.(ts|tsx)$/.test(e.name) ? [full] : [];
-  });
+/** Every `.ts`/`.tsx` across all of `SCAN_DIRS`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 169 measured today. */
+function allSourceFiles(dirs: string[]): string[] {
+  return repoFiles({ under: dirs, match: /\.(ts|tsx)$/, floor: 100 }).map(({ abs }) => abs);
 }
 
 /** The DECLARATION — not the whole file — is excluded from the reachability scan. Matching
@@ -71,7 +69,7 @@ describe('the §5 error-code set (docs/mcp-tool-conventions.md) stays closed and
   });
 
   it('sources() actually finds real files (this guard must not fail open)', () => {
-    const found = SCAN_DIRS.flatMap(allSourceFiles);
+    const found = allSourceFiles(SCAN_DIRS);
     expect(found.length).toBeGreaterThan(50);
   });
 
@@ -103,7 +101,7 @@ describe('the §5 error-code set (docs/mcp-tool-conventions.md) stays closed and
     // A quoted literal (`'CODE'`) is deliberately the bar, not a bare word — the codes are used
     // as string literal values (`code: 'AMBIGUOUS'`), and matching bare identifiers would also
     // match the code's own name inside an unrelated comment or variable name.
-    const files = SCAN_DIRS.flatMap(allSourceFiles);
+    const files = allSourceFiles(SCAN_DIRS);
     const sources = files.map((f) => {
       const src = fs.readFileSync(f, 'utf-8');
       return f === MCP_RESULT_PATH ? withoutDeclaration(src) : src;

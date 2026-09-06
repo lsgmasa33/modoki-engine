@@ -31,6 +31,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PRIVATE_BUILD_FIELDS } from '../../project-config';
 import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = REPO_ROOT;
 
@@ -52,13 +53,15 @@ const repoRoot = REPO_ROOT;
  *  snapshot that ships no projects by design. */
 const CONFIG_FLOOR = hasInternalGames() ? 10 : hasAnyProject() ? 3 : 2;
 
-const tracked = (...args: string[]): string[] =>
-  execFileSync('git', ['ls-files', ...args], { cwd: repoRoot, encoding: 'utf8' })
-    .split('\n')
-    .filter(Boolean);
+// `includeUntracked: false` — this guard's whole subject is what a COMMITTED file holds (a value
+// that leaks reaches other clones and the public snapshot only once it is tracked); an uncommitted
+// edit is not yet a leak anyone else can pull. Preserves this guard's original tracked-only
+// `git ls-files` behaviour.
+const trackedMatching = (match: RegExp): string[] =>
+  repoFiles({ match, floor: 0, includeUntracked: false }).map((f) => f.rel);
 
 describe('private build fields never reach a committed file (#172)', () => {
-  const configs = tracked('*project.config.json', 'project.config.json');
+  const configs = trackedMatching(/(^|\/)project\.config\.json$/);
 
   it('finds project configs to check — a vacuous pass is a failure', () => {
     // Not a formality. This guard's whole value is that it ran; if the glob stops matching
@@ -84,7 +87,7 @@ describe('private build fields never reach a committed file (#172)', () => {
     // `.gitignore` covers it, but `git add -f` overrides that — and the snapshot manifest is built
     // from `git ls-files`, so a force-added one WOULD ship. This is the file where the real values
     // live, so its presence in the index is itself the leak, whatever it happens to contain.
-    expect(tracked('*project.user.json', 'project.user.json')).toEqual([]);
+    expect(trackedMatching(/(^|\/)project\.user\.json$/)).toEqual([]);
   });
 });
 
@@ -120,7 +123,7 @@ describe('private build fields never reach a committed file (#172)', () => {
  *  working-tree read would go red on ordinary work and get muted. What matters is what is about to
  *  be COMMITTED. */
 describe('a demo never commits an Apple Team ID in its Xcode project', () => {
-  const pbxprojs = tracked('demos/*/ios/**/project.pbxproj');
+  const pbxprojs = trackedMatching(/^demos\/[^/]+\/ios\/(?:.*\/)?project\.pbxproj$/);
 
   // ⚠️ The FLOOR is layout-gated; the ASSERTION below is NOT, and that split is the point.
   //

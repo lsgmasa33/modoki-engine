@@ -31,26 +31,26 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-const SKIP_DIR = /^(node_modules|dist|\.cache|ios|android|\.git|ads)$/;
 
 /** GUIDs that legitimately resolve to nothing in committed JSON. Each needs a reason. */
 const ALLOWED = new Map<string, string>([
   // (empty — see KNOWN LIMIT above)
 ]);
 
-function walk(dir: string, out: string[] = []): string[] {
-  let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
-  for (const e of entries) {
-    if (SKIP_DIR.test(e.name)) continue;
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else out.push(p);
-  }
-  return out;
+/** Every file under `root` (a repo-relative POSIX path, e.g. `games`), git-enumerated (#771/#799)
+ *  rather than a hand-rolled recursive walk. `ios`/`android` are excluded explicitly because they
+ *  are TRACKED native mirrors; `node_modules`/`dist`/`.cache`/`.git`/`ads` need no entry at all —
+ *  every one of them is gitignored (or, for `.git`, never emitted by `git ls-files` at all). */
+function walk(root: string): string[] {
+  return repoFiles({
+    under: root,
+    exclude: ['ios', 'android'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** Every GUID that committed JSON DEFINES: asset `id`s and entity `guid`s alike. */
@@ -79,9 +79,8 @@ describe('GUID literals in game code resolve to a real asset or entity (#70)', (
   // broken walker.
   it.skipIf(!hasInternalGames())('has no dangling GUID in games/ or demos/', () => {
     const files = ['games', 'demos']
-      .map((r) => path.join(REPO, r))
-      .filter((d) => fs.existsSync(d))
-      .flatMap((d) => walk(d));
+      .filter((r) => fs.existsSync(path.join(REPO, r)))
+      .flatMap((r) => walk(r));
 
     const defined = definedGuids(files);
     // Sanity: if the JSON scan silently collected nothing, every code guid would look

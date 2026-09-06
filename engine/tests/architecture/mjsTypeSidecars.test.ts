@@ -22,25 +22,15 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
 
-/** Every `.d.mts` under engine/scripts/, paired with the `.mjs` it describes. */
+/** Every `.d.mts` under engine/scripts/, paired with the `.mjs` it describes — via the shared
+ *  corpus producer (#799/#771/#805 Phase 4). Floored well under the 28 measured today. */
 function sidecarPairs(): { decl: string; impl: string }[] {
-  const out: { decl: string; impl: string }[] = [];
-  const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'node_modules') continue;
-        walk(p);
-      } else if (e.name.endsWith('.d.mts')) {
-        out.push({ decl: p, impl: p.replace(/\.d\.mts$/, '.mjs') });
-      }
-    }
-  };
-  walk(scriptsDir);
-  return out;
+  return repoFiles({ under: scriptsDir, match: /\.d\.mts$/, exclude: ['node_modules'], floor: 10 })
+    .map(({ abs }) => ({ decl: abs, impl: abs.replace(/\.d\.mts$/, '.mjs') }));
 }
 
 /** Names exported as VALUES (functions, consts) — deliberately excluding type-only exports

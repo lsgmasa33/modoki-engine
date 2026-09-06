@@ -17,6 +17,7 @@ import path from 'path';
 import { readFontAxes } from '../../plugins/font-instance';
 import { DEFAULT_FONT_GUID } from '../../packages/modoki/src/runtime/assets/builtinAssets';
 import { SIDECAR_FORMAT_VERSION } from '../../plugins/meta-sidecar';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const ASSET_DIR = path.resolve(__dirname, '../../packages/modoki/src/runtime/assets');
 const FONT = path.join(ASSET_DIR, 'fonts/Arimo/Arimo-VariableFont_wght.ttf');
@@ -59,15 +60,9 @@ describe('the engine default font', () => {
    */
   it('every bundled font is guid-bearing, well-formed and unique', () => {
     const dir = path.join(ASSET_DIR, 'fonts');
-    const ttfs: string[] = [];
-    const walk = (d: string) => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name.endsWith('.ttf')) ttfs.push(p);
-      }
-    };
-    walk(dir);
+    // Via the shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 9
+    // measured today — only a broken enumeration should turn this red.
+    const ttfs = repoFiles({ under: dir, match: /\.ttf$/, floor: 5 }).map(({ abs }) => abs);
     expect(ttfs.length, 'no bundled fonts found — the asset dir moved?').toBeGreaterThan(0);
 
     const ids = new Map<string, string>();
@@ -124,17 +119,10 @@ describe('the engine default font', () => {
    */
   it('every family whose default instance is not Regular authors wght 400', () => {
     const dir = path.join(ASSET_DIR, 'fonts');
-    const sidecars: Array<{ rel: string; src: string; meta: Record<string, unknown> }> = [];
-    const walk = (d: string) => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name.endsWith('.meta.json')) {
-          sidecars.push({ rel: path.relative(dir, p), src: p.replace(/\.meta\.json$/, ''), meta: JSON.parse(fs.readFileSync(p, 'utf8')) });
-        }
-      }
-    };
-    walk(dir);
+    // Via the shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 9
+    // measured today.
+    const sidecars = repoFiles({ under: dir, match: /\.meta\.json$/, floor: 5 })
+      .map(({ abs: p }) => ({ rel: path.relative(dir, p), src: p.replace(/\.meta\.json$/, ''), meta: JSON.parse(fs.readFileSync(p, 'utf8')) }));
     expect(sidecars.length).toBeGreaterThan(0);
 
     for (const { rel, src, meta } of sidecars) {
@@ -158,24 +146,19 @@ describe('the engine default font', () => {
   it('no sidecar authors an axis its font does not have', () => {
     const dir = path.join(ASSET_DIR, 'fonts');
     const out: string[] = [];
-    const walk = (d: string) => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name.endsWith('.meta.json')) {
-          const src = p.replace(/\.meta\.json$/, '');
-          if (!fs.existsSync(src)) continue;
-          const axes = ((JSON.parse(fs.readFileSync(p, 'utf8')).font ?? {}) as { variationAxes?: Record<string, number> }).variationAxes ?? {};
-          const have = readFontAxes(new Uint8Array(fs.readFileSync(src)));
-          for (const [tag, v] of Object.entries(axes)) {
-            const a = have.find((x) => x.tag === tag);
-            if (!a) out.push(`${path.relative(dir, p)}: axis "${tag}" absent (has ${have.map((x) => x.tag).join(', ') || 'none'})`);
-            else if (v < a.min || v > a.max) out.push(`${path.relative(dir, p)}: ${tag}=${v} outside ${a.min}..${a.max}`);
-          }
-        }
+    // Via the shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 9
+    // measured today.
+    for (const { abs: p } of repoFiles({ under: dir, match: /\.meta\.json$/, floor: 5 })) {
+      const src = p.replace(/\.meta\.json$/, '');
+      if (!fs.existsSync(src)) continue;
+      const axes = ((JSON.parse(fs.readFileSync(p, 'utf8')).font ?? {}) as { variationAxes?: Record<string, number> }).variationAxes ?? {};
+      const have = readFontAxes(new Uint8Array(fs.readFileSync(src)));
+      for (const [tag, v] of Object.entries(axes)) {
+        const a = have.find((x) => x.tag === tag);
+        if (!a) out.push(`${path.relative(dir, p)}: axis "${tag}" absent (has ${have.map((x) => x.tag).join(', ') || 'none'})`);
+        else if (v < a.min || v > a.max) out.push(`${path.relative(dir, p)}: ${tag}=${v} outside ${a.min}..${a.max}`);
       }
-    };
-    walk(dir);
+    }
     // The bake THROWS on an absent axis rather than silently producing the default, so
     // this would surface as a failed import — but a red test naming the file beats
     // discovering it when a font stops converting.

@@ -18,22 +18,22 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
+const REPO_ROOT = path.resolve(__dirname, '../../..');
 const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
-/** Editor-relative path with FORWARD slashes, always.
+/** Raw keyboard listeners that are deliberately NOT keymap bindings. Each needs a reason.
  *
- *  `path.relative` yields `input\dispatcher.ts` on Windows, so a raw lookup against ALLOWED
- *  (whose keys are written `input/dispatcher.ts`) misses every time and reports the two
- *  deliberately-allowlisted files as violations. The guard then fails on Windows and only on
- *  Windows — the listeners it names are the ones the allowlist exists to permit. */
-const relKey = (file: string): string => path.relative(EDITOR, file).split(path.sep).join('/');
-
-/** Raw keyboard listeners that are deliberately NOT keymap bindings. Each needs a reason. */
+ *  Keyed with `repoFiles()`'s own `rel` — repo-root-relative, git POSIX (#799/#771/#805 Phase
+ *  4), e.g. `engine/packages/modoki/src/editor/input/dispatcher.ts` — not the editor-relative
+ *  form this used before migrating off a hand-rolled walker. That walker's own `relKey` existed
+ *  only to undo a Windows backslash a hand-rolled `path.relative` introduced; `repoFiles()`
+ *  never produces one, so there is nothing left to undo. */
 const ALLOWED: Record<string, string> = {
-  'input/dispatcher.ts':
+  'engine/packages/modoki/src/editor/input/dispatcher.ts':
     'THE dispatcher — the single window keydown listener the whole design funnels through.',
-  'panels/SceneView.tsx':
+  'engine/packages/modoki/src/editor/panels/SceneView.tsx':
     'Shift-snap tracks a MODIFIER LEVEL and needs keyup as much as keydown, whereas the '
     + 'registry dispatches discrete chords on keydown. Forcing it in would mean inventing a '
     + '"modifier held" concept for one consumer. It is guarded on focusedPanel + text-editable, '
@@ -47,13 +47,11 @@ const PATTERNS = [
   /\b(?:window|document)\s*\.\s*addEventListener\s*\(\s*['"`]keypress['"`]/,
 ];
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else if (/\.tsx?$/.test(e.name)) out.push(p);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `EDITOR`, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 240 measured today. */
+function walk(dir: string): { abs: string; rel: string }[] {
+  return repoFiles({ under: dir, match: /\.tsx?$/, floor: 150 })
+    .map(({ abs, rel }) => ({ abs, rel }));
 }
 
 describe('keymap ownership — no raw keyboard listeners in editor/', () => {
@@ -66,8 +64,7 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
 
   it('registers global keyboard listeners ONLY in the allowlisted files', () => {
     const offenders: string[] = [];
-    for (const file of files) {
-      const rel = relKey(file);
+    for (const { abs: file, rel } of files) {
       if (ALLOWED[rel]) continue;
       const src = fs.readFileSync(file, 'utf8');
       for (const re of PATTERNS) {
@@ -93,7 +90,7 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
     // An allowlist entry that no longer has a listener is stale permission: it would let a
     // future raw listener into that file unchallenged.
     for (const [rel, why] of Object.entries(ALLOWED)) {
-      const p = path.join(EDITOR, rel);
+      const p = path.join(REPO_ROOT, rel);
       expect(fs.existsSync(p), `allowlisted file is gone: ${rel} — drop the entry`).toBe(true);
       const src = fs.readFileSync(p, 'utf8');
       expect(
@@ -119,11 +116,11 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
     const known = new Set([...TIERS, ...PANELS]);
 
     const bad: string[] = [];
-    for (const file of files) {
+    for (const { abs: file, rel } of files) {
       const src = fs.readFileSync(file, 'utf8');
       src.split('\n').forEach((line, i) => {
         const m = /scope: '([a-zA-Z0-9_-]+)'/.exec(line);
-        if (m && !known.has(m[1])) bad.push(`${relKey(file)}:${i + 1} → '${m[1]}'`);
+        if (m && !known.has(m[1])) bad.push(`${rel}:${i + 1} → '${m[1]}'`);
       });
     }
     expect(

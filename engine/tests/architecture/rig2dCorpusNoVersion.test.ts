@@ -16,16 +16,28 @@
  *  untracked scratch rig can't fail the gate and a newly-added tracked rig is picked up for
  *  free. */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 
+/** Merge note: this file landed on `main` in the same window the `win` branch made
+ *  `engine/scripts/repoCorpus.mjs` the ONE corpus producer (#799/#771/#805), so it arrived
+ *  spawning `git ls-files` itself and was the first thing `corpusProducerIsShared.test.ts` caught
+ *  after the merge. The intent above is unchanged and correct — git enumeration, no filesystem
+ *  walk, no hardcoded list; it just goes through the shared producer now, which additionally
+ *  handles the hazards a direct spawn has to remember (C-quoted non-ASCII paths without `-z`,
+ *  unmerged-stage duplicates, a nested checkout reported as a bare directory).
+ *
+ *  `includeUntracked: false` preserves this guard's stated premise exactly: an untracked scratch
+ *  rig must not fail the gate. `floor: 0` because every tracked rig lives under `games/`, which
+ *  the public OSS snapshot strips entirely — the real premise check is the `hasInternalGames()`
+ *  gate below, where it can skip rather than throw at module scope. */
 function listTrackedRigFiles(): string[] {
-  const out = execFileSync('git', ['ls-files', '-z', '*.rig2d.json'], { cwd: REPO_ROOT });
-  return out.toString('utf8').split('\0').filter((f) => f.length > 0);
+  return repoFiles({ match: /\.rig2d\.json$/, floor: 0, includeUntracked: false })
+    .map(({ rel }) => rel);
 }
 
 describe('every tracked .rig2d.json carries no format-version key (#784)', () => {

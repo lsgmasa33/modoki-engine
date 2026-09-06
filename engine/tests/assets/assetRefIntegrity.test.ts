@@ -22,6 +22,7 @@ import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../..
 import { deriveGuid, isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 import { hasAnyProject } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 // engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -43,13 +44,17 @@ const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.tes
  *  cover are guarded separately by `assetPathPredicate.test.ts`. */
 const looksLikeAssetPath = (s: string): boolean => isInternalAssetPath(s);
 
-function* walk(dir: string): Generator<string> {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walk(full);
-    else yield full;
-  }
+/** Every file under an asset root, git-enumerated (#771/#799) rather than a hand-rolled recursive
+ *  walk. A dotfile/dot-dir segment is dropped, same as the old walker's `e.name.startsWith('.')` —
+ *  git enumeration additionally drops `*.meta.local.json` for free (gitignored machine-local
+ *  sidecars — `.gitignore:41`), which `detectType()` below already classifies as `null` and
+ *  discards, so nothing downstream changes. */
+function walk(absDir: string): string[] {
+  return repoFiles({
+    under: absDir,
+    match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 function urlFor(abs: string, roots: AssetRoot[]): string | null {

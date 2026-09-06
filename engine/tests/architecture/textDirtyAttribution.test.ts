@@ -16,42 +16,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
-import { toPosix } from '../../scripts/pathPosix.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const renderingDir = path.resolve(repoRoot, 'packages/modoki/src/runtime/rendering');
 
 const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
 
-/** Repo-relative path in POSIX form. `path.relative()` is `\`-separated on Windows and every
- *  comparison below is keyed on a forward-slash literal, so the normalisation has to happen
- *  here — see docs/windows.md § Paths (#798).
+/** `rel` here is `repoFiles()`'s own output — git-relative, POSIX, unquoted — never
+ *  round-tripped through `path.relative`/`sep` (that round-trip, via a local `toPosix()` call,
+ *  was instance 3 of the class docs/windows.md § Paths records, #798). `endsWith` still finds
+ *  the definition site regardless of the repo-root-relative prefix `repoFiles()` returns.
  *
  *  ⚠️ These two are shared by the scan AND by the non-vacuity pin at the bottom of the file ON
  *  PURPOSE. A pin that re-derives the path itself would keep passing when the scan's own
- *  normalisation is reverted, which makes it a test of `toPosix()` rather than of this guard. */
-const relFor = (file: string) => toPosix(path.relative(repoRoot, file));
+ *  enumeration is reverted, which makes it a test of `repoFiles()` rather than of this guard. */
 const isDefinitionSite = (rel: string) => rel.endsWith('text/textDirty.ts');
 
 /** The one place the definition-site exemption is applied. The caller sweep consumes `callers`
  *  and the non-vacuity pin consumes both halves, so the sweep cannot go back to computing its
  *  own path without visibly deleting this call — which is the only way the pin can be left
- *  asserting something the sweep no longer does. Sharing `relFor`/`isDefinitionSite` alone was
- *  NOT enough: reverting just the loop to an inline `path.relative(...).endsWith('text/…')`
- *  reintroduced #798 with all four tests still green. */
+ *  asserting something the sweep no longer does. Sharing `renderingFiles()` alone was NOT
+ *  enough once: reverting just the loop to an inline `path.relative(...).endsWith('text/…')`
+ *  reintroduced #798 with all four tests still green. Via the shared corpus producer
+ *  (#799/#771/#805 Phase 4); floored well under the 111 measured today. */
 function renderingFiles(): { all: { file: string; rel: string }[]; callers: { file: string; rel: string }[] } {
-  const all = tsFiles(renderingDir).map((file) => ({ file, rel: relFor(file) }));
+  const all = repoFiles({ under: renderingDir, match: /\.tsx?$/, floor: 60 })
+    .map(({ abs, rel }) => ({ file: abs, rel }));
   return { all, callers: all.filter((t) => !isDefinitionSite(t.rel)) };
-}
-
-function tsFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...tsFiles(p));
-    else if (/\.tsx?$/.test(e.name)) out.push(p);
-  }
-  return out;
 }
 
 // The two layout-hash sites that must attribute their dirty check to the entity's OWN font.
@@ -87,10 +79,13 @@ describe('getTextDirtyVersion stays attributed by font at both layout-hash sites
   });
 
   // Non-vacuity pin (#798, docs/windows.md § Paths "the loud failure is the lucky one"): the
-  // exemption above is keyed on a forward-slash literal compared against `path.relative()`
-  // output, which is backslash-separated on Windows. Before the `toPosix()` fix the predicate
-  // was silently false on Windows, so the definition site fell through into the assertion meant
-  // for CALLERS only — a broken guard that says nothing, rather than failing loudly.
+  // exemption above is keyed on a forward-slash literal compared against `rel`. Before the
+  // #798 fix (a hand-rolled `path.relative()` + `toPosix()`) that comparison was silently false
+  // on Windows, so the definition site fell through into the assertion meant for CALLERS only —
+  // a broken guard that says nothing, rather than failing loudly. Migrating onto `repoFiles()`
+  // (#799/#771/#805 Phase 4) removes the hazard at the source — `rel` is git's own POSIX output,
+  // never round-tripped through `path.relative`/`sep` — but the pin stays: it is what would catch
+  // a FUTURE regression back to a hand-rolled, separator-sensitive comparison.
   //
   // It pins the sweep, not itself: both halves come from `renderingFiles()`, the single place the
   // exemption is applied, so the sweep cannot compute its own path without deleting that call.
@@ -105,8 +100,8 @@ describe('getTextDirtyVersion stays attributed by font at both layout-hash sites
     // The one that fires on a broken separator, and its message prints the offending path.
     expect(callers.some((t) => t.file === defSite!.file),
       `the definition site must be EXCLUDED from the caller sweep, but its path did not match ` +
-      `the exemption — got "${defSite!.rel}" (a backslash here means the toPosix() normalisation ` +
-      'in relFor was lost; see docs/windows.md § Paths)')
+      `the exemption — got "${defSite!.rel}" (a backslash here means the git-relative POSIX rel ` +
+      'was lost somewhere in renderingFiles(); see docs/windows.md § Paths)')
       .toBe(false);
   });
 });

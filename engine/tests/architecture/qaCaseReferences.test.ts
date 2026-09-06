@@ -27,7 +27,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 // The repo's ONE vetted comment scanner (#419) — never write a private stripper here. See its
@@ -55,6 +55,7 @@ import {
 } from '../helpers/lineCitations.js';
 // The panel's OWN slug function, so a derived id and the rendered one cannot drift apart.
 import { particleFieldSlug } from '../../packages/modoki/src/editor/panels/particle/fieldIds.js';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
@@ -225,11 +226,16 @@ interface CaseFile {
   body: string;
 }
 
+/** Every file under `dir`, via the ONE shared producer (#799/#771/#805).
+ *
+ *  `qa/cases/**` and the engine tool sources this serves are both TRACKED content, so git can
+ *  enumerate them — this was never the build-output or scratch-dir case that genuinely cannot use
+ *  the producer, and the exemption that said "left for a future call on whether qa/cases counts"
+ *  was a deferral, not a reason. `floor: 0` because the callers already gate on `HAS_CASES`: a
+ *  checkout without `qa/` is an expected state here, not a broken enumeration, and a throw at a
+ *  module-adjacent call site would fail collection rather than skip. */
 function walk(dir: string): string[] {
-  return readdirSync(dir).flatMap((entry) => {
-    const full = join(dir, entry);
-    return statSync(full).isDirectory() ? walk(full) : [full];
-  });
+  return repoFiles({ under: dir, floor: 0 }).map(({ abs }) => abs);
 }
 
 function loadCases(): CaseFile[] {
@@ -1914,7 +1920,7 @@ describeCases('QA case references', () => {
   // excluding gitignored build output. Plain `ls-files` would fail a case whose `covers:`
   // names a source file added in the same edit — a confusing red for correct work.
   const trackedFiles = HAS_CASES
-    ? git(['ls-files', '--cached', '--others', '--exclude-standard']).split('\n').filter(Boolean)
+    ? repoFiles({ floor: 0, includeUntracked: true }).map((f) => f.rel)
     : [];
 
   const readIfPresent = (p: string) => (existsSync(p) ? readFileSync(p, 'utf8') : '');

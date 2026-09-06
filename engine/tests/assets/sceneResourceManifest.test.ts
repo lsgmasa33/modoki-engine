@@ -38,18 +38,23 @@ import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../..
 import { registerAsset, deriveGuid, type AssetType } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { collectResourceRefsFromEntities, type SceneResourceRef, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { hasAnyProject } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 // engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const hasProjectAssets = hasAnyProject();
 
-function* walk(dir: string): Generator<string> {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walk(full);
-    else yield full;
-  }
+/** Every file under an asset root, git-enumerated (#771/#799) rather than a hand-rolled recursive
+ *  walk. A dotfile/dot-dir segment is dropped, same as the old walker's `e.name.startsWith('.')` —
+ *  git enumeration additionally drops `*.meta.local.json` for free (gitignored machine-local
+ *  sidecars — `.gitignore:41`), which `detectType()` below already classifies as `null` and
+ *  discards, so nothing downstream changes. */
+function walk(absDir: string): string[] {
+  return repoFiles({
+    under: absDir,
+    match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 function urlFor(abs: string, roots: AssetRoot[]): string | null {

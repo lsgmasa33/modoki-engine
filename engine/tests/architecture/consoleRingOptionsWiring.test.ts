@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
  * F8 (#626/#633 adversarial review): `installConsoleRing()` is idempotent — a SECOND call returns
@@ -24,8 +25,14 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const engineDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
-/** Repo-relative POSIX path — `path.relative` yields backslashes on Windows, and the assertions
- *  below compare against forward-slash literals. */
+/** Repo-relative POSIX path for the handful of individually-named files below (`MAIN`, `APP_TSX`, …
+ *  and the F11 BFS trail) — these are known, fixed source files, not a corpus enumeration, so a
+ *  `path.relative` round-trip here is just display formatting, not the enumeration hazard
+ *  `repoFiles()` exists to remove. Still needed for exactly that: turning a handful of literal
+ *  absolute paths into readable labels. The two OFFENDER LISTS below no longer use it — they are
+ *  built straight from `walk()`'s own git-POSIX `rel`, which is the half of this file that WAS the
+ *  hazard (#799/#771/#805 Phase 4 — both lists used to compare `path.relative()` output against
+ *  forward-slash literals). */
 const relPosix = (file: string) => path.relative(engineDir, file).split(path.sep).join('/');
 
 const APP_DIR = path.join(engineDir, 'app');
@@ -35,17 +42,20 @@ const APP_TSX = path.join(APP_DIR, 'App.tsx');
 const AGENT_BRIDGE = path.join(APP_DIR, 'debug/agentBridge.ts');
 const RUNTIME_DEBUG_CONSOLE_CAPTURE = path.join(RUNTIME_SRC, 'runtime/debug/consoleCapture.ts');
 
-/** Walk a directory tree, collecting `.ts`/`.tsx` PRODUCTION source files — skips
- *  `node_modules`, `dist`, and any `tests` directory or `.test.` file (this guard is about real
- *  call sites, not the tests that exercise them). */
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'tests') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) { walk(full, out); continue; }
-    if (/\.tsx?$/.test(entry.name) && !entry.name.includes('.test.')) out.push(full);
-  }
-  return out;
+/** `.ts`/`.tsx` PRODUCTION source files under app/ and the runtime src, engine-relative POSIX —
+ *  via the shared corpus producer (#799/#771/#805 Phase 4). Skips `node_modules`/`dist`/any `tests`
+ *  directory and `.test.` files (this guard is about real call sites, not the tests that exercise
+ *  them). `repoFiles()`'s own `rel` is repo-root-relative, so the `engine/` prefix is stripped by a
+ *  plain string slice — safe, unlike a `path.relative` round-trip, because it operates on git's own
+ *  already-POSIX string rather than re-deriving one from `node:path`. Floored well under the 855
+ *  measured today. */
+function walk(): Array<{ abs: string; rel: string }> {
+  return repoFiles({
+    under: [APP_DIR, RUNTIME_SRC],
+    match: (rel: string) => /\.tsx?$/.test(rel) && !path.posix.basename(rel).includes('.test.'),
+    exclude: ['node_modules', 'dist', 'tests'],
+    floor: 600,
+  }).map(({ abs, rel }) => ({ abs, rel: rel.replace(/^engine\//, '') }));
 }
 
 /** Every `installConsoleRing(...)` CALL found in comment-stripped `text` (the declaration itself
@@ -72,17 +82,14 @@ function importSpecifiers(src: string, label: string): string[] {
 }
 
 describe('installConsoleRing() options wiring (F8)', () => {
-  const appFiles = walk(APP_DIR);
-  const runtimeFiles = walk(RUNTIME_SRC);
-  const allFiles = [...appFiles, ...runtimeFiles];
+  const allFiles = walk();
 
   it('app/installConsoleRing.ts is the ONLY call site passing options', () => {
     const withOptions: string[] = [];
-    for (const file of allFiles) {
-      const src = fs.readFileSync(file, 'utf8');
+    for (const { abs, rel } of allFiles) {
+      const src = fs.readFileSync(abs, 'utf8');
       if (!src.includes('installConsoleRing')) continue;
       const stripped = stripComments(src);
-      const rel = relPosix(file);
       assertScanIsSane(src, stripped, rel);
       for (const call of findInstallCalls(stripped)) {
         if (call.hasOptions) withOptions.push(rel);
@@ -93,11 +100,10 @@ describe('installConsoleRing() options wiring (F8)', () => {
 
   it('exactly two call sites pass NO options: agentBridge.ts and runtime/debug/consoleCapture.ts', () => {
     const noOptions: string[] = [];
-    for (const file of allFiles) {
-      const src = fs.readFileSync(file, 'utf8');
+    for (const { abs, rel } of allFiles) {
+      const src = fs.readFileSync(abs, 'utf8');
       if (!src.includes('installConsoleRing')) continue;
       const stripped = stripComments(src);
-      const rel = relPosix(file);
       assertScanIsSane(src, stripped, rel);
       for (const call of findInstallCalls(stripped)) {
         if (!call.hasOptions) noOptions.push(rel);

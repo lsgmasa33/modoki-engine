@@ -24,6 +24,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
@@ -36,13 +37,10 @@ function assetDocMutators(): string[] {
   return [...found];
 }
 
-function editorSources(dir: string, out: string[] = []): string[] {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) editorSources(p, out);
-    else if (/\.tsx?$/.test(e.name)) out.push(p);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under editor/**, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 240 measured today. */
+function editorSources(): string[] {
+  return repoFiles({ under: EDITOR, match: /\.tsx?$/, floor: 150 }).map(({ abs }) => abs);
 }
 
 /** The text of the balanced `(...)` starting at `open`. */
@@ -92,7 +90,7 @@ function code(text: string): string {
 function unflagged(): string[] {
   const mutators = assetDocMutators();
   const hits: string[] = [];
-  for (const file of editorSources(EDITOR)) {
+  for (const file of editorSources()) {
     const src = fs.readFileSync(file, 'utf8');
     // A file that imports an asset-doc mutator is in scope even when the literal reaches it
     // INDIRECTLY: MaterialBatchView's undo closures call a local `apply()` helper, so a
@@ -125,7 +123,7 @@ describe('asset-document undo entries do not dirty the scene', () => {
   });
 
   it('the comment scan is sane over every editor source file this guard reads', () => {
-    const files = editorSources(EDITOR);
+    const files = editorSources();
     expect(files.length, 'no editor sources found — the guard below would scan nothing').toBeGreaterThan(0);
     for (const file of files) {
       const raw = fs.readFileSync(file, 'utf8');

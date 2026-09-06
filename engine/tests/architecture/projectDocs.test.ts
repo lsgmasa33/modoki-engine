@@ -21,7 +21,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const TEMPLATE = 'engine/templates/starter/CLAUDE.md';
@@ -39,18 +39,11 @@ const TEMPLATE = 'engine/templates/starter/CLAUDE.md';
  *  build output would vouch for a doc citing `main.json`, and the guard would report green on
  *  precisely the citation it exists to catch, on whichever machine happened to have built.
  *
- *  `--cached --others --exclude-standard` = tracked plus new-untracked, minus everything
- *  `.gitignore` covers. The `--others` half keeps a just-added, not-yet-staged asset counted as
- *  present, so adding a scene and documenting it in one go does not trip the rule. */
+ *  `includeUntracked: true` (the default) = tracked plus new-untracked, minus everything
+ *  `.gitignore` covers. That half keeps a just-added, not-yet-staged asset counted as present, so
+ *  adding a scene and documenting it in one go does not trip the rule. */
 function gitFilesUnder(prefix: string): string[] {
-  const out = execFileSync(
-    'git',
-    ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', prefix],
-    { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-  )
-    .split('\0')
-    .filter(Boolean);
-  return out.map((p) => path.join(repoRoot, p));
+  return repoFiles({ under: prefix, floor: 0, includeUntracked: true }).map((f) => f.abs);
 }
 
 /** Every `games/<id>` / `demos/<id>` that carries its own CLAUDE.md. */

@@ -17,6 +17,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -39,20 +40,15 @@ function declaredSectionTitles(): Map<string, Set<string>> {
   return out;
 }
 
-/** Literal <SubSection title="..."> titles rendered outside the Inspector (asset views). */
+/** Literal <SubSection title="..."> titles rendered outside the Inspector (asset views). Via
+ *  the shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 90 `.tsx` files
+ *  measured today (240 counts every `.ts`/`.tsx`; this scan is `.tsx`-only). */
 function literalSubSectionTitles(): string[] {
   const dir = path.join(ROOT, 'engine/packages/modoki/src/editor');
   const found: string[] = [];
-  const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith('.tsx')) {
-        for (const [, t] of fs.readFileSync(p, 'utf8').matchAll(/<SubSection title="([^"]+)"/g)) found.push(t);
-      }
-    }
-  };
-  walk(dir);
+  for (const { abs: p } of repoFiles({ under: dir, match: /\.tsx$/, floor: 60 })) {
+    for (const [, t] of fs.readFileSync(p, 'utf8').matchAll(/<SubSection title="([^"]+)"/g)) found.push(t);
+  }
   return found;
 }
 

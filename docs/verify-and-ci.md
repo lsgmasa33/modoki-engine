@@ -327,6 +327,56 @@ carries `exclude: ['**/node_modules/**', 'packages/**', '**/release/**']`, so
 under `npm run verify`, so this only bites while iterating on one file — which is exactly when a
 silent empty run is most expensive. Surfaced by the #426 review, which lost a pass to it.
 
+### Corpus production: the ONE enumerator these guards share
+
+A guard that scans source first has to decide **which files**. Before #799/#771/#805 every one
+answered that itself, and each answered a different part of it wrong — the ROOT, the enumeration
+SOURCE, the EXCLUSION set, the separator NORMALISATION, and whether to pin NON-VACUITY. **Every
+omission fails OPEN**, because the dominant shape here collects offenders and asserts the list is
+empty, and an under-enumerated corpus satisfies that. A guard scanning nothing is indistinguishable
+from a clean repo.
+
+⚠️ **Never hand-roll a corpus. Import `repoFiles` from `engine/scripts/repoCorpus.mjs`.** Enforced
+by `engine/tests/architecture/corpusProducerIsShared.test.ts`, which forbids a direct `git ls-files`
+spawn and a hand-rolled recursive `readdir` walker. It lives in `engine/scripts/` rather than
+`engine/tests/helpers/` because the plain-`.mjs` build scripts must import it too — the same `.ts`
+barrier that forced `pathPosix.mjs` to exist (see [windows.md](windows.md) § Paths).
+
+```js
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+// `rel` is git's own repo-relative POSIX path; `abs` is joined FROM it.
+const files = repoFiles({ under: SRC_DIR, match: /\.tsx?$/, floor: 400 });
+```
+
+What it settles once, and why each one is load-bearing:
+
+- **`rel` is git's output verbatim** — already POSIX on every platform. Joining TO an absolute path
+  is safe; the round-trip BACK via `path.relative` is the hazard, and it is what
+  [windows.md](windows.md) § Paths records eight instances of. `under` accepts an absolute path
+  precisely so no caller needs that round-trip.
+- **`-z`, always.** Without it git C-quotes and octal-escapes non-ASCII paths, and this repo has 18.
+- **`execFileSync` with argv, never `execSync` with a shell string** — `cmd.exe` does not strip
+  quotes, so a quoted pathspec matches nothing. This was live in `migrate-assets.mjs`: measured 0
+  files where the same argv unquoted found 69, with the failure swallowed by a `catch`.
+- **Two separate aborts.** A git *throw* cannot be caught by an empty-result check, and a
+  zero-file listing is always fatal regardless of the caller's floor.
+- **`floor` is REQUIRED**, so the author must answer "how few files means my enumeration is broken
+  rather than my repo clean?". `floor: 0` is a legitimate answer — it throws, so at MODULE scope it
+  fails vitest *collection* rather than skipping — and then the real pin belongs in a `skipIf`-gated
+  test. `engine/tests/assets/prefabInertSize.test.ts` is the worked example.
+- **`includeUntracked` defaults to true.** A file you just wrote and have not staged is exactly when
+  a guard is most useful; pass `false` only when the guard's subject is genuinely what is COMMITTED.
+
+⚠️ **Its ledger is load-bearing, and that is the part to preserve.** Every `EXEMPT` entry must
+*currently* be flagged, so migrating a producer makes its entry stale and turns the gate RED until
+the entry is deleted — the list cannot rot into decoration the way a path-keyed allowlist did in
+#578. For the same reason the detectors' aliveness pins are SYNTHETIC: a floor on how many real
+offenders survive counts down to zero as the migration succeeds, which is a countdown, not a pin.
+
+⚠️ **Scope: the guard reads `engine/tests/**` and `engine/scripts/**` only.** 15 producers live
+outside it — including five guards in the `engine/packages/modoki/tests` project and
+`scripts/scan-publish-safety.mjs` — tracked as **#814**. A green run is not "none exist".
+
 ### Source-scanning guards, and the ONE comment scanner they share
 
 A large family of guards works by reading source off disk and asserting that a forbidden pattern

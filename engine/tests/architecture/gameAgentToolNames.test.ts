@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -31,16 +32,16 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
  *  regex from silently matching nothing after a refactor. */
 const CALL_RE = /registerAgentTool\(\s*\{[\s\S]*?\bname:\s*'([^']+)'/g;
 
-function tsFilesUnder(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  const out: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name === 'node_modules' || e.name === 'dist' || e.name === 'ios' || e.name === 'android') continue;
-    const abs = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...tsFilesUnder(abs));
-    else if (/\.tsx?$/.test(e.name)) out.push(abs);
-  }
-  return out;
+/** Every `.ts`/`.tsx` file under a project, git-enumerated (#771/#799) rather than a hand-rolled
+ *  recursive walk. `ios`/`android` are excluded explicitly because they are TRACKED native
+ *  mirrors; `node_modules`/`dist` need no entry at all — both are gitignored. */
+function tsFilesUnder(projectRel: string): string[] {
+  return repoFiles({
+    under: projectRel,
+    match: /\.tsx?$/,
+    exclude: ['ios', 'android'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** The project's declared game id (`game.ts`'s `id:`), falling back to the directory name — the
@@ -71,7 +72,7 @@ for (const root of PROJECT_ROOT_DIRS) {
     if (!entry.isDirectory()) continue;
     const projectDir = path.join(rootAbs, entry.name);
     const gameId = gameIdOf(projectDir);
-    for (const file of tsFilesUnder(projectDir)) {
+    for (const file of tsFilesUnder(`${root}/${entry.name}`)) {
       const src = fs.readFileSync(file, 'utf-8');
       if (!src.includes('registerAgentTool')) continue;
       mentioningFiles += 1;

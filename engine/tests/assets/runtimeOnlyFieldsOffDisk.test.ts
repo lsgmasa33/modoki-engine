@@ -32,6 +32,7 @@ import path from 'node:path';
 import { getAllTraits } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** trait name → the set of its fields flagged `runtimeOnly` in the Inspector metadata. */
 function runtimeOnlyByTrait(): Map<string, Set<string>> {
@@ -55,24 +56,23 @@ function runtimeOnlyByTrait(): Map<string, Set<string>> {
  *  `UI/`, and those are the GLB-wrapper prefabs — precisely the ones carrying `Animator` and
  *  `SkeletalAnimator`, whose read-back fields (`activeClip`, `time`, `normalizedTime`, `weight`)
  *  are flagged. A directory allowlist reached 63% of the corpus and missed the third where the
- *  flagged traits actually live. */
+ *  flagged traits actually live.
+ *
+ *  Git-enumerated (#771/#799) rather than a hand-rolled recursive walk. Listing the project
+ *  directories themselves stays a plain one-level `readdirSync` — not a recursive descent, so it
+ *  is not the thing this migration moves onto `repoFiles()`. */
 function authoredFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string): void => {
-    if (!fs.existsSync(dir)) return;
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.name.endsWith('.scene.json') || e.name.endsWith('.prefab.json')) out.push(p);
-    }
-  };
+  const projectUnders: string[] = [];
   for (const root of ['games', 'demos']) {
     const base = path.join(REPO_ROOT, root);
     if (!fs.existsSync(base)) continue;
-    for (const proj of fs.readdirSync(base)) walk(path.join(base, proj, 'runtime/assets'));
+    for (const proj of fs.readdirSync(base)) projectUnders.push(`${root}/${proj}/runtime/assets`);
   }
-  walk(path.join(REPO_ROOT, 'engine/templates/starter/runtime/assets'));
-  return out;
+  return repoFiles({
+    under: [...projectUnders, 'engine/templates/starter/runtime/assets'],
+    match: (rel) => rel.endsWith('.scene.json') || rel.endsWith('.prefab.json'),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** Walk the whole parsed file rather than only `entities[].traits`.

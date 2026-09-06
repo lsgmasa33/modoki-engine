@@ -10,24 +10,29 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 export const RENDERER_CENSUS_SRC_ROOTS = [
   path.resolve(__dirname, '../../packages/modoki/src'),
   path.resolve(__dirname, '../../app'),
 ];
 
-/** Every .ts/.tsx under the census roots. */
+/** Every .ts/.tsx under the census roots, via the ONE shared corpus producer.
+ *
+ *  Merge note: `main` introduced this helper (to share one census across the renderer guards) in
+ *  the same window the `win` branch migrated every corpus producer onto `repoCorpus.mjs`
+ *  (#799/#771/#805). Both changes are right and they are not in tension — main's contribution is
+ *  the shared CENSUS, this branch's is the shared ENUMERATION — so the merge keeps main's
+ *  abstraction and puts the shared producer underneath it, rather than picking a side. Left as a
+ *  hand-rolled `readdirSync` walk it would have been the first thing to trip
+ *  `corpusProducerIsShared.test.ts` after the merge.
+ *
+ *  `floor` is well under the ~855 measured, so only a broken enumeration trips it, never churn.
+ *  `under` takes the absolute roots directly — no `path.relative` round-trip, which is the hazard
+ *  the producer exists to delete (docs/windows.md § Paths). */
 export function rendererCensusSourceFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) { walk(p); continue; }
-      if (/\.tsx?$/.test(e.name)) out.push(p);
-    }
-  };
-  for (const root of RENDERER_CENSUS_SRC_ROOTS) if (fs.existsSync(root)) walk(root);
-  return out;
+  return repoFiles({ under: RENDERER_CENSUS_SRC_ROOTS, match: /\.tsx?$/, floor: 600 })
+    .map(({ abs }) => abs);
 }
 
 export interface CensusedFile {

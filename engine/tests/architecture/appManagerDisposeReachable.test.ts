@@ -29,24 +29,21 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 const RUNTIME_DIR = path.join(REPO, 'engine/packages/modoki/src/runtime');
 
-/** All .ts/.tsx files under RUNTIME_DIR, recursively, excluding test files. `.tsx` matters: there
- *  are 10+ runtime `.tsx` files (UI components etc.), and a `ManagerDef` declared in one of them
- *  used to be invisible to this scan entirely. */
+/** All .ts/.tsx files under RUNTIME_DIR, git-enumerated (#771/#799) rather than a hand-rolled
+ *  recursive walk, excluding test files. `.tsx` matters: there are 10+ runtime `.tsx` files (UI
+ *  components etc.), and a `ManagerDef` declared in one of them used to be invisible to this scan
+ *  entirely. */
 function listRuntimeFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      out.push(...listRuntimeFiles(full));
-    } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) && !entry.name.includes('.test.')) {
-      out.push(full);
-    }
-  }
-  return out;
+  return repoFiles({
+    under: dir,
+    match: (rel) => /\.tsx?$/.test(rel) && !rel.includes('.test.'),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** Given source and the index of an object literal's opening `{`, return the matching closing
@@ -226,26 +223,24 @@ function hasProductionUnregisterCaller(name: string, idents: string[], kind: 'ob
   // today (verified), but a manager torn down that way must not report unreachable and invite a
   // wrong allowlist entry.
   const re = new RegExp(`unregisterManagers?\\(\\s*(?:\\[[^\\]]{0,500})?${nameOrIdent}`);
-  // Same scope as the issue's own audit: engine app/game code, excluding tests.
-  const roots = [path.join(REPO, 'engine'), path.join(REPO, 'games'), path.join(REPO, 'demos')];
-  for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    if (scanForMatch(root, re)) return true;
-  }
-  return false;
+  // Same scope as the issue's own audit: engine app/game code, excluding tests. `floor: 0`
+  // deliberately — a checkout shipping no games/demos (the public OSS snapshot) must still scan
+  // `engine/` alone rather than fail COLLECTION; this helper has no module-scope non-vacuity pin
+  // of its own because the found-a-match / found-nothing question it answers is only ever "does
+  // any caller's own manager-name regex appear somewhere in this scan", which the guard's OTHER
+  // sanity test (`found a plausible number of app-scoped managers with dispose`) already backstops.
+  return scanForMatch(re);
 }
 
-function scanForMatch(dir: string, re: RegExp): boolean {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (scanForMatch(full, re)) return true;
-    } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
-      if (entry.name.includes('.test.') || full.includes(`${path.sep}tests${path.sep}`)) continue;
-      const src = stripComments(fs.readFileSync(full, 'utf8'));
-      if (re.test(src)) return true;
-    }
+function scanForMatch(re: RegExp): boolean {
+  const files = repoFiles({
+    under: ['engine', 'games', 'demos'],
+    match: (rel) => /\.tsx?$/.test(rel) && !rel.includes('.test.') && !rel.includes('/tests/'),
+    floor: 0,
+  });
+  for (const { abs } of files) {
+    const src = stripComments(fs.readFileSync(abs, 'utf8'));
+    if (re.test(src)) return true;
   }
   return false;
 }

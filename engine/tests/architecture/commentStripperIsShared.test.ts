@@ -27,6 +27,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
  * The lazy block-comment regex, as it is written in source. This exact substring is the defect.
@@ -56,32 +57,25 @@ const ALLOW = new Map<string, string>([
   ],
 ]);
 
-/** Test roots that own source-scanning guards. A root that is absent (the public OSS checkout has
- *  no `games/`) contributes nothing rather than failing. */
+/** Test roots that own source-scanning guards, git-enumerated (#771/#799) rather than a
+ *  hand-rolled recursive walk. A root that is absent (the public OSS checkout has no `games/`)
+ *  contributes nothing rather than failing — `repoFiles()`'s `under` list needs no existence
+ *  check of its own, unlike the old walker's per-root `fs.existsSync`.
+ *
+ *  A test file counts only under `engine/tests/`, `engine/packages/modoki/tests/`, or a project's
+ *  own DIRECT `tests/` folder (`games/<id>/tests/**`, `demos/<id>/tests/**`) — the same scope the
+ *  old walker's root list enumerated, not every `.test.tsx?` anywhere under `games/`/`demos/`. */
 function testFiles(): string[] {
-  const roots = [
-    path.join(REPO_ROOT, 'engine', 'tests'),
-    path.join(REPO_ROOT, 'engine', 'packages', 'modoki', 'tests'),
-    ...['games', 'demos'].flatMap((group) => {
-      const dir = path.join(REPO_ROOT, group);
-      if (!fs.existsSync(dir)) return [];
-      return fs.readdirSync(dir, { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => path.join(dir, e.name, 'tests'));
-    }),
-  ];
-  const out: string[] = [];
-  const walk = (dir: string): void => {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (/\.test\.tsx?$/.test(entry.name) || /^sourceScanner\.ts$/.test(entry.name)) out.push(full);
-    }
-  };
-  for (const r of roots) walk(r);
-  return out;
+  return repoFiles({
+    under: ['engine/tests', 'engine/packages/modoki/tests', 'games', 'demos'],
+    match: (rel) => {
+      const isTestFile = /\.test\.tsx?$/.test(rel) || /(^|\/)sourceScanner\.ts$/.test(rel);
+      if (!isTestFile) return false;
+      if (rel.startsWith('engine/tests/') || rel.startsWith('engine/packages/modoki/tests/')) return true;
+      return /^(games|demos)\/[^/]+\/tests\//.test(rel);
+    },
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 describe('there is ONE comment scanner, and tests import it (#419)', () => {

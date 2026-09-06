@@ -27,11 +27,10 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { join, dirname, resolve, relative, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
+import { repoFiles } from './repoCorpus.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -60,55 +59,21 @@ const PREFAB_FORMAT_VERSION = 3;
 let repoFilesCache;
 function repoSceneAndPrefabFiles() {
   if (repoFilesCache) return repoFilesCache;
-  // ⚠️ `execFileSync` THROWS when git is missing or `ROOT` is not a work tree, so it has to be
-  // caught here: an empty-enumeration abort can only fire on an empty RESULT, and a throw never
-  // reaches it. Left uncaught this printed a raw Node stack trace — and, worse, the guard that was
-  // supposed to make the failure legible was unreachable.
-  let listed;
+  // Migrated onto the ONE shared producer (#771). Every hazard this function used to spell out
+  // by hand now lives in engine/scripts/repoCorpus.mjs, which was LIFTED FROM THIS FILE: the two
+  // separate aborts (a git THROW cannot be caught by an empty-result check), unmerged-stage and
+  // case-folded dedup, and the regular-file filter. It returns git-relative POSIX paths, which
+  // is what deletes the round-trip filesMatching() used to need.
+  //
+  // The producer THROWS on a broken enumeration; a CLI owes the operator a legible line instead
+  // of a stack trace, so it is translated here. That is the same reason the old inline version
+  // caught its own execFileSync throw.
   try {
-    listed = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-      { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-      .split('\0').filter(Boolean);
+    repoFilesCache = repoFiles({ match: /\.(scene|prefab)\.json$/i, floor: 1 });
   } catch (e) {
-    console.error(`ABORT: could not enumerate files through git in ${ROOT} — ${e.message.split('\n')[0]}.\n`
-      + 'This script identifies its targets with `git ls-files`, so it needs git on PATH and a '
-      + 'work tree at the repo root. Nothing was written.');
+    console.error(`ABORT: ${e.message} Nothing was written.`);
     process.exit(1);
   }
-  // `listed` empty means git ran but the work tree has nothing at all (wrong cwd, a bare repo, an
-  // index that was never populated) — a DIFFERENT failure than "ran fine but nothing was a scene
-  // or prefab", which the pattern-match abort below (`targets.length === 0`) covers instead.
-  if (listed.length === 0) {
-    console.error(`ABORT: \`git ls-files\` listed 0 files in ${ROOT} at all — this repo always has `
-      + 'tracked files, so an empty listing means the enumeration itself is broken (wrong cwd, a '
-      + 'bare repo, or an index that was never populated), not a clean corpus. Nothing was written.');
-    process.exit(1);
-  }
-
-  const sceneOrPrefab = [...new Set(listed)]   // `--cached` emits an UNMERGED path once per merge
-    // stage (1/2/3), so a conflicted scene would otherwise be processed — and counted — three
-    // times. Writing is idempotent, but the COUNT is the artifact this script is trusted on.
-    .filter((p) => /\.(scene|prefab)\.json$/i.test(p));
-
-  // Dedupe on a case-FOLDED absolute path, after mapping — not on the raw index string above.
-  // Two index entries differing only in case (`games/Sling/x.scene.json` vs
-  // `games/sling/x.scene.json`) are distinct strings but the SAME physical file on every clone's
-  // case-insensitive filesystem (macOS, Windows); `existsSync` passes on both, so without this
-  // fold the file would be read — and counted — twice. The raw `Set` above stays: it dedupes the
-  // unmerged-stage case, where two entries are byte-IDENTICAL strings, which this fold would also
-  // catch but the raw one is cheaper and already proven correct for that case.
-  const seenAbs = new Set();
-  const abs = [];
-  for (const p of sceneOrPrefab) {
-    const full = join(ROOT, p);
-    const key = full.toLowerCase();
-    if (seenAbs.has(key)) continue;
-    seenAbs.add(key);
-    abs.push(full);
-  }
-
-  // A tracked file can be absent mid-rebase or after a manual delete; reading it would throw.
-  repoFilesCache = abs.filter((p) => existsSync(p));
   return repoFilesCache;
 }
 
@@ -131,7 +96,12 @@ function repoSceneAndPrefabFiles() {
  *  segment; this function does not lower-case anything on its own, so that is on each `re` this
  *  is called with. */
 function filesMatching(re) {
-  return repoSceneAndPrefabFiles().filter((p) => re.test(relative(ROOT, p).split(sep).join('/')));
+  // Matches on `rel` — git's own repo-relative POSIX path — rather than recomputing it with
+  // `relative(ROOT, abs).split(sep).join('/')` as this line used to. That recomputation was
+  // CORRECT, but it was the `node:path` round-trip the docblock above spends two paragraphs
+  // warning about, kept safe only by remembering the `.split(sep).join('/')`. The producer hands
+  // back the string git already had, so there is nothing left to normalise or forget.
+  return repoSceneAndPrefabFiles().filter((f) => re.test(f.rel)).map((f) => f.abs);
 }
 
 let changedFiles = 0, changedKeys = 0;

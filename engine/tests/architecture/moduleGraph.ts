@@ -23,6 +23,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 export const RUNTIME_ROOT = path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime');
@@ -47,14 +48,12 @@ export interface ImportEdge {
   valueOnly: boolean;
 }
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(full, out);
-    else if (/\.tsx?$/.test(entry.name)) out.push(full);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `RUNTIME_ROOT`, as absolute paths — via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 540 measured today. */
+function walk(dir: string): string[] {
+  return repoFiles({
+    under: dir, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 400,
+  }).map(({ abs }) => abs);
 }
 
 /** Node id for a file: its top-level subfolder under RUNTIME_ROOT, or (for a file directly at

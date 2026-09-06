@@ -16,13 +16,13 @@
  *  shares), different field set, and deliberately a separate file: that one asserts the #172
  *  private-field invariant and is scoped to it. */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mergeProjectConfig } from '../../project-config';
 import { isNonPortableProjectPath } from '../../packages/modoki/src/editor/panels/projectSettingsPaths';
 import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Fields whose value is a path into the PROJECT's own files, so a committed value must be
  *  project-relative. Every `type: 'path'` field in the Project Settings schema that lives OUTSIDE
@@ -70,9 +70,13 @@ const HOME_PATH = /^(~|\/Users\/|\/home\/|\/Volumes\/|[A-Za-z]:[\\/])/;
 // configs, `ci/main` 4, the release snapshot 2 — the two engine-owned ones survive everything.
 const CONFIG_FLOOR = hasInternalGames() ? 10 : hasAnyProject() ? 3 : 2;
 
-const tracked = execFileSync('git', ['ls-files', '*project.config.json', 'project.config.json'], {
-  cwd: REPO_ROOT, encoding: 'utf8',
-}).split('\n').filter(Boolean);
+// `includeUntracked: false` — this guard's subject is what a COMMITTED file holds (sibling of
+// privateBuildFields.test.ts, same reasoning: a value only reaches another clone once tracked).
+const tracked = repoFiles({
+  match: /(^|\/)project\.config\.json$/,
+  floor: 0,
+  includeUntracked: false,
+}).map((f) => f.rel);
 
 type Json = Record<string, unknown>;
 const parse = (rel: string): Json => JSON.parse(readFileSync(join(REPO_ROOT, rel), 'utf8')) as Json;

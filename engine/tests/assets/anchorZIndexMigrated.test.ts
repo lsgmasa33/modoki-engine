@@ -28,55 +28,39 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
 import { migrateUIAnchorZIndexInTraits } from '../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration';
 import { hasAnyProject } from '../helpers/repoLayout';
 // The single source of truth for the project roots (CLAUDE.md § Projects). Hand-listing
 // them here was a third copy; main retired the codemod's copy in f3f3f6fce, so this
 // guard follows rather than staying the holdout.
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
 type Ent = { name?: string; traits?: Record<string, unknown> };
 
-/** All scene/prefab files in the repo, enumerated through GIT rather than the filesystem, so
- *  gitignored build output (`games/*\/ads/` from a `--target playable` export, `dist/`,
- *  `release/`) can never be mistaken for authored content — a filesystem walk made this guard
- *  MACHINE-DEPENDENT, red only on a clone that had run a playable export, which reads as "the
- *  merge broke it" rather than "the guard is looking outside the repo". Full reasoning:
- *  `engine/tests/architecture/docCitations.test.ts`'s `repoFiles()`. `--others
- *  --exclude-standard` deliberately includes new UNTRACKED scenes, since an unstaged scene is
- *  exactly when this guard is most useful. */
-let allSceneAndPrefabFiles: string[] | undefined;
-function repoSceneAndPrefabFiles(): string[] {
-  if (allSceneAndPrefabFiles) return allSceneAndPrefabFiles;
-  const out = execFileSync(
-    'git',
-    ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-    { cwd: REPO, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-  )
-    .split('\0')
-    .filter(Boolean);
-  allSceneAndPrefabFiles = out
-    .filter((p) => p.endsWith('.scene.json') || p.endsWith('.prefab.json'))
-    .map((p) => path.join(REPO, p))
-    // A tracked file can be absent from the working tree mid-rebase or after a manual delete;
-    // reading it would throw and fail the guard for a reason that has nothing to do with the fix.
-    .filter((p) => fs.existsSync(p));
-  return allSceneAndPrefabFiles;
-}
-
+/**
+ * Every scene/prefab file under `root` (a repo-relative POSIX prefix, e.g. `'games'` or
+ * `'engine/tests/e2e/fixtures'`), enumerated through GIT rather than the filesystem, so
+ * gitignored build output (`games/*\/ads/` from a `--target playable` export, `dist/`,
+ * `release/`) can never be mistaken for authored content — a filesystem walk made this guard
+ * MACHINE-DEPENDENT, red only on a clone that had run a playable export, which reads as "the
+ * merge broke it" rather than "the guard is looking outside the repo".
+ *
+ * `includeUntracked: true` (the default) deliberately includes new UNTRACKED scenes, since an
+ * unstaged scene is exactly when this guard is most useful. `under`'s own case-insensitive,
+ * segment-wise prefix match (not a hand-rolled `path.relative(...).split(path.sep)` recompute —
+ * the exact round-trip this migration exists to kill) is what used to be this file's own
+ * `sceneFiles`/`PROJECT_PATTERN`-matching reimplementation; `repoFiles()` already does it, one
+ * producer instead of a second definition free to drift from it.
+ */
 function sceneFiles(root: string): string[] {
-  const rootSegs = path.relative(REPO, root).split(path.sep);
-  return repoSceneAndPrefabFiles().filter((p) => {
-    const segs = path.relative(REPO, p).split(path.sep);
-    // Case-INSENSITIVE, matching `migrate-anchor-zindex.mjs`'s `PROJECT_PATTERN` (main, f3f3f6fce).
-    // A git index holding `Games/` against a worktree holding `games/` otherwise selects NOTHING
-    // here while the codemod still migrates — the guard would go green by scanning an empty set,
-    // which is the exact failure that chain has now been fixed for three times.
-    return rootSegs.every((seg, i) => segs[i]?.toLowerCase() === seg.toLowerCase());
-  });
+  return repoFiles({
+    under: root,
+    match: (rel) => rel.endsWith('.scene.json') || rel.endsWith('.prefab.json'),
+    floor: 0,
+  }).map((f) => f.abs);
 }
 
 type Hit = { ent: Ent; anchor: Record<string, unknown>; location: string };
@@ -147,7 +131,7 @@ describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () =>
     const offenders: string[] = [];
     const scanned: string[] = [];
     for (const root of PROJECT_ROOT_DIRS) {
-      for (const file of sceneFiles(path.join(REPO, root))) {
+      for (const file of sceneFiles(root)) {
         scanned.push(file);
         for (const { ent, location } of entitiesWithAnchorZIndex(file)) {
           // `traits` is the common case and reads the same as before this widening; every other
@@ -178,7 +162,7 @@ describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () =>
   });
 
   it('the deliberately-old e2e fixtures still migrate their stacking onto UIElement.zIndex', () => {
-    const files = sceneFiles(path.join(REPO, 'engine/tests/e2e/fixtures'))
+    const files = sceneFiles('engine/tests/e2e/fixtures')
       .filter((f) => entitiesWithAnchorZIndex(f).length > 0);
 
     // If this ever hits zero the fixtures were migrated in place, which retires the migration-ladder

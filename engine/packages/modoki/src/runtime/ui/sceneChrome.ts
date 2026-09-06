@@ -345,6 +345,10 @@ export interface ChromeAnchorPatch {
    *  strip held above a home indicator takes, since the inset is a runtime fact the scene cannot
    *  author. */
   bottomPct?: number;
+  /** The `right` offset. On a right-anchored (or stretched) element this PULLS the box in from the
+   *  screen edge — the shape a horizontal letterbox takes: how much of it exists this frame is a
+   *  runtime fact (the host aspect vs. the design box), not something the scene can author. */
+  rightPct?: number;
 }
 
 /**
@@ -359,14 +363,15 @@ export function patchAnchorPct(world: World, name: string, patch: ChromeAnchorPa
   if (patch.leftPct !== undefined) { next.left = patch.leftPct; next.leftUnit = '%'; }
   if (patch.topPct !== undefined) { next.top = patch.topPct; next.topUnit = '%'; }
   if (patch.bottomPct !== undefined) { next.bottom = patch.bottomPct; next.bottomUnit = '%'; }
+  if (patch.rightPct !== undefined) { next.right = patch.rightPct; next.rightUnit = '%'; }
   // Sub-pixel churn would re-write (and so re-project) the whole UI tree every frame, which is the
   // cost `patchUI`'s diffing exists to avoid. A 0.01% deadband is well under a physical pixel at
   // any viewport this ships on.
   const moved = (a: unknown, b: unknown) => Math.abs(Number(a ?? 0) - Number(b ?? 0)) > 0.01;
   if (!moved(next.left, current.left) && !moved(next.top, current.top) &&
-      !moved(next.bottom, current.bottom) &&
+      !moved(next.bottom, current.bottom) && !moved(next.right, current.right) &&
       next.leftUnit === current.leftUnit && next.topUnit === current.topUnit &&
-      next.bottomUnit === current.bottomUnit) return false;
+      next.bottomUnit === current.bottomUnit && next.rightUnit === current.rightUnit) return false;
   entity.set(UIAnchor, next);
   markUIDirty();
   return true;

@@ -174,6 +174,25 @@ load-bearing and commented as such).
     `engine/scripts/pathPosix.mjs` (`toPosix`) is now the shared one for **new** code; the existing
     ~66 sites were deliberately left as-is — they're churn with no defect behind them, not a
     backlog to migrate.
+  - **The instance list stops here, and the reason is worth stating: the class is now UNREACHABLE
+    for anything that enumerates a corpus** (#799/#771/#805). Guards did not get better at
+    normalising — they stopped producing paths that need it. `engine/scripts/repoCorpus.mjs` returns
+    **git's own repo-relative POSIX `rel`**, so a consumer comparing against `'a/b.ts'` never touches
+    `node:path` and there is no backslash to forget. ~70 producers were migrated onto it and
+    `corpusProducerIsShared.test.ts` enforces it; the shape is documented in
+    [verify-and-ci.md](verify-and-ci.md) § "Corpus production". Instances **3, 5 and 7** above
+    (`materialCloneStamp`, `chromeTagging`, `textDirtyAttribution`) each carried a hand-rolled
+    normaliser, and all three are now dead code that `noUnusedLocals` deleted — `materialCloneStamp`
+    is the one that mattered most, since its `split(sep)` was the one genuinely broken spelling.
+    ⚠️ Three limits, so this is not read as more than it is:
+    - **Instance 4 is the exception.** `consoleRingOptionsWiring`'s `relPosix` SURVIVES and is live.
+      Its two offender lists — the actual defect — now take `rel` from git, but the helper still
+      serves individually-named fixed files and a BFS trail, which are not corpus enumeration. It
+      is correct (the safe spelling, applied to `node:path` output), just not deleted.
+    - The ~66 inline sites elsewhere are untouched **by design** — the ruling two bullets up.
+    - The guard covers only `engine/tests/**` + `engine/scripts/**`; **15** producers outside it,
+      including `determinismGuard` and `scripts/scan-publish-safety.mjs`, are tracked as **#814**.
+      A ninth instance is still possible *there*.
 
 ## Never shell out to a platform binary whose shape you assumed
 

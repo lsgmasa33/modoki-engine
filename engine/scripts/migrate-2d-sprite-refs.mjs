@@ -22,10 +22,10 @@
  *    node engine/scripts/migrate-2d-sprite-refs.mjs --write    # apply the rewrites
  */
 
-import { readFile, writeFile, readdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { join, dirname, resolve, extname, basename } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { dirname, resolve, extname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from './repoCorpus.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..'); // repo root (engine/scripts → ../..)
@@ -50,30 +50,19 @@ function deriveGuid(seed) {
 }
 const spriteGuidFor = (texGuid) => deriveGuid('sprite:' + texGuid);
 
-/** Recursively collect files under `dir` matching `pred` (skips build-output dirs). */
-async function walkFiles(dir, pred, out = []) {
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      if (e.name === 'node_modules' || e.name === 'dist' || e.name === '.cache') continue;
-      await walkFiles(p, pred, out);
-    } else if (pred(p)) out.push(p);
-  }
-  return out;
-}
+// git-backed enumeration (#771/#799) replaces the hand-rolled recursive walker + per-game
+// `runtime/assets` root list. `node_modules`/`dist`/`.cache` need no exclude entry: every one of
+// them is gitignored and is therefore absent from `repoFiles()`'s corpus for free.
+const RUNTIME_ASSETS_RE = /^games\/[^/]+\/runtime\/assets\//;
 
-/** Every `games/<id>/runtime/assets` dir. */
-async function assetRoots() {
-  const gamesDir = join(ROOT, 'games');
-  const roots = [];
-  for (const e of await readdir(gamesDir, { withFileTypes: true })) {
-    if (!e.isDirectory()) continue;
-    const r = join(gamesDir, e.name, 'runtime', 'assets');
-    if (existsSync(r)) roots.push(r);
-  }
-  return roots;
+/** Every file under any `games/<id>/runtime/assets` whose git-relative path satisfies `match`. */
+function gameAssetFiles(match) {
+  return repoFiles({
+    under: 'games',
+    match: (rel) => RUNTIME_ASSETS_RE.test(rel) && match(rel),
+    exclude: ['ios', 'android'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 const TEX_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -85,30 +74,24 @@ function resolveTextureType(meta) {
 }
 
 async function main() {
-  const roots = await assetRoots();
-
   // 1. Index every texture: guid → { metaPath, srcPath, format, type }.
   const texByGuid = new Map();
-  for (const root of roots) {
-    const metas = await walkFiles(root, (p) => p.endsWith('.meta.json') && TEX_EXT.has(extname(p.slice(0, -'.meta.json'.length)).toLowerCase()));
-    for (const metaPath of metas) {
-      const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
-      if (!isGuid(meta.id)) continue;
-      texByGuid.set(meta.id, {
-        metaPath, srcPath: metaPath.slice(0, -'.meta.json'.length),
-        format: meta?.texture?.format, type: resolveTextureType(meta), meta,
-        used2D: false, used3D: resolveTextureType(meta) === '3d' || String(meta?.texture?.format || '').startsWith('ktx2'),
-      });
-    }
+  const metas = gameAssetFiles((rel) => rel.endsWith('.meta.json') && TEX_EXT.has(extname(rel.slice(0, -'.meta.json'.length)).toLowerCase()));
+  for (const metaPath of metas) {
+    const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
+    if (!isGuid(meta.id)) continue;
+    texByGuid.set(meta.id, {
+      metaPath, srcPath: metaPath.slice(0, -'.meta.json'.length),
+      format: meta?.texture?.format, type: resolveTextureType(meta), meta,
+      used2D: false, used3D: resolveTextureType(meta) === '3d' || String(meta?.texture?.format || '').startsWith('ktx2'),
+    });
   }
 
   // 2. Mark textures used in 3D (any material slot referencing the texture GUID).
-  for (const root of roots) {
-    const mats = await walkFiles(root, (p) => p.endsWith('.mat.json'));
-    for (const matPath of mats) {
-      const raw = await readFile(matPath, 'utf-8');
-      for (const guid of texByGuid.keys()) if (raw.includes(guid)) texByGuid.get(guid).used3D = true;
-    }
+  const mats = gameAssetFiles((rel) => rel.endsWith('.mat.json'));
+  for (const matPath of mats) {
+    const raw = await readFile(matPath, 'utf-8');
+    for (const guid of texByGuid.keys()) if (raw.includes(guid)) texByGuid.get(guid).used3D = true;
   }
 
   // 3. Walk 2D content, plan rewrites of raw-texture refs in 2D fields.
@@ -140,14 +123,11 @@ async function main() {
     for (const [k, v] of Object.entries(node)) if (v && typeof v === 'object') walkContent(v, `${path}.${k}`, changes);
   };
 
-  const contentFiles = [];
-  for (const root of roots) {
-    contentFiles.push(...await walkFiles(root, (p) => {
-      const b = basename(p);
-      return b.endsWith('.rig2d.json') || b.endsWith('.prefab.json') ||
-        (extname(p) === '.json' && /(^|\/)scenes\//.test(p.replace(/\\/g, '/')));
-    }));
-  }
+  const contentFiles = gameAssetFiles((rel) => {
+    const b = basename(rel);
+    return b.endsWith('.rig2d.json') || b.endsWith('.prefab.json') ||
+      (extname(rel) === '.json' && /(^|\/)scenes\//.test(rel));
+  });
 
   for (const file of contentFiles) {
     const json = JSON.parse(await readFile(file, 'utf-8'));

@@ -7,18 +7,34 @@
  *  moving/deleting an asset, for instance).
  *
  *  Usage:
- *    node scripts/show-refs.mjs path/to/scene-or-prefab.json
- *    node scripts/show-refs.mjs --all     # walk every scene/prefab in the repo
+ *    node engine/scripts/show-refs.mjs path/to/scene-or-prefab.json
+ *    node engine/scripts/show-refs.mjs --all     # walk every scene/prefab in the repo
+ *
+ *  ⚠️ `--all` was broken two further ways until #805, BOTH of them independent of the Windows
+ *  separator bug that #798 fixed in this same function (that was instance 8 of
+ *  docs/windows.md § Paths; it is not what this note is about, and the `toPosix` call it added
+ *  was correct):
+ *
+ *    1. `ROOT` was `resolve(__dirname, '..')` — `engine/`, not the repo root. So `loadManifest()`
+ *       probed `engine/assets.manifest.json` and two siblings, none of which exist (the manifest
+ *       is at the repo root), and EVERY guid ref reported as unresolvable; and the walk could not
+ *       see `games/`/`demos/` at all. MEASURED: `--all` reached 2 files, against 154 in the repo.
+ *    2. The walker keyed PREFABS by extension but SCENES by DIRECTORY (`.../scenes/`), so a
+ *       `.scene.json` outside a `scenes/` folder was invisible no matter what the root was —
+ *       9 such files live at `engine/tests/e2e/fixtures/*.scene.json`. This is why fixing the
+ *       root alone would still have under-reported.
+ *
+ *  Both are fixed by routing through `repoCorpus.mjs` (`repoRoot()`/`repoFiles()`) and keying
+ *  scenes on the extension, like prefabs. Note that 0 `.prefab.json` files exist anywhere under
+ *  the OLD root, so the prefab branch had never once fired in this script's life.
  */
 
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, dirname, resolve, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { toPosix } from './pathPosix.mjs';
+import { join, resolve, relative } from 'node:path';
+import { repoRoot, repoFiles } from './repoCorpus.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(__dirname, '..');
+const ROOT = repoRoot();
 const args = process.argv.slice(2);
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -122,36 +138,23 @@ async function showFile(filePath, manifest) {
   }
 }
 
-async function findAllScenesAndPrefabs(dir, out = []) {
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
-  for (const ent of entries) {
-    if (ent.name === 'node_modules' || ent.name.startsWith('.')) continue;
-    const full = join(dir, ent.name);
-    if (ent.isDirectory()) {
-      await findAllScenesAndPrefabs(full, out);
-    } else if (ent.name.endsWith('.prefab.json')
-      || (ent.name.endsWith('.json') && toPosix(full).includes('/scenes/'))) {
-      out.push(full);
-    }
-  }
-  return out;
-}
-
 async function main() {
   const manifest = await loadManifest();
   console.log(`[show-refs] manifest: ${manifest.source ?? '(none found — guid refs will all show ⚠️ NOT IN MANIFEST)'}`);
   console.log(`[show-refs] entries: ${manifest.byGuid.size}`);
 
   if (args.includes('--all')) {
-    const targets = await findAllScenesAndPrefabs(ROOT);
-    for (const f of targets) await showFile(f, manifest);
+    // Keyed on EXTENSION for both scene and prefab — the old walker keyed prefabs by
+    // extension but scenes by directory (`.../scenes/`), which missed any `.scene.json`
+    // outside a `scenes/` folder. See the header comment.
+    const targets = repoFiles({ match: /\.(scene|prefab)\.json$/i, floor: 1 });
+    for (const f of targets) await showFile(f.abs, manifest);
     return;
   }
 
   if (args.length === 0) {
-    console.error('Usage: node scripts/show-refs.mjs <file.json>');
-    console.error('       node scripts/show-refs.mjs --all');
+    console.error('Usage: node engine/scripts/show-refs.mjs <file.json>');
+    console.error('       node engine/scripts/show-refs.mjs --all');
     process.exit(1);
   }
 

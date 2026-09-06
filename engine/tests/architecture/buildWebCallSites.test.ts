@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const ENGINE_ROOT = path.join(REPO_ROOT, 'engine');
@@ -46,19 +47,6 @@ function isAllowlisted(relFile: string, line: string): boolean {
   return ALLOWLIST.some((a) => a.file === relFile && line.includes(a.needle));
 }
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      walk(full, out);
-      continue;
-    }
-    if (/\.(ts|mjs|sh)$/.test(entry.name)) out.push(full);
-  }
-  return out;
-}
-
 // Space form (`--target web`) or equals form (`--target=web`) inside one string.
 const SPACE_OR_EQUALS_TARGET_RE = /--target[= ]+(web|native|playable)\b/;
 // execFileSync/spawn args-array form: '--target', 'web' as two separate array elements.
@@ -72,7 +60,11 @@ function relEngine(file: string): string {
   return path.relative(ENGINE_ROOT, file).split(path.sep).join('/');
 }
 
-const files = walk(ENGINE_ROOT).filter((f) => {
+// Every .ts/.mjs/.sh under engine/**, via the shared corpus producer (#799/#771/#805 Phase 4).
+// Floored well under the 2167 measured today — only a broken enumeration can turn this red.
+const files = repoFiles({
+  under: ENGINE_ROOT, match: /\.(ts|mjs|sh)$/, exclude: ['node_modules', 'dist'], floor: 1500,
+}).map(({ abs }) => abs).filter((f) => {
   const rel = relEngine(f);
   if (rel.startsWith('tests/')) return false; // not call sites — this suite's own files
   if (rel === 'scripts/build-web.mjs') return false; // the callee, not a caller

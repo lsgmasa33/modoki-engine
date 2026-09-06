@@ -49,6 +49,7 @@ import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../..
 import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 // engine/tests/assets/ → repo root (games/ + demos/ live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -124,20 +125,18 @@ const PENDING_MIGRATION: { file: string; note: string; guids: string[] }[] = [
   },
 ];
 
-function* walkFiles(dir: string): Generator<string> {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    // dist/ is build OUTPUT (contains bundled copies of the very sources we scan, which would
-    // double-report every finding); tools/ is build-time Node code that legitimately handles
-    // asset paths/guids while generating them; tests are allowed to name a guid as a fixture.
-    if (e.isDirectory()) {
-      if (e.name === 'dist' || e.name === 'node_modules' || e.name === 'tools' || e.name === 'tests') continue;
-      yield* walkFiles(path.join(dir, e.name));
-    } else if (/\.tsx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
-      yield path.join(dir, e.name);
-    }
-  }
+/** Every source `.ts`/`.tsx` file under `dir`, git-enumerated (#771/#799) rather than a
+ *  hand-rolled recursive walk. `tools/` (build-time Node code that legitimately handles asset
+ *  paths/guids while generating them) and `tests/` (allowed to name a guid as a fixture) are
+ *  excluded explicitly because they are TRACKED; `dist/`/`node_modules/` need no entry at all —
+ *  both are gitignored. */
+function walkFiles(dir: string): string[] {
+  return repoFiles({
+    under: dir,
+    match: (rel) => /\.tsx?$/.test(rel) && !rel.endsWith('.d.ts'),
+    exclude: ['tools', 'tests'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 function urlFor(abs: string, roots: AssetRoot[]): string | null {
@@ -193,15 +192,17 @@ function readSpriteSliceGuids(textureAbs: string): { guid: string; name: string 
   }
 }
 
-/** Asset-tree walker — separate from walkFiles (which is source-only, .ts/.tsx). */
-function* walkFiles0(dir: string): Generator<string> {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walkFiles0(full);
-    else yield full;
-  }
+/** Asset-tree walker — separate from walkFiles (which is source-only, .ts/.tsx). Git-enumerated
+ *  (#771/#799) rather than a hand-rolled recursive walk. A dotfile/dot-dir segment is dropped,
+ *  same as the old walker's `e.name.startsWith('.')` — git enumeration additionally drops
+ *  `*.meta.local.json` for free (gitignored machine-local sidecars — `.gitignore:41`), which
+ *  `detectType()` below already classifies as `null` and discards, so nothing downstream changes. */
+function walkFiles0(dir: string): string[] {
+  return repoFiles({
+    under: dir,
+    match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** `export const SOME_GUID = '<guid>'` in engine source — the ENGINE's own asset-GUID constants. */

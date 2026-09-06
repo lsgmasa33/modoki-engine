@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import * as tar from 'tar';
 import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion, verifyInstalledMatchesTarball } from '../../plugins/vendorPlugins';
 import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const enginePkgs = path.join(repoRoot, 'engine', 'packages');
@@ -51,11 +52,19 @@ describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
     for (const dir of enginePluginDirs()) {
       const name = path.basename(dir);
       it(`${name}: every hashed input is git-tracked (no untracked/ignored litter leaks in)`, () => {
+        // The one migrated call site that keeps a `path.relative` round-trip, deliberately: `rel`
+        // is not merely feeding `under` (which accepts an absolute `dir` and would need no
+        // normalisation) — it is also the PREFIX LENGTH the slice below uses to turn a
+        // repo-relative path into a plugin-relative one. Passing `dir` to `under` and keeping
+        // `rel` for the slice would split one derivation into two that can disagree, which is a
+        // worse shape than the round-trip. The `.split(path.sep).join('/')` is load-bearing on
+        // Windows and must stay.
         const rel = path.relative(repoRoot, dir).split(path.sep).join('/');
+        // `includeUntracked: false` is not a style choice here — the whole point of this test is
+        // "is this file TRACKED", so pulling in untracked files would defeat its purpose.
         const tracked = new Set(
-          execFileSync('git', ['ls-files', '-z', '--', rel], { cwd: repoRoot, encoding: 'utf8' })
-            .split('\0').filter(Boolean)
-            .map((p) => p.slice(rel.length + 1)), // repo-relative → plugin-relative
+          repoFiles({ under: rel, floor: 0, includeUntracked: false })
+            .map((f) => f.rel.slice(rel.length + 1)), // repo-relative → plugin-relative
         );
         const inputs = pluginHashInputs(dir);
         expect(inputs.length).toBeGreaterThan(0);

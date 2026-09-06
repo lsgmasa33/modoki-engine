@@ -13,10 +13,10 @@
  * passes. `repoLayoutGuard.test.ts` is the tripwire against exactly that.
  */
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Walk up from this file's own location (not `process.cwd()`, which varies with how the
  *  test runner was invoked) until we find the repo root: a directory holding BOTH a
@@ -171,12 +171,22 @@ export function hasVendoredPluginTarballs(): boolean {
  *  instead of disagreeing. */
 export function hasNativeProjects(): boolean {
   try {
-    const out = execFileSync('git', ['ls-files', '--', '*/ios/App/App.xcodeproj/project.pbxproj'], {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return out.trim() !== '';
+    // `includeUntracked: false` is the tracked-only requirement argued above, expressed through the
+    // one producer (#771) rather than by hand-rolling the spawn — so the `-z`, C-quoting, unmerged
+    // and case-fold hazards are handled centrally, and only the ERROR DISPOSITION stays local.
+    //
+    // ⚠️ That disposition is the reason this `catch` is not the fail-open shape this family exists
+    // to close. `repoFiles()` throws when git cannot answer, deliberately: for a GUARD, "I could
+    // not look" must never read as "nothing to find". Here the opposite is correct, and the
+    // docblock above says why — the consumers gate on `git grep`, which goes quiet in exactly the
+    // same circumstances, so a predicate that threw would make this file DISAGREE with the thing
+    // it gates. Swallowing is the call site's answer to a question the producer cannot answer for
+    // it; `floor: 0` keeps "no native projects" (a real, common state) a plain `false`, not a throw.
+    return repoFiles({
+      match: /.+\/ios\/App\/App\.xcodeproj\/project\.pbxproj$/,
+      floor: 0,
+      includeUntracked: false,
+    }).length > 0;
   } catch {
     return false;
   }

@@ -16,6 +16,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const editorDir = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
@@ -31,13 +32,10 @@ const ALLOWLIST = new Map<string, string>([
   ],
 ]);
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const abs = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(abs, out);
-    else if (entry.isFile() && /\.tsx?$/.test(entry.name)) out.push(abs);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under editor/**, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 240 measured today. */
+function editorSources() {
+  return repoFiles({ under: editorDir, match: /\.tsx?$/, floor: 150 });
 }
 
 /** Matches `fetch(asset.path)`, `fetch(path)`, `fetch(x.y.path)` — with or without a trailing
@@ -69,7 +67,7 @@ function findOffenders(code: string): number[] {
 describe('editor asset-document loads are parsed through parseAssetJson, not res.json() (#460)', () => {
   it('has no unguarded fetch(<...>.path) + .json() in editor/**', () => {
     const offenders: string[] = [];
-    for (const abs of walk(editorDir)) {
+    for (const { abs } of editorSources()) {
       const rel = path.relative(editorDir, abs).replace(/\\/g, '/');
       if (ALLOWLIST.has(rel)) continue;
       const raw = fs.readFileSync(abs, 'utf8');

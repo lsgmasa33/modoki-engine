@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const TEST_DIRS = [
   path.join(REPO_ROOT, 'engine', 'tests'),
@@ -50,18 +51,19 @@ const INLINE_PATTERNS: { re: RegExp; what: string }[] = [
   { re: /existsSync\s*\(\s*path\.join\s*\([^)]*['"]games['"]\s*\)\s*\)/, what: "existsSync(path.join(..., 'games'))" },
 ];
 
-function* walkTests(dir: string): Generator<string> {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walkTests(full);
-    else if (/\.tsx?$/.test(e.name)) yield full;
-  }
+/** Every `.tsx?` test source file under `under`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). */
+function walkTests(under: string | string[], floor: number): string[] {
+  return repoFiles({
+    under,
+    match: (rel: string) => /\.tsx?$/.test(rel) && !rel.split('/').some((s) => s.startsWith('.') || s === 'node_modules'),
+    floor,
+  }).map(({ abs }) => abs);
 }
 
 describe('project-presence is asked in exactly one place (#98)', () => {
-  const files = TEST_DIRS.flatMap((d) => [...walkTests(d)]);
+  // Floored well under the 1259 measured today.
+  const files = walkTests(TEST_DIRS, 900);
 
   it('found test files to scan (sanity: the guard is not passing vacuously)', () => {
     // Without this, a moved test root turns the whole guard into a silent pass — the failure
@@ -108,7 +110,7 @@ describe('e2e specs never discover projects themselves (#326 follow-up)', () => 
   it('no spec under engine/tests/e2e calls discoverProjects — pickHostProject() does', () => {
     const offenders: string[] = [];
     let scanned = 0;
-    for (const file of walkTests(E2E_DIR)) {
+    for (const file of walkTests(E2E_DIR, 15)) {
       if (ALLOWED.has(file)) continue;
       scanned++;
       if (/\bdiscoverProjects\s*\(/.test(fs.readFileSync(file, 'utf8'))) {

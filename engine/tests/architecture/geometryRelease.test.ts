@@ -46,6 +46,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const roots = [
   path.resolve(__dirname, '../../packages/modoki/src'),
@@ -159,13 +160,10 @@ function findParamScopes(code: string): ParamScope[] {
   return scopes;
 }
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const abs = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(abs, out);
-    else if (entry.isFile() && /\.tsx?$/.test(entry.name)) out.push(abs);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `roots`, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 855 measured today. */
+function sourceFiles() {
+  return repoFiles({ under: roots, match: /\.tsx?$/, floor: 600 });
 }
 
 /** The line range of `releaseGeometry`'s own body — the one place allowed to call `.destroy(`
@@ -294,24 +292,22 @@ function findChainedBuilderDestroys(code: string): number[] {
 describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-before-destroy)', () => {
   it('no other .destroy( call touches a geometry-shaped identifier', () => {
     const offenders: string[] = [];
-    for (const root of roots) {
-      for (const abs of walk(root)) {
-        const raw = fs.readFileSync(abs, 'utf8');
-        const code = stripComments(raw);
-        assertScanIsSane(raw, code, path.relative(root, abs));
-        const isHelperFile = abs === HELPER_FILE;
-        const [helperStart, helperEnd] = isHelperFile ? helperLineRange(code) : [-1, -1];
-        const inHelper = (lineNo: number) => isHelperFile && lineNo >= helperStart && lineNo <= helperEnd;
-        const codeLines = code.split('\n');
+    for (const { abs, rel } of sourceFiles()) {
+      const raw = fs.readFileSync(abs, 'utf8');
+      const code = stripComments(raw);
+      assertScanIsSane(raw, code, rel);
+      const isHelperFile = abs === HELPER_FILE;
+      const [helperStart, helperEnd] = isHelperFile ? helperLineRange(code) : [-1, -1];
+      const inHelper = (lineNo: number) => isHelperFile && lineNo >= helperStart && lineNo <= helperEnd;
+      const codeLines = code.split('\n');
 
-        const offenderLines = [
-          ...findScopedGeometryDestroys(code),
-          ...findChainedBuilderDestroys(code),
-        ];
-        for (const lineNo of offenderLines) {
-          if (inHelper(lineNo)) continue;
-          offenders.push(`${path.relative(root, abs)}:${lineNo}  ${codeLines[lineNo - 1].trim()}`);
-        }
+      const offenderLines = [
+        ...findScopedGeometryDestroys(code),
+        ...findChainedBuilderDestroys(code),
+      ];
+      for (const lineNo of offenderLines) {
+        if (inHelper(lineNo)) continue;
+        offenders.push(`${rel}:${lineNo}  ${codeLines[lineNo - 1].trim()}`);
       }
     }
     expect(

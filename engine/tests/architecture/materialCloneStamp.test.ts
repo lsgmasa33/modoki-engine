@@ -17,8 +17,9 @@
  *  the `userData` assignment must come first) needs an allowlist entry stating why. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
 
@@ -43,19 +44,33 @@ const EXEMPT: Array<{ file: string; contains: string; why: string }> = [
   // `applyLightMask` hands it a `markDerived` clone whenever the mesh is tinted or instanced.
 ];
 
-/** POSIX-normalised so the `EXEMPT` keys and the known-sites set below — both hand-authored with
- *  `/` — still match on Windows, where `relative()` returns backslashes. This guard failed exactly
- *  that way on `ci/main`; the class is documented in `docs/windows.md` § Paths. */
-const toPosix = (p: string) => p.split(sep).join('/');
-
-function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === 'dist') continue;
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (p.endsWith('.ts') || p.endsWith('.tsx')) out.push(p);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `RUNTIME`, RUNTIME-relative POSIX — via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). `repoFiles()`'s own `rel` is repo-root-relative
+ *  (`engine/packages/modoki/src/runtime/...`); the prefix up to and including the one `runtime/`
+ *  segment is stripped by a plain string search, not a `path.relative`/`sep` round-trip — that
+ *  round-trip (this file's own former `toPosix`, instance 3 of the class docs/windows.md § Paths
+ *  records) is exactly the hazard `repoCorpus.mjs` removes by returning git's own POSIX `rel`
+ *  verbatim. Floored well under the 540 measured today. */
+function runtimeFiles(): Array<{ abs: string; rel: string }> {
+  const MARKER = '/runtime/';
+  return repoFiles({ under: RUNTIME, match: /\.tsx?$/, floor: 400 })
+    .map(({ abs, rel }) => {
+      // ⚠️ THROW rather than tolerate a miss. `indexOf` returns -1 when the marker is absent, and
+      // `slice(-1 + MARKER.length)` is a perfectly valid slice — it would hand back a truncated
+      // but plausible-looking path, every EXEMPT key would quietly stop matching, and the guard
+      // would go green having compared nothing. That is a wrong answer with no error, which is the
+      // precise failure this whole family exists to remove; it must not be reintroduced by the
+      // change removing it. Unreachable while `under` is RUNTIME, which is why it is a throw and
+      // not a fallback: if it ever fires, the assumption changed and the guard should stop.
+      const i = rel.indexOf(MARKER);
+      if (i === -1) {
+        throw new Error(
+          `materialCloneStamp: ${rel} is not under a "runtime/" segment, but \`under\` is RUNTIME `
+          + '— the enumeration root and this prefix strip have drifted apart.',
+        );
+      }
+      return { abs, rel: rel.slice(i + MARKER.length) };
+    });
 }
 
 /** Strip line comments and block-comment bodies so a doc paragraph ABOUT `base.clone()` — of
@@ -92,8 +107,7 @@ describe('material clones carry the derived-base stamp', () => {
     // `tintedMaterial` and `applyPropOverride` were all doing while this guard was green. The rule
     // is now "use the helper", and the helper is the only place the raw clone may live.
     const raw: string[] = [];
-    for (const file of walk(RUNTIME)) {
-      const rel = toPosix(relative(RUNTIME, file));
+    for (const { abs: file, rel } of runtimeFiles()) {
       if (rel === HELPER_FILE) continue;
       for (const { n, text } of codeLines(readFileSync(file, 'utf8'))) {
         if (!CLONE.test(text)) continue;
@@ -118,8 +132,7 @@ describe('material clones carry the derived-base stamp', () => {
     // clone with the suite green.
     const sites: string[] = [];
     let helperStampsItsOwnClone = false;
-    for (const file of walk(RUNTIME)) {
-      const rel = toPosix(relative(RUNTIME, file));
+    for (const { abs: file, rel } of runtimeFiles()) {
       for (const { text } of codeLines(readFileSync(file, 'utf8'))) {
         if (rel === HELPER_FILE) {
           // The helper is where the ONE raw clone lives, and it must still stamp on that line.

@@ -22,8 +22,8 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 const DOCS = path.join(REPO, 'docs');
@@ -59,11 +59,23 @@ const SKIP_PATHS = [
   /^scripts\/oss\//,            // curated public overlay, reviewed on its own terms
 ];
 
+/** Floored well under the 528 measured today (698 total `.md` files, minus SKIP_PATHS) — only a
+ *  broken enumeration or a `match` that stops matching can turn this red, never ordinary doc
+ *  churn. This file previously carried NO non-vacuity check at all beyond the named-file
+ *  membership assertions below; `repoFiles()`'s `floor` is required, so this is new coverage,
+ *  not merely a migration. */
 function allMarkdown(): string[] {
-  const listed = execFileSync('git', ['ls-files', '-z', '--', '*.md'], {
-    cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-  }).split('\0').filter(Boolean);
-  return listed.filter((rel) => !SKIP_PATHS.some((re) => re.test(rel)));
+  return repoFiles({
+    match: (rel: string) => rel.endsWith('.md') && !SKIP_PATHS.some((re) => re.test(rel)),
+    // ⚠️ Floored under the PUBLIC OSS SNAPSHOT's count (86 markdown files, measured by assembling
+    // a real stage), not this clone's 528. `engine/tests/**` ships, and
+    // `scripts/publish-engine-oss.sh` is INCLUDE-ONLY — `git ls-files -- engine build docs` plus a
+    // handful of named root files — so the snapshot has no `games/`, `qa/`, `.agent-memory/`,
+    // `layouts/` or `scripts/`, and `docs/` minus seven private files. A floor of 200 (this
+    // clone's number, scaled down) went red on the public gate; the mental model "snapshot = repo
+    // minus games/" is what produced it and is wrong.
+    floor: 50,
+  }).map(({ rel }) => rel);
 }
 
 /** Patterns that must never appear INSIDE a fenced command block in those docs, with the reason

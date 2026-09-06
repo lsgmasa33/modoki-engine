@@ -17,7 +17,6 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { hashKey } from '../../plugins/texture-cache';
@@ -29,6 +28,7 @@ import { resolveFontSettings } from '../../packages/modoki/src/runtime/core/font
 import { resolveEnvSettings } from '../../packages/modoki/src/runtime/core/environmentSettings';
 import { resolveAudioSettings } from '../../packages/modoki/src/runtime/loaders/audioSettings';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 
@@ -46,15 +46,12 @@ const PROJECT_ROOT = path.resolve(__dirname, '../../..');
  */
 const INTERNAL_GAMES = hasInternalGames();
 
-/** Every `.meta.json` tracked by git, repo-root-relative. `-z` is required —
- *  without it git quotes/escapes non-ASCII paths (e.g. the tropical-island
- *  Cyrillic texture names) and they fail to open as literal strings. */
+/** Every `.meta.json` tracked by git, repo-root-relative. `includeUntracked: false` — the guard
+ *  below is about COMMITTED sidecars specifically (its whole point is that a churning
+ *  machine-dependent value reaches other clones via the commit); an untracked sidecar hasn't
+ *  reached anyone yet. Preserves this guard's original tracked-only `git ls-files` behaviour. */
 function trackedMetaSidecars(): string[] {
-  const out = execFileSync('git', ['ls-files', '-z', '*.meta.json'], {
-    cwd: PROJECT_ROOT,
-    encoding: 'utf-8',
-  });
-  return out.split('\0').filter(Boolean);
+  return repoFiles({ match: /\.meta\.json$/, floor: 0, includeUntracked: false }).map((f) => f.rel);
 }
 
 describe('committed .meta.json sidecars never carry modelCache.hash (#127)', () => {

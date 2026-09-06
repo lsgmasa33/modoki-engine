@@ -29,6 +29,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const runtimeDir = path.resolve(__dirname, '../../packages/modoki/src/runtime');
 
@@ -47,19 +48,17 @@ const ALLOWLIST = new Map<string, string>([
 // Comment stripping is the shared scanner (#419) — it tracks string state, so a `//` inside a URL
 // string is not mistaken for a comment and needs no `[^:]` hack.
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const abs = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(abs, out);
-    else if (entry.isFile() && /\.tsx?$/.test(entry.name)) out.push(abs);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under runtime/**, via the shared corpus producer (#799/#771/#805 Phase 4).
+ *  Floored well under the 540 measured today — only a broken enumeration (a wrong `under`, a
+ *  `match` that stops matching) can turn this red, never ordinary source-file churn. */
+function runtimeSources() {
+  return repoFiles({ under: runtimeDir, match: /\.tsx?$/, floor: 400 });
 }
 
 describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
   it('has no unguarded .json() call anywhere in runtime/**', () => {
     const offenders: string[] = [];
-    for (const abs of walk(runtimeDir)) {
+    for (const { abs } of runtimeSources()) {
       const rel = path.relative(runtimeDir, abs).replace(/\\/g, '/');
       if (ALLOWLIST.has(rel)) continue;
       const raw = fs.readFileSync(abs, 'utf8');

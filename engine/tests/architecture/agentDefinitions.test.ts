@@ -28,6 +28,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { REPO_ROOT, hasAgentDefinitions } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const AGENT_DIR = path.join(REPO_ROOT, '.claude', 'agents');
 
@@ -60,16 +61,18 @@ function parseAgents(): Def[] {
 /** Every place that may NAME an agent and expect it to be spawnable. */
 function referencingFiles(): string[] {
   const out = [path.join(REPO_ROOT, 'CLAUDE.md')];
-  const skillsDir = path.join(REPO_ROOT, '.claude', 'skills');
-  if (fs.existsSync(skillsDir)) {
-    const walk = (d: string): void => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name.endsWith('.md')) out.push(p);
-      }
-    };
-    walk(skillsDir);
+  // Enumerated through the ONE shared producer (#799/#771/#805), like every other corpus in the
+  // repo. `.claude/skills/**` is tracked content, so git can enumerate it — it is not the
+  // build-output or scratch-dir case that genuinely cannot use the producer.
+  //
+  // `floor: 0` because this is module-adjacent and `.claude/` is one of the directories
+  // `scripts/publish-engine-oss.sh` does NOT ship: on the public OSS snapshot there are no skills
+  // at all, and a throw there would fail collection rather than let the guard scan just CLAUDE.md.
+  // The suite gates on `hasAgentDefinitions()` (see the `describe.skipIf` below), and the snapshot
+  // ships neither `.claude/agents` nor `.claude/skills` — so an empty result here is an expected
+  // state, not a broken enumeration.
+  for (const { abs } of repoFiles({ under: '.claude/skills', match: /\.md$/, floor: 0 })) {
+    out.push(abs);
   }
   return out.filter((f) => fs.existsSync(f));
 }

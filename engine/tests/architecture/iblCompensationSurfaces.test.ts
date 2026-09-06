@@ -26,24 +26,19 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const srcRoots = [
   path.resolve(__dirname, '../../packages/modoki/src'),
   path.resolve(__dirname, '../../app'),
 ];
 
-/** Every .ts/.tsx under the given roots, minus the module that DEFINES the pair. */
+/** Every `.ts`/`.tsx` under the given roots, minus the module that DEFINES the pair — via the
+ *  shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 855 measured today. */
 function sourceFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) { walk(p); continue; }
-      if (/\.tsx?$/.test(e.name)) out.push(p);
-    }
-  };
-  for (const root of srcRoots) if (fs.existsSync(root)) walk(root);
-  return out.filter((p) => !p.endsWith(path.join('rendering', 'scene3DSync.ts')));
+  return repoFiles({ under: srcRoots, match: /\.tsx?$/, floor: 600 })
+    .map(({ abs }) => abs)
+    .filter((p) => !p.endsWith(path.join('rendering', 'scene3DSync.ts')));
 }
 
 describe('IBL-off compensation — surfaces that sync an environment must reconcile their exposure', () => {

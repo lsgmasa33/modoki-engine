@@ -77,6 +77,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 
@@ -91,23 +92,15 @@ const SCAN_DIRS = [
 /** The helper itself implements the token, so its own counters are the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/liveness.ts');
 
-function listSourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  if (!fs.existsSync(dir)) return out;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-      out.push(...listSourceFiles(full));
-    } else if (
-      entry.isFile()
-      && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))
-      && !entry.name.includes('.test.')
-    ) {
-      out.push(full);
-    }
-  }
-  return out;
+/** Every `.ts`/`.tsx` production source file under `SCAN_DIRS`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 851 measured today. */
+function listSourceFiles(): string[] {
+  return repoFiles({
+    under: SCAN_DIRS.map((rel) => path.join(REPO, rel)),
+    match: (rel: string) => /\.tsx?$/.test(rel) && !path.posix.basename(rel).includes('.test.'),
+    exclude: ['node_modules', 'dist'],
+    floor: 600,
+  }).map(({ abs }) => abs);
 }
 
 /** Zero-initialised numeric counters: module/closure `let x = 0;` and class field `private x = 0;`.
@@ -149,15 +142,13 @@ interface Scanned { file: string; counters: string[]; offenders: string[] }
 
 function scan(): Scanned[] {
   const results: Scanned[] = [];
-  for (const rel of SCAN_DIRS) {
-    for (const file of listSourceFiles(path.join(REPO, rel))) {
-      const src = stripComments(fs.readFileSync(file, 'utf8'));
-      const counters = [...src.matchAll(DECL)].map((m) => m[1]);
-      const offenders = file === HELPER
-        ? []
-        : [...new Set(counters)].filter((n) => livenessPair(src, n));
-      results.push({ file: path.relative(REPO, file), counters, offenders });
-    }
+  for (const file of listSourceFiles()) {
+    const src = stripComments(fs.readFileSync(file, 'utf8'));
+    const counters = [...src.matchAll(DECL)].map((m) => m[1]);
+    const offenders = file === HELPER
+      ? []
+      : [...new Set(counters)].filter((n) => livenessPair(src, n));
+    results.push({ file: path.relative(REPO, file), counters, offenders });
   }
   return results;
 }

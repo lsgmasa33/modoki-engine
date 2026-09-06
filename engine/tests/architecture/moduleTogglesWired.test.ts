@@ -30,6 +30,7 @@ import path from 'node:path';
 import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
  *  (no camel boundary before a digit, so it does NOT become `RENDER_3D`). */
@@ -59,26 +60,18 @@ const DEFINITION_SITES = new Set([
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'coverage', '.git', 'tests', 'e2e']);
 
-function collectSources(dir: string, out: string[]): void {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) collectSources(full, out);
-    else if ((full.endsWith('.ts') || full.endsWith('.tsx')) && !full.endsWith('.d.ts')) out.push(full);
-  }
-}
-
+/** Every `.ts`/`.tsx` (non-declaration) source under `engine/`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 1011 measured today. */
 const sources = (() => {
-  const out: string[] = [];
-  collectSources(path.join(REPO_ROOT, 'engine'), out);
-  return out
-    .map((f) => path.relative(REPO_ROOT, f).split(path.sep).join('/'))
+  return repoFiles({
+    under: path.join(REPO_ROOT, 'engine'),
+    match: (rel: string) => {
+      if (!/\.tsx?$/.test(rel) || rel.endsWith('.d.ts')) return false;
+      return !rel.split('/').some((s) => s.startsWith('.') || SKIP_DIRS.has(s));
+    },
+    floor: 700,
+  })
+    .map(({ rel }) => rel)
     .filter((rel) => !DEFINITION_SITES.has(rel));
 })();
 

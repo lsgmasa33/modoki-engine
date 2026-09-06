@@ -40,20 +40,19 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { REPO_ROOT, hasNativeProjects } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
-/** Tracked SceneDelegate.swift files. Tracked, not on-disk: an untracked one is a local
- *  experiment, and a project regenerated but not yet committed is not something this guard can
- *  meaningfully vouch for. */
+/** Tracked SceneDelegate.swift files. `includeUntracked: false` — Tracked, not on-disk: an
+ *  untracked one is a local experiment, and a project regenerated but not yet committed is not
+ *  something this guard can meaningfully vouch for. */
 function sceneDelegates(): string[] {
-  try {
-    return execFileSync('git', ['ls-files', '--', '*/ios/App/App/SceneDelegate.swift'], {
-      cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-    }).split('\n').filter(Boolean);
-  } catch {
-    return [];
-  }
+  return repoFiles({
+    // Git's own (non-anchored) glob crosses `/` — see repoLayoutGuard.test.ts's identical note.
+    match: /.+\/ios\/App\/App\/SceneDelegate\.swift$/,
+    floor: 0,
+    includeUntracked: false,
+  }).map((f) => f.rel);
 }
 
 describe('iOS SceneDelegate builds the plugin-registering bridge VC (#368)', () => {

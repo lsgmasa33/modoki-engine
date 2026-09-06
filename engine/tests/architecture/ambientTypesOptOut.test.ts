@@ -25,27 +25,25 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
-/** Roots that hold FIRST-PARTY tsconfigs. `release/` and `node_modules/` are build output
- *  and vendored code — gitignored, not ours to fix, and present only on some machines. */
+/** Roots that hold FIRST-PARTY tsconfigs. `release/`, `node_modules/` and `dist/` are build
+ *  output and vendored code — gitignored, not ours to fix, and present only on some machines, so
+ *  git enumeration (#771/#799) excludes them for free rather than needing a skip-list entry. */
 const ROOTS = ['engine', 'games', 'demos'] as const;
 
+// `floor: 0` deliberately: this runs at MODULE scope, and a checkout shipping neither `games/`
+// nor `demos/` (the public OSS snapshot) must not fail COLLECTION over it — the real non-vacuity
+// pin is the `.length > 5` sanity test below, which still holds against `engine/` alone.
 function tsconfigs(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (e.name === 'node_modules' || e.name === 'dist' || e.name === 'release') continue;
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/^tsconfig.*\.json$/.test(e.name)) out.push(p);
-    }
-  };
-  for (const r of ROOTS) walk(path.join(repoRoot, r));
-  return out.sort();
+  return repoFiles({
+    under: [...ROOTS],
+    match: (rel) => /^tsconfig.*\.json$/.test(rel.split('/').pop()!),
+    exclude: ['node_modules', 'dist', 'release'],
+    floor: 0,
+  }).map(({ abs }) => abs).sort();
 }
 
 /** JSON with comments — tsconfigs are jsonc in practice, and this repo's use BOTH `//` and

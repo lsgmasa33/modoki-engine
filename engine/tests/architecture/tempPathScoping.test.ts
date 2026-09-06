@@ -25,20 +25,16 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
 const devServerPath = path.resolve(__dirname, '../../electron/devServer.ts');
 
-/** Recursive, like reapScoping's walker — `scripts/lib/` holds shared shell too, and a guard
- *  that only reads the top level vouches for less than it appears to. */
+/** Every shell script under `engine/scripts`, recursive — `scripts/lib/` holds shared shell
+ *  too, and a guard that only reads the top level vouches for less than it appears to. Via the
+ *  shared corpus producer (#799/#771/#805 Phase 4). Floored well under the 13 measured today. */
 function shellScripts(dir = scriptsDir): string[] {
-  const out: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...shellScripts(p));
-    else if (e.name.endsWith('.sh')) out.push(p);
-  }
-  return out;
+  return repoFiles({ under: dir, match: /\.sh$/, floor: 8 }).map(({ abs }) => abs);
 }
 
 /** The basename a script builds under the NATIVE temp dir: `$(node "$PATHS" tmpdir)/<name>`

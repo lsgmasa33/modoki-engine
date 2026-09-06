@@ -42,7 +42,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
 import {
   citesALine,
@@ -79,20 +79,18 @@ const TEXT_EXT = /\.(md|ts|tsx|mjs|cjs|js|sh|yml|yaml)$/;
  *  `--recurse-submodules`; this repo has none (the clones are independent, see CLAUDE.md).
  */
 function repoFiles(): string[] {
-  const out = execFileSync(
-    'git',
-    ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-    { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-  )
-    .split('\0')
-    .filter(Boolean);
-  return out
-    .filter((p) => TEXT_EXT.test(p))
-    .filter((p) => !p.split('/').some((seg) => SKIP_DIRS.has(seg)))
-    .map((p) => path.join(repoRoot, p))
-    // A tracked file can be absent from the working tree mid-rebase or after a manual delete;
-    // reading it would throw and fail the guard for a reason that has nothing to do with citations.
-    .filter((p) => fs.existsSync(p));
+  // Migrated onto the ONE shared producer (#771). This function is where the git-backed pattern
+  // was invented in this repo — the docblock above is its original argument, and it still stands;
+  // `engine/scripts/repoCorpus.mjs` generalises it, adding the pieces that were only ever partly
+  // here: the two SEPARATE aborts (a git THROW cannot be caught by an empty-result check),
+  // unmerged-stage and case-folded dedup, and a regular-file filter (`--others` reports a nested
+  // checkout as a bare DIRECTORY entry).
+  //
+  // `SKIP_DIRS` survives as an explicit `exclude` rather than being deleted: those directories are
+  // TRACKED (`ios`, `android`, `Pods`, `build`), so git cannot drop them for free the way it drops
+  // gitignored build output — which is the half of this docblock's argument that git enumeration
+  // does NOT dissolve.
+  return repoCorpusFiles({ match: TEXT_EXT, exclude: SKIP_DIRS, floor: 200 }).map((f) => f.abs);
 }
 
 const rel = (p: string) => path.relative(repoRoot, p).split(path.sep).join('/');

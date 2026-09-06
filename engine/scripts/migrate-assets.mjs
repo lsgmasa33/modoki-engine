@@ -19,8 +19,8 @@
  * Usage:  node engine/scripts/migrate-assets.mjs [--dry]
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
 import path from 'node:path';
+import { repoFiles } from './repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
 const DRY = process.argv.includes('--dry');
@@ -65,21 +65,33 @@ function renameRenderableActiveToVisible(node) {
  *  it mutated the tree. Append future migrations here. */
 const TRANSFORMS = [renameRenderableActiveToVisible];
 
-// ── Discover files (tracked, via git) ──────────────────────────────────────────────
+// ── Discover files (via the shared git-backed enumerator, repoCorpus.mjs) ──────────
 // Game assets only. The e2e fixtures (engine/tests/e2e/fixtures/*.json) are hand-authored
 // with compact one-line trait objects, so they are migrated by hand to preserve that
 // formatting (a re-serialize would expand every object). They're also upgraded at load by
 // loadSceneFile's migration chain, so tests pass regardless.
-const patterns = [
-  'games/*/runtime/**/scenes/*.json',     // scenes
-  'games/*/runtime/**/*.prefab.json',     // prefabs
-];
-const files = new Set();
-for (const pat of patterns) {
-  let out = '';
-  try { out = execSync(`git ls-files '${pat}'`, { cwd: REPO_ROOT, encoding: 'utf8' }); } catch { /* none */ }
-  for (const f of out.split('\n').map((s) => s.trim()).filter(Boolean)) files.add(f);
-}
+//
+// This used to be `execSync(`git ls-files '${pat}'`)` — a shell STRING, not an argv array.
+// execSync spawns cmd.exe on Windows, which does not strip single quotes, so the quoted
+// pathspec reached git literally and matched nothing; the `catch { /* none */ }` then
+// swallowed the failure and every run below silently rewrote 0 files while reporting
+// success. MEASURED on this clone: quoted → 0 files, unquoted → 69. repoFiles() uses
+// execFileSync with an argv array, so there is no shell in the loop to mis-parse a quote.
+//
+// The two globs are expressed as `under: 'games'` (git-filtered, cheap) plus a `match`
+// regex carrying the rest of each pattern verbatim — `repoFiles()` has no glob support, so
+// this is the direct translation, not a loosening of what each pattern reaches.
+const scenes = repoFiles({
+  under: 'games',
+  match: /^games\/[^/]+\/runtime\/.*\/scenes\/[^/]+\.json$/,
+  floor: 20, // measured 45 today; the floor is far under that so only a broken match/under can trip it
+});
+const prefabs = repoFiles({
+  under: 'games',
+  match: /^games\/[^/]+\/runtime\/.*\.prefab\.json$/,
+  floor: 20, // measured 58 today
+});
+const files = new Set([...scenes, ...prefabs].map(({ rel }) => rel));
 
 let rewritten = 0, bumped = 0;
 for (const rel of [...files].sort()) {
