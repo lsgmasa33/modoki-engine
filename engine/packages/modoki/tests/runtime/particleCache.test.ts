@@ -280,6 +280,59 @@ describe('getParticleEffect load:false (peek)', () => {
   });
 });
 
+// Format-version handling (#784, docs/format-versioning.md). `.particle.json` is REFUSE
+// disposition: a too-new/unreadable document must not be cached, and the loader must never
+// re-stamp this build's version over bytes it did not fully understand.
+describe('particleCache — format-version REFUSE (#784)', () => {
+  it('refuses a too-new document: not cached, `failed` is permanent, error logged (not warn)', async () => {
+    const { cache } = await setup();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({ version: 99, maxParticles: 5 }) }));
+
+    expect(cache.getParticleEffect('fx/future.particle.json')).toBeNull(); // kicks off fetch
+    await flush();
+
+    expect(cache.getParticleEffect('fx/future.particle.json')).toBeNull(); // refused, not cached
+    await flush();
+    expect(fetchFn).toHaveBeenCalledTimes(1); // `failed` set — no retry
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(String(err.mock.calls[0][0])).toContain('99');
+    err.mockRestore();
+  });
+
+  it('a too-new document leaves the cache empty even on a load:false peek', async () => {
+    const { cache } = await setup();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockFetch(async () => ({ ok: true, json: async () => ({ version: 2 }) }));
+    expect(cache.getParticleEffect('fx/future2.particle.json')).toBeNull();
+    await flush();
+    expect(cache.getParticleEffect('fx/future2.particle.json', { load: false })).toBeNull();
+  });
+
+  it('a stored version SURVIVES normalization instead of being re-stamped to PARTICLE_FORMAT_VERSION', async () => {
+    // 1b: normalizeParticleDef used to build `{ ...d, ...json, version: 1 }` — the trailing key
+    // clobbered whatever the document said, on EVERY load. A document from a future build (still
+    // `ok`/`absent`, not `too-new`, if its version is ≤ this build's constant) must read back with
+    // its own version, and any top-level field this build does not model must survive too (the
+    // particle normalizer spreads the whole document, unlike the enumerated-field normalizers).
+    const { cache } = await setup();
+    mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ version: 1, maxParticles: 5, someFutureField: { kept: true } }),
+    }));
+    expect(cache.getParticleEffect('fx/survive.particle.json')).toBeNull();
+    await flush();
+    const def = cache.getParticleEffect('fx/survive.particle.json')!;
+    expect(def.version).toBe(1);
+    expect((def as unknown as Record<string, unknown>).someFutureField).toEqual({ kept: true });
+    // The bar is the BYTES a save would produce, not just the in-memory shape (§ 5.7) — a
+    // JSON round trip (what `useParkedAssetDoc`'s write path does) must not drop either field.
+    const roundTripped = JSON.parse(JSON.stringify(def));
+    expect(roundTripped.version).toBe(1);
+    expect(roundTripped.someFutureField).toEqual({ kept: true });
+  });
+});
+
 // Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
 // shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
 // undefined for a guid absent from the manifest with no warning at all.

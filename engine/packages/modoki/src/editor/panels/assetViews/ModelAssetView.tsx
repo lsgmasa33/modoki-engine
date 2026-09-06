@@ -18,6 +18,7 @@ import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings,
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
 import { invalidateModel, loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
 import { registerAsset } from '../../../runtime/loaders/assetManifest';
+import { writeCollisionMeshAssets } from './collisionMeshWrite';
 import { newGuid } from '../../../runtime/core/assetRefRules';
 import { decimateMesh, buildCollisionGLB, bytesToBase64, mergeModelGeometry } from '../../scene/collisionMeshGen';
 import { inputStyle, BufferedNumberInput } from '../fields';
@@ -556,23 +557,24 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
 
       const modelGuid = newGuid();
       const meshGuid = newGuid();
-      // Register browser-side so the new asset resolves immediately (Collider3D.mesh picker).
-      registerAsset(modelGuid, glbPath, 'model');
-      registerAsset(meshGuid, meshJsonPath, 'mesh');
 
       const glb = buildCollisionGLB(dec.positions, dec.normals, dec.indices, meshName);
       const post = (p: string, content: string, encoding?: string) => backendFetch('/api/write-file', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: p, content, encoding }),
       });
-      const glbRes = await post(glbPath, bytesToBase64(glb), 'base64');
-      if (!glbRes.ok) throw new Error(`write GLB failed (${glbRes.status})`);
-      await backendFetch('/api/write-meta', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),
-      });
-      const meshAsset = { id: meshGuid, version: 1, model: modelGuid, mesh: meshName, postprocessor: 'none', material: '' };
-      await post(meshJsonPath, JSON.stringify(meshAsset, null, 2));
+      // Ordering + response-checking live in collisionMeshWrite.ts (#784 phase C2b item 5), which
+      // is unit-tested — a `.tsx` carries no tests of its own (CLAUDE.md § Panels). The
+      // `.meta.json` write itself stays HERE, inline, as an object literal (not threaded through
+      // as data) — see collisionMeshWrite.ts's header for why.
+      await writeCollisionMeshAssets(
+        { glbPath, glbBase64: bytesToBase64(glb), meshJsonPath, meshName, modelGuid, meshGuid },
+        { post, registerAsset },
+        () => backendFetch('/api/write-meta', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),
+        }),
+      );
 
       onDone();
       setStatus(`${srcTris.toLocaleString()}→${outTris.toLocaleString()} tris (${Math.round((100 * outTris) / Math.max(1, srcTris))}%) → ${meshName}`);

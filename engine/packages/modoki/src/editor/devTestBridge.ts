@@ -26,7 +26,9 @@ export interface EditorTestBridge {
   store: typeof useEditorStore;
   getAllEntities: typeof getAllEntities;
   /** Load a scene by path into the live editor world — 'loaded' on success, 'superseded' when a
-   *  newer load won the swap first, 'failed' otherwise. E2E setup uses this instead of seeding
+   *  newer load won the swap first, 'refused' when its format version is too new/unreadable for
+   *  this build (docs/format-versioning.md § 2b-bis), 'failed' otherwise. E2E setup uses this
+   *  instead of seeding
    *  the project-namespaced `modoki-last-scene:<project>` localStorage key, so fixture loading is
    *  independent of which project the dev server happens to open. */
   loadScene(scenePath: string): Promise<SceneLoadOutcome>;

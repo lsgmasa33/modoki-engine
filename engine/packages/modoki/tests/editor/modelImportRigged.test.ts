@@ -88,6 +88,10 @@ vi.mock('../../src/runtime/traits', () => ({
   SkinnedMeshRenderer: traitFactory('SkinnedMeshRenderer'),
   SkeletalAnimator: traitFactory('SkeletalAnimator'),
   Bone: traitFactory('Bone'),
+  // #784 phase C2b: modelImport.ts stamps these onto every mesh/material asset it writes. A
+  // mocked module with no export would silently hand back `undefined`, breaking loudly here
+  // since vitest's automock validation rejects an unmocked-but-imported named export.
+  MESH_FORMAT_VERSION: 1, MATERIAL_FORMAT_VERSION: 1,
 }));
 
 // Backend IO: record meta + file writes; everything else is a soft no-op.

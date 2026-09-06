@@ -18,12 +18,21 @@
 import type { SpriteRect } from './spriteSheet';
 import type { TextureImportSettings } from './textureSettings';
 
+/** The `.atlas.json` format version this build writes/understands (docs/format-versioning.md
+ *  § 5). Never a literal — a reader compares against THIS constant, via
+ *  `runtime/core/formatVersion.ts`'s `classifyFormatVersion`. This module is the format's owner
+ *  (it declares `AtlasSource` + `defaultAtlasSource()`) and is guaranteed Node-safe (see the
+ *  file header) — already imported by four build plugins. */
+export const ATLAS_FORMAT_VERSION = 1;
+
 /** Authored `.atlas.json` contents (committed; edited via the Atlas inspector). The
  *  derived bookkeeping (pages, frame map, hash) lives in the sidecar, NOT here. */
 export interface AtlasSource {
   /** Stable GUID — the atlas's referenceable identity. */
   id: string;
-  version: 1;
+  /** Read-back document — the bytes may have been written by a newer build, so this must
+   *  not pin a literal (#734, #784). */
+  version: number;
   /** Explicit member sprite GUIDs (Phase-1 slices). */
   members: string[];
   /** Square page edge length in px (also caps a page). Must be a multiple of 4. */
@@ -45,7 +54,7 @@ export interface AtlasSource {
  *  and the build-time reimport handler's read-side defaults — see #423. `id` is left out
  *  because every call site mints its own GUID at a different point. */
 export function defaultAtlasSource(): Omit<AtlasSource, 'id'> {
-  return { version: 1, members: [], pageSize: 1024, padding: 2, extrude: 1 };
+  return { version: ATLAS_FORMAT_VERSION, members: [], pageSize: 1024, padding: 2, extrude: 1 };
 }
 
 /** One packed member's placement: which page + the INNER content rect (excludes the

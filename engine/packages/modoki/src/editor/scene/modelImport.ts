@@ -4,7 +4,7 @@
 import * as THREE from 'three';
 import { backendFetch } from '../backend/editorBackend';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
-import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
+import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
 import { ensureRiggedModelLoaded, invalidateRiggedModel } from '../../runtime/loaders/riggedModelCache';
 import { offerParsedGltf, disposePendingGltf } from '../../runtime/loaders/parsedGltfHandoff';
@@ -18,6 +18,7 @@ import { extractRigBones, type RigBoneInfo } from './rigBones';
 import { useEditorStore } from '../store/editorStore';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { sha256Hex } from '../utils/contentHash';
+import { classifyExistingAssetFetchFailure, classifyExistingAssetJson } from './modelImportPersist';
 
 async function writeAssetFile(path: string, content: string): Promise<boolean> {
   try {
@@ -35,8 +36,12 @@ async function writeAssetFile(path: string, content: string): Promise<boolean> {
 class ImportWriteAborted extends Error {
   // Declared, not a parameter property — `erasableSyntaxOnly` rejects those.
   readonly path: string;
-  constructor(path: string) {
-    super(`failed to write ${path}`);
+  /** `message` defaults to the write-failure wording; the read-before-write classification below
+   *  (item 3/4, #784 phase C2b) passes an explicit message naming the verdict instead — "failed to
+   *  write" would be false for a document that was never written to because it could not be
+   *  safely READ. */
+  constructor(path: string, message?: string) {
+    super(message ?? `failed to write ${path}`);
     this.name = 'ImportWriteAborted';
     this.path = path;
   }
@@ -100,28 +105,56 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
   return out;
 }
 
+/** Read an existing asset JSON document, classifying it before handing it back (#784 phase C2b,
+ *  items 3+4 — see `modelImportPersist.ts`'s header). `null` means genuinely ABSENT: the file does
+ *  not exist, so minting a fresh GUID / writing a brand-new document is correct, exactly as
+ *  before this fix. Anything this build cannot safely read — a real parse failure (truncated or
+ *  conflict-markered bytes) or a document stamped by a newer build — throws `ImportWriteAborted`
+ *  instead of returning `null`: the old behaviour collapsed both into the same falsy value, which
+ *  is precisely how a corrupt-but-still-referenced `.mesh.json`/`.mat.json` got a FRESH guid
+ *  minted over it and dangled every scene/prefab that pointed at the old one (§ 4's third trap). */
+async function readAssetJsonOrAbort(path: string, current: number): Promise<Record<string, unknown> | null> {
+  let json: unknown;
+  try {
+    const res = await fetch(path, { cache: 'no-store' });
+    json = await parseAssetJson(res, path);
+  } catch (e) {
+    const outcome = classifyExistingAssetFetchFailure(e);
+    if (outcome.kind === 'absent') return null;
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — could not read ${path}: ${outcome.reason}. A fresh GUID was ` +
+      'NOT minted and the file was NOT overwritten. Fix or restore the file and re-import.',
+    );
+  }
+  const outcome = classifyExistingAssetJson(json, current);
+  if (outcome.kind === 'abort') {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — refusing to read ${path}: ${outcome.reason}. A fresh GUID ` +
+      'was NOT minted and the file was NOT overwritten.',
+    );
+  }
+  return json as Record<string, unknown>;
+}
+
 /** Read an existing asset JSON file's `id` so re-import can preserve the
  *  stable guid instead of minting a fresh one (which would dangle every
  *  external reference). Returns undefined when the file doesn't exist yet
- *  (first-time import) or doesn't carry a valid guid. */
-async function readExistingId(path: string): Promise<string | undefined> {
-  try {
-    const res = await fetch(path, { cache: 'no-store' });
-    const json = await parseAssetJson(res, path) as { id?: unknown };
-    return typeof json?.id === 'string' && isGuid(json.id) ? json.id : undefined;
-  } catch { return undefined; }
+ *  (first-time import) or doesn't carry a valid guid. `current` is the format
+ *  constant for THIS file's document type (`MESH_FORMAT_VERSION` /
+ *  `MATERIAL_FORMAT_VERSION`) — see `readAssetJsonOrAbort`. */
+async function readExistingId(path: string, current: number): Promise<string | undefined> {
+  const json = await readAssetJsonOrAbort(path, current);
+  return typeof json?.id === 'string' && isGuid(json.id) ? json.id : undefined;
 }
 
-/** Read an existing `.mat.json`'s full contents (or null when absent / unparseable).
- *  Used to carry manual material edits across a re-import — a hand-assigned
- *  texture or NPR field the source GLB/DAE can't reproduce would otherwise be
+/** Read an existing `.mat.json`'s full contents (or null when genuinely absent — see
+ *  `readAssetJsonOrAbort`). Used to carry manual material edits across a re-import — a
+ *  hand-assigned texture or NPR field the source GLB/DAE can't reproduce would otherwise be
  *  clobbered by the freshly-extracted (textureless) material. */
 async function readExistingMaterial(path: string): Promise<Record<string, unknown> | null> {
-  try {
-    const res = await fetch(path, { cache: 'no-store' });
-    const json = await parseAssetJson(res, path);
-    return json && typeof json === 'object' ? json as Record<string, unknown> : null;
-  } catch { return null; }
+  return readAssetJsonOrAbort(path, MATERIAL_FORMAT_VERSION);
 }
 
 /** Resolve the stable GUID for a pre-existing material file (an override target
@@ -215,7 +248,7 @@ function materialFileName(mat: THREE.MeshStandardMaterial): string {
 
 function extractMaterialAsset(mat: THREE.MeshStandardMaterial, _textureDir: string, texturePaths: Map<string, string>): MaterialAsset {
   const asset: MaterialAsset = {
-    version: 1,
+    version: MATERIAL_FORMAT_VERSION,
     color: mat.color?.getHex() ?? 0xffffff,
     roughness: mat.roughness ?? 1,
     metalness: mat.metalness ?? 0,
@@ -452,8 +485,15 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
     // managed). For those, resolve the ref the same way as the override branch.
     if (!ctx.protectedMatPaths.has(dedupPath)) {
       const matAsset = extractMaterialAsset(mat, ctx.textureDir, ctx.texturePaths);
-      // Preserve the existing id from disk so external refs don't dangle.
-      const existingId = await readExistingId(dedupPath);
+      // ONE read-before-write classification for this file, not two (docs/format-versioning.md
+      // § 5 step 4) — the old code called `readExistingId` AND `readExistingMaterial` on the same
+      // path, fetching and classifying it twice for no reason. Preserve the existing id from disk
+      // so external refs don't dangle; derive it from the SAME parsed doc used below to carry
+      // manual edits forward. Either read throws `ImportWriteAborted` (propagating out of this
+      // function, caught only at `importModel`'s boundary) when the file is too-new or corrupt —
+      // see `readAssetJsonOrAbort`.
+      const existingMat = await readExistingMaterial(dedupPath);
+      const existingId = typeof existingMat?.id === 'string' && isGuid(existingMat.id) ? existingMat.id : undefined;
       matAsset.id = existingId ?? newGuid();
       // Carry over manual edits the importer doesn't itself write: a hand-assigned
       // `texture` (kept only when the source has none, so a real source map still
@@ -463,7 +503,6 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
       // ABSENT so a hand-assigned map on a source-less slot survives, while a real
       // source map (defined) still wins.
       const finalAsset: Record<string, unknown> = { ...matAsset };
-      const existingMat = await readExistingMaterial(dedupPath);
       if (existingMat) {
         for (const k of Object.keys(existingMat)) {
           if (finalAsset[k] === undefined) finalAsset[k] = existingMat[k];
@@ -795,8 +834,13 @@ export async function importModel(
       'nothing was registered for that file. Earlier generated files remain on disk and will be ' +
       'overwritten by a successful re-import.',
     );
+    // The toast used to hard-code "a file could not be written" — false since #784 phase C2b,
+    // where `readAssetJsonOrAbort` started throwing `ImportWriteAborted` for a READ-side refusal
+    // too (a too-new/corrupt existing `.mesh.json`/`.mat.json`), never even reaching a write. The
+    // `console.error` above already carries `e.message`, the real reason; the toast now does too
+    // (#784 phase C adversarial review, finding 4).
     useEditorStore.getState().showToast(
-      `Import FAILED for ${modelPath.split('/').pop() ?? modelPath} — a file could not be written (see console)`,
+      `Import FAILED for ${modelPath.split('/').pop() ?? modelPath} — ${e.message} (see console)`,
       'warn',
     );
     return 0;
@@ -926,10 +970,10 @@ async function importModelInner(
     if (!meshFileMap.has(meshName)) {
       const meshPath = `${meshDir}/${safeMeshName}.mesh.json`;
       // Preserve existing id so external refs (prefabs, scenes) don't dangle.
-      const existingMeshId = await readExistingId(meshPath);
+      const existingMeshId = await readExistingId(meshPath, MESH_FORMAT_VERSION);
       const meshAsset: MeshAsset = {
         id: existingMeshId ?? newGuid(),
-        version: 1,
+        version: MESH_FORMAT_VERSION,
         model: glbGuid,
         mesh: meshName,
         postprocessor: postprocessorId,

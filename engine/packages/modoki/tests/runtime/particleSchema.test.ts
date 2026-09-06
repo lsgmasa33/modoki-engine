@@ -134,9 +134,20 @@ describe('normalizeParticleDef', () => {
     expect(normalizeParticleDef({ gravity: [NaN, 1, 2] as unknown as [number, number, number] }).gravity).toEqual([0, 1, 2]);
   });
 
-  it('forces version to 1 regardless of input', () => {
+  // #784 (docs/format-versioning.md § 2b): this used to build `{ ...d, ...json, version: 1 }` —
+  // the trailing key overwrote whatever the document said on EVERY load (and on every
+  // `setParticleEffect`, which never touches disk at all). The in-memory def must report what
+  // the file said, not what this build would write; a WRITER re-stamps on save, a READER does
+  // not. (Format-version REFUSAL for a document actually too-new for this build to read at all
+  // lives at the load site — `particleCache.ts` / `ParticleEditor.tsx` — not here.)
+  it('preserves the document\'s own version instead of re-stamping it (was: "forces version to 1")', () => {
     const out = normalizeParticleDef({ version: 99 } as unknown as Partial<ParticleEffectDef>);
-    expect(out.version).toBe(1);
+    expect(out.version).toBe(99);
+  });
+
+  it('falls back to the default (current) version when the document has none', () => {
+    const out = normalizeParticleDef({} as Partial<ParticleEffectDef>);
+    expect(out.version).toBe(defaultParticleEffect().version);
   });
 
   // F4 — clamp authoring invariants so a hand-edited/corrupt def can't poison the sim.

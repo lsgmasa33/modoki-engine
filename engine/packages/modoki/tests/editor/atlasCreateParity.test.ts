@@ -29,7 +29,13 @@ describe('atlas default-document parity (#423)', () => {
 
   it('builtinCreatableAssets.ts sources its atlas body from defaultAtlasSource, not its own literal', () => {
     const s = src('editor/panels/builtinCreatableAssets.ts');
-    expect(s).toMatch(/import\s*\{\s*defaultAtlasSource\s*\}\s*from\s*'\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
+    // Tolerates OTHER named specifiers in the same import (the `[^}]*` either side of the name),
+    // matching the reimport-atlas assertion below. The strict `\{\s*defaultAtlasSource\s*\}` form
+    // this replaced asserted the import had EXACTLY one specifier, which is not what this guard is
+    // about: co-importing ATLAS_FORMAT_VERSION from the same module (#784) turned it red for a
+    // change that did not touch what it guards. A guard must not make merging an unrelated import
+    // the thing that breaks it — docs/format-versioning.md § 4, the anchor trap.
+    expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
     // The atlas `body:` line must call the factory, not repeat pageSize/padding/extrude literals.
     // Edit `defaultAtlasSource()` in spriteAtlas.ts, not this file, to change the default values.
     expect(s).toMatch(/body:\s*\(guid\)\s*=>\s*\(\{\s*id:\s*guid,\s*\.\.\.defaultAtlasSource\(\)\s*\}\)/);
@@ -47,7 +53,13 @@ describe('atlas default-document parity (#423)', () => {
 
   it('atlasPersist.ts sources DEFAULT_ATLAS_DOC + its coalescing fallbacks from defaultAtlasSource', () => {
     const s = src('editor/panels/assetViews/atlasPersist.ts');
-    expect(s).toMatch(/import\s*\{\s*defaultAtlasSource\s*\}\s*from\s*'\.\.\/\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
+    // Tolerates OTHER named specifiers in the same import (the `[^}]*` either side of the name),
+    // matching the reimport-atlas assertion below. The strict `\{\s*defaultAtlasSource\s*\}` form
+    // this replaced asserted the import had EXACTLY one specifier, which is not what this guard is
+    // about: co-importing ATLAS_FORMAT_VERSION from the same module (#784) turned it red for a
+    // change that did not touch what it guards. A guard must not make merging an unrelated import
+    // the thing that breaks it — docs/format-versioning.md § 4, the anchor trap.
+    expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
     expect(s).toMatch(/const DEFAULT_ATLAS_DOC: AtlasSourceDoc = defaultAtlasSource\(\)/);
     // Edit `defaultAtlasSource()` in spriteAtlas.ts, not this file, to change the per-field
     // fetch-handler fallbacks (pageSize/padding/extrude) — they must read DEFAULT_ATLAS_DOC, not
@@ -73,9 +85,13 @@ describe('atlas default-document parity (#423)', () => {
     expect(s).toMatch(/raw\.padding >= 0 \? raw\.padding : defaults\.padding/);
     expect(s).toMatch(/raw\.extrude >= 0 \? raw\.extrude : defaults\.extrude/);
     expect(s).toMatch(/raw\.texture \? \{ texture: raw\.texture \} : \{\}/);
-    // `version` is a fifth field that used to be its own inlined `1` — must read the factory too.
-    expect(s).toMatch(/version:\s*defaults\.version/);
+    // `version` used to hardcode `defaults.version` unconditionally, discarding whatever the
+    // file actually said (#784, docs/format-versioning.md § 2b: "never echo back what you
+    // read"). It now reads `raw.version` like every sibling field above, falling back to the
+    // factory default only when absent — `defaults.version` must still appear as the FALLBACK.
+    expect(s).toMatch(/version:\s*typeof raw\.version === 'number' \? raw\.version : defaults\.version/);
     expect(s).not.toMatch(/version:\s*1,/);
+    expect(s).not.toMatch(/version:\s*defaults\.version,/); // the old unconditional form
   });
 
   it('defaultAtlasSource() fields — the single source every consumer above must reflect', () => {

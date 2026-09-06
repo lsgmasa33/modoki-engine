@@ -1,5 +1,5 @@
 export { Transform, clampAngle } from '../core/traits/Transform';
-export { Renderable3D, type MeshAsset, type MaterialAsset } from './Renderable3D';
+export { Renderable3D, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from './Renderable3D';
 export { SkinnedModel } from './SkinnedModel';
 export { SkinnedMeshRenderer } from './SkinnedMeshRenderer';
 export { SkeletalAnimator } from './SkeletalAnimator';

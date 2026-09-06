@@ -19,6 +19,7 @@ import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, ty
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
@@ -68,6 +69,16 @@ export default function ParticleEditor() {
   const [playing, setPlaying] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [sceneReady, setSceneReady] = useState(false);
+  // 'failed' = the on-disk document could not be loaded (corrupt JSON) or was REFUSED (a
+  // too-new/unreadable format version, docs/format-versioning.md § 2b-bis — `.particle.json`
+  // is a machine-generated sidecar, not player data, so REFUSE not PRESERVE). Mirrors
+  // AtlasAssetView's `loadState`/`editingDisabled` pattern: on 'failed' the load effect below
+  // never calls `loadParticleDef`, so `def` stays unset and the whole properties panel (gated
+  // on `{def && (...)}`) stays unrendered — editing is disabled by construction, not a flag
+  // threaded through every field. A genuinely MISSING file (a brand-new asset) is NOT this —
+  // see `isMissingAsset` in the load effect.
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  const [reloadNonce, setReloadNonce] = useState(0); // bump (Retry) to re-run the load effect
   const [showFloor, setShowFloorState] = useState(loadParticleEditorShowFloor);
   const setShowFloor = (next: boolean | ((prev: boolean) => boolean)) => {
     setShowFloorState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveParticleEditorShowFloor(on); return on; });
@@ -201,6 +212,7 @@ export default function ParticleEditor() {
     let cancelled = false;
     elapsedRef.current = 0; setElapsed(0);
     playingRef.current = true; setPlaying(true);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on failure/refusal
     const existing = useEditorStore.getState().editingParticleDef;
     if (existing) {
       // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
@@ -234,6 +246,19 @@ export default function ParticleEditor() {
       .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
+        // REFUSE a too-new / unreadable format version (docs/format-versioning.md § 2b-bis)
+        // BEFORE normalizing — `normalizeParticleDef` no longer stamps a version (see its own
+        // comment), so a refused doc would otherwise load, edit, and re-save wearing a version
+        // this build does not fully implement. This is #778's mechanism on this document: the
+        // OLD code below substituted `defaultParticleEffect()` on ANY load failure (including a
+        // conflict-markered or truncated file) and marked it as the SAVED baseline — so the
+        // first edit parked a full-replace write of the defaults over the authored file.
+        const verdict = classifyParticleFetchSuccess(json);
+        if (verdict.kind === 'refused') {
+          console.error(`[ParticleEditor] refusing to open ${asset.path}: ${verdict.message}.`);
+          setLoadState('failed');
+          return;
+        }
         const loaded = normalizeParticleDef(json as Partial<ParticleEffectDef>);
         // Legacy/new effect with no in-file guid: assign + register one so scenes and sub-emitters
         // can reference it by guid (survives move/rename). The saved-baseline is the doc WITH the
@@ -248,13 +273,30 @@ export default function ParticleEditor() {
         savedMarkRef.current?.(loaded);
         loadParticleDef(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[ParticleEditor] load failed, using default', e); const fallback = defaultParticleEffect(); savedMarkRef.current?.(fallback); loadParticleDef(fallback); });
+      .catch((e) => {
+        if (cancelled) return;
+        // A genuinely MISSING file (a brand-new asset, or a stale reference) is NOT an unreadable
+        // one — defaults are the CORRECT content here, same as before this fix. Only a real parse
+        // failure (corrupt/truncated/conflict-markered JSON) must stop short of substituting
+        // defaults — see the header comment above for what got that backwards once (#778).
+        const failure = classifyParticleFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[ParticleEditor] load failed (asset missing), using default', e);
+          const fallback = defaultParticleEffect();
+          savedMarkRef.current?.(fallback);
+          loadParticleDef(fallback);
+          return;
+        }
+        console.error(`[ParticleEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // Intentionally key on the asset PATH, not the `asset` object: the store
     // hands back a stable ref, and we only want to re-load when the path (or the
-    // explicit reopen `nonce`) changes — not on incidental identity churn.
+    // explicit reopen `nonce`, or a local Retry `reloadNonce`) changes — not on incidental
+    // identity churn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [asset?.path, nonce, dropHandle]);
+  }, [asset?.path, nonce, reloadNonce, dropHandle]);
 
   // ── Apply def to the live preview + shared cache ──
   useEffect(() => {
@@ -391,6 +433,17 @@ export default function ParticleEditor() {
           <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', justifyContent: 'center', color: '#555' }}>
             <div>Double-click a .particle.json in Assets to edit</div>
             <button data-ui-id="particle.empty.new" data-ui-kind="button" onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
+          </div>
+        )}
+        {/* Load-failure / refusal banner (#784, mirrors AtlasAssetView's loadBanner) — `def` stays
+            unset while this shows, so the properties panel below never mounts and there is no
+            edit path that could write a default doc over the real file. */}
+        {asset && loadState === 'failed' && (
+          <div data-ui-id="particle.loadBanner" style={{ position: 'absolute', left: 8, right: 8, top: 8, color: '#e0a06c', fontSize: '11px', lineHeight: 1.4, padding: '5px 8px', background: '#3a2e1e', border: '1px solid #5a452a', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 8, zIndex: 5 }}>
+            <span style={{ flex: 1 }}>
+              {`⚠ Could not load ${asset.path.split('/').pop() || asset.name} — editing disabled so it is not overwritten.`}
+            </span>
+            <button data-ui-id="particle.loadBanner.retry" data-ui-kind="button" data-ui-label="Retry" onClick={() => setReloadNonce((n) => n + 1)} style={{ ...btn, padding: '2px 8px' }}>Retry</button>
           </div>
         )}
       </div>

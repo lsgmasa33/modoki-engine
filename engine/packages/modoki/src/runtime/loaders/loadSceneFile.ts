@@ -10,6 +10,7 @@ import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import { SCENE_FORMAT_VERSION } from '../core/version';
+import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBank } from '../audio/clipBank';
 import { parseAnimClipBank } from '../animation/animClipBank';
@@ -146,6 +147,24 @@ export interface LoadSceneOptions {
    *  hygiene against id reuse is independent of this flag and always runs
    *  (`clearOverrideMarks(entity.id())` on each fresh spawn, below). */
   clearMarks?: boolean;
+}
+
+/** Thrown by `loadSceneFile` when a scene's format version is `too-new` or `unreadable`
+ *  (docs/format-versioning.md § 2b-bis — Scene is REFUSE). A named class rather than a bare
+ *  `Error` so a caller several frames up (the editor's `loadScene` wrapper, item 2/3 of #784
+ *  phase C3) can tell "this load was refused because of its format version" apart from every
+ *  other reason a scene load can throw (a missing file, a bad prefab ref, …) without parsing
+ *  the message. Mirrors `ImportWriteAborted` (`editor/scene/modelImport.ts`) and
+ *  `MissingAssetError` (`runtime/loaders/assetFetch.ts`) — the established shape in this repo
+ *  for "a specific, nameable reason a throw needs to survive to a caller that must react
+ *  differently to it than to a generic failure". */
+export class SceneFormatRefusedError extends Error {
+  readonly reason: 'too-new' | 'unreadable';
+  constructor(message: string, reason: 'too-new' | 'unreadable') {
+    super(message);
+    this.name = 'SceneFormatRefusedError';
+    this.reason = reason;
+  }
 }
 
 const TEXT_FIELDS = ['fontSize', 'fontWeight', 'textColor', 'textAlign'] as const;
@@ -1439,6 +1458,45 @@ function resolveEntityIdField(raw: unknown, idMap: Map<number, number>, world: W
 export async function loadSceneFile(data: SceneData, options: LoadSceneOptions): Promise<void> {
   // New WORLD → drop every prior override mark (ecs ids are reused across worlds).
   // Marks for this scene's instances are re-seeded below as overrides are applied.
+  // Classify BEFORE anything mutates `data` — see docs/format-versioning.md § 2a/2b-bis.
+  // This must run ahead of the migration ladder AND the two unconditional mutators below
+  // (assignSyntheticEntityIds, stripLegacyCameraFrameShowGizmo): both write into `data`
+  // regardless of version, so a too-new or unreadable document was being mutated before
+  // anything ever looked at its version (#784 phase C3).
+  //
+  // Classification happens at BOTH this site and in `SceneManager.loadScene` (right
+  // after `parseAssetJson`, before `collectSceneResourceRefs`) — not because it was
+  // moved, but because `SceneManager.collectSceneResourceRefs` mutates the very same
+  // object with `sceneData.version = Math.max(sceneData.version ?? 6, 6)` BEFORE ever
+  // calling this function, and `Math.max` numerically coerces a non-numeric version
+  // into a valid one. By the time the guard below runs on a `SceneManager`-driven
+  // load, it is looking at an already-laundered version and the `unreadable` verdict
+  // is unreachable through that path — `SceneManager` is the only non-test caller of
+  // `loadSceneFile` (#784 phase C adversarial review, finding 1). The guard stays
+  // HERE too because `loadSceneFile` is the single entry every OTHER path funnels
+  // through — `preloaded` snapshots, direct test/tool calls — and both sites route
+  // through the same `classifyFormatVersion` and the same `SceneFormatRefusedError`,
+  // so they cannot disagree on the verdict.
+  const verdict = classifyFormatVersion(data, SCENE_FORMAT_VERSION);
+  if (verdict.kind === 'too-new') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
+      `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
+      'too-new',
+    );
+  }
+  if (verdict.kind === 'unreadable') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
+      `The file may be corrupt or hand-edited incorrectly.`,
+      'unreadable',
+    );
+  }
+  // `absent` (no version field at all) is NOT refused — a genuinely pre-v3 scene has
+  // no `version` key and SHOULD run the whole migration ladder below. This looks like
+  // an oversight next to the too-new/unreadable throws above, but it is deliberate:
+  // `absent` is § 2a's "legacy or freshly created — readable" verdict, and refusing it
+  // would break every scene the ladder exists to migrate.
   // Opt-out for a chain/carry load, where SceneManager owns the once-per-world clear
   // and a per-call clear would wipe the marks an earlier scene in the chain seeded
   // (A9 defect 1) — see the `clearMarks` docblock on LoadSceneOptions.
@@ -1455,17 +1513,6 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV12toV13(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
-  // Forward-version guard: the migration steps only upgrade OLDER files. A scene
-  // authored by a NEWER engine (version > current) passes through untouched and
-  // would load silently even though its data may not be understood — warn loudly
-  // so a downgrade mismatch isn't invisible.
-  if (typeof data.version === 'number' && data.version > SCENE_FORMAT_VERSION) {
-    console.warn(
-      `[scene] file format version ${data.version} is newer than this engine supports ` +
-      `(${SCENE_FORMAT_VERSION}). Loading anyway — some data may be ignored or misread. ` +
-      `Update the engine if the scene looks wrong.`,
-    );
-  }
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
   const world = options.world ?? getCurrentWorld();
   const allTraits = getAllTraits();

@@ -23,7 +23,12 @@ const onDisk = {
   extrude: 1,
 };
 
-const edited = { id: onDisk.id, version: 1, members: ['sprite-a', 'sprite-b'], pageSize: 2048, padding: 2, extrude: 1 };
+// No `version` key here (#784, docs/format-versioning.md § 2b) — this fixture models what
+// `AtlasAssetView.update()`'s `next` now builds (`{ ...prev, ...patch }`, no version literal).
+// It used to carry `version: 1 as const`, which — spread AFTER `raw` in `serializeAtlasDoc` —
+// clobbered whatever version the file actually had on every single edit; see the version-2 test
+// below for the direct regression coverage.
+const edited = { id: onDisk.id, members: ['sprite-a', 'sprite-b'], pageSize: 2048, padding: 2, extrude: 1 };
 
 describe('serializeAtlasDoc', () => {
   it('carries the top-level texture block through an edit', () => {
@@ -74,5 +79,16 @@ describe('serializeAtlasDoc', () => {
   it('the id GUID survives an edit round-trip', () => {
     const out = JSON.parse(serializeAtlasDoc(onDisk, { ...edited, id: onDisk.id, padding: 9 }));
     expect(out.id).toBe(onDisk.id);
+  });
+
+  // Direct regression test for 2b (#784): `next` used to carry a hardcoded `version: 1 as const`
+  // that overwrote `raw`'s version on every edit — invisible as long as `raw.version` also read
+  // `1`, which is why it went unnoticed. A document written by a build newer than this one
+  // (`version: 2`) must survive an `update()` round trip unchanged.
+  it('a NEWER version than this build writes (2) survives an update() round trip', () => {
+    const onDiskV2 = { ...onDisk, version: 2 };
+    const out = JSON.parse(serializeAtlasDoc(onDiskV2, { ...edited, padding: 9 }));
+    expect(out.version).toBe(2);
+    expect(out.padding).toBe(9); // the edit itself still applies
   });
 });

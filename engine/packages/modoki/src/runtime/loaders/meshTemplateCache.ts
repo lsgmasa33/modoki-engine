@@ -13,6 +13,8 @@ import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, ge
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
+import { classifyFormatVersion } from '../core/formatVersion';
+import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
 // The `lineColor` / `nprColorPreserve` prototype accessors. Imported for its ORDERING guarantee,
 // not for NPR: this module writes both properties and must not do so before they are accessors.
 // ⚠️ From `materialExtras`, NOT from `npr/NPRPostProcess` — that module imports `three/tsl`, and
@@ -986,6 +988,21 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
       }
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       const asset = await parseAssetJson(res, meshPath) as { id?: string } & MeshAsset;
+      // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
+      // `.mesh.json` is a machine-generated sidecar, not player data — REFUSE, not PRESERVE. A
+      // too-new or unreadable document is not cached (so callers keep getting `undefined`,
+      // exactly like a permanently-failed load) and its bytes are never read further.
+      const verdict = classifyFormatVersion(asset, MESH_FORMAT_VERSION);
+      if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+        console.error(
+          verdict.kind === 'too-new'
+            ? `[MeshCache] refusing ${meshPath}: format version ${verdict.version} is newer than ` +
+              `this build's MESH_FORMAT_VERSION (${MESH_FORMAT_VERSION}) — not caching it.`
+            : `[MeshCache] refusing ${meshPath}: version field is unreadable (${verdict.reason}) — not caching it.`,
+        );
+        meshAssetCache.set(meshPath, MESH_FAILED);
+        return;
+      }
       meshAssetCache.set(meshPath, asset);
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
@@ -1203,6 +1220,22 @@ function fetchMaterial(matPath: string): Promise<void> {
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the untyped `res.json()` this replaces
       const data = await parseAssetJson(res, matPath) as any;
+      // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
+      // `.mat.json` is a machine-generated sidecar, not player data — REFUSE, not PRESERVE. A
+      // too-new or unreadable document is not built into a material and lands in the SAME
+      // permanent `MATERIAL_FAILED` sentinel the "unknown material type" branch below uses, so a
+      // refused document also gets the visible pink-material fallback rather than a silent hang.
+      const verdict = classifyFormatVersion(data, MATERIAL_FORMAT_VERSION);
+      if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+        console.error(
+          verdict.kind === 'too-new'
+            ? `[MeshCache] refusing ${matPath}: format version ${verdict.version} is newer than ` +
+              `this build's MATERIAL_FORMAT_VERSION (${MATERIAL_FORMAT_VERSION}) — not building it.`
+            : `[MeshCache] refusing ${matPath}: version field is unreadable (${verdict.reason}) — not building it.`,
+        );
+        materialCache.set(matPath, MATERIAL_FAILED);
+        return;
+      }
       // Self-register so future ref-by-guid resolves to this path
       if (typeof data.id === 'string') registerAsset(data.id, matPath, 'material');
 

@@ -9,7 +9,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  createAtlasWriteQueue, classifyAtlasLoad, canPersistAtlasDoc,
+  createAtlasWriteQueue, classifyAtlasLoad, canPersistAtlasDoc, buildNextAtlasDoc,
   DEFAULT_ATLAS_DOC, type AtlasSourceDoc, type AtlasLoadState,
 } from './atlasPersist';
 import { writeAssetFileIfMatch } from '../assetOps';
@@ -71,6 +71,9 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
    *  gated on this — see `update()` and the `disabled=` props below (#430): editing on top of a
    *  load failure used to silently overwrite the real `.atlas.json` with `DEFAULT_DOC`. */
   const [loadState, setLoadState] = useState<AtlasLoadState>('loading');
+  /** Set alongside `loadState === 'refused'` — the human-readable reason a too-new/unreadable
+   *  format version was refused, surfaced in the banner instead of the generic load-failure text. */
+  const [refusalMessage, setRefusalMessage] = useState('');
   const [reloadNonce, setReloadNonce] = useState(0); // bump (Retry) to re-run the load effect
   const [packing, setPacking] = useState(false);
   const [blockVersion, setBlockVersion] = useState(0); // bump to re-read the manifest block
@@ -125,6 +128,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     loadedText.current = null;
     setDoc(DEFAULT_DOC);
     setLoadState('loading');
+    setRefusalMessage('');
     let fetchedText: string | null = null;
     backendFetch(path, { signal: ac.signal })
       .then((r) => (r.ok ? r.text().then((text) => {
@@ -140,6 +144,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       .then((result) => {
         if (result === null) return; // aborted — a newer load wins
         if (result.loadState === 'failed') { setLoadState('failed'); return; }
+        if (result.loadState === 'refused') { setLoadState('refused'); setRefusalMessage(result.message); return; }
         rawDoc.current = result.raw;
         loadedPath.current = path;
         loadedText.current = fetchedText;
@@ -163,15 +168,17 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     // Compares IDENTITY (`loadedPath.current` vs `path`), not just `loadState` — see
     // `canPersistAtlasDoc`'s header for the A→B selection-change window this closes.
     if (!canPersistAtlasDoc(loadState, loadedPath.current, path)) { console.warn('[AtlasAssetView] update() called while no matching load is loaded; ignored'); return; }
+    // `buildNextAtlasDoc` deliberately adds NO `version:` key — see its own header (#784, § 2b)
+    // for the clobber this used to be (`{ ...prev, ...patch, version: 1 as const }`).
     setDoc((prev) => {
-      const next = { ...prev, ...patch, version: 1 as const };
+      const next = buildNextAtlasDoc(prev, patch);
       // The write happens OUTSIDE this updater (not chained in-place below) — a setState updater
       // must be pure, and React StrictMode double-invokes it in dev, so writing here issued two
       // disk writes per edit (#308-adjacent, review finding E-3). `next` is still returned so the
       // panel updates optimistically; the write follows once, right after this call.
       return next;
     });
-    const next = { ...doc, ...patch, version: 1 as const };
+    const next = buildNextAtlasDoc(doc, patch);
     // Report a write that did not land, instead of discarding the boolean (#308 sweep).
     // The panel updates optimistically either way — same order as persistAssetEdit, which
     // every SIBLING asset view uses; without the failure path that optimism is a LIE: the
@@ -259,7 +266,13 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
               ? `⚠ ${fileLabel} changed on disk — your edit was not applied. Reloaded from disk.`
               : loadState === 'loading'
                 ? `Loading ${fileLabel}…`
-                : `⚠ Could not load ${fileLabel} — editing disabled so it is not overwritten.`}
+                : loadState === 'refused'
+                  // Distinct from the generic load-failure text below: this file parsed FINE, but
+                  // ${refusalMessage} means it was written by a build newer than this one — "Retry"
+                  // re-reads the same file and will refuse it again until either the file or this
+                  // build changes. A network hiccup deserves "try again"; this deserves "update".
+                  ? `⚠ Cannot open ${fileLabel} — ${refusalMessage}. Editing is disabled; update to a build that supports it, or re-save this atlas from the build that wrote it.`
+                  : `⚠ Could not load ${fileLabel} — editing disabled so it is not overwritten.`}
           </span>
           {/* Kept mounted (not `failed`-only) so a load that HANGS — rather than failing outright,
               e.g. the dev server accepting the socket mid-restart with no timeout set on the

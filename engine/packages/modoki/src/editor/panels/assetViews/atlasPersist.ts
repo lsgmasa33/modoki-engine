@@ -8,7 +8,8 @@
 
 import { writeAssetFile } from '../assetOps';
 import { reportWriteFailed } from './persist';
-import { defaultAtlasSource } from '../../../runtime/loaders/spriteAtlas';
+import { defaultAtlasSource, ATLAS_FORMAT_VERSION } from '../../../runtime/loaders/spriteAtlas';
+import { classifyFormatVersion } from '../../../runtime/core/formatVersion';
 import { sha256Hex } from '../../utils/contentHash';
 
 /** Write an atlas document's serialized content to `path` and report (console + toast) if the
@@ -43,7 +44,13 @@ export interface AtlasSourceDoc {
 
 export const DEFAULT_ATLAS_DOC: AtlasSourceDoc = defaultAtlasSource();
 
-export type AtlasLoadState = 'loading' | 'ok' | 'failed';
+// 'refused' (docs/format-versioning.md § 2b-bis) is distinct from 'failed': a `.atlas.json`
+// written by a NEWER build parsed FINE — it is `editingDisabled` for the same reason a network
+// failure is (there is no real document this panel understands to edit onto), but the banner
+// text is not the same story. "Could not load" reads as transient (retry the network); a
+// too-new format version is a standing fact about THIS build until it is updated, and telling
+// the user to retry a bad network read would be a wrong diagnosis for a right symptom.
+export type AtlasLoadState = 'loading' | 'ok' | 'failed' | 'refused';
 
 /** What the load effect actually observed, reduced to the four cases that matter. An abort is
  *  the effect's own cleanup firing (path changed again, or unmount) — never a load failure. */
@@ -81,6 +88,7 @@ function normalizeAtlasBody(body: Record<string, unknown>): AtlasSourceDoc {
 export function classifyAtlasLoad(outcome: AtlasLoadOutcome):
   | { loadState: 'ok'; doc: AtlasSourceDoc; raw: Record<string, unknown> }
   | { loadState: 'failed' }
+  | { loadState: 'refused'; message: string }
   | null {
   switch (outcome.kind) {
     case 'aborted': return null;
@@ -90,6 +98,22 @@ export function classifyAtlasLoad(outcome: AtlasLoadOutcome):
       const body = outcome.body;
       if (typeof body !== 'object' || body === null || Array.isArray(body)) return { loadState: 'failed' };
       const raw = body as Record<string, unknown>;
+      // REFUSE a too-new / unreadable format version BEFORE normalizing (docs/format-versioning.md
+      // § 2b-bis — `.atlas.json` is a machine-generated sidecar, not player data, so REFUSE not
+      // PRESERVE). `raw` is already known to be a plain object here, so `classifyFormatVersion`
+      // can only report `ok`/`absent`/`too-new`/`unreadable('non-numeric-version')` — never
+      // `unreadable('not-an-object')`, which the check above already ruled out.
+      const verdict = classifyFormatVersion(raw, ATLAS_FORMAT_VERSION);
+      if (verdict.kind === 'too-new') {
+        return {
+          loadState: 'refused',
+          message: `its format version (${verdict.version}) is newer than this build supports ` +
+            `(ATLAS_FORMAT_VERSION ${ATLAS_FORMAT_VERSION})`,
+        };
+      }
+      if (verdict.kind === 'unreadable') {
+        return { loadState: 'refused', message: `its version field is unreadable (${verdict.reason})` };
+      }
       return { loadState: 'ok', doc: normalizeAtlasBody(raw), raw };
     }
   }
@@ -108,6 +132,28 @@ export function classifyAtlasLoad(outcome: AtlasLoadOutcome):
  *  painted with A's loaded document but is now asking about B's path. */
 export function canPersistAtlasDoc(loadState: AtlasLoadState, loadedPath: string | null, path: string): boolean {
   return loadState === 'ok' && loadedPath === path;
+}
+
+/** Build the next in-memory `AtlasSourceDoc` from a control edit. Extracted so the ONE thing
+ *  `update()` must not do is unit-testable without mounting `AtlasAssetView` (CLAUDE.md §
+ *  Panels).
+ *
+ *  `update()` used to build `{ ...prev, ...patch, version: 1 as const }`, which CLOBBERED an
+ *  already-versioned document's own value on every edit (#784, docs/format-versioning.md § 2b:
+ *  "never echo back what you read" cuts both ways — never clobber it either). The straight fix
+ *  (dropping the `version` key entirely) went too far the other way (#784 phase C adversarial
+ *  review, finding 3): `normalizeAtlasBody` sets `version: d.version` — `undefined` for a
+ *  versionless file — and `serializeAtlasDoc` deletes `undefined`-valued keys, so a
+ *  versionless atlas now stayed versionless through every edit, where it used to get stamped on
+ *  the first one. § 2b: "doing only the refusal produces an unstamped document, which is the
+ *  same defect wearing a different face." Stamp ONLY when the merged result has no version to
+ *  clobber — merge first (`patch`'s own explicit `version`, if any, still wins over `prev`'s,
+ *  same as a bare spread), THEN fall back to `ATLAS_FORMAT_VERSION` only if that merge left no
+ *  version at all. Do not "simplify" this back to a bare spread (loses the stamp) or a literal
+ *  `version: ATLAS_FORMAT_VERSION` (reclobbers a real value, including one `patch` just set). */
+export function buildNextAtlasDoc(prev: AtlasSourceDoc, patch: Partial<AtlasSourceDoc>): AtlasSourceDoc {
+  const merged = { ...prev, ...patch };
+  return { ...merged, version: merged.version ?? ATLAS_FORMAT_VERSION };
 }
 
 // ---------------------------------------------------------------------------------------------

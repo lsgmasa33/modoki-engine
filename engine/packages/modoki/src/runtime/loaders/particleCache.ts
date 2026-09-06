@@ -9,9 +9,10 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
+import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
 import { createTeardownToken } from '../core/liveness';
+import { classifyFormatVersion } from '../core/formatVersion';
 
 const cache = new Map<string, ParticleEffectDef>();
 const loading = new Map<string, Promise<void>>();
@@ -68,7 +69,15 @@ export function normalizeParticleDef(json: Partial<ParticleEffectDef>): Particle
     shape: { ...d.shape, ...(json.shape ?? {}) },
     render: { ...d.render, ...(json.render ?? {}) },
     collision: migrateCollision(json.collision),
-    version: 1,
+    // ⚠️ Deliberately NO `version:` key here. A later key wins in an object spread, so a
+    // trailing `version: 1` used to overwrite whatever `...json` carried — re-stamping the
+    // in-memory def to `1` on EVERY load, and on every `setParticleEffect` call (which never
+    // touched disk at all). The fix is the ORDER, not a new mechanism: `...d` (this build's
+    // default, `PARTICLE_FORMAT_VERSION`) applies first and `...json` applies after, so a
+    // stored version wins when the document has one and only a versionless legacy/fresh doc
+    // falls back to the default (docs/format-versioning.md § 2b: "never echo back what you
+    // read" for a WRITER — this is a READER, and the in-memory def must report what the file
+    // said, not what this build would write).
   };
 
   // ── clamp invariants ──
@@ -139,6 +148,26 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         // An editor live-preview edit (setParticleEffect) landed while we were
         // fetching: it already seeded the cache, so don't clobber it with disk.
         if (cache.has(path)) return;
+        // Format-version REFUSAL (docs/format-versioning.md § 2b-bis): `.particle.json` is a
+        // machine-generated sidecar, not player data, so a `too-new`/`unreadable` document is
+        // REFUSE, not PRESERVE — do not cache it (so `getParticleEffect` keeps answering `null`)
+        // and never let `normalizeParticleDef` re-stamp this build's version over bytes it could
+        // not fully read.
+        const verdict = classifyFormatVersion(json, PARTICLE_FORMAT_VERSION);
+        if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+          // console.error, not .warn: a "still loading" null and a "refused, permanently" null
+          // are indistinguishable to every caller (particle systems do `if (!def) return; //
+          // still loading, retry next frame`), so this log line is the ONLY place the two are
+          // told apart. A `.warn` here would read exactly like the slow-load case it is not.
+          console.error(
+            verdict.kind === 'too-new'
+              ? `[particleCache] refusing ${path}: format version ${verdict.version} is newer than ` +
+                `this build's PARTICLE_FORMAT_VERSION (${PARTICLE_FORMAT_VERSION}) — not caching it.`
+              : `[particleCache] refusing ${path}: version field is unreadable (${verdict.reason}) — not caching it.`,
+          );
+          failed.add(path);
+          return;
+        }
         // Self-register guid → path (same pattern as meshTemplateCache) so a
         // later ref to this effect by guid resolves even if it wasn't in the
         // pre-loaded manifest (e.g. a freshly created effect in the editor).

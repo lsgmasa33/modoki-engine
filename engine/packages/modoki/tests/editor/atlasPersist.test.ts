@@ -15,11 +15,12 @@ vi.mock('../../src/editor/panels/assetOps', () => ({
 }));
 
 import {
-  persistAtlasDoc, classifyAtlasLoad, canPersistAtlasDoc, DEFAULT_ATLAS_DOC,
+  persistAtlasDoc, classifyAtlasLoad, canPersistAtlasDoc, buildNextAtlasDoc, DEFAULT_ATLAS_DOC,
   persistAtlasDocIfUnchanged, createAtlasWriteQueue,
 } from '../../src/editor/panels/assetViews/atlasPersist';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import { sha256Hex } from '../../src/editor/utils/contentHash';
+import { ATLAS_FORMAT_VERSION } from '../../src/runtime/loaders/spriteAtlas';
 
 let consoleSpies: Array<{ mockRestore: () => void }> = [];
 const spyConsole = (level: 'error' | 'warn') => {
@@ -126,6 +127,78 @@ describe('classifyAtlasLoad', () => {
   });
 });
 
+// Format-version REFUSAL (#784, docs/format-versioning.md § 2b-bis). `.atlas.json` is REFUSE
+// disposition: a too-new/unreadable document parses fine but must not become an editable `doc`
+// — a distinct outcome from `failed` (network/HTTP), because the banner text and the fix are
+// different ("update this build" vs. "retry the load").
+describe('classifyAtlasLoad — format-version refusal', () => {
+  it('a too-new version classifies as refused, not ok — and not the generic "failed"', () => {
+    const body = { id: 'g1', version: 99, members: [], pageSize: 512, padding: 1, extrude: 2 };
+    const result = classifyAtlasLoad({ kind: 'ok', body });
+    expect(result?.loadState).toBe('refused');
+    expect((result as { message: string }).message).toContain('99');
+  });
+
+  it('an unreadable (non-numeric) version classifies as refused', () => {
+    const body = { id: 'g1', version: 'two', members: [] };
+    const result = classifyAtlasLoad({ kind: 'ok', body });
+    expect(result?.loadState).toBe('refused');
+  });
+
+  it('an ok (at or below this build) version still classifies as ok, unaffected', () => {
+    const body = { id: 'g1', version: 1, members: [] };
+    const result = classifyAtlasLoad({ kind: 'ok', body });
+    expect(result?.loadState).toBe('ok');
+  });
+
+  it('an absent version still classifies as ok — legacy/fresh documents are readable', () => {
+    const body = { id: 'g1', members: [] };
+    const result = classifyAtlasLoad({ kind: 'ok', body });
+    expect(result?.loadState).toBe('ok');
+  });
+});
+
+// Direct regression test for 2b (#784): `AtlasAssetView.update()` used to build
+// `{ ...prev, ...patch, version: 1 as const }` — the trailing literal clobbered whatever
+// version the document actually carried, on EVERY edit. `buildNextAtlasDoc` is the extracted
+// replacement `update()` now calls.
+describe('buildNextAtlasDoc', () => {
+  const base = { id: 'g1', version: 2, members: ['a'], pageSize: 512, padding: 1, extrude: 2 };
+
+  it('never overrides the document\'s own version with a literal', () => {
+    const out = buildNextAtlasDoc(base, { padding: 5 });
+    expect(out.version).toBe(2); // NOT re-stamped to 1
+    expect(out.padding).toBe(5); // the edit itself still applies
+  });
+
+  it('applies the patch over the previous doc otherwise unchanged', () => {
+    const out = buildNextAtlasDoc(base, { members: ['a', 'b'] });
+    expect(out).toEqual({ ...base, members: ['a', 'b'] });
+  });
+
+  it('a patch that explicitly sets version is still honored (this is not a version-immutability guard)', () => {
+    const out = buildNextAtlasDoc(base, { version: 5 });
+    expect(out.version).toBe(5);
+  });
+
+  // #784 phase C adversarial review, finding 3: dropping the clobbering literal ALSO dropped the
+  // stamp for a document that had no version to begin with — `normalizeAtlasBody` sets
+  // `version: undefined` for a versionless file, and `serializeAtlasDoc` strips `undefined`
+  // keys, so a versionless atlas stayed versionless through every edit instead of getting
+  // stamped on the first one, same as it did before #784 phase C2a's fix.
+  it('a versionless doc gains ATLAS_FORMAT_VERSION on its first edit', () => {
+    const versionless = { id: 'g2', members: ['a'], pageSize: 512, padding: 1, extrude: 2 };
+    const out = buildNextAtlasDoc(versionless, { padding: 5 });
+    expect(out.version).toBe(ATLAS_FORMAT_VERSION);
+    expect(out.padding).toBe(5);
+  });
+
+  it('a doc already carrying its OWN version keeps that value unchanged (not re-stamped)', () => {
+    const out = buildNextAtlasDoc(base, { padding: 9 });
+    expect(out.version).toBe(base.version); // 2, not ATLAS_FORMAT_VERSION
+  });
+});
+
 describe('canPersistAtlasDoc', () => {
   it('refuses while loading, even with a matching path', () => {
     expect(canPersistAtlasDoc('loading', '/a.atlas.json', '/a.atlas.json')).toBe(false);
@@ -150,6 +223,10 @@ describe('canPersistAtlasDoc', () => {
 
   it('refuses when loadedPath is null (no load has landed yet) regardless of loadState', () => {
     expect(canPersistAtlasDoc('ok', null, '/a.atlas.json')).toBe(false);
+  });
+
+  it('refuses a "refused" (format-version) load state, even with a matching path', () => {
+    expect(canPersistAtlasDoc('refused', '/a.atlas.json', '/a.atlas.json')).toBe(false);
   });
 });
 

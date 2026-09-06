@@ -29,6 +29,7 @@ import {
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  getLastSceneLoadFailureMessage,
   isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
@@ -1531,8 +1532,28 @@ export function registerEditorAgentOps(): void {
     const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
     guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
+    // Read BEFORE the load — `loadScene()` never gets far enough to change this on a
+    // refusal/failure, but capturing it up front (mirrors `agentBridge.ts`'s runtime twin,
+    // #486 finding A) lets the message say whether the PREVIOUS scene is still what's loaded,
+    // rather than assuming it.
+    const before = getCurrentScenePath();
     const outcome = await loadScene(path);
-    if (outcome === 'failed') throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
+    if (outcome === 'refused' || outcome === 'failed') {
+      // Carry the ACTUAL reason (docs/format-versioning.md § 2b-bis / #784 phase C3) instead of
+      // guessing one — a too-new/unreadable scene is a REFUSAL, not a missing path, and the old
+      // hard-coded "does the path exist?" message was a wrong diagnosis for a right symptom.
+      const reason = getLastSceneLoadFailureMessage();
+      const cur = getCurrentScenePath();
+      const verb = outcome === 'refused' ? 'REFUSED' : 'FAILED';
+      const why = reason ?? (outcome === 'failed' ? 'the scene was not loaded (does the path exist?)' : 'its format version is not supported by this build');
+      const stillPrevious = cur === before;
+      throw new Error(
+        `load-scene ${verb} for "${path}": ${why}. ` +
+        (stillPrevious
+          ? `The previous scene is still loaded.`
+          : `The active scene is now "${cur ?? 'null'}" — the previous scene is NOT what is loaded, because another load swapped it in while this one was failing.`),
+      );
+    }
     if (outcome === 'superseded') {
       // A LATER load won the swap while ours was in flight (sceneManager.ts:885-900) — our own
       // load did not fail, and this says nothing about whether `path` exists. Mirrors the

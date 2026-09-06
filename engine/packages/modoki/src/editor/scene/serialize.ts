@@ -22,7 +22,7 @@ import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
+import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
@@ -996,7 +996,27 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
  *  loser's own `sceneManager.loadScene` resolves successfully and throws nothing). Neither case
  *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
  *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
-export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed';
+export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
+
+/** Set alongside a `'failed'` or `'refused'` outcome PRODUCED BY THIS MODULE'S OWN `loadScene`
+ *  below — the message from the throw that caused it, since `SceneLoadOutcome` stays a bare
+ *  string (every existing caller compares it with `===`/`!==`, so widening it to an object would
+ *  ripple through all of them for no benefit). Mirrors `isSceneLoadInFlight`'s
+ *  module-state-plus-getter shape, just below. Read this immediately after a `loadScene()` call
+ *  returns 'failed'/'refused' — a LATER load overwrites it.
+ *
+ *  ⚠️ **Not a total invariant across every `'failed'`, anywhere.** `createEditor.tsx`'s
+ *  `loadFirstScene`/`tryLoad` synthesizes its OWN `'failed'` (#784 phase C adversarial review,
+ *  finding 5) when `deps.load` — normally this very `loadScene`, which never throws past its own
+ *  catch-all below — throws anyway (a defensive belt for a caller that changes that contract).
+ *  That `'failed'` does not touch this variable: it belongs to a boot-time candidate-fallback
+ *  walk, is followed by trying the NEXT candidate rather than surfacing to a caller, and nothing
+ *  reads this getter from there today. If a future caller of `getLastSceneLoadFailureMessage()`
+ *  needs to observe THAT failure too, `tryLoad`'s catch needs its own way to set this (there is
+ *  no exported setter, deliberately — this variable is module-private) rather than assuming it
+ *  is already covered. */
+let _lastLoadFailureMessage: string | null = null;
+export function getLastSceneLoadFailureMessage(): string | null { return _lastLoadFailureMessage; }
 
 /** Load a scene from a JSON file. Delegates to SceneManager which handles the
  *  full async preload + atomic swap + refcount lifecycle. The editor wrapper
@@ -1079,6 +1099,25 @@ export async function loadScene(
     // the epoch guard above); it's expected, not a failure worth a red console error, and it's
     // the same outcome as the tail-supersede case above: this op's own load did not fail.
     if ((e as Error)?.name === 'AbortError') return 'superseded';
+    // A format-version refusal (docs/format-versioning.md § 2b-bis — Scene is REFUSE, #784
+    // phase C3): distinct from 'failed' because "Failed to load — check the path" is a WRONG
+    // diagnosis for a right symptom — the path exists and the bytes are fine, this build just
+    // refuses to read them. Toasted here (not just logged) because a double-click on a scene
+    // in the Assets panel has no other feedback path (openAssetInEditor.ts has no 'failed'
+    // branch either) — without this, a refused open looks like a click that did nothing, with
+    // the previous scene silently still on screen.
+    //
+    // ⚠️ The toast auto-clears after ~3.5s and is `pointerEvents:'none'` (not copyable/
+    // re-readable) — it is a heads-up, not the durable record. The console.error line below,
+    // and `getLastSceneLoadFailureMessage()` for a caller that needs the text (e.g.
+    // agentEditorOps.ts's `load-scene` op), are.
+    if (e instanceof SceneFormatRefusedError) {
+      _lastLoadFailureMessage = e.message;
+      const msg = `[Editor] Refused to load scene "${scenePath}": ${e.message}`;
+      console.error(msg);
+      useEditorStore.getState().showToast(`Scene not loaded: ${e.message}`, 'warn');
+      return 'refused';
+    }
     // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
     // normal step, not a failure — the next candidate is expected to load. Logging it at
     // `error` made a healthy self-healing boot look broken, and because
@@ -1086,6 +1125,7 @@ export async function loadScene(
     // stale remembered scene path could fail a packaging gate for a reason unrelated to the
     // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
     // loadFirstScene after every candidate has missed.
+    _lastLoadFailureMessage = (e as Error)?.message ?? String(e);
     const msg = `[Editor] Failed to load scene: ${e}`;
     if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
     else console.error(msg);

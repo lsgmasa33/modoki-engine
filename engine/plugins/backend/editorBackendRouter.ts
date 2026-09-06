@@ -178,7 +178,19 @@ import {
   getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData,
   ASSET_SCHEMA_TYPES, type AssetSchemaType,
 } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
+import { PARTICLE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/particles/types';
+import { MATERIAL_FORMAT_VERSION } from '../../packages/modoki/src/runtime/traits/Renderable3D';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
+
+// Format-version constant per `AssetSchemaType`, for /api/asset-write's too-new/unreadable
+// refusal (docs/format-versioning.md § 2b). Only types that actually carry a stamped `version`
+// field belong here — `.anim.json`, `.spriteanim.json`, `.timeline.json` and `.rig2d.json`
+// don't (§ 3), so they are deliberately absent rather than mapped to an invented constant.
+const ASSET_WRITE_FORMAT_VERSION: Partial<Record<AssetSchemaType, number>> = {
+  material: MATERIAL_FORMAT_VERSION,
+  particle: PARTICLE_FORMAT_VERSION,
+};
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
@@ -2461,9 +2473,41 @@ async function describeUnresolvedAgainstLiveWorld(
           hint: 'Read the current def first (modoki_read_asset_def), change what you need, and write the WHOLE object back. For a one-field edit prefer the granular tools (modoki_particle_set / anim_set_clip / timeline_set).',
         }, 400);
       }
+      // ── Refuse to overwrite a document this build cannot read (docs/format-versioning.md
+      // § 2b: "a writer that ... can overwrite an existing document must refuse a too-new
+      // one"). Only the asset types that carry a real format constant are checked — `type`
+      // is narrowed to `AssetSchemaType`, which does not include `mesh`/`atlas` (those are
+      // written elsewhere, never through this route), so the map below only ever matches
+      // `material`/`particle` today; any OTHER type keeps today's behaviour rather than
+      // inventing a constant that does not exist.
+      const prevText = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : null;
+      if (prevText !== null) {
+        const formatVersion = ASSET_WRITE_FORMAT_VERSION[type];
+        if (formatVersion !== undefined) {
+          const verdict = classifyJsonFormatVersion(prevText, formatVersion);
+          if (verdict.kind === 'too-new') {
+            return json({
+              ok: false,
+              error: `REFUSED: ${assetPath} is format version ${verdict.version}, newer than this build understands (${formatVersion}). Overwriting it would destroy a document this build cannot read. Nothing was written.`,
+              hint: 'Open this project with a newer engine build to edit this asset.',
+            }, 409);
+          }
+          if (verdict.kind === 'unreadable') {
+            return json({
+              ok: false,
+              error: `REFUSED: ${assetPath} could not be classified (${verdict.reason}) — it may be corrupt or hand-edited incorrectly (e.g. unresolved merge markers). Overwriting it would silently destroy whatever content is still recoverable. Nothing was written.`,
+              hint: 'Inspect and repair the file directly before writing to it again.',
+            }, 400);
+          }
+        }
+      }
+      // Parsed once, above the format-version check, and reused below for both the
+      // dropped-field guard and id preservation — a second independent parse of the same
+      // bytes (each with its own try/catch) is how a corrupt file used to slip past BOTH
+      // guards silently (#778's own precedent, see the id-preservation comment below).
       let prevDoc: Record<string, unknown> | null = null;
-      if (fs.existsSync(abs)) {
-        try { prevDoc = JSON.parse(fs.readFileSync(abs, 'utf-8')) as Record<string, unknown>; } catch { prevDoc = null; }
+      if (prevText !== null) {
+        try { prevDoc = JSON.parse(prevText) as Record<string, unknown>; } catch { prevDoc = null; }
       }
       if (isObj && prevDoc && !(body as { replace?: boolean })?.replace) {
         const incoming = new Set(Object.keys(data as object));
@@ -2488,8 +2532,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // later: every scene/Animator reference to the old guid dangled and the clip silently
       // stopped loading. `write_asset` promises to preserve the id, and reported ok:true
       // while doing the opposite. (C7)
-      if (out && typeof out === 'object' && !out.id && fs.existsSync(abs)) {
-        try { const prev = JSON.parse(fs.readFileSync(abs, 'utf-8')); if (prev?.id) out.id = prev.id; } catch { /* ignore */ }
+      if (out && typeof out === 'object' && !out.id && prevDoc?.id) {
+        out.id = prevDoc.id;
       }
       // `selfWrite` — the editor is flushing a doc it ALREADY applied to the live cache
       // (dirtyAssets.flushDirtyAssets), so fingerprint the bytes the way /api/write-file does and

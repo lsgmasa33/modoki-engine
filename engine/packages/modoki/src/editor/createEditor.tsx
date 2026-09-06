@@ -235,6 +235,12 @@ export async function loadFirstScene(
     try {
       return await deps.load(p);
     } catch (err) {
+      // This 'failed' is synthesized here, not produced by `serialize.ts`'s `loadScene` (which
+      // never throws past its own catch-all) — so it does NOT set `_lastLoadFailureMessage`,
+      // and `getLastSceneLoadFailureMessage()` will not reflect it. That's fine today: nothing
+      // reads the getter from this boot-time fallback walk, and the next candidate is tried
+      // regardless. Named exception in the getter's own docblock (#784 phase C adversarial
+      // review, finding 5) — read that before wiring a caller here to the getter.
       console.warn(`[Editor] Scene at ${p} failed to load, trying next fallback…`, err);
       return 'failed';
     }

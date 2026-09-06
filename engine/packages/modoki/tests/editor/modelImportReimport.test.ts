@@ -118,7 +118,13 @@ vi.mock('../../src/runtime/loaders/modelPostprocessorRegistry', () => ({
 
 vi.mock('../../src/runtime/traits', () => {
   const mk = (name: string) => { const f = (d?: any) => ({ _trait: name, ...d }); (f as any)._name = name; return f; };
-  return { Transform: mk('Transform'), EntityAttributes: mk('EntityAttributes'), ModelSource: mk('ModelSource') };
+  return {
+    Transform: mk('Transform'), EntityAttributes: mk('EntityAttributes'), ModelSource: mk('ModelSource'),
+    // #784 phase C2b: modelImport.ts stamps these onto every mesh/material asset it writes. A
+    // mocked module with no export would silently hand back `undefined`, which JSON.stringify
+    // then drops — masking the constant entirely rather than exercising it.
+    MESH_FORMAT_VERSION: 1, MATERIAL_FORMAT_VERSION: 1,
+  };
 });
 
 beforeEach(() => {
@@ -230,6 +236,103 @@ describe('manual material edits survive re-import (texture-loss regression)', ()
     expect(after.type).toBe('custom');
     expect(after.shader).toBe('space-console/planet');
     expect(after.nprColorPreserve).toBe(0.1);
+  });
+});
+
+describe('format-version REFUSAL on re-import (#784 phase C2b, items 3+4)', () => {
+  it('a too-new .mesh.json is NOT overwritten — the import aborts instead of minting a fresh guid', async () => {
+    const { importModel } = await getModule();
+
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const meshFile = [...vfsFiles.keys()].find((p) => p.endsWith('.mesh.json'))!;
+    const before = vfsFiles.get(meshFile)!;
+    const beforeParsed = JSON.parse(before);
+
+    // A future build wrote this file with a format version this build does not understand.
+    const tooNew = { ...beforeParsed, version: (beforeParsed.version ?? 1) + 1 };
+    vfsFiles.set(meshFile, JSON.stringify(tooNew, null, 2));
+
+    clearManifest();
+    mockTemplates = new Map();
+    addTemplate('wall', mat('brick'));
+    const result = await importModel(GLB, 'level');
+
+    // The falsy/aborted return every caller already checks (`if (!rootId) return;`).
+    expect(result).toBe(0);
+    // The bytes on disk are UNCHANGED — item 4's REFUSE, not merely "the call failed".
+    expect(vfsFiles.get(meshFile)).toBe(JSON.stringify(tooNew, null, 2));
+  });
+
+  it('an UNREADABLE .mesh.json (conflict markers) does NOT mint a fresh guid — the mesh dies with its scene/prefab refs intact', async () => {
+    // This is item 3's regression guard and the most important test in this phase: before the
+    // fix, ANY read failure (missing file, corrupt bytes, too-new) collapsed to "absent", so a
+    // conflict-markered `.mesh.json` was treated as a brand-new asset and got a FRESH guid —
+    // dangling every scene/prefab that referenced the old one, even though the file (and its
+    // real id) was still sitting right there on disk.
+    const { importModel } = await getModule();
+
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const meshFile = [...vfsFiles.keys()].find((p) => p.endsWith('.mesh.json'))!;
+    const meshId1 = JSON.parse(vfsFiles.get(meshFile)!).id as string;
+
+    // Simulate a merge conflict landing on disk — unparsable JSON.
+    const corrupt = '<<<<<<< HEAD\n{"id":"' + meshId1 + '"}\n=======\n{"id":"' + meshId1 + '","x":1}\n>>>>>>> branch\n';
+    vfsFiles.set(meshFile, corrupt);
+
+    clearManifest();
+    mockTemplates = new Map();
+    addTemplate('wall', mat('brick'));
+    const result = await importModel(GLB, 'level');
+
+    expect(result).toBe(0); // aborted, not a fresh entity tree
+    expect(vfsFiles.get(meshFile)).toBe(corrupt); // bytes untouched — no fresh guid was minted over them
+  });
+
+  it('a too-new .mat.json is NOT overwritten either — same REFUSE, on the material path', async () => {
+    const { importModel } = await getModule();
+
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const matFile = [...vfsFiles.keys()].find((p) => p.endsWith('.mat.json'))!;
+    const beforeParsed = JSON.parse(vfsFiles.get(matFile)!);
+    const tooNew = { ...beforeParsed, version: (beforeParsed.version ?? 1) + 1 };
+    vfsFiles.set(matFile, JSON.stringify(tooNew, null, 2));
+
+    clearManifest();
+    mockTemplates = new Map();
+    addTemplate('wall', mat('brick'));
+    const result = await importModel(GLB, 'level');
+
+    expect(result).toBe(0);
+    expect(vfsFiles.get(matFile)).toBe(JSON.stringify(tooNew, null, 2));
+  });
+
+  // #784 phase C adversarial review, finding 4. Before this fix, `importModel`'s abort boundary
+  // hard-coded the toast text to "a file could not be written" — true for the ORIGINAL #311
+  // write-failure case, but false since phase C2b started throwing `ImportWriteAborted` for a
+  // READ-side refusal too (this exact too-new-mesh case never reaches a write at all). The
+  // console.error one line above already used the real `e.message`; the toast now must too.
+  it('the abort toast carries the REAL reason, not the hard-coded "could not be written"', async () => {
+    const { importModel } = await getModule();
+    const { useEditorStore } = await import('../../src/editor/store/editorStore');
+
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const meshFile = [...vfsFiles.keys()].find((p) => p.endsWith('.mesh.json'))!;
+    const beforeParsed = JSON.parse(vfsFiles.get(meshFile)!);
+    const tooNew = { ...beforeParsed, version: (beforeParsed.version ?? 1) + 1 };
+    vfsFiles.set(meshFile, JSON.stringify(tooNew, null, 2));
+
+    clearManifest();
+    mockTemplates = new Map();
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+
+    const toast = useEditorStore.getState().toast;
+    expect(toast?.message).toMatch(/newer than this engine|refusing to read/i);
+    expect(toast?.message).not.toMatch(/a file could not be written/i);
   });
 });
 

@@ -14,7 +14,8 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { packAtlas, defaultAtlasSource, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
+import { packAtlas, defaultAtlasSource, ATLAS_FORMAT_VERSION, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
+import { classifyJsonFormatVersion } from '../packages/modoki/src/runtime/core/formatVersion';
 import {
   resolveTextureSettings, TEXTURE_MAX_SIZES,
   type TextureImportSettings, type TextureMaxSize,
@@ -53,13 +54,44 @@ interface ResolvedMember {
   pivot: { x: number; y: number };
 }
 
-/** Read + normalize the authored `.atlas.json`. */
+/** Read + normalize the authored `.atlas.json`.
+ *
+ *  ⚠️ **The only site that parses a versioned document with no try/catch, until now.** A bare
+ *  `JSON.parse` on a conflict-markered/truncated file threw an opaque `SyntaxError` with no file
+ *  name in it. `classifyJsonFormatVersion` is the entry point every on-disk caller should use
+ *  (`runtime/core/formatVersion.ts`) — it turns a parse failure into a named `unreadable` verdict
+ *  instead of an uncaught throw from deep inside `JSON.parse`, and separately catches a
+ *  `too-new` document (REFUSE disposition, docs/format-versioning.md § 2b-bis: `.atlas.json` is
+ *  a machine-generated sidecar, not player data) BEFORE any pack work runs for it. All three
+ *  callers of this handler already have a per-asset try/catch around it (the production build's
+ *  `assertNoConversionFallback` gate, the dev `/api/reimport` route's per-asset `summary.errors`,
+ *  and `modoki_import_file`'s 422 response) — this throws into that existing plumbing rather than
+ *  inventing a new channel. */
 function readAtlasSource(absPath: string): AtlasSource {
-  const raw = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as Partial<AtlasSource>;
+  const text = fs.readFileSync(absPath, 'utf-8');
+  const verdict = classifyJsonFormatVersion(text, ATLAS_FORMAT_VERSION);
+  if (verdict.kind === 'too-new') {
+    throw new Error(
+      `${absPath} is atlas format version ${verdict.version}, newer than this build's ` +
+      `ATLAS_FORMAT_VERSION (${ATLAS_FORMAT_VERSION}) — refusing to reimport a document written ` +
+      `by a newer build. Merge/pull the change that bumped the format, or reimport with that build.`,
+    );
+  }
+  if (verdict.kind === 'unreadable') {
+    throw new Error(
+      `${absPath} could not be read as a .atlas.json document (${verdict.reason}) — check for ` +
+      `unresolved merge-conflict markers or truncated JSON before reimporting.`,
+    );
+  }
+  const raw = JSON.parse(text) as Partial<AtlasSource>;
   const defaults = defaultAtlasSource();
   return {
     id: typeof raw.id === 'string' ? raw.id : '',
-    version: defaults.version,
+    // Reads `raw.version` like every sibling field below — it used to hardcode
+    // `defaults.version`, silently discarding whatever the file actually said (#784). Safe to
+    // trust directly: `classifyJsonFormatVersion` above already guarantees that when `version`
+    // is present here, it parsed as a finite integer at or below `ATLAS_FORMAT_VERSION`.
+    version: typeof raw.version === 'number' ? raw.version : defaults.version,
     members: Array.isArray(raw.members) ? raw.members.filter((m): m is string => typeof m === 'string') : [],
     pageSize: typeof raw.pageSize === 'number' && raw.pageSize > 0 ? raw.pageSize : defaults.pageSize,
     padding: typeof raw.padding === 'number' && raw.padding >= 0 ? raw.padding : defaults.padding,

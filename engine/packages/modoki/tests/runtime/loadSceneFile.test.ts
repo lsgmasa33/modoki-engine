@@ -893,6 +893,81 @@ describe('loadSceneFile', () => {
       )).resolves.toBeUndefined();
     });
   });
+
+  // #784 phase C3 — the scene's disposition is REFUSE (owner's ruling, 2026-09-06): a
+  // too-new or unreadable format version must not be read, and must not be mutated either.
+  // Before this phase, `assignSyntheticEntityIds` and `stripLegacyCameraFrameShowGizmo` ran
+  // UNCONDITIONALLY ahead of the (then-advisory) forward-version warning, so a too-new
+  // document was mutated even though nothing "loaded" it. These tests assert the document
+  // survives byte-for-byte, not merely that the call throws — a throw alone would pass even
+  // without the reordering in loadSceneFile (see the mutation check in the close-out).
+  describe('too-new / unreadable format version (REFUSE, #784 phase C3)', () => {
+    it('refuses a too-new scene and does not mutate it', async () => {
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION + 7,
+        resources: [],
+        entities: [{
+          // No `id` — a genuine too-new file wouldn't have synthetic ids either; this also
+          // proves assignSyntheticEntityIds never ran (it would have backfilled one).
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'FromTheFuture', parentId: 0 } },
+        }],
+      };
+      const snapshot = JSON.parse(JSON.stringify(data));
+
+      await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+        .rejects.toThrow(SceneFormatRefusedError);
+
+      // Bytes untouched: version unchanged, no synthetic id backfilled, no entities spawned.
+      // (koota's createWorld() always carries one implicit entity — id 0 — so "no entities
+      // spawned" is baseline-1, not 0.)
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1);
+    });
+
+    it('refuses a non-numeric string version instead of loading it silently', async () => {
+      // The historical defect: `"20" >= N` coerces truthy in every migration guard AND in
+      // the old `typeof data.version === 'number'` forward-warning check excluded it — so a
+      // string version passed through every rung untouched and unwarned, while the two
+      // unconditional mutators below the ladder still ran. classifyFormatVersion's
+      // `non-numeric-version` verdict is what catches this now.
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
+      const data = {
+        version: '20' as unknown as number,
+        resources: [],
+        entities: [{
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Ghost', parentId: 0 } },
+        }],
+      };
+      const snapshot = JSON.parse(JSON.stringify(data));
+
+      await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+        .rejects.toThrow(SceneFormatRefusedError);
+
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1); // baseline only — see the comment above
+    });
+
+    it('still migrates a scene with an ABSENT version (deliberate exception — do not gate this)', async () => {
+      // `absent` is § 2a's "legacy or freshly created — readable" verdict. A genuinely
+      // pre-v3 scene has no `version` key at all and MUST still run the whole ladder; this
+      // guards that exception against a later "tidy-up" that folds it into the refusal.
+      const { loadSceneFile } = await getLoader();
+      const data: any = {
+        resources: [],
+        entities: [{
+          id: 1,
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Legacy', parentId: 0 } },
+        }],
+      };
+
+      await expect(loadSceneFile(data, { fetchPrefab: async () => null, loadModels: false }))
+        .resolves.toBeUndefined();
+
+      expect(data.version).toBe(SCENE_FORMAT_VERSION);
+      expect(testWorld.entities.length).toBe(2); // baseline (1) + the one spawned entity
+    });
+  });
 });
 
   describe('v5 → v6 migration (derive resources)', () => {

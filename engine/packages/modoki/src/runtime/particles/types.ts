@@ -49,6 +49,14 @@ export const seekSteps = (fromTime: number, toTime: number): number =>
 import type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient } from '../core/curves';
 export type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient };
 
+/** The `.particle.json` format version this build writes/understands (docs/format-versioning.md
+ *  § 5). Never a literal — a reader compares against THIS constant, via
+ *  `runtime/core/formatVersion.ts`'s `classifyFormatVersion`. This module is the format's owner
+ *  (it declares `ParticleEffectDef` + `defaultParticleEffect()`) and is safe to import from the
+ *  runtime, the editor, and the Node build plugins alike (it pulls in only `../core/curves` and
+ *  `../core/spriteFrames`). */
+export const PARTICLE_FORMAT_VERSION = 1;
+
 export type EmitterShapeType = 'point' | 'cone' | 'sphere' | 'box' | 'circle' | 'cylinder' | 'polyline';
 
 export interface EmitterShape {
@@ -304,7 +312,9 @@ export interface RenderConfig {
  * assets keep loading.
  */
 export interface ParticleEffectDef {
-  version: 1;
+  /** Read-back document — the bytes may have been written by a newer build, so this must
+   *  not pin a literal (#734, #784). */
+  version: number;
   /** Stable asset GUID, stored in-file (same convention as mesh/material/prefab/scene
    *  `id`). Lets scenes + sub-emitters reference this effect by GUID so the reference
    *  survives the file being moved/renamed. Assigned on first save if absent. */
@@ -542,7 +552,7 @@ export function gpuDefSupported(def: ParticleEffectDef): boolean {
 /** A sensible default effect (a small upward spray) — used when creating new assets. */
 export function defaultParticleEffect(): ParticleEffectDef {
   return {
-    version: 1,
+    version: PARTICLE_FORMAT_VERSION,
     name: 'New Effect',
     duration: 5,
     looping: true,

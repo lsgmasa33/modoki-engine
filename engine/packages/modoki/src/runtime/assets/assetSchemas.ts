@@ -11,7 +11,9 @@
  *  Nested structures (particle shape/emission/curves, animation tracks/keys)
  *  follow the `example` shape — call out in `notes`. */
 
-import { defaultParticleEffect, type ParticleEffectDef } from '../particles/types';
+import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef } from '../particles/types';
+import { MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
+import { classifyFormatVersion } from '../core/formatVersion';
 import { defaultAnimationClip, normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { defaultTimeline, normalizeTimeline, type TimelineDef } from '../timeline/types';
 import { defaultSpriteClip } from '../traits/SpriteAnimator';
@@ -58,6 +60,7 @@ export interface AssetSchema {
 
 // ── Material (standard MeshStandardMaterial surface the editor writes) ──
 const MATERIAL_FIELDS: FieldMeta[] = [
+  { key: 'version', type: 'number', note: 'the format this document was written by (MATERIAL_FORMAT_VERSION) — never hand-author it; the writer stamps it on save' },
   { key: 'shader', type: 'enum', enum: ['builtin', 'unlit', 'file'], default: 'builtin', note: 'builtin = MeshStandardMaterial' },
   { key: 'color', type: 'color', default: 0xffffff },
   { key: 'roughness', type: 'number', default: 1, min: 0, max: 1 },
@@ -90,13 +93,19 @@ const MATERIAL_FIELDS: FieldMeta[] = [
   ...MATERIAL_TEXTURE_SLOTS.map((key): FieldMeta => ({ key, type: 'ref', note: 'texture GUID' })),
 ];
 
-function defaultMaterial(): Record<string, unknown> {
-  return { shader: 'builtin', color: 0xffffff, roughness: 1, metalness: 0 };
+// Exported (not local-only) so a parity test can pin the "Create Material" body against the
+// same factory GLB import stamps from (docs/format-versioning.md § 5 — one stamper per document,
+// #784 phase C2b). Previously unstamped: this was the SECOND of two `.mat.json` writers and the
+// only one that never stamped a version, so 11 committed files (10 games/sling/, 1
+// demos/forest-camp/) carry no version at all — those stay valid as `absent` (§ 2a); this fix
+// does not touch them, it only stops the divergence for material documents created from now on.
+export function defaultMaterial(): Record<string, unknown> {
+  return { shader: 'builtin', color: 0xffffff, roughness: 1, metalness: 0, version: MATERIAL_FORMAT_VERSION };
 }
 
 // ── Particle (top-level ParticleEffectDef surface) ──
 const PARTICLE_FIELDS: FieldMeta[] = [
-  { key: 'version', type: 'number', default: 1, note: 'always 1' },
+  { key: 'version', type: 'number', note: 'the format this document was written by (PARTICLE_FORMAT_VERSION) — never hand-author it; the writer stamps it on save' },
   { key: 'name', type: 'string' },
   { key: 'space', type: 'enum', enum: ['2d', '3d'], default: '3d', note: 'editor preview hint only (2d=PixiJS, 3d=Three.js); runtime routing is by Canvas2D ancestry, not this' },
   { key: 'duration', type: 'number', default: 5, note: 'loop period (s)' },
@@ -160,7 +169,6 @@ export function defaultSpriteAnimData(): { clips: Record<string, ReturnType<type
 // structural part edit, and a rig authored either way must validate.
 const RIG2D_FIELDS: FieldMeta[] = [
   { key: 'id', type: 'string', note: 'stable GUID (mirrors .meta.json)' },
-  { key: 'version', type: 'number', note: 'present on rigs written by the editor; not interpreted — the SHAPE (parts[] or not) is what selects v1/v2' },
   { key: 'bones', type: 'array', note: 'SHARED skeleton: [{ name, parent(-1 = root), x, y, rot, noScale? }] — each bone local to its parent' },
   { key: 'parts', type: 'array', note: 'v2: [{ name?, sprite(GUID), mesh:{verts:[[x,y]],uvs:[[u,v]],tris:[i0,i1,i2,…]}, skinIndices:[4 per vertex], skinWeights:[4 per vertex], order?, visible? }] — omit for a v1 single-part rig' },
   { key: 'sprite', type: 'ref', note: 'v1 only (single part): sprite/texture GUID. Ignored when `parts` is present' },
@@ -208,7 +216,16 @@ export function validateAssetData(type: AssetSchemaType, data: unknown): { error
   const byKey = new Map(schema.fields.map((f) => [f.key, f] as const));
 
   // Per-type required-field sanity (hard errors only for fundamentals).
-  if (type === 'particle' && (obj.version !== 1)) warnings.push('particle.version should be 1');
+  // Strictly-greater only (docs/format-versioning.md § 2a) — the old `obj.version !== 1` flagged
+  // a legitimately OLDER/absent document exactly as loudly as a too-new one. Advisory only: this
+  // pushes to `warnings`, never `errors`, so nothing here blocks the write (the load-time REFUSAL
+  // for `.particle.json` lives in `particleCache.ts` / `ParticleEditor.tsx`).
+  if (type === 'particle') {
+    const verdict = classifyFormatVersion(obj, PARTICLE_FORMAT_VERSION);
+    if (verdict.kind === 'too-new') {
+      warnings.push(`particle.version ${verdict.version} is newer than this build's PARTICLE_FORMAT_VERSION (${PARTICLE_FORMAT_VERSION})`);
+    }
+  }
   if (type === 'animation' && !Array.isArray(obj.tracks) && obj.tracks !== undefined) {
     errors.push('animation.tracks must be an array');
   }

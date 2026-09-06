@@ -21,17 +21,33 @@ export const Renderable3D = trait({
   receiveShadow: true as boolean,
 });
 
+/** The `.mesh.json` format version this build writes/understands (docs/format-versioning.md
+ *  § 5). Never a literal — a reader compares against THIS constant, via
+ *  `runtime/core/formatVersion.ts`'s `classifyFormatVersion`. This module is the format's owner
+ *  (it declares `MeshAsset`) and is import-safe from the runtime, the editor, and Node build
+ *  plugins alike — a plain koota `trait()` module with no heavy dependencies. */
+export const MESH_FORMAT_VERSION = 1;
+
 /** Mesh asset file format (*.mesh.json). `model` and `material` accept either
  *  a path (legacy) or a UUID resolved through the asset manifest. */
 export interface MeshAsset {
   /** Stable UUID — written once at import, never changes across renames/moves. */
   id?: string;
-  version: 1;
+  /** Read-back document — the bytes may have been written by a newer build, so this must
+   *  not pin a literal (#734, #784). */
+  version: number;
   model: string;        // GLB ref (guid or path)
   mesh: string;         // mesh name within the model, e.g., "boat"
   postprocessor: string; // model postprocessor ID, e.g., "island"
   material?: string;    // material ref (guid or path)
 }
+
+/** The `.mat.json` format version this build writes/understands (docs/format-versioning.md
+ *  § 5). Never a literal — a reader compares against THIS constant, via
+ *  `runtime/core/formatVersion.ts`'s `classifyFormatVersion`. Two documents, two constants
+ *  (§ 2b) — `.mesh.json` and `.mat.json` version independently even though this module owns
+ *  both formats. */
+export const MATERIAL_FORMAT_VERSION = 1;
 
 /** Material asset file format (*.mat.json) — the full `MeshStandardMaterial`
  *  authoring surface. All texture fields accept a guid or path. A map's colorspace
@@ -47,7 +63,9 @@ export interface MeshAsset {
 export interface MaterialAsset {
   /** Stable UUID — written once at import, never changes across renames/moves. */
   id?: string;
-  version: 1;
+  /** Read-back document — the bytes may have been written by a newer build, so this must
+   *  not pin a literal (#734, #784). */
+  version: number;
 
   // ── Scalars / colors ──
   color?: number;

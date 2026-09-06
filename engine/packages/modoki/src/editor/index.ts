@@ -77,6 +77,7 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
+  getLastSceneLoadFailureMessage, type SceneLoadOutcome,
 } from './scene/serialize';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,

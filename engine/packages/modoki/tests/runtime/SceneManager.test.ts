@@ -241,6 +241,79 @@ describe('SceneManager — basic load', () => {
     expect(open.map((sp) => sp.name)).toEqual([]);
   });
 
+  /** #784 phase C3 — the scene's disposition is REFUSE. `loadSceneFile`'s too-new/unreadable
+   *  throw must land in `SceneManager.loadScene`'s own `catch`, which releases the
+   *  newly-allocated resources, destroys `nextWorld`, and never calls `setCurrentWorld` — so
+   *  the currently-active scene is untouched. Driven through a REAL too-new scene load rather
+   *  than asserting the throw shape directly, per this file's own convention above (#238). */
+  it('a too-new scene is refused and leaves the previously-loaded scene current', async () => {
+    const { SCENE_FORMAT_VERSION } = await import('../../src/runtime/core/version');
+    defineSceneA();
+    fetchResponses['/tooNew.json'] = {
+      version: SCENE_FORMAT_VERSION + 1,
+      resources: [],
+      entities: [{ id: 900, traits: { Transform: { x: 99 }, EntityAttributes: { name: 'Future', parentId: 0 } } }],
+    };
+    const { sceneManager } = await getSceneManager();
+
+    await sceneManager.loadScene('/sceneA.json');
+    const beforeWorld = sceneManager.getCurrent();
+    const { getCurrentWorld } = await getWorld();
+    const worldBefore = getCurrentWorld();
+
+    await expect(sceneManager.loadScene('/tooNew.json')).rejects.toThrow(/newer than this engine supports/);
+
+    expect(sceneManager.getCurrent()).toEqual(beforeWorld);
+    expect(getCurrentWorld()).toBe(worldBefore);
+    // The refused scene's entity must never have been spawned into any world.
+    let futureCount = 0;
+    getCurrentWorld().query(EntityAttributes).updateEach(([ea]: any[]) => { if (ea.name === 'Future') futureCount++; });
+    expect(futureCount).toBe(0);
+
+    // koota caps live worlds at 16 per process and this file never destroys most of its
+    // (many) worlds — destroy this test's own, like the "shadows a scene root" test above
+    // does, so it doesn't push a LATER test over that ceiling.
+    worldBefore.destroy();
+  });
+
+  /** #784 phase C adversarial review, finding 1 — `SceneManager.collectSceneResourceRefs`
+   *  ends with `sceneData.version = Math.max(sceneData.version ?? 6, 6)`, which runs BEFORE
+   *  `loadSceneFile`'s own too-new/unreadable guard and numerically COERCES a non-numeric
+   *  version into a valid number — so by the time the guard runs on a `SceneManager`-driven
+   *  load, an `unreadable` scene has already been laundered into `ok`. Driven through
+   *  `SceneManager.loadScene` (not `loadSceneFile` directly, which is the whole point: that
+   *  guard alone cannot catch this, because `SceneManager` mutates the object before ever
+   *  calling it) for a string version, a float version and a `null` version — three shapes of
+   *  the same `unreadable` verdict (docs/format-versioning.md § 2a). */
+  it.each([
+    ['a string version', '5'],
+    ['a non-integer version', 2.5],
+    ['a null version', null],
+  ])('a scene with %s is refused through SceneManager, not laundered by Math.max', async (_label, badVersion) => {
+    defineSceneA();
+    fetchResponses['/unreadable.json'] = {
+      version: badVersion,
+      resources: [],
+      entities: [{ id: 900, traits: { Transform: { x: 99 }, EntityAttributes: { name: 'Corrupt', parentId: 0 } } }],
+    };
+    const { sceneManager } = await getSceneManager();
+
+    await sceneManager.loadScene('/sceneA.json');
+    const beforeWorld = sceneManager.getCurrent();
+    const { getCurrentWorld } = await getWorld();
+    const worldBefore = getCurrentWorld();
+
+    await expect(sceneManager.loadScene('/unreadable.json')).rejects.toThrow(/unreadable/);
+
+    expect(sceneManager.getCurrent()).toEqual(beforeWorld);
+    expect(getCurrentWorld()).toBe(worldBefore);
+    let corruptCount = 0;
+    getCurrentWorld().query(EntityAttributes).updateEach(([ea]: any[]) => { if (ea.name === 'Corrupt') corruptCount++; });
+    expect(corruptCount).toBe(0);
+
+    worldBefore.destroy();
+  });
+
   it('loads from opts.preloaded without fetching the scene path', async () => {
     const { sceneManager } = await getSceneManager();
     const { getCurrentWorld } = await getWorld();

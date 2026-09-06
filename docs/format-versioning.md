@@ -12,9 +12,11 @@ rate was never the problem — the absence of this page was.
 #767 and #778 then closed the two data-loss instances and, in doing so, found *why* the shapes kept
 diverging: the **verdict** and the **disposition** were being computed in one expression (§ 2). Both
 now come from one place — `runtime/core/formatVersion.ts` for the verdict, § 2b-bis for the choice.
-**Four documents remain unfixed** — `.particle.json`, `.atlas.json`, `.mesh.json`/`.mat.json` and the
+**Four documents were unfixed** — `.particle.json`, `.atlas.json`, `.mesh.json`/`.mat.json` and the
 profiler capture export — plus scene's disposition and prefab's recorded non-gate; they are #784, and
-they are one piece of work with one design, not one ticket each.
+they are one piece of work with one design, not one ticket each. Phase C2a (`.particle.json`,
+`.atlas.json`), C2b (`.mesh.json`, `.mat.json`) and C3 (scene's disposition, prefab's recorded
+non-gate confirmed) have landed; the profiler capture export is covered by its own row in § 3.
 
 ## 0. Three kinds of version, and they are not interchangeable
 
@@ -119,11 +121,11 @@ answers. This is the part that was never written down, which is why every site i
 | **REFUSE** | machine-generated artifacts that are a unit — sidecars, manifests, OTA releases, sub-game bundles | do not read, do not write; the bytes stay untouched |
 | **PRESERVE** | documents holding the player's own data — PlayerPrefs documents, saves, the IAP ledger | read the known fields, carry the unknown ones through, write back `max(stored, current)` |
 
-⚠️ **"Warn and load anyway" is not a third disposition — it is the absence of one**, and the scene
-loader currently does exactly that (`loadSceneFile.ts` logs that the file is newer than this engine
-supports, then loads it and lets the ladder re-stamp an absent version). It reads a document it has
-just admitted it does not understand, and then writes. Deciding scene's real disposition is part of
-the remaining work in #784, not something to infer from the current behaviour.
+⚠️ **"Warn and load anyway" is not a third disposition — it is the absence of one.** The scene
+loader used to do exactly that (`loadSceneFile` logged that the file was newer than this engine
+supported, then loaded it and let the ladder re-stamp an absent version) — it read a document it
+had just admitted it did not understand, and then wrote. **Fixed in #784 phase C3**: Scene's
+disposition is now REFUSE (§ 3's row), the same as every other machine-generated artifact.
 
 Choose by asking **what refusing costs the player.** Refusing a sidecar costs a reimport; refusing a
 save costs someone their purchases, so a save is never REFUSE. Both honour § 1's rule — REFUSE by
@@ -160,18 +162,35 @@ The corpus. A new versioned document adds a row here in the same change that int
 | `subgame.json` | `SUBGAME_MANIFEST_SCHEMA_VERSION` (`runtime/core/version.ts`) | REFUSE | ✅ | `notEvidence` |
 | `assets.manifest.json` | `ASSET_MANIFEST_VERSION` (`runtime/loaders/assetManifestVersion.ts`) | REFUSE | ✅ | `notEvidence`, checked **before** the merge |
 | OTA `manifest.json` / `release.json` | `SCHEMA_VERSION` ×2 (`runtime/ota/otaClient.ts`, `scripts/ota/schema.mjs`) | REFUSE | ✅ | refused; parity test pins the two constants |
-| Scene | `SCENE_FORMAT_VERSION` (`runtime/core/version.ts`) | ❌ **undecided (#784)** | ⚠️ advisory only | warns, then **loads anyway**; and an ABSENT version runs the whole ladder and re-stamps |
+| Scene | `SCENE_FORMAT_VERSION` (`runtime/core/version.ts`) | REFUSE | ✅ | classified at **two** sites, deliberately: in `SceneManager.loadScene`'s pre-load loop (the only production entry, and the one that must run before `collectSceneResourceRefs` — see § 4's fourth trap) and again at the top of `loadSceneFile` as the backstop for direct callers, both through the same `classifyFormatVersion` and the same `SceneFormatRefusedError` so they cannot disagree. Ahead of the migration ladder and of the two mutators (`assignSyntheticEntityIds`, `stripLegacyCameraFrameShowGizmo`) that used to run on it unconditionally — a `too-new`/`unreadable` document is now refused (throws `SceneFormatRefusedError`) before either can touch it, bytes untouched, no entities spawned. **`absent` is deliberately NOT refused** — a genuinely pre-v3 scene has no `version` key at all and still runs the whole ladder; that is § 2a's "legacy — readable" verdict, not an oversight. The throw lands in `SceneManager.loadScene`'s own failure path (release + destroy `nextWorld`, no `setCurrentWorld`), so the previously-active scene is untouched. The editor's `loadScene()` wrapper (`editor/scene/serialize.ts`) surfaces it as a distinct `'refused'` outcome — toasted (`showToast(…, 'warn')`) and logged, not folded into `'failed'`, because "check the path" is a wrong diagnosis for a right symptom — and `agentEditorOps.ts`'s `load-scene` op carries the real reason instead of guessing one (#784 phase C3) |
 | Prefab | `PREFAB_FORMAT_VERSION` (`editor/scene/prefab.ts`) | — | ⚠️ **raises only** | nothing branches — a writer-only stamp, confirmed, not a gate to be invented (#365) |
 | IAP ledger / mock store | `LEDGER_FORMAT_VERSION` / `MOCK_STORE_FORMAT_VERSION` (`runtime/iap/`) | PRESERVE | ✅ | read + bagged; `max(stored, current)` on write-back (#767) |
-| `.particle.json` | ❌ literal `1` | ❌ undecided | ❌ | **re-stamped to 1 on every load** |
-| `.atlas.json` | ❌ literal `1` | ❌ undecided | ❌ | re-stamped on every patch — and its own unknown-key preservation helper clobbers it |
-| `.mesh.json` / `.mat.json` | ❌ literal `1` | ❌ undecided | ❌ | loader's type does not declare the field |
-| Profiler capture export | ❌ literal `1` | ❌ undecided | ❌ | one-way debug export; nothing re-ingests it |
+| `.particle.json` | `PARTICLE_FORMAT_VERSION` (`runtime/particles/types.ts`) | REFUSE | ✅ | not cached (`particleCache.ts`'s permanent `failed` set), logged at **error** — a "still loading" `null` and a "refused forever" `null` are otherwise identical to every consumer. `ParticleEditor` refuses to open it, disabling editing rather than substituting `defaultParticleEffect()` and marking it the saved baseline — which was #778's mechanism on this document (phase C2a) |
+| `.atlas.json` | `ATLAS_FORMAT_VERSION` (`runtime/loaders/spriteAtlas.ts`) | REFUSE | ✅ | the panel's existing `loadState` gate, as a **distinct `'refused'` state** — same disabled editing as a load failure, different banner, because "Could not load — Retry" is a wrong diagnosis for a right symptom. `reimport-atlas.ts` throws a named verdict into the three contexts that already handle a throw (build fails red, dev repack collects a per-asset error, `modoki_import_file` returns 422). The `version: 1` that `serializeAtlasDoc`'s own unknown-key preservation was clobbering is gone (phase C2a) |
+| `.mesh.json` | `MESH_FORMAT_VERSION` (`runtime/traits/Renderable3D.ts`) | REFUSE | ✅ | not cached (`meshTemplateCache.ts`'s `MESH_FAILED`, matching the particle/atlas shape); read-before-write in `modelImport.ts` ABORTS the import via `ImportWriteAborted` rather than minting a fresh GUID over it (#784 phase C2b) |
+| `.mat.json` | `MATERIAL_FORMAT_VERSION` (`runtime/traits/Renderable3D.ts`) | REFUSE | ✅ | not built (`meshTemplateCache.ts`'s `MATERIAL_FAILED`, same fallback the "unknown material type" branch already used); read-before-write in `modelImport.ts` ABORTS rather than minting a fresh GUID. The two-writer divergence (B1) is fixed here too — `defaultMaterial()` (`runtime/assets/assetSchemas.ts`, reached by BOTH GLB import's `extractMaterialAsset` and the "Create Material" button via `defaultAssetData`) now stamps the constant from one place. The **11 pre-existing versionless `.mat.json`** (10 under `games/sling/`, 1 `demos/forest-camp/.../pond_water.mat.json`) are left untouched — they remain valid, readable documents under the `absent` verdict (§ 2a); this phase does not re-stamp them |
+| `.rig2d.json` | — no field at all | — n/a | ❌ | never had a format version; the SHAPE (`parts[]` present or not) is the v1/v2 discriminator, and code never reads/writes a `version` key. The schema row that advertised one was an unread authoring surface — removed here (#784) |
+| Profiler capture export | — dropped in this change (#784) | — n/a (pure sink) | n/a | one-way debug export; nothing re-ingests it, so a version here would guard nothing (§ 1) |
 
 **Not in this family, despite the name.** `Skin2DBuffer.version` is an in-memory GPU-upload dirty
 counter, never serialized (see the warning below). `sync/decide.ts`'s `version` is a **data-identity**
 version — a compare-and-swap revision, § 0's middle row — not a format version. Both are excluded
 from the § 4 guard by name, with those reasons.
+
+† **`.particle.json` had two more sites assuming the constant stays `1`; phase C2a moved both.**
+`assetSchemas.ts`'s `validateAssetData` warns `'particle.version should be 1'` on `obj.version !==
+1` — a `!==`, so it flags a legitimately NEWER document exactly as loudly as an older one, violating
+§ 2a's strictly-greater rule (it is advisory only, so nothing is refused, but it will warn on every
+particle document written the moment the constant moves past `1`). `PARTICLE_FIELDS` declares the
+field itself as `{ key: 'version', type: 'number', default: 1, note: 'always 1' }` — the note tells
+an authoring agent the field is meaningless, and `default: 1` marks it a strip candidate the moment
+someone reads § "Author values in the SCENE and the PREFAB". **Both had to move in the same change
+as the constant** — landing `PARTICLE_FORMAT_VERSION` without them would have shipped a constant
+beside two committed statements that it is wrong. The check now routes through
+`classifyFormatVersion` and warns only on `too-new`; the field's row no longer claims "always 1"
+and no longer carries a `default`. Kept as a footnote because the *shape* recurs: a schema note or
+an advisory validator is a second, quieter copy of the constant, and neither is where anyone looks
+when bumping one.
 
 The unfixed rows are tracked as **one piece of work with one design, not one ticket each** — #784.
 If that work gets split, split it by RISK, never by document.
@@ -207,6 +226,32 @@ content. **A recovery step has to ask what the file IDENTIFIES, not only what it
 `salvageSidecarId` now reads the `id` textually out of the damaged bytes (a merge conflict wraps
 only the conflicting hunk, so that line is nearly always intact) and refuses to guess when the id
 itself conflicts.
+
+**A fourth trap, for the corpus inversion planned in #784 item 2 (making § 3's table itself a
+derivable source of truth): don't turn a constant into a registry lookup without moving the guard
+that pattern-matches its literal.** `prefabFormatVersionLiteral.test.ts` (landed on `origin/main`)
+keeps `PREFAB_FORMAT_VERSION` in sync with a deliberate numeric literal in the Playwright spec
+`editor-hierarchy.spec.ts` — the two drifted 2 → 3 and only the free public e2e runner caught it,
+since e2e isn't in `npm run verify`. It locates the constant with `PREFAB_FORMAT_VERSION\s*=\s*(\d+)`;
+a refactor to `export const PREFAB_FORMAT_VERSION = FORMAT_VERSIONS.prefab` no longer matches. Credit
+where due: that guard asserts its match exists before comparing, so a broken anchor fails loudly by
+name rather than passing vacuously — § 4's own "anchor" lesson, applied correctly.
+
+**A fifth trap, and it defeated this family's own guard once: a classifier is only as good as
+everything UPSTREAM of it.** C3 put the scene verdict at the top of `loadSceneFile`, argued in its
+own comment that this was the single entry every path funnels through, and shipped green — but
+`SceneManager.collectSceneResourceRefs` ends with `sceneData.version = Math.max(sceneData.version ??
+6, 6)` and runs *earlier*, on the same object. `Math.max` numerically coerces, so `"5"`, `"13"`,
+`2.5` and `null` all reached the guard as a clean `ok`: the entire `unreadable` half of the
+disposition was dead in production, while a unit test calling `loadSceneFile` directly proved it
+worked. **Ask what mutates the document between the bytes and your verdict** — and prefer to
+classify where the bytes are first parsed, not where they are first used. The test that would have
+caught it is the one driven through the real caller; the one that did not is the one that called
+the classified function directly.
+
+⚠️ Related, still unfixed and filed separately: that same `Math.max` also RAISES an older numeric
+version to 6, so a genuine v3 scene is stamped 6 and skips the v3→v6 rungs entirely. Latent only
+because the committed corpus bottoms out at v9.
 
 ⚠️ **And a non-trap, recorded because it was written down as fact first.** That fix also claimed
 the quarantine file would be scanned as an asset unless its suffix was explicitly skipped, reasoning

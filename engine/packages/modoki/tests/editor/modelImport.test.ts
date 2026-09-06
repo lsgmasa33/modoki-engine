@@ -117,6 +117,10 @@ vi.mock('../../src/runtime/traits', () => {
     Transform: transformFn,
     EntityAttributes: eaFn,
     ModelSource: msFn,
+    // #784 phase C2b: modelImport.ts stamps these onto every mesh/material asset it writes. A
+    // mocked module with no export would silently hand back `undefined`, which JSON.stringify
+    // then drops — masking the constant entirely rather than exercising it.
+    MESH_FORMAT_VERSION: 1, MATERIAL_FORMAT_VERSION: 1,
   };
 });
 

@@ -323,6 +323,21 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     expect(load).toHaveBeenCalledTimes(2);
   });
 
+  /** #784 phase C adversarial review, finding 5. `tryLoad`'s synthesized 'failed' (when
+   *  `deps.load` throws — this test's `HTML_ERR` case) does NOT set `_lastLoadFailureMessage`;
+   *  `getLastSceneLoadFailureMessage`'s docblock in `serialize.ts` now names this as a
+   *  deliberate exception to its "set alongside a 'failed'/'refused' outcome" invariant rather
+   *  than claiming a total guarantee it doesn't keep. Pin the getter as UNTOUCHED by this path so
+   *  a future change that starts writing to it here (without updating the doc) is caught. */
+  it('does not touch getLastSceneLoadFailureMessage when a candidate throws (finding 5)', async () => {
+    const { getLastSceneLoadFailureMessage } = await import('../../src/editor/scene/serialize');
+    const before = getLastSceneLoadFailureMessage();
+    const canonicalize = vi.fn(async (p: string) => p);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => { throw HTML_ERR; });
+    await loadFirstScene([BUNDLE, CANON], { canonicalize, load });
+    expect(getLastSceneLoadFailureMessage()).toBe(before);
+  });
+
   /** #91 — a boot that RECOVERS on a later candidate must leave no console.error behind.
    *  `smoke-packaged.sh` and `assert-app-renders.sh` both fail on ANY renderer console error,
    *  so a stale remembered scene path could fail a packaging gate for a reason that has

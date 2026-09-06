@@ -119,10 +119,12 @@ import {
   loadSceneFile,
   collectResourceRefsFromEntities,
   instantiatePrefabIntoWorld,
+  SceneFormatRefusedError,
   type SceneData,
   type SceneResourceRef,
   type SceneEntityEntry,
 } from '../loaders/loadSceneFile';
+import { classifyFormatVersion } from '../core/formatVersion';
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
@@ -610,6 +612,33 @@ class SceneManagerImpl implements SceneManager {
       const preparedSceneData = new Map<string, SceneData>();
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
+        // Classify HERE, before `collectSceneResourceRefs` — its own tail
+        // (`sceneData.version = Math.max(sceneData.version ?? 6, 6)`) numerically
+        // coerces the raw version (a string like "5", a float, `null`) into a valid
+        // number, so by the time `loadSceneFile`'s own guard runs (further below,
+        // on the ALREADY-mutated object) a too-new/unreadable scene has already been
+        // laundered into `ok`. `SceneManager` is the only non-test caller of
+        // `loadSceneFile`, so without this the `unreadable` half of the guard is
+        // dead in production (#784 phase C adversarial review, finding 1).
+        // `loadSceneFile`'s own classification stays in place as the backstop for
+        // every other caller (tests, tools, future direct callers) — both route
+        // through the same `classifyFormatVersion` and the same
+        // `SceneFormatRefusedError`, so the two sites cannot disagree on the verdict.
+        const verdict = classifyFormatVersion(sceneData, SCENE_FORMAT_VERSION);
+        if (verdict.kind === 'too-new') {
+          throw new SceneFormatRefusedError(
+            `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
+            `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
+            'too-new',
+          );
+        }
+        if (verdict.kind === 'unreadable') {
+          throw new SceneFormatRefusedError(
+            `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
+            `The file may be corrupt or hand-edited incorrectly.`,
+            'unreadable',
+          );
+        }
         const sid = sceneIdByPath.get(ref.path)!;
         const refs = await bootSpanAsync(
           'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller, enteredGeneration), ref.path);
@@ -1293,6 +1322,14 @@ class SceneManagerImpl implements SceneManager {
     // Persist the merged manifest back onto the scene data so downstream code
     // (the respawn call above, telemetry) sees the full picture.
     sceneData.resources = allRefs;
+    // ⚠️ This numerically COERCES a non-numeric `version` (a string, a float, `null`)
+    // into a valid number, and RAISES an older numeric one to 6 — either would launder
+    // a too-new/unreadable scene into `ok` for any classifier running after this point.
+    // That is why scene format classification happens in `loadScene`'s caller loop
+    // (above, before this method is ever invoked), not here or downstream of here.
+    // Left as-is rather than fixed in this pass: raising an older version also skips
+    // the v3→v6 migration rungs for a genuinely old scene — a separate pre-existing
+    // defect, filed rather than folded into an unreviewed change here.
     sceneData.version = Math.max(sceneData.version ?? 6, 6);
     return allRefs;
   }

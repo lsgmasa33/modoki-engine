@@ -97,9 +97,14 @@ export interface PrefabFile {
    *
    *  v1, v2 and v3 all share the same shape (the nested-instance fields are optional, and v3
    *  only drops a trait FIELD, not a structural shape), so an older file still loads unchanged
-   *  and nothing on the loading path inspects this at all (#365). `1`/`2` survive in the type
-   *  for documents written before #379/this change that nobody has re-saved. */
-  version: 1 | 2 | 3;
+   *  and nothing on the loading path inspects this at all (#365). Documents written before
+   *  #379/this change and never re-saved still carry a `1` or `2` on disk; they load fine, and
+   *  this field reports what wrote them, not what this build would write.
+   *
+   *  Widened from `1 | 2 | 3` to `number` (#784) — this is a read-back document (bytes may
+   *  come from a newer build than this one understands), and the literal union made
+   *  `existing.version` at a v4+ document lie about its own type (#734 precedent). */
+  version: number;
   name: string;
   rootLocalId: number;
   entities: PrefabEntity[];
@@ -459,7 +464,10 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     // migration re-applies (idempotently) the next time anything loads it. A hypothetical v4
     // that changes SHAPE (not just drops a field) would not get this same free pass and would
     // need its own decision here.
-    version: Math.max(PREFAB_FORMAT_VERSION, existing.version) as 1 | 2 | 3,
+    // `preservedVersion()` (runtime/core/formatVersion.ts) is the shared form of this exact
+    // rule, but routing prefab through it needs a verdict computed first — that's #784 phase
+    // C3, not this change.
+    version: Math.max(PREFAB_FORMAT_VERSION, existing.version),
     name: fresh.name,
     rootLocalId: fresh.rootLocalId,
     entities: [...mergedSkeleton, ...mergedUser],
