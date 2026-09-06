@@ -12,7 +12,7 @@
  *  per-game boot effect). */
 
 import { Capacitor } from '@capacitor/core';
-import { ENGINE_API_VERSION, loadManifestJson, type AssetManifestFile, type GameDefinition } from '@modoki/engine/runtime';
+import { ENGINE_API_VERSION, SUBGAME_MANIFEST_SCHEMA_VERSION, loadManifestJson, ASSET_MANIFEST_VERSION, type AssetManifestFile, type GameDefinition } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import { checkAppSubgameUpdates, isPluginUnimplemented } from './ota';
 import { registerDynamicGame, getGames } from './gameRegistry';
@@ -106,9 +106,22 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
     return 'fatal';
   }
 
-  // Belt-and-suspenders check #1: the build-stamped manifest field. Checked BEFORE
-  // evaluating the bundle at all — no reason to even load a script we already know is
-  // incompatible.
+  // Checked BEFORE engineApi and every other field: `schema` says how this document is
+  // LAID OUT, so a bump can change what the other fields mean — reading them first would
+  // be interpreting a shape we have already been told we do not know.
+  // 'notEvidence', for the same reason as the engineApi mismatch below: the bundle is
+  // well-formed, it is THIS shell that cannot read it. Quarantining would outlive the app
+  // binary (`rejected` survives resetForNewBinary) and permanently block a version the next
+  // engine upgrade would load perfectly.
+  if (typeof manifest.schema === 'number' && manifest.schema > SUBGAME_MANIFEST_SCHEMA_VERSION) {
+    reportError(bundle.name, bundle.version, `subgame.json schema ${manifest.schema} is newer than this shell supports (${SUBGAME_MANIFEST_SCHEMA_VERSION})`);
+    return 'notEvidence';
+  }
+
+  // Belt-and-suspenders check #1 (the pair is `engineApi`, specifically — not `subgame.json`
+  // as a whole; `schema` above is a separate, earlier format gate): the build-stamped manifest
+  // field. Checked BEFORE evaluating the bundle at all — no reason to even load a script we
+  // already know is incompatible.
   if (manifest.engineApi !== ENGINE_API_VERSION) {
     // 'notEvidence', NOT 'fatal': this bundle is fine, it just does not match THIS engine.
     // Quarantining it would outlive the app binary (`rejected` survives resetForNewBinary)
@@ -220,13 +233,31 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
     reportError(bundle.name, bundle.version, `assets.manifest.json fetch failed (${manifestRes.status})`);
     return 'fatal';
   }
+  let fragment: AssetManifestFile;
   try {
-    const fragment: AssetManifestFile = await manifestRes.json();
+    fragment = await manifestRes.json();
+  } catch (e) {
+    // Unparseable: the published bytes are broken. This is #540's case and the one
+    // device-verified as fatal.
+    reportError(bundle.name, bundle.version, `assets.manifest.json parse threw: ${e}`);
+    return 'fatal';
+  }
+  // A SEPARATE arm from the fatal parse/merge failures above and below. A missing or
+  // unparseable manifest is a broken bundle (fatal); a manifest we can parse but whose
+  // FORMAT is newer than us is a host limitation — same class as the engineApi mismatch,
+  // so 'notEvidence'. Folding it into the fatal arm would quarantine on exactly the case
+  // this gate exists to survive. Checked BEFORE loadManifestJson because the merge has no
+  // undo (see the registerDynamicGame note below).
+  if (typeof fragment.version === 'number' && fragment.version > ASSET_MANIFEST_VERSION) {
+    reportError(bundle.name, bundle.version, `assets.manifest.json version ${fragment.version} is newer than this shell supports (${ASSET_MANIFEST_VERSION})`);
+    return 'notEvidence';
+  }
+  try {
     loadManifestJson(fragment, { pathPrefix: baseUrl });
   } catch (e) {
-    // Unparseable, or a merge that threw: the published bytes are broken. This is #540's case
-    // and the one device-verified as fatal.
-    reportError(bundle.name, bundle.version, `assets.manifest.json parse threw: ${e}`);
+    // A merge that threw: the published bytes are broken. This is #540's case and the one
+    // device-verified as fatal.
+    reportError(bundle.name, bundle.version, `assets.manifest.json merge threw: ${e}`);
     return 'fatal';
   }
 

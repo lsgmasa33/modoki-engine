@@ -1943,17 +1943,19 @@ export function disposeRetiredEnvironment(tex: THREE.DataTexture): void {
   tex.dispose();
 }
 
-// ── Environment PMREM disposal hook (#739; indirection for #214) ─────────────────────────
+// ── Environment derived-texture disposal hook (#739/#775/#779; indirection for #214) ─────
 //
-// The actual PMREM generation/cache/disposal (`getEnvPMREMTexture`, `sourceForEnvPMREM`,
-// `disposeEnvPMREMFor`) lives in `../rendering/envPmrem.ts` now, not here — it needs
+// The actual generation/cache/disposal of the derived environment textures — the PMREM and the
+// cube (`getEnvPMREMTexture`, `getEnvCubeTexture`, `sourceForEnvDerived`, `disposeEnvDerivedFor`)
+// — lives in `../rendering/envPmrem.ts`, not here: it needs
 // `PMREMGenerator` from `three/webgpu`, and `runtime/loaders/**` (this file) is reachable from the
 // 2D boot path, so importing that value HERE would ship the whole Three node pipeline into a
 // `render3d:false` 2D-only build (`tests/runtime/render3dBoundary.test.ts`, #214).
 //
-// But this cache must still ensure a PMREM dies with its source, without importing anything
-// three/webgpu-shaped itself. So instead of calling `disposeEnvPMREMFor` directly, it fans out to
-// a registry that `envPmrem.ts` populates at module scope (`registerEnvDisposeHook(disposeEnvPMREMFor)`)
+// But this cache must still ensure a derived texture dies with its source, without importing
+// anything three/webgpu-shaped itself. So instead of calling `disposeEnvDerivedFor` directly, it
+// fans out to a registry `envPmrem.ts` populates at module scope
+// (`registerEnvDisposeHook('envPmrem', disposeEnvDerivedFor)`)
 // — only when something ELSE (a 3D render surface) has already pulled that module in. A 2D-only
 // build never imports `envPmrem.ts`, so this set stays empty and the hook fan-out below is a no-op,
 // with nothing three-shaped ever reaching this file. ⚠️ Do not "simplify" this back into a direct

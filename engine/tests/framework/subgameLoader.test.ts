@@ -453,6 +453,102 @@ describe('subgameLoader — versioned promotion + the load-failure watchdog (#55
     __resetGameRegistryForTest();
   });
 
+  /** #730 §2 — `subgame.json.schema` was written but never compared. A schema NEWER than
+   *  this shell supports means the FILE FORMAT changed, not the engine API — same
+   *  'notEvidence' reasoning as the engineApi mismatch above, and checked first because a
+   *  schema bump can change what every other field means. */
+  it('a subgame.json schema newer than this shell returns notEvidence, never quarantined', async () => {
+    mockBundleEnv({
+      '/bundle-a': {
+        manifest: { schema: 2, engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a', scriptDelayMs: 0, assetsManifest: {},
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    expect(h.reportBundleLoadFailure).toHaveBeenCalledWith({ name: 'bundle-a', version: 'v1', disposition: 'notEvidence' });
+    expect(getGames()).toEqual([]); // never loaded — the shell doesn't trust its own read of the fields
+    __resetGameRegistryForTest();
+  });
+
+  it('an absent or older subgame.json schema still loads normally', async () => {
+    mockBundleEnv({
+      '/bundle-a': {
+        // no `schema` field at all — an older build that predates SUBGAME_MANIFEST_SCHEMA_VERSION
+        manifest: { engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a', scriptDelayMs: 0, assetsManifest: {},
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    expect(h.reportBundleLoadFailure).not.toHaveBeenCalled();
+    expect(getGames().map((g) => g.id)).toEqual(['game-a']);
+    __resetGameRegistryForTest();
+  });
+
+  it('an explicit OLDER subgame.json schema (0, below SUBGAME_MANIFEST_SCHEMA_VERSION) still loads normally', async () => {
+    mockBundleEnv({
+      '/bundle-a': {
+        // schema present but strictly below the gate — only schema > SUBGAME_MANIFEST_SCHEMA_VERSION refuses.
+        manifest: { schema: 0, engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a', scriptDelayMs: 0, assetsManifest: {},
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    expect(h.reportBundleLoadFailure).not.toHaveBeenCalled();
+    expect(getGames().map((g) => g.id)).toEqual(['game-a']);
+    __resetGameRegistryForTest();
+  });
+
+  /** #730 §3 — `assets.manifest.json.version` was written but never compared. A merge has
+   *  no undo, so a too-new fragment must be refused BEFORE `loadManifestJson` runs, not
+   *  merely reported afterward. */
+  it('an assets.manifest.json version newer than this shell returns notEvidence and merges nothing', async () => {
+    mockBundleEnv({
+      '/bundle-a': {
+        manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a', scriptDelayMs: 0,
+        assetsManifest: { version: 3, assets: [{ id: 'should-never-merge', path: 'x.png' }] },
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    const { loadManifestJson } = await import('@modoki/engine/runtime');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    // Separate-arm assertion: a too-new manifest is 'notEvidence', never 'fatal' — folding
+    // it into the parse/merge-failure arm would quarantine on exactly the case this gate
+    // exists to survive.
+    expect(h.reportBundleLoadFailure).toHaveBeenCalledWith({ name: 'bundle-a', version: 'v1', disposition: 'notEvidence' });
+    // The merge has no undo — this is the assertion that matters, not the disposition alone.
+    expect(loadManifestJson).not.toHaveBeenCalled();
+    expect(getGames()).toEqual([]);
+    __resetGameRegistryForTest();
+  });
+
   it('reports a failed shared-dependency fetch as transient — it may simply not recur', async () => {
     h.ensure.mockRejectedValueOnce(new Error('network down'));
     mockBundleEnv({

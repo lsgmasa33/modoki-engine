@@ -76,6 +76,21 @@ export interface ChromeUIPatch {
    */
   pointerThrough?: boolean;
   /**
+   * The element's own rotation, in degrees.
+   *
+   * Earns a slot by the same test `pointerThrough` does, one field up: a game genuinely drives it
+   * per frame, and unlike a colour or a size it CANNOT be authored — an animation angle is not a
+   * value the scene can hold, because there is no single value to hold. Court's login-bonus wheel
+   * (#372) spins a disc through it and counter-rotates the labels riding on that disc so their text
+   * stays upright.
+   *
+   * ⚠️ Rotation is the ONE patchable field whose sensible resting value is not the trait default
+   * for every consumer — a disc left mid-spin stays where it stopped, deliberately, so the next
+   * spin starts from there rather than snapping back to 0. Do not "reset" it in a teardown without
+   * asking whether the caller wants continuity.
+   */
+  rotation?: number;
+  /**
    * ⚠️ **`swallowClicks` is deliberately NOT here, and that asymmetry with `pointerThrough` above
    * is a decision, not an oversight** (#728). A swallow is a property of what a panel IS — a
    * dialog body is never sometimes-a-dialog-body — so it is authored in the scene and read from

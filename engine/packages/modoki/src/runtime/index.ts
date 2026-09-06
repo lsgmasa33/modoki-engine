@@ -6,7 +6,7 @@ import './core/instanceGuard';
 // Side-effect only — wires every core/providerSlot.ts seam (P7 C8+). See its own header.
 import './loaders/registerProviders';
 
-export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core/version';
+export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION, SUBGAME_MANIFEST_SCHEMA_VERSION } from './core/version';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
@@ -422,7 +422,7 @@ export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type 
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
-  clearManifest, getAllAssets, resolveSceneByName,
+  clearManifest, getAllAssets, resolveSceneByName, ASSET_MANIFEST_VERSION,
   type AssetType, type AssetEntry, type AssetManifestEntry, type AssetManifestFile, type BinaryAssetMeta,
   type AudioImportSettings,
 } from './loaders/assetManifest';

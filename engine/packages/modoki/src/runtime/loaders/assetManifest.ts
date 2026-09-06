@@ -21,6 +21,7 @@
  */
 
 import { assetUrl } from './assetUrl';
+import { ASSET_MANIFEST_VERSION } from './assetManifestVersion';
 import { markUIDirty } from '../core/uiDirty';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
@@ -159,12 +160,20 @@ export interface AssetManifestFile {
   assets: AssetManifestEntry[];
 }
 
+// Re-exported from its own zero-import file — see assetManifestVersion.ts's header for why
+// this constant can't simply live here: this module transitively imports assetFetch.ts/
+// assetUrl.ts (browser-only globals), and vite-asset-scanner.ts (a Node-context Vite plugin)
+// needs the version number without dragging that graph into its Node-lib typecheck.
+export { ASSET_MANIFEST_VERSION };
+
 /** Sidecar `.meta.json` written next to binary assets (.glb, .hdr, .png/.jpg).
  *  Carries the stable UUID plus importer state (e.g., the list of derived
  *  files produced from a GLB so they can be cleaned up on delete). */
 export interface BinaryAssetMeta {
   id: string;
-  version: 2;
+  /** Format version of the sidecar document itself — owned and stamped by
+   *  `writeMetaSidecar` (see `SIDECAR_FORMAT_VERSION` in meta-sidecar.ts). */
+  version: number;
   /** Importer/loader ID (e.g., 'island', 'default'). Optional — only models have one. */
   loader?: string;
   /** Files produced from this binary by the importer — used for cleanup. */
@@ -701,7 +710,7 @@ export function serializeManifest(): AssetManifestFile {
       environment: entry.environment,
     });
   }
-  return { version: 2, assets };
+  return { version: ASSET_MANIFEST_VERSION, assets };
 }
 
 /** Clear the manifest. Used in tests + when reloading. */

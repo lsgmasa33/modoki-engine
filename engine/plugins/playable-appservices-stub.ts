@@ -27,6 +27,12 @@ export function startInstallMilestones(): void {}
  *  implementation off-hydration) and `markForwardedOnce` is a no-op. */
 export function hasForwardedOnce(_name: string): boolean { return true; }
 export function markForwardedOnce(_name: string): void {}
+/** #372 — the install stamp Court's welcome-back spin measures against. `null` is the real
+ *  implementation's "cannot find out", and it is the RIGHT answer here rather than a convenient
+ *  zero: an ad creative has no install record at all, and returning 0 would read as "installed at
+ *  the epoch", making every since-install reward instantly due inside a playable. The caller
+ *  already refuses on null. */
+export function installFirstOpenAt(): number | null { return null; }
 
 /** Crash reporting — a no-op for the same reason. An ad creative has no Firebase app, and the
  *  Crashlytics SDK behind the real wrapper is byte weight the cap cannot afford. Exported as a

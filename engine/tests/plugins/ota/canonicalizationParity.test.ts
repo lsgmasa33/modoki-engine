@@ -27,11 +27,17 @@ import { createHash } from 'node:crypto';
 import {
   manifestHashPayload as manifestHashPayloadJs,
   signingPayload as signingPayloadJs,
+  SCHEMA_VERSION as SCHEMA_VERSION_JS,
+  validateManifest as validateManifestJs,
+  validateRelease as validateReleaseJs,
 } from '../../../scripts/ota/schema.mjs';
 import {
   manifestHashPayload as manifestHashPayloadTs,
   signingPayload as signingPayloadTs,
   sha256Hex,
+  SCHEMA_VERSION as SCHEMA_VERSION_TS,
+  validateManifest as validateManifestTs,
+  validateRelease as validateReleaseTs,
   type OtaManifest,
   type OtaRelease,
 } from '../../../packages/modoki/src/runtime/ota/otaClient';
@@ -273,4 +279,45 @@ describe('OTA canonicalization parity: the hash-chain joint (Node createHash vs 
     const payload = manifestHashPayloadJs(manifest);
     expect(sha256Hex(payload)).toBe(nodeSha256Hex(payload));
   });
+});
+
+/** #629 — `SCHEMA_VERSION` lives as two separately-bumped constants (one per
+ *  implementation, same "keep in sync" reasoning as the canonicalization functions above:
+ *  `otaClient.ts` ships in `@modoki/engine` and must not reach outside its own `src/` into
+ *  `engine/scripts/`, a Node-only dev-tooling dir). Prose ("KEEP IN SYNC with...") kept
+ *  these in agreement until now — nothing re-checked it on an edit. This converts that
+ *  banner into a mechanism: a value bump on one side with none on the other fails HERE,
+ *  not in the field as every device's manifest/release getting refused as `schema` mismatch. */
+describe('OTA schema-version + validator gate parity (#629)', () => {
+  it('SCHEMA_VERSION agrees between the two implementations', () => {
+    expect(SCHEMA_VERSION_JS).toBe(SCHEMA_VERSION_TS);
+  });
+
+  it.each([SCHEMA_VERSION_TS - 1, SCHEMA_VERSION_TS, SCHEMA_VERSION_TS + 1])(
+    'validateManifest and validateRelease AGREE on acceptance at schema %d',
+    (schema) => {
+      const manifest = {
+        schema,
+        name: 'shell',
+        version: 'v1',
+        engineApi: 1,
+        files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      };
+      const release = {
+        schema,
+        bundles: { shell: 'v1' },
+        mandatory: false,
+        minEngineApi: 1,
+        sig: 'x'.repeat(16),
+      };
+
+      const manifestAcceptedJs = validateManifestJs(manifest).length === 0;
+      const manifestAcceptedTs = validateManifestTs(manifest).length === 0;
+      expect(manifestAcceptedTs).toBe(manifestAcceptedJs);
+
+      const releaseAcceptedJs = validateReleaseJs(release).length === 0;
+      const releaseAcceptedTs = validateReleaseTs(release).length === 0;
+      expect(releaseAcceptedTs).toBe(releaseAcceptedJs);
+    },
+  );
 });

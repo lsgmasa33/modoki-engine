@@ -44,3 +44,9 @@ export const SCENE_FORMAT_VERSION = 13;
 // `project.config.json`'s `ota.engineApi` (a separate, per-build-artifact field) must equal
 // this constant; bump both together when the runtime surface a sub-game depends on changes.
 export const ENGINE_API_VERSION = 1;
+
+/** FORMAT version of a sub-game's `subgame.json` document — how the file is laid out.
+ *  Distinct from ENGINE_API_VERSION, which is a COMPATIBILITY version (what the bundle
+ *  needs from the host). Checked by subgameLoader BEFORE any other manifest field,
+ *  because a schema bump can change what those fields mean. */
+export const SUBGAME_MANIFEST_SCHEMA_VERSION = 1;

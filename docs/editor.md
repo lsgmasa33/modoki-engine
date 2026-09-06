@@ -809,6 +809,23 @@ Panels live in `editor/panels/`:
   unmount. It reloads on a re-import off the invalidation epoch — see "The asset Inspector"
   below, rule 3.
 
+**The two standalone `WebGLRenderer`s must call `forceContextLoss()`** (#776).
+`ModelPreview` and `previewScene` are the only editor surfaces that build a renderer directly
+rather than through `makeWebGPURenderer` — and `WebGLRenderer.dispose()` frees programs and render
+targets but does **not** release the underlying GL context; the browser reclaims it whenever it
+feels like it. Both panels mount per asset click, and `ModelPreview`'s effect re-runs on `[hasLods]`
+as well, so without the explicit call the live-context count climbs to the browser's ~16 cap and
+"too many active WebGL contexts" blacks out the previews **and** the main SceneView. `previewScene`
+had the call from the start; `ModelPreview` shipped without it for months, because the seam was
+documented in two places (`gpuContextTracking.ts`'s header and `previewScene`'s own comment) and
+guarded in none. It is guarded now, on comment-stripped source, by
+`tests/architecture/glContextRelease.test.ts`. Both panels place the call just before `dispose()`,
+but that ordering is convention, not a requirement — `dispose()` never touches the extensions
+closure or `_gl`, so either order releases the context. The guard therefore checks that the call
+exists, not where it sits. ⚠️ This does **not** apply to `WebGPURenderer`, which
+has no such API — `makeWebGPURenderer` wraps its `dispose` instead, so every downstream disposer is
+correct for free.
+
 Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 `ProjectSettingsDialog`, and the import/build progress modals. Each panel is wrapped in a
 `PanelErrorBoundary` so one panel crashing doesn't take down the editor.
@@ -1694,6 +1711,56 @@ is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.
 > `engine/tests/editor/metaMergeNotClobber.test.ts` encodes exactly that rule. Found by the
 > close-out sweep of the 9-slice work, not by a report — the post succeeds, the UI updates, and
 > the damage sits in a file nobody re-reads until much later.
+
+> **`version` is the sidecar's FORMAT version, and `writeMetaSidecar` owns it — writers must not
+> supply one** (#734). The pattern every versioned document in the repo follows, and the decision
+> table it belongs to, is [format-versioning.md](./format-versioning.md). It says how the `.meta.json` document is laid out, not anything about the
+> asset it describes. Every write THROUGH `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION`
+> (`plugins/meta-sidecar.ts`), so a caller that passes `version` is ignored; a caller that omits it
+> is correct.
+>
+> ⚠️ **`writeAssetGuid` is not the only writer outside `writeMetaSidecar`** — the complete list of
+> four is `writeAssetGuid` (writes via `vite-asset-scanner.ts`'s own `writeJsonAtomic`), the two
+> `.meta.json` generator scripts (`gen-white-hdr.mjs`, `gen-skinned-test-models.mjs`), and
+> `tools-scratch/spine-import.mjs`. None of them inherit `writeMetaSidecar`'s stamp or its refusal
+> automatically. **Calling
+> `assertSidecarWritable` alone is NOT sufficient** — a writer that refuses but never stamps
+> `SIDECAR_FORMAT_VERSION` still leaves an unstamped document behind, which is the same downgrade
+> risk (#734) wearing a different face. The actual rule for a writer outside `writeMetaSidecar`:
+> it must BOTH stamp `SIDECAR_FORMAT_VERSION` and, if it can overwrite an existing sidecar, call
+> `assertSidecarWritable` (or an equivalent refusal) first. Every known sidecar writer overwrites
+> an EXISTING file — `gen-white-hdr.mjs` and `gen-skinned-test-models.mjs` both rewrite a tracked
+> `.meta.json` on every run (reading the old one first to preserve `id`) — so all of them owe both
+> halves.
+>
+> It was written by 14 sites and **read by nothing** until #734, and ten of those sites stamped a
+> literal `2` over whatever was already on disk — so a sidecar written by a build with a newer
+> format was silently downgraded in place. That is not hypothetical: the postprocessor incident
+> above downgraded `version` 2 → 1 alongside the GUID loss. The stakes are the sidecar's contents —
+> the stable GUID every scene and mesh ref resolves through, the Texture-Inspector import settings,
+> and the Sprite Editor's hand-drawn slices with their own per-slice GUIDs. **None of it is
+> regenerable**, so "just reimport it" was never a recovery story: a reimport regenerates the files
+> listed under `generated`, not the authored state beside them.
+>
+> ⚠️ **A too-new sidecar makes the write REFUSE, loudly.** `writeMetaSidecar` throws when the
+> on-disk `version` is strictly greater than this build's, writing neither the committed sidecar nor
+> `.meta.local.json`; `/api/write-meta` surfaces that as a 500 carrying the message.
+> `assertSidecarWritable` is the same check exported for callers that want to fail before doing
+> work — `/api/reimport` calls it per asset, INSIDE that asset's own try/catch, so a refusal on one
+> asset is recorded into `summary.errors` and the loop CONTINUES to the next asset; the route still
+> rebuilds the manifest and sends `invalidate-assets` afterward. **Deliberately not [PlayerPrefs' shape](./player-prefs.md)**:
+> that one warns and silently does nothing, which is right for a save read at boot with nobody
+> watching, and wrong for an action a human just triggered in the editor and is waiting on. The cost
+> is accepted — on a branch older than the format bump you cannot reimport that asset until you
+> merge.
+>
+> ⚠️ **The `version: 2` literals still in the seven panel writers are INERT BUT LOAD-BEARING — do
+> not tidy them away.** They no longer affect what is written (the server stamps it), so they read
+> as dead weight. But `tests/editor/metaMergeNotClobber.test.ts` finds a meta-write literal by
+> searching for `version:\s*\d`, so they are that detector's anchor: strip them and every one of its
+> per-file assertions matches an empty set and passes **vacuously**. A liveness test in that file
+> turns the cleanup red rather than silently green; if you genuinely need them gone, re-anchor the
+> detector on the `writeMetaOrWarn(` / `'/api/write-meta'` call instead of deleting the test.
 
 ### SpriteAnim Editor
 

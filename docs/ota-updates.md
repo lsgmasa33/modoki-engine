@@ -108,6 +108,53 @@ version would make every already-shipped client reject every future release, per
 additive-compat reasoning as `manifest.bundleZip`.) An attacker cannot simply *strip* the field —
 `release.json` is signed, so removing it invalidates the signature.
 
+**Identity binding (#629) closes MISROUTE — the case the optional hash cannot cover.** The client
+fetches `bundles/<name>/<version>/manifest.json`, and until #629 nothing checked that the manifest
+it got back *named that bundle and that version*. `manifest.name` and `manifest.version` were
+shape-checked as non-empty strings by both validators and never compared to what was requested, so
+serving bundle **B**'s perfectly well-formed manifest under bundle **A**'s path was undetected:
+`files` came from B's manifest, native verified the staged tree against B's own hashes and
+succeeded, and A activated holding B's bytes.
+
+The `manifests[<name>]` hash above would catch that — but it is **optional and often absent**, and
+this document already says where: coverage *"starts empty"*, and a publisher older than #570
+*"disarms the guard for EVERY bundle in one publish"*. That is exactly the window where `name` and
+`version` are the only identity signal there is. So the check runs **before** the hash block rather
+than after it, and fires whether or not coverage exists. ⚠️ It matters more on the **delta** path,
+where the NETWORK-fetched base manifest is deliberately hash-unverified by design — there
+`name`/`version` are the *only* signal, full stop; a mismatch falls back to the whole-zip download
+via `onDeltaFallback` rather than failing the update, since a bad delta base is an optimization loss.
+
+⚠️ **The EMBEDDED base manifest is deliberately exempt from that check, and the exemption is
+load-bearing.** `ota-embedded-manifest.json` ships inside the app and is read from local storage, not
+fetched from the bucket, so it cannot be misrouted — the check buys nothing there. It also cannot
+pass: `ota-embed-manifest.mjs` stamps that manifest with the SHELL's `ota.bundleName`, while sub-game
+checks are driven with names taken from `release.bundles` minus the shell's, so `name` never matches
+for a sub-game by construction. Applying the check there fired a false "identity mismatch" on a
+healthy CDN and silently disabled delta staging for **every** sub-game's first stage. Caught in
+review before it shipped; if skipping the shell's dist as a sub-game delta base is ever wanted, it
+has to be that decision explicitly, not a bogus diagnostic in the field logs.
+
+⚠️ **This is a DATA-identity check, not a format one, and that decides its disposition** — the three
+kinds and the repo-wide decision table are in [format-versioning.md](./format-versioning.md). A too-new
+`schema` means the bundle is fine and this shell cannot read it — about the HOST, so it is
+`notEvidence` and never quarantines ([sub-game modules](./ota-subgame-modules.md) § Dispositions).
+A name/version mismatch is *not* about the host: it is a misroute, a stale CDN edge, or a bucket
+write. It stages nothing and retries on the next check — modelled on `manifest-untrusted`, its
+nearest sibling. `notEvidence` would be wrong here (it refunds the attempt forever, so a wrong
+payload re-fetches indefinitely with nothing escalating) and so would `fatal` (it cannot tell a
+momentary bad edge from tampering, and would kill a legitimate release permanently on that device).
+
+**The two `SCHEMA_VERSION` constants are a deliberate port, and a TEST — not a shared import — is
+what keeps them honest** (#629). `runtime/ota/otaClient.ts` and `engine/scripts/ota/schema.mjs`
+each declare their own `SCHEMA_VERSION` and their own gates. The keep-in-sync banner explains why
+they must not import across that boundary: `@modoki/engine` ships standalone and must not reach into
+`engine/scripts/`, a Node-only dev-tooling dir outside the published package. That reasoning stands
+— what was missing was any mechanism enforcing the agreement the banner asserts, and prose is not a
+mechanism. `engine/tests/plugins/ota/canonicalizationParity.test.ts`, already the only test that
+imports both implementations side by side, now asserts the constants are equal **and** that both
+validators accept the same version SET.
+
 **Anti-rollback (#571) closes release REPLAY.** `release.json` carries an optional monotonic
 `seq`, bumped by `ota-publish.mjs` on every publish (`(existingRelease?.seq ?? 0) + 1`, recomputed
 inside the same `--if-generation-match` retry loop `bundles`/`mandatory`/`manifests` already use,
@@ -167,17 +214,21 @@ absent.
 short-circuits if the target version is already `active` or `pending`. It then enforces
 **two independent** engine-API gates — the release-level `release.minEngineApi` (checked
 here, before any manifest fetch) and the per-bundle `manifest.engineApi` (checked after
-fetching the target manifest) — before picking a **delta base** and calling native. The target
-manifest is checked against `release.manifests[<name>]` immediately after `validateManifest` and
-before the per-bundle `manifest.engineApi` gate (the release-level gate has already run, before
-the manifest was even fetched), so a tampered manifest is refused (`manifest-untrusted`) without
-ever reaching native. Every
+fetching the target manifest) — before picking a **delta base** and calling native. Immediately
+after `validateManifest`, the target manifest's own `name`/`version` are checked against what was
+actually requested (`manifest-identity-mismatch` — a CDN misroute/stale-edge/bucket-write check,
+independent of hash coverage); only then is it checked against `release.manifests[<name>]`
+(`manifest-untrusted` on a hash mismatch), and only after both identity checks pass does the
+per-bundle `manifest.engineApi` gate run (the release-level gate has already run, before the
+manifest was even fetched). So a tampered or misrouted manifest is refused without ever reaching
+native. Every
 failure mode is a discriminated result, never a throw — an OTA check failing must never
 crash a game the player is already looking at:
 
 `up-to-date` · `no-release-for-bundle` · `signature-invalid` · `seq-rollback` (release `seq` is
 below this device's recorded high-water mark — see § The trust chain's anti-rollback section) ·
-`engine-api-too-old` · `manifest-invalid` · `manifest-untrusted` · `no-bundle-zip-in-manifest` ·
+`engine-api-too-old` · `manifest-invalid` · `manifest-identity-mismatch` · `manifest-untrusted` ·
+`no-bundle-zip-in-manifest` ·
 `version-rejected` · `staged` (carries `mandatory: boolean`, mirroring `release.mandatory`) ·
 `pending-restart` (target is already `pending` natively but never served — carries `version` +
 `mandatory`; see #509 below)

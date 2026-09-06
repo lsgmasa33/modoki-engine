@@ -11,6 +11,7 @@ import path from 'path';
 import { FloatType } from 'three';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import { WHITE_HDR_GUID } from '../../packages/modoki/src/runtime/assets/builtinAssets';
+import { SIDECAR_FORMAT_VERSION } from '../../plugins/meta-sidecar';
 
 const ASSET_DIR = path.resolve(__dirname, '../../packages/modoki/src/runtime/assets');
 const HDR = path.join(ASSET_DIR, 'white.hdr');
@@ -48,6 +49,6 @@ describe('white.hdr', () => {
   it('sidecar GUID matches the runtime WHITE_HDR_GUID const (no drift)', () => {
     const meta = JSON.parse(fs.readFileSync(META, 'utf8'));
     expect(meta.id).toBe(WHITE_HDR_GUID);
-    expect(meta.version).toBe(2);
+    expect(meta.version).toBe(SIDECAR_FORMAT_VERSION);
   });
 });

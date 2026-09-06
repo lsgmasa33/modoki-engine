@@ -271,6 +271,15 @@ export type OtaCheckResult =
    *  one the signature vouches for, which means the bucket served tampered or stale
    *  bytes. Nothing is staged when this fires. */
   | { outcome: 'manifest-untrusted'; version: string; expected: string; actual: string }
+  /** The fetched manifest is well-formed but names a DIFFERENT bundle or version than the
+   *  one requested — the client asked for `bundles/<name>/<version>/manifest.json` and got
+   *  a manifest for something else. A CDN misroute, a stale edge, or a bucket write. This
+   *  is a DATA-identity failure, not a format or compatibility one, so it is not "about the
+   *  host": nothing is staged, nothing is quarantined, and the next check retries. Matters
+   *  most where `manifests[bundleName]` coverage is absent — `docs/ota-updates.md` records
+   *  that coverage "starts empty" and that a pre-#570 publisher disarms it for every bundle,
+   *  which is exactly the window where name/version are the only identity signal. */
+  | { outcome: 'manifest-identity-mismatch'; version: string; expectedName: string; actualName: string; expectedVersion: string; actualVersion: string }
   /** #571 anti-rollback: the release's `seq` is LOWER than the highest this device has
    *  already recorded — a validly-signed but stale release.json, most plausibly an
    *  attacker with bucket write replaying an old capture (see docs/ota-updates.md "The
@@ -504,6 +513,23 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   const manifestErrors = validateManifest(manifest);
   if (manifestErrors.length > 0) return { outcome: 'manifest-invalid', errors: manifestErrors };
 
+  // The manifest was fetched from `bundles/<bundleName>/<targetVersion>/manifest.json` —
+  // a well-formed document at that URL naming a DIFFERENT bundle/version is a CDN
+  // misroute, a stale edge, or a bucket write, not a fact about this host. Checked here,
+  // regardless of whether `expectedManifestHash` coverage exists below — the identity
+  // check is cheap and should fire even when hash coverage is absent (docs/ota-updates.md:
+  // coverage "starts empty", and a pre-#570 publisher disarms it for every bundle).
+  if (manifest.name !== opts.bundleName || manifest.version !== targetVersion) {
+    return {
+      outcome: 'manifest-identity-mismatch',
+      version: targetVersion,
+      expectedName: opts.bundleName,
+      actualName: String(manifest.name),
+      expectedVersion: targetVersion,
+      actualVersion: String(manifest.version),
+    };
+  }
+
   // Chain the manifest into the SIGNED release (#570): release.json is Ed25519-signed
   // and `manifests[bundleName]` is a field on it like any other, so an attacker with
   // bucket write cannot alter/replace manifest.json without invalidating that signature.
@@ -535,9 +561,34 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   // update outright — delta is an optimization, not a requirement for the update to
   // succeed (an older build with no embedded manifest, or a CDN blip, must still work).
   const baseVersion = currentActive ?? EMBEDDED_BASE_VERSION;
-  const baseManifest = currentActive
+  let baseManifest = currentActive
     ? await tryFetchManifest(doFetch, opts.baseUrl, opts.bundleName, currentActive)
     : await tryFetchEmbeddedManifest(doFetch, opts.embeddedManifestUrl ?? 'ota-embedded-manifest.json');
+  // The delta BASE fetch is deliberately hash-unverified (see tryFetchManifest's doc) —
+  // name/version are the ONLY identity signal here. A mismatched base is not a corrupt
+  // base (that's the fetch/validate failure already handled inside tryFetch*), it is
+  // evidence the response is for a DIFFERENT bundle/version than the one asked for — same
+  // CDN-misroute/stale-edge class as the target-manifest check above. This is an
+  // optimization loss, not an update failure: treat it as "no usable base" and fall
+  // through to the existing whole-download path, same as a fetch/validate failure would.
+  // This check applies ONLY to the network-fetched base (`currentActive` set) — the
+  // misroute risk it guards against is a CDN/bucket problem (a stale edge or a wrong
+  // bucket handing back manifest bytes for a different bundle/version than requested).
+  // The embedded manifest is a LOCAL file shipped inside the app binary; it was never
+  // fetched from the bucket and cannot be misrouted, so the check buys nothing there
+  // and only costs a false alarm plus a lost delta optimization on every sub-game's
+  // very first stage (the embedded manifest's `name` is the SHELL's bundle name, never
+  // the sub-game's — see ota-embed-manifest.mjs — so this fired on every one of them).
+  if (baseManifest && currentActive) {
+    const identityMismatch = baseManifest.name !== opts.bundleName || baseManifest.version !== currentActive;
+    if (identityMismatch) {
+      opts.onDeltaFallback?.({
+        version: targetVersion,
+        reason: `base manifest identity mismatch: expected ${opts.bundleName}@${baseVersion}, got ${baseManifest.name}@${baseManifest.version}`,
+      });
+      baseManifest = null;
+    }
+  }
   if (baseManifest) {
     const { copy, download } = diffManifests(baseManifest, manifest);
     const downloadWithUrls: OtaDeltaDownload[] = download.map((d) => ({

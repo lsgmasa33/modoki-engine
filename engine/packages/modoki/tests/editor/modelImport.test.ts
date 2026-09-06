@@ -483,7 +483,11 @@ describe('importModel', () => {
 
     expect(writtenMeta).not.toBeNull();
     expect(writtenMeta!.path).toBe('/assets/models/scene.glb');
-    expect(writtenMeta!.meta.version).toBe(2);
+    // The CLIENT no longer sends `version` — `writeMetaSidecar` owns the sidecar's
+    // format version and stamps it server-side (#734). Asserting its absence here
+    // pins that ownership: if a client-side writer starts supplying `version` again,
+    // it is once more a value two places can disagree about.
+    expect(writtenMeta!.meta.version).toBeUndefined();
     expect(writtenMeta!.meta.generated.meshes).toHaveLength(2);
     expect(writtenMeta!.meta.generated.materials.length).toBeGreaterThanOrEqual(1);
   });

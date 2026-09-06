@@ -59,7 +59,7 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // the button a no-op that claims to have converted something.
   const prior = (meta as { texture?: Partial<TextureImportSettings> }).texture ?? {};
   const { format: _format, mipmaps: _mipmaps, wrapS: _wrapS, wrapT: _wrapT, ...carried } = prior;
-  const updatedMeta = { ...meta, version: 2, type: '2d', texture: deriveSettingsForType('2d', carried) };
+  const updatedMeta = { ...meta, type: '2d', texture: deriveSettingsForType('2d', carried) };
   const wrote = await writeMetaOrWarn(path, updatedMeta);
   if (!wrote) return false;
 

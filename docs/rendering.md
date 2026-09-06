@@ -399,40 +399,75 @@ An `Environment` entity (`three/traits/Environment.ts`) binds an HDR equirect as
 
 The texture is acquired + refcounted per scene by `SceneManager` (see [Architecture](./architecture.md)) so `getCachedEnvironment(hdrPath)` returns a ready texture before first render. Every `scene.environment` / intensity / background write is CHANGE-GATED — this runs every frame, but the texture + scalars rarely change and reassigning them flags the render state dirty on some backends. An `ultrahdr`-format source is display-referred (dimmer for IBL), so both its env + bg intensity are boosted by `ULTRAHDR_INTENSITY_BOOST` toward scene-linear parity (the user's `intensity` still scales on top). A runtime-spawned Environment (editor live-edit) that skipped the acquire path kicks off an async load and lands on a later frame. Removing/deactivating the Environment — or unticking `showAsBackground` — clears `scene.environment` **and takes back a texture `scene.background`** (the texture is owned by `envCache`, never disposed here; `syncCamera` re-applies the authored clearColor on the next frame). Nothing else can take that background back: `syncCamera` leaves a texture background alone precisely because this sync owns it. `syncEnvironment` also runs the **retired-env sweep** at the end of each call — the free point for an HDR that a re-import evicted while a surface still bound it; the mechanism and why it reads the live binding instead of a refcount live in [textures.md](./textures.md) § "The env cache retires too" (#315).
 
-### The engine owns the PMREM, not three (#739)
+### The engine owns the environment PMREM and cube derivation, not three (#739, #775, #779)
 
-`scene.environment` is bound to a **pre-generated PMREM**, never the raw equirect. `envPmrem.ts`
-(`runtime/rendering/`) builds it with `PMREMGenerator.fromEquirectangular()`, caches the output
-render target per `(renderer, source texture)` — **keyed on the renderer of the surface being
-synced, not a global "active" one** — and hands three the result. That key is load-bearing: a
-PMREM output is a render-target texture and **cannot be shared across render contexts** (three's
-own `PMREMNode` says so, which is why it keys its cache the same way), and the editor runs up to
-three renderers at once — GameView, SceneView, ParticleEditor — each with its own GPUDevice. Hand
-one surface the target another surface's renderer built and its IBL is permanently BLACK, with
-nothing to re-initialise it. `syncEnvironment` therefore takes the renderer as a parameter; when
-it is absent the raw equirect is bound instead, because absence must mean "no PMREM", never
-"somebody else's PMREM". three's `PMREMNode`
-short-circuits on `isPMREMTexture` / `CubeUVReflectionMapping` and never invokes its own generator.
+`scene.environment` is bound to a **pre-generated PMREM**, and `scene.background` (when
+`showAsBackground` is on) to a **pre-generated PMREM or cube texture, chosen by
+`backgroundBlurriness`** — never the raw equirect, for either. `envPmrem.ts`
+(`runtime/rendering/`) builds both kinds, caches each output render target per
+`(renderer, source texture, kind)` — **keyed on the renderer of the surface being synced, not a
+global "active" one** — and hands three the result. That key is load-bearing: a derived output is a
+render-target texture and **cannot be shared across render contexts** (three's own PMREM cache says
+so, which is why it keys its cache the same way), and the editor runs up to three renderers at
+once — GameView, SceneView, ParticleEditor — each with its own GPUDevice. Hand one surface the
+target another surface's renderer built and its IBL/background is permanently BLACK, with nothing
+to re-initialise it. `syncEnvironment` therefore takes the renderer as a parameter; when it is
+absent the raw equirect is bound instead, because absence must mean "no derived texture", never
+"somebody else's".
 
-**Why, measured.** Left to itself, three builds the PMREM lazily inside the node graph, through a
-`PMREMGenerator` it creates per `PMREMNode`. It frees only the PMREM *output* — a dispose listener
-on the SOURCE texture. The generator's own `_pingPongRenderTarget` (768×1024 half-float, ~6 MB) and
-its 11 LOD-mesh geometries are freed only by `PMREMGenerator.dispose()`, reachable only through
-`PMREMNode.dispose()`, and **nothing on the scene-swap path calls it**. Since a scene swap gives the
-env a new texture *identity*, that leaked once per swap, unbounded — four transitions cleared the
-`com.apple.WebKit.GPU` jetsam band (#590). Measured on `games/3d-test`, alternating
-`tropical-island` ⟷ `empty`, per swap cycle:
+**Two doors, because three's own dispatch forks on `backgroundBlurriness`.**
+`NodeManager.getBackgroundNode` routes a texture through `pmremTexture()` (→ `PMREMNode`) when
+`backgroundBlurriness > 0` or the mapping is already `CubeUVReflectionMapping`, and through
+`cubeMapNode()` (→ `CubeMapNode`) when it is `0`. Each node short-circuits its OWN generator only
+when the texture it's handed already satisfies that node's door —
+`isPMREMTexture`/`CubeUVReflectionMapping` for `PMREMNode`, a non-equirectangular mapping for
+`CubeMapNode` ("envNode already refers to a cube map"). Fixing only the `environment` binding (as
+#739 originally did) leaves `background` walking through whichever of the two doors blurriness
+picks, unrepaired — #779 is that leak recurring through the PMREM door for a blurred background,
+#775 is the same shape through the cube door for a sharp one. A PMREM's level 0 is not the sharp
+original, and `NodeManager` routes ANY `CubeUVReflectionMapping` texture through the blur path
+regardless of the authored blurriness — so the sharp case (0) MUST get the cube texture, never the
+PMREM, or the background silently blurs.
+
+**Why, measured (the PMREM half, #739).** Left to itself, three builds the PMREM lazily inside the
+node graph, through a `PMREMGenerator` it creates per `PMREMNode`. It frees only the PMREM
+*output* — a dispose listener on the SOURCE texture. The generator's own `_pingPongRenderTarget`
+(768×1024 half-float, ~6 MB) and its 11 LOD-mesh geometries are freed only by
+`PMREMGenerator.dispose()`, reachable only through `PMREMNode.dispose()`, and **nothing on the
+scene-swap path calls it**. Since a scene swap gives the env a new texture *identity*, that leaked
+once per swap, unbounded — four transitions cleared the `com.apple.WebKit.GPU` jetsam band (#590).
+Measured on `games/3d-test`, alternating `tropical-island` ⟷ `empty`, per swap cycle:
 
 | | render targets | textures | texture memory | geometries |
 |---|---|---|---|---|
-| before | +3 | +3 | **+6.0 MB** | +16 |
-| after | +1 | +1 | **0.0 MB** | 0 |
+| before #739 | +3 | +3 | **+6.0 MB** | +16 |
+| after #739 | +1 | +1 | **0.0 MB** | 0 |
+| after #775/#779 | **0** | **0** | 0.0 MB | 0 |
+
+Re-measured after #775/#779 on the same harness: geometries and textures both flat across three
+full cycles (29/29/29 and 16/16/16), with a fresh PMREM identity each cycle — i.e. the previous
+one was released, not accumulated.
+
+⚠️ **That `0.0 MB` in the middle row is a FIXTURE artefact, and it set the wrong scope on #775 for
+a while.** `CubeMapNode` sizes its target `new CubeRenderTarget( image.height )` — the leak scales
+with the SOURCE. In this harness the only scene with `showAsBackground: true` is `empty`, whose
+env is the 16×8 `white.hdr` placeholder, so the residual measured was an **8×8** target that
+genuinely rounds to nothing; `tropical-island` has `showAsBackground: false` and never took the
+background path at all. A real scene showing a 2K HDR background downscales to 1024×512
+(`DEFAULT_ENV_SETTINGS.maxSize` 1024), giving `CubeRenderTarget(512)` — 6 × 512² × RGBA16F ≈
+**12.6 MB, ~16.8 MB with mips**, per env-identity change. So the residual #775 recorded as
+"essentially no memory" was **larger than the 6 MB/cycle #739 was worth fixing**, on any scene that
+actually shows its environment. The lesson is the general one: a leak whose size tracks an asset
+must be measured on a representative asset, not on whichever fixture the harness happened to load.
 
 The generator's lifetime is exactly one call — build, take the target, `dispose()` immediately.
 That is safe because `dispose()` frees the scratch state but **not** the output target, which is
-the one thing we keep.
+the one thing we keep. The cube half (#775) has no generator to dispose — `CubeRenderTarget`
+disposes its own scratch geometry/material internally inside `fromEquirectangularTexture` — but it
+temporarily swaps the source texture's filtering flags and the renderer's MRT state, restoring both
+before returning, so it must only ever run from this sync, same as the PMREM build.
 
-Three consequences worth knowing before touching this:
+Consequences worth knowing before touching this:
 
 - ⚠️ **There are TWO `PMREMGenerator`s.** `THREE.PMREMGenerator` (core) is `ShaderMaterial`-based
   and only works with `WebGLRenderer`; the one a `WebGPURenderer` needs comes from `three/webgpu`
@@ -440,25 +475,40 @@ Three consequences worth knowing before touching this:
   so it is always the `three/webgpu` one. Using the wrong one **does not throw**: three logs
   `NodeBuilder: Material "ShaderMaterial" is not compatible` and returns a target that rendered
   nothing, so a silently BLACK environment gets bound and every unit test still passes.
-- **The retired-env sweep resolves the PMREM back to its source.** `scene.environment` no longer
-  holds the equirect, so `sweepRetiredEnvironments` maps the bound texture through
-  `sourceForEnvPMREM` and treats the source as bound too. Without that a retired equirect looks
-  unbound and is disposed while its PMREM is still on screen — the #315 use-after-free shape.
-- **The shader prewarm must mirror the PMREM too.** `prewarmShadersForWorld` is registered with
+- ⚠️ **The "0 / 0" row is a per-surface DELTA, not a claim that ownership is free.** Engine
+  ownership keys on `(renderer, source, kind)` where three's own `CubeMapNode._cache` keys on the
+  source alone — that is the point (three would hand one surface a target another renderer built),
+  but it means an editor showing the same sharp HDR in SceneView *and* GameView now holds **two**
+  cube targets where three held one. On the ~16.8 MB figure above that is real memory, traded
+  deliberately for correctness. Two smaller corollaries: crossing `backgroundBlurriness` 0 ⟷ >0
+  while authoring builds and then RETAINS both kinds for that source — nothing releases the unused
+  one until the source itself dies — and a source that is not yet decoded (`image` absent or zero
+  height) returns undefined WITHOUT being negative-cached, so it retries next frame instead of
+  degrading permanently, mirroring three's own `isEquirectangularMapReady`.
+- **The retired-env sweep resolves EITHER derived texture back to its source.** Neither
+  `scene.environment` nor `scene.background` holds the equirect any more, so
+  `sweepRetiredEnvironments` maps whichever is bound through `sourceForEnvDerived` and treats the
+  source as bound too, for both fields independently. Without that a retired equirect looks unbound
+  and is disposed while its derived texture is still on screen — the #315 use-after-free shape.
+- **The shader prewarm must mirror the PMREM too** (only `environment` — there is no background
+  door in the prewarm scene, since three only derives a background conversion from a
+  `scene.background` that's actually set). `prewarmShadersForWorld` is registered with
   `registerBeforeSwap`, so it runs on EVERY swap; binding a raw equirect there would make
   `PMREMNode` build its own generator and re-open the leak through the prewarm door, with every
   other test still green.
+- **Three's own `CubeMapNode` cache is keyed on the source texture ALONE, not per renderer** — a
+  latent cross-renderer correctness bug in the editor's multi-renderer setup (the same hazard
+  `envPmrem.ts`'s `(renderer, source, kind)` key exists to avoid for the PMREM half). Engine
+  ownership of the cube derivation fixes that too, incidentally: our cache is per-renderer by
+  construction, so a `CubeRenderTarget` built for one surface's GPU context is never handed to
+  another.
 
 `envPmrem.ts` lives in `rendering/` and not beside the env cache in `loaders/meshTemplateCache.ts`
 because `loaders/**` is reachable from the 2D boot path, and a value-import of `three/webgpu` there
 would ship the whole Three node pipeline into a `render3d:false` build (#214). It registers
-`disposeEnvPMREMFor` into a three-free hook registry in the cache instead, so the PMREM still dies
-with its source; a 2D-only build never imports the module and the registry stays empty. It is
-reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
-
-**Known remainder:** `scene.background` still binds the sharp equirect, so three's `CubeMapNode`
-mints an 8×8 `CubeRenderTarget` per env identity change that nothing disposes — the same ownership
-shape, one render target per swap, and ~0 bytes (which is why the table above still shows +1).
+`disposeEnvDerivedFor` into a three-free hook registry in the cache instead, so a derived texture
+still dies with its source; a 2D-only build never imports the module and the registry stays empty.
+It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
 ### HDR conversion (Node — dev server + build)
 

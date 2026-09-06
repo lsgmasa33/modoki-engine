@@ -18,7 +18,6 @@ export const audioReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     settings,
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   meta.audio = settings;
   meta.audioCache = {
     hash: result.hash,

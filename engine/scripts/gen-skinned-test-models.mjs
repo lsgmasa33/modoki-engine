@@ -22,6 +22,7 @@ import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SIDECAR_FORMAT_VERSION, assertSidecarWritable } from '../plugins/meta-sidecar.ts';
 
 // GLTFExporter's binary path uses the browser FileReader to read its Blob. Node
 // has a global Blob (18+) with .arrayBuffer(), so bridge it with a minimal shim.
@@ -181,10 +182,14 @@ function exportGLB(root, animations) {
 }
 
 function writeMeta(glbName, id, clipNames) {
-  const meta = { version: 2, id };
+  const meta = { version: SIDECAR_FORMAT_VERSION, id };
   if (clipNames && clipNames.length) meta.rig = { clips: clipNames };
   // Binary assets carry a sidecar named "<file>.<ext>.meta.json" (e.g. cone.glb.meta.json).
-  fs.writeFileSync(path.join(OUT_DIR, `${glbName}.glb.meta.json`), JSON.stringify(meta, null, 2) + '\n');
+  const glbPath = path.join(OUT_DIR, `${glbName}.glb`);
+  // Refuse to overwrite a committed sidecar written by a newer build (§ 2b) —
+  // this rewrites a TRACKED sidecar, not just a fresh one.
+  assertSidecarWritable(glbPath);
+  fs.writeFileSync(`${glbPath}.meta.json`, JSON.stringify(meta, null, 2) + '\n');
 }
 
 function ea(name, guid, sortOrder = 0, parentId = 0, layer = '') {
@@ -250,7 +255,7 @@ async function main() {
   const CYL_ID = 4, BONE_ID = 7;   // entry ids referenced by parentId (loader remaps to runtime ids)
   const scene = {
     id: GUID.scene,
-    version: 8,
+    version: 8, // format-version-guard: ignore-line — SCENE format version, not the sidecar version (#781)
     resources: [
       { type: 'riggedModel', path: GUID.cylinder },
       { type: 'riggedModel', path: GUID.cone },

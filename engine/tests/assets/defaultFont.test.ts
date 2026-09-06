@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import { readFontAxes } from '../../plugins/font-instance';
 import { DEFAULT_FONT_GUID } from '../../packages/modoki/src/runtime/assets/builtinAssets';
+import { SIDECAR_FORMAT_VERSION } from '../../plugins/meta-sidecar';
 
 const ASSET_DIR = path.resolve(__dirname, '../../packages/modoki/src/runtime/assets');
 const FONT = path.join(ASSET_DIR, 'fonts/Arimo/Arimo-VariableFont_wght.ttf');
@@ -29,7 +30,7 @@ describe('the engine default font', () => {
   it('sidecar GUID matches the runtime DEFAULT_FONT_GUID const (no drift)', () => {
     const meta = JSON.parse(fs.readFileSync(META, 'utf8'));
     expect(meta.id).toBe(DEFAULT_FONT_GUID);
-    expect(meta.version).toBe(2);
+    expect(meta.version).toBe(SIDECAR_FORMAT_VERSION);
   });
 
   it('carries the `font` import block that makes it BAKE rather than ship as a CSS font', () => {

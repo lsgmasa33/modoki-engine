@@ -181,3 +181,20 @@ export function hasNativeProjects(): boolean {
     return false;
   }
 }
+
+/** True when this checkout carries `tools-scratch/` — developer scratch tooling.
+ *  `scripts/publish-engine-oss.sh` assembles the snapshot INCLUDE-ONLY from `git ls-files --
+ *  engine build docs` plus a few root files, so `tools-scratch/` is absent there by
+ *  construction.
+ *
+ *  ⚠️ **Reads the DIRECTORY, not `tools-scratch/spine-import.mjs`** — deliberately, and this
+ *  is the load-bearing part. Its consumer asserts that each listed producer file EXISTS ("a
+ *  rename must turn this red"). A predicate keyed on that same file would be self-disabling:
+ *  rename the file and the predicate silently goes false, the guarded test skips, and the
+ *  tripwire that exists to catch the rename is the very thing the rename switches off.
+ *  Reading a different fact (the directory) means a rename instead lands as a RED existence
+ *  failure. Same lesson as `hasVendoredPluginTarballs()` and `hasNativeProjects()` above, one
+ *  notch over. */
+export function hasScratchTooling(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'tools-scratch'));
+}

@@ -72,12 +72,21 @@ async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknow
     retiredMaterials3D: () => opts.retiredMats ?? new Set(),
     disposeRetiredMaterial,
   }));
-  // `getEnvPMREMTexture`/`sourceForEnvPMREM` moved to `./envPmrem` (#739) — mocked separately now.
+  // `getEnvPMREMTexture`/`getEnvCubeTexture`/`sourceForEnvDerived` moved to `./envPmrem`
+  // (#739, #775, #779) — mocked separately now. All three must be present: `scene3DSync.ts`
+  // imports all three by name, and an explicit-export-list mock missing one breaks the import
+  // BINDING, not an assertion.
   vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
     // #739: PMREM binding. Most tests here leave `pmrem` unset, so `getEnvPMREMTexture` returns
     // undefined and the callers fall back to the raw `cached` texture — which is what those tests
     // assert on. Setting `pmrem` exercises the real binding.
-    getEnvPMREMTexture: vi.fn(() => opts.pmrem ?? undefined), sourceForEnvPMREM: vi.fn(),
+    getEnvPMREMTexture: vi.fn(() => opts.pmrem ?? undefined),
+    // #775/#779: this suite exercises `prewarmShadersForWorld`'s environment mirror only — it
+    // never sets a prewarm-scene BACKGROUND (deliberately, see `scene3DSync.ts`'s comment at the
+    // mirror), so `getEnvCubeTexture` returning undefined (falling back to `cached`, unused here)
+    // is enough.
+    getEnvCubeTexture: vi.fn(() => undefined),
+    sourceForEnvDerived: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),

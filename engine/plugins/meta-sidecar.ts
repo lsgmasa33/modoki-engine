@@ -43,6 +43,15 @@
 
 import fs from 'fs';
 
+/** The FORMAT version of the `.meta.json` sidecar document — how the file is laid
+ *  out (which top-level fields exist, how cache blocks are shaped), NOT a version
+ *  of the asset it describes. `writeMetaSidecar` compares this against whatever
+ *  version is already on disk on every write and refuses to overwrite a sidecar
+ *  written by a newer build (see `assertSidecarWritable`). Bumping this number
+ *  means deciding what older-versioned sidecars this build can still read — do
+ *  not bump it casually. */
+export const SIDECAR_FORMAT_VERSION = 2;
+
 function sidecarPath(absPath: string): string {
   return absPath + '.meta.json';
 }
@@ -90,11 +99,44 @@ export function readMetaSidecar(absPath: string): Record<string, unknown> {
   return meta;
 }
 
+/** Read the version stamped in the COMMITTED sidecar on disk, if any — a plain,
+ *  non-merging read (unlike `readMetaSidecar`, which merges in local stats and
+ *  swallows parse errors as `{}`). Returns `undefined` when the file is missing,
+ *  unparsable, not an object, or its `version` field isn't a number. */
+function versionOnDisk(absPath: string): number | undefined {
+  const sidecar = sidecarPath(absPath);
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { return undefined; }
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const version = (parsed as Record<string, unknown>).version;
+  return typeof version === 'number' ? version : undefined;
+}
+
+/** Throws if the sidecar at `absPath` was written by a NEWER format than this
+ *  build knows — call before doing expensive reimport work so a too-new sidecar
+ *  aborts fast, before `writeMetaSidecar` would refuse it anyway. */
+export function assertSidecarWritable(absPath: string): void {
+  const onDisk = versionOnDisk(absPath);
+  if (onDisk !== undefined && onDisk > SIDECAR_FORMAT_VERSION) {
+    throw new Error(
+      `Sidecar ${sidecarPath(absPath)} is format version ${onDisk}, newer than this build's ` +
+      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
+      `written by a newer build — merge the branch that bumped the format.`
+    );
+  }
+}
+
 /** Atomically write the sidecar. The committed `.meta.json` gets everything EXCEPT
  *  the volatile byte-size stats, which go to a gitignored `.meta.local.json`. Both
- *  writes use tmp+rename for crash-atomicity. */
+ *  writes use tmp+rename for crash-atomicity. Refuses (throws, writes nothing) if
+ *  the sidecar already on disk carries a newer format version than this build's
+ *  `SIDECAR_FORMAT_VERSION` — see `assertSidecarWritable`. Stamps
+ *  `SIDECAR_FORMAT_VERSION` onto the written sidecar itself; callers do not
+ *  supply `version`. */
 export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>): void {
+  assertSidecarWritable(absPath);
   const committed = JSON.parse(JSON.stringify(meta)) as Record<string, unknown>;
+  committed.version = SIDECAR_FORMAT_VERSION;
   const local: Record<string, Record<string, unknown>> = {};
   for (const block of CACHE_BLOCKS) {
     const b = committed[block] as Record<string, unknown> | undefined;

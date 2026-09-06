@@ -26,7 +26,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
-import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable } from '../meta-sidecar';
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -2353,6 +2353,16 @@ async function describeUnresolvedAgainstLiveWorld(
         if (!handler) { summary.skipped++; noHandler.push(`${a.path} (${a.type})`); continue; }
         if (!abs) { summary.skipped++; unresolved.push(a.path); continue; }
         try {
+          // Fail fast on a too-new sidecar BEFORE running any conversion work for this
+          // asset — checked per-asset rather than pre-walking the whole `targets` list,
+          // and deliberately placed INSIDE this asset's own try/catch, same as any other
+          // per-asset failure: a refusal here lands in `summary.errors` and the loop
+          // CONTINUES to the next asset, it does not abort the whole route. A recursive
+          // reimport with one too-new sidecar still bakes and reports every OTHER asset,
+          // and the route still rebuilds the manifest and sends `invalidate-assets`
+          // afterward. `handler`'s own `writeMetaSidecar` re-checks anyway, so nothing is
+          // lost by checking inside the try.
+          assertSidecarWritable(abs);
           await handler(a.path, abs, reCtx); summary.converted++;
           // EVERY baked type is announced, and the renderer op decides which ones hold a
           // cache worth evicting (#304 close-out). This used to filter to model|texture

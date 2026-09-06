@@ -133,7 +133,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // The main scene uses HDR envs via a shared cache; for this standalone
     // preview a procedural RoomEnvironment is the standard drop-in equivalent.
     const pmrem = new THREE.PMREMGenerator(renderer);
-    const envTexture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const roomEnv = new RoomEnvironment();
+    const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
+    roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
     pmrem.dispose();
     scene.environment = envTexture;
     // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
@@ -198,6 +200,12 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
       s.scene.environment = null;
       s.envTexture?.dispose();
+      // dispose() does NOT release the GL context — see previewScene.ts's dispose() for the
+      // full explanation. This effect re-runs on [hasLods] flips too, not just unmount, so a
+      // missing call strands a context per flip. Placed before dispose() to match previewScene;
+      // either order works (dispose() never touches the extensions closure or _gl), so what is
+      // load-bearing is that the call happens at all — which is what the guard checks.
+      s.renderer.forceContextLoss();
       s.renderer.dispose();
       if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
       try { container.removeChild(s.renderer.domElement); } catch { /* already gone */ }

@@ -40,10 +40,11 @@ describe('makeTexture2D', () => {
     const ok = await makeTexture2D('/assets/rock.png');
 
     expect(ok).toBe(true);
+    // No `version` in the payload: `writeMetaSidecar` stamps the sidecar's format
+    // version server-side (#734), so a client-side writer must not supply one.
     expect(mockedWriteMetaOrWarn).toHaveBeenCalledWith('/assets/rock.png', {
       id: 'g',
       textureCache: { a: 1 },
-      version: 2,
       type: '2d',
       texture: deriveSettingsForType('2d'),
     });

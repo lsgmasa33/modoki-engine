@@ -177,7 +177,6 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
   const block: AtlasCacheBlock = { hash: atlasHash, pages, texture: settings, frames };
   const meta = { ...prevMeta };
   if (typeof meta.id !== 'string' && src.id) meta.id = src.id;
-  meta.version = 2;
   meta.atlasCache = block;
   writeMetaSidecar(absPath, meta);
 };

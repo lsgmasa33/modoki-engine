@@ -414,7 +414,6 @@ async function registerExtractedTextures(
           path: texPath,
           meta: {
             ...existingMeta,
-            version: (existingMeta.version as number) ?? 2,
             id: guid,
             ...(seeded ? { texture: { ...(existingMeta.texture as object ?? {}), ...seeded } } : {}),
           },
@@ -676,7 +675,6 @@ async function importRiggedModel(
       path: glbPath,
       meta: {
         ...existingMeta,
-        version: (existingMeta.version as number) ?? 2,
         id: glbGuid,
         source: sourcePath,
         rig: { clips: rig.clipNames, expandSkeleton },
@@ -952,7 +950,6 @@ async function importModelInner(
   const meta = {
     ...existingGlbMeta,
     id: glbGuid,
-    version: 2,
     postprocessor: postprocessorId,
     // Record the original source for converted models (OBJ/FBX/DAE → GLB) so the
     // GLB is traceable back to its authoring file. Omitted for native GLB imports.

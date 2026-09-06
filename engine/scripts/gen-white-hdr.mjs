@@ -15,6 +15,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SIDECAR_FORMAT_VERSION, assertSidecarWritable } from '../plugins/meta-sidecar.ts';
+import { WHITE_HDR_GUID as FALLBACK_GUID } from '../packages/modoki/src/runtime/assets/builtinAssets.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(HERE, '../packages/modoki/src/runtime/assets');
@@ -22,12 +24,12 @@ const OUT_HDR = path.join(OUT_DIR, 'white.hdr');
 const OUT_META = path.join(OUT_DIR, 'white.hdr.meta.json');
 
 // The GUID's single source of truth is the runtime const WHITE_HDR_GUID
-// (packages/modoki/src/runtime/assets/builtinAssets.ts). This build script can't
-// import a .ts module (it runs under plain `node`), so it PRESERVES the id from
-// the existing sidecar when present (the committed authority) and only falls back
-// to the literal below on a first-ever generation. whiteHdr.test.ts asserts the
-// on-disk sidecar equals the runtime const, catching any drift.
-const FALLBACK_GUID = 'beef0000-0000-4000-8000-000000000001';
+// (packages/modoki/src/runtime/assets/builtinAssets.ts), imported directly above —
+// the repo pins Node v24.18.1+, which type-strips a plain `.ts` import under plain
+// `node`. This PRESERVES the id from the existing sidecar when present (the
+// committed authority) and only falls back to the runtime const on a first-ever
+// generation. whiteHdr.test.ts asserts the on-disk sidecar equals the runtime const,
+// catching any drift.
 const WHITE_HDR_GUID = (() => {
   try { return JSON.parse(fs.readFileSync(OUT_META, 'utf8')).id || FALLBACK_GUID; }
   catch { return FALLBACK_GUID; }
@@ -46,6 +48,11 @@ for (let y = 0; y < H; y++) {
   for (const v of PIXEL) bytes.push(128 + W, v);
 }
 
+// Refuse to overwrite a committed sidecar written by a newer build (§ 2b) — this
+// rewrites a TRACKED sidecar, not just a fresh one, so it owes the same refusal
+// as any other writer outside writeMetaSidecar.
+assertSidecarWritable(OUT_HDR);
+
 fs.writeFileSync(OUT_HDR, Buffer.from(bytes));
-fs.writeFileSync(OUT_META, JSON.stringify({ version: 2, id: WHITE_HDR_GUID }, null, 2) + '\n');
+fs.writeFileSync(OUT_META, JSON.stringify({ version: SIDECAR_FORMAT_VERSION, id: WHITE_HDR_GUID }, null, 2) + '\n');
 console.log(`wrote ${OUT_HDR} (${bytes.length} bytes) + meta id=${WHITE_HDR_GUID}`);

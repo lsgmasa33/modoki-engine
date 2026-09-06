@@ -48,11 +48,22 @@ const WRITERS = [
  *  is the shape every writer here uses; a future multi-line literal would slip past, which is what
  *  the "detector detects" case below exists to make visible if these shapes ever change.
  */
+/** Lines of `src` with comment-only lines dropped, so a detector anchored on a literal
+ *  cannot mistake a MENTION of that literal inside a comment (prose describing the bug,
+ *  a worked example, ...) for the real write call. Shared by every detector below so
+ *  they cannot drift apart — that drift is exactly how the liveness check below once
+ *  "anchored" on a comment while the real literal it was meant to protect was deleted. */
+function codeLines(src: string): string[] {
+  return src.split('\n').filter((raw) => {
+    const line = raw.trim();
+    return !(line.startsWith('*') || line.startsWith('//'));
+  });
+}
+
 function clobberingMetaLiterals(src: string): string[] {
   const bad: string[] = [];
-  for (const raw of src.split('\n')) {
+  for (const raw of codeLines(src)) {
     const line = raw.trim();
-    if (line.startsWith('*') || line.startsWith('//')) continue;      // prose, not code
     const at = line.search(/version:\s*\d/);
     if (at < 0) continue;
     // Everything before `version:` on the line, rather than a brace-matched window. Two shapes
@@ -82,6 +93,26 @@ describe('meta sidecar writers merge instead of replacing', () => {
     const sidecar = readFileSync(path.resolve(__dirname, '../../plugins/meta-sidecar.ts'), 'utf-8');
     expect(sidecar).toMatch(/writeJsonAtomic\(sidecarPath\(absPath\), committed\)/);
     expect(sidecar).not.toMatch(/readMetaSidecar\(absPath\)[\s\S]{0,200}\.\.\./); // no read-and-merge
+  });
+
+  it('the detector still has something to anchor on — WRITERS really do contain version literals', () => {
+    // ⚠️ `clobberingMetaLiterals` FINDS a meta literal by searching for `version:\s*\d`.
+    // Since #734 those `version: 2` literals are inert — `writeMetaSidecar` stamps the
+    // sidecar's format version server-side and ignores what a caller passes. That makes
+    // them look like dead weight a cleanup would strip, and stripping them would leave
+    // every per-file assertion above matching an EMPTY set and passing for the wrong
+    // reason. This test is what turns that cleanup RED instead of silently green.
+    // If you are here because you removed those literals: re-anchor the detector on
+    // something structural (the `writeMetaOrWarn(` / `'/api/write-meta'` call itself)
+    // rather than deleting this test.
+    // Every WRITERS file, not just "at least one" — a weaker bound lets six of seven be
+    // stripped while this stays green and six of the seven per-file assertions above go
+    // vacuous (matching an empty set, passing for the wrong reason). `toEqual(WRITERS)`
+    // also names exactly which file(s) went unanchored on failure.
+    const anchored = WRITERS.filter((rel) =>
+      codeLines(read(rel)).some((line) => /version:\s*\d/.test(line)),
+    );
+    expect(anchored).toEqual(WRITERS);
   });
 
   it('the detector detects — including the variable form, which a first attempt missed', () => {

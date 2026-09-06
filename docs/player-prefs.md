@@ -126,7 +126,11 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   rather than accept an op it cannot truthfully report on. `player-prefs-read` is NOT refused,
   since a read during the window answers truthfully about the (still fully hydrated) outgoing
   store.
-- **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. The version
+- **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. This is the
+  repo-wide format-versioning pattern applied to saves — the rule, the three verdicts and the
+  decision table covering every versioned document are in
+  [format-versioning.md](./format-versioning.md); PlayerPrefs is where that rule was first
+  settled (#630). The version
   describes the on-disk format, not the game's data shape. `readEnvelope` **enforces** it (#630 —
   before that it was stamped on every write and read by nothing, while a comment claimed
   otherwise). Three outcomes: a version this build understands is read; a corrupt/unparseable

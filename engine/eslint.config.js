@@ -45,7 +45,7 @@ const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'manager
  *
  *  `rendering/envPmrem.ts` (#739) joined the set for the same reason: it registers itself with
  *  `loaders/meshTemplateCache.ts`'s (L3) env-dispose hook registry at module scope
- *  (`registerEnvDisposeHook(disposeEnvPMREMFor)`) so a 2D-only build — which never imports this
+ *  (`registerEnvDisposeHook('envPmrem', disposeEnvDerivedFor)`) so a 2D-only build — which never imports this
  *  file — never pulls in `three/webgpu`. That registration is an L3 edge on a file that otherwise
  *  reads like ordinary L2 rendering code. */
 const L3_RECLASSIFIED_FILES = [

@@ -328,6 +328,65 @@ describe('checkForUpdate', () => {
     expect(native.activate).not.toHaveBeenCalled();
   });
 
+  /** #629 — the manifest was fetched from `bundles/<bundleName>/<targetVersion>/manifest.json`
+   *  but nothing ever checked that the document it returned actually NAMES that bundle/version.
+   *  A CDN misroute, a stale edge, or a bucket write can serve a well-formed manifest for
+   *  something else entirely — this must be refused before it is trusted, independent of
+   *  whether `release.manifests` hash coverage exists. */
+  it('reports manifest-identity-mismatch and stages nothing when the manifest names a different bundle', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const manifest: OtaManifest = {
+      schema: 1, name: 'not-shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'b'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(manifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({
+      outcome: 'manifest-identity-mismatch', version: 'v2',
+      expectedName: 'shell', actualName: 'not-shell',
+      expectedVersion: 'v2', actualVersion: 'v2',
+    });
+    expect(native.stageUpdate).not.toHaveBeenCalled();
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+    expect(native.activate).not.toHaveBeenCalled();
+  });
+
+  it('reports manifest-identity-mismatch and stages nothing when the manifest names a different version', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const manifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v3', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'b'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(manifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({
+      outcome: 'manifest-identity-mismatch', version: 'v2',
+      expectedName: 'shell', actualName: 'shell',
+      expectedVersion: 'v2', actualVersion: 'v3',
+    });
+    expect(native.stageUpdate).not.toHaveBeenCalled();
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+    expect(native.activate).not.toHaveBeenCalled();
+  });
+
   it('stages normally when the release has no manifests field at all (back-compat)', async () => {
     const { privateKey, publicKey } = makeKeypair();
     const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
@@ -422,6 +481,46 @@ describe('checkForUpdate', () => {
     });
   });
 
+  /** #629 §3 — the delta BASE manifest fetch is deliberately hash-unverified (see
+   *  tryFetchManifest's doc), so name/version are the ONLY identity signal there. A base
+   *  manifest naming a different bundle/version must not be trusted as a diff source — it
+   *  is treated as "no usable base" and the update falls through to a whole-bundle
+   *  download, same as a fetch/validate failure of the base would. This is an optimization
+   *  loss, not an update failure — the update itself still stages via `stageUpdate`. */
+  it('falls back to whole-bundle download when the delta BASE manifest names a different version (#629)', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    // Fetched as the base for "v1" (currentActive), but the document names "v9" — a stale
+    // edge / CDN misroute, not a legitimate base for this diff.
+    const wrongBaseManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v9', engineApi: 1,
+      files: { 'index.html': { hash: 'e'.repeat(64), size: 1 } },
+    };
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'd'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse(wrongBaseManifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+    const onDeltaFallback = vi.fn();
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+      onDeltaFallback,
+    });
+
+    expect(onDeltaFallback).toHaveBeenCalledWith({
+      version: 'v2', reason: expect.stringContaining('base manifest identity mismatch'),
+    });
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+    expect(native.stageUpdate).toHaveBeenCalled();
+    expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
+  });
+
   it('does NOT re-download the whole bundle when the delta staged fine but activate threw (#556)', async () => {
     // `activate` sits outside the delta try deliberately. Inside it, a failed activate would
     // fall through and re-download a whole bundle for a version that had already staged
@@ -486,6 +585,50 @@ describe('checkForUpdate', () => {
       name: 'shell', version: 'v1', baseVersion: 'embedded',
       copy: ['index.html'],
       download: [{ path: 'assets/new.js', hash: 'e'.repeat(64), size: 5, url: 'https://cdn.example.com/game/bundles/shell/v1/files/' + 'e'.repeat(64) }],
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }, { path: 'assets/new.js', hash: 'e'.repeat(64) }],
+    });
+  });
+
+  /** The embedded manifest is written by `ota-embed-manifest.mjs` with `name` set to the
+   *  SHELL's bundle name — every sub-game's embedded-base fetch necessarily names a
+   *  DIFFERENT bundle than `opts.bundleName` (a sub-game), by construction, always. The
+   *  identity check exists to catch a CDN/bucket misroute; the embedded manifest is a
+   *  local file baked into the app binary, never fetched from the bucket, so it must NOT
+   *  be subject to that check — this must still take the delta path with no fallback. */
+  it('takes the delta path against the embedded manifest even when it names the SHELL, not this sub-game (no false identity mismatch)', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { subgame: 'v1' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const embeddedManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'embedded', engineApi: 1, // shell's name, not "subgame"
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+    };
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'subgame', version: 'v1', engineApi: 1,
+      files: {
+        'index.html': { hash: 'a'.repeat(64), size: 1 }, // unchanged from embedded
+        'assets/new.js': { hash: 'e'.repeat(64), size: 5 },
+      },
+      bundleZip: { hash: 'f'.repeat(64), size: 200 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse(embeddedManifest));
+    const native = mockNative(); // no active/pending — genuinely fresh install
+    const onDeltaFallback = vi.fn();
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'subgame', runningEngineApi: 1, fetchImpl, native,
+      onDeltaFallback,
+    });
+
+    expect(onDeltaFallback).not.toHaveBeenCalled();
+    expect(result).toEqual({ outcome: 'staged', version: 'v1', delta: true, mandatory: false });
+    expect(native.stageUpdate).not.toHaveBeenCalled();
+    expect(native.stageUpdateDelta).toHaveBeenCalledWith({
+      name: 'subgame', version: 'v1', baseVersion: 'embedded',
+      copy: ['index.html'],
+      download: [{ path: 'assets/new.js', hash: 'e'.repeat(64), size: 5, url: 'https://cdn.example.com/game/bundles/subgame/v1/files/' + 'e'.repeat(64) }],
       files: [{ path: 'index.html', hash: 'a'.repeat(64) }, { path: 'assets/new.js', hash: 'e'.repeat(64) }],
     });
   });

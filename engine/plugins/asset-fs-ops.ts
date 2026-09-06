@@ -142,10 +142,10 @@ export function duplicateAssetFile(
         delete meta.generated;
         writeMetaSidecar(absTo, meta);
       } catch {
-        writeMetaSidecar(absTo, { id: newGuid, version: 2 });
+        writeMetaSidecar(absTo, { id: newGuid });
       }
     } else {
-      writeMetaSidecar(absTo, { id: newGuid, version: 2 });
+      writeMetaSidecar(absTo, { id: newGuid });
     }
   }
   return newGuid;

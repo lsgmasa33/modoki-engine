@@ -42,9 +42,10 @@ import {
   retiredEnvironments, disposeRetiredEnvironment,
   retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial, getTemplatesForModel,
 } from '../loaders/meshTemplateCache';
-// `getEnvPMREMTexture`/`sourceForEnvPMREM` moved to `./envPmrem` (#739) — that module needs
-// `three/webgpu`, which `meshTemplateCache.ts` can no longer import (render3dBoundary, #214).
-import { getEnvPMREMTexture, sourceForEnvPMREM } from './envPmrem';
+// `getEnvPMREMTexture`/`getEnvCubeTexture`/`sourceForEnvDerived` live in `./envPmrem` (#739, #775,
+// #779) — that module needs `three/webgpu`, which `meshTemplateCache.ts` can no longer import
+// (render3dBoundary, #214).
+import { getEnvPMREMTexture, getEnvCubeTexture, sourceForEnvDerived } from './envPmrem';
 import { getRiggedModel, ensureRiggedModelLoaded, ensureRiggedModelLoadedFor } from '../loaders/riggedModelCache';
 import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
@@ -603,13 +604,20 @@ function sweepRetiredEnvironments(): void {
       bound.add(surface.environment);
       // #739: `surface.environment` holds the PMREM output now, not the equirect (see
       // `syncEnvironment`). A bound PMREM keeps its SOURCE alive too — resolve it back through
-      // `sourceForEnvPMREM` and add it, or a retired equirect with a live PMREM on screen would
+      // `sourceForEnvDerived` and add it, or a retired equirect with a live PMREM on screen would
       // look unbound here and get disposed while still driving the render (the #315 shape).
-      const src = sourceForEnvPMREM(surface.environment);
+      const src = sourceForEnvDerived(surface.environment);
       if (src) bound.add(src);
     }
     const bg = surface.background as THREE.Texture | THREE.Color | null;
-    if (bg && (bg as THREE.Texture).isTexture) bound.add(bg as THREE.Texture);
+    if (bg && (bg as THREE.Texture).isTexture) {
+      bound.add(bg as THREE.Texture);
+      // #775/#779: `surface.background` is a derived PMREM or cube texture now too (see
+      // `syncEnvironment`), not the raw equirect — same resolve-and-add as `surface.environment`
+      // above, or its source would look unbound here and get disposed mid-render (#315).
+      const bgSrc = sourceForEnvDerived(bg as THREE.Texture);
+      if (bgSrc) bound.add(bgSrc);
+    }
   }
   for (const tex of [...retired]) if (!bound.has(tex)) disposeRetiredEnvironment(tex);
 }
@@ -684,7 +692,27 @@ export function syncEnvironment(world: World, scene: THREE.Scene, renderer?: Web
       if (scene.environment !== wantEnv) scene.environment = wantEnv;
       if (scene.environmentIntensity !== wantEnvIntensity) scene.environmentIntensity = wantEnvIntensity;
       if (env.showAsBackground) {
-        if (scene.background !== cached) scene.background = cached;
+        // #775/#779: which derived texture the BACKGROUND needs depends on `backgroundBlurriness`,
+        // independently of `iblOn` above — that tier gate suppresses only the lighting
+        // contribution (its own comment: the background was measured not to be the cost), and
+        // when it suppresses IBL three would otherwise still build (and leak) its own conversion
+        // for the background regardless of tier, so building ours here is strictly never a tier
+        // regression.
+        //
+        // `NodeManager.getBackgroundNode` (three, `nodes/NodeManager.js`) forks on blurriness:
+        // > 0 (or an already-CubeUV mapping) routes through `pmremTexture()` → `PMREMNode`, which
+        // builds its own generator per node unless the texture already carries
+        // `isPMREMTexture`/`CubeUVReflectionMapping` (#779 — #739's leak through a second door);
+        // === 0 routes through `cubeMapNode()` → `CubeMapNode`, which builds its own
+        // `CubeRenderTarget` unless the texture's mapping is already non-equirectangular (#775).
+        // A PMREM's level 0 is not the sharp original (`docs/rendering.md` records the sharp
+        // background as deliberate), and `NodeManager` routes ANY CubeUV texture through the blur
+        // path regardless of blurriness — so binding a PMREM at blurriness 0 would silently blur
+        // the sky. Hence cube for sharp, PMREM for blurred, never the other way round.
+        const blurred = env.backgroundBlurriness > 0;
+        const derivedBg = blurred ? getEnvPMREMTexture(renderer, cached) : getEnvCubeTexture(renderer, cached);
+        const wantBg = derivedBg ?? cached; // fall back to the raw equirect when there's no renderer yet or generation failed
+        if (scene.background !== wantBg) scene.background = wantBg;
         if (scene.backgroundIntensity !== bgIntensity) scene.backgroundIntensity = bgIntensity;
         if (scene.backgroundBlurriness !== env.backgroundBlurriness) scene.backgroundBlurriness = env.backgroundBlurriness;
       } else {
@@ -4186,6 +4214,11 @@ async function prewarmShadersForWorldInner(
         // fixes, re-entering through the prewarm door and defeating the fix.
         prewarmScene.environment = getEnvPMREMTexture(renderer, cached) ?? cached;
         prewarmScene.environmentIntensity = env.intensity;
+        // Deliberately NO `prewarmScene.background` mirror (#775/#779): three only derives a
+        // background conversion from a `scene.background` that is actually SET, so there is no
+        // "wrong variant compiles" door here the way there is for `environment` above — a prewarm
+        // scene with `background` left unset compiles nothing background-shaped either way. Don't
+        // add one; there's nothing for it to fix.
       }
     });
   }

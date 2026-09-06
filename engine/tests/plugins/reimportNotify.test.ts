@@ -9,6 +9,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { registerReimportHandler } from '../../plugins/reimport-registry';
 
+// Real `assertSidecarWritable` only throws for an actual too-new sidecar ON DISK — these
+// tests use fake in-memory paths, so mock it to throw for one chosen path instead of
+// standing up real files. Every other export passes through unmocked.
+vi.mock('../../plugins/meta-sidecar', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../plugins/meta-sidecar')>();
+  return { ...actual, assertSidecarWritable: vi.fn(actual.assertSidecarWritable) };
+});
+import { assertSidecarWritable } from '../../plugins/meta-sidecar';
+
 /** A full mock context — every field a vi.fn/stub; tests override the few they read. */
 function makeCtx(manifest: Manifest, requestBrowser = vi.fn().mockResolvedValue({ ok: true })): BackendContext {
   return {
@@ -216,6 +225,45 @@ describe('/api/reimport → invalidate-assets notification', () => {
         { path: '/assets/models/a.glb', type: 'model' },
         { path: '/assets/tex/b.png', type: 'texture' },
         { path: '/games/x/c.glb', type: 'model' },
+      ],
+    });
+  });
+
+  it('a too-new-sidecar refusal on one asset lands in errors[] — the rest of a recursive reimport still bakes and the manifest still rebuilds', async () => {
+    // `assertSidecarWritable` sits inside the per-asset try now (not outside it) — a
+    // refusal on one asset must not abort the whole route and discard already-baked work.
+    const manifest: Manifest = {
+      version: 2,
+      assets: [
+        { path: '/assets/a/good.glb', type: 'model' },
+        { path: '/assets/a/toonew.glb', type: 'model' },
+        { path: '/assets/a/also-good.glb', type: 'model' },
+      ],
+    };
+    vi.mocked(assertSidecarWritable).mockImplementation((abs: string) => {
+      // A deliberately synthetic sentinel — NOT real prose from the real
+      // `assertSidecarWritable` — so the assertion below proves the error
+      // propagates through, not that we verified the real wording.
+      if (abs.includes('toonew')) throw new Error('SENTINEL_TOO_NEW_MOCK_ERROR_xyz');
+    });
+    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const ctx = makeCtx(manifest, requestBrowser);
+
+    const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a', recursive: true }));
+
+    const body = (res as { body: { converted: number; errors: string[] } }).body;
+    expect(body.converted).toBe(2);                             // the other two still baked
+    expect(body.errors).toHaveLength(1);
+    expect(body.errors[0]).toContain('/assets/a/toonew.glb');   // the refused asset is named
+    expect(body.errors[0]).toContain('SENTINEL_TOO_NEW_MOCK_ERROR_xyz');
+    expect((res as { status?: number }).status).toBe(200);       // converted>0 → not a 500
+    expect(ctx.rebuildManifest).toHaveBeenCalled();               // the route still finished
+    // The renderer is told to evict only the two that actually re-baked.
+    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
+      items: [
+        { path: '/assets/a/good.glb', type: 'model' },
+        { path: '/assets/a/also-good.glb', type: 'model' },
       ],
     });
   });

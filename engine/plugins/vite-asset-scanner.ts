@@ -24,6 +24,10 @@ import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceI
 import { acquireBuild, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
+// From the standalone zero-import file, NOT assetManifest.ts — that module transitively
+// imports assetFetch.ts/assetUrl.ts (browser-only globals), which would drag DOM/vite-client
+// requirements into this Node-context plugin's typecheck (tsconfig.node.json has neither).
+import { ASSET_MANIFEST_VERSION } from '../packages/modoki/src/runtime/loaders/assetManifestVersion';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
 import { atlasReimportHandler } from './reimport-atlas';
@@ -33,7 +37,7 @@ import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
 import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
-import { readMetaSidecar } from './meta-sidecar';
+import { readMetaSidecar, assertSidecarWritable, SIDECAR_FORMAT_VERSION } from './meta-sidecar';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
@@ -238,7 +242,9 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
 }
 
 /** Atomic write: tmp file + rename. Same pattern as `plugins/meta-sidecar.ts`,
- *  inlined to avoid a circular import with this module. */
+ *  inlined here because this writer handles documents other than sidecars
+ *  (JSON-asset `id` stamping) — not to avoid a circular import; this module
+ *  already imports from `meta-sidecar.ts` above. */
 function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(json, null, 2));
@@ -301,11 +307,28 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
       // sidecar branch below instead of silently no-op'ing via JSON.stringify.
     }
     const sidecar = absPath + '.meta.json';
-    let meta: Record<string, unknown> = { version: 2 };
+    // ⚠️ This path writes through the LOCAL `writeJsonAtomic` below, NOT through
+    // `writeMetaSidecar` — so it does not inherit that function's too-new refusal and
+    // has to make the same check itself (#734). `writeMetaSidecar` is the choke point for
+    // MOST sidecar writes, but several writers bypass it and each must carry the stamp +
+    // refusal itself — see docs/format-versioning.md § 2b. Refused explicitly rather
+    // than by letting the throw hit the outer `catch { return false }`, which would
+    // report the same `false` as an ordinary write failure and say nothing.
+    try {
+      assertSidecarWritable(absPath);
+    } catch (e) {
+      console.warn(`[assets] not stamping a GUID into ${sidecar}: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+    let meta: Record<string, unknown> = {};
     if (fs.existsSync(sidecar)) {
       try { meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { /* recreate */ }
     }
     meta.id = guid;
+    // This writer does not route through `writeMetaSidecar`, so it must stamp
+    // as well as refuse — refusing alone (above) yields an unstamped document,
+    // which is the same downgrade-risk defect (#734) wearing a different face.
+    meta.version = SIDECAR_FORMAT_VERSION;
     writeJsonAtomic(sidecar, meta);
     return true;
   } catch {
@@ -1060,7 +1083,7 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
     }
   }
 
-  return { version: 2, assets: items.map((it) => it.entry), folders };
+  return { version: ASSET_MANIFEST_VERSION, assets: items.map((it) => it.entry), folders };
 }
 
 /** Resolve the engine built-in assets dir (/modoki/assets) from the first
@@ -1244,7 +1267,7 @@ export function assetScannerPlugin(): Plugin {
    *  see isGameCodeFile. */
   let gameCodeRoot: string | null = null;
   /** Cached manifest, rebuilt on file changes. Avoids re-scanning on every fetch. */
-  let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: 2, assets: [], folders: [] };
+  let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: ASSET_MANIFEST_VERSION, assets: [], folders: [] };
   /** Server reference so the watcher can push HMR updates. */
   let viteServer: { ws: { send: (m: object) => void } } | null = null;
 

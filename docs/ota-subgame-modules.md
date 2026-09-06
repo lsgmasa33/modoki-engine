@@ -227,7 +227,31 @@ applies it.
 |---|---|---|
 | `fatal` | a non-ok or unparseable `subgame.json` · `<script>` `onerror` · a module with no `game.id` · **a missing/unparseable `assets.manifest.json`** | reverts to the previous version **and quarantines**, immediately — no attempts burned (#550) |
 | `transient` | `ensure(sharedDeps)` failed · **a `fetch` that REJECTED** (as opposed to returning non-ok) for either JSON file · **a script that assigned no module** (see below) | for a PENDING version: costs one attempt; three exhaust and quarantine, as for the shell. For an ACTIVE one: clears `active` immediately, never quarantining — see the ⚠️ below. A retry is genuinely possible rather than merely hoped for — §1's #522 note: `ensure()` clears its `pending` entry when a load SETTLES, so a rejected dynamic import is no longer memoized for the life of the process |
-| `notEvidence` | `engineApi` mismatch (either check) · `gameId` collision · `__MODOKI_SHARED__` missing | gives the attempt back, **never quarantines** |
+| `notEvidence` | `engineApi` mismatch (either check) · `gameId` collision · `__MODOKI_SHARED__` missing · **a too-new `subgame.json` `schema`** · **a too-new `assets.manifest.json` `version`** (both #730) | gives the attempt back, **never quarantines** |
+
+⚠️ **A too-new FORMAT version is a separate arm from "unparseable", and putting it in the `fatal`
+row would defeat the gate** (#730). Both `subgame.json` and `assets.manifest.json` already have a
+`fatal` arm for a missing or unparseable document — a genuinely broken bundle. A document that
+parses fine but declares a format NEWER than this shell is the opposite case: the bundle is
+well-formed and it is THIS shell that cannot read it, exactly like an `engineApi` mismatch. Folding
+it into `fatal` would quarantine on precisely the case the check exists to survive, and `rejected`
+survives `resetForNewBinary`, so a legitimate release would be permanently dead on that device.
+
+⚠️ **`schema` is checked BEFORE every other field of `subgame.json`, including `engineApi`.** A
+schema bump can change what the other fields MEAN, so reading them first is interpreting a shape you
+have already been told you do not know.
+
+⚠️ **The `assets.manifest.json` version gate runs BEFORE `loadManifestJson`, and must stay there.**
+The merge has no undo. `loadOneSubgame`'s own note records that the `registerDynamicGame` refusal is
+the only one occurring after the merge, and that "a refused bundle never leaves a half-merged
+manifest behind" is true *by accident, not by design* — any new check added after the merge breaks
+that silently.
+
+⚠️ **Not every version field is this kind**, and the distinction decides the disposition — the three
+kinds and the full decision table live in **[format-versioning.md](./format-versioning.md)**. Short
+version for this page: `schema` and `assets.manifest.json`'s `version` are the **format** kind, so
+too-new is about the HOST and gets `notEvidence`; `manifest.name`/`.version` on the OTA path are the
+**data-identity** kind and are handled differently ([ota-updates.md](./ota-updates.md)).
 
 ⚠️ **Two splits in that table are load-bearing and were both wrong in the first draft** (caught by review, 2026-09-01):
 
