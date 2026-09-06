@@ -37,6 +37,7 @@ import { registerPointerPassthrough } from '../core/pointerBlockers';
 import { createRendererRecovery, type RendererRecovery } from './rendererRecovery';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { noteGpuContextCreated, noteGpuContextDestroyed, liveGpuContextCount } from '../core/gpuContextTracking';
+import { revalidateSubtreeAfterRendererRebuild } from './gpuResourceInvalidation';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
  *  honor an explicit `pixi.backend` render-setting ('webgpu'/'webgl'), else fall
@@ -97,6 +98,14 @@ export interface Canvas2DSlot {
    *  not the canvas, so a listener left on a replaced or destroyed canvas keeps mutating a live
    *  slot — and Pixi forces a context loss on every `app.destroy()`, so that fires for real. */
   detachCanvasListeners?: () => void;
+  /** Disposer for this slot's WebGPU `device.lost` listener (#794). Kept and detached
+   *  DEFENSIVELY, not because our own teardown is known to resolve `device.lost` — it does not
+   *  (verified: `GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`, and Pixi
+   *  never calls `GPUDevice.destroy()` anywhere in its own source). But the listener closes over
+   *  the SLOT, so leaving it attached past a rebuild costs nothing to avoid and would be a real
+   *  bug the moment either Pixi starts calling `device.destroy()` or something OUTSIDE Pixi
+   *  destroys the device — see `attachDeviceLostListener`'s own doc comment. */
+  detachDeviceLost?: () => void;
   /** This slot's WebGL context has been lost and not restored — every draw into it is a no-op.
    *
    *  ⚠️ Until #213 the 2D path had NO notion of this, and that is the whole reason a lost context
@@ -132,6 +141,15 @@ export interface Canvas2DSlot {
    *  once `slot.ready` settles AND from `teardownSlot`, so the watchdog can never fire into a
    *  torn-down slot and no fake-timer test is left holding a live timer. Idempotent. */
   initWatchdog?: () => void;
+  /** Renderers destroyed for this slot whose `_gpuData` has not been purged yet (#678). A rebuild
+   *  whose `init()` throws (see `APP_INIT_TIMEOUT_MS`) leaves entries here for the NEXT attempt to
+   *  sweep — `rebuildSlotApp` accumulates onto this array before the timed-out init, and the
+   *  `revalidateSubtreeAfterRendererRebuild` call after a SUCCESSFUL init purges and clears the
+   *  whole list, not just the uid from the attempt that succeeded. Without this, a renderer whose
+   *  init timed out is never purged by any path: `slot.app` on the retry is the abandoned,
+   *  never-initialised Application from the failed attempt, so capturing just its uid purges
+   *  nothing for the ORIGINAL dead renderer. */
+  pendingDeadRendererUids?: number[];
 }
 
 /** How long a REBUILD's `Application.init()` (after context loss) may take before it counts as
@@ -243,12 +261,87 @@ export class Canvas2DPool {
     };
   }
 
+  /** WebGPU twin of `attachCanvasListeners`'s context-loss half (#794). `webglcontextlost`/
+   *  `webglcontextrestored` are DOM events a WebGPU canvas never fires — Pixi's WebGPU backend
+   *  reports device loss through the standard `GPUDevice.lost` promise instead, so a WebGPU
+   *  Canvas2D slot had NO loss detection at all: no log, no rebuild, the surface frozen forever.
+   *  Measured on an iPad mini 5 (iPadOS 26.6.1): `device.lost` resolved with
+   *  `{reason:'destroyed'}` for a listener attached by hand, while the engine logged nothing,
+   *  `renderer.uid` never changed, and `render()` kept returning cleanly with a blank frame.
+   *
+   *  Read defensively — on the WebGL backend there is no `renderer.gpu.device` at all, so this
+   *  is a silent no-op there.
+   *
+   *  ⚠️ Not filtering on `info.reason === 'destroyed'` (unlike `activeRenderer.ts`'s 3D twin,
+   *  which does) is still correct here, but for a DIFFERENT reason than this comment used to give.
+   *  It used to say our own `app.destroy()` resolves `device.lost`, which is FALSE — verified
+   *  against `GpuDeviceSystem.destroy()` (`rendering/renderers/gpu/GpuDeviceSystem.mjs`), which
+   *  only nulls `gpu`/`extensions`/`_renderer`, and a repo-wide `grep` for `device.destroy` in
+   *  `node_modules/pixi.js/lib` finds nothing — Pixi never calls `GPUDevice.destroy()` at all. So
+   *  since Pixi itself can never be the source of a `'destroyed'` resolution here, one arriving
+   *  means someone OUTSIDE Pixi destroyed the device — which is a real loss for this surface, not
+   *  a reason to filter it out. */
+  private attachDeviceLostListener(slot: Canvas2DSlot, app: Application): void {
+    // `_gpu`/`device` are WebGPU-backend-only internals with no convenient public type here — one
+    // localised, commented cast, mirroring the `_gpuData` pattern in `gpuResourceInvalidation.ts`.
+    const device = (app.renderer as unknown as {
+      gpu?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } };
+    })?.gpu?.device;
+    if (!device?.lost) return; // WebGL backend (or a device that hasn't come up) — nothing to wire
+
+    let disposed = false;
+    void device.lost.then((info) => {
+      // Our own teardown (`app.destroy()`) does NOT resolve `device.lost` — Pixi never calls
+      // `GPUDevice.destroy()` (see this method's doc comment above). This listener is defensive:
+      // it costs nothing to keep attached, is required if Pixi ever adopts `device.destroy()`, and
+      // is correct today if something OUTSIDE Pixi destroys the device. `disposed` is set by our
+      // own detach; `slot.app !== app` means a later rebuild already superseded this listener's
+      // Application.
+      if (disposed || slot.destroyed || slot.app !== app) return;
+      slot.contextLost = true;
+      console.error(
+        `[canvas2DPool] WebGPU DEVICE LOST on the 2D canvas for entity ${slot.entityId} ` +
+        `(reason: ${info?.reason ?? 'unknown'}) — every draw into it is now a no-op and the ` +
+        `surface will stay BLANK until it does. Rebuilding. See #794.`,
+      );
+      slot.recovery?.request();
+    }).catch((err: unknown) => {
+      // `GPUDevice.lost` resolves per spec and never rejects, so this guards a mock/polyfill
+      // that rejects it rather than a real WebGPU implementation. What it actually catches in
+      // practice is a THROW from the handler body above (`console.error`, `slot.recovery?.request()`)
+      // — i.e. the #794 recovery trigger itself failing. That must not be silent.
+      console.error(
+        `[canvas2DPool] WebGPU device-lost handler failed for the 2D canvas on entity ` +
+        `${slot.entityId} — recovery may not have been requested. See #794.`, err,
+      );
+    });
+    slot.detachDeviceLost = () => { disposed = true; };
+  }
+
   /** Bring a NEW Pixi Application up on a slot whose GPU context died (#213).
    *
    *  Rebuilding is the only route back: the old renderer's device is gone, and every GPU resource
    *  it held died with it. Pixi's scene graph is renderer-agnostic, so `slot.container` and its
-   *  children SURVIVE — they are re-attached to the new stage and their textures re-upload on the
-   *  next draw. That is why this does not tear the display objects down.
+   *  children SURVIVE — they are re-attached to the new stage. That is why this does not tear the
+   *  display objects down.
+   *
+   *  ⚠️ This comment used to end "…and their textures re-upload on the next draw", stated as the
+   *  REASON the survive-and-reattach policy is safe. **That was measurably false** (#678), and so
+   *  was the FIRST fix for it: purging surviving resources' stale `_gpuData[uid]` entries was
+   *  device-tested alone and still left the frame blank. The real mechanism is per-pipe (see
+   *  `gpuResourceInvalidation.ts`'s file header for the full detail): `GraphicsPipe.addRenderable`
+   *  only rebuilds a graphics's GPU data `if (graphics.didViewUpdate)`, so a surviving `Graphics`
+   *  node not re-marked dirty across the rebuild gets a fresh, EMPTY batch under the new renderer's
+   *  uid — drawing nothing — while `MeshPipe` initialises its GPU data unconditionally and so
+   *  survives on its own. That is NOT a render-group instruction-set replay; it is this
+   *  graphics-pipe-specific dirty gate. Measured on an iPhone 8: 48 `graphics`-pipe objects,
+   *  visible and undestroyed, drawing nothing, versus 18 mesh-pipe objects fine; `render()` alone
+   *  did not fix it, and neither did the `_gpuData` purge alone — calling `onViewUpdate()` on every
+   *  surviving view did (it sets `didViewUpdate = true`, which is what makes the graphics pipe take
+   *  the rebuild branch again). That is what the `revalidateSubtreeAfterRendererRebuild` call below
+   *  exists to force (see its file header for the full isolation-test table). The
+   *  survive-and-reattach policy is still right; the reason given for it was an assertion nobody
+   *  had watched fail.
    *
    *  ⚠️ The canvas ELEMENT is deliberately kept. It is mounted in the DOM by `Canvas2DMount`,
    *  which holds this exact node; swapping it would need the mount to re-attach, and the element
@@ -259,6 +352,27 @@ export class Canvas2DPool {
    *  Scheduling (delay, single-flight, coalescing, bounded backoff) is NOT here — it belongs to
    *  `rendererRecovery.ts`, which the 3D viewports already use. */
   private async rebuildSlotApp(slot: Canvas2DSlot): Promise<void> {
+    // Captured BEFORE the old app is destroyed, for #678: this is the uid
+    // `revalidateSubtreeAfterRendererRebuild` below actually purges — see
+    // `gpuResourceInvalidation.ts`'s file header for why identifying the DEAD renderer, rather
+    // than building a "live renderer" set, is the correct (and only cross-pool-safe) purge key.
+    // Read defensively — a context lost badly enough to trigger this rebuild may have already left
+    // the renderer in a state where even reading `uid` throws; the purge below is then a no-op for
+    // this rebuild (a missing uid means nothing to identify), which is still reported honestly in
+    // the `console.warn` further down.
+    let deadRendererUid: number | undefined;
+    try { deadRendererUid = slot.app.renderer?.uid; } catch { /* renderer already dead — fine, see
+      above: the purge below simply has nothing to purge this time */ }
+    // Accumulate onto the slot, not just a local — see `pendingDeadRendererUids`'s doc comment.
+    // If the `init()` below TIMES OUT this uid must survive to the NEXT rebuild attempt, because
+    // this attempt returns early (via the `!slot.initialized` guard) without ever reaching the
+    // purge call. Not gated on `slot.initialized`: on a retry after a timed-out init, `slot.app` is
+    // the abandoned, pre-`init()` Application from the failed attempt, whose `.renderer` is
+    // `undefined` — `deadRendererUid` reads as `undefined` there and this push is a no-op.
+    if (typeof deadRendererUid === 'number') {
+      (slot.pendingDeadRendererUids ??= []).push(deadRendererUid);
+    }
+
     // Detach the surviving scene graph BEFORE destroying, so the old app cannot take it down.
     slot.container.removeFromParent();
     // …and detach the OLD canvas's context listeners before destroying its app, because Pixi's
@@ -268,6 +382,12 @@ export class Canvas2DPool {
     // redundant rebuild through `recovery.request()`'s `again` flag.
     slot.detachCanvasListeners?.();
     slot.detachCanvasListeners = undefined;
+    // Same reasoning as the line above, for WebGPU (#794): the listener closes over the SLOT, so
+    // leaving it attached past this rebuild costs nothing to avoid — it is defensive, not because
+    // our own `app.destroy()` below is known to resolve `device.lost` (it does not; see
+    // `attachDeviceLostListener`'s doc comment).
+    slot.detachDeviceLost?.();
+    slot.detachDeviceLost = undefined;
     if (slot.initialized) {
       try { slot.app.destroy(false); } catch { /* a dead renderer often throws on teardown — the
         point is to stop referencing it, and a throw here must not abort the rebuild */ }
@@ -308,6 +428,37 @@ export class Canvas2DPool {
     // this commit's `onSkipped` exists to remove.
     if (!slot.initialized) return;
     slot.contextLost = false;
+
+    // #678 — revalidate the surviving scene graph after the rebuild. Two independent jobs, one
+    // walk (`gpuResourceInvalidation.ts`'s file header has the full mechanism + isolation-test
+    // evidence):
+    //  - mark every surviving view dirty via `onViewUpdate()`, so the graphics pipe takes its
+    //    rebuild branch again on the NEW renderer instead of leaving an empty batch. THIS is what
+    //    actually restores the frame.
+    //  - purge `deadRendererUid`'s `_gpuData` entry off every surviving node. Pixi's own
+    //    `GCManagedHash`-backed pipes null this out on a clean teardown, but `SpritePipe` and
+    //    `MeshPipe` are unmanaged and a context loss that THROWS mid-teardown can leave the
+    //    nulling partial — so some real orphans do survive. Worth fixing on its own merits
+    //    (unbounded growth of a per-process cache under repeated context losses); device-tested to
+    //    NOT be what fixes the blank frame on its own.
+    // The WHOLE accumulated set is passed — NOT just this attempt's `deadRendererUid` — because a
+    // PRIOR attempt's timed-out `init()` can have left its own dead uid unpurged (see
+    // `pendingDeadRendererUids`'s doc comment). Also NOT a caller-built "live uid set": a prior
+    // version of this call built a live set from THIS pool's own `this.slots` and purged
+    // everything else; that is wrong the moment a SECOND pool exists, because Pixi
+    // `TextureSource`s are process-global and shared across pools — `editorCanvas2DPool`
+    // (`editor/rendering/editorScene2D.ts`) is live alongside `defaultPool`, so a live set built
+    // from one pool's slots alone would delete the OTHER pool's still-live renderer's entry off a
+    // shared texture. Purging only uids that are PROVABLY dead (renderers this slot has actually
+    // destroyed) needs no live-set reasoning and cannot make that mistake. See
+    // `gpuResourceInvalidation.ts`'s file header for the full argument.
+    const deadUids = slot.pendingDeadRendererUids;
+    const { gpuDataPurged, viewsMarked } =
+      revalidateSubtreeAfterRendererRebuild(slot.container, deadUids);
+    // Clear only AFTER the purge call returns — a purge that throws must not lose the record of
+    // what still needs sweeping.
+    slot.pendingDeadRendererUids = undefined;
+
     // The new renderer starts with an EMPTY frame, and Scene2D only redraws what it believes
     // changed — so without a full redraw the surface stays blank behind a perfectly healthy
     // context, which is the original bug wearing a different hat. Raised as a FLAG the renderer
@@ -315,7 +466,13 @@ export class Canvas2DPool {
     // Scene2D. Scene2D already depends on the pool, and reaching back would make the two mutually
     // recursive for no gain.
     this._rebuiltSinceLastRender = true;
-    console.warn(`[canvas2DPool] 2D renderer rebuilt after context loss (entity ${slot.entityId}).`);
+    const uidCount = deadUids?.length ?? 0;
+    console.warn(
+      `[canvas2DPool] 2D renderer rebuilt after context loss (entity ${slot.entityId}` +
+      `${uidCount > 0 ? `, dead renderer uid(s) ${deadUids!.join(', ')}` : ''}). ` +
+      `Purged ${gpuDataPurged} stale GPU-data entries` +
+      `${uidCount > 1 ? ` across ${uidCount} dead renderers` : ''}, re-marked ${viewsMarked} views (#678).`,
+    );
   }
 
   private async initSlotApp(slot: Canvas2DSlot): Promise<void> {
@@ -386,6 +543,13 @@ export class Canvas2DPool {
     app.stage.addChild(slot.container);
     slot.initialized = true;
     noteGpuContextCreated();
+    // Unlike the WebGL listeners (attached at CREATION, before init, specifically to catch a
+    // boot-time loss — see `createSlot`), this one can only attach AFTER `init()`: the GPUDevice
+    // this reads off `app.renderer.gpu.device` does not exist until init has actually brought the
+    // WebGPU backend up. A device loss DURING init instead surfaces as an `init()` rejection,
+    // which `withTimeout` + `rendererRecovery` already handle — so nothing is missed here, it's
+    // just handled on a different path. `app`, not `slot.app` — see the CAPTURE note above.
+    this.attachDeviceLostListener(slot, app);
   }
 
   private createSlot(): Canvas2DSlot {
@@ -530,6 +694,12 @@ export class Canvas2DPool {
     slot.initWatchdog?.(); // stop the FIRST-init watchdog — it must never fire into a torn-down slot
     slot.detachCanvasListeners?.();
     slot.detachCanvasListeners = undefined;
+    // Same reasoning, for WebGPU (#794): the listener closes over the SLOT, so leaving it attached
+    // past a for-good teardown costs nothing to avoid — defensive, not because `app.destroy()`
+    // below is known to resolve `device.lost` (it does not; see `attachDeviceLostListener`'s doc
+    // comment).
+    slot.detachDeviceLost?.();
+    slot.detachDeviceLost = undefined;
     slot.unpassthrough?.();
     slot.container.destroy();
     if (slot.initialized) { slot.app.destroy(true); noteGpuContextDestroyed(); }

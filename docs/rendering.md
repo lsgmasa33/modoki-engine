@@ -2964,6 +2964,72 @@ simplification, but those two filters (superseded-renderer, and `reason === 'des
 paid for by shipping a diagnostic that declared a healthy 61 fps editor dead. They are the
 acceptance criteria for any such refactor.
 
+### The 2D path needs the same recovery, and two halves of it were missing (#678, #794)
+
+The recovery policy above is three's. The 2D/PixiJS path (`runtime/rendering/canvas2DPool.ts`,
+`gpuResourceInvalidation.ts`) needed its own — and was missing it in two independent places.
+
+**Half 1 — detection was WebGL-only (#794).** `canvas2DPool.attachCanvasListeners` registered only
+`webglcontextlost`/`webglcontextrestored` — DOM events a **WebGPU canvas never fires**. So on
+WebGPU a lost `GPUDevice` was undetected entirely: no log, no rebuild, the surface frozen on its
+last presented frame forever. Measured on an iPad mini 5 (iPadOS 26.6.1, `games/court`):
+`GPUDevice.destroy()` resolved `device.lost` for a hand-attached listener while the engine logged
+nothing, `renderer.uid` never changed, and `render()` kept returning cleanly. ⚠️ Verified by
+PERTURBATION, not by a screenshot — a capture never forces a render, so "the screen still looks
+right" only meant the last good frame was still on it; setting `visible = false` on the stage's
+children and rendering changed nothing, which is what proved the surface dead. Fixed by
+`attachDeviceLostListener` — the `device.lost` twin, mirroring `activeRenderer.ts`'s
+`attachWebGpuDeviceListeners`.
+
+⚠️ One deliberate difference from that twin: `activeRenderer` filters out `reason === 'destroyed'`
+because three destroys its own device on disposal and that code has no disposer, so it cried wolf
+at 61 FPS. `canvas2DPool` does NOT filter on reason. Pixi never calls `GPUDevice.destroy()` at all
+(`GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`), so a `'destroyed'` reason
+means something outside Pixi destroyed the device — a real loss for this surface, and a rebuild is
+the right answer.
+
+**Half 2 — a rebuilt renderer draws nothing for surviving Graphics (#678).** `rebuildSlotApp`
+deliberately keeps the surviving scene graph and re-parents it onto the new stage. **Nothing marked
+those views dirty**, and the mechanism is a per-pipe asymmetry in Pixi:
+- `GraphicsPipe.addRenderable` (`scene/graphics/shared/GraphicsPipe.mjs`) calls `_rebuild(graphics)`
+  **only `if (graphics.didViewUpdate)`**. Unmarked, the pipe mints a fresh EMPTY `GraphicsGpuData`
+  (`batches: []`) under the new renderer's uid, which contributes nothing to the batcher — so the
+  object draws nothing, silently.
+- `MeshPipe._getBatchableMesh` (`scene/mesh/shared/MeshPipe.mjs`) initialises its gpu data
+  **unconditionally**.
+
+**That asymmetry is exactly the measurement**: on an iPhone 8 (iOS 16.7.16, `games/wordweave`),
+after a context loss and a SUCCESSFUL rebuild, **48 `graphics`-pipe objects were present,
+`destroyed: false`, visible, correctly bounded — and drew nothing, while 18 `mesh`-pipe objects
+drew fine.** Fixed by `revalidateSubtreeAfterRendererRebuild` calling `onViewUpdate()` on every
+surviving view (a VIEW-level notification that sets `didViewUpdate`, not a render-group dirty
+flag).
+
+**⚠️ The comment that was measurably false.** `rebuildSlotApp`'s doc used to justify
+survive-and-reattach with *"their textures re-upload on the next draw."* They do not. It was an
+assertion nobody had watched fail — the same shape as #590 itself.
+
+**⚠️ The scar worth carrying: isolate each part of a bundled repair.** The live repair that first
+restored the frame did three things at once — deleted Pixi's `_gpuData`, set `context.dirty =
+true`, and called `onViewUpdate()` — then rendered. Only "render alone" was isolated, and the cure
+was credited to the `_gpuData` delete because a stale-GPU-cache leak was the finding already being
+chased. **That was wrong**, and it took deploying to the phone to find out: the purge ran (206
+entries) and the frame stayed blank. Isolation on the fixed build:
+
+| after the pool's own rebuild | result |
+|---|---|
+| `_gpuData` purge alone | still blank |
+| `context.dirty = true`, then render | still blank |
+| `onViewUpdate()`, then render | frame fully restored |
+
+**The `_gpuData` purge is kept, re-scoped.** It deletes only the DEAD renderer's uid — provably
+safe, since that renderer no longer exists. ⚠️ An earlier version took a "live renderer uids" set
+built from one pool's own slots and deleted every key not in it; that is **wrong**, because
+`defaultPool` and `editorCanvas2DPool` are both live at once and Pixi `TextureSource`s are
+process-global, so it would delete the editor renderer's live entry off a shared texture — a leak
+introduced by a leak fix. Renderer uids come from a monotonic counter that is never reused, so
+there is no uid-collision hazard to defend against either.
+
 ### No custom GLSL
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).

@@ -23,6 +23,12 @@ const created: Array<{ destroyed: boolean; destroyArg: unknown }> = [];
 /** Lets a test HOLD `Application.init()` open. The timeout/retry race lives entirely inside that
  *  window, and a mock that always resolves immediately cannot express it. */
 const initGate: { hold: Promise<void> | null } = { hold: null };
+/** Lets a test control a WebGPU renderer's `gpu.device.lost` promise (#794). Read at Application
+ *  CONSTRUCTION time (mirroring real Pixi, where the device exists as soon as the renderer does),
+ *  so a test must set this BEFORE the allocate()/mount() call that creates the Application it
+ *  wants wired. `null` (the default) means "no `renderer.gpu` at all" — the WebGL-backend shape
+ *  every other test in this file already relies on. */
+const deviceLostGate: { promise: Promise<{ reason?: string; message?: string }> | null } = { promise: null };
 vi.mock('pixi.js', () => {
   class Container {
     children: unknown[] = [];
@@ -40,9 +46,19 @@ vi.mock('pixi.js', () => {
   class Application {
     stage = new Container();
     ticker = { stop() {} };
-    renderer = { resize() {}, screen: { width: 0, height: 0 } };
+    // A predictable, sequential uid — mirroring Pixi's real incrementing-int `renderer.uid`
+    // scoped to the process (see gpuResourceInvalidation.ts's file header for why that matters:
+    // a REBUILT renderer's fresh uid can collide with a stale `_gpuData` key). Assigned from
+    // `created.length` BEFORE this instance is pushed, so the Nth Application built in a test
+    // (0-based, reset per test by `created.length = 0` in beforeEach) gets uid N.
+    uid = created.length;
+    renderer!: { resize(): void; screen: { width: number; height: number }; uid: number; gpu?: { device: { lost: Promise<{ reason?: string; message?: string }> } } };
     private rec = { destroyed: false, destroyArg: undefined as unknown };
-    constructor() { created.push(this.rec); }
+    constructor() {
+      this.renderer = { resize() {}, screen: { width: 0, height: 0 }, uid: this.uid };
+      if (deviceLostGate.promise) this.renderer.gpu = { device: { lost: deviceLostGate.promise } };
+      created.push(this.rec);
+    }
     async init() { if (initGate.hold) await initGate.hold; /* resolved = context acquired */ }
     destroy(arg: unknown) { this.rec.destroyed = true; this.rec.destroyArg = arg; }
   }
@@ -65,7 +81,7 @@ vi.mock('../../src/runtime/core/pointerBlockers', () => ({
 import { Canvas2DPool } from '../../src/runtime/rendering/canvas2DPool';
 
 let pool: Canvas2DPool;
-beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; pool = new Canvas2DPool(); });
+beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; pool = new Canvas2DPool(); });
 afterEach(() => { vi.restoreAllMocks(); });
 
 /** Drive the event the browser fires. jsdom has no WebGL, so the listener is what we test. */
@@ -434,5 +450,251 @@ describe('canvas2DPool.destroyPool — the boot race (#213 root cause)', () => {
     // behaviour would have made this exact slot the sole free one and handed it straight back.
     const reused = pool.allocate(7)!;
     expect(reused, 'a destroyed slot must not be reused — a DESTROY destroys').not.toBe(slot);
+  });
+});
+
+describe('canvas2DPool.rebuildSlotApp — stale _gpuData purge (#678)', () => {
+  // These are CALLER-level tests: `revalidateSubtreeAfterRendererRebuild` itself is covered by
+  // gpuResourceInvalidation.test.ts. What matters here is that `rebuildSlotApp` calls it with the
+  // DEAD renderer's own uid — NOT a caller-built "live renderer uids" exclusion set.
+  //
+  // ⚠️ An earlier version of this suite had a "uid-collision" test here, asserting that a purge
+  // built from a live-uid EXCLUSION set correctly reached an entry keyed under the REBUILT
+  // renderer's freshly-minted uid. That input cannot occur: Pixi renderer `uid`s come from a
+  // monotonic counter (`AbstractRenderer.mjs`'s `uid('renderer')`) that this repo never resets
+  // (`resetUids()` has zero callers), so two renderers can never collide on the same uid. The test
+  // asserted a real fact about the old implementation (an excluded uid IS purged) while resting it
+  // on a premise that was never true. It is replaced below with a test of what the function
+  // actually does now: purge the uid it is TOLD is dead, nothing else.
+
+  it("purges the dead renderer's own _gpuData entry from a surviving node after a rebuild", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(50)!;
+    await slot.ready;
+    const deadUid = slot.app.renderer.uid;
+
+    // A surviving display object carrying a stale `_gpuData` entry keyed under the OLD (about to
+    // be destroyed) renderer's uid — exactly what `revalidateSubtreeAfterRendererRebuild` is told
+    // to purge.
+    const stale: { _gpuData: Record<number, unknown> } = { _gpuData: { [deadUid]: 'sentinel' } };
+    slot.container.addChild(stale as unknown as never);
+
+    fireLost(slot.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(slot.app.renderer.uid, 'precondition: the rebuild produced a NEW (never-reused) uid').not.toBe(deadUid);
+    expect(
+      stale._gpuData[deadUid],
+      "the entry keyed under the renderer that was destroyed must be purged",
+    ).toBeUndefined();
+  });
+
+  it("does NOT purge an entry belonging to ANOTHER live slot's renderer (same pool)", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slotA = pool.allocate(51)!;
+    const slotB = pool.allocate(52)!;
+    await slotA.ready;
+    await slotB.ready;
+    const bUid = slotB.app.renderer.uid;
+
+    // A resource shared with (or simply cached against) slot B's still-live renderer, sitting on
+    // slot A's surviving scene graph.
+    const shared: { _gpuData: Record<number, unknown> } = { _gpuData: { [bUid]: 'owned-by-b' } };
+    slotA.container.addChild(shared as unknown as never);
+
+    fireLost(slotA.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slotA.ready;
+
+    expect(
+      shared._gpuData[bUid],
+      "an entry belonging to a DIFFERENT live slot's renderer must survive — deleting it would " +
+        'orphan a GPU object that slot still owns',
+    ).toBe('owned-by-b');
+  });
+
+  it("a rebuild whose FIRST init times out still purges the ORIGINAL dead renderer's uid on the retry", async () => {
+    // Regression pinned after a second adversarial review of #678: `deadRendererUid` used to be a
+    // plain local captured at the top of `rebuildSlotApp` and passed to the purge call AFTER the
+    // `await withTimeout(...)` for `Application.init()`. If that timed out (APP_INIT_TIMEOUT_MS,
+    // 8000ms), the function threw right there and the purge call — further down — never ran. The
+    // uid was then lost: on the RETRY, `rebuildSlotApp` starts over and only knows about the
+    // retry's OWN (never-initialized) app, not the renderer that originally died. So the original
+    // dead renderer's `_gpuData` entries were never purged by any path. The fix accumulates dead
+    // uids on `slot.pendingDeadRendererUids` across attempts instead of a single local.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(60)!;
+    await slot.ready;
+    const originalDeadUid = slot.app.renderer.uid;   // the renderer this test kills
+
+    // A surviving display object carrying a stale `_gpuData` entry keyed under the ORIGINAL
+    // renderer's uid — exactly the entry a timed-out-then-retried rebuild must still purge.
+    const stale: { _gpuData: Record<number, unknown> } = { _gpuData: { [originalDeadUid]: 'sentinel' } };
+    slot.container.addChild(stale as unknown as never);
+
+    // Make the FIRST rebuild attempt's `Application.init()` hang forever, so it is bounded only by
+    // `APP_INIT_TIMEOUT_MS` (8000ms) inside `withTimeout` and REJECTS rather than resolving.
+    initGate.hold = new Promise<void>(() => { /* never settles — simulates a dead GPU */ });
+    fireLost(slot.canvas);
+    // Past the policy's initial delay (250ms) plus the full init timeout (8000ms): the first
+    // attempt has now REJECTED, and `rendererRecovery` has scheduled a retry with backoff.
+    await vi.advanceTimersByTimeAsync(8300);
+
+    // Let the RETRY's `Application.init()` actually succeed.
+    initGate.hold = null;
+    // Past the backoff delay (500ms = delayMs * 2**1) plus the retry's (now instant) init.
+    await vi.advanceTimersByTimeAsync(700);
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(slot.initialized, 'the retry must have brought a renderer up').toBe(true);
+    expect(slot.app.renderer.uid, 'precondition: the retry produced a NEW uid').not.toBe(originalDeadUid);
+    expect(
+      stale._gpuData[originalDeadUid],
+      "the ORIGINAL dead renderer's entry must be purged, even though it died on an EARLIER " +
+        'attempt than the one that finally purges it',
+    ).toBeUndefined();
+  });
+
+  it('calls onViewUpdate on a surviving view in slot.container after a rebuild (#678 — the actual cure)', async () => {
+    // The `_gpuData` purge alone was device-measured to leave the frame blank; `onViewUpdate` is
+    // what restores it (see gpuResourceInvalidation.ts's file header for the isolation table).
+    // This is the CALLER-level check that `rebuildSlotApp` actually reaches a surviving view.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(53)!;
+    await slot.ready;
+
+    const survivingView: { onViewUpdate: () => void } = { onViewUpdate: vi.fn() };
+    slot.container.addChild(survivingView as unknown as never);
+
+    fireLost(slot.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(survivingView.onViewUpdate, 'a surviving view must be marked dirty after the rebuild').toHaveBeenCalled();
+  });
+});
+
+describe('canvas2DPool.rebuildSlotApp — TWO POOLS (cross-pool _gpuData safety)', () => {
+  // The important regression here: TWO `Canvas2DPool` instances are live at once in real usage —
+  // `defaultPool` (this file) and `editorCanvas2DPool` (`editor/rendering/editorScene2D.ts`) — and
+  // Pixi `TextureSource`s are process-global, so the SAME resource object can be shared between
+  // slots that belong to DIFFERENT pools. A purge that reasons about "every uid I know is live"
+  // from only ONE pool's own slots is an INCOMPLETE live set: it would delete the other pool's
+  // still-live renderer's entry off a shared resource, orphaning a GPU object that pool still
+  // owns. Purging only the uid `rebuildSlotApp` is TOLD is dead (its own destroyed renderer's)
+  // cannot make this mistake, because it never has to reason about what else is "live" at all.
+  //
+  // Pattern follows `scene2DBoundsSurface.test.ts`'s two-pool fixture: two independent
+  // `Canvas2DPool` instances, each with its own slots and renderers.
+
+  it("a rebuild on pool A purges only pool A's dead uid — pool B's live entry on the SAME shared node survives", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+
+    const poolA = new Canvas2DPool();
+    const poolB = new Canvas2DPool();
+    const slotA = poolA.allocate(100)!;
+    const slotB = poolB.allocate(200)!;
+    await slotA.ready;
+    await slotB.ready;
+
+    const deadUidA = slotA.app.renderer.uid;
+    const liveUidB = slotB.app.renderer.uid;
+
+    // One node, shared across both pools' scene graphs (a process-global `TextureSource` would be
+    // exactly this shape in real Pixi) — carrying a `_gpuData` entry for EACH pool's renderer.
+    const shared: { _gpuData: Record<number, unknown> } = {
+      _gpuData: { [deadUidA]: 'owned-by-a', [liveUidB]: 'owned-by-b' },
+    };
+    slotA.container.addChild(shared as unknown as never);
+
+    fireLost(slotA.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slotA.ready;
+
+    expect(shared._gpuData[deadUidA], "pool A's dead renderer entry must be purged").toBeUndefined();
+    expect(
+      shared._gpuData[liveUidB],
+      "pool B's LIVE renderer entry must survive untouched — deleting it would orphan a GPU " +
+        'object pool B still owns',
+    ).toBe('owned-by-b');
+  });
+});
+
+describe('canvas2DPool — WebGPU device.lost (#794)', () => {
+  it('a device.lost resolving marks the slot lost and requests recovery', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    let resolveLost!: (info: { reason?: string }) => void;
+    deviceLostGate.promise = new Promise((r) => { resolveLost = r; });
+    const slot = pool.allocate(40)!;
+    await slot.ready;
+    const madeBefore = created.length;
+
+    // The handler does NOT filter on `reason` — deliberately, per the doc comment on
+    // `attachDeviceLostListener`. Any resolution is a real loss.
+    resolveLost({ reason: 'unknown' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(slot.contextLost, 'a lost WebGPU device must be OBSERVABLE on the slot').toBe(true);
+
+    await vi.advanceTimersByTimeAsync(2000); // let the recovery policy's delay elapse
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(created.length, 'recovery must actually rebuild a new renderer').toBeGreaterThan(madeBefore);
+  });
+
+  it('does NOT report a phantom device loss once OUR OWN teardown has run', async () => {
+    // ⚠️ Isolates the `disposed` guard specifically, not just the overall "teardown is silent"
+    // outcome. Going through the full `pool.mount()`/`unmount()`/`destroyPool()` path also flips
+    // `slot.destroyed` and (on a rebuild) reassigns `slot.app` — either of which independently
+    // guards the handler, so a mutation removing ONLY the `disposed` check would sail through
+    // that path undetected. `detachDeviceLost()` is called BEFORE `app.destroy()` in every real
+    // teardown (see canvas2DPool.ts's own comment on `detachDeviceLost`), which is exactly the
+    // window this exercises directly: the listener has been told to stand down, but nothing else
+    // about the slot has changed yet.
+    let resolveLost!: (info: { reason?: string }) => void;
+    deviceLostGate.promise = new Promise((r) => { resolveLost = r; });
+    const slot = pool.allocate(41)!;
+    await slot.ready;
+    expect(slot.detachDeviceLost, 'precondition: the listener actually attached').toBeTypeOf('function');
+
+    slot.detachDeviceLost!(); // the disposer our own teardown calls before app.destroy()
+    expect(slot.destroyed, 'precondition: NOT a full disposal — isolates the disposed flag alone').toBeFalsy();
+
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const madeBefore = created.length;
+
+    // Exactly what a real GPUDevice.destroy() resolves `device.lost` with, as our OWN
+    // `app.destroy()` teardown provokes it.
+    resolveLost({ reason: 'destroyed' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(err, 'a detached listener must not report a phantom device loss').not.toHaveBeenCalled();
+    expect(slot.contextLost, 'must not flip to lost once the listener is detached').toBeFalsy();
+
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+    expect(created.length, 'no rebuild must be queued from a phantom device loss').toBe(madeBefore);
   });
 });
