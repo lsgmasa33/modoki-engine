@@ -3005,6 +3005,25 @@ drew fine.** Fixed by `revalidateSubtreeAfterRendererRebuild` calling `onViewUpd
 surviving view (a VIEW-level notification that sets `didViewUpdate`, not a render-group dirty
 flag).
 
+**⚠️ But the repro has the OPPOSITE POLARITY to the report, and the reported polarity was never
+reproduced or explained.** #678 was filed on a real WebKit GPU-process jetsam (owner, 2026-09-04):
+*"all letters are gone. I see grid background and crossword background."* The measurement above is
+its mirror image — the **letters survive** and the **backgrounds vanish**. The mapping is not
+ambiguous: `Text2D` becomes a Pixi `Mesh` (`Scene2D.tsx`, `new Mesh({ geometry, texture: ptex,
+shader })`), while a `Renderable2D` whose `sprite` is not an image/video ref becomes a `Graphics`
+(`spriteKind = (imageMode || videoMode) ? 'sprite' : 'graphics'`) — and wordweave's board cells,
+crossword cells and meter segments are all `sprite: 'square'`. So 48 graphics = the squares,
+18 meshes = the letters.
+
+The **class** reproduces (a rebuilt renderer silently drawing nothing for surviving views); the
+specific content mapping does not. The standing hypothesis is that #690 made the text shader
+module-scoped and reused, so meshes now recover where they did not on 2026-09-04 — **unverified,
+and nobody has re-measured it.** What this means for anyone reading this later: `onViewUpdate()`
+repairs the Graphics half and that half is device-verified, but **the letters-gone polarity has no
+measured explanation and no live repro**, so if letters vanish again after a real jetsam, do not
+assume this fix covers it. The induced `loseContext()` drives the real recovery path — same four
+log lines, same order — but it is not proof that it drives the same *failure*.
+
 **⚠️ The comment that was measurably false.** `rebuildSlotApp`'s doc used to justify
 survive-and-reattach with *"their textures re-upload on the next draw."* They do not. It was an
 assertion nobody had watched fail — the same shape as #590 itself.
@@ -3022,8 +3041,15 @@ entries) and the frame stayed blank. Isolation on the fixed build:
 | `context.dirty = true`, then render | still blank |
 | `onViewUpdate()`, then render | frame fully restored |
 
-**The `_gpuData` purge is kept, re-scoped.** It deletes only the DEAD renderer's uid — provably
-safe, since that renderer no longer exists. ⚠️ An earlier version took a "live renderer uids" set
+**The `_gpuData` purge is kept, re-scoped.** It deletes only uids of renderers that are provably
+DEAD — safe precisely because those renderers no longer exist, so no live-set reasoning is needed.
+⚠️ It is a **set**, not one uid: a rebuild whose `init()` exceeds `APP_INIT_TIMEOUT_MS` never
+reaches the purge, so each slot ACCUMULATES its dead uids (`pendingDeadRendererUids`) and whichever
+attempt finally succeeds sweeps them all. ⚠️ **Known reach limit, unmeasured:** the purge is
+per-slot, so it does NOT reach renderers destroyed via `teardownSlot` (`destroyPool`, the
+`renderAll` shrink pass, `reclaimIfUnclaimed`) — e.g. a SceneView mount/unmount leaves one
+null-valued key per shared `TextureSource`. That is a deliberate trade for the cross-pool
+correctness fix below, not an oversight. ⚠️ An earlier version took a "live renderer uids" set
 built from one pool's own slots and deleted every key not in it; that is **wrong**, because
 `defaultPool` and `editorCanvas2DPool` are both live at once and Pixi `TextureSource`s are
 process-global, so it would delete the editor renderer's live entry off a shared texture — a leak

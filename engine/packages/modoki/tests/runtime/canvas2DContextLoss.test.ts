@@ -683,8 +683,14 @@ describe('canvas2DPool — WebGPU device.lost (#794)', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const madeBefore = created.length;
 
-    // Exactly what a real GPUDevice.destroy() resolves `device.lost` with, as our OWN
-    // `app.destroy()` teardown provokes it.
+    // `{reason:'destroyed'}` is what a real `GPUDevice.destroy()` resolves `device.lost` with.
+    // ⚠️ NOT provoked by our own teardown: Pixi never calls `GPUDevice.destroy()` at all
+    // (`GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`), so this reason can
+    // only come from OUTSIDE Pixi. That is exactly why the `disposed` guard is worth pinning — the
+    // window it defends is an external destruction landing after `detachDeviceLost()`, not a
+    // self-inflicted one. (An earlier comment here claimed our own `app.destroy()` provoked it;
+    // that claim is retracted — see `gpuResourceInvalidation.ts`'s header. The WebGL twin above,
+    // `fireLost(slot.canvas)`, IS self-provoked, and its comment is correct as written.)
     resolveLost({ reason: 'destroyed' });
     await Promise.resolve();
     await Promise.resolve();
