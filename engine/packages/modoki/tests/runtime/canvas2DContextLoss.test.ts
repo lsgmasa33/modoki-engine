@@ -704,3 +704,37 @@ describe('canvas2DPool — WebGPU device.lost (#794)', () => {
     expect(created.length, 'no rebuild must be queued from a phantom device loss').toBe(madeBefore);
   });
 });
+
+describe('canvas2DPool — slot-reused label is read at FIRE time, not attach time (finding 4)', () => {
+  it('a handler-failure catch message names the CURRENT entity after the slot is reused by a different one', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let resolveLost!: (info: { reason?: string }) => void;
+    deviceLostGate.promise = new Promise((r) => { resolveLost = r; });
+
+    const slotA = pool.allocate(50)!;
+    await slotA.ready;
+    pool.release(50); // frees the slot WITHOUT destroying its Application — reuse, not rebuild
+    const slotB = pool.allocate(51)!;
+    // Precondition: this is the SAME slot/Application/listener as entity 50's — the reuse the
+    // finding is about, not a fresh one that would trivially get the right label anyway.
+    expect(slotB, 'precondition: the freed slot is reused, not recreated').toBe(slotA);
+
+    // Force the WebGPU device-lost `onLost` callback itself to throw, so
+    // `attachDeviceLostListener`'s handler-failure catch fires — the ONE place that reads
+    // `handlers.label` directly rather than through the (already-dynamic) `describe()` closure.
+    slotB.recovery!.request = () => { throw new Error('boom'); };
+
+    resolveLost({ reason: 'unknown' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(err).toHaveBeenCalled();
+    const msg = String(err.mock.calls.at(-1)![0]);
+    expect(msg, 'must name the entity the slot serves NOW').toMatch(/canvas2DPool:51\b/);
+    expect(msg, 'must NOT still name the entity it was attached under').not.toMatch(/canvas2DPool:50\b/);
+    // The #794 issue reference the shared module's generic catch message drops per-caller —
+    // canvas2DPool restores it via the label itself (see canvas2DPool.ts).
+    expect(msg).toMatch(/#794/);
+  });
+});

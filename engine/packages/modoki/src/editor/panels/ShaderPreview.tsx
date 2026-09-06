@@ -17,6 +17,8 @@ import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram 
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
 import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { makePreviewLossPolicy } from './previewLossPolicy';
 
 const SIZE = 132; // css px (square)
 
@@ -101,6 +103,32 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // `renderNow`, whose rejection can't reach this catch), so it only ever fired while a LATER run
     // had already stored ITS OWN mesh there — and destroyed that live mesh out from under it.
     let ownMesh: Mesh<MeshGeometry, Shader> | null = null;
+    // Detach for this run's GPU-context-loss listeners (#795) — a no-op until `app.init()`
+    // succeeds and there is a canvas/device worth watching. Reassigned below; called from
+    // `teardown` so a lost context tears the panel down exactly once, from the same path as
+    // unmount.
+    let detachLoss: () => void = () => {};
+
+    // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context/device,
+    // so a lost context tears the panel down exactly the same way an unmount would. Idempotent by
+    // construction: every step below already guards on state a first run clears (`app.renderer`
+    // null after the first `destroy(true)`, `stateRef.current.mesh` null after the first
+    // `destroyMesh`, `texUrls` emptied, `markDestroyed`'s own `contextLive` guard), so calling it
+    // twice (once from a loss, once from unmount) is safe.
+    const teardown = () => {
+      disposed = true;
+      stateRef.current.serial++;
+      detachLoss();
+      destroyMesh(stateRef.current.mesh); // must run BEFORE nulling the ref below
+      // Hand back every texture this panel was holding (#701) — the panel is going away, so its
+      // veto on the shared unload must go with it or the texture is pinned for the process.
+      for (const u of stateRef.current.texUrls) releasePanelTexture(u);
+      stateRef.current.texUrls = [];
+      stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
+      if (!app.renderer) { /* init never finished */ } else app.destroy(true);
+      markDestroyed();
+      canvas.remove();
+    };
 
     // Every async-side destroy is guarded on `app.renderer` (Pixi nulls it in destroy()): the
     // cleanup below may already have torn the app down while we were parked on an await, and a
@@ -116,6 +144,12 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         // stale/disposed resume still pairs its `app.destroy(true)` with a decrement.
         contextLive = true;
         noteGpuContextCreated();
+        // Wire loss detection (#795) as soon as the context exists — a preview left open across
+        // a GPU driver reset would otherwise stay blank forever with no error anywhere.
+        detachLoss = attachRendererLossHandling(
+          { canvas, device: (app.renderer as unknown as { gpu?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.gpu?.device },
+          { label: 'ShaderPreview', isStale: () => disposed || stateRef.current.serial !== serial, ...makePreviewLossPolicy({ label: 'ShaderPreview', teardown }) },
+        );
         if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); markDestroyed(); return; }
         app.ticker.stop();
         const program = await buildPixiShaderProgram(path);
@@ -138,19 +172,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
       }
     })();
 
-    return () => {
-      disposed = true;
-      stateRef.current.serial++;
-      destroyMesh(stateRef.current.mesh); // must run BEFORE nulling the ref below
-      // Hand back every texture this panel was holding (#701) — the panel is going away, so its
-      // veto on the shared unload must go with it or the texture is pinned for the process.
-      for (const u of stateRef.current.texUrls) releasePanelTexture(u);
-      stateRef.current.texUrls = [];
-      stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
-      if (!app.renderer) { /* init never finished */ } else app.destroy(true);
-      markDestroyed();
-      canvas.remove();
-    };
+    return () => { teardown(); };
   }, [path, is2D]);
 
   // Re-bind uniforms/textures + re-render when the shader data (param defaults) changes.

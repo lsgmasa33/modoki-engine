@@ -35,6 +35,10 @@ import { getWebGPUSupported } from './gpuDetect';
 import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
 import { createRendererRecovery, type RendererRecovery } from './rendererRecovery';
+import {
+  attachContextLossListeners,
+  attachDeviceLostListener as attachDeviceLostListenerPrimitive,
+} from './rendererLossHandling';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { noteGpuContextCreated, noteGpuContextDestroyed, liveGpuContextCount } from '../core/gpuContextTracking';
 import { revalidateSubtreeAfterRendererRebuild } from './gpuResourceInvalidation';
@@ -212,7 +216,11 @@ export class Canvas2DPool {
 
   /** Wire a slot's canvas: pointer passthrough + GPU-context-loss handling. Called for the
    *  original canvas and again for any REPLACEMENT one, so a rebuilt slot is not left deaf to a
-   *  second loss (which is exactly how a recovered surface would quietly die again). */
+   *  second loss (which is exactly how a recovered surface would quietly die again).
+   *
+   *  The detection primitives (event wiring, `preventDefault`, the stale-teardown guard) live in
+   *  the shared `rendererLossHandling.ts` (#795) — this method supplies only the POLICY: the
+   *  #213 log line and what a loss/restore does to this slot. */
   private attachCanvasListeners(slot: Canvas2DSlot, canvas: HTMLCanvasElement): void {
     slot.unpassthrough?.();
     slot.unpassthrough = registerPointerPassthrough(canvas);
@@ -221,44 +229,46 @@ export class Canvas2DPool {
     // it has to, because Pixi fires a context loss during that destroy, which is earlier than this
     // point. A second detach here would be unreachable, and worse: it would mask the real one, so
     // removing either would leave the tests green. One mechanism, one test that fails without it.
-    const onLost = (e: Event) => {
-      // ⚠️ OUR OWN teardown fires this. Pixi's `GlContextSystem.destroy()` ends with
+    slot.detachCanvasListeners = attachContextLossListeners(canvas, {
+      // Lazy for the same reuse reason as the WebGPU twin's label below (`attachDeviceLostListener`
+      // in this same file) — a slot is reused across entities (`reclaimIfUnclaimed` nulls
+      // `entityId`, `takeFreeSlot` reassigns it) while its attach call runs only once. UNLIKE that
+      // twin, though, this half is unreachable TODAY (mutation-checked, finding 5, third
+      // adversarial review of #795): `describe` below is always supplied here, and
+      // `rendererLossHandling.ts`'s `logLoss` reads `label` only when `describe` is absent — the
+      // WebGL half has no separate handler-failure catch that reads it directly, the way the
+      // WebGPU `.catch()` does. Kept as forward-defence in case `describe` is ever dropped here, or
+      // a later change adds such a catch — replacing this with a fixed string leaves every test in
+      // the repo green.
+      label: () => `canvas2DPool:${slot.entityId}`,
+      // ⚠️ OUR OWN teardown fires a context loss. Pixi's `GlContextSystem.destroy()` ends with
       // `extensions.loseContext?.loseContext()` — an EXPLICIT forced context loss on every
       // `app.destroy()` — and it removes only Pixi's own listeners, not ours. Without this guard a
       // perfectly correct teardown emits two loud errors swearing the surface will stay blank and
       // citing #213, which is exactly the misleading diagnostic that made #213 cost what it did.
-      if (slot.destroyed) return;
-      // preventDefault is what makes the browser willing to restore the context at all; three's
-      // WebGL backend does this for the 3D canvas, and nothing was doing it for ours.
-      e.preventDefault();
-      slot.contextLost = true;
-      console.error(
+      isStale: () => !!slot.destroyed,
+      describe: () =>
         `[canvas2DPool] WebGL CONTEXT LOST on the 2D canvas for entity ${slot.entityId} — every ` +
         `draw into it is now a no-op and the surface will stay BLANK (size, opacity and DOM ` +
         `position all stay correct, which is why this looks like "nothing renders"). Rebuilding. ` +
         `See #213.`,
-      );
-      // Requested on LOSS as well as on restore, deliberately. Waiting only for
-      // `webglcontextrestored` is the tidier reading of the spec and it is a BET that the browser
-      // fires it — measured on an iPhone 8, it does not: the context died at boot and was never
-      // restored, so a restore-only trigger would wait forever.
-      slot.recovery?.request();
-    };
-    const onRestored = () => {
-      if (slot.destroyed) return;
-      slot.contextLost = false;
-      slot.recovery?.request();
-    };
-    canvas.addEventListener('webglcontextlost', onLost);
-    canvas.addEventListener('webglcontextrestored', onRestored);
+      onLost: () => {
+        slot.contextLost = true;
+        // Requested on LOSS as well as on restore, deliberately. Waiting only for
+        // `webglcontextrestored` is the tidier reading of the spec and it is a BET that the
+        // browser fires it — measured on an iPhone 8, it does not: the context died at boot and
+        // was never restored, so a restore-only trigger would wait forever.
+        slot.recovery?.request();
+      },
+      onRestored: () => {
+        slot.contextLost = false;
+        slot.recovery?.request();
+      },
+    });
     // A disposer, because these listeners close over `slot` — NOT over the canvas they sit on. A
     // replaced canvas whose listeners were never removed goes on mutating the LIVE slot: the
     // forced loss from destroying the old app would set `contextLost = true` on the freshly
     // rebuilt slot and request a redundant second rebuild. See `rebuildSlotApp`.
-    slot.detachCanvasListeners = () => {
-      canvas.removeEventListener('webglcontextlost', onLost);
-      canvas.removeEventListener('webglcontextrestored', onRestored);
-    };
   }
 
   /** WebGPU twin of `attachCanvasListeners`'s context-loss half (#794). `webglcontextlost`/
@@ -289,33 +299,29 @@ export class Canvas2DPool {
     })?.gpu?.device;
     if (!device?.lost) return; // WebGL backend (or a device that hasn't come up) — nothing to wire
 
-    let disposed = false;
-    void device.lost.then((info) => {
+    // The detection primitive lives in the shared `rendererLossHandling.ts` (#795) — this method
+    // supplies only the POLICY: the #794 log line, the stale/superseded guard below, and what a
+    // loss does to this slot.
+    slot.detachDeviceLost = attachDeviceLostListenerPrimitive(device, {
+      // Lazy for the same reason as `attachCanvasListeners`'s label above — a slot outlives many
+      // entities. The `(#794)` tag restores the issue reference the shared module's generic
+      // handler-failure catch message (rendererLossHandling.ts) doesn't carry per-caller.
+      label: () => `canvas2DPool:${slot.entityId} (#794)`,
       // Our own teardown (`app.destroy()`) does NOT resolve `device.lost` — Pixi never calls
-      // `GPUDevice.destroy()` (see this method's doc comment above). This listener is defensive:
-      // it costs nothing to keep attached, is required if Pixi ever adopts `device.destroy()`, and
-      // is correct today if something OUTSIDE Pixi destroys the device. `disposed` is set by our
-      // own detach; `slot.app !== app` means a later rebuild already superseded this listener's
-      // Application.
-      if (disposed || slot.destroyed || slot.app !== app) return;
-      slot.contextLost = true;
-      console.error(
+      // `GPUDevice.destroy()` (see this method's doc comment above). This guard is defensive: it
+      // costs nothing to keep, is required if Pixi ever adopts `device.destroy()`, and is correct
+      // today if something OUTSIDE Pixi destroys the device. `slot.app !== app` means a later
+      // rebuild already superseded this listener's Application.
+      isStale: () => !!slot.destroyed || slot.app !== app,
+      describe: (e) =>
         `[canvas2DPool] WebGPU DEVICE LOST on the 2D canvas for entity ${slot.entityId} ` +
-        `(reason: ${info?.reason ?? 'unknown'}) — every draw into it is now a no-op and the ` +
+        `(reason: ${e.reason ?? 'unknown'}) — every draw into it is now a no-op and the ` +
         `surface will stay BLANK until it does. Rebuilding. See #794.`,
-      );
-      slot.recovery?.request();
-    }).catch((err: unknown) => {
-      // `GPUDevice.lost` resolves per spec and never rejects, so this guards a mock/polyfill
-      // that rejects it rather than a real WebGPU implementation. What it actually catches in
-      // practice is a THROW from the handler body above (`console.error`, `slot.recovery?.request()`)
-      // — i.e. the #794 recovery trigger itself failing. That must not be silent.
-      console.error(
-        `[canvas2DPool] WebGPU device-lost handler failed for the 2D canvas on entity ` +
-        `${slot.entityId} — recovery may not have been requested. See #794.`, err,
-      );
+      onLost: () => {
+        slot.contextLost = true;
+        slot.recovery?.request();
+      },
     });
-    slot.detachDeviceLost = () => { disposed = true; };
   }
 
   /** Bring a NEW Pixi Application up on a slot whose GPU context died (#213).

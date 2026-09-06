@@ -21,8 +21,11 @@ import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scen
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
 import { collectMaterialResources, disposeOwnedResources } from './modelPreviewResources';
+import { gateModelLoad, shouldAttachLoadedModel } from './modelPreviewLoss';
 
 interface Props {
   /** Source GLB URL — e.g. `/games/.../island.glb`. Suffixes are computed
@@ -80,6 +83,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     ownedTextures: Set<THREE.Texture>;
     raf: number | null;
     activeLevel: LodChoice;
+    /** Set by `teardown()` (finding 3a, adversarial review of #795) — the signal an in-flight
+     *  "load the model" effect has no other way to receive, since that effect's OWN `cancelled`
+     *  flag is set only by ITS cleanup, which does not run when `teardown` fires from a
+     *  GPU-context loss instead of an unmount or a [hasLods] re-run. */
+    aborted: boolean;
     /** Render-on-demand flag (F7). The tick loop only submits a GPU frame when
      *  this is set — by the OrbitControls 'change' event (orbit/zoom/pan +
      *  damping settle) or by content changes (model load, wireframe, reframe).
@@ -126,6 +134,22 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // imported PBR materials read the same here as in the live scene.
     applyRendererColorConfig(renderer);
     container.appendChild(renderer.domElement);
+    // Loss detection (#795) — wired as soon as the context exists. `stateRef.current === null`
+    // doubles as the stale check: `teardown` below nulls it BEFORE doing anything else, and
+    // React always runs this effect's cleanup (which calls `teardown`) before a later run of
+    // this same effect (the [hasLods] re-run) attaches its own listener, so a stale event from a
+    // superseded renderer can never reach a live `stateRef.current`.
+    const detachLoss = attachRendererLossHandling(
+      { canvas: renderer.domElement },
+      {
+        label: 'ModelPreview', isStale: () => stateRef.current === null,
+        // This panel is embedded in the Model Inspector (`ModelAssetView`, mounted with no `key`)
+        // — selecting a different model re-populates THIS SAME instance rather than unmounting it,
+        // so the default "reopen the panel" hint is wrong (finding 6, third adversarial review of
+        // #795; same shape as `previewScene.ts`'s Mesh/Material Preview3DShell, finding 2).
+        ...makePreviewLossPolicy({ label: 'ModelPreview', teardown: () => teardown(), recoverHint: REOPEN_INSPECTOR_HINT }),
+      },
+    );
 
     const scene = new THREE.Scene();
     // IBL: a neutral RoomEnvironment gives MeshStandardMaterial the indirect
@@ -168,7 +192,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     stateRef.current = {
       renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
       ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
-      raf: null, activeLevel: hasLods ? 'auto' : 0,
+      raf: null, activeLevel: hasLods ? 'auto' : 0, aborted: false,
       needsRender: true, // draw the first frame
     };
 
@@ -186,10 +210,19 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     };
     stateRef.current.raf = requestAnimationFrame(tick);
 
-    return () => {
+    // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context, so a
+    // loss tears the preview down exactly the same way an unmount would. Idempotent by
+    // construction: `stateRef.current` is nulled FIRST, so a second call sees `s === null` and
+    // returns immediately.
+    const teardown = () => {
       const s = stateRef.current;
       stateRef.current = null;
       if (!s) return;
+      // Signal any in-flight "load the model" effect to stop attaching/collecting onto this dead
+      // scene (finding 3a, adversarial review of #795) — that effect closes over THIS SAME state
+      // object, so it can observe the flip even though `stateRef.current` above is already null.
+      s.aborted = true;
+      detachLoss();
       if (s.raf !== null) cancelAnimationFrame(s.raf);
       s.controls.removeEventListener('change', onControlsChange);
       s.controls.dispose();
@@ -210,12 +243,20 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
       try { container.removeChild(s.renderer.domElement); } catch { /* already gone */ }
     };
+
+    return () => { teardown(); };
   }, [hasLods]);
 
   // ── Load / reload the model when the source or LOD choice changes ────────
   useEffect(() => {
-    const s = stateRef.current;
-    if (!s) return;
+    const s0 = stateRef.current;
+    // `!s0` means the mount effect's teardown already ran (unmount, or #795's GPU-loss path) —
+    // this used to return BEFORE `setLoading(true)`, so the NEXT model selection after a loss
+    // silently left `loading: false, error: null`: a permanently empty box reporting success
+    // (finding 3b, adversarial review of #795).
+    const gate = gateModelLoad(!!s0);
+    if (!gate.proceed) { setLoading(false); setError(gate.error); return; }
+    const s = s0!; // non-null from here down — every use below is unchanged from before finding 3
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -273,16 +314,25 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
 
     const buildSingle = (gltf: { scene: THREE.Group }) => {
       const root = gltf.scene;
-      // Collect FIRST and unconditionally: a cancelled run's parsed document must still be
-      // owned, or it leaks (#537 — this is the path that leaked).
+      // A GPU-loss teardown (finding 3a) means there is no NEXT `clearModel()` coming to sweep
+      // whatever gets collected below — collecting into `s.ownedGeometries`/`ownedMaterials` would
+      // leak them forever. Dispose the parsed document directly instead and stop here — the same
+      // `disposeSourceModel` helper used for the OBJ/FBX/DAE path below, not a second sweep (an
+      // earlier version of this fix grew its own geometry/material-only copy that leaked every
+      // texture, finding 1, second adversarial review of #795).
+      if (s.aborted) { disposeSourceModel(root); return; }
+      // Collect FIRST and unconditionally (for the ORDINARY cancel case below): a cancelled run's
+      // parsed document must still be owned, or it leaks (#537 — this is the path that leaked).
       root.traverse((child) => {
         const m = child as THREE.Mesh;
         if (m.isMesh) collectMaterials(m);
       });
       // ATTACHING is what must be conditional. The next effect run calls clearModel()
       // synchronously before its own await, so a cancelled run adding here would leave BOTH
-      // models as children of modelRoot, rendering together until the next clear.
-      if (!cancelled) s.modelRoot.add(root);
+      // models as children of modelRoot, rendering together until the next clear. (`s.aborted` is
+      // always false past the early return above, so `shouldAttachLoadedModel` no longer takes it
+      // — finding 7, third adversarial review of #795.)
+      if (shouldAttachLoadedModel(cancelled)) s.modelRoot.add(root);
     };
 
     const buildLodAuto = async () => {
@@ -293,6 +343,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
         const url = bust(assetUrl(sourceUrl + lodUrlSuffix(i)));
         const gltf = await (await getLoader()).loadAsync(url);
         const root = gltf.scene;
+        // Same reasoning as `buildSingle` (finding 3a) — a GPU-loss teardown leaves no next
+        // `clearModel()` to sweep a collected-but-never-attached level, so dispose it directly.
+        if (s.aborted) { disposeSourceModel(root); return; }
         // Switch distance: we don't know the model's lodDistances here without
         // an extra fetch; use linearly-spaced placeholders so orbit-back/forward
         // visibly switches levels. The "Auto" option is for visual verification,
@@ -332,7 +385,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // imported. (LODs never apply pre-import, so this path ignores lodChoice.)
     const buildFromSource = async () => {
       const obj = await loadSourceModel(sourceUrl);
-      if (cancelled) { disposeSourceModel(obj); return; }
+      // `s.aborted` (finding 3a) joins the existing `cancelled` check here — same disposal, two
+      // different reasons nothing else will ever attach or sweep this parsed model.
+      if (cancelled || s.aborted) { disposeSourceModel(obj); return; }
       s.modelRoot.add(obj);
       s.sourceRoot = obj;
       obj.traverse((child) => {
@@ -355,15 +410,19 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           const url = bust(hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl));
           const gltf = await (await getLoader()).loadAsync(url);
           buildSingle(gltf as { scene: THREE.Group });
-          if (cancelled) return;
+          if (cancelled || s.aborted) return;
           frameCamera();
         }
-        if (cancelled) return;
+        // `s.aborted` (finding 3, adversarial review of #795) joins `cancelled` in every one of
+        // these post-await checks: a loss can land after any of the branches above already
+        // started, and reaching `setLoading(false)` here would report a successfully-loaded model
+        // for a scene that stopped drawing when the loss teardown ran.
+        if (cancelled || s.aborted) return;
         applyWireframe();
         s.needsRender = true; // new geometry/materials are in the scene
         setLoading(false);
       } catch (e) {
-        if (cancelled) return;
+        if (cancelled || s.aborted) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       }

@@ -3056,6 +3056,78 @@ process-global, so it would delete the editor renderer's live entry off a shared
 introduced by a leak fix. Renderer uids come from a monotonic counter that is never reused, so
 there is no uid-collision hazard to defend against either.
 
+### Detection is a shared contract now; policy stays per-surface (#795)
+
+The two sections above cover the 3D viewports (`activeRenderer.ts`) and the 2D canvas pool
+(`canvas2DPool.ts`) — but detection used to be wired **per construction site**, and three other
+live renderer surfaces had none at all: `ShaderPreview.tsx`'s Pixi `Application`, and
+`previewScene.ts`'s + `ModelPreview.tsx`'s bare `THREE.WebGLRenderer`. A lost context left each
+permanently blank with no error anywhere — the canvas keeps its size and DOM position, the ECS
+stays correct, draws keep being issued and do nothing. `ParticleEditor.tsx` had detection only by
+*inheriting* the 3D viewports' global slot, which another renderer can take out from under it.
+
+`runtime/rendering/rendererLossHandling.ts` is now the shared DETECTION contract for all three
+renderer classes a construction site can create — `THREE.WebGLRenderer`, `WebGPURenderer` (via
+`makeWebGPURenderer`), and Pixi's `Application`. `attachRendererLossHandling` wires whichever
+halves a renderer actually has: `attachContextLossListeners` (the `webglcontextlost` DOM event) and
+`attachDeviceLostListener` (the `GPUDevice.lost` promise). It is detection only — policy is each
+caller's own `onLost`, exactly as before.
+
+**Who rebuilds vs who tears down, and why:**
+
+| Surface | On loss | Why |
+|---|---|---|
+| `canvas2DPool` slots | rebuild in place | mid-scene 2D content must not go permanently blank |
+| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget | the GameView/SceneView must not stay blank mid-play |
+| `ShaderPreview`, `previewScene` (Mesh/Material previews), `ModelPreview`, `ParticleEditor` | log loudly, then run the panel's OWN existing teardown | these panels are cheap to reopen, and rebuild-in-place would land this decision inside `canvas2DPool.ts`, where #801 is a pending, separate design change to that machinery |
+
+The four previews share ONE policy, `editor/panels/previewLossPolicy.ts`'s
+`makePreviewLossPolicy`: log a distinguishing line, then call the panel's existing teardown exactly
+once — guarded so a throw inside teardown can't escape the event handler, and so a `webglcontextlost`
+plus a later `device.lost` resolution on the same surface can't run it twice.
+
+⚠️ **The shared module deliberately does NOT feed `activeRenderer`'s recovery budget** — that
+budget is 3 losses per 60s **global to the process**, and exhausting it sets `recoveryAbandoned` for
+every surface. Routing editor previews into it would let a flapping preview panel disarm the
+GameView's own recovery. `canvas2DPool` already stayed out of it for the same reason, and still does.
+
+**The guard, and the trap it was written around.**
+`engine/tests/architecture/rendererLossHandling.test.ts` pairs every renderer/`Application`
+construction site with an attach call into the shared module — sibling to `glContextRelease.test.ts`
+(RELEASE-on-teardown), checking a different property (DETECT-on-construction) over the same file
+census, kept as two files so a red in one is never ambiguous with the other. Its first draft also
+accepted `setActiveRenderer(` as evidence of detection, which made it unable to police
+`ParticleEditor` — that panel calls `setActiveRenderer` too, so deleting its attach call left the
+guard green. The three surfaces that legitimately wire detection elsewhere — `SceneView.tsx` and
+`scene3DSync.ts` via `core/activeRenderer.ts`'s `attachGpuFaultListeners`, and `Scene3D.tsx` via its
+own `onRendererLost` + `createRendererRecovery` — are now allowlisted BY NAME instead, so the
+exemption cannot spread to a new construction site.
+
+⚠️ **The census must name every FACTORY, not just the `new` expressions.** The same guard's first
+draft matched `makeWebGPURenderer(` but not `createRenderer(`, and `Scene3D.tsx` — the shipped-game
+3D surface — reaches its renderer only through the latter. It was therefore matched by nothing:
+not policed, and not allowlisted either, so nothing said it was uncovered. A construction site that
+names a factory builds a renderer just as surely as one that says `new`. Found by this change's own
+close-out sweep, after the guard had already been mutation-checked against two other panels.
+
+That older route's own detection lives in a single global slot another renderer can take — filed,
+not fixed: **#802**.
+
+**Measured, not inferred (2026-09-06, Electron editor on macOS).** All four preview surfaces were
+driven with a REAL loss and each produced its log line and tore down: `ModelPreview` and
+`previewScene` (via MaterialPreview) through `WEBGL_lose_context.loseContext()` on the **WebGL**
+path, and `ShaderPreview` (Pixi) and `ParticleEditor` (three) through `GPUDevice.destroy()` on the
+**WebGPU** path. The `ShaderPreview` run is the load-bearing one: it is the only Pixi surface, so it
+is the only check that exercises `attachDeviceLostListener` and the `app.renderer.gpu?.device` cast
+— the two WebGL runs touch neither. `ModelPreview`'s GPU context was accounted destroyed rather
+than stranded (`gpuMemory` went `created=6,destroyed=5` -> one fewer live context), and reselecting
+the asset brought up a fresh, non-lost context.
+
+⚠️ **What that does NOT establish: pixel-correct rendering after a reopen.** A `readPixels` probe on
+the rebuilt canvas returned zeros, which is what an un-`preserveDrawingBuffer` canvas returns after
+compositing regardless of what it drew — evidence of nothing either way. The reopen is verified as
+far as "a fresh, healthy context is up"; nobody has looked at the pixels.
+
 ### No custom GLSL
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).

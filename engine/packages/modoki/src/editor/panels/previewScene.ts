@@ -15,6 +15,8 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
 
 export interface PreviewSceneHandle {
   scene: THREE.Scene;
@@ -33,6 +35,11 @@ export interface PreviewSceneHandle {
   clearContent(): void;
   /** Tear down the loop, controls, content, env, and renderer. */
   dispose(): void;
+  /** True once `dispose()` has run — including from a GPU-context-loss teardown fired MID-MOUNT
+   *  (#795), not just from the caller's own unmount. A caller must check this before populating:
+   *  a dead handle's `contentRoot` will never draw again, and its scene/renderer are already gone
+   *  (finding 2, adversarial review of #795). */
+  readonly disposed: boolean;
 }
 
 export interface PreviewSceneOptions {
@@ -57,11 +64,34 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
   // decrement twice.
   noteGpuContextCreated();
   let contextLive = true;
+  // Guards both `dispose()` (idempotent — a lost-context teardown and an unmount can both call
+  // it) and the loss listener's `isStale` check below (#795): `dispose()` itself forces a context
+  // loss, and without this a correct teardown would report itself as a fault. Named `isDisposed`
+  // (not `disposed`, which is the PUBLIC getter below) so the two can't be confused for one another.
+  let isDisposed = false;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(width, height);
   renderer.setClearColor(background, 1);
   applyRendererColorConfig(renderer);
   container.appendChild(renderer.domElement);
+  const detachLoss = attachRendererLossHandling(
+    { canvas: renderer.domElement },
+    {
+      label: 'previewScene',
+      isStale: () => isDisposed,
+      ...makePreviewLossPolicy({
+        label: 'previewScene',
+        teardown: () => dispose(),
+        // Unlike ShaderPreview/ParticleEditor, this handle's caller (Preview3DShell) does NOT
+        // unmount on the recovery path a reader would expect: selecting a different Mesh/Material
+        // asset just changes `resetKey` and re-populates in place. "Reopen the panel" is wrong
+        // advice here — the Inspector has to be closed and reopened, not the asset reselected
+        // (finding 2, adversarial review of #795). `ModelPreview.tsx` shares this exact shape
+        // (finding 6) and overrides with the same constant.
+        recoverHint: REOPEN_INSPECTOR_HINT,
+      }),
+    },
+  );
 
   const scene = new THREE.Scene();
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -141,10 +171,18 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
   };
 
   const dispose = () => {
+    // clearContent() runs on EVERY call, even a repeat one — the guard below prevents double
+    // renderer teardown, not cleanup of content added AFTER the first dispose. A loss teardown
+    // (#795) can fire mid-mount, and if the caller then adds more content before noticing (it
+    // shouldn't, once it checks `disposed` — but this is the backstop), a second `dispose()` call
+    // from unmount must still sweep it, or it leaks (finding 2, adversarial review of #795).
+    clearContent();
+    if (isDisposed) return; // idempotent from here down — a lost-context teardown and an unmount can both call this
+    isDisposed = true;
+    detachLoss();
     if (raf !== null) cancelAnimationFrame(raf);
     controls.removeEventListener('change', onControlsChange);
     controls.dispose();
-    clearContent();
     scene.environment = null;
     envTexture.dispose();
     // forceContextLoss BEFORE dispose: dispose() frees programs/RTs but does NOT
@@ -159,5 +197,8 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
     try { container.removeChild(renderer.domElement); } catch { /* already gone */ }
   };
 
-  return { scene, camera, controls, contentRoot, requestRender, frameContent, setWireframe, clearContent, dispose };
+  return {
+    scene, camera, controls, contentRoot, requestRender, frameContent, setWireframe, clearContent, dispose,
+    get disposed() { return isDisposed; },
+  };
 }

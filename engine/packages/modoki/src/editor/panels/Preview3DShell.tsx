@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPreviewScene, type PreviewSceneHandle } from './previewScene';
+import { gatePopulate } from './preview3DShellLossGuard';
 
 const PREVIEW_W = 320;
 const PREVIEW_H = 220;
@@ -55,17 +56,29 @@ export function Preview3DShell({ populate, resetKey, width = PREVIEW_W, height =
   // new closure each render doesn't retrigger (only resetKey drives a rebuild).
   useEffect(() => {
     const h = handleRef.current;
-    if (!h) return; // WebGL unavailable → error already shown
+    const gate = gatePopulate(h);
+    if (!gate.proceed) {
+      // `error === null` means WebGL was never available and the mount effect already shows that
+      // — this is only the SECOND reason a handle can be un-populatable: one that died to a
+      // GPU-context-loss teardown after construction (#795, finding 1 of the adversarial review).
+      if (gate.error) { handleRef.current = null; setError(gate.error); setLoading(false); }
+      return;
+    }
     const ac = new AbortController();
     setLoading(true);
     setError(null);
-    h.clearContent();
+    h!.clearContent();
     (async () => {
       try {
-        await populateRef.current(h, ac.signal);
+        await populateRef.current(h!, ac.signal);
         if (ac.signal.aborted) return;
-        h.setWireframe(wireframeRef.current);
-        h.frameContent();
+        // The handle can die WHILE `populate` is awaiting (a loss mid-populate) — re-check after
+        // the await, not just before it, or this reports success onto a scene that already
+        // stopped drawing (finding 2, adversarial review of #795).
+        const after = gatePopulate(h);
+        if (!after.proceed) { handleRef.current = null; setError(after.error); setLoading(false); return; }
+        h!.setWireframe(wireframeRef.current);
+        h!.frameContent();
         setLoading(false);
       } catch (e) {
         if (ac.signal.aborted) return;

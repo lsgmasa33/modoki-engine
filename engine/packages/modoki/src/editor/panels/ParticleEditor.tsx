@@ -14,6 +14,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { makeWebGPURenderer } from '../../runtime/rendering/scene3DSync';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { makePreviewLossPolicy } from './previewLossPolicy';
+import { canApplyParticleDef, handleParticleLossTeardown } from './particle/particlePreviewLoss';
 import { particleBackend } from '../../runtime/particles/particleBackend';
 import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
@@ -79,6 +82,11 @@ export default function ParticleEditor() {
   // see `isMissingAsset` in the load effect.
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
   const [reloadNonce, setReloadNonce] = useState(0); // bump (Retry) to re-run the load effect
+  // Set once a GPU-context/device loss tears the viewport down (finding 7, third adversarial
+  // review of #795). Before this, a loss correctly blocked the zombie apply-effect (finding 1) but
+  // showed the user NOTHING — `sceneReady` has no overlay consumer, so the surface just went
+  // console.error + a frozen last frame, unlike ModelPreview/Preview3DShell's visible error state.
+  const [lost, setLost] = useState(false);
   const [showFloor, setShowFloorState] = useState(loadParticleEditorShowFloor);
   const setShowFloor = (next: boolean | ((prev: boolean) => boolean)) => {
     setShowFloorState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveParticleEditorShowFloor(on); return on; });
@@ -92,6 +100,11 @@ export default function ParticleEditor() {
     let raf = 0;
     let resizeRaf = 0;
     const timer = new THREE.Timer(); // THREE.Clock is deprecated in r184
+    // Detach for this run's own GPU-context-loss listeners (#795, #802) — wired directly rather
+    // than relying on `setActiveRenderer`'s global-slot detection, which is conditional on
+    // winning a slot it can lose (that separate defect is #802, not fixed here). Reassigned once
+    // the renderer exists; called from `cleanupRef.current` below.
+    let detachLoss: () => void = () => {};
 
     (async () => {
       let renderer: Awaited<ReturnType<typeof makeWebGPURenderer>>;
@@ -105,6 +118,24 @@ export default function ParticleEditor() {
       // the effect's cleanup a no-op and the renderer + loop + ResizeObserver alive forever.
       if (disposed) { disposeActiveRenderer(); renderer.dispose(); renderer.domElement.remove(); return; }
       rendererRef.current = renderer;
+      detachLoss = attachRendererLossHandling(
+        { canvas: renderer.domElement, device: (renderer as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
+        { label: 'ParticleEditor', isStale: () => disposed, ...makePreviewLossPolicy({
+          label: 'ParticleEditor',
+          // Beyond the renderer/handle disposal below, a mid-mount loss must also clear the
+          // state the "apply def" effect gates on (finding 1, adversarial review of #795) — or
+          // this panel stays mounted as a zombie that recreates a particle handle on whatever
+          // renderer now owns the active-renderer slot the next time a slider moves.
+          teardown: () => {
+            disposed = true;
+            setLost(true); // give the user a visible state instead of a frozen, silent viewport (finding 7)
+            handleParticleLossTeardown(
+              { setSceneReady, clearScene: () => { sceneRef.current = null; } },
+              () => { cleanupRef.current?.(); cleanupRef.current = null; },
+            );
+          },
+        }) },
+      );
 
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0x14141f);
@@ -173,6 +204,7 @@ export default function ParticleEditor() {
 
       // expose cleanup via closure captured below
       cleanupRef.current = () => {
+        detachLoss();
         cancelAnimationFrame(raf);
         cancelAnimationFrame(resizeRaf);
         ro.disconnect();
@@ -300,18 +332,20 @@ export default function ParticleEditor() {
 
   // ── Apply def to the live preview + shared cache ──
   useEffect(() => {
-    if (!def || !sceneReady || !asset) return;
-    const scene = sceneRef.current;
-    if (!scene) return;
+    // Shared with the loss-teardown test (finding 1) so the exact condition a mid-mount loss must
+    // block is pinned in one place, not re-derived here and in the test.
+    if (!canApplyParticleDef({ sceneReady, scene: sceneRef.current }, !!def, !!asset)) return;
+    const scene = sceneRef.current!;
+    const d = def!; // non-null: canApplyParticleDef's `hasDef` arg above is exactly `!!def`
     if (!handleRef.current) {
       // create on the fresh handle (getObject3D is valid here)
-      const h = particleBackend.create(def);
+      const h = particleBackend.create(d);
       const obj = particleBackend.getObject3D(h);
       scene.add(obj);
       handleRef.current = h;
       objRef.current = obj;
     } else {
-      particleBackend.setDef(handleRef.current, def); // live edit (store already updated the shared cache)
+      particleBackend.setDef(handleRef.current, d); // live edit (store already updated the shared cache)
     }
     // `asset` is only read for a truthiness guard; we key on its stable path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -417,6 +451,14 @@ export default function ParticleEditor() {
       {/* Viewport */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+        {/* A GPU-context/device loss tore the viewport down (finding 7, third adversarial review
+            of #795) — without this the panel went silent (console.error + a frozen last frame)
+            while ModelPreview/Preview3DShell both show a visible error for the same event. */}
+        {lost && (
+          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#e88', fontSize: 11, padding: 8, textAlign: 'center', background: 'rgba(20,20,31,0.85)' }}>
+            Particle preview unavailable — GPU context was lost. Reopen the panel to rebuild it.
+          </div>
+        )}
         {/* Timeline toolbar */}
         {def && (
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>

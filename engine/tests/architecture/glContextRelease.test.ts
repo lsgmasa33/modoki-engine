@@ -17,33 +17,15 @@
  *  API — it wraps `dispose` instead (`scene3DSync.ts:4752-4756`); PixiJS `Application` teardown in
  *  `ShaderPreview.tsx`; and `@monogrid/gainmap-js` creates its own throwaway renderer internally in
  *  `editor/panels/assetViews/encodeUltraHDR.ts:29`, invisible to our tracking and editor-only,
- *  short-lived.
+ *  short-lived. The `ShaderPreview.tsx` Pixi `Application` gap named above is now covered by the
+ *  sibling guard, `rendererLossHandling.test.ts` (#795) — RELEASE-on-teardown (this file) and
+ *  DETECT-on-construction (that one) are different properties over the same construction sites.
  *
  *  The scan runs on comment-stripped source, so a `forceContextLoss` mentioned only in a comment
  *  (e.g. a stale TODO) cannot satisfy the pairing. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
-
-const srcRoots = [
-  path.resolve(__dirname, '../../packages/modoki/src'),
-  path.resolve(__dirname, '../../app'),
-];
-
-/** Every .ts/.tsx under the given roots. */
-function sourceFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) { walk(p); continue; }
-      if (/\.tsx?$/.test(e.name)) out.push(p);
-    }
-  };
-  for (const root of srcRoots) if (fs.existsSync(root)) walk(root);
-  return out;
-}
+import { censusRendererSources } from './rendererConstructionCensus';
 
 // Matches `new THREE.WebGLRenderer(` and a bare `new WebGLRenderer(`, but not
 // `WebGPURenderer` (e.g. `new WebGPURenderer(` / `new WebGPURendererMod(`) — that class has no
@@ -54,10 +36,7 @@ describe('GL context release — every bare THREE.WebGLRenderer site must call f
   it('every WebGLRenderer construction site also calls forceContextLoss', () => {
     const offenders: string[] = [];
     let sites = 0;
-    for (const file of sourceFiles()) {
-      const raw = fs.readFileSync(file, 'utf8');
-      const stripped = stripComments(raw);
-      assertScanIsSane(raw, stripped, path.relative(process.cwd(), file));
+    for (const { file, stripped } of censusRendererSources()) {
       if (!CONSTRUCT_RE.test(stripped)) continue;
       sites++;
       if (!/\bforceContextLoss\s*\(/.test(stripped)) offenders.push(path.relative(process.cwd(), file));
