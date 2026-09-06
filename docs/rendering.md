@@ -4359,6 +4359,174 @@ tests only** — no game exercises it yet.
 the mask rect's extent shrink while the content it clips is positioned uncompensated, so the clip
 lands wrong. No project uses `fill` today (swept: 64 `contain`, 11 `fitW`, 5 `fitH`, 0 `fill`).
 
+## GPU resource ownership — derived resources, and what owns them
+
+Graduated from the retired `docs/plans/gpu-resource-ownership-plan.md` tracker (2026-09-07), which
+was written for #695. Owner's original ask: *"make the ownership of GPU resources explicit, otherwise
+it's hard to manage the lifecycle."* **The registry that design proposed was never built and is not
+planned** — #695 closed on a regression test instead, for the reason the "roads not taken" below
+gives. Read this for the mental model and the rejected approaches, both of which are load-bearing,
+not as a work item.
+
+For the env/PMREM specifics — the per-swap measurement table, the prewarm door, the sharp-vs-blurred
+background split — see § "HDR Environment & IBL" above, which owns that detail.
+
+### The shape that actually recurs
+
+Two measured incidents — #590 (PixiJS, ~300 MB over 6 min, four teardown sites wrong at once) and
+#739 (three.js, 72 MB per scene load from the environment alone) — are the same defect, and neither
+is a destroy-order bug:
+
+| | owned resource | derived resource | derived by | back-reference? |
+|---|---|---|---|---|
+| #590 | a Scene2D slot | geometry, shader, mesh, container | our own four hand-written teardown loops | none — each loop re-derived the contract |
+| #739 | the env `DataTexture` | PMREM cubeUV + ping-pong render targets | **three.js**, in `PMREMNode` | none in r184 — fixed in r185 |
+| #739 | the env `DataTexture` | background `CubeRenderTarget` | **three.js**, in `CubeMapNode` | a listener exists, but it disposes the target's TEXTURE — still broken in r185 |
+
+**The generalisation: a GPU object created FROM a resource we own, by code that is not the owner,
+with nothing linking owner to derivative.** Releasing the owner then cannot release the derivative,
+and nothing errors — the counter simply never comes down. #739 is the sharper case precisely because
+the deriving code is a third party we cannot change, which is what makes "one helper per class"
+useless there: there is no call site of ours to route through.
+
+⚠️ **Having the link is necessary and not sufficient.** three's `CubeMapNode` DOES register
+`texture.addEventListener('dispose', …)` — and still leaks, because `onTextureDispose` caches
+`renderTarget.texture` but disposes the *target*'s texture rather than the target
+(`three/src/nodes/utils/CubeMapNode.js`). A back-reference has to be tested by observation, not by
+reading that it exists.
+
+### Two axes, not one — RELEASE and INVALIDATION
+
+The family has a second axis that the original design missed, added from #678 and #794, both
+device-measured:
+
+| | release (#695) | invalidation (#678, #794) |
+|---|---|---|
+| trigger | owner dies | GPU context/device dies |
+| needs | owner → derivatives | renderer → everything it uploaded |
+| today | hand-written per site | **nothing at all** |
+
+"Nothing at all" is a measured sweep, re-verified 2026-09-07: there is no context-loss hook on
+`meshTemplateCache.ts`, `textureResolver.ts`, `fontTexturePixi.ts`, or the module-scope program
+caches in `pixiShaderBuilder` / `mtsdfPixiShader`. `activeRenderer`'s `lostListeners` has exactly
+three production subscribers — the `onRendererLost(...)` calls in `frameDriver.ts`, `Scene3D.tsx`
+and `SceneView.tsx` — and all three only request a renderer rebuild. **Nothing subscribes on behalf
+of a resource cache.** See § "GPU context loss is recoverable" above for the recovery path itself.
+
+### Roads not taken — read these before proposing a fix here
+
+- **"One release helper per resource kind" is the WRONG generalisation.** #695 originally proposed
+  cloning the `releaseGeometry` pattern across `Shader`, `Texture`/`TextureSource`, `Mesh`,
+  `Container` and the three.js equivalents. Do not. `releaseGeometry` (in `Scene2D.tsx`) is a
+  workaround for ONE upstream quirk, and its own body doc says so: PixiJS's `Geometry.destroy()`
+  calls `removeAllListeners()` before `unload()`, orphaning the VAO, while `Buffer`,
+  `TextureSource`, `GraphicsContext` and `ViewContainer` all order it correctly. Cloning it per kind
+  produces five wrappers around a `destroy()` that was already correct. It solves destroy ORDER —
+  a real problem, already solved where it occurs, and **not** the problem that cost 300 MB.
+- **Its guard test must not be cloned either.** `engine/tests/architecture/geometryRelease.test.ts`
+  is a 373-line per-identifier static scanner whose header enumerates what it cannot see (array
+  elements, `this`-stored geometry, wrapper helpers) and closes with *"Do not extend this guard to
+  chase those without a design discussion — they need either real type information or a bigger
+  rewrite, not another regex."* Five copies means five heuristics with five sets of blind spots.
+- **The guard for this class must be a RUNTIME check, not a sixth scanner.** The invariant is
+  observable — *after `releaseAllForScene(sceneId)`, nothing owned by that scene remains* — and a
+  static guard could not have caught #739 at all, where there is no call site of ours to scan.
+  ⚠️ **Verify by PERTURBATION**: a registry that is empty because nothing ever registered passes
+  identically to one that is empty because everything was released, so the test must first assert
+  it is NON-empty while the scene is live.
+- **Tier 2 (slot-granularity handles — no caller touches `destroy` directly) was never built.** If
+  it is ever revisited it must re-ask the `meshTemplateCache` question below, which the registry
+  design did not trigger.
+- ⚠️ **An owner-keyed registry would NOT have caught #747, and that bounds the whole idea.** #747
+  was a third shape: the derivative-to-owner link was present and correct, and the OWNER ITSELF was
+  a sentinel — `LAZY_OWNER = -1`, which no `sceneId` can equal — so `releaseRiggedModelsForScene`
+  never reported last-owner. Nothing was derived and nothing was unlinked; the release ran and
+  correctly concluded an owner remained. State the invariant over OWNERS, not only over
+  derivatives.
+
+### `meshTemplateCache`'s count-based invariant — checked, and it does NOT fire
+
+`meshTemplateCache.ts` carries an INVARIANT comment: if resource lifetime is ever made
+finer-grained than per-scene, its `Set<sceneId>` ownership must become count-based. A derived-resource
+registry does not trigger it — the registry is keyed on the OWNING resource and released with it, so
+the owner's own lifetime is unchanged and still scene-scoped via `releaseAllForScene`. The invariant
+fires on a genuine per-entity unload, streaming/LOD eviction, or an "unload unused assets" action.
+See [scene-loading.md](./scene-loading.md).
+
+### `envPmrem.ts` is the working prototype — generalise it, don't invent one
+
+`runtime/rendering/envPmrem.ts` (landed for #775/#776/#779) is `register`/`releaseDerived` in all but
+name and already carries both axes: `envDerivedCache`, a `WeakMap` keyed by RENDERER, and
+`envDerivedBySource`, a reverse index keyed by OWNER, with `disposeEnvDerivedFor(source)` as the
+release entry point. Anyone tempted to build a generic registry should start from this rather than
+from scratch.
+
+⚠️ **A PMREM texture belongs to the renderer that produced it**, so the key is **(surface renderer,
+env path)** — not env path alone. The editor runs GameView and SceneView on separate renderers plus a
+throwaway prewarm scene; a shared cache would let one dispose the other's target out from under it.
+The reverse index deliberately holds no `Set`/strong reference to a renderer either — that would pin
+a disposed renderer and everything it retains for the process lifetime, which is #720's defect
+re-created inside the fix for #739.
+
+### ⭐ A per-renderer discriminant is only real if a two-surface test pins it (#828)
+
+**The transferable rule, and the most reusable thing this design produced.** `envPmremOwnership.test.ts`
+had 18 cases and not one of them could tell the two shapes apart: every case built exactly one
+`const renderer = {}`, so a `WeakMap<renderer, …>` and a single shared `Map<source, target>` behave
+IDENTICALLY. Collapsing the WeakMap indirection to a plain Map passed all 18 unchanged.
+
+> **A derived-resource cache's discriminant is not verified by any test that only ever exercises one
+> instance of that discriminant.** Wherever a cache is keyed by renderer / surface / scene to keep
+> two live instances from colliding, the regression test has to construct two of them and assert
+> they don't collide — one instance cannot fail either way.
+
+The sibling `lightMaskVariants.ts` solves the identical multi-surface problem with key salting
+instead of a nested cache, and its suite states the two-surface scenario in its own docblock and
+renders alternating frames from both surfaces — which is why that cache had cover and this one did
+not. **#828 tracks the six sites where this cover is still missing**, including
+`pixiShaderBuilder.ts`, which shares compiled GPU programs across both live `Scene2DRenderer`s with
+no renderer in the key and may be a live defect rather than a cover gap.
+
+### Retractions worth keeping — each was a confident claim that measurement killed
+
+- **`registerRuntimeMeshTemplate` is fragile by design but is NOT a live leak.** It writes into
+  `cache` but never into `modelOwners`/`meshAssetOwners`, so a procedurally registered template is
+  invisible to `releaseAllForScene` — and an earlier revision of this design called that "the
+  sharpest unfiled instance" and demanded a red test before any fix. **That was wrong, and checking
+  took one grep**: the only caller in tracked source, `games/sling/runtime/field/rebuildField.ts`,
+  accumulates every key it registers into a per-root set and unregisters all of them. The convention
+  is discharged correctly. What survives is that *nothing enforces it* — a plausible latent leak,
+  never measured. Tier 1 was therefore hardening with no measured defect behind it, which is part of
+  why it was not built.
+- **PixiJS `_gpuData` orphans: "nothing purges an entry when the renderer is destroyed" was
+  overstated.** Purging need not use `delete` — fifteen systems/pipes hold a `GCManagedHash` whose
+  `destroy()` → `removeAll()` → `remove()` **nulls** `item._gpuData[renderer.uid]`, and
+  `Application.destroy` calls `renderer.destroy()`. On a clean teardown most entries are already
+  null; genuinely unmanaged are `SpritePipe` and `MeshPipe`. Orphans survive mainly when teardown
+  THROWS part-way. So the gap is not "nothing is purged" — it is "no cache can be ASKED what it
+  holds for a dead renderer," which is narrower. Measured on an iPhone 8 (`games/wordweave`): 206
+  orphaned entries after a SINGLE context loss.
+- **"A later renderer can be handed a uid a stale entry already sits under" — it cannot.**
+  `renderer.uid` comes from a monotonic `uid('renderer')` counter and `resetUids()` is called nowhere
+  in this repo, so a renderer uid is never reused. That is what lets the shipped purge be scoped to
+  provably-dead uids instead of needing live-set reasoning.
+- **#715's GL program/shader leak was real, is closed in-repo, and is NOT fully fixed.** three's
+  `webgl-fallback` backend compiles programs and never issues a GL delete: measured over repeated
+  scene swaps, `Pipelines._releaseProgram` fired 12 times while `gl.deleteProgram`,
+  `gl.deleteShader` and `gl.deleteVertexArray` were called **zero** times (`gl.deleteBuffer` fired
+  106 times, the control proving the instrumentation worked). The GL context survives a scene swap,
+  so anything leaked this way accumulates for the life of the app.
+  `installGlProgramReleaseHatch` (`runtime/rendering/glProgramRelease.ts`) closes the program/shader
+  half by wrapping three's `Pipelines.prototype` — self-disabling, verifying the vendor's private
+  shape at install time and degrading to a loud no-op if it moves. **UBOs never leaked** (24/24
+  `destroyUniformBuffer` calls issue a `gl.deleteBuffer`; a `deleteBindGroupData` override would
+  DOUBLE-FREE). **VAOs do leak and cannot be fixed from here** — `three/build/three.webgpu.js`
+  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is iceboxed;
+  what remains is three upstream changes, not one: wire `_releaseProgram` to
+  `backend.destroyProgram`; make `WebGLBackend.destroyProgram` actually issue the GL deletes rather
+  than only dropping its DataMap entry; and invent a backend hook for the pipeline half, which has
+  no `backend.*` call on either backend.
+
 ## Shipped web build: canvas sizing (`rendering.web.sizeMode`)
 
 How the STANDALONE web game's layer container (`App.tsx`'s `.game-wrapper`) is sized in the
