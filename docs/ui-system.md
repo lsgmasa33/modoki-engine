@@ -1352,7 +1352,7 @@ frame from the game's own system — never a static authored offset guessed from
 `games/wordweave`'s `ZoomControl` (#628) is the worked example: it re-anchors to the crossword
 panel's own corner, computed in DESIGN space and converted through `designToHostPct` every frame,
 specifically because no authored `UIAnchor` offset could track a 2D-canvas-drawn panel that itself
-moves with `boardShare`/device aspect.
+moves with the `board`/`crossword` ScreenBand flex weights (#773) and the device aspect.
 
 ---
 

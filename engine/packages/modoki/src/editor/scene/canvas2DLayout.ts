@@ -31,6 +31,7 @@ export interface Canvas2DSpec {
   referenceWidth: number;
   referenceHeight: number;
   scaleMode: Canvas2DScaleMode;
+  maxReferenceWidth?: number;
 }
 
 export interface Canvas2DLayout {
@@ -125,12 +126,12 @@ export function computeCanvas2DLayout(
   // 4) Fit the reference resolution inside the div → content region (screen px).
   const refW = canvas.referenceWidth || 1;
   const refH = canvas.referenceHeight || 1;
-  const cs = computeCanvasScale(refW, refH, divRect.w, divRect.h, canvas.scaleMode);
+  const cs = computeCanvasScale(refW, refH, divRect.w, divRect.h, canvas.scaleMode, canvas.maxReferenceWidth || 0);
   const contentRect: Rect = {
     x: divRect.x + cs.offsetX,
     y: divRect.y + cs.offsetY,
-    w: refW * cs.scaleX,
-    h: refH * cs.scaleY,
+    w: cs.refW * cs.scaleX,
+    h: cs.refH * cs.scaleY,
   };
 
   return {

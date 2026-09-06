@@ -11,6 +11,14 @@ export const Canvas2D = trait({
   referenceWidth: 1080 as number,
   /** Design resolution height — game content is authored at this height. */
   referenceHeight: 1920 as number,
+  /** Opt-in adaptive width — on a host WIDER than the design aspect, the design box
+   *  may widen from `referenceWidth` up to this value (never past it). `0` (or any
+   *  value <= `referenceWidth`) disables adaptation entirely and is the default, so
+   *  every existing project is unaffected. It never shrinks the box below
+   *  `referenceWidth`. Intended for `contain`/`fitH`, where a narrower-than-host box
+   *  would otherwise pillarbox; past the cap the content letterboxes exactly as it
+   *  does today. */
+  maxReferenceWidth: 0 as number,
   /** How to scale content to fit the actual canvas size (all modes center the
    *  content; only `fill` is non-uniform).
    *  fitW    = match width exactly (the other axis may crop or letterbox)

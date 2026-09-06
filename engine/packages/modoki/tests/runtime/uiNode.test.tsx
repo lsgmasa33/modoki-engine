@@ -1346,7 +1346,7 @@ describe('UINode toggle branch', () => {
     const node = makeNode({
       guid: 'tg-drop', toggle: toggle({ value: false }),
       action: { bindings: [{ event: 'change', kind: 'set' } as never] },
-      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
       children: [makeNode({ guid: 'tg-drop-kid' })],
     });
     try {
@@ -1427,7 +1427,7 @@ describe('UINode toggle branch', () => {
 // ── canvas2D branch ──
 describe('UINode canvas2D branch', () => {
   it('runtime mounts the pooled Canvas2DMount with the entityId', async () => {
-    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     // Canvas2DMount is a flag-gated lazy import (so a 3D-only build DCEs PixiJS), so it
     // mounts asynchronously via Suspense — await it rather than expecting it synchronously.
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
@@ -1441,7 +1441,7 @@ describe('UINode canvas2D branch', () => {
     // the editor SceneView viewport, which sizes itself / uses device presets. The prop
     // defaults to false, so this is the call site that has to opt in — if it stops passing
     // applyWebSizeMode, `max` silently goes back to doing nothing on the 2D layer.
-    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('canvas2dmount')).getAttribute('data-web-size-mode')).toBe('true');
   });
@@ -1450,7 +1450,7 @@ describe('UINode canvas2D branch', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const node = makeNode({
       entityId: 12, elementType: 'input',
-      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' },
+      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 },
     });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 12'));
@@ -1474,7 +1474,7 @@ describe('UINode canvas2D branch', () => {
     // exactly Court's shape.
     const node = makeNode({
       entityId: 25, hasVideo: true,
-      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' },
+      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 },
     });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('uivideomount')).getAttribute('data-entity-id')).toBe('25');
@@ -1524,14 +1524,14 @@ describe('UINode canvas2D branch', () => {
 
   it('does NOT warn for a plain Canvas2D (elementType div)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 
   it('editor uses the injected renderCanvas2D instead of Canvas2DMount', () => {
-    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     const renderCanvas2D = vi.fn((id: number) => <div data-testid="injected" data-id={id} />);
     const { getByTestId, queryByTestId } = render(
       <UINode node={node} storeState={{}} onSelectEntity={vi.fn()} renderCanvas2D={renderCanvas2D} />,
@@ -2030,7 +2030,7 @@ describe('dropped-text DEV warnings (#745)', () => {
     try {
       renderNode(makeNode({
         guid: 'dt-3', text: 'hi',
-        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
       }));
       const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
       expect(msgs).toContain('canvas');

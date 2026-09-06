@@ -1018,19 +1018,24 @@ interface Scene2DInteractionOpts {
 // Mirrors Canvas2DLayer's draw-loop scale computation, for the Pixi pick overlay (which has no draw
 // loop feeding canvasScaleRef).
 // A Canvas2D's reference resolution + scale mode (trait defaults), independent of any renderer.
-// Used by computeScale2DFor AND the chrome overlay's boundary rect (which needs refW/refH).
-function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' } {
+// Used by computeScale2DFor AND the chrome overlay's boundary rect. ⚠️ The boundary must be
+// stroked from `CanvasScale.refW/refH` (the EFFECTIVE box), never from the raw pair this
+// returns — those differ the moment `maxReferenceWidth` adapts the box (#774), and the overlay
+// would then outline the box the scene USED to have while the content fills the real one.
+function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number } {
   let refW = fallbackW || 1, refH = fallbackH || 1;
   let scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' = 'fitH';
+  let maxRefW = 0;
   const c2dMeta = getAllTraits().find((t) => t.name === 'Canvas2D');
   const canvasEntity = findEntity(canvasEntityId);
   if (c2dMeta && canvasEntity?.has(c2dMeta.trait)) {
-    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none' };
+    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number };
     refW = c2d.referenceWidth || 1080;
     refH = c2d.referenceHeight || 1920;
     scaleMode = c2d.scaleMode || 'fitH';
+    maxRefW = c2d.maxReferenceWidth || 0;
   }
-  return { refW, refH, scaleMode };
+  return { refW, refH, scaleMode, maxRefW };
 }
 
 // Install the capture-phase 2D pointer handlers on opts.getTargetEl(). Returns a cleanup fn.
@@ -1688,7 +1693,6 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
 
 interface Scene2DDrawOpts {
   cs: ReturnType<typeof computeCanvasScale>;
-  refW: number; refH: number;
   gizmoScreenScaleRef: { current: number };
   showBoundaryRef: { current: boolean };
   hoveredRef: { current: GizmoHandle | null };
@@ -1700,7 +1704,7 @@ interface Scene2DDrawOpts {
 // The 2D CONTENT (sprites, skinned mesh) is drawn by the Pixi Scene2DRenderer underneath; this chrome
 // canvas stacks the editor-only overlays on top. (Was shared with the now-deleted DOM Canvas2DLayer.)
 function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: Scene2DDrawOpts): void {
-  const { cs, refW, refH, gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef } = o;
+  const { cs, gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef } = o;
   const allTraits = getAllTraits();
   const transformMeta = allTraits.find((t) => t.name === 'Transform');
   const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
@@ -1722,7 +1726,9 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
         ctx.strokeStyle = '#4a9eff';
         ctx.lineWidth = 2 * bs;
         ctx.setLineDash([6 * bs, 4 * bs]);
-        ctx.strokeRect(0, 0, refW, refH);
+        // `cs.refW`/`cs.refH`, not the authored pair: under an adaptive box (#774) they differ,
+        // and this outline is what a human retunes the box against.
+        ctx.strokeRect(0, 0, cs.refW, cs.refH);
         ctx.setLineDash([]);
       }
 
@@ -2267,13 +2273,13 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, pw, ph);
-      const { refW, refH, scaleMode } = readCanvas2DRefDims(canvasEntityId, pw, ph);
-      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode);
+      const { refW, refH, scaleMode, maxRefW } = readCanvas2DRefDims(canvasEntityId, pw, ph);
+      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW);
       canvasScaleRef.current = cs;
       const rectW = canvas.getBoundingClientRect().width;
       gizmoScreenScaleRef.current = (rectW > 0 && cs.scale > 0) ? pw / (cs.scale * rectW) : 1;
       drawScene2D(ctx, canvasEntityId, {
-        cs, refW, refH,
+        cs,
         gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef,
       });
     };

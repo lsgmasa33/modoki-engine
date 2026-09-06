@@ -1303,6 +1303,7 @@ export function registerAllTraits() {
     fields: {
       referenceWidth: { type: 'number', step: 1, tooltip: 'Design resolution width. Content is authored at this width and scaled to fit.' },
       referenceHeight: { type: 'number', step: 1, tooltip: 'Design resolution height. Content is authored at this height and scaled to fit.' },
+      maxReferenceWidth: { type: 'number', min: 0, step: 10, tooltip: '0 = off (default). On a host wider than the design aspect, widens the design box from Reference Width up to this value instead of pillarboxing.' },
       scaleMode: { type: 'enum', options: ['fitW', 'fitH', 'contain', 'cover', 'fill', 'none'], tooltip: 'fitW = match width (crop vertical), fitH = match height (crop horizontal), contain = fit entirely inside (letterbox), cover = cover area (crop), fill = stretch to fill, none = 1:1 pixels' },
     },
   });

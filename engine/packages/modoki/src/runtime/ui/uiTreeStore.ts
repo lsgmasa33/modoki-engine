@@ -91,7 +91,7 @@ export interface UINodeData {
   // widening here would hand an unrecognised mode straight through to a silently
   // unpositioned element.
   anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean };
-  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
+  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string; maxReferenceWidth: number };
   /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
    *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
    *  and its absence has to survive `_scalarKeys` being derived from whichever node
@@ -503,7 +503,7 @@ function buildTree(world: World): UINodeData[] | null {
       }
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
         const c = entity.get(_canvas2dMeta.trait) as any;
-        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode };
+        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode, maxReferenceWidth: c.maxReferenceWidth };
       }
       if (_toggleMeta && entity.has(_toggleMeta.trait)) {
         const t = entity.get(_toggleMeta.trait) as any;

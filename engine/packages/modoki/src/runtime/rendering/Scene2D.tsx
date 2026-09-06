@@ -1474,6 +1474,7 @@ export class Scene2DRenderer {
         const refW = c2d.referenceWidth || 1080;
         const refH = c2d.referenceHeight || 1920;
         const mode = c2d.scaleMode || 'fitH';
+        const maxRefW = c2d.maxReferenceWidth || 0;
         // The container this scale/offset positions lives in the Pixi renderer's
         // logical `screen` space, NOT necessarily the canvas's backing-pixel size —
         // those diverge once a project pins `rendering.pixi.resolution` > 0 (which
@@ -1482,7 +1483,7 @@ export class Scene2DRenderer {
         const actualW = slot.app.renderer?.screen?.width || slot.canvas.width;
         const actualH = slot.app.renderer?.screen?.height || slot.canvas.height;
         const { scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
-          computeCanvasScale(refW, refH, actualW, actualH, mode);
+          computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
         this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY });

@@ -3746,7 +3746,7 @@ The `2d` layer draws `Renderable2D` (and `Text2D` / `SkinnedSprite2D`) entities 
 
 ### Canvas2D host + design-resolution scaler
 
-A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a PixiJS `<canvas>`; every `Renderable2D` descendant renders into its NEAREST Canvas2D ancestor (`canvas2DRouting.ts` `findCanvasAncestor` — a cycle-guarded walk up `EntityAttributes.parentId`; an entity that IS a Canvas2D resolves to itself). Content is authored at a design resolution (`referenceWidth`×`referenceHeight`, default 1080×1920) and mapped onto the live canvas pixels by `canvas2DScaler.ts` `computeCanvasScale(refW, refH, actualW, actualH, mode)`:
+A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a PixiJS `<canvas>`; every `Renderable2D` descendant renders into its NEAREST Canvas2D ancestor (`canvas2DRouting.ts` `findCanvasAncestor` — a cycle-guarded walk up `EntityAttributes.parentId`; an entity that IS a Canvas2D resolves to itself). Content is authored at a design resolution (`referenceWidth`×`referenceHeight`, default 1080×1920) and mapped onto the live canvas pixels by `canvas2DScaler.ts` `computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW?)`:
 
 > **An entity that routes to NO Canvas2D is warned about, once, and the warning FORGETS a recovery** (QA-ASSET-0014). Scene2D skips a visible `Renderable2D` with no canvas ancestor, so a 2D prefab instantiated at the world root (`modoki_prefab`'s own default parent) came back `ok:true` and then reported `screen:null` with nothing said anywhere; `Scene2D` now warns once per entity and `modoki_prefab` answers in its own response via `findUnrenderable2D`. The bookkeeping lives in `canvas2DRouting.ts` `Orphan2DTracker`, not inline in the component, and it holds two properties that both regressed silently while inline: it **drops an entity's warned key when the entity finds a canvas**, so parenting an orphan under the host and back out again warns a *second* time (a warn-once registry over a recoverable condition has to forget, or the second break is the silent one — the same gap `resolveRefWarnOnce` had, QA-ASSET-0005); and the guid lookup that forms the key is a **callback**, invoked only on the frame an entity crosses the threshold or recovers, never for the healthy entities that make up the scene — `clear()` runs per drawn 2D entity per frame, so an eager key would put a trait read on the hot path.
 
@@ -3760,6 +3760,49 @@ A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a Pix
 | `cover` | Uniform scale to COVER the area (crop the overflow axis). |
 | `fill` | Non-uniform stretch to fill exactly (no crop, no letterbox). |
 | `none` | 1:1 pixels. |
+
+**`maxReferenceWidth` — an OPT-IN adaptive design width** (#774). A portrait design box is
+pillarboxed on any host wider than its design aspect, and nothing authored INSIDE the box can reach
+those bars: on an iPad Pro 13" preview, 26.1% of the canvas width was pillarbox. Set
+`maxReferenceWidth` and the box widens toward the host's aspect instead:
+
+⚠️ **Two pillarbox figures for "an iPad Pro 13\"" appear in this change's history and BOTH are
+right** — they were taken on differently-shaped canvases, which is a trap worth naming. #774
+originally measured a canvas of 633.48x907.58 css (aspect 0.698) and reported **19.4%**; the live
+close-out measurement on the same PRESET measured 680.68x894.79 (aspect 0.7607, which is what
+1032x1376 minus the 20px bottom safe-area inset actually gives) and reported **26.1%**. The editor's
+Game panel scales the preset to the panel, so "the iPad Pro 13\" preview" does not pin a canvas
+size. **Always quote the canvas you measured, not just the device.**
+
+```
+effectiveRefW = clamp(referenceHeight x hostAspect, referenceWidth, maxReferenceWidth)
+```
+
+- **`0` (the default) disables it**, as does any value <= `referenceWidth`. Every existing project is
+  therefore byte-identical, which is deliberate — see the Court note below.
+- It can only ever GROW the box from `referenceWidth`, never shrink it. On a host at or TALLER than
+  the design aspect (every phone, for a 1080x1920 box) the result is exactly `referenceWidth` and
+  nothing moves.
+- Past the cap the content letterboxes exactly as before. **That ceiling is load-bearing, not
+  cosmetic**: an iPad in LANDSCAPE would otherwise follow the aspect to ~2746 design px. Apple
+  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), and
+  Android 16 ignores `android:screenOrientation` on displays >= 600dp, so a wide host is reachable on
+  both platforms in a shipping build.
+
+⚠️ **The mode is NOT the lever — do not reach for `fitH` instead.** Every mode in
+`computeCanvasScale` centres on both axes, so with `referenceWidth` pinned, `fitH` pillarboxes
+exactly as `contain` does. Only the reference WIDTH changes the answer.
+
+⚠️ **`CanvasScale` carries the EFFECTIVE box back as `refW`/`refH`.** A consumer that needs the box's
+own size — `contentRect = refW * scaleX`, a design-space centre at `refW / 2` — must read those,
+not its own input, or it describes a box that is not the one on screen.
+
+⚠️ **Adaptation is opt-in because a game may DEPEND on the pillarbox.** `games/court` authors
+`contain` and clamps `ChromeRoot`, `NarrationBand` and `BoardPage` to `maxWidth: 56.25vh`
+(= `100 x refW/refH`) so its chrome shrinks to meet the board instead of spanning an iPad's full
+width (`games/court/tests/chromeLetterbox.test.ts`). Court answered the same geometry the OPPOSITE
+way on purpose; widening every `contain` canvas would strand those three clamps against a letterbox
+that no longer exists.
 
 Every mode CENTERS the content (via `offsetX`/`offsetY`). `fill` stretches non-uniformly, so the scaler also returns `compensateX`/`compensateY` (= `uniformScale / axisScale`) which Scene2D multiplies back onto each object's scale so PRIMITIVE SHAPES stay un-stretched even while the container fills. `screenToReference2D` inverts the mapping for 2D picking (client px → reference space), shared by the DOM SceneView layer and the Pixi pick overlay so both pick identically.
 
