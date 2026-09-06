@@ -856,6 +856,24 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     expect(fs.readFileSync(cfgPath(), 'utf8')).not.toContain('configErrors');
   });
 
+  it('POST ignores a round-tripped configWarnings — the case where Apply actually broke', async () => {
+    // The sibling of the test above, and the one that was NOT covered (#821 review).
+    // ⚠️ Its reachability is the opposite of configErrors': `configErrors` makes the
+    // dialog INERT, so that post can only happen with the form disabled — whereas a
+    // WARNING deliberately leaves every control editable (ProjectSettingsDialog gates
+    // inertness on errors alone). So the banner renders, the user edits an unrelated
+    // field, presses Apply, and gets `unknown config section(s) "configWarnings" —
+    // nothing was written`: no setting saveable until the file is hand-edited, on
+    // exactly the project the warning exists for.
+    const r = (await settings({
+      app: { appName: 'Court' },
+      configWarnings: [{ path: 'rendering.web.sizeMode', message: 'not one of: fixed, responsive' }],
+    })) as { status?: number };
+    expect(r.status ?? 200).toBe(200);
+    expect(readCfg().app.appName).toBe('Court');
+    expect(fs.readFileSync(cfgPath(), 'utf8')).not.toContain('configWarnings');
+  });
+
   it('rejects `null` rather than persisting it into a typed field', async () => {
     // No config field is nullable. Writing it through poisons the field (appName:null
     // survives the merge and reaches consumers); dropping it would be a silent no-op

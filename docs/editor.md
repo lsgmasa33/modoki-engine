@@ -326,6 +326,17 @@ projects:
   internal game `webBucket: "gs://modoki-www-site/demo"`. Note prune measures "already
   recorded" against the **pre-edit** file: pass the patched one and every key is trivially
   present, nothing prunes, and the bug returns for full-object saves.
+  ⚠️ **A third rule since #821: a top-level SECTION the build does not know is carried
+  through from the pre-edit file.** `mergeProjectConfig` returns a fixed literal naming
+  only the sections in `DEFAULT_PROJECT_CONFIG`, so before this an unknown section never
+  reached prune and an older editor **deleted a section a newer branch had added** — in a
+  committed file, with six clones on different branches. Unknown keys *inside* a declared
+  section were never affected (every section is spread, so they land in `resolved` and the
+  already-in-the-file rule keeps them). The carry is **top-level only**, and deliberately
+  does not recurse; `pruneProjectConfig`'s own docblock carries the reasoning, including a
+  measurement showing the hazard its first draft cited does not currently exist.
+  ⚠️ Consequence worth knowing: prune used to double as a scrubber of unrecognised
+  top-level junk in the committed file, and no longer does — a stray key now survives Apply.
 - **Reading COERCES a bad string-union value; writing ROUND-TRIPS it.** `mergeProjectConfig`
   falls an out-of-union value back to the default and warns, for EVERY string-union field in
   the config — not just `rendering.web.sizeMode` / the three/pixi `backend`s (#39) — so the

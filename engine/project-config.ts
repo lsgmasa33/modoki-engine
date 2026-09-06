@@ -1192,11 +1192,54 @@ export function findNullPatchPaths(patch: unknown, prefix = ''): string[] {
  *  Make the caller name which defaults it means.
  *
  *  INVARIANT: `mergeProjectConfig(pruneProjectConfig(resolved, onDisk, defaults))`
- *  must deep-equal `resolved`. Pruning may never change what a project resolves to. */
+ *  must deep-equal `resolved`. Pruning may never change what a project resolves to.
+ *
+ *  TOP-LEVEL SECTIONS THIS BUILD DOES NOT KNOW ABOUT ARE CARRIED THROUGH, NEVER
+ *  RECURSED INTO (#821). `mergeProjectConfig` only ever emits the sections named
+ *  in `DEFAULT_PROJECT_CONFIG` (`app`, `content`, `build`, …), so a top-level key
+ *  present in `onDisk` but absent from `resolved` is unambiguously a section a
+ *  NEWER branch added that this build can't parse — not a deletion — and dropping
+ *  it would erase it from the committed file on the next Apply.
+ *
+ *  ⚠️ **The restriction to the top level is DEFENSIVE, and the first draft of this
+ *  comment justified it with a hazard that does not currently exist** — corrected
+ *  here rather than left as the durable record, because the false version invites
+ *  deleting the split as cargo cult. What it claimed: that recursing the carry
+ *  would resurrect a tier deleted through Project Settings' "Remove tier" button,
+ *  which expresses deletion by omission via `REPLACE_WHOLESALE` (see the
+ *  `tiersPatch` comment in `editorBackendRouter.ts`). **Measured false.**
+ *  `DEFAULT_PROJECT_CONFIG.rendering.three` has no `tiers` key at all — its
+ *  presence IS the signal — so `defaults[k]` is `undefined`, `isPlainObject(def)`
+ *  is false, and `tiers` is emitted as a LEAF below; the recursion never descends
+ *  into it and the carry could not fire there. The general form is stronger:
+ *  `mergeProjectConfig` SPREADS every level it descends into, so `resolved` is
+ *  always a superset of `onDisk`'s keys wherever `defaults[k]` is a plain object,
+ *  and **no production input makes a nested carry observable today.**
+ *
+ *  It stays top-level-only anyway, for the reason the false version was reaching
+ *  for: the top level is the one place where "absent from `resolved`" is
+ *  UNAMBIGUOUSLY "unknown to this build", because `mergeProjectConfig` always
+ *  emits every known section. Nested, that inference does not hold in general,
+ *  and it becomes load-bearing the moment a `REPLACE_WHOLESALE` path gains a
+ *  default object — at which point the recursion WOULD start descending into it.
+ *  The thin wrapper plus an internal worker that never carries anything through
+ *  makes that structural rather than a property of where a line happens to sit.
+ *  The invariant test in `loadProjectConfig.test.ts` is correspondingly synthetic:
+ *  it constructs a `resolved`/`onDisk` pair production cannot generate, which is
+ *  the only way to pin a defensive rule. */
 export function pruneProjectConfig(
   resolved: RawProjectConfig,
   onDisk: RawProjectConfig,
   defaults: RawProjectConfig,
+): RawProjectConfig {
+  return pruneProjectConfigLevel(resolved, onDisk, defaults, /* carryUnknown */ true);
+}
+
+function pruneProjectConfigLevel(
+  resolved: RawProjectConfig,
+  onDisk: RawProjectConfig,
+  defaults: RawProjectConfig,
+  carryUnknown: boolean,
 ): RawProjectConfig {
   const kept: [string, unknown][] = [];
   for (const [k, v] of Object.entries(resolved)) {
@@ -1205,13 +1248,22 @@ export function pruneProjectConfig(
     const disk = onDisk[k];
     const onDiskHasKey = Object.prototype.hasOwnProperty.call(onDisk, k);
     if (isPlainObject(v) && isPlainObject(def)) {
-      const nested = pruneProjectConfig(v, isPlainObject(disk) ? disk : {}, def);
+      // Nested: never carry unknown keys through, however this level was called.
+      const nested = pruneProjectConfigLevel(v, isPlainObject(disk) ? disk : {}, def, false);
       // An empty nested result means every child matched its default and none was
       // recorded — emit the branch only if the file already had it.
       if (Object.keys(nested).length > 0 || onDiskHasKey) kept.push([k, nested]);
       continue;
     }
     if (onDiskHasKey || !deepEqualJson(v, def)) kept.push([k, v]);
+  }
+  // Carry through whole sections `onDisk` has that `resolved` never mentions at
+  // all — see the doc comment on `pruneProjectConfig` above. Only ever true for
+  // the top-level call.
+  if (carryUnknown) {
+    for (const k of Object.keys(onDisk)) {
+      if (!Object.prototype.hasOwnProperty.call(resolved, k)) kept.push([k, onDisk[k]]);
+    }
   }
   // Emit in the file's existing key order, with genuinely new keys appended in
   // resolved order. Purely cosmetic, but it makes a no-op save a no-op DIFF —

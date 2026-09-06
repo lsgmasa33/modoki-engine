@@ -2837,11 +2837,16 @@ async function describeUnresolvedAgainstLiveWorld(
   // invalidate the virtual config module so the next reload reflects new values.
   //
   // THE BODY IS A PATCH, deep-merged onto the file ON DISK — a section you omit is
-  // left exactly as the file had it. ("Section" means one DECLARED in ProjectConfig:
-  // the write still funnels through mergeProjectConfig, whose explicit key list drops
-  // any UNDECLARED top-level key. Pre-existing — the old route did the same — and
-  // inert, since every reader resolves through that same list. Unknown keys nested
-  // INSIDE a declared section do survive, via prune's already-on-disk rule.)
+  // left exactly as the file had it, and since #821 that now holds for an UNDECLARED
+  // top-level section too. (It did not before: the write funnels through
+  // mergeProjectConfig, whose explicit key list drops any key it does not name, so a
+  // section a NEWER branch added was erased from the committed file on the next Apply
+  // by an older editor. This paragraph used to describe that as "pre-existing and
+  // inert, since every reader resolves through that same list" — the inertness claim
+  // was about READERS and did not survive the file being rewritten underneath them.
+  // pruneProjectConfig now carries such a section through, TOP LEVEL ONLY; its own
+  // docblock has the reasoning and the measurement.) Unknown keys nested INSIDE a
+  // declared section survived all along, via prune's already-on-disk rule.
   // ⚠️ **EXCEPT `rendering.three.tiers`** (REPLACE_WHOLESALE, project-config.ts): it is merged as
   // a LEAF, not a section, so a patch naming it REPLACES the whole map — an omitted tier is
   // DELETED, not left alone, and an omitted FIELD inside a named tier is refused below rather than
@@ -2861,11 +2866,24 @@ async function describeUnresolvedAgainstLiveWorld(
   // once handed an internal game the demo deploy bucket.
   if (urlPath === '/api/project-settings' && method === 'POST') {
     try {
-      // `configErrors` is the GET's read-only diagnostic, not a section. The dialog
-      // posts back the WHOLE object it loaded, so it would otherwise come straight
-      // back here and trip the unknown-section 400 below — a confusing refusal for
-      // something the caller never authored. Drop it before anything else looks.
-      const { configErrors: _configErrors, ...bodyIn } = (body ?? {}) as Record<string, unknown>;
+      // `configErrors` and `configWarnings` are the GET's read-only diagnostics, not
+      // sections. The dialog posts back the WHOLE object it loaded, so either would
+      // otherwise come straight back here and trip the unknown-section 400 below — a
+      // confusing refusal for something the caller never authored. Drop both before
+      // anything else looks.
+      //
+      // ⚠️ **`configWarnings` was missing from this list, and that made Apply fail on
+      // exactly the projects the warning exists for** (found by #821's review; the
+      // reasoning above already covered it and only `configErrors` was stripped).
+      // `configErrors` makes the dialog INERT, so its post can only happen if the form
+      // is disabled — but a warning deliberately leaves every control editable
+      // (`ProjectSettingsDialog.tsx` gates inertness on errors alone), so the banner
+      // renders, the user edits an unrelated field, presses Apply, and gets
+      // `unknown config section(s) "configWarnings" — nothing was written`. No setting
+      // could be saved until the file was hand-edited. Latent when found: no committed
+      // project.config.json currently resolves to a warning.
+      const { configErrors: _configErrors, configWarnings: _configWarnings, ...bodyIn } =
+        (body ?? {}) as Record<string, unknown>;
       const { user: userPartIn, ...configPart } = bodyIn;
       let userPart = userPartIn;
       // Private build.* fields (see PRIVATE_BUILD_FIELDS) must never land in
