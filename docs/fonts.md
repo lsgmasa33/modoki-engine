@@ -165,7 +165,10 @@ block in `gpuComputeBackend.ts` states for the particle backend, but **on its ow
 What actually removes the churn for a layout-only edit is the fast path above: no rebuild happens
 at all, so nothing is disposed and nothing is re-acquired. A `text` change or an atlas change still
 takes the full rebuild and still hits the vendor gap #715 describes on the 3D side — that gap is
-not closed by this change, and #715 stays open.
+not closed by this change. #715's app-side half has since been closed by
+`installGlProgramReleaseHatch` (`runtime/rendering/glProgramRelease.ts`), which issues the GL
+deletes three's `webgl-fallback` omits; the issue itself is **iceboxed**, because what remains is
+three upstream changes in three.js that cannot be made from this repo.
 
 **Colour** — `color` + `opacity`. A per-glyph colour animation (`TextAnimation` rainbow/fade)
 multiplies on top via a vertex attribute.

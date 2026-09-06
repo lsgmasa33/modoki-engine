@@ -88,8 +88,9 @@ function makeRenderer(opts: {
 
 describe('installGlProgramReleaseHatch (#715)', () => {
   beforeEach(() => {
-    // Fresh shared prototype per test — otherwise the idempotence guard (the own-property
-    // PATCHED_MARKER symbol on the prototype) would see every test's renderer as "already patched".
+    // Fresh shared prototype per test — otherwise the previous test's installed WRAPPERS are
+    // still on it, and the idempotence guard (PATCHED_MARKER on the wrapper functions) would see
+    // every later test's renderer as "already patched".
     pipelinesProto = makePipelinesProto();
   });
 
@@ -209,15 +210,15 @@ describe('installGlProgramReleaseHatch (#715)', () => {
     expect(deleteCalls).toBe(1); // not 2 — a double-wrap would call the wrapper twice.
   });
 
-  it('a SUBCLASS prototype inheriting the marker (not owning it) still gets patched, not skipped as already-installed', () => {
+  it('a SUBCLASS that OVERRIDES both methods gets its own overrides patched, not skipped as already-installed', () => {
     // Patch the base prototype first, exactly like the idempotence test above.
     const baseProto = pipelinesProto;
     expect(installGlProgramReleaseHatch(makeRenderer())).toBe('installed');
 
-    // A subclass prototype — created via `Object.create(baseProto)`, so it INHERITS
-    // PATCHED_MARKER through the chain but does not itself carry it as an own property. Also
-    // carries its OWN `_releaseProgram`/`_releasePipeline` overrides (mirroring the base's
-    // original bodies), the way a real subclass overriding those methods would.
+    // A subclass prototype — created via `Object.create(baseProto)` — carrying its OWN
+    // `_releaseProgram`/`_releasePipeline` overrides (mirroring the base's original bodies), the
+    // way a real subclass overriding those methods would. Those overrides are NOT our wrappers, so
+    // both must be patched even though the base prototype above already was.
     const subclassProto = Object.create(baseProto, {
       _releaseProgram: {
         value(this: { programs: Record<string, Map<string, unknown>>; info: { destroyProgram: (p: unknown) => void } }, program: { code: string; stage: string }) {
@@ -248,8 +249,8 @@ describe('installGlProgramReleaseHatch (#715)', () => {
     });
     const subclassRenderer = { backend, _pipelines: pipelines };
 
-    // Must patch, not short-circuit as 'already-installed' — the marker on `subclassProto` is only
-    // INHERITED, never its own.
+    // Must patch, not short-circuit as 'already-installed' — the functions reached through
+    // `subclassProto` are the subclass's own un-wrapped overrides.
     expect(installGlProgramReleaseHatch(subclassRenderer)).toBe('installed');
     expect((subclassProto as Record<string, unknown>)._releaseProgram).not.toBe(subclassOriginalReleaseProgram);
 
@@ -262,6 +263,128 @@ describe('installGlProgramReleaseHatch (#715)', () => {
     subclassRenderer._pipelines._releaseProgram(program);
 
     expect(deletedShaders).toEqual(['shader-handle-1']);
+  });
+
+  it('a SUBCLASS that overrides NEITHER method is already-installed — it must not wrap our own wrapper', () => {
+    // ⚠️ THE REGRESSION THIS FILE EXISTS FOR, and the one two earlier rounds got wrong in opposite
+    // directions. Reading the marker as an OWN property of the prototype, this subclass has none
+    // — so install() proceeded, read `_releaseProgram` off the CHAIN (which is the base's
+    // already-installed wrapper), and wrapped that. `gl.deleteShader` then fired TWICE on the same
+    // handle: `GL_INVALID_VALUE` on every program release, on the WebGL2-fallback path this hatch
+    // exists for. Strictly worse than not patching at all.
+    const baseProto = pipelinesProto;
+    expect(installGlProgramReleaseHatch(makeRenderer())).toBe('installed');
+
+    // Inherits BOTH methods — no overrides of its own, which is the whole point.
+    const subclassProto = Object.create(baseProto) as typeof baseProto;
+
+    const dataMap = new Map<unknown, { shaderGPU?: unknown; programGPU?: unknown }>();
+    const gl = makeGl();
+    const backend = { isWebGLBackend: true, gl, get: (obj: unknown) => dataMap.get(obj) };
+    const pipelines = Object.create(subclassProto, {
+      backend: { value: backend, writable: true, configurable: true },
+      programs: { value: { fragment: new Map(), vertex: new Map() } },
+      info: { value: { destroyProgram: () => {} } },
+      caches: { value: new Map() },
+    });
+    const subclassRenderer = { backend, _pipelines: pipelines };
+
+    expect(installGlProgramReleaseHatch(subclassRenderer)).toBe('already-installed');
+    // Nothing was written onto the subclass prototype — the inherited wrapper already does the job.
+    expect(Object.prototype.hasOwnProperty.call(subclassProto, '_releaseProgram')).toBe(false);
+
+    const program = { code: 'c1', stage: 'fragment' };
+    dataMap.set(program, { shaderGPU: 'shader-handle-1' });
+    subclassRenderer._pipelines.programs.fragment.set('c1', {});
+    const deletedShaders: unknown[] = [];
+    gl.deleteShader = (sh: unknown) => { deletedShaders.push(sh); };
+
+    subclassRenderer._pipelines._releaseProgram(program);
+
+    // Exactly one — a double-wrap gives ['shader-handle-1', 'shader-handle-1'].
+    expect(deletedShaders).toEqual(['shader-handle-1']);
+  });
+
+  it('a MIXED subclass — overrides one method, inherits the other — patches only the override', () => {
+    // The case no per-PROTOTYPE flag can express in either direction: the override needs wrapping,
+    // the inherited wrapper must be left alone. Both halves still delete exactly once.
+    const baseProto = pipelinesProto;
+    expect(installGlProgramReleaseHatch(makeRenderer())).toBe('installed');
+    const baseWrapperPipeline = baseProto._releasePipeline;
+
+    const subclassProto = Object.create(baseProto, {
+      _releaseProgram: {
+        value(this: { programs: Record<string, Map<string, unknown>>; info: { destroyProgram: (p: unknown) => void } }, program: { code: string; stage: string }) {
+          this.programs[program.stage].delete(program.code);
+          this.info.destroyProgram(program);
+        },
+        writable: true,
+        configurable: true,
+      },
+    }) as typeof baseProto;
+
+    const dataMap = new Map<unknown, { shaderGPU?: unknown; programGPU?: unknown }>();
+    const gl = makeGl();
+    const backend = { isWebGLBackend: true, gl, get: (obj: unknown) => dataMap.get(obj) };
+    const pipelines = Object.create(subclassProto, {
+      backend: { value: backend, writable: true, configurable: true },
+      programs: { value: { fragment: new Map(), vertex: new Map() } },
+      info: { value: { destroyProgram: () => {} } },
+      caches: { value: new Map() },
+    });
+    const mixedRenderer = { backend, _pipelines: pipelines };
+
+    expect(installGlProgramReleaseHatch(mixedRenderer)).toBe('installed');
+    // The inherited half must be untouched — re-assigning it here would wrap our own wrapper.
+    expect(Object.prototype.hasOwnProperty.call(subclassProto, '_releasePipeline')).toBe(false);
+    expect(subclassProto._releasePipeline).toBe(baseWrapperPipeline);
+
+    const program = { code: 'c1', stage: 'fragment' };
+    dataMap.set(program, { shaderGPU: 'shader-handle-1' });
+    pipelines.programs.fragment.set('c1', {});
+    const pipeline = { cacheKey: 'k1' };
+    dataMap.set(pipeline, { programGPU: 'program-handle-1' });
+
+    const deletedShaders: unknown[] = [];
+    const deletedPrograms: unknown[] = [];
+    gl.deleteShader = (sh: unknown) => { deletedShaders.push(sh); };
+    gl.deleteProgram = (pr: unknown) => { deletedPrograms.push(pr); };
+
+    mixedRenderer._pipelines._releaseProgram(program);
+    mixedRenderer._pipelines._releasePipeline(pipeline);
+
+    expect(deletedShaders).toEqual(['shader-handle-1']);
+    expect(deletedPrograms).toEqual(['program-handle-1']);
+  });
+
+  it('a mismatched pipelines.backend with NO isWebGLBackend is refused — the harm, not just the return value', () => {
+    // The `pipelinesBackendMismatch` case above carries `isWebGLBackend: true` on the decoy, so
+    // dropping the identity check there is caught only through the RETURN VALUE. This is the shape
+    // that was actually measured: a second object carrying `get`/`gl` but NOT `isWebGLBackend`.
+    // Without the identity check install() reports 'installed' and then every wrapper call takes
+    // the `this.backend?.isWebGLBackend !== true` early return, so ZERO deletes are ever issued —
+    // a hatch that reports success and does nothing, which is the fail-open shape this file exists
+    // to avoid.
+    const r = makeRenderer();
+    const decoyGl = makeGl();
+    const decoyBackend = {
+      get: () => ({ shaderGPU: 'never-deleted' }),
+      gl: decoyGl,
+      // deliberately no `isWebGLBackend`
+    };
+    (r._pipelines as unknown as Record<string, unknown>).backend = decoyBackend;
+
+    const warnSpy: unknown[][] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnSpy.push(args); };
+    try {
+      expect(installGlProgramReleaseHatch(r)).toBe('unsupported-shape');
+      expect(warnSpy.length).toBe(1);
+    } finally {
+      console.warn = origWarn;
+    }
+    // Refused, so the prototype is untouched and no delete path was ever armed.
+    expect((pipelinesProto._releaseProgram as unknown as Record<PropertyKey, unknown>)[Symbol.for('modoki.glProgramRelease.patched')]).toBeUndefined();
   });
 
   it('never throws out of the wrapper when the extra delete fails — the original still runs', () => {
@@ -346,41 +469,20 @@ describe('installGlProgramReleaseHatch (#715)', () => {
       expect(warnSpy.length).toBe(1);
       expect(pipelinesProto._releaseProgram).toBe(originalReleaseProgram);
       expect(pipelinesProto._releasePipeline).toBe(originalReleasePipeline);
-      expect((pipelinesProto as Record<PropertyKey, unknown>)[Symbol.for('modoki.glProgramRelease.patched')]).toBeUndefined();
+      // Neither method may be left as one of our wrappers — the marker lives on the FUNCTION now.
+      expect((pipelinesProto._releaseProgram as unknown as Record<PropertyKey, unknown>)[Symbol.for('modoki.glProgramRelease.patched')]).toBeUndefined();
+      expect((pipelinesProto._releasePipeline as unknown as Record<PropertyKey, unknown>)[Symbol.for('modoki.glProgramRelease.patched')]).toBeUndefined();
     } finally {
       console.warn = origWarn;
     }
   });
 
-  it('marker branch: both method writes land but the PATCHED_MARKER defineProperty throws — both methods are still rolled back, no marker, one warning', async () => {
-    // `Object.preventExtensions` blocks adding a NEW own property but not reassigning an EXISTING
-    // one — so both `_releaseProgram`/`_releasePipeline` writes (existing own properties) land, and
-    // only the later `Object.defineProperty(proto, PATCHED_MARKER, ...)` (a brand-new property)
-    // throws. This exercises the OTHER branch of the same rollback: both reverts succeed cleanly
-    // (nothing throws in the inner catch this time), and the net result must still be fully
-    // reverted.
-    vi.resetModules();
-    const fresh = await import('../../src/runtime/rendering/glProgramRelease');
-
-    const originalReleaseProgram = pipelinesProto._releaseProgram;
-    const originalReleasePipeline = pipelinesProto._releasePipeline;
-    Object.preventExtensions(pipelinesProto);
-    const r = makeRenderer();
-
-    const warnSpy: unknown[][] = [];
-    const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnSpy.push(args); };
-    try {
-      const result = fresh.installGlProgramReleaseHatch(r);
-      expect(result).toBe('unsupported-shape');
-      expect(warnSpy.length).toBe(1);
-      expect(pipelinesProto._releaseProgram).toBe(originalReleaseProgram);
-      expect(pipelinesProto._releasePipeline).toBe(originalReleasePipeline);
-      expect((pipelinesProto as Record<PropertyKey, unknown>)[Symbol.for('modoki.glProgramRelease.patched')]).toBeUndefined();
-    } finally {
-      console.warn = origWarn;
-    }
-  });
+  // REMOVED: the "marker branch" test (`Object.preventExtensions` blocking the PATCHED_MARKER
+  // `defineProperty` while both method writes land). install() no longer writes any new property
+  // to the prototype — the marker moved onto the wrapper FUNCTIONS — so there is nothing left
+  // after the two method assignments that can throw, and the branch it exercised does not exist.
+  // `preventExtensions` now blocks nothing here: both writes are reassignments of EXISTING own
+  // properties. The surviving `partial hostility` test above still covers the rollback path.
 
   it('reads this.backend per call rather than closing over the install-time renderer', () => {
     // Two SEPARATE renderers (own backend, own `_pipelines` instance) sharing the same patched
@@ -517,9 +619,9 @@ describe('the patched prototype is SHARED, so the backend gate has to hold at CA
   // relying on the field being absent would pass just as well with no gate at all, and would stop
   // protecting us the moment three renamed something.
   beforeEach(() => {
-    // Same reason as the first describe's reset: the idempotence guard is the own-property
-    // PATCHED_MARKER symbol on the prototype, so without a fresh prototype every test here inherits
-    // an already-patched one and install() reports 'already-installed'.
+    // Same reason as the first describe's reset: the idempotence guard is PATCHED_MARKER on the
+    // wrapper functions, so without a fresh prototype every test here inherits already-wrapped
+    // methods and install() reports 'already-installed'.
     pipelinesProto = makePipelinesProto();
   });
 

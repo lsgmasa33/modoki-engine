@@ -484,7 +484,8 @@ class SceneManagerImpl implements SceneManager {
         // Latent, not live: all FIVE production `preloaded` callers were checked —
         // `agentBridge` passes a freshly-parsed object, `applyPrefabUndo` passes a
         // `clone(scene)`, and `timelinePreview`/`playMode`/`prefabEdit` all build
-        // theirs at `SCENE_FORMAT_VERSION` (the latter two via `serializeScene`), so
+        // theirs at `SCENE_FORMAT_VERSION` (the first two via `serializeScene`, and
+        // `prefabEdit` via `buildPrefabEditScene`, which stamps it itself), so
         // no ladder rung runs on a caller-owned document today. A caller that ever
         // passes a genuinely pre-v6 object it intends to keep needs a deep clone,
         // not this one. Enumerate with

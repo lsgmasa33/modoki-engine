@@ -68,8 +68,7 @@ interface RendererLike {
   _pipelines: PipelinesLike;
 }
 
-/** Marks a Pipelines prototype already patched, so a second `install` call on the SAME three build
- *  (shared across every renderer — see the doc above) is a no-op rather than a double-wrap.
+/** Marks a WRAPPER FUNCTION as one of ours, so a second `install` call never wraps a wrapper.
  *
  *  A registry `Symbol.for(...)` — not a module-local `WeakSet` — because the WeakSet only catches
  *  a repeat call THROUGH THIS MODULE INSTANCE. Two loaded copies of this module (Vite HMR handing
@@ -78,8 +77,40 @@ interface RendererLike {
  *  prototype and double-wraps it — `gl.deleteShader` then fires twice per release (a second call
  *  on an already-deleted shader is `GL_INVALID_VALUE`). `Symbol.for` looks its symbol up in the
  *  global symbol registry by string, so every module instance in the same realm gets the identical
- *  symbol and the marker on the prototype answers "patched?" regardless of which instance asks. */
+ *  symbol and the marker answers "patched?" regardless of which instance asks.
+ *
+ *  ⚠️ **On the FUNCTION, and checked PER METHOD — not on the prototype.** Two earlier rounds both
+ *  put it on the prototype and both were wrong, in opposite directions, because
+ *  `Object.getPrototypeOf(pipelines)` is the SUBCLASS's prototype when three ever subclasses
+ *  `Pipelines`:
+ *    - Read through the prototype CHAIN, a subclass that OVERRIDES these methods inherits the
+ *      base's marker, reports `already-installed`, and its overrides are never wrapped — the leak
+ *      stays open. Benign, but the hatch does nothing.
+ *    - Read as an OWN property (`hasOwnProperty`), a subclass that does NOT override them has no
+ *      marker of its own, so `install()` proceeds and reads `proto._releaseProgram` off the chain
+ *      — which is the base's ALREADY-INSTALLED wrapper. It then wraps that wrapper, and
+ *      `gl.deleteShader` fires TWICE per release: `GL_INVALID_VALUE` on every program release, on
+ *      the WebGL2-fallback path this file exists for. Strictly worse than doing nothing.
+ *  Marking the function itself is the only form that is right in both directions, and it is the
+ *  only one that can express the MIXED case — a subclass overriding one of the two methods needs
+ *  that half wrapped and the other half left alone, which no single per-prototype flag can say. */
 const PATCHED_MARKER = Symbol.for('modoki.glProgramRelease.patched');
+
+/** True when `fn` is a wrapper THIS module (or another instance of it, via the registry symbol)
+ *  already installed. Reads the marker as an own property OF THE FUNCTION — functions do not
+ *  inherit from each other here, so there is no chain to walk and no subclass ambiguity. */
+function isOurWrapper(fn: unknown): boolean {
+  return typeof fn === 'function'
+    && (fn as unknown as Record<symbol, unknown>)[PATCHED_MARKER] === true;
+}
+
+/** Stamps a wrapper so a later `install()` — from this module instance or another copy of it —
+ *  recognises it and refuses to wrap it again. Non-enumerable so it never shows up in a
+ *  `for…in`/`Object.keys` walk of the prototype. */
+function markAsOurWrapper<T extends (...args: never[]) => unknown>(fn: T): T {
+  Object.defineProperty(fn, PATCHED_MARKER, { value: true, configurable: true, enumerable: false });
+  return fn;
+}
 
 /** Warned categories, so each DISTINCT failure is reported once per process however many times
  *  install() is retried (e.g. one scene reload after another) — loud, not spammy.
@@ -142,7 +173,7 @@ function findUnsupportedReason(renderer: RendererLike): string | null {
 
 /** Installs the extra GL deletes onto `renderer`'s (shared) Pipelines prototype. Safe to call once
  *  per renderer — see module doc for exactly what this patches and why, and see `PATCHED_MARKER`
- *  (a per-prototype own-property marker, not module-level) for why a repeat call is a no-op, and
+ *  (a marker on the wrapper FUNCTIONS, checked per method) for why a repeat call is a no-op, and
  *  the wrapper bodies below for why a WebGPU backend is a no-op. */
 export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstall {
   const r = renderer as Partial<RendererLike> | null | undefined;
@@ -156,17 +187,19 @@ export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstal
   }
 
   const proto = Object.getPrototypeOf((r as RendererLike)._pipelines) as PipelinesLike & object;
-  // hasOwnProperty, not a plain property read: a plain read walks the prototype CHAIN, so a
-  // `Pipelines` subclass whose own prototype inherits the marker from the (already-patched) base
-  // prototype would wrongly report 'already-installed' and leave the subclass's own
-  // `_releaseProgram`/`_releasePipeline` overrides unwrapped.
-  if (Object.prototype.hasOwnProperty.call(proto, PATCHED_MARKER)) return 'already-installed';
 
+  // Read each method the way a CALL would — through the prototype chain — and ask whether that
+  // exact function is already one of ours. See `PATCHED_MARKER` for why this is per method and on
+  // the function rather than on the prototype.
+  //
   // NOT bound — `this` must stay whatever the CALL SITE passes (the per-renderer pipelines
   // instance that owns `programs`/`caches`/`info`, not this shared prototype), so both are
   // invoked below via `.call(this, ...)` inside the wrapper.
   const originalReleaseProgram = proto._releaseProgram as (this: PipelinesLike, program: unknown) => void;
   const originalReleasePipeline = proto._releasePipeline as (this: PipelinesLike, pipeline: unknown) => void;
+  const programAlreadyPatched = isOurWrapper(originalReleaseProgram);
+  const pipelineAlreadyPatched = isOurWrapper(originalReleasePipeline);
+  if (programAlreadyPatched && pipelineAlreadyPatched) return 'already-installed';
 
   // The prototype is SHARED across every renderer three constructs, so both wrappers read
   // `this.backend`/`this.backend.gl` PER CALL — never close over the renderer passed to install().
@@ -179,7 +212,7 @@ export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstal
   // no-op. But that is a property of three's CURRENT field names, not a guarantee, and if it ever
   // changed we would call `gl.*` on a backend that has no `gl`. So each wrapper re-checks the
   // backend it is actually running against, making the gate real rather than incidental.
-  const releaseProgramWrapper = function (this: PipelinesLike & { backend: WebGLFallbackBackendLike }, program: unknown) {
+  const releaseProgramWrapper = markAsOurWrapper(function (this: PipelinesLike & { backend: WebGLFallbackBackendLike }, program: unknown) {
     if (this.backend?.isWebGLBackend !== true) { originalReleaseProgram.call(this, program); return; }
     // Read the GL shader handle BEFORE delegating: a future three that wires up
     // `backend.destroyProgram` from inside the original method would drop the DataMap entry,
@@ -198,9 +231,9 @@ export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstal
       // Never let the extra cleanup break a teardown path — the original release already ran.
       warnOnce('delete-shader-threw', `gl.deleteShader threw: ${String(e)}`);
     }
-  };
+  });
 
-  const releasePipelineWrapper = function (this: PipelinesLike & { backend: WebGLFallbackBackendLike }, pipeline: unknown) {
+  const releasePipelineWrapper = markAsOurWrapper(function (this: PipelinesLike & { backend: WebGLFallbackBackendLike }, pipeline: unknown) {
     if (this.backend?.isWebGLBackend !== true) { originalReleasePipeline.call(this, pipeline); return; }
     let programGPU: unknown;
     try {
@@ -215,7 +248,7 @@ export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstal
     } catch (e) {
       warnOnce('delete-program-threw', `gl.deleteProgram threw: ${String(e)}`);
     }
-  };
+  });
 
   // `findUnsupportedReason` only catches internals being MISSING. A three build where
   // `Pipelines.prototype` is frozen, or one of these two properties non-writable (ESM modules run
@@ -227,14 +260,27 @@ export function installGlProgramReleaseHatch(renderer: unknown): GlReleaseInstal
   // failure can never leave one wrapper installed without its twin: on any throw, put back
   // whichever original already landed and report the same 'unsupported-shape' a missing internal
   // would.
+  //
+  // ⚠️ Each half is written only if it is not ALREADY one of our wrappers. In the mixed subclass
+  // case — an override on one method, the base's installed wrapper inherited for the other — the
+  // already-patched half must be left exactly as it is: re-assigning it onto this prototype would
+  // wrap our own wrapper and double the GL delete (see `PATCHED_MARKER`). The revert below is
+  // symmetric for the same reason: it only puts back what this call actually wrote.
   try {
-    (proto as unknown as Record<string, unknown>)._releaseProgram = releaseProgramWrapper;
-    (proto as unknown as Record<string, unknown>)._releasePipeline = releasePipelineWrapper;
-    Object.defineProperty(proto, PATCHED_MARKER, { value: true, configurable: true, enumerable: false });
+    if (!programAlreadyPatched) {
+      (proto as unknown as Record<string, unknown>)._releaseProgram = releaseProgramWrapper;
+    }
+    if (!pipelineAlreadyPatched) {
+      (proto as unknown as Record<string, unknown>)._releasePipeline = releasePipelineWrapper;
+    }
   } catch (e) {
     try {
-      (proto as unknown as Record<string, unknown>)._releaseProgram = originalReleaseProgram;
-      (proto as unknown as Record<string, unknown>)._releasePipeline = originalReleasePipeline;
+      if (!programAlreadyPatched) {
+        (proto as unknown as Record<string, unknown>)._releaseProgram = originalReleaseProgram;
+      }
+      if (!pipelineAlreadyPatched) {
+        (proto as unknown as Record<string, unknown>)._releasePipeline = originalReleasePipeline;
+      }
     } catch {
       // Reached only when a REVERT write itself throws — e.g. one of the two properties is
       // non-writable, so its forward write above never actually landed and this reassignment to

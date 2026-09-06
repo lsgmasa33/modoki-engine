@@ -174,7 +174,13 @@ const TRS_FIELDS = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
  *  a genuinely empty/absent override — never merely because every TRS field failed validation,
  *  since a surviving unknown key must not be destroyed along with them. */
 function normalizeControlTransform(t: unknown): ControlClipBlock['transform'] | undefined {
-  if (!t || typeof t !== 'object') return undefined;
+  // ⚠️ `Array.isArray` is load-bearing, not defensive tidiness. Widening the return
+  // gate below to "any key survived" made an ARRAY reachable for the first time:
+  // `[1,2,3]` spreads to `{"0":1,"1":2,"2":3}`, survives the round trip, and is
+  // written back into the `.timeline.json` on the next panel save. The old
+  // "a TRS field validated" gate happened to mask it. Same shape `normalizeSpriteAnim`
+  // guards against, and it was reintroduced here by the very commit that fixed it there.
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return undefined;
   const src = t as Record<string, unknown>;
   // Carry unknown keys through (#821) — this function only OWNS the nine TRS fields
   // (it validates/coerces those); anything else is a passenger. A TRS field is deleted

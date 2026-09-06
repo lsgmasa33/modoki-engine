@@ -210,6 +210,16 @@ describe('#821 review findings — the fix stopped short of these', () => {
     expect(Array.isArray(out.clips.run.frames)).toBe(true);
   });
 
+  it('normalizeControlTransform rejects an ARRAY instead of spreading its indices', () => {
+    // Widening the return gate to "any key survived" made this reachable: the array
+    // spreads to {"0":1,"1":2,"2":3}, round-trips, and is written back to the file.
+    // The previous gate ("a TRS field validated") masked it, which is why the sibling
+    // guard in normalizeSpriteAnim landed and this one did not.
+    const raw = { id: 't', tracks: [{ id: 'tr1', type: 'control', clips: [{ prefab: 'guid-1', start: 0, transform: [1, 2, 3] }] }] };
+    const out = JSON.parse(JSON.stringify(normalizeTimeline(raw as never)));
+    expect(out.tracks[0].clips[0].transform).toBeUndefined();
+  });
+
   it('normalizeControlTransform keeps an unknown key when NO TRS field is present', () => {
     const raw = { id: 't', tracks: [{ id: 'tr1', type: 'control', clips: [{ prefab: 'guid-1', start: 0, transform: { ease: 'inOut' } }] }] };
     const out = JSON.parse(JSON.stringify(normalizeTimeline(raw as never)));
