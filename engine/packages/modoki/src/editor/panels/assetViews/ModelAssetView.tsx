@@ -137,7 +137,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       if (patch.lodCount !== undefined && patch.lodCount !== prev.lodCount) {
         next = resolveModelSettings({ model: next });
       }
-      const updatedMeta = { ...(meta ?? {}), version: 2, model: next };
+      const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -150,7 +150,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
   const updateTex = useCallback((patch: Partial<TextureImportSettings>) => {
     setTexSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, texture: next };
+      const updatedMeta = { ...(meta ?? {}), texture: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -163,7 +163,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const dists = prev.lodDistances.slice();
       if (kind === 'ratio') ratios[index] = value; else dists[index] = value;
       const next: ModelImportSettings = { ...prev, lodRatios: ratios, lodDistances: dists };
-      const updatedMeta = { ...(meta ?? {}), version: 2, model: next };
+      const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -175,7 +175,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const encoders = (prev.lodEncoders ?? Array.from({ length: prev.lodCount }, () => prev.encoder)).slice();
       encoders[index] = encoder;
       const next: ModelImportSettings = { ...prev, lodEncoders: encoders };
-      const updatedMeta = { ...(meta ?? {}), version: 2, model: next };
+      const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -191,7 +191,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const next: ModelImportSettings = kind === 'meshopt'
         ? { ...prev, lodMeshopt: arr }
         : { ...prev, lodAggressive: arr };
-      const updatedMeta = { ...(meta ?? {}), version: 2, model: next };
+      const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -569,7 +569,7 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
       if (!glbRes.ok) throw new Error(`write GLB failed (${glbRes.status})`);
       await backendFetch('/api/write-meta', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, version: 2, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),
+        body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),
       });
       const meshAsset = { id: meshGuid, version: 1, model: modelGuid, mesh: meshName, postprocessor: 'none', material: '' };
       await post(meshJsonPath, JSON.stringify(meshAsset, null, 2));

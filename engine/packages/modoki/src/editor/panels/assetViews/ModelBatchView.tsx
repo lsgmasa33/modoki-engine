@@ -54,7 +54,7 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       for (const p of paths) {
         updated[p] = next;
         // MERGE — a bare {version, postprocessor} would replace the whole sidecar.
-        void writeMetaOrWarn(p, { ...(metas[p] ?? {}), version: 2, postprocessor: next });
+        void writeMetaOrWarn(p, { ...(metas[p] ?? {}), postprocessor: next });
       }
       return updated;
     });

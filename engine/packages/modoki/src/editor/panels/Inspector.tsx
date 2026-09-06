@@ -1435,7 +1435,10 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
   // Persist postprocessor to meta when changed
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
-    const updated = { ...(metaRef.current ?? {}), version: 2, postprocessor: newPostprocessor };
+    // No `version` here — `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION` onto every write
+    // unconditionally, so a literal here would be dead weight at best and a stale number at
+    // worst. See docs/format-versioning.md § 2b.
+    const updated = { ...(metaRef.current ?? {}), postprocessor: newPostprocessor };
     metaRef.current = updated;
     // writeMetaOrWarn, not a raw fetch with `.catch(() => {})` — that swallow-catch is exactly
     // the pattern it exists to replace (a dev-server outage looked like a successful edit).

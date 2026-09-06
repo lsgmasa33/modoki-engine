@@ -8,10 +8,15 @@
  *
  *  ⚠️ **Prefabs are NOT covered by this number.** `.prefab.json` carries its own, much smaller
  *  format version with its own constant — `PREFAB_FORMAT_VERSION` in
- *  `editor/scene/prefab.ts` — currently 2, where a scene is 12. This comment said
+ *  `editor/scene/prefab.ts` — currently 3, where a scene is 13. This comment said
  *  "scene/prefab JSON" for a long time and was simply wrong; a prefab has never been stamped
- *  12. The prefab constant lives in `editor/` rather than here because prefab serialization is
- *  editor-only and nothing in `runtime/**` reads or writes it (#365, #379). */
+ *  13. The prefab constant lives in `editor/` rather than here because prefab serialization is
+ *  editor-only and nothing in `runtime/**` reads or writes it (#365, #379).
+ *
+ *  (The two numbers in this note drifted once already — they were left at "2" and "12" through
+ *  two bumps. They are stated here only to make the SIZE difference concrete; if you find them
+ *  stale again, the fix is to check `PREFAB_FORMAT_VERSION` and `SCENE_FORMAT_VERSION`
+ *  directly rather than to trust this line.) */
 
 // Keep in sync with packages/modoki/package.json "version".
 export const ENGINE_VERSION = '0.1.0';

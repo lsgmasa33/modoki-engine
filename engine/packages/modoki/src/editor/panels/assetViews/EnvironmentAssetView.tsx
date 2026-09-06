@@ -74,7 +74,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   const update = useCallback((patch: Partial<EnvImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, environment: next };
+      const updatedMeta = { ...(meta ?? {}), environment: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -97,7 +97,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         });
         if (!w.ok) { console.error('[Inspector] UltraHDR write failed'); return; }
         const hash = hashBytes(jpeg);
-        const updatedMeta = { ...(meta ?? {}), version: 2, environment: settings, environmentCache: { hash, bytes: jpeg.length } };
+        const updatedMeta = { ...(meta ?? {}), environment: settings, environmentCache: { hash, bytes: jpeg.length } };
         setMeta(updatedMeta);
         await writeMetaOrWarn(path, updatedMeta);
       } else {

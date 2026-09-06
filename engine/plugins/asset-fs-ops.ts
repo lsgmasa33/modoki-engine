@@ -11,7 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
-import { writeMetaSidecar } from './meta-sidecar';
+import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
 
 /** mkdir -p. Throws if the folder already exists (the endpoint maps this to 409). */
 export function createFolderAt(absPath: string): void {
@@ -29,7 +29,12 @@ export function moveAssetFile(absFrom: string, absTo: string): void {
   const destDir = path.dirname(absTo);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
   fs.renameSync(absFrom, absTo);
-  for (const suffix of ['.meta.json', '.meta.local.json']) {
+  // ⚠️ `.meta.json.corrupt` rides along too (#778). It is the QUARANTINED copy of a sidecar that
+  // did not parse, and it holds the only surviving copy of that asset's authored fields — the
+  // exact thing this loop exists to stop being stranded under the old filename (QA-CTX-0005, for
+  // `.meta.local.json`). It is gitignored, so a stranding is invisible to `git status` and would
+  // only surface when someone went looking for data they had already lost.
+  for (const suffix of ['.meta.json', '.meta.local.json', '.meta.json' + CORRUPT_SIDECAR_SUFFIX]) {
     const metaFrom = absFrom + suffix;
     if (fs.existsSync(metaFrom)) fs.renameSync(metaFrom, absTo + suffix);
   }

@@ -27,6 +27,13 @@
 import { Capacitor } from '@capacitor/core';
 import { NoopStoreBackend, type StoreBackend } from './storeBackend';
 import type { IapProduct, IapProductInfo, StoreTransaction } from './types';
+import {
+  classifyFormatVersion,
+  isReadable,
+  preservedVersion,
+  collectUnknownFields,
+  mergeUnknownFields,
+} from '../core/formatVersion';
 
 /** The same structural persistence shape the ledger uses — satisfied by `createPrefsDocStore`. */
 export interface MockStoreStore {
@@ -35,31 +42,71 @@ export interface MockStoreStore {
   flush(): Promise<void>;
 }
 
+/** FORMAT version of the persisted mock-store document. Named for the same reason
+ *  `LEDGER_FORMAT_VERSION` is — see `docs/format-versioning.md` § 2b. */
+export const MOCK_STORE_FORMAT_VERSION = 1;
+
+/** Lowest version this build will read. See `MIN_READABLE_LEDGER_VERSION`. */
+export const MIN_READABLE_MOCK_STORE_VERSION = 1;
+
+/** The fields this build owns; everything else is preserved verbatim. */
+const KNOWN_MOCK_KEYS = ['v', 'seq', 'paid', 'finished', 'acknowledged'] as const;
+
 interface MockDoc {
-  v: 1;
+  /** `number`, not the literal `1` — a document read back from storage may have been written
+   *  by a different build. Same reasoning as `LedgerDoc.v`. */
+  v: number;
   seq: number;
   /** Everything ever "paid for". */
   paid: StoreTransaction[];
   /** Transaction ids the app has finished. */
   finished: string[];
   acknowledged: string[];
+  /** Keys a NEWER build wrote that this one does not understand, carried through untouched.
+   *  Absent rather than `{}` when there is nothing unknown. Never itself written as a key. */
+  unknownFields?: Record<string, unknown>;
 }
 
 function emptyDoc(): MockDoc {
-  return { v: 1, seq: 0, paid: [], finished: [], acknowledged: [] };
+  return { v: MOCK_STORE_FORMAT_VERSION, seq: 0, paid: [], finished: [], acknowledged: [] };
 }
 
+/**
+ * Parse the stored document. Same defect and same fix as `ledger.ts`'s `parse` (#767): this was
+ * `d.v !== 1 || !Array.isArray(d.paid)`, which collapsed all four verdicts onto "discard the whole
+ * document" and fused the version gate with shape validation so a caller could not tell them apart.
+ *
+ * Lower stakes than the ledger — this is the editor/off-device mock and no real money moves
+ * through it — but it is fixed identically on purpose. The whole point of the shared classifier
+ * is that the same document question does not get two different answers depending on how important
+ * the document looked to whoever was passing.
+ */
 function parse(raw: unknown): MockDoc {
-  if (!raw || typeof raw !== 'object') return emptyDoc();
+  const verdict = classifyFormatVersion(raw, MOCK_STORE_FORMAT_VERSION, {
+    field: 'v',
+    minReadable: MIN_READABLE_MOCK_STORE_VERSION,
+  });
+  if (!isReadable(verdict) && verdict.kind !== 'too-new') return emptyDoc();
+
   const d = raw as Partial<MockDoc>;
-  if (d.v !== 1 || !Array.isArray(d.paid)) return emptyDoc();
+  if (!Array.isArray(d.paid)) return emptyDoc();
+
+  const unknownFields = collectUnknownFields(raw, KNOWN_MOCK_KEYS);
   return {
-    v: 1,
+    v: preservedVersion(verdict, MOCK_STORE_FORMAT_VERSION),
     seq: typeof d.seq === 'number' ? d.seq : 0,
     paid: d.paid,
     finished: Array.isArray(d.finished) ? d.finished : [],
     acknowledged: Array.isArray(d.acknowledged) ? d.acknowledged : [],
+    ...(unknownFields ? { unknownFields } : {}),
   };
+}
+
+/** This build's fields, with preserved unknown keys spread UNDER them so a known key always
+ *  wins. `unknownFields` is a parse-time construct and is never itself written. */
+function serialize(doc: MockDoc): Record<string, unknown> {
+  const { unknownFields, ...known } = doc;
+  return mergeUnknownFields(known, unknownFields);
 }
 
 export interface MockStoreOptions {
@@ -109,7 +156,7 @@ export class MockStoreBackend implements StoreBackend {
       + 'This backend cannot be selected on a device.');
   }
 
-  private persist(): void { this.store.write(this.doc); }
+  private persist(): void { this.store.write(serialize(this.doc)); }
 
   async products(ids: readonly string[]): Promise<IapProductInfo[]> {
     return ids.filter((id) => this.kinds.has(id)).map((id) => ({

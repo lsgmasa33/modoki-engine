@@ -65,7 +65,7 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
         const m = prev[p] ?? {};
         const curSettings = resolveTextureSettings(m as { type?: TextureType; texture?: Partial<TextureImportSettings> });
         const curType = resolveTextureType(m as { type?: TextureType; texture?: Partial<TextureImportSettings> });
-        const updated = { ...m, version: 2, type: curType, texture: { ...curSettings, ...patch } };
+        const updated = { ...m, type: curType, texture: { ...curSettings, ...patch } };
         next[p] = updated;
         writeMetaOrWarn(p, updated);
       }
@@ -80,7 +80,7 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
     setMetas((prev) => {
       const next: MetaMap = { ...prev };
       for (const p of paths) {
-        const updated = { ...(prev[p] ?? {}), version: 2, type: nextType, texture: derived };
+        const updated = { ...(prev[p] ?? {}), type: nextType, texture: derived };
         next[p] = updated;
         writeMetaOrWarn(p, updated);
       }

@@ -93,7 +93,7 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<VideoImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, video: next };
+      const updatedMeta = { ...(meta ?? {}), video: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;

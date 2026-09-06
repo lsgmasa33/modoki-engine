@@ -40,6 +40,12 @@ subgame-dist/
 # every import/build; readMetaSidecar merges them back for the inspector.
 *.meta.local.json
 
+# A sidecar that did not parse, moved aside rather than destroyed (#778 — usually
+# unresolved merge-conflict markers in a committed .meta.json). Machine-local recovery
+# evidence: resolve it by hand and merge the authored fields back, then delete it. Ignored
+# so a conflict-marked file can't be committed by accident.
+*.meta.json.corrupt
+
 # iOS
 ios/App/Pods/
 ios/App/AppLovinQualityService/

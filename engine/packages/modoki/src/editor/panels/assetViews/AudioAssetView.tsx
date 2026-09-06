@@ -68,7 +68,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<AudioImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, audio: next };
+      const updatedMeta = { ...(meta ?? {}), audio: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;

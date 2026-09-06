@@ -30,9 +30,15 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // `textureCache` with it. This is a `return false`, not a best-effort continue.
   //
   // Requiring `res.ok` costs nothing, because the route is explicit about every failure
-  // (F10): bad path 400, outside-root 403, missing asset 404 — so an ok response carrying
-  // `{}` unambiguously means "this asset exists and simply has no sidecar yet", which is a
-  // safe thing to spread.
+  // (F10): bad path 400, outside-root 403, missing asset 404.
+  //
+  // ⚠️ But an ok response carrying `{}` does NOT unambiguously mean "no sidecar yet" — this
+  // comment claimed that and was wrong. `readMetaSidecar` also returns `{}` for a sidecar that
+  // exists and does not PARSE (merge-conflict markers, #778), so this function can still reach
+  // the write below with no `id` in hand. What makes that survivable is downstream, not here:
+  // `writeMetaSidecar` salvages the `id` textually out of the damaged bytes before quarantining
+  // them, so the identity is restored even though the payload posted from here lacks it. Do not
+  // re-derive a "safe to spread" argument from the status code alone.
   const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`).catch(() => null);
   if (!metaRes || !metaRes.ok) {
     console.error(`[SpritePicker] could not read the meta for ${path} (${metaRes ? metaRes.status : 'network error'}) — not converting, because overwriting the sidecar from a failed read would discard its GUID.`);

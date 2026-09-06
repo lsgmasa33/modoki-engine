@@ -318,7 +318,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const save = async () => {
     const hasBorder = border.l || border.r || border.t || border.b;
     const borderOut = { ...border, ...(edgeScale !== 1 ? { scale: edgeScale } : {}) };
-    const nextMeta = { ...(meta ?? {}), version: 2, ...(hasBorder ? { border: borderOut } : {}) };
+    const nextMeta = { ...(meta ?? {}), ...(hasBorder ? { border: borderOut } : {}) };
     if (!hasBorder) delete (nextMeta as Record<string, unknown>).border;
     // AWAIT the write before onClose(): the Inspector's onClose handler re-reads this exact file,
     // so an un-awaited POST raced that GET and the Inspector kept showing the pre-edit numbers

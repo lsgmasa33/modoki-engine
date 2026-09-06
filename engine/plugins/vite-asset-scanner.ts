@@ -37,7 +37,14 @@ import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
 import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
-import { readMetaSidecar, assertSidecarWritable, SIDECAR_FORMAT_VERSION } from './meta-sidecar';
+import {
+  readMetaSidecar,
+  assertSidecarWritable,
+  quarantineCorruptSidecar,
+  salvageSidecarId,
+  CORRUPT_SIDECAR_SUFFIX,
+  SIDECAR_FORMAT_VERSION,
+} from './meta-sidecar';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
@@ -234,8 +241,19 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
     // Binary (or non-object ID-bearing JSON): read sidecar
     const sidecar = absPath + '.meta.json';
     if (!fs.existsSync(sidecar)) return undefined;
-    const meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8'));
-    return isGuidShape(meta?.id) ? meta.id : undefined;
+    const text = fs.readFileSync(sidecar, 'utf-8');
+    try {
+      const meta = JSON.parse(text);
+      return isGuidShape(meta?.id) ? meta.id : undefined;
+    } catch {
+      // ⚠️ The sidecar does not parse (merge-conflict markers — #778). Returning `undefined` here
+      // is what makes `buildManifest`'s heal pass mint a BRAND-NEW guid, dangling every existing
+      // scene/prefab reference to this asset. A conflict wraps only the conflicting hunk, so the
+      // `"id"` line is almost always intact and readable textually — recover it rather than
+      // treating a damaged file as an un-stamped one. Returns undefined if the id ITSELF
+      // conflicts, where minting is the honest outcome.
+      return salvageSidecarId(text);
+    }
   } catch {
     return undefined;
   }
@@ -320,8 +338,27 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
       console.warn(`[assets] not stamping a GUID into ${sidecar}: ${e instanceof Error ? e.message : e}`);
       return false;
     }
+    // ⚠️ An unparsable sidecar is MOVED ASIDE, never silently replaced (#778). This branch
+    // used to `catch { /* recreate */ }` and write `{id: guid}` over the whole document —
+    // discarding the texture import settings and every hand-drawn sprite slice (each with its
+    // OWN GUID that scenes reference), re-minting the asset's GUID so every existing ref
+    // dangled, and returning `true`. None of that is recoverable from the source image, and a
+    // reimport does not bring it back: it regenerates the files listed under `generated`, not
+    // the authored state beside them.
+    // Warned explicitly rather than left to the outer `catch { return false }`. That catch DOES
+    // do the safe thing — the throw happens before any write, so the damaged bytes survive — but
+    // it reports the same bare `false` as an ordinary write failure and says nothing, which is
+    // the identical "refused, and nobody can tell why" complaint the `assertSidecarWritable`
+    // block above exists to avoid.
+    try {
+      quarantineCorruptSidecar(absPath);
+    } catch (e) {
+      console.warn(`[assets] not stamping a GUID into ${sidecar}: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
     let meta: Record<string, unknown> = {};
     if (fs.existsSync(sidecar)) {
+      // Parses by construction now — anything that did not was just quarantined away.
       try { meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { /* recreate */ }
     }
     meta.id = guid;
@@ -383,7 +420,18 @@ export function detectType(relPath: string, ext: string): string | null {
   // must be listed explicitly: it does NOT end with `.meta.json`, so it used to fall
   // through to the `.json` catch-all below and get classified as a SCENE, which minted a
   // GUID into it and registered it in the manifest as a scene.
-  if (relPath.endsWith('.meta.json') || relPath.endsWith('.meta.local.json')) return null;
+  // The quarantined half (`<asset>.meta.json.corrupt`, #778) is listed for a WEAKER reason, and
+  // the distinction matters: its extension is `.corrupt`, so the `.json` branch below is never
+  // entered and the final `EXT_TYPE[ext] || null` already returns null. Deleting this clause
+  // changes nothing today — it is explicit belt-and-braces against a future `EXT_TYPE` entry,
+  // not the mechanism keeping the file out of the scan. (Claimed as load-bearing when first
+  // written; measured otherwise — a bare `.corrupt` path, which this clause does not match,
+  // classifies as null too.)
+  if (
+    relPath.endsWith('.meta.json') ||
+    relPath.endsWith('.meta.local.json') ||
+    relPath.endsWith('.meta.json' + CORRUPT_SIDECAR_SUFFIX)
+  ) return null;
   // Committed UltraHDR variant (`<src>.hdr~ultrahdr.jpg`) — a DERIVED file next to its
   // source HDR, NOT a standalone texture asset. Exclude it from the scan (else it'd be
   // classified `.jpg` → texture and get its own meta/manifest entry).

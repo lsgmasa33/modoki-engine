@@ -2084,7 +2084,11 @@ async function describeUnresolvedAgainstLiveWorld(
     const resolved = ctx.resolveAssetPath(assetPath);
     if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
     if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
-    // The asset exists — an empty `{}` here now unambiguously means "no sidecar", not "bad path".
+    // The asset exists, so `{}` is no longer "bad path". ⚠️ It is still NOT unambiguous: this
+    // returns `readMetaSidecar`, which yields `{}` for a sidecar that exists and does not PARSE
+    // as well as for one that is absent (#778 — see that function's own warning). A caller must
+    // not read `{}` as "there was nothing here"; the write path is what protects the authored
+    // fields and the GUID, by quarantining and salvaging respectively.
     return { kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)) };
   }
 

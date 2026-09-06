@@ -593,7 +593,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
     const nextMeta = {
-      ...(meta ?? {}), version: 2,
+      ...(meta ?? {}),
       spriteMode: clean.length ? 'multiple' : 'single',
       sprites: clean,
       spriteSheet: { width: imgDims.w, height: imgDims.h },

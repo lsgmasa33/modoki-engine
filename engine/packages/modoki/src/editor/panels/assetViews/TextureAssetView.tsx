@@ -238,7 +238,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   const update = useCallback((patch: Partial<TextureImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, type, texture: next };
+      const updatedMeta = { ...(meta ?? {}), type, texture: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -257,7 +257,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       const hasBorder = merged.l || merged.r || merged.t || merged.b;
       const nextB = { l: merged.l, r: merged.r, t: merged.t, b: merged.b,
         ...(merged.scale !== 1 ? { scale: merged.scale } : {}) };
-      const updatedMeta: Record<string, unknown> = { ...(prev ?? {}), version: 2, border: nextB };
+      const updatedMeta: Record<string, unknown> = { ...(prev ?? {}), border: nextB };
       writeMetaOrWarn(path, updatedMeta);
       // Live-apply to the texture's auto whole-image sprite so the scene view reflects
       // border/edge-scale edits immediately (without a re-import/rescan) — same path
@@ -283,7 +283,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
     const next = deriveSettingsForType(nextType);
     setType(nextType);
     setSettings(next);
-    const updatedMeta = { ...(meta ?? {}), version: 2, type: nextType, texture: next };
+    const updatedMeta = { ...(meta ?? {}), type: nextType, texture: next };
     setMeta(updatedMeta);
     writeMetaOrWarn(path, updatedMeta);
   }, [meta, path]);

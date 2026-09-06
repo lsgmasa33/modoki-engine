@@ -47,6 +47,20 @@ describe('moveAssetFile', () => {
     expect(read('dst/a.png.meta.json')).toBe('{"id":"g1"}');
   });
 
+  it('carries a QUARANTINED .meta.json.corrupt along too (#778)', () => {
+    // The same stranding bug as QA-CTX-0005 below, on the file that can least afford it: the
+    // quarantined sidecar holds the ONLY surviving copy of the asset's authored fields (texture
+    // import settings, sprite slices and their GUIDs). It is gitignored, so stranding it under
+    // the old filename shows up in no `git status` — it surfaces when someone goes looking for
+    // data they have already lost.
+    write('src/a.png', 'X');
+    write('src/a.png.meta.json', '{"id":"g1"}');
+    write('src/a.png.meta.json.corrupt', '{"id":"g1"\n<<<<<<< HEAD');
+    moveAssetFile(abs('src/a.png'), abs('dst/a.png'));
+    expect(exists('src/a.png.meta.json.corrupt')).toBe(false);
+    expect(read('dst/a.png.meta.json.corrupt')).toBe('{"id":"g1"\n<<<<<<< HEAD');
+  });
+
   it('carries the GITIGNORED .meta.local.json half along too (QA-CTX-0005)', () => {
     // Both halves are written as a pair by writeMetaSidecar. Moving only the committed
     // one stranded the local stats under the OLD filename and left the moved asset

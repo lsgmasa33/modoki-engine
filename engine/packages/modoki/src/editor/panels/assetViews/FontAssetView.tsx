@@ -111,7 +111,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       const next: FontImportSettings = { ...prev };
       if (nextAxes) next.variationAxes = nextAxes;
       else delete next.variationAxes;
-      const updatedMeta = { ...(meta ?? {}), version: 2, font: next };
+      const updatedMeta = { ...(meta ?? {}), font: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
@@ -123,7 +123,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<FontImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, font: next };
+      const updatedMeta = { ...(meta ?? {}), font: next };
       setMeta(updatedMeta);
       writeMetaOrWarn(path, updatedMeta);
       return next;
