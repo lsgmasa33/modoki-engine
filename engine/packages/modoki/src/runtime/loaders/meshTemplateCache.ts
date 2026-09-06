@@ -1420,14 +1420,14 @@ export function disposeAllCachedResources() {
 
   // Dispose any cached HDR environments and clear env owners — they're tied
   // to the same cacheToken / scene lifetime as everything else here.
-  for (const [, tex] of envCache) tex.dispose();
+  for (const [, tex] of envCache) { runEnvDisposeHooks(tex); tex.dispose(); } // #739: PMREM dies with its source
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
   // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
   // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
   // Everything binding them is being torn down with this generation anyway.
-  for (const tex of retiredEnvs) tex.dispose();
+  for (const tex of retiredEnvs) { runEnvDisposeHooks(tex); tex.dispose(); } // #739
   retiredEnvs.clear();
 
   // Clear refcount tracking
@@ -1939,7 +1939,43 @@ export function retiredEnvironments(): ReadonlySet<THREE.DataTexture> {
  *  `dispose()` on a retired env directly — that is the bug this exists to prevent. */
 export function disposeRetiredEnvironment(tex: THREE.DataTexture): void {
   if (!retiredEnvs.delete(tex)) return; // not retired (or already freed) — nothing to do
+  runEnvDisposeHooks(tex); // the PMREM built from this equirect is dead with its source (#739)
   tex.dispose();
+}
+
+// ── Environment PMREM disposal hook (#739; indirection for #214) ─────────────────────────
+//
+// The actual PMREM generation/cache/disposal (`getEnvPMREMTexture`, `sourceForEnvPMREM`,
+// `disposeEnvPMREMFor`) lives in `../rendering/envPmrem.ts` now, not here — it needs
+// `PMREMGenerator` from `three/webgpu`, and `runtime/loaders/**` (this file) is reachable from the
+// 2D boot path, so importing that value HERE would ship the whole Three node pipeline into a
+// `render3d:false` 2D-only build (`tests/runtime/render3dBoundary.test.ts`, #214).
+//
+// But this cache must still ensure a PMREM dies with its source, without importing anything
+// three/webgpu-shaped itself. So instead of calling `disposeEnvPMREMFor` directly, it fans out to
+// a registry that `envPmrem.ts` populates at module scope (`registerEnvDisposeHook(disposeEnvPMREMFor)`)
+// — only when something ELSE (a 3D render surface) has already pulled that module in. A 2D-only
+// build never imports `envPmrem.ts`, so this set stays empty and the hook fan-out below is a no-op,
+// with nothing three-shaped ever reaching this file. ⚠️ Do not "simplify" this back into a direct
+// import — that is exactly the edge `render3dBoundary.test.ts` exists to catch.
+//
+// Keyed by string, not a bare `Set`: `envPmrem.ts` registers at MODULE SCOPE, and HMR re-evaluates
+// a module's top level on every edit without re-running the app's mount/teardown. A `Set` would
+// accumulate one closure per HMR pass, each pinning the PREVIOUS module instance's caches — and
+// (dev-only) a stale hook can dispose a render target the CURRENT module instance still has bound
+// (the #315 use-after-free shape, reborn via HMR). Re-registering under the same key REPLACES the
+// old closure instead of piling on, so only the current module instance's hook ever runs.
+const envDisposeHooks = new Map<string, (tex: THREE.DataTexture) => void>();
+
+/** Register a callback to run when a cached HDR environment texture is disposed, so a dependent
+ *  (currently: the PMREM built from it) can free itself. See the comment above for why this
+ *  indirection exists instead of a direct import, and why registration is keyed and idempotent. */
+export function registerEnvDisposeHook(key: string, fn: (tex: THREE.DataTexture) => void): void {
+  envDisposeHooks.set(key, fn);
+}
+
+function runEnvDisposeHooks(tex: THREE.DataTexture): void {
+  for (const fn of envDisposeHooks.values()) fn(tex);
 }
 
 function fetchEnvironment(hdrPath: string): Promise<void> {

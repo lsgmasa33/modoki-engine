@@ -31,6 +31,10 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { migrateUIAnchorZIndexInTraits } from '../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration';
 import { hasAnyProject } from '../helpers/repoLayout';
+// The single source of truth for the project roots (CLAUDE.md § Projects). Hand-listing
+// them here was a third copy; main retired the codemod's copy in f3f3f6fce, so this
+// guard follows rather than staying the holdout.
+import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -67,7 +71,11 @@ function sceneFiles(root: string): string[] {
   const rootSegs = path.relative(REPO, root).split(path.sep);
   return repoSceneAndPrefabFiles().filter((p) => {
     const segs = path.relative(REPO, p).split(path.sep);
-    return rootSegs.every((seg, i) => segs[i] === seg);
+    // Case-INSENSITIVE, matching `migrate-anchor-zindex.mjs`'s `PROJECT_PATTERN` (main, f3f3f6fce).
+    // A git index holding `Games/` against a worktree holding `games/` otherwise selects NOTHING
+    // here while the codemod still migrates — the guard would go green by scanning an empty set,
+    // which is the exact failure that chain has now been fixed for three times.
+    return rootSegs.every((seg, i) => segs[i]?.toLowerCase() === seg.toLowerCase());
   });
 }
 
@@ -138,7 +146,7 @@ describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () =>
   it('no scene or prefab under games/ or demos/ still authors UIAnchor.zIndex', () => {
     const offenders: string[] = [];
     const scanned: string[] = [];
-    for (const root of ['games', 'demos']) {
+    for (const root of PROJECT_ROOT_DIRS) {
       for (const file of sceneFiles(path.join(REPO, root))) {
         scanned.push(file);
         for (const { ent, location } of entitiesWithAnchorZIndex(file)) {

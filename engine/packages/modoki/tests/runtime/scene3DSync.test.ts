@@ -35,6 +35,7 @@ function mockSceneSyncDeps() {
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(), resolveMaterialForMesh: vi.fn(),
     resolveMaterial: vi.fn(), getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     onModelInvalidated: vi.fn(), getMeshAsset: vi.fn(),
@@ -97,6 +98,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -135,6 +137,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -187,6 +190,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -227,6 +231,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -321,6 +326,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -896,6 +902,7 @@ describe('scene3DSync', () => {
         worldTransforms: new Map(), deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(), resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(), getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
         onModelInvalidated: vi.fn(), getMeshAsset: vi.fn(),
@@ -1219,7 +1226,9 @@ describe('scene3DSync', () => {
     // -call (so the observer always detects it), all within a tiny drift-free band.
     async function loadHelper() {
       mockSceneSyncDeps();
-      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({}));
+      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
+      }));
       vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
       vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
       const THREE = await import('three');

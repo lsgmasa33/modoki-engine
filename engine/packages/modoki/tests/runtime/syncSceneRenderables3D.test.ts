@@ -49,8 +49,11 @@ async function setup() {
     resolveMaterial: vi.fn(() => ({ uuid: 'm', color: { setHex: vi.fn() }, nprColorPreserve: 0, dispose: vi.fn() })),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
-    retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
     retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
+  }));
+  vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+    getEnvPMREMTexture: vi.fn(), sourceForEnvPMREM: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
@@ -311,6 +314,9 @@ describe('syncSkinnedModels — lifecycle', () => {
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
     }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), sourceForEnvPMREM: vi.fn(),
+    }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
     const ensure = vi.fn((ref: string) => { void ref; });
@@ -396,6 +402,9 @@ describe('syncSkinnedModels — lifecycle', () => {
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), sourceForEnvPMREM: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
@@ -503,6 +512,9 @@ describe('attachInvalidationListener — re-import eviction', () => {
       // not variant retirement (that has its own file, invalidationVariantRetire.test.ts).
       getTemplatesForModel: () => new Map(),
     }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), sourceForEnvPMREM: vi.fn(),
+    }));
     // resolveRef is identity here (asset.model already a path) so targets.has matches.
     vi.doMock('../../src/runtime/loaders/assetManifest', () => ({ resolveRef: (r: string) => r, onFontInvalidated: () => () => {} }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
@@ -582,6 +594,9 @@ describe('syncEnvironment — cached branch is change-gated', () => {
       // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), sourceForEnvPMREM: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));

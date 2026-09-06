@@ -63,6 +63,7 @@ async function setup() {
     worldTransforms: new Map(), deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(),
     resolveMeshLodInfo: vi.fn(() => null),   // GLB path checks LOD first; default: no baked LODs
     resolveMaterialForMesh: vi.fn(() => null),

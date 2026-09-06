@@ -42,6 +42,9 @@ import {
   retiredEnvironments, disposeRetiredEnvironment,
   retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial, getTemplatesForModel,
 } from '../loaders/meshTemplateCache';
+// `getEnvPMREMTexture`/`sourceForEnvPMREM` moved to `./envPmrem` (#739) — that module needs
+// `three/webgpu`, which `meshTemplateCache.ts` can no longer import (render3dBoundary, #214).
+import { getEnvPMREMTexture, sourceForEnvPMREM } from './envPmrem';
 import { getRiggedModel, ensureRiggedModelLoaded, ensureRiggedModelLoadedFor } from '../loaders/riggedModelCache';
 import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
@@ -596,7 +599,15 @@ function sweepRetiredEnvironments(): void {
   for (const ref of envSurfaceRefs) {
     const surface = ref.deref();
     if (!surface) { envSurfaceRefs.delete(ref); continue; }
-    if (surface.environment) bound.add(surface.environment);
+    if (surface.environment) {
+      bound.add(surface.environment);
+      // #739: `surface.environment` holds the PMREM output now, not the equirect (see
+      // `syncEnvironment`). A bound PMREM keeps its SOURCE alive too — resolve it back through
+      // `sourceForEnvPMREM` and add it, or a retired equirect with a live PMREM on screen would
+      // look unbound here and get disposed while still driving the render (the #315 shape).
+      const src = sourceForEnvPMREM(surface.environment);
+      if (src) bound.add(src);
+    }
     const bg = surface.background as THREE.Texture | THREE.Color | null;
     if (bg && (bg as THREE.Texture).isTexture) bound.add(bg as THREE.Texture);
   }
@@ -620,7 +631,18 @@ function clearTextureBackground(scene: THREE.Scene): void {
   if (scene.background && (scene.background as THREE.Texture).isTexture) scene.background = null;
 }
 
-export function syncEnvironment(world: World, scene: THREE.Scene) {
+/** `renderer` is optional and MUST be the renderer THIS surface renders with — never a shared
+ *  "whichever renderer registered most recently" lookup. A PMREM output is a render target
+ *  belonging to a specific GPU context (three's own `PMREMNode.js` keys its cache per renderer for
+ *  the same reason); handing surface A a PMREM built by surface B's renderer hands it a texture
+ *  that was never rendered into on A's device, so A's IBL is permanently black. With three live
+ *  renderers possible at once (GameView, editor SceneView, ParticleEditor —
+ *  `runtime/core/activeRenderer.ts`), there is no global answer to "the" renderer, only "mine".
+ *  Omitting `renderer` is a deliberate degrade, not a shortcut: `getEnvPMREMTexture` returns
+ *  `undefined` for a missing renderer and this function falls back to binding the RAW equirect
+ *  (see below) — absence means "skip the #739 optimisation for this call", never "borrow someone
+ *  else's PMREM". */
+export function syncEnvironment(world: World, scene: THREE.Scene, renderer?: WebGPURenderer | THREE.WebGLRenderer) {
   registerRenderSurface(scene);
   let envActive = false;
   let suppressed = false;
@@ -646,7 +668,18 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       // contribution is suppressed, and syncLights/applyRendererColorConfig compensate.
       const iblOn = tierAllowsIBL(getActiveTierOverrides());
       if (!iblOn) suppressed = true; // this scene HAS an env and the tier is taking it away
-      const wantEnv = iblOn ? cached : null;
+      // #739: bind a PRE-GENERATED PMREM, not the raw equirect. `PMREMNode` (three 0.185.1) uses a
+      // texture DIRECTLY, skipping its own generator, when it already carries
+      // `isPMREMTexture`/`CubeUVReflectionMapping` — which `fromEquirectangular`'s output does.
+      // Handing three the raw equirect instead makes it build (and leak — see
+      // `getEnvPMREMTexture`'s comment) a fresh generator on every object-identity change. Falls
+      // back to the raw equirect when there's no renderer yet or generation failed — never blocks
+      // a frame on this, and the next frame retries once a renderer/PMREM is available.
+      // `renderer` here is THIS surface's own renderer (see the function's doc comment) — NOT
+      // `getActiveRenderer()`, which is a global "most recent registrant" and would hand this
+      // surface a PMREM rendered on a different GPU context.
+      const pmrem = iblOn ? getEnvPMREMTexture(renderer, cached) : undefined;
+      const wantEnv = iblOn ? (pmrem ?? cached) : null;
       const wantEnvIntensity = iblOn ? envIntensity : 1;
       if (scene.environment !== wantEnv) scene.environment = wantEnv;
       if (scene.environmentIntensity !== wantEnvIntensity) scene.environmentIntensity = wantEnvIntensity;
@@ -4145,7 +4178,13 @@ async function prewarmShadersForWorldInner(
       if (!env.hdrPath) return;
       const cached = getCachedEnvironment(env.hdrPath);
       if (cached) {
-        prewarmScene.environment = cached;
+        // #739: mirror the PMREM the real path binds, NOT the raw equirect. Two reasons, and the
+        // second is the load-bearing one. (1) This mirror exists to compile the variant the real
+        // render draws, and since #739 that is a CubeUV PMREM. (2) This hook is registered with
+        // `registerBeforeSwap`, so it runs on EVERY scene swap — handing three a raw equirect here
+        // makes `PMREMNode` build its own generator, which is precisely the per-swap leak #739
+        // fixes, re-entering through the prewarm door and defeating the fix.
+        prewarmScene.environment = getEnvPMREMTexture(renderer, cached) ?? cached;
         prewarmScene.environmentIntensity = env.intensity;
       }
     });

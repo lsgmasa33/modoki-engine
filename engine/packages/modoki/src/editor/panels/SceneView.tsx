@@ -4004,8 +4004,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         }
       }
 
-      // Sync ECS environment (shared runtime logic)
-      syncEnvironment(getCurrentWorld(), scene);
+      // Sync ECS environment (shared runtime logic). Pass THIS panel's own renderer (#739) — a
+      // PMREM output belongs to a specific GPU context, so `syncEnvironment` must never resolve
+      // it through the global "most recently registered" renderer lookup.
+      syncEnvironment(getCurrentWorld(), scene, renderer);
       // EVERY surface that calls syncEnvironment must reconcile its OWN exposure right after it:
       // the IBL-off compensation is gated on module state that syncEnvironment overwrites, so a
       // surface that only sets it and never reads it back keeps whatever exposure it was created

@@ -36,6 +36,7 @@ async function setup() {
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     // Always resolves — the "does this GLB build a mesh at all" question is not what's under
     // test here; whether it MINTS A MATERIAL for an empty ref is.
     resolveMeshTemplate: vi.fn(() => ({ geometry, material: templateMat })),

@@ -458,7 +458,7 @@ export default function Scene3D() {
         beginProfilerSample('sync');
         activeCamera = syncCamera(world, scene, camera, orthoCamera);
         applyFraming(world, activeCamera, camera.aspect, activeCamera === orthoCamera);
-        syncEnvironment(world, scene);
+        syncEnvironment(world, scene, renderer); // THIS surface's own renderer (#739) — see syncEnvironment's doc comment
         // Must follow syncEnvironment: it is what decides whether this scene lost its IBL, and
         // the exposure compensation is gated on that (#154). See reconcileToneExposure.
         reconcileToneExposure(renderer);
@@ -737,7 +737,7 @@ export default function Scene3D() {
           // Pull the latest ECS state (a mutate may have landed since last frame).
           const world = getCurrentWorld();
           const activeForCapture = syncCamera(world, scene, camera, orthoCamera);
-          syncEnvironment(world, scene);
+          syncEnvironment(world, scene, renderer); // THIS surface's own renderer (#739) — see syncEnvironment's doc comment
           reconcileToneExposure(renderer);
           syncFog(world, scene);
           syncLights(world, scene, ecsLights, shadowFocusFor(activeForCapture));

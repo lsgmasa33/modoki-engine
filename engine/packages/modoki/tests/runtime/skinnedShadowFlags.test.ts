@@ -49,6 +49,7 @@ async function setup() {
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),

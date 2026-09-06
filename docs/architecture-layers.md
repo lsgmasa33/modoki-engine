@@ -225,12 +225,14 @@ run into the same shape of question:
   (`config`, `gameDefinition`, `appServices`, `instanceGuard`, `version`) are all leaves too —
   leaving them loose at `runtime/` root (the rejected option) would have preserved exactly the kind
   of un-owned, importable-from-anywhere space where the next `systems/` starts to form.
-- **D4 — `rendering/{Scene2D.tsx,Scene3D.tsx,scene3DSync.ts}` are reclassified L3 in place, not
-  moved.** They structurally compose scene data + loaders + subsystems into a rendered frame — L3
-  composition wearing an L2 folder path — but physically moving them would change
+- **D4 — `rendering/{Scene2D.tsx,Scene3D.tsx,scene3DSync.ts,envPmrem.ts}` are reclassified L3 in
+  place, not moved.** They structurally compose scene data + loaders + subsystems into a rendered
+  frame — L3 composition wearing an L2 folder path — but physically moving them would change
   `engine/app/App.tsx`'s deep import of `Scene3D`, a public-surface change. Implemented as a
   file-level ESLint carve-out (`L3_RECLASSIFIED_FILES`), the same mechanism used pre-P6 for the L0
-  primitives still sitting in `systems/`.
+  primitives still sitting in `systems/`. `envPmrem.ts` joined in #739: it registers itself with
+  `loaders/meshTemplateCache.ts`'s env-dispose hook registry at module scope so a 2D-only build
+  (which never imports it) never pulls in `three/webgpu`.
 - **D5 — an unprovided provider slot warns once and returns a neutral value; it does not throw.**
   See "The registration-inversion pattern" above — this is what keeps headless unit tests and
   DCE'd playable-ad builds from crashing on a missing provider.

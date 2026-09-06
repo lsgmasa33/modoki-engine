@@ -36,13 +36,21 @@ const L2_FOLDERS = [
 ];
 const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];
 
-/** D4 (docs/architecture-layers.md "## Settled decisions"): these three files
- *  physically sit in `rendering/` (L2) but are reclassified L3 by the owner — they compose scene
- *  data + loaders + subsystems into a rendered frame, not a reusable L2 subsystem. Reclassified
- *  in place (NOT moved) to keep `engine/app/App.tsx`'s deep import of `rendering/Scene3D`
- *  untouched; verified nothing in any OTHER runtime L2 folder imports these three, so this
- *  creates zero new violations elsewhere. */
-const L3_RECLASSIFIED_FILES = ['rendering/Scene2D.tsx', 'rendering/Scene3D.tsx', 'rendering/scene3DSync.ts'];
+/** D4 (docs/architecture-layers.md "## Settled decisions"): these files physically sit in
+ *  `rendering/` (L2) but are reclassified L3 by the owner — they compose scene data + loaders +
+ *  subsystems into a rendered frame, not a reusable L2 subsystem. Reclassified in place (NOT
+ *  moved) to keep `engine/app/App.tsx`'s deep import of `rendering/Scene3D` untouched; verified
+ *  nothing in any OTHER runtime L2 folder imports these, so this creates zero new violations
+ *  elsewhere.
+ *
+ *  `rendering/envPmrem.ts` (#739) joined the set for the same reason: it registers itself with
+ *  `loaders/meshTemplateCache.ts`'s (L3) env-dispose hook registry at module scope
+ *  (`registerEnvDisposeHook(disposeEnvPMREMFor)`) so a 2D-only build — which never imports this
+ *  file — never pulls in `three/webgpu`. That registration is an L3 edge on a file that otherwise
+ *  reads like ordinary L2 rendering code. */
+const L3_RECLASSIFIED_FILES = [
+  'rendering/Scene2D.tsx', 'rendering/Scene3D.tsx', 'rendering/scene3DSync.ts', 'rendering/envPmrem.ts',
+];
 
 /** Declared, one-directional L2→L2 exceptions (rationale in docs/architecture-layers.md).
  *  Within L2 there is an implicit tier order — producers (animation/skinning/particles/audio/…)
