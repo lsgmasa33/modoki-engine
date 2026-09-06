@@ -831,7 +831,7 @@ unverified and had to be reverted (`c6e570f6` → `6f495a0d9`).
 
 So the inset is emitted as `var(--ui-sa-<edge>, env(safe-area-inset-<edge>))`
 (`runtime/ui/anchorCss.ts`), and the editor's device preview publishes `--ui-sa-*` from
-the selected device preset. Three things about that shape are load-bearing:
+the selected device preset. Four things about that shape are load-bearing:
 
 - **A shipped build never sets the var** and falls through to the real `env()`. There is
   no `isEditor` branch in the runtime and only one expression, so the two cannot drift.
@@ -845,6 +845,9 @@ the selected device preset. Three things about that shape are load-bearing:
   (34); rotated, it has **no top inset at all** (0 top, 21 bottom, 62 on both sides).
   Deriving one from the other by swapping w/h — which `resolveLogicalSize` legitimately
   does for the screen box — invents a top inset the device does not have.
+- **An Android tablet preset carries zero insets in both orientations** (no display cutout,
+  both system bars hidden) — but unlike the phone row's measured 28, this one is REASONED,
+  not measured, and awaits a real tablet to confirm it.
 
 The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), always on
 with a device preset: simulating an inset without showing it trades one invisible failure

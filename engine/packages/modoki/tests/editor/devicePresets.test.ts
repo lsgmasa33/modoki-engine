@@ -39,6 +39,7 @@ describe('device catalog integrity', () => {
     for (const n of [
       'iPhone Air', 'Galaxy S22', 'Galaxy Z Fold7 (Folded)', 'Galaxy Z Fold7 (Open)',
       'iPad Pro 11"', 'iPad Pro 13"', 'Xiaomi 14', 'Huawei Mate 60 Pro', 'Motorola Edge 50',
+      'Galaxy Tab S9', 'Galaxy Tab S9+', 'Pixel Tablet',
     ]) {
       expect(find(n)).toBeTruthy();
     }
@@ -57,6 +58,19 @@ describe('device catalog integrity', () => {
     const aspect = (d: DevicePreset) => d.logicalW / d.logicalH;
     expect(aspect(folded)).toBeLessThan(0.55);  // tall + narrow cover
     expect(aspect(open)).toBeGreaterThan(0.8);   // near-square main panel
+  });
+
+  it('the Android tablets carry their real specs', () => {
+    for (const [n, logical, physical] of [
+      ['Galaxy Tab S9', [800, 1280], [1600, 2560]],
+      ['Pixel Tablet', [800, 1280], [1600, 2560]],
+      ['Galaxy Tab S9+', [876, 1400], [1752, 2800]],
+    ] as const) {
+      const p = find(n);
+      expect([p.logicalW, p.logicalH], n).toEqual(logical);
+      expect([p.physicalW, p.physicalH], n).toEqual(physical);
+      expect(presetDpr(p), n).toBe(2);
+    }
   });
 });
 
@@ -168,18 +182,48 @@ describe('devicePresets — safe area', () => {
     expect(resolveSafeArea(find('iPhone SE'), 'portrait')).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
   });
 
+  /** The Android presets that are TABLETS. An explicit list, not a property read off the preset:
+   *  deriving "is a tablet" from its own safe-area quartet would make the guard below assert the
+   *  data it is guarding. A new Android preset therefore defaults into the phone set and is held to
+   *  the 28pt cutout — which is the right default, and a tablet added without a line here fails
+   *  loudly rather than passing silently. */
+  const ANDROID_TABLETS = ['Galaxy Tab S9', 'Galaxy Tab S9+', 'Pixel Tablet'];
+
   // MEASURED on TWO handsets that agree within 1dp: Galaxy A23 -> env() top 28, Galaxy S22 -> 27,
   // both bottom 0 (Court hides both system bars). Bottom-of-screen chrome therefore sits flush on
   // Android while it lifts 34pt on a home-indicator iPhone — the asymmetry is real, not an
   // oversight, and a symmetric "24/24" guess got it wrong on both edges at once.
   it('Android presets carry the cutout on top and nothing at the bottom', () => {
     const android = DEVICE_PRESETS.filter((p) => ['Samsung', 'Google', 'Android'].includes(p.category));
-    expect(android.length).toBeGreaterThan(4);
-    for (const p of android) {
+    const phones = android.filter((p) => !ANDROID_TABLETS.includes(p.name));
+    const tablets = android.filter((p) => ANDROID_TABLETS.includes(p.name));
+    expect(phones.length).toBeGreaterThan(4);
+    // ⚠️ NOT `phones.length + tablets.length === android.length` — that was here and it is
+    // VACUOUS: the two filters are complementary predicates over one array, so the sum equals
+    // `android.length` for every possible catalog and every possible ANDROID_TABLETS. What
+    // actually catches a stale list is the `top === 28` loop below (a tablet that fell into
+    // `phones`) plus this, which catches the other direction: a name here with no row behind it.
+    for (const n of ANDROID_TABLETS) {
+      expect(tablets.some((p) => p.name === n), `${n} is in ANDROID_TABLETS but not in the catalog`).toBe(true);
+    }
+    for (const p of phones) {
       const portrait = resolveSafeArea(p, 'portrait');
       expect(portrait.top, `${p.name} top`).toBe(28);
       expect(portrait.bottom, `${p.name} bottom — both bars are hidden`).toBe(0);
       expect(portrait.left + portrait.right, `${p.name} sides`).toBe(0);
+    }
+  });
+
+  // REASONED, not measured — no ANDROID tablet is attached to this machine (an iPad mini 5 is,
+  // and it is what pins `faceIdIPad`). All three put the camera in the
+  // bezel (no cutout) and hide both system bars (nothing at the bottom), so all four edges are 0 in
+  // both orientations. Replace with a real quartet the first time a tablet is on hand to measure.
+  it('the Android tablets have no insets in either orientation — reasoned, not measured', () => {
+    for (const name of ANDROID_TABLETS) {
+      const p = find(name);
+      for (const o of ['portrait', 'landscape'] as const) {
+        expect(resolveSafeArea(p, o), `${name} ${o}`).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+      }
     }
   });
 

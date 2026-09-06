@@ -1182,7 +1182,7 @@ the one that needs the device changed repeatedly to be checked at all. `modoki_g
 lists the catalog; `modoki_get_editor_state` reports the current selection as `gameView`, so a
 measurement can be attributed to a screen size.
 
-Four things about that surface are load-bearing:
+Six things about that surface are load-bearing:
 
 - **`gameViewDevice` + `gameViewOrientation` are the source of truth; `gameViewSize`,
   `gameViewSafeArea` and `gameRect` stay DERIVED** — GameView resolves them and publishes them

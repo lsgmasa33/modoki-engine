@@ -160,9 +160,35 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   { name: 'Galaxy S24',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3
   { name: 'Galaxy Z Fold7 (Folded)', category: 'Samsung', logicalW: 360, logicalH: 840,  physicalW: 1080, physicalH: 2520, safeArea: androidPhone() }, // cover, @3
   { name: 'Galaxy Z Fold7 (Open)',   category: 'Samsung', logicalW: 656, logicalH: 728,  physicalW: 1968, physicalH: 2184, safeArea: androidPhone() }, // main, @3 (near-square)
+  // Android tablets, both DPR 2 — the Tab S9 is 11" / 2560x1600 native, the S9+ 12.4" / 2800x1752.
+  // The zero insets are REASONED, not measured like androidPhone()'s 28: no ANDROID tablet is
+  // attached to this machine (an iPad mini 5 is, and it is what pins `faceIdIPad`). All three
+  // tablet rows (the Pixel Tablet below shares this note) put the camera in the BEZEL, so there is
+  // no cutout to inset, and hide both system bars, so there is nothing at the bottom either — the
+  // same shape and the same reason as the iPhone SE row. Replace with a real measurement the first
+  // time an Android tablet is on hand. Per the header, a zero here is a CLAIM ("this screen has no
+  // cutout"), indistinguishable in the preview from a window that is not reaching the edge — which
+  // is exactly how the Android phone row was wrong once already.
+  //
+  // ⚠️ **The Tab S9 ULTRA is deliberately absent, and picking it would be a defect.** It is the one
+  // tablet in this class with a real display NOTCH (dual 12MP front cameras), so it cannot take the
+  // zero quartet above — and its notch sits on the LONG edge, which in this portrait-authored table
+  // means a SIDE inset in portrait and a top one in landscape: the mirror of `androidPhone()`, not a
+  // variant of it. No published source dimensions it (checked Samsung Mobile Press, GSMArena — both
+  // stop at resolution and ppi; Samsung's own emulator skin, which does encode the cutout, is behind
+  // an account login), and a secondary spec sheet offering "~40 to 48 px" contradicted itself on the
+  // width and cited pages that demonstrably lack the figure. So the Ultra waits for a device, not a
+  // better guess. The S9+ is the large slab instead: same 16:10 family, no notch.
+  //
+  // 800x1280 logical is the Android-tablet mainstream, not a copy-paste slip: the Pixel Tablet and
+  // the Galaxy Tab A9+ share the Tab S9's viewport exactly. Bigger logical size means a physically
+  // bigger tablet, and the iPads still hold the catalog's widest portrait rows (iPad Pro 13" is 1032).
+  { name: 'Galaxy Tab S9',           category: 'Samsung', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: NO_SAFE_AREA },
+  { name: 'Galaxy Tab S9+',          category: 'Samsung', logicalW: 876, logicalH: 1400, physicalW: 1752, physicalH: 2800, safeArea: NO_SAFE_AREA },
 
   // ── Google ──
   { name: 'Pixel 9',      category: 'Google', logicalW: 412, logicalH: 924, physicalW: 1080, physicalH: 2424, safeArea: androidPhone() }, // ~@2.62
+  { name: 'Pixel Tablet', category: 'Google', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: NO_SAFE_AREA }, // same reasoned-zero shape as the Galaxy Tab S9 row above
 
   // ── Other Android ──
   { name: 'Xiaomi 14',         category: 'Android', logicalW: 400, logicalH: 890, physicalW: 1200, physicalH: 2670, safeArea: androidPhone() }, // @3

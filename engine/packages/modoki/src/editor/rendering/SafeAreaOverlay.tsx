@@ -9,8 +9,8 @@
  *
  *  Purely decorative: `pointerEvents: 'none'` throughout, so it can never eat a click
  *  meant for the game underneath, and it renders nothing at all when the device has no
- *  insets (every Android preset in landscape aside, that is the whole `Free` + `Aspect`
- *  half of the catalog). */
+ *  insets — the `Free` + `Aspect` presets, and the real devices that genuinely report
+ *  zeros (`iPhone SE`, and the Android tablets, which have no cutout to inset). */
 import type { SafeAreaPx } from '../scene/devicePresets';
 
 /** Faint warm tint + a dashed inner edge: legible over both a dark scene and a light
