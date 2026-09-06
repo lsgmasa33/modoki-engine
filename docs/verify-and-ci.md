@@ -445,11 +445,24 @@ hands back both views from one read, so it keeps `code` for the eight and `raw` 
 `SRC` and `SRC_WITH_PROSE` so reaching for prose stays a deliberate act rather than the default.
 
 **Both halves are enforced by `commentStripperIsShared.test.ts`** — no hand-rolled stripper
-anywhere, and no raw read of repo source in **either vitest project**, `engine/tests/**` and
-`engine/packages/modoki/tests/**`.
+anywhere, no raw read of repo source, and no `.raw` without a declared reason, across
+`engine/tests/**`, `engine/packages/modoki/tests/**` **and every `games/<id>/tests` and
+`demos/<id>/tests`**.
 
-⚠️ **It was scoped to `engine/tests/architecture/` first, and that narrowing was a mistake worth
-recording (#812 → #816).** The argument was that of 1,234 test files only ~113 carry a raw utf8
+⚠️ **`.raw` is enforced because it was a silent bypass.** `comments: 'include'` throws without a
+`reason`; `readScannedSource(p).raw` returns the identical unstripped text and required nothing,
+and the rule matched only `readFileSync` — so a `.raw` scan was invisible to it. It was live in
+`mcpRegistry`, the migration's own worked example, with two call sites matching CODE against raw
+text. `.raw` now has to come from a read that declared the opt-out.
+
+⚠️ **The scope was narrowed twice and both narrowings were wrong, which is the whole lesson
+(#812 → #816).** First to `engine/tests/architecture/`, then — after widening — to "both vitest
+projects", which still left out `games/<id>/tests`: not a third project (Court's suite runs under
+`engine/vite.config.ts`), and already enumerated by the *other* rule in the same file. Three real
+source-scanning guards were reading raw there, two of them scanning `games/court/runtime/systems.ts`
+— the file where #411's comment defect was found LIVE.
+
+⚠️ **On the first narrowing:** The argument was that of 1,234 test files only ~113 carry a raw utf8
 read, and almost all of those read back a fixture the test itself just wrote — so a repo-wide rule
 would need a ~55-entry allowlist, which is the same fail-open hole one level up. True about the
 FILES, wrong about the RULE: the exclusions already discriminate a fixture read from a source scan

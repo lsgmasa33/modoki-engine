@@ -17,13 +17,13 @@
  *  See `docs/mcp-response-budget.md` Phase 1. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
-const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf-8');
+const read = (f: string) => readScannedSource(path.join(SRC, f)).code;
 
 /** Every `.ts` under `SRC`, recursively — SRC-relative paths, so failures name the file. Via
  *  the shared corpus producer (#799/#771/#805 Phase 4); `repoFiles()`'s own `rel` is

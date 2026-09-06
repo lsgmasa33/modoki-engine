@@ -20,11 +20,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { UI_SURFACE_GAME, UI_SURFACE_SCENE_VIEW } from '../../app/debug/uiSurface';
 import { makeEntitySpec } from '../../tools/modoki-mcp/src/shapes';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOUNDS_SURFACE_SRC = path.resolve(
@@ -34,7 +34,7 @@ const BOUNDS_SURFACE_SRC = path.resolve(
 /** The 2D/3D surface names, read from the type that every bounds provider labels its rects with.
  *  Parsed from source because it is a TYPE — there is no runtime value to import. */
 function boundsSurfaces(): string[] {
-  const src = fs.readFileSync(BOUNDS_SURFACE_SRC, 'utf8');
+  const src = readScannedSource(BOUNDS_SURFACE_SRC).code;
   const m = src.match(/export type BoundsSurface\s*=\s*([^;]+);/);
   expect(m, 'BoundsSurface union not found — did screenBounds.ts move or get renamed?').toBeTruthy();
   const names = [...m![1].matchAll(/'([^']+)'/g)].map((x) => x[1]);

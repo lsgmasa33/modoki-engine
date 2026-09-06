@@ -1257,7 +1257,8 @@ describe('the Electron watcher must not re-implement classifySceneChange', () =>
   const src = readScannedSource(
     pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'),
   ).code;
-  const code = src.split('\n').map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l)).join('\n');
+  // Already stripped at the read (#816) — this line filter matched nothing.
+  const code = src;
 
   it('calls the shared classifier', () => {
     expect(code).toMatch(/classifySceneChange\(/);

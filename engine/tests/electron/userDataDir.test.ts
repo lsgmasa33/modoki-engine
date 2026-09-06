@@ -221,7 +221,6 @@ describe('main.ts must fix userData before anything reads it', () => {
   // blank the comment lines rather than drop them, to keep every offset comparable.
   const src = raw
     .split('\n')
-    .map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l))
     .join('\n');
 
   it('guards the setPath behind shouldOverrideUserData (never clobber --user-data-dir)', () => {
@@ -323,7 +322,10 @@ describe('adoptLegacyToolchain', () => {
  */
 describe('main.ts must adopt the toolchain before anything provisions it', () => {
   const raw = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'main.ts')).code;
-  const src = raw.split('\n').map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l)).join('\n');
+  // ⚠️ No private comment blanker (#816): `raw` here comes from a stripped read, so a comment
+  // line is already whitespace and this filter matched nothing. It was the #419 multiplicity
+  // in a shape that rule cannot see — it bans `.replace(...)` strippers, not a line filter.
+  const src = raw;
 
   it('adoptLegacyToolchain runs at module scope, above initFileLog()', () => {
     expect(src.indexOf('adoptLegacyToolchain(')).toBeGreaterThan(-1);

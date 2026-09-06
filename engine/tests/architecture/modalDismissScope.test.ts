@@ -13,8 +13,8 @@
  *  to be written is the one that needs the rule stated. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
@@ -32,7 +32,7 @@ const MAY_DISMISS = [
   'panels/animation/BindAnimatorPicker.tsx',
 ];
 
-const read = (rel: string) => readFileSync(path.join(SRC, rel), 'utf-8');
+const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
 
 /** The backdrop is the JSX element carrying the full-screen overlay style; a dismiss wires its
  *  onClick straight to the close callback. Scans whole opening tags so ATTRIBUTE ORDER does not

@@ -31,7 +31,7 @@ import { z } from '../../tools/modoki-mcp/node_modules/zod';
 // Same reasoning as the zod import above: the MCP package's OWN copy, not whatever the repo root
 // hoists (or lacks). Used only by the definition-surface ledger (#456) to walk NESTED schemas.
 import { zodToJsonSchema } from '../../tools/modoki-mcp/node_modules/zod-to-json-schema';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   registerTool,
   getTool,
@@ -43,7 +43,8 @@ import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
-const read = (rel: string) => fs.readFileSync(path.join(SRC, rel), 'utf-8');
+/** One read (#812). Every assertion in this file is about CODE, so nothing here wants `.raw`. */
+const scan = (rel: string) => readScannedSource(path.join(SRC, rel));
 /** Every module that defines tools, plus the registration seam. */
 const toolModules = () =>
   fs.readdirSync(path.join(SRC, 'tools')).filter((f) => f.endsWith('.ts')).map((f) => `tools/${f}`);
@@ -52,17 +53,31 @@ const toolModules = () =>
 const allSrcFiles = () =>
   fs.readdirSync(SRC).filter((f) => f.endsWith('.ts')).concat(toolModules());
 
+/**
+ * The source between two CODE anchors, with both anchors proven to exist.
+ *
+ * ⚠️ **A length floor is not enough, and mutation testing is what showed it.** `indexOf` returns
+ * -1 when an anchor stops matching, and `slice(a, -1)` does not give an empty string — it gives
+ * everything up to the last character. So a broken END anchor silently WIDENS the slice to most of
+ * the file and sails past any floor, while a `.not.toMatch` over it then checks far too much. Only
+ * asserting the offsets catches both directions.
+ */
+function between(src: string, startAnchor: string, endAnchor: string, label: string): string {
+  const a = src.indexOf(startAnchor);
+  const b = src.indexOf(endAnchor);
+  expect(a, `${label}: start anchor ${JSON.stringify(startAnchor)} no longer appears — the slice `
+    + 'below is measuring the wrong region').toBeGreaterThanOrEqual(0);
+  expect(b, `${label}: end anchor ${JSON.stringify(endAnchor)} no longer appears — slice(a, -1) `
+    + 'would silently widen to the rest of the file').toBeGreaterThan(a);
+  return src.slice(a, b);
+}
+
 const okResult = { content: [{ type: 'text' as const, text: '{}' }] };
 
 /** A module's source, comments stripped via the shared scanner (@modoki/engine/testing, #419) —
  *  the lazy-regex stripper this replaced could delete real code hiding behind a `/*`-shaped line
  *  comment. */
-const codeOf = (f: string): string => {
-  const raw = read(f);
-  const stripped = stripComments(raw);
-  assertScanIsSane(raw, stripped, f);
-  return stripped;
-};
+const codeOf = (f: string): string => scan(f).code;
 
 describe('registry', () => {
   beforeEach(() => clearRegistry());
@@ -112,7 +127,7 @@ describe('registry', () => {
   it('stays free of the MCP SDK, so it remains unit-testable', () => {
     // Same rule result.ts follows. The moment this imports McpServer it inherits index.ts's
     // "can't be imported by a test" problem and these tests become another source scan.
-    expect(fs.readFileSync(path.join(SRC, 'registry.ts'), 'utf-8')).not.toContain('@modelcontextprotocol');
+    expect(codeOf('registry.ts')).not.toContain('@modelcontextprotocol');
   });
 });
 
@@ -721,8 +736,15 @@ describe('source guards that cannot be expressed as assertions', () => {
     // set_transform's documented `path` default fail on every call — and no test caught it
     // because every test passed an explicit `path`. It lives in `activeScenePath` so a second
     // scene-editing tool cannot re-derive it wrong.
-    const src = read('tools/scene.ts');
-    const helper = src.slice(src.indexOf('/** Resolve the scene an edit should apply to'), src.indexOf('// ── mutate_scene'));
+    // ⚠️ **Anchored on CODE, not on the comments that used to bracket this helper (#816).** The
+    // slice ran from `'/** Resolve the scene an edit should apply to'` to `'// ── mutate_scene'`
+    // — both comments — and survived only because this read was the one raw read left in the file.
+    // Stripping would have made both `indexOf` return -1 and the slice empty, so `toContain` would
+    // fail while the third assertion (`src.replace(helper, '')`) silently checked the whole file.
+    // The declaration and the next tool's registered name are the same boundary, in code.
+    const src = codeOf('tools/scene.ts');
+    const helper = between(src, 'async function activeScenePath(', "'modoki_mutate_scene'",
+      'activeScenePath helper');
     expect(helper).toContain('scenePathRef');
     expect(helper).not.toMatch(/\}\s*\)\.scenePath\b/); // no falling back to the raw /@fs field
     expect(src.replace(helper, '')).not.toContain('scenePathRef');
@@ -734,7 +756,10 @@ describe('source guards that cannot be expressed as assertions', () => {
     // this, so every prefab call sent 'instantiate' as the op name and got a 400 listing the
     // valid ops — all three prefab actions were dead through the MCP. Spread FIRST, routing key
     // last. (Also asserted behaviourally in `mcpToolContracts.test.ts`.)
-    const fn = read('context.ts');
+    // ⚠️ `codeOf`, not `read`: this matches CODE. Against raw text a rationale comment reading
+    // `// spread FIRST: { ...params, action }` satisfies it, so the spread could be deleted from
+    // context.ts and every modoki_prefab call go dead with this guard still green (#816 review).
+    const fn = codeOf('context.ts');
     expect(fn).toContain('{ ...params, action }');
     expect(fn).not.toContain('{ action, ...params }');
   });
@@ -743,8 +768,12 @@ describe('source guards that cannot be expressed as assertions', () => {
     // The other half: /api/editor-action STRIPS `action` before relaying, so a param by that name
     // is structurally unreachable through it — a tool that needs one must rename it on the wire
     // (prefab uses `prefabAction`). Catch a new tool repeating the mistake.
-    const src = read('tools/editor.ts');
-    const prefab = src.slice(src.indexOf("'modoki_prefab'"), src.indexOf('// ── gizmo / focus'));
+    // ⚠️ Code anchors, and a floor — same reason as the `activeScenePath` slice above (#816). The
+    // end anchor was `'// ── gizmo / focus'`, a COMMENT: strip it, or reword the section header,
+    // and `indexOf` returns -1. `toContain` below would catch an empty slice, but the
+    // `not.toMatch` would PASS on it — the fail-open half, checking nothing.
+    const src = codeOf('tools/editor.ts');
+    const prefab = between(src, "'modoki_prefab'", "'modoki_set_gizmo'", 'modoki_prefab tool');
     expect(prefab).toContain('prefabAction: action');
     expect(prefab).not.toMatch(/editorAction\('prefab', p\)/);
   });
@@ -754,7 +783,9 @@ describe('source guards that cannot be expressed as assertions', () => {
     // a style choice: `mutate_scene` is the batchable authoring route (a batch cannot read a
     // response to discover a path), and it required one until 2026-07-30. `validate_scene` /
     // `load_scene` are excluded on purpose — naming a specific file IS the call.
-    const src = read('tools/scene.ts');
+    // ⚠️ `codeOf` for the same reason, and it also stops the slice below from starting at a
+    // COMMENT occurrence of the tool name rather than its registration.
+    const src = codeOf('tools/scene.ts');
     for (const name of ['modoki_mutate_scene', 'modoki_set_transform']) {
       const start = src.indexOf(`'${name}'`);
       const fn = src.slice(start, src.indexOf('\n  );', start));
@@ -780,10 +811,9 @@ describe('zod resolution (issue #23)', () => {
    *  A version bump that aligned the two would make the bare import harmless again, but it would
    *  also make it silently re-breakable on the next drift, so the guard stays either way. */
   it('uses the MCP server\'s own zod, not whatever is hoisted to the repo root', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcpRegistry.test.ts'),
-      'utf8',
-    );
+    ).code;
     expect(src, 'import zod from tools/modoki-mcp/node_modules, not a bare specifier')
       .not.toMatch(/^import\s+\{[^}]*\}\s+from\s+'zod';$/m);
 

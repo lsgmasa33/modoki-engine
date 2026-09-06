@@ -18,9 +18,9 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, type DeviceSurface } from './deviceSurface';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const BRIDGE_SRC = join(__dirname, '../../app/debug/bridge.ts');
 
@@ -80,15 +80,21 @@ describe('device_eval_api guidance (#101)', () => {
   it('every method it calls unreachable really is a bridge switch case, not an agent op', async () => {
     const text = await evalApiText();
     const { notReachable } = JSON.parse(text) as { notReachable: { methods: string[] } };
-    const bridge = readFileSync(BRIDGE_SRC, 'utf8');
+    // Comments blanked: a `case 'x':` written in prose used to satisfy the loop below.
+    const bridge = readScannedSource(BRIDGE_SRC).code;
     // Non-empty FIRST: a for-loop over [] passes without checking anything, so an empty list would
     // make this guard vacuous exactly when the guidance had been gutted. (Caught by mutation-testing
     // this file during close-out — the mutation that emptied the list left this test green.)
     expect(notReachable.methods.length).toBeGreaterThanOrEqual(8);
     for (const m of notReachable.methods) {
       if (m === 'screenshot') {
-        // Intercepted natively in initNativeBridge before the router ever sees it.
-        expect(bridge).toMatch(/'screenshot' is intercepted natively/);
+        // ⚠️ Asserts the INTERCEPT, not the sentence describing it (#816 review). This read the
+        // rationale comment at bridge.ts:1125 until the code anchor was found: delete the
+        // intercept block and leave the comment, and `screenshot` falls through to
+        // `delegateToAgentOps` while device_eval_api keeps advertising it as unreachable.
+        expect(bridge, 'screenshot is no longer intercepted in initNativeBridge, so it DOES reach '
+          + 'the agent-op router — device_eval_api must stop calling it unreachable')
+          .toContain("if (method === 'screenshot')");
         continue;
       }
       // A `case '<m>':` in handleMessage means the router answers it directly — so it never reaches

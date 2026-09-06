@@ -12,10 +12,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '../helpers/sourceScanner';
 import { warnInertPrefabSizes } from '../../src/editor/scene/prefab';
 
 const SRC = path.resolve(__dirname, '../../src');
-const read = (rel: string) => fs.readFileSync(path.join(SRC, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
 
 const trap = (localId = 3) => ({
   entities: [{ localId, name: 'Band', traits: { UIAnchor: { anchor: 'stretch' }, UIElement: { width: 90, widthUnit: '%' } } }],

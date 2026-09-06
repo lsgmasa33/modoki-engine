@@ -188,10 +188,26 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * `corpusProducerIsShared.test.ts` records the same root as its own open hole, from the
  * enumeration side.
  */
-const SCANNED_ROOTS = [
-  'engine/tests/',
-  'engine/packages/modoki/tests/',
-];
+const SCANNED_ROOTS: string[] = (() => {
+  const roots = ['engine/tests/', 'engine/packages/modoki/tests/'];
+  // ⚠️ **`games/<id>/tests` and `demos/<id>/tests` too, and leaving them out was the same mistake
+  // twice.** They are not a third vitest project — Court's suite runs under `engine/vite.config.ts`
+  // — and the OTHER rule in this file (`testFiles()`) already enumerated them, so "both vitest
+  // projects" was a claim this rule did not meet. Three real source-scanning guards were reading
+  // raw there, two of them scanning `games/court/runtime/systems.ts`: the file where #411's
+  // comment defect was found LIVE. Absent roots contribute nothing (the OSS snapshot has no
+  // `games/`), which is why the floors below iterate what was found rather than what was listed.
+  for (const group of ['games', 'demos']) {
+    const dir = path.join(REPO_ROOT, group);
+    if (!fs.existsSync(dir)) continue;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory() && fs.existsSync(path.join(dir, e.name, 'tests'))) {
+        roots.push(`${group}/${e.name}/tests/`);
+      }
+    }
+  }
+  return roots;
+})();
 
 /**
  * Every `readFileSync(…, 'utf8')` call, as source text.
@@ -210,6 +226,11 @@ const READ_CALL =
  * A path built from a repo-root token — what separates scanning the repo's own source from
  * reading back a tmp fixture the test itself just wrote.
  *
+ * ⚠️ **`SRC\b` is here because `ROOT\b` alone was not the repo's only naming habit.** A guard that
+ * hoists `const SRC = path.join(...)` and reads off it is the same shape as one using `REPO_ROOT`,
+ * and six of them were invisible to this rule until the token was added — including
+ * `mcpRegistry.test.ts`, which stripped for some assertions and read raw for others.
+ *
  * ⚠️ **This is a PARTIAL rule and the gap is known, not accidental.** It sees the read expression
  * only, so `readFileSync(file, 'utf8')` where `file` came from a walk of the repo is NOT caught —
  * whether the path is repo-rooted is a dataflow question, and this is a regex. `docCitations` and
@@ -223,7 +244,7 @@ const READ_CALL =
  * COMMON shape cannot come back silently. It is not a proof that the class is closed.
  */
 const REPO_ROOTED =
-  /ROOT\b|[Rr]epoRoot|\bREPO\b|[A-Z][A-Z_]*_DIR\b|__dirname|['"](?:engine|games|demos|docs|qa)\//;
+  /ROOT\b|SRC\b|[Rr]epoRoot|\bREPO\b|[A-Z][A-Z_]*_DIR\b|__dirname|['"](?:engine|games|demos|docs|qa)\//;
 
 /**
  * Reads that are NOT this defect, and must not be reported as it.
@@ -276,9 +297,15 @@ const WRAPPED_AFTER =
  * evidence about what it holds. It was reported as an offender until this existed.
  */
 const scratchRootIdents = (code: string): string[] =>
-  [...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*=[^;\n]*?(?:mkdtempSync|mkdtemp|tmpdir)\s*\(/g)]
+  // ⚠️ **Anchored at the `=`, and `tmpdir` alone is NOT a trigger.** The first version accepted
+  // any initialiser that merely MENTIONED the call, so
+  // `const REPO_ROOT = process.env.MODOKI_REPO ?? os.tmpdir();` marked a genuine repo root as
+  // scratch and excused every read off it. `tmpdir()` is a fallback people write beside real
+  // roots; `mkdtemp` is the one that actually creates a throwaway directory.
+  [...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*(?::[^=]*)?=\s*(?:await\s+)?(?:[\w$.]*\.)?mkdtemp(?:Sync)?\s*\(/g)]
     .map((m) => m[1])
-    .concat([...code.matchAll(/([\w$]+)\s*=\s*makeScratch[\w$]*\s*\(/g)].map((m) => m[1]));
+    .concat([...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*(?::[^=]*)?=\s*(?:await\s+)?makeScratch[\w$]*\s*\(/g)]
+      .map((m) => m[1]));
 
 /** `.md` names a file with no comment syntax these guards can be blinded by. */
 const MARKDOWN_READ = /\.md['"]|\bMD\b|markdown/i;
@@ -321,6 +348,45 @@ const rawSourceReads = (code: string): string[] => {
  */
 const RAW_READ_ALLOW = new Map<string, string>([]);
 
+/**
+ * ⚠️ **`.raw` was a silent bypass of this whole rule, and it was live in the exemplar file.**
+ *
+ * `comments: 'include'` is enforced at RUNTIME — `readScannedSource` throws without a `reason`. But
+ * `readScannedSource(p).raw` asks for the identical unstripped text and requires nothing, and the
+ * rule above only matches `readFileSync`, so a `.raw` scan was invisible to it. `mcpRegistry` had
+ * `const read = (rel) => scan(rel).raw` with two call sites matching CODE against raw text — the
+ * exact defect this file exists to stop, in the file used as the migration's worked example.
+ *
+ * So `.raw` must now be declared the way the opt-out is: reached from a read that passes
+ * `comments: 'include'`, where a human had to write a reason.
+ *
+ * ⚠️ Textual and deliberately narrow — it matches `readScannedSource(…).raw` and
+ * `const { raw } = readScannedSource(…)` in the SAME expression. A `.raw` reached through an
+ * intermediate variable is not caught: the same dataflow limit as `REPO_ROOTED`, stated for the
+ * same reason.
+ */
+const UNDECLARED_RAW =
+  /readScannedSource\((?:[^()]|\([^()]*\))*\)\s*\.\s*raw|(?:const|let)\s*\{[^}]*\braw\b[^}]*\}\s*=\s*readScannedSource\((?:[^()]|\([^()]*\))*\)/g;
+
+/**
+ * Reads of `.raw` that never declared `comments: 'include'`.
+ *
+ * ⚠️ **The declaration is usually HOISTED, and the first version of this missed that** — it
+ * reported six correct guards. `DOC_AS_PROSE`, `README_AS_PROSE`, `PBXPROJ_AS_WRITTEN` and
+ * `AGENT_MD_AS_PROSE` are all `as const` objects carrying the reason, passed by name; a rule
+ * looking only for an inline literal sees a bare `.raw`. So the named constants that declare it
+ * are collected first, and a read passing one of them counts as declared.
+ */
+const undeclaredRawReads = (code: string): string[] => {
+  const declaredConsts = [...code.matchAll(
+    /(?:const|let)\s+([\w$]+)\s*(?::[^=]*)?=\s*\{[^}]*comments\s*:\s*['"]include['"][^}]*\}/g,
+  )].map((m) => m[1]);
+  const isDeclared = (call: string): boolean =>
+    /comments\s*:\s*['"]include['"]/.test(call)
+    || declaredConsts.some((id) => new RegExp(`(^|[^\\w$])${id}\\b`).test(call));
+  return [...code.matchAll(UNDECLARED_RAW)].map((m) => m[0]).filter((c) => !isDeclared(c));
+};
+
 describe('an architecture guard reads source through the shared reader (#812)', () => {
   // ⚠️ **`.ts` as well as `.test.ts`, because a source-scanning HELPER is not a test.**
   // `moduleGraph.ts` reads all 541 runtime files and feeds two frozen baselines, and it carried
@@ -344,11 +410,21 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     expect(archFiles.length, 'the walk found no guards').toBeGreaterThan(400);
     // ⚠️ Per-root floors, not just a total: a total alone is satisfied by one root while another
     // has silently stopped being walked, which is the vacuous-pass shape this file exists to stop.
-    for (const root of SCANNED_ROOTS) {
+    // ⚠️ Only the two ENGINE roots carry a size floor. A game's test folder is legitimately small
+    // (or absent in the OSS snapshot), so a blanket per-root floor would go red on the public gate
+    // — the failure mode #799's close-out already hit. What matters is that each root the walk
+    // FOUND contributed something.
+    for (const root of ['engine/tests/', 'engine/packages/modoki/tests/']) {
       expect(
         archFiles.filter((f) => f.rel.startsWith(root)).length,
         `${root} contributed no files — that root has dropped out of the rule`,
       ).toBeGreaterThan(20);
+    }
+    for (const root of SCANNED_ROOTS) {
+      expect(
+        archFiles.filter((f) => f.rel.startsWith(root)).length,
+        `${root} is in SCANNED_ROOTS but contributed no files`,
+      ).toBeGreaterThan(0);
     }
   });
 
@@ -405,6 +481,12 @@ describe('an architecture guard reads source through the shared reader (#812)', 
       "const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-'));",
       `const s = fs.${READ}path.join(ENGINE_ROOT, 'vite.config.ts'), 'utf8');`,
     ].join('\n')), 'a scratch ident must not excuse a genuine repo read in the same file').toBe(1);
+    // ⚠️ A real root whose initialiser merely MENTIONS tmpdir as a fallback is NOT scratch. The
+    // first version of `scratchRootIdents` excused this, silently, in the direction that matters.
+    expect(fires([
+      'const REPO_ROOT = process.env.MODOKI_REPO ?? os.tmpdir();',
+      `const s = fs.${READ}path.join(REPO_ROOT, 'engine/app/x.ts'), 'utf8');`,
+    ].join('\n')), 'a tmpdir FALLBACK does not make a root scratch').toBe(1);
   });
 
   it('THE RULE IS WIRED: a planted offender is reported', () => {
@@ -437,6 +519,46 @@ describe('an architecture guard reads source through the shared reader (#812)', 
       + `{ comments: 'include', reason } (#812):\n`
       + offenders.join('\n'),
     ).toEqual([]);
+  });
+
+  it("no guard reaches .raw without declaring comments:'include'", () => {
+    // ⚠️ The bypass, not a style rule. `.raw` and `comments:'include'` return the SAME unstripped
+    // text; only one of them made somebody write down why. Four guards legitimately scan prose
+    // (docCitations, editorStoreActionsReachable, fontSourceShipped, deviceEvalApiGuidance) and
+    // each declares it — so an undeclared `.raw` is a guard that quietly stopped stripping.
+    // The two files that ARE the mechanism need the unstripped view to do their job, and neither
+    // is a source scan: this guard hands `raw` to `assertScanIsSane` to prove the strip did not
+    // eat code, and `sourceScanner.test.ts` has `.raw` as its literal subject under test.
+    const RAW_IS_THE_SUBJECT = new Map<string, string>([
+      ['engine/tests/architecture/commentStripperIsShared.test.ts',
+        'feeds `raw` to assertScanIsSane — comparing the real file against its stripped form IS '
+        + 'this rule; taking the stripped view on both sides would make that check vacuous'],
+      ['engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
+        'the readScannedSource contract is what it tests, so `.raw` is the subject, not a bypass'],
+    ]);
+    const offenders = archFiles
+      .filter((f) => !RAW_IS_THE_SUBJECT.has(f.rel))
+      .filter((f) => undeclaredRawReads(f.code).length > 0)
+      .map((f) => f.rel);
+    expect(
+      offenders,
+      'these reach unstripped text through `.raw` without passing '
+      + "{ comments: 'include', reason }, so the strip is off and nothing recorded why:\n"
+      + offenders.join('\n'),
+    ).toEqual([]);
+  });
+
+  it('THE .raw RULE FIRES: a bare .raw is reported, a declared one is not', () => {
+    // ⚠️ Spelled in HALVES, same reason as `BLOCK_LAZY` and the `READ` fixtures above: this scan
+    // keeps string CONTENT, so writing the banned shape as one literal makes this file its own
+    // offender. It did, on the first run.
+    const RS = 'readScanned' + 'Source(';
+    const bare = `const s = ${RS}path.join(REPO_ROOT, rel)).raw;`;
+    const destructured = `const { raw } = ${RS}path.join(REPO_ROOT, rel));`;
+    const declared = `const s = ${RS}p, { comments: 'include', reason: 'prose' }).raw;`;
+    expect(undeclaredRawReads(bare), 'a bare .raw is the bypass').toHaveLength(1);
+    expect(undeclaredRawReads(destructured), 'destructuring is the same bypass').toHaveLength(1);
+    expect(undeclaredRawReads(declared), 'a declared prose read is legitimate').toHaveLength(0);
   });
 
   it('every raw-read allowlist entry still exists and still needs to be there', () => {
