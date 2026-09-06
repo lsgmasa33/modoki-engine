@@ -27,9 +27,15 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
+// The repo's ONE vetted comment scanner (#419) — never write a private stripper here. See its
+// own docblock for why a naive `//`/`/* */` regex has twice deleted real code from a guard's view.
+// `stripCommentsAndStrings` additionally blanks string/template CONTENT (parser-driven) — used
+// below to compute brace/bracket DEPTH safely, so a stray `(`/`{`/`[` inside a tooltip string
+// cannot desync a balanced-span scan (#723 review finding H).
+import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens } from '@modoki/engine/testing';
 
 /**
  * `node:path` yields `\` on Windows, but every path in this file's vocabulary — the `area`
@@ -305,6 +311,35 @@ const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
   { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'file.ts:123' },
 ];
 
+/**
+ * Every `data-ui-id="…"` a case or doc cites.
+ *
+ * #723: the character class used to admit a SPACE and PARENTHESES. Without them,
+ * `contextmenu.item.Constant (stepped)"` and `gameView.devicePicker.device.iPhone SE"` were
+ * captured TRUNCATED (`contextmenu.item.Constant`, `gameView.devicePicker.device.iPhone`) — a
+ * citation that silently checked the wrong string. That was invisible before #723: the truncated
+ * fragment still matched the family's shape pattern (`[^.]+` does not know what a name is
+ * supposed to contain), so a fragment happened to "resolve" for the wrong reason. Deriving these
+ * families exposed it — the deriver correctly does NOT produce the truncated form, so the bug had
+ * to be fixed here rather than worked around in a deriver.
+ *
+ * ⚠️ **#723 review, item I: rewritten to match to the real closing DELIMITER instead of enumerating
+ * allowed characters.** Three real device presets contain a literal `"` (`iPad Pro 11"`, `13"`,
+ * `12.9"`), which a character class can never admit without also being able to stop correctly at
+ * an attribute's own close — the two needs conflict for exactly the character that closes a
+ * `"`-quoted attribute. Two forms are cited in this corpus, and each has an unambiguous close:
+ *  - the ESCAPED form (used inside a `modoki_eval {code:"…"}` JSON payload, ~100 existing
+ *    citations) opens `\"` and closes at the next literal `\"` — a bare `"` in between (a
+ *    quote-bearing device name) is content, not a terminator, so matching NON-GREEDILY up to `\"`
+ *    admits it correctly.
+ *  - the BARE form opens `"` or `'` and must close on the SAME character (a backreference, `\2`,
+ *    picks up whichever one) — so a bare `"` device name is written inside `'…'` and a bare `'`
+ *    would be written inside `"…"`, exactly how HTML/JS already resolve this ambiguity.
+ * Verified against a case-like sample of each form, including a quote-bearing device id, before
+ * trusting it (no test corpus citation exercises the device-name case yet).
+ */
+const CITED_UI_ID_RE = /data-ui-id=(?:\\"([^\n]*?)\\"|(["'])([^\n]*?)\2)/g;
+
 
 function git(args: string[]): string {
   return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
@@ -332,11 +367,69 @@ export function isUnder(path: string, entry: string): boolean {
  * Forms 2 and 3 are not decoration: leaving either out reported three PERFECTLY CORRECT citations
  * as missing on the first run of this check. A guard that cries wolf gets disabled.
  */
+/**
+ * `knownUiIds` (#723 review, item G) — swapped from `assertScanIsSane` to the shared
+ * `findDamagedCodeTokens`/`assertEveryCodeTokenSurvives` MACHINERY, which actually verifies code
+ * tokens survived rather than only checking length/line parity (true by construction for
+ * `stripComments`, so it could never catch a scanner that is merely WRONG — only a regression to
+ * a deleting regex-based one).
+ *
+ * ⚠️ **Not a bare call to `assertEveryCodeTokenSurvives`.** That helper parses by the label's file
+ * EXTENSION, and `knownUiIds` receives raw source TEXT with no filename attached — the real corpus
+ * is a mix of plain `.ts` files (some use generic-arrow syntax, `<T>(x: T) => …`, a parse ERROR
+ * under TSX rules) and JSX-bearing `.tsx` panels, plus one-line test fixtures that are only valid
+ * as a JSX fragment. Labelling everything `.tsx` broke a REAL file
+ * (`runtime/harness/createTestWorld.ts`, 15 parse diagnostics, all `<T>` generics misread as JSX);
+ * labelling everything `.ts` broke every JSX-bearing panel and fixture. Trying TSX FIRST (the
+ * common case among editor sources) and falling back to `.ts` only when that failed to parse is
+ * what makes this correct for both, without needing `knownUiIds` to carry filenames through its
+ * many call sites (dozens of hand-typed fixtures across this file, plus both real corpus scans).
+ */
+function assertKnownUiIdsSourceSurvived(raw: string, stripped: string, label: string): void {
+  const tsx = findDamagedCodeTokens(raw, stripped, `${label}.tsx`);
+  const result = tsx.parseErrors === 0 ? tsx : findDamagedCodeTokens(raw, stripped, `${label}.ts`);
+  expect(result.parseErrors, `${label}: did not parse as EITHER .tsx or .ts, so the token walk is `
+    + 'measuring a stump — this check would pass while inspecting nothing').toBe(0);
+  // `minTokens` floor deliberately not enforced here (unlike the shared helper's default of >10):
+  // this runs once per SOURCE, and plenty of legitimate inputs are tiny — a one-line test fixture,
+  // or a small real editor file (an `index.ts` barrel). The corpus-level vacuity floors
+  // (`ids.size > 30`, `checked > 20`, …) already guard against a silently-empty scan; this call
+  // only needs to know the walk found ANYTHING at all.
+  expect(result.tokens, `${label}: 0 tokens were inspected — the walk is not reaching the tree`)
+    .toBeGreaterThan(0);
+  expect(result.damaged, `${label}: the stripper ate CODE, not comments — a count taken over this `
+    + `is meaningless, and it lowers silently.\n${result.damaged.join('\n')}`).toEqual([]);
+}
+
 export function knownUiIds(sources: string[]): {
   ids: Set<string>;
   prefixes: string[];
   patterns: RegExp[];
+  /** #723: EVERY template's shape pattern, INCLUDING the ones `patterns` excludes for a derived
+   *  family. Only `shapeOnlyCitedIds` (below) reads this, to measure what a derived family's
+   *  UNDERIVABLE citations (`contextmenu.item.Move to Trash`) would still shape-match — the
+   *  baseline candidate set. Never use this for live "does X resolve" checks: that is exactly the
+   *  shape-blanket rule 1 removes `patterns` to close. */
+  allPatterns: RegExp[];
+  /** #723 review, item E: the raw template STRINGS `DERIVED_FAMILY_TEMPLATES` filters against
+   *  (same set that feeds `patterns`/`allPatterns` — before `.map(templateToIdPattern)`). Exposed
+   *  so a test can assert every exclusion regex matches at least one LIVE template, rather than
+   *  only being trusted by inspection. */
+  templates: string[];
 } {
+  // A follow-up to #723: `topLevelObjectKeys`'s `^\s*` anchor cannot skip a `//` comment, so any
+  // trait field whose declaration is preceded by one (`UIElement.width`, `Animator.time`,
+  // `Renderable3DPrimitive.material`, 30 more — measured against registerTraits.ts) was silently
+  // NOT derived, and a comma INSIDE such a comment split the entry at depth 0 and corrupted the
+  // fields after it too. Stripped ONCE here, at the source, so both the literal/template
+  // extraction below AND every deriver see comment-free text — including `contextMenuItemIds`,
+  // which has the mirror-image (fail-OPEN) bug: unstripped, it would happily derive a
+  // COMMENTED-OUT `label: '…'` as a real context-menu item.
+  sources = sources.map((src, i) => {
+    const stripped = stripComments(src);
+    assertKnownUiIdsSourceSurvived(src, stripped, `knownUiIds source #${i}`);
+    return stripped;
+  });
   const ids = new Set<string>();
   const joined = sources.join('\n');
   // `\s*` around the `=`/`:` in all four, for the same reason as the prefix regex below: a JSX
@@ -396,9 +489,30 @@ export function knownUiIds(sources: string[]): {
   // which is what a runner does — and the guard would have called a working selector unknown.
   // Fixed by admitting the spelling, NOT by loosening the matching: the id still has to match a
   // whole template, so `hierarchy.entity.<guid>.bogus` remains a red.
-  const patterns = templates.filter((t) => !t.startsWith('$')).map(templateToIdPattern);
-  for (const src of sources) for (const id of particleFieldIds(src)) ids.add(id);
-  return { ids, prefixes, patterns };
+  // #723 rule 1: a template whose family now has a DERIVER (below) loses its shape pattern here —
+  // see `DERIVED_FAMILY_TEMPLATES`'s docblock for why a surviving shape pattern would undo the fix.
+  const nonPlaceholderTemplates = templates.filter((t) => !t.startsWith('$'));
+  const patterns = nonPlaceholderTemplates
+    .filter((t) => !DERIVED_FAMILY_TEMPLATES.some((re) => re.test(t)))
+    .map(templateToIdPattern);
+  const allPatterns = nonPlaceholderTemplates.map(templateToIdPattern);
+  for (const src of sources) {
+    for (const id of particleFieldIds(src)) ids.add(id);
+    for (const id of traitFieldIds(src)) ids.add(id);
+    for (const id of traitSectionIds(src)) ids.add(id);
+    for (const id of addComponentItemIds(src)) ids.add(id);
+    for (const id of traitSubSectionIds(src)) ids.add(id);
+    for (const id of animationViewModeIds(src)) ids.add(id);
+    for (const id of sceneViewGizmoIds(src)) ids.add(id);
+    for (const id of devicePickerDeviceIds(src)) ids.add(id);
+    for (const id of moduleToggleIds(src)) ids.add(id);
+    for (const id of projectSettingsFieldIds(src)) ids.add(id);
+    for (const id of contextMenuItemIds(src)) ids.add(id);
+  }
+  // `qualityTierIds` needs TWO files' content at once (see its docblock), so it takes the whole
+  // array rather than being called once per file like every deriver above.
+  for (const id of qualityTierIds(sources)) ids.add(id);
+  return { ids, prefixes, patterns, allPatterns, templates: nonPlaceholderTemplates };
 }
 
 /**
@@ -435,6 +549,551 @@ export function particleFieldIds(source: string): string[] {
   return out;
 }
 
+// ── #723: derivers for the templated families that used to be verified by SHAPE alone ─────────
+//
+// `templateToIdPattern`'s `[^.]+` class checks a templated id resolves to the right SHAPE, but it
+// cannot check the substituted VALUE — `contextmenu.item.Delelte` matches
+// `/^contextmenu\.item\.[^.]+$/` exactly as well as the real `contextmenu.item.Delete` does. Every
+// function below closes that for one family the same way `particleFieldIds` above already does:
+// read the concrete values out of the source that actually builds the id, so a typo of a real
+// value cannot pass and a renamed/removed value goes red instead of silently vouching for
+// anything. `knownUiIds` folds each of these into `ids` AND removes the family's shape pattern
+// from `patterns` — see the `DERIVED_FAMILY_TEMPLATES` list below for why leaving the shape
+// pattern in place would undo the fix (rule 1 of #723's brief).
+//
+// Families with NO deriver here (`particle.bursts.row.${i}.*`, `spriteAnim.frames.${i}.*`,
+// `uiActions.binding.${i}.*`, `spriteEditor.slice.${s.guid}`, every other `*.row.${i}.*`) keep
+// their shape pattern on purpose: the substituted value is authored PROJECT DATA (an array index,
+// a GUID) with no finite source-side vocabulary to derive from. A shape pattern is the honest
+// answer there; it would be the dishonest one everywhere else in this list.
+
+/**
+ * `balancedBraceSpan`/`topLevelObjectKeys`/`splitTopLevelItems` below all need to know real
+ * `{}[]()` DEPTH, but counting those characters wherever they appear TEXTUALLY breaks the moment
+ * one appears inside a string — `tooltip: 'playing (or not'` has an unmatched `(` that is not a
+ * bracket at all. Measured (#723 review, item H): injecting that exact string into
+ * `registerTraits.ts` silently dropped 8 ids (every field of `SkeletalAnimator`, the trait whose
+ * span the desynced counter then ran past).
+ *
+ * The fix is NOT to blank the source and scan the blanked text — `stripCommentsAndStrings` blanks
+ * a string literal's content (the very field names and key names these functions extract) to
+ * spaces. Instead: build a DEPTH-SAFE companion string of identical length via the shared,
+ * parser-driven stripper, use IT to decide where a `{`/`[`/`(`/`,` is real, but slice/accumulate
+ * the actual TEXT from the original — positions line up 1:1 because both stripping passes are
+ * length-preserving.
+ */
+
+/** A generic helper the trait-registry derivers below share: given the index of an object
+ *  literal's opening `{` (in `text`, whose depth-safe companion is `depthSafe` — same length, same
+ *  offsets), return the text strictly between it and its MATCHING `}` (brace-depth aware, so a
+ *  nested `{ }` inside a field's own config — `castShadow: { type: 'enum', ... }` — does not end
+ *  the scan early, AND a `{`/`}` inside a STRING cannot desync it either — see the note above). */
+function balancedBraceSpan(text: string, depthSafe: string, openBraceIndex: number): string {
+  let depth = 0;
+  for (let i = openBraceIndex; i < depthSafe.length; i++) {
+    if (depthSafe[i] === '{') depth++;
+    else if (depthSafe[i] === '}') {
+      depth--;
+      if (depth === 0) return text.slice(openBraceIndex + 1, i);
+    }
+  }
+  return '';
+}
+
+/** The bracket-matching twin of `balancedBraceSpan`, for a `[ ... ]` array literal (used by
+ *  `projectSettingsFieldIds` below to find a `fields: [ ... ]` array's body). */
+function balancedBracketSpan(text: string, depthSafe: string, openBracketIndex: number): string {
+  let depth = 0;
+  for (let i = openBracketIndex; i < depthSafe.length; i++) {
+    if (depthSafe[i] === '[') depth++;
+    else if (depthSafe[i] === ']') {
+      depth--;
+      if (depth === 0) return text.slice(openBracketIndex + 1, i);
+    }
+  }
+  return '';
+}
+
+/** Split an array/object literal's BODY into its top-level entries at DEPTH-0 commas — decided
+ *  from `depthSafeBody` (same length as `body`), so a comma or bracket inside a string cannot
+ *  fracture an entry or hide a real separator. Shared by `topLevelObjectKeys` (below) and
+ *  `projectSettingsFieldIds`'s array-of-field-objects scan. */
+function splitTopLevelItems(body: string, depthSafeBody: string): string[] {
+  const items: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < depthSafeBody.length; i++) {
+    const d = depthSafeBody[i];
+    if (d === '{' || d === '[' || d === '(') depth++;
+    else if (d === '}' || d === ']' || d === ')') depth--;
+    else if (d === ',' && depth === 0) {
+      items.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start < body.length) items.push(body.slice(start));
+  return items;
+}
+
+/** The key of one top-level object-literal entry (`key: { ... }` or `key: value`), as split out by
+ *  `splitTopLevelItems` — `undefined` when the entry does not start with a plain or quoted key. */
+function entryKey(entry: string): string | undefined {
+  const m = /^\s*(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:/.exec(entry);
+  return m?.[1] ?? m?.[2];
+}
+
+interface TraitDecl {
+  name: string;
+  category: string;
+  /** The text inside `fields: { ... }`, or '' when the trait has none (a tag). */
+  fieldsBody: string;
+  /** The depth-safe (string-blanked) companion of `fieldsBody`, same length/offsets — see the
+   *  note above `balancedBraceSpan` for why `topLevelObjectKeys` needs this rather than
+   *  `fieldsBody` itself to split fields safely. */
+  depthSafeFieldsBody: string;
+}
+
+/** Every `registerTrait({ name: '…', category: '…', fields: {…} })` call in a source file,
+ *  parsed with brace-depth tracking rather than a single regex — the fields object routinely
+ *  contains its own nested `{ }` (an `options: [...]`, a per-field config object), which a
+ *  non-greedy `[^}]*?` would stop at prematurely. Shared by `traitFieldIds`, `traitSectionIds` and
+ *  `addComponentItemIds` below so the three cannot read the registry three different ways.
+ *
+ *  Gated on the literal substring `registerTrait(` before doing any work: `stripCommentsAndStrings`
+ *  is a real TypeScript parse, and every other (non-registry) source in the corpus — plus dozens of
+ *  hand-typed fixtures in the tests below — would otherwise pay that cost for nothing. */
+// `traitFieldIds`/`traitSectionIds`/`addComponentItemIds` each call `traitDecls` independently on
+// the SAME source, and it now does a real TS parse (not just a regex scan) — keyed on the exact
+// source TEXT (immutable within one test run, and the `registerTrait(` gate already keeps this
+// tiny: only a handful of files in the whole corpus ever populate it).
+const traitDeclsCache = new Map<string, TraitDecl[]>();
+
+function traitDecls(source: string): TraitDecl[] {
+  if (!source.includes('registerTrait(')) return [];
+  const cached = traitDeclsCache.get(source);
+  if (cached) return cached;
+  // Depth-safe companion, SOLELY to decide where a `{`/`}` is real (see the note above
+  // `balancedBraceSpan`) — the actual name/category/field text is always sliced from `source`.
+  //
+  // The literal substring `registerTrait(` is not unique to `registerTraits.ts` — its own
+  // DEFINITION (`traitRegistry.ts`) and one call site inside a `.tsx` panel (`createEditor.tsx`)
+  // both contain it too, and `stripCommentsAndStrings` THROWS on whichever extension fails to
+  // parse. Same two-attempt strategy as `assertKnownUiIdsSourceSurvived` above: try TSX (JSX is
+  // the common case), fall back to plain TS.
+  let depthSafe: string;
+  try {
+    depthSafe = stripCommentsAndStrings(source, 'traitDecls-source.tsx');
+  } catch {
+    depthSafe = stripCommentsAndStrings(source, 'traitDecls-source.ts');
+  }
+  const out: TraitDecl[] = [];
+  const callRe = /registerTrait\(\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(source))) {
+    const openIdx = m.index + m[0].length - 1;
+    const body = balancedBraceSpan(source, depthSafe, openIdx);
+    if (!body) continue;
+    const bodyStart = openIdx + 1;
+    const depthSafeBody = depthSafe.slice(bodyStart, bodyStart + body.length);
+    const name = /name:\s*'([^']+)'/.exec(body)?.[1];
+    const category = /category:\s*'([^']+)'/.exec(body)?.[1];
+    if (!name || !category) continue;
+    let fieldsBody = '';
+    let depthSafeFieldsBody = '';
+    const fieldsIdx = body.indexOf('fields:');
+    if (fieldsIdx !== -1) {
+      const braceIdx = body.indexOf('{', fieldsIdx);
+      if (braceIdx !== -1) {
+        fieldsBody = balancedBraceSpan(body, depthSafeBody, braceIdx);
+        const fieldsBodyStart = braceIdx + 1;
+        depthSafeFieldsBody = depthSafeBody.slice(fieldsBodyStart, fieldsBodyStart + fieldsBody.length);
+      }
+    }
+    out.push({ name, category, fieldsBody, depthSafeFieldsBody });
+  }
+  traitDeclsCache.set(source, out);
+  return out;
+}
+
+/** Field `type`s `Inspector.tsx`'s `renderField`/`VecField` actually tag with a `data-ui-id` —
+ *  plain/unit `number` (also every grouped Vec2/Vec3 member: `renderVecGroup` only groups
+ *  `type: 'number'` fields, so no separate case is needed), plain/asset `string`, and `boolean`.
+ *  `'enum'` (→ `DropdownField`), `'color'` (→ `ColorField`), `'entityRef'` (→ `EntityRefField`),
+ *  `'bindings'` and `'materialOverrides'` all render through widgets with NO `data-ui-id` anywhere
+ *  in their bodies (verified against `Inspector.tsx`/`widgets.tsx`/`inspectorFields.tsx`), and
+ *  `renderField`'s terminal `return null` covers anything else. */
+const INSPECTOR_TAGGED_FIELD_TYPES = new Set(['number', 'string', 'boolean']);
+
+/**
+ * `inspector.field.${traitName}.${f.key}` AND `inspector.field.${meta.name}.${key}` — TWO
+ * templates in `Inspector.tsx`/`assetViews/widgets.tsx` that build the SAME id shape, so one
+ * deriver serves both (see `DERIVED_FAMILY_TEMPLATES`, which removes both from `patterns`).
+ *
+ * Derived from `engine/app/ecs/registerTraits.ts` — the trait's OWN field declarations — rather
+ * than shape-matching `inspector\.field\.[^.]+\.[^.]+`, which would (again) vouch for a typo'd
+ * field name on a trait that has never had one.
+ *
+ * ⚠️ **#723 review finding A: deriving the KEY is not enough — the field's own `type` decides
+ * whether `renderField` tags it at all.** Measured against the current
+ * `engine/app/ecs/registerTraits.ts` (2026-09-06): 92 `enum`, 29 `color`, 11 `entityRef`, 1
+ * `bindings` and 1 `materialOverrides` field declarations — 134 fields whose widget renders no
+ * `data-ui-id`, all of which this deriver used to vouch for (`inspector.field.UIElement.
+ * flexDirection`, an enum, and `inspector.field.Renderable2D.color`, a color, among them). Only
+ * `INSPECTOR_TAGGED_FIELD_TYPES` above is derived.
+ *
+ * Two further STATIC suppressions `Inspector.tsx` applies before a field ever reaches
+ * `renderField`, both measured the same way:
+ *  - `hidden: true` (`Inspector.tsx`'s `topItems`/`sections` memo) — 28 fields, e.g.
+ *    `EntityAttributes.sourceScene`.
+ *  - claimed as ANOTHER field's `alphaField` (`Inspector.tsx`'s `renderField`, folded into that
+ *    field's own color-picker alpha slider) — 10 fields, e.g. `Renderable2D.opacity`,
+ *    `UIElement.backgroundOpacity`.
+ *
+ * ⚠️ **Engine built-ins ONLY, deliberately not widened to `games/**`.** A game calls
+ * `registerTrait` too (`games/court/runtime/systems.ts` among others), but a QA case is pinned to
+ * ONE `fixture_project` — pooling every game's traits into one id set would let a case pinned to
+ * `wordweave` cite a `court` trait field and still go green, which is the exact fail-open #723
+ * exists to close. A case citing a GAME trait's field falls through to the shape-only baseline
+ * instead — "I cannot verify this" is the honest answer until this is refined per-fixture.
+ */
+export function traitFieldIds(source: string): string[] {
+  const out: string[] = [];
+  for (const d of traitDecls(source)) {
+    const entries = splitTopLevelItems(d.fieldsBody, d.depthSafeFieldsBody);
+    // A field claimed as ANOTHER field's alpha slider is never a standalone row, whatever ITS own
+    // type is — collected first so the second pass can simply skip a claimed key.
+    const alphaTargets = new Set<string>();
+    for (const entry of entries) {
+      const af = /\balphaField:\s*'([\w$]+)'/.exec(entry)?.[1];
+      if (af) alphaTargets.add(af);
+    }
+    for (const entry of entries) {
+      const key = entryKey(entry);
+      if (!key || alphaTargets.has(key)) continue;
+      if (/\bhidden:\s*true\b/.test(entry)) continue;
+      const type = /\btype:\s*'([\w-]+)'/.exec(entry)?.[1];
+      if (!type || !INSPECTOR_TAGGED_FIELD_TYPES.has(type)) continue;
+      out.push(`inspector.field.${d.name}.${key}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * `inspector.section.${title}.header` and `.menu` (`assetViews/widgets.tsx`). `title` is
+ * `meta.name`, or `` `${meta.name} (resource)` `` for a resource trait (`Inspector.tsx`'s
+ * `isResource` — `meta.category === 'resource'`) — both forms are derived here so a resource
+ * trait's section id does not silently fall to the baseline.
+ *
+ * ⚠️ **#723 review finding B: `EntityAttributes` is excluded.** `Inspector.tsx` (its trait-section
+ * filter, `t.meta.category === 'component' && t.meta.name !== 'EntityAttributes'`) never renders it
+ * as a normal `<Section>` — it gets its own inline header (checkbox + name + id) above every other
+ * component. `inspector.section.EntityAttributes.header`/`.menu` have never existed.
+ */
+export function traitSectionIds(source: string): string[] {
+  const out: string[] = [];
+  for (const d of traitDecls(source)) {
+    if (d.name === 'EntityAttributes') continue;
+    if (d.category !== 'component' && d.category !== 'resource') continue;
+    const title = d.category === 'resource' ? `${d.name} (resource)` : d.name;
+    out.push(`inspector.section.${title}.header`, `inspector.section.${title}.menu`);
+  }
+  return out;
+}
+
+/**
+ * `inspector.addComponent.item.${t.name}` (`AddComponentPicker.tsx`) — one row per `component`
+ * trait `Inspector.tsx` offers via `getAllTraits().filter(t => t.category === 'component' && …)`.
+ * The second half of that filter (not already on the selected entity) is per-SCENE state this
+ * static scan cannot see, so this derives the wider "could plausibly be addable" set rather than
+ * the narrower "addable to entity X right now" one — the same kind of honest over-approximation
+ * `knownUiIds` already makes for every other family (it verifies a selector CAN exist, not that
+ * it is visible in the current DOM).
+ *
+ * ⚠️ **#723 review finding B: `EntityAttributes` is excluded**, for the same reason as
+ * `traitSectionIds` above — it is never offered as an addable component (every entity already has
+ * one), so `inspector.addComponent.item.EntityAttributes` has never existed either.
+ */
+export function addComponentItemIds(source: string): string[] {
+  return traitDecls(source)
+    .filter((d) => d.category === 'component' && d.name !== 'EntityAttributes')
+    .map((d) => `inspector.addComponent.item.${d.name}`);
+}
+
+/**
+ * `inspector.subsection.${subSectionSlug(title)}` (`assetViews/widgets.tsx`) — but only for the
+ * LITERAL `<SubSection title="…">` call sites. `Inspector.tsx`'s own call
+ * (`<SubSection title={sectionName} …>`) passes a name built from trait field metadata rather
+ * than a string literal, so it has no static value to derive here and falls to the baseline
+ * exactly like a `*.row.${i}.*` family would — a real gap, not an oversight, and the honest
+ * answer until a future pass derives it from `registerTrait`'s per-field `group`/`section` too.
+ *
+ * `subSectionSlug` is REIMPLEMENTED here rather than imported from `widgets.tsx`, unlike
+ * `particleFieldSlug` above — `widgets.tsx` is a full panel module (React, `ContextMenu`, the
+ * backend fetch seam), not the small dependency-free module `particle/fieldIds.ts` was carved out
+ * to be, and importing it into this architecture test would drag that whole graph in for a
+ * five-line function. `engine/tests/editor/subSectionUiIds.test.ts` already establishes this exact
+ * trade-off (mirror + a `toContain` check pinning the mirror to the source) — read there before
+ * "fixing" this by switching to an import.
+ */
+export function traitSubSectionIds(source: string): string[] {
+  const slug = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  const out = new Set<string>();
+  for (const m of source.matchAll(/<SubSection\s+title="([^"]+)"/g)) out.add(slug(m[1]));
+  return [...out].map((s) => `inspector.subsection.${s}`);
+}
+
+/**
+ * `animation.viewMode.${m}` (`animation/TrackList.tsx`) — derived from the `(['dopesheet',
+ * 'curves'] as const).map(...)` tuple the tabs are built from, so a third view mode is picked up
+ * automatically and a typo of either name (`animation.viewMode.dopesheat`) does not pass.
+ *
+ * ⚠️ Gated on the file containing the `animation.viewMode.` template text itself, and NOT just on
+ * finding an `(X as const).map(...)` shape — that shape is common (`ConsoleTab.tsx`'s log-level
+ * filter, `SceneView.tsx`'s view toggles, `TextureAssetView.tsx`'s edge picker all use it), so an
+ * ungated match would derive `animation.viewMode.show3D` from a SceneView tuple that has nothing
+ * to do with this family. Measured, not theorised: caught by running this over the real 3 scan
+ * roots before trusting it.
+ */
+export function animationViewModeIds(source: string): string[] {
+  if (!source.includes('animation.viewMode.')) return [];
+  const m = /\(\[([^\]]*)\]\s*as const\)\.map/.exec(source);
+  if (!m) return [];
+  return [...m[1].matchAll(/'([^']+)'/g)].map((mm) => `animation.viewMode.${mm[1]}`);
+}
+
+/**
+ * `sceneView.toolbar.gizmo.${m.value}` (`SceneView.tsx`) — derived from the module-level
+ * `gizmoModes` array's `value` field, the same array the toolbar itself maps over.
+ */
+export function sceneViewGizmoIds(source: string): string[] {
+  const m = /gizmoModes:\s*Array<[^>]*>\s*=\s*\[([\s\S]*?)\];/.exec(source);
+  if (!m) return [];
+  return [...m[1].matchAll(/value:\s*'([^']+)'/g)].map((mm) => `sceneView.toolbar.gizmo.${mm[1]}`);
+}
+
+/**
+ * `gameView.devicePicker.device.${d.name}` (`DevicePicker.tsx`) — derived from every `name:` the
+ * `DEVICE_PRESETS` catalog declares (`devicePresets.ts`), plus `FREE_PRESET`'s own `name: 'Free'`
+ * (spread into the array by reference, not as a literal `{ name: … }` inside it, so it needs its
+ * own read).
+ */
+export function devicePickerDeviceIds(source: string): string[] {
+  const m = /DEVICE_PRESETS:\s*DevicePreset\[\]\s*=\s*\[([\s\S]*?)\n\];/.exec(source);
+  if (!m) return [];
+  const names = new Set<string>();
+  for (const mm of m[1].matchAll(/name:\s*'([^']+)'/g)) names.add(mm[1]);
+  const free = /FREE_PRESET[^=]*=\s*\{[^}]*name:\s*'([^']+)'/.exec(source)?.[1];
+  if (free) names.add(free);
+  return [...names].map((n) => `gameView.devicePicker.device.${n}`);
+}
+
+/**
+ * `module-toggles.${m.key}.${o.slug}` (`ModuleTogglesEditor.tsx`) — a closed 5×3 cross-product of
+ * `MODULES`' `key` and `OPTIONS`' `slug`, both module-level arrays in the same file.
+ */
+export function moduleToggleIds(source: string): string[] {
+  const modules = /const MODULES:[^=]*=\s*\[([\s\S]*?)\n\];/.exec(source);
+  const options = /const OPTIONS:[^=]*=\s*\[([\s\S]*?)\n\];/.exec(source);
+  if (!modules || !options) return [];
+  const keys = [...modules[1].matchAll(/key:\s*'([^']+)'/g)].map((mm) => mm[1]);
+  const slugs = [...options[1].matchAll(/slug:\s*'([^']+)'/g)].map((mm) => mm[1]);
+  const out: string[] = [];
+  for (const key of keys) for (const slug of slugs) out.push(`module-toggles.${key}.${slug}`);
+  return out;
+}
+
+/**
+ * The whole `quality-tiers.*` namespace — four templates across TWO files
+ * (`QualityTiersEditor.tsx`'s `TIER_COLUMNS`, and `qualityTiersModel.ts`'s `MATRIX_GROUPS` +
+ * `POSTFX_LABELS`), so unlike every other deriver here this one takes the WHOLE `sources` array
+ * and finds its own two files in it rather than being called once per file.
+ *
+ * ⚠️ Matching `MATRIX_GROUPS` requires the DECLARATION (`export const MATRIX_GROUPS`), not a bare
+ * mention — `QualityTiersEditor.tsx` merely IMPORTS the name, and `sources.find` would otherwise
+ * silently grab the wrong file (the editor, which has no `POSTFX_LABELS` or `field:` rows at all)
+ * and derive nothing. Caught by running this against the real files before trusting it.
+ *
+ * `quality-tiers.field.${tier}.${row.field}` gets EVERY row's field (`TierCell` renders one for
+ * every row regardless of `defaultPath`), but `quality-tiers.field.default.${row.field}` only
+ * gets rows where `defaultPath !== null` (`DefaultCell` renders nothing else for `textureMaxSize`
+ * or a `postfx` row) — that asymmetry is why `defaultPath` is read per field rather than just
+ * collecting every `field:` literal once.
+ */
+export function qualityTierIds(sources: string[]): string[] {
+  const editorSrc = sources.find((s) => s.includes('const TIER_COLUMNS'));
+  const modelSrc = sources.find((s) => s.includes('export const MATRIX_GROUPS'));
+  if (!editorSrc || !modelSrc) return [];
+
+  const tierMatch = /const TIER_COLUMNS:[^=]*=\s*\[([^\]]*)\]/.exec(editorSrc);
+  const tiers = tierMatch ? [...tierMatch[1].matchAll(/'([^']+)'/g)].map((mm) => mm[1]) : [];
+
+  const postfxMatch = /export const POSTFX_LABELS[^=]*=\s*\{([^}]*)\}/.exec(modelSrc);
+  const postfxFields = postfxMatch ? [...postfxMatch[1].matchAll(/(\w+):/g)].map((mm) => mm[1]) : [];
+
+  const rowFields: string[] = [];
+  const defaultableFields: string[] = [];
+  for (const m of modelSrc.matchAll(/field:\s*'([\w-]+)'[\s\S]*?defaultPath:\s*(null|'[^']*')/g)) {
+    rowFields.push(m[1]);
+    if (m[2] !== 'null') defaultableFields.push(m[1]);
+  }
+  const allFields = [...new Set([...rowFields, ...postfxFields])];
+
+  const out: string[] = [];
+  for (const tier of tiers) {
+    out.push(`quality-tiers.add.${tier}`, `quality-tiers.remove.${tier}`);
+    for (const field of allFields) out.push(`quality-tiers.field.${tier}.${field}`);
+  }
+  for (const field of defaultableFields) out.push(`quality-tiers.field.default.${field}`);
+  return out;
+}
+
+/** Control kinds `FieldControl` (`ProjectSettingsDialog.tsx`'s `switch (field.type)`) renders by
+ *  handing the WHOLE control off to a dedicated sub-editor component with no `uiId` threaded
+ *  through at all — no `data-ui-id` anywhere in the rendered output for these. */
+const PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS = new Set([
+  'scene-list', 'physics-layers', 'module-toggles', 'quality-tiers',
+]);
+
+/**
+ * `projectSettings.${field.key}` (`ProjectSettingsDialog.tsx`'s `FieldControl`) — derived from
+ * every field object's OWN top-level `key`/`type` in `engine/app/editor/setup.ts`'s `fields: [...]`
+ * arrays (brace/bracket-depth aware — see the note above `balancedBraceSpan`: a `showIf`/
+ * `disabledIf` guard nests its OWN `{ key: '…' }` pointing at ANOTHER field, and reading only each
+ * array item's TOP-LEVEL key/type is what keeps that nested key from borrowing the outer field's
+ * type, or vice versa).
+ *
+ * ⚠️ **#723 review finding C — two bugs, opposite directions.**
+ *
+ * **Over-derived:** `FieldControl` renders NO `data-ui-id` at all for `scene-list`,
+ * `physics-layers`, `module-toggles` and `quality-tiers` (`PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS`
+ * above) — each hands the control to a sub-editor with no `uiId` prop. `projectSettings.rendering`,
+ * `.physics`, `.build.modules` and `.content.scenes` were ACCEPTED and impossible. Filtered by
+ * control KIND, not by hardcoding these four keys, so a fifth untagged kind can't reopen this.
+ *
+ * **Under-derived:** the dialog also emits `${uiId}.select` (a `combo` field's known-values
+ * dropdown, when `options.length > 0`), `.browse`/`.warning`/`.dropError` (every `path` field's
+ * Browse button and validation text) and `.preview` (a `path` field whose value resolves to an
+ * image). Every one of these is built as `` `${uiId}.suffix` `` — a template literal whose captured
+ * content STARTS with `${`, which `knownUiIds`'s `t.startsWith('$')` guard drops from
+ * `patterns`/`allPatterns` entirely (its own comment explains why: no static prefix to anchor a
+ * shape pattern on). They were unresolvable by shape OR derivation —
+ * `projectSettings.build.appleTeamId.select` and `projectSettings.app.iconSource.browse` both came
+ * back REJECTED, though nothing cites them yet. Derived here as concrete ids (added straight to
+ * `ids`, never to a shape pattern) by control kind, over-approximating the runtime condition
+ * (`options.length > 0`, a validation message actually present) exactly as `addComponentItemIds`
+ * above over-approximates "could plausibly be addable".
+ *
+ * ⚠️ Landing this deriver is what makes `templateToIdPattern`'s one-family `.+` allowlist (the
+ * `projectSettings.${` special case) dead code — see that function's comment for why it is
+ * deleted in the same change rather than left "just in case".
+ */
+export function projectSettingsFieldIds(source: string): string[] {
+  if (!source.includes("key: 'app.appName'")) return [];
+  const depthSafe = stripCommentsAndStrings(source, 'setup.ts');
+  const out = new Set<string>();
+  const fieldsRe = /fields:\s*\[/g;
+  let m: RegExpExecArray | null;
+  while ((m = fieldsRe.exec(source))) {
+    const openIdx = m.index + m[0].length - 1;
+    const arrayBody = balancedBracketSpan(source, depthSafe, openIdx);
+    if (!arrayBody) continue;
+    const bodyStart = openIdx + 1;
+    const depthSafeArrayBody = depthSafe.slice(bodyStart, bodyStart + arrayBody.length);
+    for (const entry of splitTopLevelItems(arrayBody, depthSafeArrayBody)) {
+      const key = /\bkey:\s*'([\w.]+)'/.exec(entry)?.[1];
+      if (!key) continue;
+      const type = /\btype:\s*'([\w-]+)'/.exec(entry)?.[1];
+      if (type && PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS.has(type)) continue;
+      const uiId = `projectSettings.${key}`;
+      out.add(uiId);
+      if (type === 'combo') out.add(`${uiId}.select`);
+      if (type === 'path') {
+        out.add(`${uiId}.browse`);
+        out.add(`${uiId}.warning`);
+        out.add(`${uiId}.dropError`);
+        out.add(`${uiId}.preview`);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * `contextmenu.item.${item.label}` (`ContextMenu.tsx`) — derived from every STATIC
+ * `label: '…'` inside an object that also carries `onClick` or `children` (the two shapes a real
+ * `ContextMenuItem` is built with). Measured against the current tree (2026-09-06): 52 unique
+ * labels across the 4 files that actually contribute — `Hierarchy.tsx` (38), `Assets.tsx` (11),
+ * `animation/CurvesView.tsx` (6) and `Inspector.tsx` (1). `SceneView.tsx` mentions no
+ * `ContextMenuItem` at all (the gate below returns `[]` before scanning it) and
+ * `assetViews/widgets.tsx` passes the gate but matches nothing — both scanned, both currently
+ * contributing 0, kept in the corpus walk (not this function) rather than excluded, so a future
+ * context menu added to either is picked up with no code change here.
+ *
+ * ⚠️ That `onClick|children` requirement is load-bearing, not decoration: without it this would
+ * also catch `Hierarchy.tsx`'s `pushAction({ label: 'Paste Entity', undo: …, redo: … })` — an UNDO
+ * HISTORY entry, not a context-menu row, and `contextmenu.item.Paste Entity` has never existed.
+ * Vouching for a string that merely LOOKS like a menu label is exactly the shape-blanket failure
+ * `particleFieldIds`'s docblock warns about, arrived at from a different direction.
+ *
+ * Deliberately does NOT attempt the interpolated labels (`` `Instantiate "${prefab.name}"` ``,
+ * `` `Remove ${title}` ``, `` `Duplicate${suffix}` ``, `` `Detach prefab "${name}"` ``) — there is
+ * no finite source-side vocabulary for a prefab/entity name, so those fall to the shape-only
+ * baseline exactly like a `*.row.${i}.*` id would. Do not add a shape regex for this family "to
+ * cover" them — that is the fix #723 exists to remove, not reinstate.
+ *
+ * ⚠️ Gated on the file mentioning `ContextMenuItem` at all, and that gate is load-bearing too:
+ * without it this matched `engine/app/debug/hmrStaleness.ts`'s UNRELATED `BannerAction` items
+ * (`{ label: 'Dismiss', onClick: … }`, `{ label: 'Reload now', onClick: … }`) — same object
+ * shape, nothing to do with a context menu — and would have vouched for
+ * `contextmenu.item.Dismiss`, a selector that has never existed. Measured, not theorised: caught
+ * by running this deriver over the real 3 scan roots before trusting it.
+ */
+export function contextMenuItemIds(source: string): string[] {
+  if (!source.includes('ContextMenuItem')) return [];
+  const out = new Set<string>();
+  for (const m of source.matchAll(/\{\s*label:\s*'([^']+)'[^}]*?(?:onClick|children)\s*:/g)) {
+    out.add(m[1]);
+  }
+  return [...out].map((label) => `contextmenu.item.${label}`);
+}
+
+/**
+ * Every templated family that now has a deriver above — matched against the RAW template string
+ * `knownUiIds` captured (e.g. `` `sceneView.toolbar.gizmo.${m.value}` ``), not the compiled regex.
+ *
+ * This is rule 1 of #723's brief, and it is the part that actually fixes anything: a deriver that
+ * adds concrete ids to `ids` while its template's SHAPE PATTERN survives in `patterns` changes
+ * nothing — `contextmenu.item.Delelte` still matches `/^contextmenu\.item\.[^.]+$/` and the guard
+ * is exactly as blind as before. Excluding the pattern is what makes a typo, or a deriver that
+ * later under-derives (a panel refactor, a renamed literal), go RED instead of silently passing —
+ * fail-closed, which is the direction this file wants to break in.
+ */
+const DERIVED_FAMILY_TEMPLATES: RegExp[] = [
+  /^animation\.viewMode\.\$\{/,
+  /^sceneView\.toolbar\.gizmo\.\$\{/,
+  /^gameView\.devicePicker\.device\.\$\{/,
+  /^module-toggles\.\$\{[^}]*\}\.\$\{/,
+  /^quality-tiers\.field\.\$\{[^}]*\}\.\$\{/,
+  /^quality-tiers\.add\.\$\{/,
+  /^quality-tiers\.remove\.\$\{/,
+  /^quality-tiers\.field\.default\.\$\{/,
+  // #723 review, item E: anchored on the `projectSettings.` id NAMESPACE plus "this is a
+  // template" (the same shape every other entry here uses), NOT on the destructured variable
+  // name `field` in `ProjectSettingsDialog.tsx`'s `const uiId = `projectSettings.${field.key}`;`.
+  // The old `/^projectSettings\.\$\{field/` was the one entry anchored on an IDENTIFIER rather
+  // than the namespace — rename `field` to `f` there and it silently stops matching, which a
+  // dead-exclusion test could not have caught without ALSO covering rename-immunity (`f.key`
+  // still matches this one; verified against a scratch copy, not left in the tree).
+  /^projectSettings\.\$\{/,
+  /^inspector\.field\.\$\{/,
+  /^inspector\.section\.\$\{[^}]*\}\.header$/,
+  /^inspector\.section\.\$\{[^}]*\}\.menu$/,
+  /^inspector\.subsection\.\$\{/,
+  /^inspector\.addComponent\.item\.\$\{/,
+  /^contextmenu\.item\.\$\{/,
+];
+
 /**
  * A template literal (`a.b.${x}.c`) as an anchored regex over a complete id.
  *
@@ -451,13 +1110,13 @@ function templateToIdPattern(template: string): RegExp {
   const literal = template
     .split(/\$\{[^}]*\}/)
     .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  // The one substitution that is legitimately a DOTTED path rather than a segment:
-  // `ProjectSettingsDialog.tsx` builds every field id from a settings key like
-  // `rendering.three.qualityTier`. An allowlist of one beats a global `.+` that pays for this
-  // family across every other. If a second such template appears, add it here — and say why the
-  // value can contain a dot, because that is what makes the looseness earn its place.
-  const cls = /^projectSettings\.\$\{/.test(template) ? '.+' : '[^.]+';
-  return new RegExp(`^${literal.join(cls)}$`);
+  // #723: this used to carry a one-family `.+` allowlist here for `projectSettings.${field.key}`
+  // (a DOTTED settings key, not a single segment). `projectSettingsFieldIds` now derives that
+  // family's concrete values instead, and `DERIVED_FAMILY_TEMPLATES` removes its shape pattern
+  // from `patterns` entirely — so this function is never even CALLED for that template anymore,
+  // and the allowlist was dead weight. Deleted rather than left "just in case": a second family
+  // that legitimately needs a dotted placeholder should get its OWN deriver, not reopen this hole.
+  return new RegExp(`^${literal.join('[^.]+')}$`);
 }
 
 
@@ -718,7 +1377,10 @@ describe('qa case guard helpers', () => {
         '<button data-ui-id="inspector.header.delete" />',
         '<TreeSearchInput uiId="assets.toolbar.search" />',
         '<Row dataUiId="quality-tiers.field.mid.shadows" />',
-        "items={[{ key: 'grid', uiId: 'sceneView.toolbar.grid' }]}",
+        // A full statement, not a bare JSX-attribute fragment (`items={[…]}`) — the latter is not
+        // valid top-level TS/TSX on its own, and #723's `assertKnownUiIdsSourceSurvived` (item G)
+        // now actually PARSES every source, which a bare attribute value fails.
+        "const items = [{ key: 'grid', uiId: 'sceneView.toolbar.grid' }];",
       ]);
       expect([...ids].sort()).toEqual([
         'assets.toolbar.search',
@@ -748,12 +1410,20 @@ describe('qa case guard helpers', () => {
       expect(matches('particle.bursts.row.0.remove.extra')).toBe(false);
     });
 
-    it('keeps a dotted substitution working — the class is `.+`, not `[^.]+`', () => {
-      // `ProjectSettingsDialog.tsx` builds `projectSettings.${field.key}` from a DOTTED key, so
-      // narrowing the placeholder would report the whole settings family as unknown — the false
-      // alarm this file's history says gets a guard disabled.
-      const { patterns } = knownUiIds(['const uiId = `projectSettings.${field.key}`;']);
-      expect(patterns.some((p) => p.test('projectSettings.rendering.three.qualityTier'))).toBe(true);
+    it('derives a dotted `projectSettings.*` id instead of shape-matching it (#723)', () => {
+      // This family used to be verified by a one-family `.+` allowlist in `templateToIdPattern`,
+      // wide enough to admit ANY dotted string typed after `projectSettings.` — a typo included.
+      // `projectSettingsFieldIds` derives the real dotted keys from `setup.ts` instead, and
+      // `DERIVED_FAMILY_TEMPLATES` removes the shape pattern entirely, so `patterns` no longer
+      // covers this family at all — only `ids` does. Read from the REAL file, not a hand-typed
+      // fixture, so a renamed/removed settings key goes red instead of the assertion testing
+      // itself.
+      const setupSrc = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([setupSrc, 'const uiId = `projectSettings.${field.key}`;']);
+      expect(ids.has('projectSettings.rendering.three.qualityTier')).toBe(true);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      // The `.+` allowlist this replaced would have waved this typo through.
+      expect(known('projectSettings.rendering.three.qualityTierx')).toBe(false);
     });
 
     it('derives the ids `useFieldId` computes, from the REAL panel source', () => {
@@ -849,6 +1519,307 @@ describe('qa case guard helpers', () => {
     });
   });
 
+  /**
+   * Mutation cover for #723's derivers, ONE PER FAMILY CLASS rather than a single test over all
+   * of them — a typo of a real value must be rejected by each family independently, because each
+   * reads a different file with its own quoting/regex shape and a single combined test could pass
+   * by accident on the family it happens to check last. Every `it` below is verified RED without
+   * its deriver (temporarily remove the `for (const id of …) ids.add(id)` line in `knownUiIds` and
+   * re-run — each of these fails, which is what makes the green here mean something).
+   */
+  describe('#723 derived families reject a typo of a real cited value', () => {
+    it('inspector.field — from the REAL trait registry', () => {
+      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('inspector.field.Transform.x')).toBe(true);
+      expect(known('inspector.field.VideoPlayer.loop')).toBe(true);
+      expect(known('inspector.field.HapticSettings.masterIntensity')).toBe(true);
+      // Typos of real, currently-cited values (qa/cases/**) that used to pass on shape alone.
+      expect(known('inspector.field.Transform.xx')).toBe(false);
+      expect(known('inspector.field.VideoPlayer.lop')).toBe(false);
+      // A trait that has never existed must not be waved through by the `[^.]+` shape either.
+      expect(known('inspector.field.NotATrait.foo')).toBe(false);
+    });
+
+    /**
+     * The completeness direction the tests above never exercised: they only prove a TYPO is
+     * REJECTED, which a stripper that silently drops fields would still pass — a dropped field's
+     * id is unknown too. This proves every REAL field of a comment-heavy trait is still ACCEPTED.
+     *
+     * `UIElement`, `Animator` and `Renderable3DPrimitive` were picked because each has a field
+     * whose declaration sits directly behind a `//` comment inside `fields: { … }` —
+     * `topLevelObjectKeys`'s `^\s*` anchor cannot skip one, so the field was silently not derived.
+     * Measured against `engine/app/ecs/registerTraits.ts` before the fix: 33 trait fields dropped
+     * across the registry, these three among them. `Animator.time` is the first field after a
+     * 4-line comment; `Renderable3DPrimitive.material` sits behind a 2-line comment.
+     */
+    it('inspector.field derives EVERY field of a comment-heavy trait, not just the ones after its last comment', () => {
+      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      // The two ids the brief names explicitly.
+      expect(known('inspector.field.Animator.time')).toBe(true);
+      expect(known('inspector.field.Renderable3DPrimitive.material')).toBe(true);
+      // ⚠️ #723 review finding A: `flexDirection` (an `enum`, → `DropdownField`) and
+      // `backgroundColor` (a `color`, → `ColorField`) render through widgets that emit NO
+      // `data-ui-id` at all — this test used to pin BOTH as "known", which is the exact fail-open
+      // finding A closes (an id the Inspector can never render, vouched for). Replaced below with
+      // `borderWidth` and `fontFamily` — both still comment-heavy-trait fields (the same `UIElement`
+      // block), both a TAGGED type (`number`, and `string` with `accept`, i.e. `AssetRefField`).
+      expect(known('inspector.field.UIElement.flexDirection')).toBe(false);
+      expect(known('inspector.field.UIElement.backgroundColor')).toBe(false);
+      // Every other field of the same three comment-heavy traits.
+      for (const id of [
+        'inspector.field.UIElement.width',
+        'inspector.field.UIElement.borderWidth',
+        'inspector.field.UIElement.fontFamily',
+        'inspector.field.UIElement.paddingTop',
+        'inspector.field.Animator.speed',
+        'inspector.field.Animator.playing',
+        'inspector.field.Animator.loop',
+        'inspector.field.Animator.fadeDuration',
+        'inspector.field.Animator.activeClip',
+        'inspector.field.Animator.fadeFrom',
+        'inspector.field.Animator.fadeFromTime',
+        'inspector.field.Animator.fadeElapsed',
+        'inspector.field.Renderable3DPrimitive.isVisible',
+      ]) {
+        expect(known(id), id).toBe(true);
+      }
+    });
+
+    it('inspector.section / inspector.addComponent.item — from the REAL trait registry', () => {
+      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('inspector.section.Director.header')).toBe(true);
+      expect(known('inspector.section.GroupAlpha.menu')).toBe(true);
+      expect(known('inspector.addComponent.item.AudioSource')).toBe(true);
+      // Cited today per qa/cases/** — real, unmutated.
+      expect(known('inspector.addComponent.item.GroupAlpha')).toBe(true);
+      // Typos.
+      expect(known('inspector.section.Diretcor.header')).toBe(false);
+      expect(known('inspector.addComponent.item.AudioSrouce')).toBe(false);
+      // A resource trait is addressed by ITS name plus " (resource)", not the bare name.
+      expect(known('inspector.section.HapticSettings.header')).toBe(false);
+      expect(known('inspector.section.HapticSettings (resource).header')).toBe(true);
+    });
+
+    it('inspector.subsection — from a literal <SubSection title> call site', () => {
+      expect(traitSubSectionIds('<SubSection title="Advanced" defaultOpen={x}>')).toEqual([
+        'inspector.subsection.advanced',
+      ]);
+      // A dynamic call (`<SubSection title={sectionName}>`, Inspector.tsx's own) has no static
+      // value — correctly derives nothing rather than guessing.
+      expect(traitSubSectionIds('<SubSection title={sectionName} defaultOpen={x}>')).toEqual([]);
+    });
+
+    /**
+     * #723 review, item I: `traitSubSectionIds`'s inline `subSectionSlug` copy had NO pin to the
+     * source it mirrors — unlike `engine/tests/editor/subSectionUiIds.test.ts`'s OWN inline copy
+     * of the same function, which is pinned to `widgets.tsx` by a `toContain` check (its own "the
+     * slug helper matches the implementation it mirrors" test). This file's docblock above already
+     * cites that precedent as the reason NOT to import `widgets.tsx` (a full panel module) for a
+     * five-line function — the consistent choice is the SAME mirror-plus-pin shape, not switching
+     * to an import, so this is that pin for the copy in THIS file.
+     */
+    it("traitSubSectionIds' inline subSectionSlug copy matches widgets.tsx (pin, not an import)", () => {
+      const src = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/assetViews/widgets.tsx'),
+        'utf8',
+      );
+      expect(src).toContain("return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');");
+    });
+
+    it('animation.viewMode — from the REAL TrackList tuple', () => {
+      const src = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/animation/TrackList.tsx'),
+        'utf8',
+      );
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('animation.viewMode.dopesheet')).toBe(true);
+      expect(known('animation.viewMode.curves')).toBe(true);
+      expect(known('animation.viewMode.dopesheat')).toBe(false);
+    });
+
+    it('sceneView.toolbar.gizmo — from the REAL gizmoModes array', () => {
+      const src = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
+        'utf8',
+      );
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('sceneView.toolbar.gizmo.translate')).toBe(true);
+      expect(known('sceneView.toolbar.gizmo.rotate')).toBe(true);
+      // The typo the brief names explicitly.
+      expect(known('sceneView.toolbar.gizmo.rotat')).toBe(false);
+    });
+
+    it('gameView.devicePicker.device — from the REAL device catalog', () => {
+      const src = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
+        'utf8',
+      );
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('gameView.devicePicker.device.Free')).toBe(true);
+      expect(known('gameView.devicePicker.device.iPhone SE')).toBe(true);
+      expect(known('gameView.devicePicker.device.iPhone 16 Pro Max')).toBe(true);
+      expect(known('gameView.devicePicker.device.iPhone 16 Pro Maxx')).toBe(false);
+      expect(known('gameView.devicePicker.device.Nokia 3310')).toBe(false);
+    });
+
+    it('module-toggles — from the REAL MODULES × OPTIONS arrays', () => {
+      const src = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx'),
+        'utf8',
+      );
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('module-toggles.render3d.auto')).toBe(true);
+      expect(known('module-toggles.video.off')).toBe(true);
+      expect(known('module-toggles.render3d.maybe')).toBe(false);
+      expect(known('module-toggles.audio.auto')).toBe(false);
+    });
+
+    it('quality-tiers.* — from the REAL editor + model files, mutation-checked exactly as named in the brief', () => {
+      const editorSrc = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/QualityTiersEditor.tsx'),
+        'utf8',
+      );
+      const modelSrc = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/qualityTiersModel.ts'),
+        'utf8',
+      );
+      const { ids, patterns } = knownUiIds([editorSrc, modelSrc]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('quality-tiers.field.mid.pixelRatioCap')).toBe(true);
+      expect(known('quality-tiers.field.default.pixelRatioCap')).toBe(true);
+      expect(known('quality-tiers.add.mid')).toBe(true);
+      expect(known('quality-tiers.remove.low')).toBe(true);
+      // The exact typo the brief names.
+      expect(known('quality-tiers.field.mid.pixelRatioCapp')).toBe(false);
+      // `textureMaxSize` has NO Default cell (`defaultPath: null`) — the tier column exists, the
+      // default one does not, and that asymmetry is the whole reason `defaultPath` is read
+      // per-field instead of collecting every `field:` literal once for both templates.
+      expect(known('quality-tiers.field.mid.textureMaxSize')).toBe(true);
+      expect(known('quality-tiers.field.default.textureMaxSize')).toBe(false);
+    });
+
+    it('projectSettings.* — from the REAL setup.ts field declarations', () => {
+      const src = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([src]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('projectSettings.app.appName')).toBe(true);
+      expect(known('projectSettings.rendering.three.qualityTier')).toBe(true);
+      expect(known('projectSettings.app.appNam')).toBe(false);
+    });
+
+    it('contextmenu.item — from the REAL 4 contributing files, and does not vouch for an unrelated label', () => {
+      // #723 review, item I: `SceneView.tsx` (mentions no `ContextMenuItem` at all — the gate
+      // returns `[]` before it is ever scanned) and `assetViews/widgets.tsx` (passes the gate,
+      // matches nothing) were both in this list contributing ZERO ids to what this test asserts —
+      // measured, not assumed. Trimmed to the 4 files that actually produce a label, plus
+      // `hmrStaleness.ts` below for the negative case.
+      const files = [
+        'engine/packages/modoki/src/editor/panels/Hierarchy.tsx',
+        'engine/packages/modoki/src/editor/panels/Assets.tsx',
+        'engine/packages/modoki/src/editor/panels/animation/CurvesView.tsx',
+        'engine/packages/modoki/src/editor/panels/Inspector.tsx',
+        // Ungated, this file's `BannerAction`s (`{ label: 'Dismiss', onClick: … }`) match the same
+        // shape as a real ContextMenuItem — this is the false positive the deriver's docblock
+        // names, reproduced here rather than only asserted about.
+        'engine/app/debug/hmrStaleness.ts',
+      ].map((f) => readFileSync(join(REPO_ROOT, f), 'utf8'));
+      const { ids, patterns } = knownUiIds(files);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(known('contextmenu.item.Delete')).toBe(true);
+      expect(known('contextmenu.item.Rename')).toBe(true);
+      expect(known('contextmenu.item.Create Prefab')).toBe(true);
+      // The exact typo the brief names.
+      expect(known('contextmenu.item.Delelte')).toBe(false);
+      // The interpolated labels fall to the baseline by design — never derived, never shape-matched.
+      expect(known('contextmenu.item.Move to Trash')).toBe(false);
+      // The false positive an ungated scan would produce from hmrStaleness.ts.
+      expect(known('contextmenu.item.Dismiss')).toBe(false);
+    });
+
+    /**
+     * #723 review close-out — the consolidated verification the brief's items A/B/C-over/C-under/I
+     * asked for: every named IMPOSSIBLE id now REJECTED, and the REAL cited ids the tightening must
+     * not touch still ACCEPTED. Reads the two real registry/setup files directly rather than a
+     * hand-typed fixture, so a future change to either can only make this MORE honest, not less.
+     */
+    it('#723 review close-out: impossible ids rejected, real cited ids still accepted', () => {
+      const traitsSrc = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const setupSrc = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const { ids, patterns } = knownUiIds([traitsSrc, setupSrc]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+
+      // A: an enum/color field the Inspector can never tag with a data-ui-id.
+      expect(known('inspector.field.UIElement.flexDirection')).toBe(false);
+      expect(known('inspector.field.UIElement.backgroundColor')).toBe(false);
+      expect(known('inspector.field.Renderable2D.color')).toBe(false);
+      // A: an alpha field folded into its color picker's own alpha slider.
+      expect(known('inspector.field.Renderable2D.opacity')).toBe(false);
+      // A: a field marked `hidden: true`.
+      expect(known('inspector.field.EntityAttributes.sourceScene')).toBe(false);
+      // B: EntityAttributes is an inline header, never a normal Section or an addable component.
+      expect(known('inspector.section.EntityAttributes.header')).toBe(false);
+      expect(known('inspector.section.EntityAttributes.menu')).toBe(false);
+      expect(known('inspector.addComponent.item.EntityAttributes')).toBe(false);
+      // C (over): control kinds FieldControl hands off to a sub-editor with no uiId at all.
+      expect(known('projectSettings.rendering')).toBe(false);
+      expect(known('projectSettings.physics')).toBe(false);
+      expect(known('projectSettings.build.modules')).toBe(false);
+      expect(known('projectSettings.content.scenes')).toBe(false);
+
+      // The six ids real qa/cases/** citations rely on — tightening the filter must not touch
+      // these. All are `number`/`boolean` fields, so they were never at risk from finding A, but
+      // this is the ACTUAL "did I break a live citation" check, not an inference from the source.
+      expect(known('inspector.field.Transform.x')).toBe(true);
+      expect(known('inspector.field.Transform.y')).toBe(true);
+      expect(known('inspector.field.VideoPlayer.loop')).toBe(true);
+      expect(known('inspector.field.GroupAlpha.alpha')).toBe(true);
+      expect(known('inspector.field.HapticSettings.masterIntensity')).toBe(true);
+      expect(known('inspector.field.Rotate3D.speed')).toBe(true);
+
+      // C (under): the sub-id the dialog emits that the old `.+` allowlist covered and the
+      // deriver's first version did not replace.
+      expect(known('projectSettings.build.appleTeamId.select')).toBe(true);
+
+      // I: a quote-bearing device name (`iPad Pro 11"`) — CITED_UI_ID_RE only, not `knownUiIds`
+      // itself, so exercised against the REAL device catalog + the regex directly.
+      const devicePresetsSrc = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
+        'utf8',
+      );
+      const { ids: deviceIds, patterns: devicePatterns } = knownUiIds([devicePresetsSrc]);
+      const knownDevice = (id: string) => deviceIds.has(id) || devicePatterns.some((p) => p.test(id));
+      expect(knownDevice('gameView.devicePicker.device.iPad Pro 11"')).toBe(true);
+      // The citation-side regex must extract the id WHOLE (trailing `"` included), not truncated.
+      const cited = [...`data-ui-id='gameView.devicePicker.device.iPad Pro 11"'`.matchAll(CITED_UI_ID_RE)];
+      expect(cited[0]?.[1] ?? cited[0]?.[3]).toBe('gameView.devicePicker.device.iPad Pro 11"');
+    });
+
+    it('an under-deriving family goes RED rather than silently passing (rule 1)', () => {
+      // Simulates a panel refactor that renames the array `gizmoModes` reads from — the deriver
+      // then returns [], and because `DERIVED_FAMILY_TEMPLATES` already removed the shape
+      // pattern, a previously-good citation must now be UNKNOWN rather than quietly still passing
+      // on the shape it used to fall back to. This is rule 1's whole point: fail closed, not open.
+      const renamed = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
+        'utf8',
+      ).replace(/gizmoModes/g, 'renamedGizmoModes');
+      const { ids, patterns } = knownUiIds([renamed]);
+      const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
+      expect(sceneViewGizmoIds(renamed)).toEqual([]);
+      expect(known('sceneView.toolbar.gizmo.translate')).toBe(false);
+    });
+  });
+
   describe('isUnder', () => {
     it('matches the entry itself and anything below it', () => {
       expect(isUnder('games/qa-temp', 'games/qa-temp')).toBe(true);
@@ -919,6 +1890,26 @@ describeCases('QA case references', () => {
   // tests. So every load here must survive `qa/` being absent, or the OSS snapshot (which does
   // not ship qa/) throws during collection and the "skip" protects nothing.
   const cases = HAS_CASES ? loadCases() : [];
+  // #723: the committed grandfather list of citations that resolve only via a shape pattern for a
+  // family that now has a deriver — see `shapeOnlyCitedIds` and the ratchet tests below.
+  //
+  // ⚠️ **#723 review, item D: a `{ "<id>": "<reason>" }` MAP, not a flat array.** A flat list let
+  // `MODOKI_QA_WRITE_SHAPE_BASELINE=1` launder a typo silently: append a typo in a DERIVED family
+  // to a case, regenerate, and the typo is permanently vouched for with no record anyone looked —
+  // reproduced end-to-end during review. The reason string is the review `shapeOnlyCitedIds`'s own
+  // docblock always asked for in prose but never enforced; `readShapeBaseline`'s "no empty reason"
+  // ratchet below is what makes a human typing one part of getting green rather than optional.
+  const SHAPE_BASELINE_PATH = join(REPO_ROOT, 'engine/tests/architecture/qa-shape-only-baseline.json');
+  const readShapeBaseline = (): Record<string, string> =>
+    JSON.parse(readFileSync(SHAPE_BASELINE_PATH, 'utf8'));
+  /** Regenerates the baseline, carrying an EXISTING id's reason forward — only a truly NEW id gets
+   *  the empty string the ratchet below rejects, so "why" survives a routine re-sort/reshuffle. */
+  const writeShapeBaseline = (ids: string[]): void => {
+    const existing = existsSync(SHAPE_BASELINE_PATH) ? readShapeBaseline() : {};
+    const next: Record<string, string> = {};
+    for (const id of ids) next[id] = existing[id] ?? '';
+    writeFileSync(SHAPE_BASELINE_PATH, `${JSON.stringify(next, null, 2)}\n`);
+  };
   // `--others --exclude-standard` includes files that are new but not yet staged, while still
   // excluding gitignored build output. Plain `ls-files` would fail a case whose `covers:`
   // names a source file added in the same edit — a confusing red for correct work.
@@ -1335,12 +2326,24 @@ describeCases('QA case references', () => {
   });
 
   /**
-   * A selector is an AIM. If it does not resolve, the case cannot be executed at all — and unlike a
-   * wrong path or a wrong tool name, nothing else in this file would notice: the tool is real, the
-   * parameter is real, only the target is missing. Wave 2 of the suite drives the editor through its
-   * actual chrome, so this became the highest-value check to add.
+   * The full-corpus source walk + `knownUiIds` scan + case/README docs array, HOISTED into one
+   * lazily-memoized computation (#723 review, item F).
+   *
+   * The scan roots and the `cases ∪ qa/README.md` docs array used to be duplicated verbatim across
+   * this test and `shapeOnlyCitedIds` below — widen one and not the other and the two ratchets
+   * deadlock, each naming a different fix. And the full source walk (reading + `knownUiIds`-scanning
+   * every `.ts(x)` file under the 3 roots, now including a real TypeScript parse per file for item
+   * G/H's teeth) used to run up to THREE times per test run: once here, and once more for EACH of
+   * the two ratchet tests below (`shapeOnlyCitedIds` is called by both). `engine/vite.config.ts`
+   * records this suite already blowing past its 35s Windows ceiling — one walk, cached for every
+   * caller in this run, is what keeps that from getting worse as the corpus grows.
    */
-  it('every `data-ui-id` a case aims at exists in the editor source', () => {
+  let corpusScanCache: {
+    known: ReturnType<typeof knownUiIds>;
+    docs: Array<{ rel: string; body: string }>;
+  } | null = null;
+  function getCorpusScan() {
+    if (corpusScanCache) return corpusScanCache;
     const roots = ['engine/packages/modoki/src', 'engine/app', 'engine/electron'].map((r) =>
       join(REPO_ROOT, r),
     );
@@ -1348,10 +2351,7 @@ describeCases('QA case references', () => {
       .filter((r) => existsSync(r))
       .flatMap((r) => walk(r).filter((f) => /\.tsx?$/.test(f)))
       .map((f) => readFileSync(f, 'utf8'));
-    const { ids, patterns } = knownUiIds(sources);
-    // A vacuous pass would be worse than no check — the editor really does tag its chrome.
-    expect(ids.size).toBeGreaterThan(30);
-
+    const known = knownUiIds(sources);
     // qa/README.md is scanned alongside the cases: the SPEC teaches selectors too, and a wrong one
     // there propagates further than in any single case. It already did — `modoki_tap`'s docstring
     // taught `inspector.header.kebab` (an Inspector kebab menu that has never existed), the README
@@ -1360,19 +2360,188 @@ describeCases('QA case references', () => {
       ...cases.map((c) => ({ rel: c.rel, body: c.body })),
       { rel: 'qa/README.md', body: readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8') },
     ];
+    corpusScanCache = { known, docs };
+    return corpusScanCache;
+  }
+
+  /**
+   * A selector is an AIM. If it does not resolve, the case cannot be executed at all — and unlike a
+   * wrong path or a wrong tool name, nothing else in this file would notice: the tool is real, the
+   * parameter is real, only the target is missing. Wave 2 of the suite drives the editor through its
+   * actual chrome, so this became the highest-value check to add.
+   */
+  it('every `data-ui-id` a case aims at exists in the editor source', () => {
+    const { known: { ids, patterns }, docs } = getCorpusScan();
+    // A vacuous pass would be worse than no check — the editor really does tag its chrome.
+    expect(ids.size).toBeGreaterThan(30);
+
+    // #723: the frozen `qa-shape-only-baseline.json` is a legitimate PASS here, not just a
+    // measurement — it is what stands in for the shape pattern rule 1 removed for a derived
+    // family's UNDERIVABLE values (`contextmenu.item.Move to Trash`). See the ratchet tests below
+    // for what keeps this list itself honest (no new entries, no stale ones).
+    const shapeBaseline = new Set(Object.keys(readShapeBaseline()));
 
     const unknown: string[] = [];
     for (const c of docs) {
-      for (const m of c.body.matchAll(/data-ui-id=\\?["']([\w.:${}<>-]+)/g)) {
-        const id = m[1];
-        if (/[${}<>]/.test(id)) continue; // a placeholder the runner substitutes
-        if (ids.has(id) || patterns.some((p) => p.test(id))) continue;
+      for (const m of c.body.matchAll(CITED_UI_ID_RE)) {
+        const id = m[1] ?? m[3]!;
+        if (/[${}<>…]/.test(id)) continue; // a placeholder the runner substitutes
+        if (ids.has(id) || patterns.some((p) => p.test(id)) || shapeBaseline.has(id)) continue;
         unknown.push(`${c.rel}: [data-ui-id="${id}"]`);
       }
     }
     // PROPOSING an id that should exist is legitimate — write it in prose, without the
     // `data-ui-id="…"` code span, so it cannot be mistaken for a working selector.
     expect(unknown).toEqual([]);
+  });
+
+  /**
+   * #723 Part 2 — the RATCHET over every citation that resolves ONLY via a shape pattern.
+   *
+   * `templateToIdPattern`'s `[^.]+` class checks a citation's SHAPE, not its VALUE — a family with
+   * no deriver (rule 2 of #723's brief: `particle.bursts.row.${i}.*`, `spriteEditor.slice.${s.guid}`,
+   * every other `*.row.${i}.*`) keeps that pattern on purpose, because the substituted value is
+   * authored PROJECT DATA (an array index, a GUID) with no finite source-side vocabulary to check
+   * it against. A shape-only pass is therefore not a claim the selector's VALUE is real — it is "I
+   * cannot verify this", frozen into a committed baseline so the set can neither grow silently (a
+   * new templated family landing with no deriver) nor go stale (a deriver landing, or a citation
+   * moving/being fixed, must shrink it in the same commit). Follows `noNewCycles.test.ts`'s
+   * pattern exactly: TWO assertions enforce EQUALITY, not just "no growth".
+   *
+   * Regenerate with:
+   *   MODOKI_QA_WRITE_SHAPE_BASELINE=1 npx vitest run --config engine/vite.config.ts \
+   *     engine/tests/architecture/qaCaseReferences.test.ts
+   * Never hand-edit the JSON by ID — DO hand-edit a REASON string once a fresh entry is written
+   * with an empty one (see "no empty reason" below): the regeneration run cannot know WHY an id
+   * cannot be derived, only that it is shape-only, and that "why" is the actual review.
+   *
+   * ⚠️ **A regeneration that ADDS an entry reports ONE RED, by design — run it TWICE.** The write
+   * happens inside the "no NEW entries" test below; the LIVE CHECK test above it in this file reads
+   * the baseline EARLIER in the same run, before that write has happened, so it still sees the OLD
+   * baseline missing the just-added id and fails once. The second run reads the now-updated file and
+   * is green (assuming a real reason was typed in for the new entry in between).
+   *
+   * A regeneration that only REMOVES an entry is green in ONE run — the live check does not need the
+   * departing id, so nothing fails while the file catches up. Measured 2026-09-06 by regenerating
+   * after deleting a citation: 79/79 first time. So "it went green immediately" does not mean the
+   * write was skipped; check the file, not the exit code.
+   */
+  function shapeOnlyCitedIds(): string[] {
+    // `allPatterns`, NOT `patterns` — this measurement asks "would this citation still shape-match
+    // under the OLD, undiminished rules", which is exactly what identifies a derived family's
+    // UNDERIVABLE residue (`contextmenu.item.Move to Trash`). Using the live-check's filtered
+    // `patterns` here would make every derived family's residue invisible to this scan, and the
+    // baseline would never pick up what rule 1 needs it to.
+    const { known: { ids, allPatterns }, docs } = getCorpusScan();
+    const shapeOnly = new Set<string>();
+    for (const c of docs) {
+      for (const m of c.body.matchAll(CITED_UI_ID_RE)) {
+        const id = m[1] ?? m[3]!;
+        if (/[${}<>…]/.test(id)) continue; // a placeholder the runner substitutes
+        if (ids.has(id)) continue; // verified by literal or derivation
+        if (allPatterns.some((p) => p.test(id))) shapeOnly.add(id);
+      }
+    }
+    return [...shapeOnly].sort();
+  }
+
+  it("the shape-only baseline has no NEW entries (derive it, or add it with a reason)", () => {
+    // Regeneration lives INSIDE this test, not a standalone script, so the same `shapeOnlyCitedIds`
+    // computation backs both the write and the read — a separate script re-implementing the scan
+    // could silently drift from what the assertion below actually checks.
+    if (process.env.MODOKI_QA_WRITE_SHAPE_BASELINE === '1') {
+      writeShapeBaseline(shapeOnlyCitedIds());
+    }
+    const baseline = readShapeBaseline();
+    const current = shapeOnlyCitedIds();
+    const newEntries = current.filter((id) => !(id in baseline));
+    expect(
+      newEntries,
+      'NEW shape-only citation(s) — this guard cannot verify these ids\' VALUES, only their ' +
+        'shape. Either add a deriver for the family (see the #723 derivers above particleFieldIds), ' +
+        'or add the id to qa-shape-only-baseline.json with a one-line reason in the same commit:\n' +
+        newEntries.join('\n'),
+    ).toEqual([]);
+  });
+
+  /**
+   * #723 review, item D: the ratchet that makes the reason MANDATORY rather than a comment nobody
+   * enforces. `writeShapeBaseline` writes `""` for a brand-new id — a regeneration run WRITES green
+   * on the shape (nothing new/stale), but this fails LOUDLY, naming the id, until a human types WHY
+   * it cannot be derived. Without this, `MODOKI_QA_WRITE_SHAPE_BASELINE=1` is a green button with no
+   * review attached — reproduced end-to-end pre-fix: a typo'd DERIVED-family id, regenerated, went
+   * permanently green with nobody having looked.
+   */
+  it('every shape-only baseline entry has a non-empty reason (no laundering a typo to green)', () => {
+    const baseline = readShapeBaseline();
+    const unexplained = Object.entries(baseline)
+      .filter(([, reason]) => reason.trim() === '')
+      .map(([id]) => id);
+    expect(
+      unexplained,
+      'qa-shape-only-baseline.json has entry/entries with an EMPTY reason — a regeneration run ' +
+        'writes one for a brand-new id, and a human must fill in why it cannot be derived before ' +
+        `this can go green:\n${unexplained.join('\n')}`,
+    ).toEqual([]);
+  });
+
+  it('the shape-only baseline has no STALE entries (shrink it when a citation is verified)', () => {
+    const baseline = readShapeBaseline();
+    const current = new Set(shapeOnlyCitedIds());
+    const stale = Object.keys(baseline).filter((id) => !current.has(id));
+    expect(
+      stale,
+      'qa-shape-only-baseline.json lists id(s) no longer shape-only (a deriver landed, or the ' +
+        `citation moved/was fixed) — shrink the baseline in the same commit:\n${stale.join('\n')}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * #723 review, item E — nothing PINS `DERIVED_FAMILY_TEMPLATES` to the derivers it exists to
+   * protect, and the failure is silent and fail-OPEN: add a 12th deriver, forget its exclusion
+   * entry, and that family keeps its shape blanket forever while its `ids` grow underneath it —
+   * every typo of a real value in that family quietly keeps passing on shape, exactly rule 1 was
+   * written to stop. Two directions, over the REAL 3-root corpus:
+   *
+   *  1. Every exclusion regex matches at least one LIVE template — a DEAD entry (the family was
+   *     renamed/removed, or the regex was mistyped and never matched anything to begin with) is
+   *     invisible with no other signal, so it is asserted here rather than trusted by inspection.
+   *  2. No pattern SURVIVING in the live, filtered `patterns` set also matches a real DERIVED id —
+   *     the direct check for "a shape blanket is still covering a family `ids` already derives".
+   */
+  it('DERIVED_FAMILY_TEMPLATES has no dead exclusions and lets no shape blanket survive over a derived id', () => {
+    const { known: { templates, patterns } } = getCorpusScan();
+    for (const re of DERIVED_FAMILY_TEMPLATES) {
+      expect(
+        templates.some((t) => re.test(t)),
+        `${re} matches no live template — a dead exclusion (renamed/removed family, or a typo that `
+          + 'never matched)',
+      ).toBe(true);
+    }
+    // One real, currently-derivable id per family above — a shape pattern still matching any of
+    // these means that family's `[^.]+` blanket SURVIVED despite having its own deriver, which is
+    // exactly the hole rule 1 exists to close.
+    const derivedSampleIds = [
+      'inspector.field.Transform.x',
+      'inspector.section.Director.header',
+      'inspector.section.HapticSettings (resource).menu',
+      'inspector.subsection.advanced',
+      'inspector.addComponent.item.AudioSource',
+      'animation.viewMode.dopesheet',
+      'sceneView.toolbar.gizmo.translate',
+      'gameView.devicePicker.device.Free',
+      'module-toggles.render3d.auto',
+      'quality-tiers.add.mid',
+      'quality-tiers.remove.mid',
+      'quality-tiers.field.mid.pixelRatioCap',
+      'quality-tiers.field.default.pixelRatioCap',
+      'projectSettings.app.appName',
+      'contextmenu.item.Delete',
+    ];
+    for (const id of derivedSampleIds) {
+      expect(patterns.some((p) => p.test(id)), `${id} still shape-matches a SURVIVING pattern`)
+        .toBe(false);
+    }
   });
 
   /**
