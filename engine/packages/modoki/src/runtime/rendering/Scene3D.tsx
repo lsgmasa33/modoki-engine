@@ -21,7 +21,8 @@ import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { disposeVideoTextures } from './videoTextureSync';
 import { registerRenderSurface } from './materialBroker';
-import { onRendererLost } from '../core/activeRenderer';
+import { onRendererLost, makeViewportLossPolicy, attachUncapturedErrorListener } from '../core/activeRenderer';
+import { attachRendererLossHandling } from './rendererLossHandling';
 import { createRendererRecovery } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
@@ -128,6 +129,14 @@ export default function Scene3D() {
     const config = getGameConfig();
     let renderer: WebGPURenderer | THREE.WebGLRenderer;
     let disposed = false;
+    // GPU-context/device loss DETECTION (#802) — wired directly per bring-up rather than through
+    // `setActiveRenderer`'s shared handle, which no longer arms any fault channel: a second
+    // registrant (e.g. the editor's Particle Editor) used to silently disarm the first viewport's
+    // detection. Reassigned each `bringUp()`; the previous pair is detached by `teardown()`'s
+    // installed `cleanupRef.current` BEFORE a rebuild's `bringUp()` reassigns these, so there is
+    // no window where two live attachments exist for this one viewport.
+    let detachRendererLoss: () => void = () => {};
+    let detachUncapturedError: () => void = () => {};
 
     // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
     // Everything this viewport owns — scene, cameras, renderState, particles, the post-FX
@@ -143,6 +152,18 @@ export default function Scene3D() {
       const r = await createRenderer(container, config.preferWebGPU);
       if (disposed) { r.dispose(); r.domElement.remove(); return; }
       renderer = r;
+      // `isStale` also compares against the OUTER `renderer` (not just `disposed`) so a later
+      // rebuild that reassigns `renderer` to a NEWER instance immediately disarms an
+      // in-flight callback from THIS one, even in the gap before `teardown()` gets to call
+      // `detachRendererLoss()` below. `attachContextLossListeners` calls `e.preventDefault()` on
+      // the WebGL path; the pre-#802 code here deliberately did not, because three's own
+      // `WebGLBackend` listener already does — a second `preventDefault()` on the same event
+      // changes nothing, so this is a known, harmless behaviour change, not an oversight.
+      detachRendererLoss = attachRendererLossHandling(
+        { canvas: r.domElement, device: (r as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
+        { label: 'Scene3D', isStale: () => disposed || renderer !== r, ...makeViewportLossPolicy({ renderer: r, isStale: () => disposed || renderer !== r }) },
+      );
+      detachUncapturedError = attachUncapturedErrorListener(r);
       startRenderLoop();
     };
 
@@ -953,6 +974,8 @@ export default function Scene3D() {
         const step = (what: string, fn: () => void) => {
           try { fn(); } catch (e) { console.warn(`[Scene3D] teardown step "${what}" failed`, e); }
         };
+        step('detachRendererLoss', () => detachRendererLoss());
+        step('detachUncapturedError', () => detachUncapturedError());
         step('unregisterSceneRenderer', () => unregisterSceneRenderer(offscreenRender));
         step('unregBounds', unregBounds);
         step('captureRT.dispose', () => captureRT?.dispose());

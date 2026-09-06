@@ -4,9 +4,17 @@
  *  watchdog reported only the symptom ("wedged, relaunch") with no idea why. Recovery policy
  *  (#121 P1) is exercised in the third describe block below.
  *
+ *  #802 moved DETECTION off this module's single-slot `attachedRenderer` (a second registrant —
+ *  e.g. the Particle Editor — silently disarmed the first, e.g. SceneView) and onto the shared
+ *  per-renderer contract `rendererLossHandling.ts` (#795): a "viewport" here is simulated by
+ *  composing `attachRendererLossHandling` + `makeViewportLossPolicy` + `attachUncapturedErrorListener`
+ *  — see `attachViewport` below — rather than by calling `setActiveRendererHandle` alone, which
+ *  now arms NOTHING fault-related (it keeps only its texture/KTX2-caps + registrants-stack role;
+ *  that role is covered separately by the `activeRenderer disposer (#720)` describe block).
+ *
  *  Every test does `vi.resetModules()` + a fresh dynamic import so the module-level
- *  `gpuFaultState`/`attachedRenderer` singletons start clean — this file's own state would
- *  otherwise leak between tests exactly like the fault-state leak it's testing for. */
+ *  `gpuFaultState`/loss-history singletons start clean — this file's own state would otherwise
+ *  leak between tests exactly like the fault-state leak it's testing for. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -15,7 +23,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** A minimal fake `GPUDevice`: a controllable `lost` promise + an `uncapturederror`
- *  event target, matching the two hooks `attachWebGpuDeviceListeners` reads. */
+ *  event target, matching what `attachDeviceLostListener`/`attachUncapturedErrorListener` read. */
 function makeGpuDevice() {
   let resolveLost!: (info: { reason: string; message?: string }) => void;
   const lost = new Promise<{ reason: string; message?: string }>((res) => { resolveLost = res; });
@@ -24,6 +32,9 @@ function makeGpuDevice() {
     lost,
     addEventListener: vi.fn((type: string, cb: (e: unknown) => void) => {
       (listeners[type] ??= []).push(cb);
+    }),
+    removeEventListener: vi.fn((type: string, cb: (e: unknown) => void) => {
+      listeners[type] = (listeners[type] ?? []).filter((fn) => fn !== cb);
     }),
     resolveLost,
     emit: (type: string, evt: unknown) => { for (const cb of listeners[type] ?? []) cb(evt); },
@@ -35,7 +46,7 @@ function makeRenderer(device?: ReturnType<typeof makeGpuDevice>, domElement?: un
 }
 
 /** A `domElement` fake that actually tracks + removes listeners (unlike the bare `vi.fn()` stub
- *  above), so `#720`'s disposer tests can prove `removeEventListener` was really called and that
+ *  above), so the disposer tests can prove `removeEventListener` was really called and that
  *  a subsequent dispatch no longer reaches the handler. */
 function makeDomElement() {
   const listeners: Record<string, Array<(e: unknown) => void>> = {};
@@ -44,8 +55,40 @@ function makeDomElement() {
     removeEventListener: vi.fn((type: string, cb: (e: unknown) => void) => {
       listeners[type] = (listeners[type] ?? []).filter((fn) => fn !== cb);
     }),
-    emit: (type: string, evt: unknown = {}) => { for (const cb of [...(listeners[type] ?? [])]) cb(evt); },
+    // `attachContextLossListeners` (`rendererLossHandling.ts`) unconditionally calls
+    // `e.preventDefault()` on the WebGL path (finding (c) of #802's design) — a bare `{}` event
+    // would throw there, so every emitted event carries a stub.
+    emit: (type: string, evt: Record<string, unknown> = {}) => {
+      for (const cb of [...(listeners[type] ?? [])]) cb({ preventDefault: () => {}, ...evt });
+    },
   };
+}
+
+/** Loads a fresh `activeRenderer` + `rendererLossHandling` pair (mirrors `vi.resetModules()` +
+ *  a dynamic import, done once for both modules that now cooperate to detect a loss). */
+async function load() {
+  vi.resetModules();
+  const activeRenderer = await import('../../src/runtime/core/activeRenderer');
+  const rendererLossHandling = await import('../../src/runtime/rendering/rendererLossHandling');
+  return { activeRenderer, rendererLossHandling };
+}
+
+/** Simulates what a viewport (`SceneView.tsx`/`scene3DSync.ts`'s `createRenderer`/`Scene3D.tsx`
+ *  via that) now wires per-renderer: context-loss detection (`attachRendererLossHandling` +
+ *  `makeViewportLossPolicy`) AND the independent `uncapturederror` counter. Returns one composed
+ *  detach, matching the shape every real call site uses. */
+function attachViewport(
+  mod: Awaited<ReturnType<typeof load>>,
+  renderer: ReturnType<typeof makeRenderer>,
+  isStale: () => boolean = () => false,
+  label = 'test-viewport',
+): () => void {
+  const detachLoss = mod.rendererLossHandling.attachRendererLossHandling(
+    { canvas: renderer.domElement as HTMLCanvasElement, device: renderer.backend?.device },
+    { label, isStale, ...mod.activeRenderer.makeViewportLossPolicy({ renderer: renderer as never, isStale }) },
+  );
+  const detachUncaptured = mod.activeRenderer.attachUncapturedErrorListener(renderer as never);
+  return () => { detachLoss(); detachUncaptured(); };
 }
 
 let errSpy: ReturnType<typeof vi.spyOn>;
@@ -65,93 +108,101 @@ afterEach(() => {
 
 describe('activeRenderer GPU fault channel', () => {
   it('starts healthy: getGpuFaultState() is null before any renderer registers', async () => {
-    vi.resetModules();
-    const { getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    expect(getGpuFaultState()).toBeNull();
+    const { activeRenderer } = await load();
+    expect(activeRenderer.getGpuFaultState()).toBeNull();
+  });
+
+  it('a WEBGL viewport attach takes a clean slate, so a rebuild does not inherit the dead renderer\'s loss (#802)', async () => {
+    // Regression guard for the #802 refactor, NOT a new capability. The clean-slate reset used to
+    // live in `attachGpuFaultListeners`, which ran for every renderer; it now lives in
+    // `attachUncapturedErrorListener`, whose body bails early when there is no WebGPU device. If
+    // that reset sits BELOW the bail-out, the WebGL path never resets — and three's WebGL2 fallback
+    // is the path every low-end device we ship to actually takes. A stale `deviceLost: true`
+    // OUTRANKS every other explanation in `explainCaptureFailure`, so a recovered editor would go
+    // on reporting itself dead forever.
+    const mod = await load();
+    const dead = makeDomElement();
+    const detach = attachViewport(mod, makeRenderer(undefined, dead) as never);
+    dead.emit('webglcontextlost');
+    expect(mod.activeRenderer.getGpuFaultState()?.deviceLost).toBe(true);
+    detach();
+
+    // The rebuild: a fresh WebGL renderer, no WebGPU device anywhere in sight.
+    attachViewport(mod, makeRenderer(undefined, makeDomElement()) as never);
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
   });
 
   it('records a lost device with its reason + message', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+    const mod = await load();
     const device = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(device) as never);
+    attachViewport(mod, makeRenderer(device));
 
     device.resolveLost({ reason: 'unknown', message: 'driver reset' });
     await flush();
 
-    expect(getGpuFaultState()).toEqual({
+    expect(mod.activeRenderer.getGpuFaultState()).toEqual({
       deviceLost: true, reason: 'unknown', message: 'driver reset', uncapturedErrors: 0,
       losses: 1, unrecoverable: false,
     });
   });
 
   it('caps LOGGING of uncaptured errors at MAX_REPORTED_GPU_ERRORS but keeps counting past it', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState, MAX_REPORTED_GPU_ERRORS } =
-      await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const device = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(device) as never);
+    activeRenderer.attachUncapturedErrorListener(makeRenderer(device) as never);
 
-    const total = MAX_REPORTED_GPU_ERRORS + 3;
+    const total = activeRenderer.MAX_REPORTED_GPU_ERRORS + 3;
     for (let i = 0; i < total; i++) device.emit('uncapturederror', { error: { message: `err${i}` } });
 
     // The COUNT is never suppressed — only the console.error call is.
-    expect(getGpuFaultState()?.uncapturedErrors).toBe(total);
-    expect(errSpy).toHaveBeenCalledTimes(MAX_REPORTED_GPU_ERRORS);
+    expect(activeRenderer.getGpuFaultState()?.uncapturedErrors).toBe(total);
+    expect(errSpy).toHaveBeenCalledTimes(activeRenderer.MAX_REPORTED_GPU_ERRORS);
   });
 
-  it('resets fault state when a NEW renderer handle replaces the old one', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+  it('resets fault state when a NEW renderer\'s uncaptured-error listener attaches', async () => {
+    const mod = await load();
     const deviceA = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(deviceA) as never);
+    attachViewport(mod, makeRenderer(deviceA));
     deviceA.resolveLost({ reason: 'unknown' });
     await flush();
-    expect(getGpuFaultState()?.deviceLost).toBe(true);
+    expect(mod.activeRenderer.getGpuFaultState()?.deviceLost).toBe(true);
 
     const deviceB = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(deviceB) as never); // a fresh renderer handle — clean slate
-    expect(getGpuFaultState()).toBeNull();
-  });
-
-  it('is idempotent: attaching the SAME renderer handle twice does not double-attach listeners', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle } = await import('../../src/runtime/core/activeRenderer');
-    const device = makeGpuDevice();
-    const renderer = makeRenderer(device);
-    setActiveRendererHandle(renderer as never);
-    setActiveRendererHandle(renderer as never); // same object reference — must be a no-op re-attach
-    expect(device.addEventListener).toHaveBeenCalledTimes(1); // only the 'uncapturederror' listener
+    attachViewport(mod, makeRenderer(deviceB)); // a fresh renderer attaches — clean slate
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
   });
 
   it('records a WebGL context loss (the non-WebGPU fallback)', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    let handler: (() => void) | undefined;
-    const domElement = { addEventListener: vi.fn((type: string, cb: () => void) => { if (type === 'webglcontextlost') handler = cb; }) };
-    setActiveRendererHandle(makeRenderer(undefined, domElement) as never);
+    const mod = await load();
+    const domElement = makeDomElement();
+    attachViewport(mod, makeRenderer(undefined, domElement));
 
-    handler?.();
+    domElement.emit('webglcontextlost');
 
-    expect(getGpuFaultState()).toEqual({
-      deviceLost: true, reason: 'webglcontextlost', uncapturedErrors: 0,
+    // `reason` stays the literal `'webglcontextlost'` across the #802 migration. An earlier cut of
+    // this test pinned `undefined` and argued nothing reads the literal — true of the literal,
+    // false of the FIELD: `frameDriver` renders `GPU fault: ${reason ?? 'unknown reason'}` in its
+    // stall escalation, so dropping it degraded the diagnostic on exactly the WebGL devices this
+    // channel exists for. `attachContextLossListeners` carries it, and `statusMessage`, through.
+    expect(mod.activeRenderer.getGpuFaultState()).toEqual({
+      deviceLost: true, reason: 'webglcontextlost', message: undefined, uncapturedErrors: 0,
       losses: 1, unrecoverable: false,
     });
   });
 
   it('NEVER throws for a bare {} renderer (no backend, no device, no domElement)', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    expect(() => setActiveRendererHandle({} as never)).not.toThrow();
-    expect(getGpuFaultState()).toBeNull();
+    const { activeRenderer } = await load();
+    expect(() => activeRenderer.setActiveRendererHandle({} as never)).not.toThrow();
+    expect(() => activeRenderer.attachUncapturedErrorListener({} as never)).not.toThrow();
+    expect(activeRenderer.getGpuFaultState()).toBeNull();
   });
 
   it('NEVER throws for a WebGL-ish stub (domElement present, backend/device absent)', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+    const mod = await load();
     const domElement = { addEventListener: vi.fn() };
-    expect(() => setActiveRendererHandle({ domElement } as never)).not.toThrow();
-    expect(getGpuFaultState()).toBeNull();
+    const renderer = makeRenderer(undefined, domElement);
+    expect(() => attachViewport(mod, renderer)).not.toThrow();
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
     expect(domElement.addEventListener).toHaveBeenCalledWith('webglcontextlost', expect.any(Function));
   });
 });
@@ -162,52 +213,60 @@ describe('activeRenderer GPU fault channel', () => {
  * rendered at 61 FPS, telling the owner to relaunch something that was fine. Both causes are
  * pinned here because this state OUTRANKS the frame-loop stall in `explainCaptureFailure`: a
  * false loss does not merely add noise, it MASKS every other explanation of a capture failure.
+ *
+ * #802 moved these filters from the old single-slot `attachedRenderer` identity guard onto
+ * `makeViewportLossPolicy`'s `describe`/`onLost` (filter 2, reason==='destroyed') and each
+ * viewport's own `isStale` closure (filter 1, superseded renderer) — pinned here against the
+ * SAME shape of regression: a refactor of the detection path silently dropping a filter.
  */
 describe('activeRenderer GPU fault channel — false-positive filters', () => {
-  it('a deliberate device.destroy() (reason=destroyed) is NOT a fault', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+  it('a deliberate device.destroy() (reason=destroyed) is NOT a fault — reports AND logs nothing', async () => {
+    const mod = await load();
     const device = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(device) as never);
+    attachViewport(mod, makeRenderer(device));
 
     // What three does when a renderer is disposed — i.e. every HMR reload / viewport remount.
     device.resolveLost({ reason: 'destroyed', message: 'Device was destroyed.' });
     await flush();
 
-    expect(getGpuFaultState()).toBeNull();
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
+    // `attachDeviceLostListener` logs BEFORE calling `onLost` — a naive migration would print a
+    // false alarm here even with an early return in `onLost` alone. `describe` returning `null`
+    // for this reason is what suppresses the log itself.
     expect(errSpy).not.toHaveBeenCalled();
   });
 
-  it('a SUPERSEDED renderer\'s late device.lost cannot overwrite the live renderer\'s state', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+  it('a SUPERSEDED renderer\'s late device.lost cannot report once its viewport is stale', async () => {
+    const mod = await load();
     const oldDevice = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(oldDevice) as never);
+    let oldStale = false;
+    attachViewport(mod, makeRenderer(oldDevice), () => oldStale);
 
-    // A new renderer takes over (reload / remount) BEFORE the old device's promise resolves.
+    // A new renderer/viewport takes over (reload / remount) BEFORE the old device's promise
+    // resolves — the old viewport's `isStale` flips, exactly as its own teardown would set it.
+    oldStale = true;
     const newDevice = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(newDevice) as never);
+    attachViewport(mod, makeRenderer(newDevice));
 
     // The corpse of the old renderer speaks — with a REAL loss reason, so only the
-    // superseded-renderer check can suppress it.
+    // superseded-renderer (`isStale`) check can suppress it.
     oldDevice.resolveLost({ reason: 'unknown', message: 'stale' });
     await flush();
 
-    expect(getGpuFaultState()).toBeNull();
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
     expect(errSpy).not.toHaveBeenCalled();
   });
 
   it('the LIVE renderer losing its device is still reported (the filters are not a mute button)', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    setActiveRendererHandle(makeRenderer(makeGpuDevice()) as never);
+    const mod = await load();
+    attachViewport(mod, makeRenderer(makeGpuDevice()));
     const live = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(live) as never);
+    attachViewport(mod, makeRenderer(live));
 
     live.resolveLost({ reason: 'unknown', message: 'driver reset' });
     await flush();
 
-    expect(getGpuFaultState()).toMatchObject({ deviceLost: true, reason: 'unknown' });
+    expect(mod.activeRenderer.getGpuFaultState()).toMatchObject({ deviceLost: true, reason: 'unknown' });
     // A first loss is RECOVERABLE, so it warns rather than errors. The filters are still not a
     // mute button — the point of this test — but the severity moved with the behaviour.
     expect(warnSpy).toHaveBeenCalled();
@@ -224,104 +283,98 @@ describe('activeRenderer GPU fault channel — false-positive filters', () => {
  * itself belongs to the viewport that owns the renderer.
  */
 describe('activeRenderer recovery policy', () => {
-  const load = async () => {
-    vi.resetModules();
-    return await import('../../src/runtime/core/activeRenderer');
-  };
-
-  it('asks a subscriber to rebuild on the first loss, with the backend that died', async () => {
-    const { setActiveRendererHandle, onRendererLost } = await load();
+  it('asks a subscriber to rebuild on the first loss, with the backend AND renderer that died', async () => {
+    const mod = await load();
     const seen: Array<Record<string, unknown>> = [];
-    onRendererLost((info) => seen.push(info as unknown as Record<string, unknown>));
+    mod.activeRenderer.onRendererLost((info) => seen.push(info as unknown as Record<string, unknown>));
 
     const device = makeGpuDevice();
     const renderer = makeRenderer(device);
-    setActiveRendererHandle(renderer as never);
+    attachViewport(mod, renderer);
     device.resolveLost({ reason: 'unknown', message: 'driver reset' });
     await flush();
 
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatchObject({ api: 'WebGPU', reason: 'unknown', message: 'driver reset', attempt: 1 });
-    // WHICH renderer died, by identity. The editor mounts two viewports and this notification is
-    // a broadcast, so without this a healthy viewport cannot tell that the loss wasn't its own —
-    // and would tear its own working renderer down in sympathy.
+    // WHICH renderer died, by identity. The editor mounts multiple viewports and this notification
+    // is a BROADCAST, so without this a healthy viewport cannot tell that the loss wasn't its own
+    // — and would tear its own working renderer down in sympathy.
     expect(seen[0].renderer).toBe(renderer);
   });
 
   it('reports a WebGL context loss as api:WebGL — the path a low-end phone actually takes', async () => {
-    const { setActiveRendererHandle, onRendererLost } = await load();
+    const mod = await load();
     const seen: Array<{ api: string }> = [];
-    onRendererLost((info) => seen.push(info));
+    mod.activeRenderer.onRendererLost((info) => seen.push(info));
 
-    let handler: (() => void) | undefined;
-    const domElement = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') handler = cb; }) };
-    setActiveRendererHandle(makeRenderer(undefined, domElement) as never);
-    handler?.();
+    const domElement = makeDomElement();
+    attachViewport(mod, makeRenderer(undefined, domElement));
+    domElement.emit('webglcontextlost');
 
     expect(seen).toHaveLength(1);
     expect(seen[0].api).toBe('WebGL');
   });
 
   it('COUNTS LOSSES ACROSS RENDERER REPLACEMENTS — the whole basis of loop detection', async () => {
-    // The subtle one. Every recovery installs a NEW renderer, and `attachGpuFaultListeners`
+    // The subtle one. Every recovery installs a NEW renderer, and `attachUncapturedErrorListener`
     // deliberately clears `gpuFaultState` so the new renderer reports cleanly. If the loss
     // HISTORY were cleared on the same path, a hard rebuild loop would present as an endless
     // series of "first" losses and the budget would never trip. The history must outlive the
     // renderer; the reported state must not.
-    const { setActiveRendererHandle, onRendererLost, getGpuFaultState } = await load();
+    const mod = await load();
     const attempts: number[] = [];
-    onRendererLost((info) => attempts.push(info.attempt));
+    mod.activeRenderer.onRendererLost((info) => attempts.push(info.attempt));
 
     const a = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(a) as never);
+    attachViewport(mod, makeRenderer(a));
     a.resolveLost({ reason: 'unknown' });
     await flush();
 
     // The rebuild the listener would have performed: a fresh renderer registers.
     const b = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(b) as never);
-    expect(getGpuFaultState()).toBeNull();      // reporting state IS reset for the new renderer
+    attachViewport(mod, makeRenderer(b));
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull(); // reporting state IS reset for the new renderer
     b.resolveLost({ reason: 'unknown' });
     await flush();
 
-    expect(attempts).toEqual([1, 2]);            // ...but the loss history is NOT
+    expect(attempts).toEqual([1, 2]); // ...but the loss history is NOT
   });
 
   it('abandons recovery past MAX_RECOVERY_ATTEMPTS and stops asking', async () => {
-    const { setActiveRendererHandle, onRendererLost, isRecoveryAbandoned, getGpuFaultState, MAX_RECOVERY_ATTEMPTS } = await load();
+    const mod = await load();
     const attempts: number[] = [];
-    onRendererLost((info) => attempts.push(info.attempt));
+    mod.activeRenderer.onRendererLost((info) => attempts.push(info.attempt));
 
-    for (let i = 0; i < MAX_RECOVERY_ATTEMPTS + 2; i++) {
+    for (let i = 0; i < mod.activeRenderer.MAX_RECOVERY_ATTEMPTS + 2; i++) {
       const d = makeGpuDevice();
-      setActiveRendererHandle(makeRenderer(d) as never);
+      attachViewport(mod, makeRenderer(d));
       d.resolveLost({ reason: 'unknown' });
       await flush();
     }
 
     // Asked exactly up to the budget, then went quiet — no rebuild request on the 4th or 5th.
     expect(attempts).toEqual([1, 2, 3]);
-    expect(isRecoveryAbandoned()).toBe(true);
-    expect(getGpuFaultState()).toMatchObject({ unrecoverable: true, deviceLost: true });
+    expect(mod.activeRenderer.isRecoveryAbandoned()).toBe(true);
+    expect(mod.activeRenderer.getGpuFaultState()).toMatchObject({ unrecoverable: true, deviceLost: true });
     expect(errSpy).toHaveBeenCalled(); // giving up is an ERROR, unlike a recoverable loss
   });
 
   it('a loss OUTSIDE the window does not count toward the budget', async () => {
-    const { setActiveRendererHandle, onRendererLost, RECOVERY_WINDOW_MS } = await load();
+    const mod = await load();
     const { setManualNow, advanceManual } = await import('../../src/runtime/core/clock');
     setManualNow(0);
     const attempts: number[] = [];
-    onRendererLost((info) => attempts.push(info.attempt));
+    mod.activeRenderer.onRendererLost((info) => attempts.push(info.attempt));
 
     const a = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(a) as never);
+    attachViewport(mod, makeRenderer(a));
     a.resolveLost({ reason: 'unknown' });
     await flush();
 
     // Two unrelated transient faults an hour apart are not a loop; the window must forget.
-    advanceManual(RECOVERY_WINDOW_MS + 1);
+    advanceManual(mod.activeRenderer.RECOVERY_WINDOW_MS + 1);
     const b = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(b) as never);
+    attachViewport(mod, makeRenderer(b));
     b.resolveLost({ reason: 'unknown' });
     await flush();
 
@@ -329,13 +382,13 @@ describe('activeRenderer recovery policy', () => {
   });
 
   it('a listener that THROWS cannot stop the other subscribers from rebuilding', async () => {
-    const { setActiveRendererHandle, onRendererLost } = await load();
+    const mod = await load();
     const survived: number[] = [];
-    onRendererLost(() => { throw new Error('bad subscriber'); });
-    onRendererLost((info) => survived.push(info.attempt));
+    mod.activeRenderer.onRendererLost(() => { throw new Error('bad subscriber'); });
+    mod.activeRenderer.onRendererLost((info) => survived.push(info.attempt));
 
     const d = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(d) as never);
+    attachViewport(mod, makeRenderer(d));
     d.resolveLost({ reason: 'unknown' });
     await flush();
 
@@ -343,13 +396,13 @@ describe('activeRenderer recovery policy', () => {
   });
 
   it('unsubscribing stops delivery (a remounted viewport must not be asked twice)', async () => {
-    const { setActiveRendererHandle, onRendererLost } = await load();
+    const mod = await load();
     const seen: number[] = [];
-    const off = onRendererLost((info) => seen.push(info.attempt));
+    const off = mod.activeRenderer.onRendererLost((info) => seen.push(info.attempt));
     off();
 
     const d = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(d) as never);
+    attachViewport(mod, makeRenderer(d));
     d.resolveLost({ reason: 'unknown' });
     await flush();
 
@@ -360,93 +413,161 @@ describe('activeRenderer recovery policy', () => {
     // The WebGL twin of the existing device.lost false-positive filter. A replaced renderer's
     // canvas is torn down as a matter of course, and that must not read as a live fault — this
     // module's whole credibility problem was crying wolf on orderly teardown.
-    const { setActiveRendererHandle, onRendererLost, getGpuFaultState } = await load();
+    const mod = await load();
     const seen: unknown[] = [];
-    onRendererLost((info) => seen.push(info));
+    mod.activeRenderer.onRendererLost((info) => seen.push(info));
 
-    let oldHandler: (() => void) | undefined;
-    const oldEl = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') oldHandler = cb; }) };
-    setActiveRendererHandle(makeRenderer(undefined, oldEl) as never);
-    setActiveRendererHandle(makeRenderer(undefined, { addEventListener: vi.fn() }) as never);
+    const oldEl = makeDomElement();
+    let oldStale = false;
+    attachViewport(mod, makeRenderer(undefined, oldEl), () => oldStale);
+    oldStale = true;
+    attachViewport(mod, makeRenderer(undefined, { addEventListener: vi.fn() }));
 
-    oldHandler?.(); // the corpse's canvas fires
+    oldEl.emit('webglcontextlost'); // the corpse's canvas fires
 
     expect(seen).toEqual([]);
-    expect(getGpuFaultState()).toBeNull();
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull();
   });
 
   it('resetRecoveryState() clears the history and re-enables recovery', async () => {
-    const { setActiveRendererHandle, onRendererLost, resetRecoveryState, isRecoveryAbandoned, MAX_RECOVERY_ATTEMPTS } = await load();
+    const mod = await load();
     const attempts: number[] = [];
-    onRendererLost((info) => attempts.push(info.attempt));
+    mod.activeRenderer.onRendererLost((info) => attempts.push(info.attempt));
 
-    for (let i = 0; i < MAX_RECOVERY_ATTEMPTS + 1; i++) {
+    for (let i = 0; i < mod.activeRenderer.MAX_RECOVERY_ATTEMPTS + 1; i++) {
       const d = makeGpuDevice();
-      setActiveRendererHandle(makeRenderer(d) as never);
+      attachViewport(mod, makeRenderer(d));
       d.resolveLost({ reason: 'unknown' });
       await flush();
     }
-    expect(isRecoveryAbandoned()).toBe(true);
+    expect(mod.activeRenderer.isRecoveryAbandoned()).toBe(true);
 
-    resetRecoveryState();
-    expect(isRecoveryAbandoned()).toBe(false);
+    mod.activeRenderer.resetRecoveryState();
+    expect(mod.activeRenderer.isRecoveryAbandoned()).toBe(false);
 
     const d = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(d) as never);
+    attachViewport(mod, makeRenderer(d));
     d.resolveLost({ reason: 'unknown' });
     await flush();
 
     expect(attempts.at(-1)).toBe(1); // counting starts over
   });
+
+  /** #802's whole point: TWO viewports attached at once, neither disarming the other. Red before
+   *  the fix — the old single-slot `attachedRenderer` meant B's attach silently stole detection
+   *  away from A, so a loss on A's canvas reported nothing. */
+  it('#802: renderer A stays watched after renderer B attaches — A\'s loss IS reported, with A named', async () => {
+    const mod = await load();
+    const seen: Array<{ renderer: unknown }> = [];
+    mod.activeRenderer.onRendererLost((info) => seen.push(info));
+
+    const elA = makeDomElement();
+    const rendererA = makeRenderer(undefined, elA);
+    attachViewport(mod, rendererA, () => false, 'A');
+
+    const elB = makeDomElement();
+    const rendererB = makeRenderer(undefined, elB);
+    attachViewport(mod, rendererB, () => false, 'B');
+
+    elA.emit('webglcontextlost');
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].renderer).toBe(rendererA);
+  });
+
+  /** #802, continued: B tearing down must not disarm A either — the permanent half of the old
+   *  bug (closing the Particle Editor deafened SceneView for the rest of the session). */
+  it('#802: A is still watched after B is DISPOSED, not just after B attaches', async () => {
+    const mod = await load();
+    const seen: Array<{ renderer: unknown }> = [];
+    mod.activeRenderer.onRendererLost((info) => seen.push(info));
+
+    const elA = makeDomElement();
+    const rendererA = makeRenderer(undefined, elA);
+    attachViewport(mod, rendererA, () => false, 'A');
+
+    const elB = makeDomElement();
+    const rendererB = makeRenderer(undefined, elB);
+    let bStale = false;
+    const detachB = attachViewport(mod, rendererB, () => bStale, 'B');
+    bStale = true;
+    detachB();
+
+    elA.emit('webglcontextlost');
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].renderer).toBe(rendererA);
+  });
+
+  /** A preview panel (`makePreviewLossPolicy`, #795) tears itself down instead of calling
+   *  `reportRendererLoss` — so its losses must never touch the global recovery budget.
+   *  `rendererLossHandling.ts`'s own header names this hazard: feeding editor preview panels
+   *  into the shared 3-losses-per-60s budget would let a flapping preview permanently disarm
+   *  real gameplay recovery. */
+  it('losses from a makePreviewLossPolicy-attached renderer do not count against the global budget', async () => {
+    const mod = await load();
+    const { makePreviewLossPolicy } = await import('../../src/editor/panels/previewLossPolicy');
+
+    for (let i = 0; i < 3; i++) {
+      const device = makeGpuDevice();
+      const renderer = makeRenderer(device);
+      mod.rendererLossHandling.attachRendererLossHandling(
+        { canvas: renderer.domElement as HTMLCanvasElement, device: renderer.backend?.device },
+        { label: 'PreviewPanel', isStale: () => false, ...makePreviewLossPolicy({ label: 'PreviewPanel', teardown: () => {} }) },
+      );
+      device.resolveLost({ reason: 'unknown' });
+      await flush();
+    }
+
+    expect(mod.activeRenderer.isRecoveryAbandoned()).toBe(false);
+    expect(mod.activeRenderer.getGpuFaultState()).toBeNull(); // never reached reportRendererLoss at all
+  });
 });
 
 /**
- * DISPOSER (#720). Before this, `activeRenderer`/`attachedRenderer` were assigned and never
- * cleared — a teardown left `getActiveRenderer()` handing consumers (the GPU particle backend,
- * tier calibration, the memory report, the draw-call probe) a DISPOSED renderer, and the
- * `webglcontextlost` listener from `attachWebGlContextLostListener` had no removal path at all.
- * `setActiveRendererHandle` now returns a disposer pairing every register with an unregister,
- * matching the convention `onRendererLost` already uses.
+ * REGISTRANTS + KTX2-caps role (#720, #802). `setActiveRendererHandle` keeps ONLY this role after
+ * #802 — the GPU-fault channel above no longer runs through it at all. Before #720,
+ * `activeRenderer`/`attachedRenderer` were assigned and never cleared — a teardown left
+ * `getActiveRenderer()` handing consumers (the GPU particle backend, tier calibration, the memory
+ * report, the draw-call probe) a DISPOSED renderer. `setActiveRendererHandle` returns a disposer
+ * pairing every register with an unregister, matching the convention `onRendererLost` already uses.
  */
 describe('activeRenderer disposer (#720)', () => {
   it('clears getActiveRenderer() to null after the disposer runs', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const renderer = makeRenderer();
-    const dispose = setActiveRendererHandle(renderer as never);
+    const dispose = activeRenderer.setActiveRendererHandle(renderer as never);
 
-    expect(getActiveRenderer()).toBe(renderer);
+    expect(activeRenderer.getActiveRenderer()).toBe(renderer);
     dispose();
-    expect(getActiveRenderer()).toBeNull();
+    expect(activeRenderer.getActiveRenderer()).toBeNull();
   });
 
   it('identity guard: an OLD renderer\'s disposer must not clear a NEWER renderer\'s handle', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const r1 = makeRenderer();
     const r2 = makeRenderer();
-    const disposeR1 = setActiveRendererHandle(r1 as never);
-    setActiveRendererHandle(r2 as never);
+    const disposeR1 = activeRenderer.setActiveRendererHandle(r1 as never);
+    activeRenderer.setActiveRendererHandle(r2 as never);
 
     disposeR1(); // a late disposer from the SUPERSEDED renderer
 
-    expect(getActiveRenderer()).toBe(r2);
+    expect(activeRenderer.getActiveRenderer()).toBe(r2);
   });
 
   it('is idempotent: calling a disposer twice does not throw and does not clear a newer renderer', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const r1 = makeRenderer();
-    const disposeR1 = setActiveRendererHandle(r1 as never);
+    const disposeR1 = activeRenderer.setActiveRendererHandle(r1 as never);
     disposeR1();
-    expect(getActiveRenderer()).toBeNull();
+    expect(activeRenderer.getActiveRenderer()).toBeNull();
 
     // A newer renderer takes over after the first disposed cleanly.
     const r2 = makeRenderer();
-    setActiveRendererHandle(r2 as never);
+    activeRenderer.setActiveRendererHandle(r2 as never);
 
     expect(() => disposeR1()).not.toThrow();
-    expect(getActiveRenderer()).toBe(r2); // the second (stale) call must not clear r2
+    expect(activeRenderer.getActiveRenderer()).toBe(r2); // the second (stale) call must not clear r2
   });
 
   /** ⚠️ THE SEAM THE DISPOSER ACTUALLY LIVES ON, and the regression it nearly shipped.
@@ -463,50 +584,47 @@ describe('activeRenderer disposer (#720)', () => {
    *  The handle must fall back to the most recent SURVIVOR, reaching null only when the last
    *  registrant goes. */
   it('hands the handle to the surviving registrant when a LATER one tears down (3 live surfaces)', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const sceneView = makeRenderer();
     const gameView = makeRenderer();
     const particleEditor = makeRenderer();
 
-    setActiveRendererHandle(sceneView as never);
-    setActiveRendererHandle(gameView as never);
-    const closePanel = setActiveRendererHandle(particleEditor as never);
+    activeRenderer.setActiveRendererHandle(sceneView as never);
+    activeRenderer.setActiveRendererHandle(gameView as never);
+    const closePanel = activeRenderer.setActiveRendererHandle(particleEditor as never);
 
     closePanel(); // the Particle Editor panel closes; the other two are still drawing
 
-    expect(getActiveRenderer()).toBe(gameView);
-    expect(getActiveRenderer()).not.toBeNull();
+    expect(activeRenderer.getActiveRenderer()).toBe(gameView);
+    expect(activeRenderer.getActiveRenderer()).not.toBeNull();
   });
 
   it('only reaches null once the LAST registrant is gone', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const a = makeRenderer();
     const b = makeRenderer();
-    const disposeA = setActiveRendererHandle(a as never);
-    const disposeB = setActiveRendererHandle(b as never);
+    const disposeA = activeRenderer.setActiveRendererHandle(a as never);
+    const disposeB = activeRenderer.setActiveRendererHandle(b as never);
 
     disposeB();
-    expect(getActiveRenderer()).toBe(a);
+    expect(activeRenderer.getActiveRenderer()).toBe(a);
     disposeA();
-    expect(getActiveRenderer()).toBeNull();
+    expect(activeRenderer.getActiveRenderer()).toBeNull();
   });
 
   /** A repeat registration of the SAME renderer must leave ONE entry — two would mean its disposer
    *  removes only one and the corpse stays reachable through the survivor fallback. */
   it('re-seats rather than duplicating when the same renderer registers twice', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const older = makeRenderer();
     const repeat = makeRenderer();
-    setActiveRendererHandle(older as never);
-    setActiveRendererHandle(repeat as never);
-    const disposeRepeat = setActiveRendererHandle(repeat as never); // registered TWICE
+    activeRenderer.setActiveRendererHandle(older as never);
+    activeRenderer.setActiveRendererHandle(repeat as never);
+    const disposeRepeat = activeRenderer.setActiveRendererHandle(repeat as never); // registered TWICE
 
     disposeRepeat();
 
-    expect(getActiveRenderer()).toBe(older); // not `repeat` again from a duplicate entry
+    expect(activeRenderer.getActiveRenderer()).toBe(older); // not `repeat` again from a duplicate entry
   });
 
   /** Pins the `disposed` latch specifically. Review found the old idempotence test passed with the
@@ -515,30 +633,28 @@ describe('activeRenderer disposer (#720)', () => {
    *  AGAIN. Without the latch, the stale first disposer removes the live re-registration and the
    *  handle falls back past a renderer that is still drawing. */
   it('a stale disposer cannot unregister its renderer\'s LATER re-registration', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, getActiveRenderer } = await import('../../src/runtime/core/activeRenderer');
+    const { activeRenderer } = await load();
     const r = makeRenderer();
-    const staleDispose = setActiveRendererHandle(r as never);
+    const staleDispose = activeRenderer.setActiveRendererHandle(r as never);
     staleDispose();
-    expect(getActiveRenderer()).toBeNull();
+    expect(activeRenderer.getActiveRenderer()).toBeNull();
 
     // The SAME renderer comes back (a viewport remount reusing the renderer lease).
-    setActiveRendererHandle(r as never);
-    expect(getActiveRenderer()).toBe(r);
+    activeRenderer.setActiveRendererHandle(r as never);
+    expect(activeRenderer.getActiveRenderer()).toBe(r);
 
     staleDispose(); // the first disposer fires late — it must be inert now
 
-    expect(getActiveRenderer()).toBe(r);
+    expect(activeRenderer.getActiveRenderer()).toBe(r);
   });
 
-  it('removes the webglcontextlost listener — a dispatch after dispose() reports nothing', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle } = await import('../../src/runtime/core/activeRenderer');
+  it('removes the webglcontextlost listener — a dispatch after the viewport detaches reports nothing', async () => {
+    const mod = await load();
     const domElement = makeDomElement();
     const renderer = makeRenderer(undefined, domElement);
-    const dispose = setActiveRendererHandle(renderer as never);
+    const detach = attachViewport(mod, renderer);
 
-    dispose();
+    detach();
     domElement.emit('webglcontextlost');
 
     // A live listener would call reportRendererLoss(), which warns. No warn ⇒ nothing fired.
@@ -546,27 +662,26 @@ describe('activeRenderer disposer (#720)', () => {
     expect(domElement.removeEventListener).toHaveBeenCalledWith('webglcontextlost', expect.any(Function));
   });
 
-  it('does NOT reset lossTimes on dispose — loss count keeps counting across the teardown', async () => {
-    vi.resetModules();
-    const { setActiveRendererHandle, onRendererLost } = await import('../../src/runtime/core/activeRenderer');
+  it('does NOT reset lossTimes on a viewport detach — loss count keeps counting across the teardown', async () => {
+    const mod = await load();
     const attempts: number[] = [];
-    onRendererLost((info) => attempts.push(info.attempt));
+    mod.activeRenderer.onRendererLost((info) => attempts.push(info.attempt));
 
     const a = makeGpuDevice();
     const rendererA = makeRenderer(a);
-    const disposeA = setActiveRendererHandle(rendererA as never);
+    const detachA = attachViewport(mod, rendererA);
     a.resolveLost({ reason: 'unknown' });
     await flush();
     expect(attempts).toEqual([1]);
 
-    disposeA(); // teardown of the viewport that owned the now-dead renderer
+    detachA(); // teardown of the viewport that owned the now-dead renderer
 
     const b = makeGpuDevice();
-    setActiveRendererHandle(makeRenderer(b) as never); // the recovery rebuild
+    attachViewport(mod, makeRenderer(b)); // the recovery rebuild
     b.resolveLost({ reason: 'unknown' });
     await flush();
 
-    // If the disposer had reset lossTimes, this would read back as attempt 1 again.
+    // If the detach had reset lossTimes, this would read back as attempt 1 again.
     expect(attempts).toEqual([1, 2]);
   });
 });

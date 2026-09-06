@@ -62,7 +62,11 @@ describe('attachContextLossListeners', () => {
     const onLost = vi.fn();
     attachContextLossListeners(canvas, { label: 'MyLabel', onLost });
     fireLost(canvas);
-    expect(onLost).toHaveBeenCalledWith({ api: 'WebGL' });
+    // `reason` is the fixed WebGL marker and `message` the event's `statusMessage` (absent on a
+    // bare synthetic event). Both are carried through because `frameDriver` renders
+    // `GPU fault: ${reason ?? 'unknown reason'}` — dropping them degraded that line on the
+    // WebGL devices the fault channel exists for.
+    expect(onLost).toHaveBeenCalledWith({ api: 'WebGL', reason: 'webglcontextlost', message: undefined });
     expect(err).toHaveBeenCalled();
     expect(String(err.mock.calls[0][0])).toMatch(/MyLabel/);
   });
@@ -160,7 +164,11 @@ describe('attachRendererLossHandling', () => {
       { label: 't', onLost },
     );
     fireLost(canvas);
-    expect(onLost).toHaveBeenCalledWith({ api: 'WebGL' });
+    // `reason` is the fixed WebGL marker and `message` the event's `statusMessage` (absent on a
+    // bare synthetic event). Both are carried through because `frameDriver` renders
+    // `GPU fault: ${reason ?? 'unknown reason'}` — dropping them degraded that line on the
+    // WebGL devices the fault channel exists for.
+    expect(onLost).toHaveBeenCalledWith({ api: 'WebGL', reason: 'webglcontextlost', message: undefined });
     onLost.mockClear();
     detach();
     expect(() => detach()).not.toThrow();

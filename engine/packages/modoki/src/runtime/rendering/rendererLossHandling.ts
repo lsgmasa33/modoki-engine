@@ -23,10 +23,14 @@
 
 export interface RendererLossEvent {
   api: 'WebGL' | 'WebGPU';
-  /** WebGPU only — `GPUDeviceLostInfo.reason` (e.g. `'destroyed'` for a deliberate teardown, or
-   *  `'unknown'` for a real loss). Absent for WebGL, which carries no such distinction. */
+  /** WebGPU: `GPUDeviceLostInfo.reason` (`'destroyed'` for a deliberate teardown, `'unknown'` for a
+   *  real loss) — the `'destroyed'` value is load-bearing, it is how a caller filters an orderly
+   *  teardown out of the fault channel. WebGL carries no such distinction and always reports the
+   *  fixed marker `'webglcontextlost'`, so consumers rendering `reason` have a name for the cause
+   *  on both backends rather than "unknown reason" on the WebGL one. */
   reason?: string;
-  /** WebGPU only — `GPUDeviceLostInfo.message`. */
+  /** WebGPU: `GPUDeviceLostInfo.message`. WebGL: the event's `statusMessage`, when the browser
+   *  supplies one (often empty). */
   message?: string;
 }
 
@@ -86,8 +90,17 @@ export function attachContextLossListeners(
     // preventDefault is what makes the browser willing to restore the context at all — without
     // it, a lost WebGL context is lost forever.
     e.preventDefault();
-    logLoss(handlers, { api: 'WebGL' });
-    handlers.onLost({ api: 'WebGL' });
+    // Carry the WebGL event's own detail through. `reason` is a fixed marker rather than a WebGPU
+    // enum, and `message` is the browser's `statusMessage` (usually empty, occasionally the driver's
+    // explanation). Both matter downstream: `frameDriver`'s stall escalation renders
+    // `GPU fault: ${reason ?? 'unknown reason'}`, so dropping them degraded that line to
+    // "unknown reason" on precisely the devices this channel exists for -- three's WebGL2 fallback
+    // is what the iPhone 8 and the Y6 run -- and lost `statusMessage` from `get_editor_state`'s
+    // `gpu` payload entirely.
+    const message = (e as unknown as { statusMessage?: string })?.statusMessage || undefined;
+    const event: RendererLossEvent = { api: 'WebGL', reason: 'webglcontextlost', message };
+    logLoss(handlers, event);
+    handlers.onLost(event);
   };
   const onRestored = () => {
     if (handlers.isStale?.()) return;

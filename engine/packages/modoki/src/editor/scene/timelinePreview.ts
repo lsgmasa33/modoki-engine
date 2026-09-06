@@ -78,24 +78,50 @@ export interface PreviewSaveHandler {
   isLive?(): boolean;
 }
 
-let _saveHandler: PreviewSaveHandler | null = null;
+/** Every handler currently registered, oldest first; `_saveHandler`'s answer is always the LAST
+ *  entry — same shape as `registrants` in `runtime/core/activeRenderer.ts` (#810).
+ *
+ *  ⚠️ A single slot overwritten unconditionally is how one panel's registration silently deletes
+ *  the other's: both panels register in an effect and re-run it on unrelated deps (a world swap
+ *  re-resolves the Timeline panel's Director root, for instance), so TimelineEditor registering
+ *  after AnimationEditor used to drop the Timeline's handler with nothing telling it — and the
+ *  Animation panel's later, correctly-guarded clear then nulled the slot out from under a still-
+ *  mounted Timeline panel (bug class: #810). A disposer now removes only ITS OWN entry and hands
+ *  the slot back to the most recent survivor, reaching null only when the last registrant goes.
+ *  Membership is by identity, so a repeat registration of the same handler object re-seats rather
+ *  than duplicating. */
+const _registrants: PreviewSaveHandler[] = [];
 
-/** Register the owner panel's save hooks. */
-export function setPreviewSaveHandler(h: PreviewSaveHandler): void { _saveHandler = h; }
+/** Register the owner panel's save hooks. Re-seats rather than duplicates: a repeat registration
+ *  of the same handler object must leave ONE entry, or its clear would remove only one of them and
+ *  the stale entry would linger reachable underneath. */
+export function setPreviewSaveHandler(h: PreviewSaveHandler): void {
+  const existing = _registrants.indexOf(h);
+  if (existing >= 0) _registrants.splice(existing, 1);
+  _registrants.push(h);
+}
 
-/** Clear them — but ONLY if `mine` is still the registered handler.
+/** Clear `mine` — but ONLY by removing IT, wherever it sits in the stack, and hand the slot back to
+ *  the most recent survivor. Null only when the last registrant goes.
  *
  *  ⚠️ Unconditional clearing is how one panel deletes another's registration. Both panels register
  *  in an effect and both clean up in its teardown, and their effects re-run on unrelated deps (a
  *  world swap re-resolves the Timeline panel's Director root, for instance) — so an unguarded
  *  `setPreviewSaveHandler(null)` from the panel that does NOT own the envelope silently disables
- *  the feature for the one that does. Same lesson as `_modeOwner` in playMode.ts. */
+ *  the feature for the one that does. Same lesson as `_modeOwner` in playMode.ts. Removing `mine`
+ *  specifically (rather than only-if-current) is what makes this safe even when `mine` was already
+ *  displaced from the top of the stack by a later registration — the OLD guard's `if (_saveHandler
+ *  === mine)` would silently no-op that clear and leak `mine` in the stack forever. */
 export function clearPreviewSaveHandler(mine: PreviewSaveHandler): void {
-  if (_saveHandler === mine) _saveHandler = null;
+  const at = _registrants.indexOf(mine);
+  if (at >= 0) _registrants.splice(at, 1);
 }
 
-/** The owner panel's save hooks, or null when nothing owns an envelope. */
-export function getPreviewSaveHandler(): PreviewSaveHandler | null { return _saveHandler; }
+/** The owner panel's save hooks, or null when nothing owns an envelope — the most recently
+ *  registered survivor. */
+export function getPreviewSaveHandler(): PreviewSaveHandler | null {
+  return _registrants[_registrants.length - 1] ?? null;
+}
 
 /** The CURRENT handler for `owner`, or null if that panel no longer owns the envelope.
  *
@@ -107,7 +133,8 @@ export function getPreviewSaveHandler(): PreviewSaveHandler | null { return _sav
  *  said "Scene saved". Resuming through the CURRENT handler is also what makes the resume use the
  *  freshly-rebound root rather than the dead one. */
 export function currentPreviewSaveHandlerFor(owner: PreviewSaveHandler['owner']): PreviewSaveHandler | null {
-  return _saveHandler?.owner === owner ? _saveHandler : null;
+  const current = getPreviewSaveHandler();
+  return current?.owner === owner ? current : null;
 }
 
 /** Which handler a finished save cycle should RESUME through — or null when it must not resume.

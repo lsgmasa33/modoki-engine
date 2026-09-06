@@ -81,10 +81,15 @@ export function isRendererReadyFired(): boolean {
  *  `KTX2Loader.detectSupport` before reaching here, so a real viewport registering always
  *  implies KTX2 caps are ready too; mark that channel alongside this one.
  *
- *  Returns a disposer: on teardown it clears `activeRenderer`/`attachedRenderer` and detaches
- *  the GPU-fault listeners, but ONLY if they still point at THIS renderer (the same
- *  superseded-renderer identity guard the fault-detection paths already use) — a late disposer
- *  from an old renderer must never clear a newer one's handle. Idempotent; never throws. */
+ *  Texture/KTX2-caps role ONLY (#802) — this no longer arms any GPU-fault detection. That moved
+ *  to `makeViewportLossPolicy` + `attachUncapturedErrorListener`, wired per-viewport instead of
+ *  through this shared handle: the old single-slot detection meant closing one registrant (e.g.
+ *  the Particle Editor) silently disarmed another's (SceneView's) detection, and this handle's
+ *  own re-seating disposer below exists for exactly the analogous reason on the texture side —
+ *  see `registrants`.
+ *
+ *  Returns a disposer: on teardown it re-seats the handle onto the most recent survivor,
+ *  reaching null only when the last registrant goes. Idempotent; never throws. */
 export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
   // Re-seat rather than duplicate: a repeat registration of the same renderer must leave ONE entry,
   // or its disposer would remove only one of them and the corpse would stay reachable.
@@ -97,7 +102,6 @@ export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRe
     _rendererReadyResolve();
   }
   markKtx2CapsReady('viewport');
-  const detachFaultListeners = attachGpuFaultListeners(renderer);
 
   let disposed = false;
   return () => {
@@ -109,7 +113,6 @@ export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRe
     const at = registrants.indexOf(renderer);
     if (at >= 0) registrants.splice(at, 1);
     activeRenderer = registrants[registrants.length - 1] ?? null;
-    try { detachFaultListeners(); } catch { /* a disposer must never throw */ }
   };
 }
 
@@ -122,14 +125,15 @@ export function setActiveRendererHandle(renderer: WebGPURenderer | THREE.WebGLRe
 // GPU device is gone". This channel records the cause AND drives recovery (see the recovery
 // section below) — it was log-only until #121 P1.
 //
-// WHY THIS DETECTION PATH SURVIVED THE RECOVERY WORK UNCHANGED. three fires both backends'
-// losses through one public hook (`renderer.onDeviceLost(info)`, `info.api` = 'WebGL'|'WebGPU'),
-// which would collapse the two attach functions below into one. It is deliberately NOT used:
-// this module's two false-positive filters (see `attachWebGpuDeviceListeners`) were paid for by
-// shipping a diagnostic that called a healthy 61fps editor dead, and a refactor of the detection
-// path is a chance to lose them. The recovery layer was added ON TOP instead. The unification is
-// a real simplification and worth doing — separately, deliberately, with those filters as the
-// acceptance criteria.
+// #802 moved DETECTION out of this module's own single-slot `attachedRenderer` (see history in
+// git blame if needed) and onto the shared per-renderer contract `rendererLossHandling.ts`
+// established for the editor preview panels (#795): `makeViewportLossPolicy` below builds the
+// `{describe, onLost}` half, and each viewport wires it through `attachRendererLossHandling` +
+// its own `isStale` closure. A single global slot meant a second registrant (the Particle Editor)
+// silently disarmed the first (SceneView) — the exact #802 bug. This module still OWNS policy
+// (the recovery window/budget in `reportRendererLoss`, below) and the two false-positive filters
+// that shipping this channel already paid for once (see `makeViewportLossPolicy`'s doc) — only
+// the per-renderer identity/attach mechanics moved.
 
 /** How many `uncapturederror` events we LOG before going quiet — mirrors `frameDriver`'s
  *  `MAX_REPORTED_ATTEMPTS`. An uncaptured-error flood (a single bad frame can fire dozens) is
@@ -152,13 +156,6 @@ export interface GpuFaultState {
 }
 
 let gpuFaultState: GpuFaultState | null = null;
-/** Which renderer we last attached listeners to — lets a NEW renderer handle (a relaunch, or a
- *  viewport remount) get a clean slate instead of inheriting a previous renderer's fault state,
- *  and lets attaching to the SAME renderer twice stay a no-op (idempotent). */
-let attachedRenderer: WebGPURenderer | THREE.WebGLRenderer | null = null;
-/** The detach paired with `attachedRenderer` — handed back to a REPEAT registration of the same
- *  renderer so every disposer for it detaches for real (#720). Cleared by that detach. */
-let attachedDetach: (() => void) | null = null;
 
 /** Current GPU fault, or null when nothing has gone wrong. Read by the editor-state payload
  *  (`agentEditorOps.ts`) and by `explainCaptureFailure` via the same channel `frameLoop`/
@@ -211,17 +208,18 @@ export interface RendererLostInfo {
    *  gratuitous shader-prewarm stall, and a fresh chance to fail, on a surface that never had a
    *  problem. Compare by identity and return early when it isn't yours.
    *
-   *  Note what this does NOT fix: only the renderer that most recently called
-   *  `setActiveRendererHandle` is watched at all (both detection paths guard on
-   *  `attachedRenderer`), so a loss in the OTHER viewport is never reported in the first place.
-   *  That is a pre-existing limit of the detection layer, not something this field introduces. */
+   *  Comes from the attachment's own closure (`makeViewportLossPolicy`'s `renderer` argument),
+   *  not a shared global — #802 fixed the pre-existing limit noted here before this comment was
+   *  updated: every attached viewport is watched now, not only the one most recently registered
+   *  through the old single-slot `attachedRenderer`. */
   renderer: WebGPURenderer | THREE.WebGLRenderer | null;
 }
 
 /** Loss timestamps inside the current window.
  *
- *  DELIBERATELY NOT reset by `attachGpuFaultListeners`. That function clears `gpuFaultState` so a
- *  new renderer starts clean, which is right for REPORTING and would be fatal here: every
+ *  DELIBERATELY NOT reset when a viewport attaches. `attachUncapturedErrorListener` clears
+ *  `gpuFaultState` so a new renderer starts clean (it took over that job from the deleted
+ *  `attachGpuFaultListeners` in #802), which is right for REPORTING and would be fatal here: every
  *  recovery installs a new renderer, so resetting the history on attach would zero the counter on
  *  the very event it exists to count, and a hard rebuild loop would look like an unbroken series
  *  of first-time losses and never trip. Only `resetRecoveryState()` clears it. */
@@ -252,8 +250,17 @@ export function resetRecoveryState(): void {
 }
 
 /** Record a real device/context loss and, if the budget allows, ask viewports to rebuild.
- *  Both detection paths funnel here so the policy exists in exactly one place. */
-function reportRendererLoss(api: 'WebGL' | 'WebGPU', reason?: string, message?: string): void {
+ *  Every attached viewport's `onLost` funnels here (via `makeViewportLossPolicy`) so the policy
+ *  exists in exactly one place. Module-private: `renderer` comes from the CALLER's closure
+ *  (the attachment that detected the loss), not from a shared global — #802 replaced the old
+ *  single-slot `attachedRenderer` this used to read, which a second registrant could silently
+ *  overwrite. */
+function reportRendererLoss(
+  renderer: WebGPURenderer | THREE.WebGLRenderer | null,
+  api: 'WebGL' | 'WebGPU',
+  reason?: string,
+  message?: string,
+): void {
   const now = rawNow();
   lossTimes = lossTimes.filter((t) => now - t < RECOVERY_WINDOW_MS);
   lossTimes.push(now);
@@ -287,89 +294,103 @@ function reportRendererLoss(api: 'WebGL' | 'WebGPU', reason?: string, message?: 
   for (const fn of lostListeners) {
     // A listener that throws must not prevent the others from rebuilding. Reported, not swallowed
     // silently: a viewport that cannot rebuild is exactly the fault worth seeing.
-    // `attachedRenderer` IS the renderer that died: both detection paths refuse to report for
-    // any renderer we are no longer attached to (the superseded-renderer guards).
-    try { fn({ api, reason, message, attempt, renderer: attachedRenderer }); }
+    try { fn({ api, reason, message, attempt, renderer }); }
     catch (e) { console.error('[activeRenderer] a renderer-lost listener threw', e); }
   }
 }
 
-/** Attach GPU fault listeners to a newly-activated renderer. NEVER throws into the caller — the
- *  device/backend shape is version-dependent (three's WebGPU internals are not a stable public
- *  API), so every hop is guarded; a failure here just means faults go unreported, not that
- *  `setActiveRendererHandle` fails.
- *
- *  Returns a detach function (composed into `setActiveRendererHandle`'s disposer): it removes the
- *  `webglcontextlost` listener and clears `attachedRenderer`, both ONLY if still pointing at THIS
- *  renderer — the same identity guard the loss-detection callbacks above already use. Deliberately
- *  does NOT touch `gpuFaultState` or `lossTimes`/`recoveryAbandoned`: see the module-level comments
- *  on those — clearing fault/loss history on teardown would erase the very fault a teardown might
- *  be responding to, or zero the counter that detects a rebuild loop. */
-function attachGpuFaultListeners(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
-  // Already attached — hand back the EXISTING detach, not a fresh no-op. A no-op here would
-  // reopen #720 on the double-registration path: `setActiveRendererHandle` is documented as safe
-  // to call twice for the same renderer (a `bringUp()` retry does), and a caller that keeps only
-  // the LATEST disposer would then clear `activeRenderer` while leaving `attachedRenderer` pinned
-  // to the corpse and the `webglcontextlost` listener still on its canvas — the exact leak this
-  // change exists to close. The returned detach is itself idempotent, so both disposers running
-  // is harmless.
-  if (renderer === attachedRenderer) return attachedDetach ?? (() => {});
-  attachedRenderer = renderer;
-  gpuFaultState = null; // a new renderer starts with a clean slate
-
-  try {
-    attachWebGpuDeviceListeners(renderer);
-  } catch { /* must never throw into setActiveRendererHandle */ }
-
-  let removeWebGlListener = () => {};
-  try {
-    removeWebGlListener = attachWebGlContextLostListener(renderer);
-  } catch { /* must never throw into setActiveRendererHandle */ }
-
-  let detached = false;
-  const detach = (): void => {
-    if (detached) return;
-    detached = true;
-    try { removeWebGlListener(); } catch { /* must never throw into the disposer */ }
-    if (attachedRenderer === renderer) { attachedRenderer = null; attachedDetach = null; }
-  };
-  attachedDetach = detach;
-  return detach;
+/** Structural (not imported) twin of `runtime/rendering/rendererLossHandling.ts`'s
+ *  `RendererLossHandlers` — `{describe, isStale, label, onLost}`. This file is L0 core
+ *  (`engine/eslint.config.js`'s layer contract: "L0 core may import: nothing"), and
+ *  `rendererLossHandling.ts` lives in `rendering/`, an L2 subsystem — so the real interface
+ *  cannot be imported here even for a type. Callers (viewports — all L3/editor code, so
+ *  unrestricted) spread this return value into an object typed against the real interface,
+ *  the same composition `editor/panels/previewLossPolicy.ts`'s `makePreviewLossPolicy` already
+ *  uses for the preview-panel family. */
+export interface ViewportLossPolicyOptions {
+  /** The renderer this policy watches — reported as `RendererLostInfo.renderer` so a subscriber
+   *  (`onRendererLost`) can tell which viewport's renderer actually died. */
+  renderer: WebGPURenderer | THREE.WebGLRenderer;
+  /** This ATTACHMENT's own stale check — true once its renderer has been superseded or disposed.
+   *  Replaces the old single-slot `renderer !== attachedRenderer` guard (#802): each viewport
+   *  supplies its own closure now, so tearing one down can never disarm a survivor's detection —
+   *  the bug this issue exists to fix. */
+  isStale: () => boolean;
 }
 
-/** Reach through three's WebGPU backend to the raw `GPUDevice` and attach `device.lost` +
- *  `uncapturederror`. Every property access is optional-chained: `renderer.backend.device` is
- *  three-internal (not exported in its public types) and has moved before. A WebGL renderer, or
- *  a WebGPU renderer that fell back to WebGL internally, simply has none of these and this is a
- *  silent no-op. */
-function attachWebGpuDeviceListeners(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
+/** Build the `{label, isStale, describe, onLost}` policy a viewport passes to
+ *  `attachRendererLossHandling` — the per-renderer detection contract #795 established for the
+ *  editor preview panels, now also the way `SceneView`/`Scene3D`/`scene3DSync`'s GameView detect
+ *  loss (#802 deleted the old single-slot `attachedRenderer` these three shared).
+ *
+ *  Preserves the two false-positive filters this channel already paid for once (owner,
+ *  2026-08-01: a `reason=destroyed` loss logged as an error while the editor rendered at a
+ *  healthy 61 FPS):
+ *   1. SUPERSEDED RENDERER — the caller's `isStale` closure, checked by
+ *      `attachRendererLossHandling` before anything else runs.
+ *   2. DELIBERATE TEARDOWN (`reason === 'destroyed'`, WebGPU-only) — three calls
+ *      `device.destroy()` when disposing a renderer, which is exactly what a reload/remount
+ *      looks like, not a fault. `describe` returns `null` to suppress the log (needed because
+ *      `attachDeviceLostListener` logs BEFORE calling `onLost`, so an early return in `onLost`
+ *      alone would still print a false alarm) and `onLost` early-returns to suppress the report.
+ *
+ *  ⚠️ `attachContextLossListeners` calls `e.preventDefault()` unconditionally on the WebGL path;
+ *  the old `attachWebGlContextLostListener` here deliberately did not, because three's own
+ *  `WebGLBackend` listener already does (that's what makes the browser willing to restore the
+ *  context at all). A second `preventDefault()` on the same event changes nothing — this is a
+ *  known, harmless behaviour change from the pre-#802 code, not an oversight. */
+export function makeViewportLossPolicy({ renderer, isStale }: ViewportLossPolicyOptions): {
+  describe: (e: { api: 'WebGL' | 'WebGPU'; reason?: string; message?: string }) => string | null;
+  onLost: (e: { api: 'WebGL' | 'WebGPU'; reason?: string; message?: string }) => void;
+} {
+  // Only `describe`/`onLost` are returned here — never `label`/`isStale` — because a caller
+  // spreads this straight into its own `RendererLossHandlers` object alongside its OWN `label`/
+  // `isStale` (see `SceneView.tsx`/`Scene3D.tsx`); returning those fields here too would silently
+  // overwrite the caller's choice on the very next spread key, and TS rightly flags the resulting
+  // duplicate-property spread as an error. `isStale` is still re-checked in `onLost` below as a
+  // defensive redundant guard — `attachRendererLossHandling` already checks it before calling
+  // `onLost` at all, but a `renderer`-scoped policy should not depend on that being the ONLY gate.
+  return {
+    describe: (e) => (
+      e.reason === 'destroyed'
+        ? null // filter 2: an orderly teardown must log NOTHING, not just report nothing
+        : `[activeRenderer] ${e.api} context/device LOST${e.reason ? ` (reason: ${e.reason})` : ''} — every ` +
+          'draw into it is now a no-op and the surface will stay BLANK until it recovers.'
+    ),
+    onLost: (e) => {
+      if (e.reason === 'destroyed') return; // filter 2, matching the describe() suppression above
+      if (isStale()) return; // defensive: see the doc above
+      reportRendererLoss(renderer, e.api, e.reason, e.message);
+    },
+  };
+}
+
+/** Reach through three's WebGPU backend to the raw `GPUDevice` and count `uncapturederror`
+ *  events into `gpuFaultState`. Independent of the loss-detection wiring above — the shared
+ *  `rendererLossHandling.ts` contract covers `webglcontextlost`/`device.lost` only, not this
+ *  event — so a viewport calls this alongside `attachRendererLossHandling`.
+ *
+ *  Every property access is optional-chained: `renderer.backend.device` is three-internal (not
+ *  exported in its public types) and has moved before. A WebGL renderer, or a WebGPU renderer
+ *  that fell back to WebGL internally, simply has none of these and this is a silent no-op.
+ *
+ *  Returns a detach fn. Before #802 this listener was attached with no removal path at all and
+ *  outlived every renderer it was attached to — folded in here while this function was open. */
+export function attachUncapturedErrorListener(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
+  // ⚠️ The clean slate is taken for EVERY viewport renderer, BEFORE the WebGPU-only bail-out
+  // below — not after it. Until #802 this reset lived in `attachGpuFaultListeners`, which ran for
+  // any renderer regardless of backend; moving it past the `device?.addEventListener` guard would
+  // leave the WEBGL path with no reset at all, and that is the path three's WebGL2 fallback takes
+  // on every low-end device we ship to. The consequence is the false positive this channel was
+  // burned by once: after a WebGL context loss and a successful rebuild, `gpuFaultState.deviceLost`
+  // would still read true from the DEAD renderer, and a stale loss OUTRANKS every other
+  // explanation in `explainCaptureFailure` — so a recovered editor would keep reporting itself
+  // dead. Reset first, then attach whatever this backend actually has.
+  gpuFaultState = null;
   const device = (renderer as unknown as { backend?: { device?: GPUDevice } })?.backend?.device;
-  if (!device) return;
+  if (!device?.addEventListener) return () => {};
 
-  device.lost?.then((info: GPUDeviceLostInfo) => {
-    // ── TWO FALSE-POSITIVE FILTERS, both found by this code reporting a HEALTHY editor as dead
-    //    within minutes of shipping (owner, 2026-08-01: a `reason=destroyed` error logged at
-    //    61 FPS, telling them to relaunch an editor that was rendering fine). A diagnostic that
-    //    cries wolf is worse than none: this one OUTRANKS the frame-loop stall in
-    //    `explainCaptureFailure`, so a false loss would mask every other explanation.
-    //
-    // 1. SUPERSEDED RENDERER. `device.lost` is a promise that can resolve long after its renderer
-    //    was replaced (an HMR reload, a viewport remount). By then `attachGpuFaultListeners` has
-    //    already reset the state for the NEW renderer, and this late callback would overwrite it
-    //    with the corpse of the old one. Only the renderer we are still attached to may speak.
-    if (renderer !== attachedRenderer) return;
-    // 2. DELIBERATE TEARDOWN. Per the WebGPU spec `reason === 'destroyed'` means someone called
-    //    `device.destroy()` — three does this when disposing a renderer, which is exactly what a
-    //    reload/remount looks like. That is an orderly shutdown, not a fault: the replacement
-    //    renderer brings its own device. Only 'unknown' is a REAL loss (driver reset, TDR, the OS
-    //    reclaiming the GPU), and only that is worth a word.
-    if (info.reason === 'destroyed') return;
-    // A real loss: nothing renders again on THIS device, so ask for a rebuild. The policy (window,
-    // budget, give-up) lives in reportRendererLoss — this path only decides that it is real.
-    reportRendererLoss('WebGPU', info.reason, info.message);
-  }).catch(() => { /* device.lost rejecting is not itself a fault worth reporting */ });
-
-  device.addEventListener?.('uncapturederror', (e: Event) => {
+  const handler = (e: Event): void => {
     const message = (e as unknown as { error?: { message?: string } })?.error?.message;
     const count = (gpuFaultState?.uncapturedErrors ?? 0) + 1;
     gpuFaultState = { ...(gpuFaultState ?? { deviceLost: false }), uncapturedErrors: count };
@@ -382,36 +403,15 @@ function attachWebGpuDeviceListeners(renderer: WebGPURenderer | THREE.WebGLRende
           : ''),
       );
     }
-  });
-}
-
-/** WebGL fallback: `webglcontextlost` is the WebGL equivalent of a lost GPU device — fired on the
- *  canvas, not a device object. Recorded into the same `GpuFaultState` shape so callers don't
- *  need to know which backend is active.
- *
- *  This is the path the Y6 2019 took, and the one that matters most on low-end mobile: a
- *  `WebGPURenderer` with no adapter falls back to three's WebGL2 backend, so a phone reports its
- *  death here rather than through `device.lost`.
- *
- *  We do NOT call `preventDefault()` — three's own `WebGLBackend` listener already does, which is
- *  what makes the browser willing to restore the context at all. A second `preventDefault()` on
- *  the same event changes nothing; believing it was the fix would have been the trap. Note we
- *  are a SECOND listener on this canvas: three's fires too and flips its private `_isDeviceLost`,
- *  which is precisely why the old renderer is unusable and a rebuild is the only route back. */
-function attachWebGlContextLostListener(renderer: WebGPURenderer | THREE.WebGLRenderer): () => void {
-  const el = (renderer as unknown as { domElement?: EventTarget })?.domElement;
-  const handler = (e: Event): void => {
-    // Superseded-renderer guard, matching the WebGPU path: a canvas belonging to a renderer we
-    // have already replaced must not report — its death is expected teardown, not a live fault.
-    if (renderer !== attachedRenderer) return;
-    const message = (e as unknown as { statusMessage?: string })?.statusMessage || undefined;
-    reportRendererLoss('WebGL', 'webglcontextlost', message);
   };
-  el?.addEventListener?.('webglcontextlost', handler);
-  // Returned so `attachGpuFaultListeners`' detach function can take this listener back off the
-  // canvas on teardown — otherwise a disposed renderer's `domElement` (which can outlive the
-  // renderer, or be reused) keeps a stale listener alive whose renderer is already gone.
-  return () => { el?.removeEventListener?.('webglcontextlost', handler); };
+  device.addEventListener('uncapturederror', handler);
+
+  let detached = false;
+  return () => {
+    if (detached) return;
+    detached = true;
+    try { device.removeEventListener?.('uncapturederror', handler); } catch { /* never throw out of a teardown */ }
+  };
 }
 
 // ── KTX2 transcoder-caps channel ───────────────────────────────────────────────────────────

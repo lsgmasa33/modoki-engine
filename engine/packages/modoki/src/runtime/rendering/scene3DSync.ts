@@ -4808,6 +4808,12 @@ export async function createRenderer(
   // same reason: every existing `renderer.dispose()` call site (Scene3D's unmount/rebuild, the
   // KTX2 probe, the editor viewports) stays correct for free instead of needing a second call
   // site to keep in sync.
+  //
+  // GPU-context/device loss DETECTION (#802) is deliberately NOT wired here — `createRenderer`
+  // has no lifecycle of its own to hang an `isStale` check on (it returns once and is done); that
+  // belongs to `Scene3D.tsx`, its one caller, which already owns a `disposed` flag spanning this
+  // renderer's whole life (including the context-loss rebuild path) and wires
+  // `attachRendererLossHandling` + `makeViewportLossPolicy` right after calling this function.
   const priorDispose = r.dispose.bind(r);
   r.dispose = (...args: Parameters<typeof priorDispose>) => {
     disposeActiveRenderer();

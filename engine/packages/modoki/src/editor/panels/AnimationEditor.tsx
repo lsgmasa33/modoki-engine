@@ -48,11 +48,13 @@ import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
 import {
   beginTimelinePreviewSession, hasTimelinePreviewSession,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
+import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
+import { panelDrivesPreview, panelMayStopPreview } from './previewOwnership';
 
 const COALESCE_MS = 500;
 const TRACK_LIST_MIN_W = 140;
@@ -94,6 +96,9 @@ export default function AnimationEditor() {
   const playhead = useEditorStore((s) => s.playheadTime);
   const recording = useEditorStore((s) => s.isRecording);
   const playing = useEditorStore((s) => s.isPreviewPlaying);
+  // See TimelineEditor's twin of this: one shared flag, two panels, so the preview runs only
+  // in the panel whose ▶ started it. null = unclaimed, keep the old any-panel behaviour.
+  const previewOwner = useEditorStore((s) => s.previewOwner);
   const selectedEntityId = useEditorStore((s) => s.selectedEntityId);
 
   // While recording, warn up-front if the selected entity isn't under this clip's
@@ -461,19 +466,46 @@ export default function AnimationEditor() {
     return () => clearPreviewSaveHandler(mine);
   }, [inPreview]);
 
+  // The CURRENT preview effect run's guard, or null while not previewing (#810 follow-up). Lets
+  // `registerModeOwnerDisplaced`'s callback — which fires OUTSIDE this effect's closure — stop
+  // THIS run's tick without touching the shared `isPreviewPlaying` flag. See previewLoopGuard.ts.
+  const previewLoopGuardRef = useRef<PreviewLoopGuard | null>(null);
+
+  // ── Displacement (#810): the Timeline panel taking the mode (▶ preview / a ruler scrub) ends
+  // OUR preview GLOBALLY — `RunMode` is single-valued — but nothing else tells this panel's rAF
+  // loop (just below, keyed `[playing, pose]`) to stop, and its tick body never consults
+  // `getRunMode()` either.
+  //
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Timeline panel
+  // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
+  // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
+  // itself: this panel enters first (no notify yet, nothing owned the mode), Timeline's async
+  // session-open resolves a microtask later and takes the mode, displacing us — and the first
+  // #810 pass's callback then killed the flag Timeline's own just-started preview was keyed on.
+  // Confirmed live in `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS
+  // run's guard is what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole
+  // lifetime, not gated on `playing` — a displacement can arrive between preview sessions just as
+  // easily as during one, and the callback is a no-op when no guard is live.
+  useEffect(() => registerModeOwnerDisplaced('animation', () => {
+    previewLoopGuardRef.current?.stop();
+  }), []);
+
   // ── Preview playback loop ──
   // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,
   // so it opens the same session and carries the `preview` run-mode. Without the run-mode a save
   // DURING playback passed the guard and baked whatever frame was on screen.
   useEffect(() => {
     if (!playing) return;
+    if (!panelDrivesPreview(playing, previewOwner, 'animation')) return; // the Timeline panel's ▶, not ours
     enterPreviewMode(true, 'animation');
     setInPreview(true);
     void beginTimelinePreviewSession(); // idempotent — a scrub before ▶ already holds the snapshot
-    let raf = 0;
+    const guard = createPreviewLoopGuard();
+    previewLoopGuardRef.current = guard;
     let last = performance.now();
     const tick = () => {
-      raf = requestAnimationFrame(tick);
+      if (guard.stopped) return; // displaced — do not reschedule (checked BEFORE scheduling)
+      guard.arm(requestAnimationFrame(tick));
       const now = performance.now();
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
@@ -483,9 +515,10 @@ export default function AnimationEditor() {
       useEditorStore.getState().setPlayhead(t);
       pose(cur, t);
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [playing, pose]);
+    guard.arm(requestAnimationFrame(tick));
+    // Release the ref only if it is still OURS — see the same note in TimelineEditor's cleanup.
+    return () => { guard.stop(); if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null; };
+  }, [playing, previewOwner, pose]);
 
   // Panel gone → revert the previewed pose and return the global run-mode to stopped (drops a
   // scrub this panel left set). Empty deps → runs only on real unmount. No-op during Play, and
@@ -547,7 +580,9 @@ export default function AnimationEditor() {
   useEffect(() => () => {
     const s = useEditorStore.getState();
     if (s.isRecording) s.setRecording(false);
-    if (s.isPreviewPlaying) s.setPreviewPlaying(false);
+    // Only if the preview is OURS (or unclaimed) — the flag is shared with the Timeline panel, so
+    // an unguarded clear stops ITS playback when this tab is closed. See `panelMayStopPreview`.
+    if (s.isPreviewPlaying && panelMayStopPreview(s.previewOwner, 'animation')) s.setPreviewPlaying(false);
   }, []);
 
   // ── Add Property (one or many) ──
@@ -883,7 +918,7 @@ export default function AnimationEditor() {
       register({ id: 'anim.valDownFine', keys: 'alt+ArrowDown', scope: S, when: hasKeys, run: () => nudgeValueSelected(-0.1) }),
       register({
         id: 'anim.togglePreview', keys: 'Space', scope: S, when: hasClip,
-        run: () => { const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying); },
+        run: () => { const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying, 'animation'); },
       }),
       register({ id: 'anim.addKeyAll', keys: 'k', scope: S, when: hasClip, run: addKeyAll }),
       register({ id: 'anim.breakTangents', keys: 'b', scope: S, when: hasKeys, run: toggleBreakSelected }),
@@ -1008,7 +1043,7 @@ export default function AnimationEditor() {
           frameRate={clip.frameRate} onSetFrameRate={setFrameRate}
           duration={clip.duration} onSetDuration={setDuration}
           loop={clip.loop} onToggleLoop={toggleLoop}
-          playing={playing} onTogglePlay={() => useEditorStore.getState().setPreviewPlaying(!playing)}
+          playing={playing} onTogglePlay={() => useEditorStore.getState().setPreviewPlaying(!playing, 'animation')}
           onStop={() => scrub(0)}
           recording={recording} onToggleRecord={() => useEditorStore.getState().setRecording(!recording)}
           playhead={playhead} onScrub={scrub}

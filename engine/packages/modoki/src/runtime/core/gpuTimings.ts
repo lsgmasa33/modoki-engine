@@ -211,11 +211,38 @@ function arm(): void {
       'first frame after one does.';
     return;
   }
+  // The OUTGOING renderer is being displaced (a relaunch, a viewport remount) and never goes
+  // through `disarm()` — nothing else clears its `trackTimestamp` flag, so left alone it would keep
+  // writing GPU timestamp queries every frame for as long as the process lives (#810, reachable
+  // only while the profiler is enabled). Clear it, and purge its pool for the same reason
+  // `purgePool`'s own doc comment gives — a resolve landing for it after this point would otherwise
+  // file a stale sample under the NEW renderer's frame counter.
+  //
+  // ⚠️ This runs BEFORE the support probe, not inside the success path below. The incoming renderer
+  // may be the one that cannot time (the editor's two viewports need not share a backend), and on
+  // that path we still displaced the old one — leaving the clear until after `probe.ok` would leak
+  // exactly the flag this exists to clear, on the one path where nothing later cleans it up.
+  const displaced = armedRenderer && armedRenderer !== renderer ? armedRenderer : null;
+  if (displaced) {
+    clearTrackTimestamp(displaced);
+    purgePool(displaced);
+    // The old renderer's in-flight work is now unattributable — its frame ids belong to a counter
+    // we are leaving behind. Retire it here rather than only in the success path below.
+    liveness.invalidateAll();
+    resolveInFlight = false;
+    pendingRanges = [];
+  }
   const probe = probeSupport(renderer);
   backendKind = probe.backend;
   if (!probe.ok) {
     status = 'unsupported';
     detail = probe.reason;
+    // Adopt it anyway. `pollGpuTimings`'s "once shown not to support timestamps, stop asking it"
+    // guard is `status === 'unsupported' && renderer === armedRenderer` — leaving `armedRenderer`
+    // pointing at the DISPLACED renderer makes that test never match, so `arm()` (and its probe)
+    // would run again on every single frame. A remount with a different renderer still re-probes,
+    // which is what that guard's own comment promises.
+    armedRenderer = renderer;
     return;
   }
   try {
@@ -246,22 +273,33 @@ function arm(): void {
  *  TWO samples with a max of 99ms from before the disable.
  *
  *  We are already the only consumer of that map (three never reads or clears it — see `drain`),
- *  so clearing it here is the same ownership, applied at the other boundary. */
-function purgePool(): void {
+ *  so clearing it here is the same ownership, applied at the other boundary.
+ *
+ *  Takes the renderer explicitly (rather than reading `armedRenderer`) so `arm()` can purge the
+ *  OUTGOING renderer's pool at the moment it is being displaced by a new one (#810) — by then
+ *  `armedRenderer` may already point at the replacement, or the caller may want to target a
+ *  renderer that was never the current one at all. */
+function purgePool(renderer: unknown): void {
   try {
-    (armedRenderer as {
+    (renderer as {
       backend?: { timestampQueryPool?: Record<string, { timestamps?: Map<string, number> }> };
     } | null)?.backend?.timestampQueryPool?.render?.timestamps?.clear();
   } catch { /* teardown must never throw */ }
 }
 
-function disarm(): void {
-  const r = armedRenderer as { backend?: { trackTimestamp?: boolean } } | null;
+/** Clear `trackTimestamp` on `renderer`. Split out of `disarm()` so `arm()` can apply it to the
+ *  OUTGOING renderer too (#810) — never throws. */
+function clearTrackTimestamp(renderer: unknown): void {
+  const r = renderer as { backend?: { trackTimestamp?: boolean } } | null;
   try { if (r?.backend) r.backend.trackTimestamp = false; } catch { /* teardown must not throw */ }
+}
+
+function disarm(): void {
+  clearTrackTimestamp(armedRenderer);
   // Retire anything in flight: a resolve landing after the caller turned timing OFF would write
   // into the rings, so a later re-enable would open with samples from before the disable.
   liveness.invalidateAll();
-  purgePool();
+  purgePool(armedRenderer);
   armedRenderer = null;
   resolveInFlight = false;
   pendingRanges = [];
@@ -607,7 +645,7 @@ export function resetGpuTimings(): void {
   // window and flip `status` back to 'active' carrying the previous action's samples — and purge
   // what three has already resolved but we have not consumed, or the next drain files it anyway.
   liveness.invalidateAll();
-  purgePool();
+  purgePool(armedRenderer);
   resolveInFlight = false;
   if (enabled && status === 'active') status = 'pending';
 }

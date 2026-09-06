@@ -346,6 +346,15 @@ interface EditorState {
   isRecording: boolean;
   /** Preview playback running (advances the playhead each frame). */
   isPreviewPlaying: boolean;
+  /** WHICH panel the ▶ was pressed in, or null when nobody claimed it (#810 follow-up).
+   *  `isPreviewPlaying` is ONE flag both the Timeline and Animation panels read, so without
+   *  this both panels' preview effects run on a single press and each takes the single-valued
+   *  `RunMode` from the other — after #810 gave displacement real teeth, the loser's loop is
+   *  stopped, and the Timeline always lands second (its entry is behind an await), so pressing
+   *  ▶ in the Animation panel played nothing at all. A panel drives the preview only when it
+   *  owns it. NULL means unclaimed — a programmatic `setPreviewPlaying(true)` (the e2e path)
+   *  keeps the pre-existing any-panel-may-drive behaviour rather than silently doing nothing. */
+  previewOwner: 'timeline' | 'animation' | null;
 
   selectEntity: (id: number | null) => void;
   /** Replace the whole selection set. `primary` becomes the anchor (defaults to
@@ -480,7 +489,7 @@ interface EditorState {
   applyAnimationClip: (path: string, clip: AnimationClipDef) => void;
   setPlayhead: (t: number) => void;
   setRecording: (on: boolean) => void;
-  setPreviewPlaying: (on: boolean) => void;
+  setPreviewPlaying: (on: boolean, owner?: 'timeline' | 'animation') => void;
   setAnimatorRoot: (id: number | null) => void;
 
   /** Open the Timeline Editor on a `.timeline.json` asset, bound to `rootEntityId` (the
@@ -618,7 +627,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   prefabReturnScenePath: null,
   playheadTime: 0,
   isRecording: false,
-  isPreviewPlaying: false,
+  isPreviewPlaying: false, previewOwner: null,
 
   selectEntity: (id) => {
     const prev = get();
@@ -910,9 +919,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
     animationEditNonce: s.animationEditNonce + 1,
     playheadTime: 0,
     isRecording: false,
-    isPreviewPlaying: false,
+    isPreviewPlaying: false, previewOwner: null,
   })),
-  closeAnimationEditor: () => set({ editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false, isPreviewPlaying: false }),
+  closeAnimationEditor: () => set({ editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false, isPreviewPlaying: false, previewOwner: null }),
   remapEditingAssetPath: (field, path, name) => set((s) => {
     const cur = s[field];
     if (!cur) return {}; // unbound → nothing to repoint
@@ -929,7 +938,16 @@ export const useEditorStore = create<EditorState>((set, get) => {
   },
   setPlayhead: (t) => set({ playheadTime: Math.max(0, t) }),
   setRecording: (on) => set({ isRecording: on }),
-  setPreviewPlaying: (on) => set({ isPreviewPlaying: on }),
+  setPreviewPlaying: (on, owner) => {
+    // DEV-only: an untagged start drives NEITHER panel (see `panelDrivesPreview` — the permissive
+    // fallback was #810 re-armed). Silence would look exactly like a broken ▶, so say which call
+    // is at fault rather than leaving the next reader to find it.
+    if (on && !owner && import.meta.env?.DEV) {
+      console.warn('[editorStore] setPreviewPlaying(true) with no owner — no panel will drive this ' +
+        "preview. Pass 'timeline' or 'animation'.");
+    }
+    set({ isPreviewPlaying: on, previewOwner: on ? (owner ?? null) : null });
+  },
   setAnimatorRoot: (id) => set({ animatorRootEntityId: id }),
 
   openTimelineEditor: (asset, rootEntityId) => set((s) => ({
@@ -938,9 +956,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
     directorRootEntityId: rootEntityId,
     timelineEditNonce: s.timelineEditNonce + 1,
     playheadTime: 0,
-    isPreviewPlaying: false,
+    isPreviewPlaying: false, previewOwner: null,
   })),
-  closeTimelineEditor: () => set({ editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null, isPreviewPlaying: false }),
+  closeTimelineEditor: () => set({ editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null, isPreviewPlaying: false, previewOwner: null }),
   loadTimelineDoc: (doc) => {
     const { editingTimelineAsset } = get();
     if (editingTimelineAsset) setTimeline(editingTimelineAsset.path, doc);

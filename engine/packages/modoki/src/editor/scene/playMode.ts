@@ -365,19 +365,69 @@ let _modeOwner: string | null = null;
 /** The owner of the current non-stopped editor mode, or null. */
 export function getModeOwner(): string | null { return _modeOwner; }
 
+/** Displacement callbacks, keyed by owner tag: "you no longer hold the mode — stop running." (#810)
+ *
+ *  ⚠️ NOT a re-seating stack like `timelinePreview.ts`'s `_saveHandler` registry. `RunMode` is
+ *  genuinely single-valued — the moment panel B enters, panel A's preview is over GLOBALLY, there
+ *  is no slot to hand back to A later. What A is missing is not ownership but NOTICE: its rAF loop
+ *  (`TimelineEditor.tsx`'s preview effect, keyed `[playing, rootId]` — never consults `getRunMode()`
+ *  in its tick body) keeps mutating authored traits with nobody telling it to stop, even though
+ *  `getRunMode()` already reads B's mode. So this is a one-shot "you were displaced" notification,
+ *  not a stack of owners.
+ *
+ *  One callback per owner tag — a panel re-registers (replacing, not stacking) each time it takes
+ *  the mode, since only the CURRENT registration is meaningful once displaced. */
+const _displacedCallbacks = new Map<string, () => void>();
+
+/** Register `fn` to run once if `owner` is displaced by a DIFFERENT owner entering scrub/preview.
+ *  Returns an unregister function (call it on teardown so a stale callback can't fire into an
+ *  unmounted panel). */
+export function registerModeOwnerDisplaced(owner: string, fn: () => void): () => void {
+  _displacedCallbacks.set(owner, fn);
+  return () => { if (_displacedCallbacks.get(owner) === fn) _displacedCallbacks.delete(owner); };
+}
+
+/** Tell the previous owner (if any, and if different) that it was just displaced.
+ *
+ *  ⚠️ ORDERING IS LOAD-BEARING — call this AFTER `_modeOwner`/`setRunMode` have already been
+ *  updated to the NEW mode, never before. `TimelineEditor`'s preview-effect cleanup does
+ *  `if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline')` (review L1's guard)
+ *  precisely to avoid clobbering a scrub/preview some OTHER panel just entered. Notifying the
+ *  displaced owner BEFORE the new mode is set would run that cleanup while `getRunMode()` still
+ *  read the OLD mode — the guard would pass and the just-entered transition would be clobbered.
+ *
+ *  ⚠️ **Notifying AFTER makes that guard decline only when the new mode is `'scrub'`** — do not
+ *  read this ordering as making re-entry safe in general. When the displacing owner enters
+ *  `'preview'`, `getRunMode()` reads `'preview'` and the guard PASSES, so a callback that re-enters
+ *  `enterPreviewMode` would clobber the transition and steal the ownership back. The ordering is
+ *  necessary, not sufficient; what makes it safe here is that **no registered callback re-enters a
+ *  mode transition at all** — both panels' callbacks only stop their own rAF guard. Keep it that
+ *  way: a displacement callback is for standing down, never for taking a mode. A callback must never throw into the transition it's reporting — wrapped below, same
+ *  convention as `onRendererLost`'s listener loop in `runtime/core/activeRenderer.ts`. */
+function notifyDisplaced(previousOwner: string | null, newOwner: string): void {
+  if (!previousOwner || previousOwner === newOwner) return;
+  const fn = _displacedCallbacks.get(previousOwner);
+  if (!fn) return;
+  try { fn(); } catch (e) { console.error('[playMode] a mode-owner-displaced callback threw', e); }
+}
+
 /** Enter `scrub` (an idempotent pose at time t). No-op during Play. Sticks until an explicit exit
  *  (panel teardown / world-swap / asset-switch) or a transition to preview/play. */
 export function enterScrubMode(owner: string): void {
   if (getRunMode() === 'playing') return; // never downgrade a live/paused Play
+  const previousOwner = _modeOwner;
   _modeOwner = owner;
   setRunMode('scrub');
+  notifyDisplaced(previousOwner, owner);
 }
 
 /** Enter forward `preview`; `advancing:false` = a frozen/paused preview frame. No-op during Play. */
 export function enterPreviewMode(advancing: boolean, owner: string): void {
   if (getRunMode() === 'playing') return;
+  const previousOwner = _modeOwner;
   _modeOwner = owner;
   setRunMode('preview', { advancing });
+  notifyDisplaced(previousOwner, owner);
 }
 
 /** Return to `stopped` from a scrub/preview (panel teardown, world-swap, asset-switch). No-op

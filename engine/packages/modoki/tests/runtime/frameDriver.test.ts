@@ -17,6 +17,39 @@ async function getDriver() {
   return import('../../src/runtime/rendering/frameDriver');
 }
 
+/** Wire GPU-loss detection the way a viewport does since #802: per-renderer, through the shared
+ *  `rendererLossHandling` contract, NOT as a side effect of `setActiveRendererHandle` (which now
+ *  arms nothing fault-related — it keeps only its registrants-stack/KTX2 role). Returns the fake
+ *  canvas so a test can fire `webglcontextlost` on it, plus the composed detach.
+ *
+ *  ⚠️ Both GPU-fault tests below USED to reach the detection path via `setActiveRendererHandle`
+ *  alone. After #802 that call armed nothing, so their `handler` was never assigned and
+ *  `handler?.()` became a silent no-op — which left one of them failing and the OTHER passing
+ *  VACUOUSLY (its assertion is "no GPU fault is mentioned", which holds trivially when no fault
+ *  was ever recorded). This helper is what makes them exercise the real sequence again. */
+async function attachViewportDetection(renderer?: { domElement: unknown }) {
+  const activeRenderer = await import('../../src/runtime/core/activeRenderer');
+  const { attachRendererLossHandling } = await import('../../src/runtime/rendering/rendererLossHandling');
+  const listeners: Record<string, Array<(e: unknown) => void>> = {};
+  const domElement = renderer?.domElement ?? {
+    addEventListener: (t: string, cb: (e: unknown) => void) => { (listeners[t] ??= []).push(cb); },
+    removeEventListener: (t: string, cb: (e: unknown) => void) => {
+      listeners[t] = (listeners[t] ?? []).filter((fn) => fn !== cb);
+    },
+  };
+  const r = { domElement } as never;
+  const detachLoss = attachRendererLossHandling(
+    { canvas: domElement as HTMLCanvasElement, device: undefined },
+    { label: 'test-viewport', isStale: () => false, ...activeRenderer.makeViewportLossPolicy({ renderer: r, isStale: () => false }) },
+  );
+  const detachUncaptured = activeRenderer.attachUncapturedErrorListener(r);
+  return {
+    /** Fire a real `webglcontextlost` — `attachContextLossListeners` calls `preventDefault()`. */
+    loseContext: () => { for (const cb of [...(listeners.webglcontextlost ?? [])]) cb({ preventDefault: () => {} }); },
+    detach: () => { detachLoss(); detachUncaptured(); },
+  };
+}
+
 describe('frameDriver FPS capping', () => {
   it('skips callbacks when timestamp is within the frame interval', async () => {
     // Capture the rAF callback so we can simulate it
@@ -882,7 +915,8 @@ describe('frameDriver — stall watchdog escalation (#590)', () => {
     // The real sequence is `reportRendererLoss` -> `onRendererLost` -> `rendererRecovery`
     // (~250ms delay) -> a viewport's `bringUp()` -> `setActiveRenderer` ->
     // `setActiveRendererHandle`, which UNCONDITIONALLY wipes `gpuFaultState` for the new
-    // renderer (`attachGpuFaultListeners`'s "a new renderer starts with a clean slate"). Against
+    // renderer (`attachUncapturedErrorListener`'s "a new renderer starts with a clean slate",
+    // which every viewport bring-up calls — it took that job over in #802). Against
     // the plan doc's own iPhone-8 trace the loss is at +1,136,882 and the stall fires at
     // +1,139,989 — well over a `STALL_MS` later, so by report time the LIVE `getGpuFaultState()`
     // has already been cleared by that rebuild. This test simulates exactly that: a second
@@ -899,15 +933,14 @@ describe('frameDriver — stall watchdog escalation (#590)', () => {
     // (matching production, where frameDriver loads long before any renderer ever registers)
     // BEFORE the loss fires, so the latch is actually listening.
     const { startFrameDriver, setTargetFPS, getFrameLoopHealth } = await getDriver();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    let handler: (() => void) | undefined;
-    const domElement = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') handler = cb; }) };
-    setActiveRendererHandle({ domElement } as never);
-    handler?.(); // record a WebGL context loss — the CAUSE
+    const { getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+    const viewport = await attachViewportDetection();
+    viewport.loseContext(); // record a WebGL context loss — the CAUSE
+    expect(getGpuFaultState()?.deviceLost).toBe(true); // the loss really was recorded
 
-    // The rebuild: a NEW renderer registers, wiping the live fault state clean for it. Sanity
+    // The rebuild: a NEW viewport attaches, wiping the live fault state clean for it. Sanity
     // check the premise — if this stops being true, the whole test stops meaning anything.
-    setActiveRendererHandle({ domElement: { addEventListener: vi.fn() } } as never);
+    await attachViewportDetection();
     expect(getGpuFaultState()).toBeNull();
 
     setTargetFPS(0);
@@ -942,20 +975,22 @@ describe('frameDriver — stall watchdog escalation (#590)', () => {
     vi.spyOn(globalThis, 'cancelAnimationFrame').mockImplementation(() => {});
 
     const { startFrameDriver, setTargetFPS, getFrameLoopHealth } = await getDriver();
-    const { setActiveRendererHandle, getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
-    let handler: (() => void) | undefined;
-    const domElement = { addEventListener: vi.fn((t: string, cb: () => void) => { if (t === 'webglcontextlost') handler = cb; }) };
-    setActiveRendererHandle({ domElement } as never);
+    const { getGpuFaultState } = await import('../../src/runtime/core/activeRenderer');
+    const viewport = await attachViewportDetection();
 
     setTargetFPS(0);
     startFrameDriver();
     frameCallback!(0); // a real frame, before the loss
 
-    handler?.(); // GPU context lost at t=0 — latches the fault (the CAUSE)
+    viewport.loseContext(); // GPU context lost at t=0 — latches the fault (the CAUSE)
+    // ⚠️ Assert the fault was REALLY recorded. Without this the test passes vacuously: its final
+    // assertions are all "no GPU fault is mentioned", which hold trivially if the loss never
+    // happened — which is exactly what #802 silently did to it for a while.
+    expect(getGpuFaultState()?.deviceLost).toBe(true);
 
-    // The rebuild: a NEW renderer registers, wiping the LIVE fault state — matching the
+    // The rebuild: a NEW viewport attaches, wiping the LIVE fault state — matching the
     // "SURVIVING" test's premise above.
-    setActiveRendererHandle({ domElement: { addEventListener: vi.fn() } } as never);
+    await attachViewportDetection();
     expect(getGpuFaultState()).toBeNull();
 
     // Recovery IN PLACE: a real frame runs again well inside STALL_MS of the loss.

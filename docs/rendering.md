@@ -2908,6 +2908,10 @@ A repeat registration of the SAME renderer hands back the *existing* detach rath
 otherwise a caller keeping only the latest disposer (a `bringUp()` retry does exactly that) would
 clear `activeRenderer` while leaving `attachedRenderer` pinned to the corpse.
 
+⚠️ **`attachedRenderer` no longer exists — #802 deleted it** (see "One fix, two twin globals"
+below). The paragraphs above describe the state #720 left behind, which is what made #802
+reachable; `activeRenderer` and its `registrants` stack are still exactly as described.
+
 **A rebuild that REJECTS is now retried (#156), not dropped.** It used to be reported and abandoned,
 which was terminal by construction: the only thing that can ask for another attempt is a further
 `onRendererLost`, and once a rebuild has failed there is no live renderer left to lose — so that
@@ -2978,12 +2982,15 @@ nothing, `renderer.uid` never changed, and `render()` kept returning cleanly. �
 PERTURBATION, not by a screenshot — a capture never forces a render, so "the screen still looks
 right" only meant the last good frame was still on it; setting `visible = false` on the stage's
 children and rendering changed nothing, which is what proved the surface dead. Fixed by
-`attachDeviceLostListener` — the `device.lost` twin, mirroring `activeRenderer.ts`'s
-`attachWebGpuDeviceListeners`.
+`attachDeviceLostListener` — the `device.lost` twin of what was then `activeRenderer.ts`'s own
+`attachWebGpuDeviceListeners`. (#802 later deleted that function and moved the 3D viewports onto
+this same shared listener, so the two are now one implementation rather than twins — see "One fix,
+two twin globals".)
 
-⚠️ One deliberate difference from that twin: `activeRenderer` filters out `reason === 'destroyed'`
-because three destroys its own device on disposal and that code has no disposer, so it cried wolf
-at 61 FPS. `canvas2DPool` does NOT filter on reason. Pixi never calls `GPUDevice.destroy()` at all
+⚠️ One deliberate difference from the viewport policy: it filters out `reason === 'destroyed'`
+because three destroys its own device on disposal, and the original code had no disposer, so it
+cried wolf at 61 FPS. That filter now lives in `makeViewportLossPolicy`, which suppresses the log
+as well as the report. `canvas2DPool` does NOT filter on reason. Pixi never calls `GPUDevice.destroy()` at all
 (`GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`), so a `'destroyed'` reason
 means something outside Pixi destroyed the device — a real loss for this surface, and a rebuild is
 the right answer.
@@ -3091,6 +3098,75 @@ budget is 3 losses per 60s **global to the process**, and exhausting it sets `re
 every surface. Routing editor previews into it would let a flapping preview panel disarm the
 GameView's own recovery. `canvas2DPool` already stayed out of it for the same reason, and still does.
 
+### One fix, two twin globals — and only one of them got it (#802, #810)
+
+`activeRenderer.ts` held **two** module globals with the same shape, and #720 fixed one of them.
+`activeRenderer` got a `registrants` **stack** whose disposer hands the handle back to the most
+recent survivor. Its twin `attachedRenderer` — the slot both detection paths guarded on with
+`if (renderer !== attachedRenderer) return` — kept the single slot, overwritten on attach and
+nulled on detach with **no re-seat**.
+
+That asymmetry is the whole of #802. Three surfaces register through one global (`SceneView`,
+`Scene3D`/GameView, `ParticleEditor`), so opening the Particle Editor took the detection slot from
+SceneView; closing it left the slot `null`, and nothing re-registers — `setActiveRenderer` runs only
+at renderer CREATION. **SceneView was then deaf to context loss for the rest of the session**, which
+is the #213 failure mode with no log and no rebuild, reintroduced through the side door by an
+ordinary UI action.
+
+**The fix was to delete the slot, not to stack it.** Detection is per-renderer by construction once
+it goes through `rendererLossHandling.ts`: the listeners live on that renderer's own canvas/device
+and the detach is per-attachment, so there is nothing to win or lose. `SceneView` and `Scene3D` now
+wire `attachRendererLossHandling` with `makeViewportLossPolicy` — the viewport sibling of
+`makePreviewLossPolicy` in the table above — and `setActiveRendererHandle` keeps only its
+texture/KTX2-caps role. `RendererLostInfo.renderer` now names the renderer that actually died rather
+than whichever one held the slot, so the second viewport is routed correctly instead of never being
+heard at all.
+
+That split also closed a hazard the coupling hid: `ParticleEditor` calls `setActiveRenderer` purely
+for KTX2 `detectSupport`, and that registration used to arm the **gameplay** recovery budget as a
+side effect — exactly what the warning above says must not happen.
+
+**Three things a refactor of this path is expected to lose.** The file says so itself, and the two
+filters were paid for by shipping a diagnostic that called a healthy 61 fps editor dead:
+- `reason === 'destroyed'` must report **and log** nothing. `logLoss` runs *before* `onLost`, so an
+  early return in `onLost` alone still prints the false alarm — `describe()` has to return `null` too.
+- The superseded-renderer filter, now the per-attachment `isStale` closure. Strictly more correct:
+  the old form treated a renderer superseded by an unrelated *panel* as stale.
+- The clean-slate `gpuFaultState = null` must run for **every** viewport attach, not just WebGPU
+  ones. It now lives in `attachUncapturedErrorListener`, whose body bails early when there is no
+  WebGPU device — so placing the reset below that bail-out silently exempts the **WebGL** path,
+  which is what three's WebGL2 fallback takes on every low-end device we ship to. A rebuild after a
+  loss would then keep reporting the healthy renderer as dead, and a stale loss outranks every other
+  explanation in `explainCaptureFailure`.
+
+**The lesson generalises past rendering, which is why #810 exists.** Stated at the level the
+symptoms share: *per-instance ownership in a module-level single slot, where the take path
+overwrites unconditionally and the release path nulls without re-seating a survivor.* **"Null it if
+it is still mine" is only ever half a contract** — it guards the release and leaves the take bare,
+which is precisely the half each of these sites had already written. The same shape was live in
+`editor/scene/playMode.ts` (`_modeOwner`) and `editor/scene/timelinePreview.ts` (`_saveHandler`),
+both driven by TimelineEditor + AnimationEditor, and in `runtime/core/gpuTimings.ts`
+(`armedRenderer`, which leaked `trackTimestamp` on every renderer it displaced).
+
+⚠️ **The right fix is not always a stack** — this is the part worth carrying forward. `_saveHandler`
+is a plain slot, so a re-seating registry is exactly right. `_modeOwner` is not: `RunMode` is
+genuinely **single-valued**, so once panel B enters, panel A's preview is over globally and there is
+no slot to hand back. What A lacked was NOTICE — its rAF is keyed on `[playing, rootId]` and its tick
+never consults `getRunMode()`, so it went on mutating authored traits while the run mode read
+`stopped`. That site needed a displacement callback, and a stack would have been a confident,
+plausible, wrong fix. Ask what the displaced owner is missing — the slot, or the news — before
+reaching for the pattern that worked next door.
+
+⚠️ **A displaced panel must stop its OWN loop, never the shared flag.** Both editor panels read one
+`isPreviewPlaying` store flag, so `setPreviewPlaying(false)` is not "stop my panel", it is "stop the
+global preview". The first cut of #810 had the displaced callback do exactly that, and with both
+panels docked one ▶ press stopped itself: AnimationEditor enters preview synchronously, the
+Timeline's async session-open takes the mode a microtask later and displaces it, and Animation's
+callback then killed the flag the Timeline had just started on. `editor/panels/previewLoopGuard.ts`
+is the mechanism that avoids it — cancel this run's rAF and block its reschedule, leave the flag to
+whoever owns the mode. Its tick checks `stopped` *before* rescheduling, because a bare
+`cancelAnimationFrame` loses the race against a tick already queued.
+
 **The guard, and the trap it was written around.**
 `engine/tests/architecture/rendererLossHandling.test.ts` pairs every renderer/`Application`
 construction site with an attach call into the shared module — sibling to `glContextRelease.test.ts`
@@ -3098,10 +3174,19 @@ construction site with an attach call into the shared module — sibling to `glC
 census, kept as two files so a red in one is never ambiguous with the other. Its first draft also
 accepted `setActiveRenderer(` as evidence of detection, which made it unable to police
 `ParticleEditor` — that panel calls `setActiveRenderer` too, so deleting its attach call left the
-guard green. The three surfaces that legitimately wire detection elsewhere — `SceneView.tsx` and
+guard green. The three surfaces that legitimately wired detection elsewhere — `SceneView.tsx` and
 `scene3DSync.ts` via `core/activeRenderer.ts`'s `attachGpuFaultListeners`, and `Scene3D.tsx` via its
-own `onRendererLost` + `createRendererRecovery` — are now allowlisted BY NAME instead, so the
-exemption cannot spread to a new construction site.
+own `onRendererLost` + `createRendererRecovery` — were allowlisted BY NAME instead, so the exemption
+could not spread to a new construction site.
+
+**Two of those three exemptions are gone since #802**, which is the objective measure that it
+landed: `SceneView.tsx` and `Scene3D.tsx` now call `attachRendererLossHandling` directly and are
+policed like any other construction site. `scene3DSync.ts` keeps its entry for a reason that has
+nothing to do with #802 — `createRenderer` and `makeWebGPURenderer` are DECLARED in that file, so
+`CONSTRUCT_RE` matches their own declarations whatever the file does with a renderer. The real
+construction call site is `Scene3D.tsx`'s `bringUp()`, the only caller of `createRenderer`, which is
+where the attach lives; wiring a second attach in `scene3DSync.ts` to satisfy the guard would
+double-fire every GameView loss.
 
 ⚠️ **The census must name every FACTORY, not just the `new` expressions.** The same guard's first
 draft matched `makeWebGPURenderer(` but not `createRenderer(`, and `Scene3D.tsx` — the shipped-game
@@ -3110,8 +3195,8 @@ not policed, and not allowlisted either, so nothing said it was uncovered. A con
 names a factory builds a renderer just as surely as one that says `new`. Found by this change's own
 close-out sweep, after the guard had already been mutation-checked against two other panels.
 
-That older route's own detection lives in a single global slot another renderer can take — filed,
-not fixed: **#802**.
+That older route's own detection lived in a single global slot another renderer could take. Fixed
+in **#802** — see "One fix, two twin globals" above.
 
 **Measured, not inferred (2026-09-06, Electron editor on macOS).** All four preview surfaces were
 driven with a REAL loss and each produced its log line and tore down: `ModelPreview` and

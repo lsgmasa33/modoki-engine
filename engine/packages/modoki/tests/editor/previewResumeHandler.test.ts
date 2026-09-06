@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   setPreviewSaveHandler, clearPreviewSaveHandler, resumeHandlerFor,
-  currentPreviewSaveHandlerFor, type PreviewSaveHandler,
+  currentPreviewSaveHandlerFor, getPreviewSaveHandler, type PreviewSaveHandler,
 } from '../../src/editor/scene/timelinePreview';
 
 const handler = (
@@ -25,9 +25,11 @@ const handler = (
 
 describe('resumeHandlerFor', () => {
   beforeEach(() => {
-    // Leave the registry empty between cases — it is module state.
-    const cur = currentPreviewSaveHandlerFor('timeline') ?? currentPreviewSaveHandlerFor('animation');
-    if (cur) clearPreviewSaveHandler(cur);
+    // Leave the registry empty between cases — it is module state, and it is now a STACK
+    // (#810), so a single top-clear is not enough when a prior case left more than one entry
+    // registered (e.g. two `setPreviewSaveHandler` calls with no matching clear) — drain it.
+    let cur: PreviewSaveHandler | null;
+    while ((cur = getPreviewSaveHandler())) clearPreviewSaveHandler(cur);
   });
 
   it('falls back to the pre-cycle handler when the suspend DEREGISTERED the owner', () => {
@@ -100,5 +102,40 @@ describe('resumeHandlerFor', () => {
     const fresh = handler('timeline', 'fresh');
     setPreviewSaveHandler(fresh);
     expect(resumeHandlerFor('timeline', started)).toBe(fresh);
+  });
+});
+
+describe('_saveHandler registry (#810 — re-seating, not overwrite-and-drop)', () => {
+  beforeEach(() => {
+    let cur: PreviewSaveHandler | null;
+    while ((cur = getPreviewSaveHandler())) clearPreviewSaveHandler(cur);
+  });
+
+  it('clearing the NEWER registration hands the slot back to the older survivor, not null', () => {
+    // The bug: TimelineEditor registers, AnimationEditor registers (used to silently drop
+    // Timeline's), AnimationEditor unmounts and clears — the old code nulled the slot even
+    // though Timeline never left.
+    const t = handler('timeline', 'T');
+    const a = handler('animation', 'A');
+    setPreviewSaveHandler(t);
+    setPreviewSaveHandler(a);
+    clearPreviewSaveHandler(a);
+    expect(getPreviewSaveHandler()).toBe(t); // NOT null
+  });
+
+  it('a non-owner clear still cannot clear the current registration', () => {
+    const t = handler('timeline', 'T');
+    const rogue = handler('animation', 'rogue'); // never registered
+    setPreviewSaveHandler(t);
+    clearPreviewSaveHandler(rogue);
+    expect(getPreviewSaveHandler()).toBe(t);
+  });
+
+  it('registering the same handler object twice then clearing once leaves nothing registered', () => {
+    const t = handler('timeline', 'T');
+    setPreviewSaveHandler(t);
+    setPreviewSaveHandler(t); // re-seat, not duplicate
+    clearPreviewSaveHandler(t);
+    expect(getPreviewSaveHandler()).toBeNull();
   });
 });

@@ -581,7 +581,8 @@ export class Canvas2DPool {
     // A lost WebGL context is INVISIBLE from every other angle: the canvas keeps its size and its
     // place in the DOM, the ECS stays correct, and `renderAll` keeps issuing draws that do
     // nothing. The screen just goes blank. The 3D path has watched for this since #121; this is
-    // the 2D twin of `attachWebGlContextLostListener` in `core/activeRenderer.ts`.
+    // the 2D twin of the 3D viewports' `attachRendererLossHandling` wiring (#802 replaced
+    // `core/activeRenderer.ts`'s own `attachWebGlContextLostListener` with that shared contract).
     //
     // Attached at CREATION, before `initSlotApp`, deliberately: the loss we actually hit happened
     // at boot on an iPhone 8 launched from Xcode, and a listener added after `init()` resolves

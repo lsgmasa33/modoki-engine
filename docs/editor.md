@@ -1270,6 +1270,29 @@ runtime) safe: those writes only ever happen while playing, and Stop throws them
 they reach disk. Transitions emit `!play`/`!pause`/`!stop` to the editor journal (see
 [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept").
 
+**The scrub/preview run-modes carry an OWNER, and taking it now NOTIFIES the panel that lost it
+(#810).** `RunMode` is a single global that both the Timeline and Animation panels drive, so each
+tags its transitions with an `owner` and `exitPreviewMode(owner)` refuses to tear down a mode a
+different panel holds. That guard covers only the panel that never entered: once panel B enters
+legitimately — an ordinary ruler drag — it owns the mode, and B's exit then returned the global to
+`stopped` while A's preview rAF was still running and still mutating authored traits, because that
+loop is keyed on `[playing, rootId]` and never consults `getRunMode()`. `registerModeOwnerDisplaced`
+closes it: taking the mode tells the previous owner, which stops its own loop.
+
+⚠️ Three traps live in that mechanism. **The notification must fire after the new mode is set** —
+before it, TimelineEditor's `if (getRunMode() === 'preview')` cleanup clobbers the transition being
+entered. But that ordering is **necessary, not sufficient**: it makes the guard decline only when the
+new mode is `'scrub'`; a `'preview'` displacer passes it and steals the ownership back. What makes it
+safe is that **no displacement callback re-enters a mode transition** — they only stop their own rAF.
+Second, **a displaced panel must stop its own rAF, never call `setPreviewPlaying(false)`** —
+`isPreviewPlaying` is one flag BOTH panels read, so that stops the global preview rather than the
+panel. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
+press**, so each would take the mode from the other — and the Timeline always lands second (its entry
+is behind an await), so it always won and always stopped the Animation panel's loop. Pressing ▶ in
+the Animation panel played nothing at all. A panel now drives the preview only when it owns it. Full mechanism, and why this site needed a displacement
+callback where its sibling `timelinePreview._saveHandler` needed a re-seating stack:
+[rendering.md](./rendering.md) § "One fix, two twin globals".
+
 **Stop pressed during Play's startup window is queued, not dropped (#470).** `enterPlay` awaits
 several times (ending a Timeline preview session, `serializeScene()` for the primary and each base)
 before the final `setPlayState('playing')`, and `getPlayState()` still reads `'stopped'` for that

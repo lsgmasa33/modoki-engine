@@ -47,7 +47,9 @@ import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rend
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import {
   noteRendererProgress, reportRendererInitFailure, clearRendererInitFailure, onRendererLost,
+  makeViewportLossPolicy, attachUncapturedErrorListener,
 } from '../../runtime/core/activeRenderer';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
 import { disposeSceneViewEntityObjects } from './sceneViewResources';
@@ -2631,6 +2633,38 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     rendererRef.current = renderer;
 
     let disposed = false;
+    // GPU-context/device loss detection (#802) — wired directly rather than relying on
+    // `setActiveRenderer`'s shared handle, which no longer arms any fault channel: a second
+    // registrant (the Particle Editor, or GameView) used to silently disarm this viewport's
+    // detection by re-seating the old single-slot `attachedRenderer`. `disposed` above is set at
+    // the START of `cleanup` below, which runs on both real unmount AND the context-loss rebuild
+    // path (`teardownViewport()`), so a superseded renderer from either path stops speaking.
+    //
+    // `attachContextLossListeners` (inside `attachRendererLossHandling`) calls
+    // `e.preventDefault()` on the WebGL path; the pre-#802 code here deliberately did not, because
+    // three's own `WebGLBackend` listener already does — a second `preventDefault()` on the same
+    // event changes nothing, so this is a known, harmless behaviour change, not an oversight.
+    // `isStale` compares renderer IDENTITY, not just this run's `disposed` flag — matching
+    // `Scene3D.tsx`'s. The deleted `attachGpuFaultListeners` refused a second attach for a renderer
+    // it already held (`if (renderer === attachedRenderer) return attachedDetach`), and the shared
+    // contract has no equivalent, so two live attachments on ONE canvas would turn one
+    // `webglcontextlost` into two `reportRendererLoss` calls and spend two of the three recovery
+    // attempts on a single loss.
+    //
+    // ⚠️ That is NOT reachable here, and an earlier cut of this comment asserted it was — via this
+    // setup's documented throw plus a remount reusing the lease. It cannot happen: the lease map in
+    // `rendererLease.ts` is keyed on the CONTAINER NODE and `ThreeJSViewport` is rendered with no
+    // `key`, so a remount is a new React instance with a new container div — new lease, new
+    // renderer, new canvas. What the identity check actually earns is silencing an orphaned
+    // attachment from a SUPERSEDED renderer (the `recovery.rebuild()` path calls
+    // `discardRenderer(container)`, so setup 2 builds a different one), where a closure-local
+    // `disposed` never goes true for the orphan.
+    const isStale = () => disposed || rendererRef.current !== renderer;
+    const detachRendererLoss = attachRendererLossHandling(
+      { canvas: renderer.domElement, device: (renderer as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
+      { label: 'SceneView', isStale, ...makeViewportLossPolicy({ renderer, isStale }) },
+    );
+    const detachUncapturedError = attachUncapturedErrorListener(renderer);
 
     // ── Scene ───────────────────────────────────────────
     const scene = new THREE.Scene();
@@ -4837,6 +4871,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     cleanup = () => {
       disposed = true;
+      detachRendererLoss();
+      detachUncapturedError();
       _pickBillboardInUI = null; // drop the 2D-overlay picking bridge into the disposed viewport
       unregisterFocusHandler();
       unregisterViewportController();

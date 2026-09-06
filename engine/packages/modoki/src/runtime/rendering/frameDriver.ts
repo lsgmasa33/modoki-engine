@@ -327,9 +327,9 @@ let unrecoverable = false;
 /** Latched copy of `activeRenderer.getGpuFaultState()` at the moment `onRendererLost` fired,
  *  kept because reading `getGpuFaultState()` LIVE at report time is provably too late: the
  *  production sequence is `reportRendererLoss` -> `onRendererLost` -> `rendererRecovery` (a
- *  ~250ms delay) -> the viewport's `bringUp()` -> `setActiveRenderer` -> `setActiveRendererHandle`
- *  -> `attachGpuFaultListeners`, which unconditionally does `gpuFaultState = null` for the NEW
- *  renderer. Against the plan doc's own iPhone-8 trace the loss is at +1,136,882 and the stall
+ *  ~250ms delay) -> the viewport's `bringUp()` -> its own `attachUncapturedErrorListener`, which
+ *  unconditionally does `gpuFaultState = null` for the NEW renderer (that reset moved off
+ *  `setActiveRendererHandle` in #802, but it still happens on every viewport bring-up). Against the plan doc's own iPhone-8 trace the loss is at +1,136,882 and the stall
  *  fires at +1,139,989 — over a full STALL_MS later, long after that 250ms-delayed rebuild has
  *  already wiped the state this module used to read. Latching at the loss event, not at report
  *  time, is the only way the stall/unrecoverable report can still name the cause. Cleared when the

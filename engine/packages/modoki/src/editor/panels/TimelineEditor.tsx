@@ -26,7 +26,9 @@ import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
+import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
+import { panelDrivesPreview, panelMayStopPreview } from './previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
 import {
   defaultTimeline, normalizeTimeline,
@@ -79,6 +81,12 @@ export default function TimelineEditor() {
   const rootId = useEditorStore((s) => s.directorRootEntityId);
   const playhead = useEditorStore((s) => s.playheadTime);
   const playing = useEditorStore((s) => s.isPreviewPlaying);
+  // WHICH panel's ▶ started this preview (#810 follow-up). `isPreviewPlaying` is shared with
+  // AnimationEditor, so without this both panels' preview effects run on one press and each
+  // takes the single-valued RunMode from the other — and this panel always lands SECOND (its
+  // entry sits behind an await), so it silently killed the Animation panel's playback. null =
+  // unclaimed (a programmatic setPreviewPlaying(true)); keep the old any-panel behaviour there.
+  const previewOwner = useEditorStore((s) => s.previewOwner);
   // Reactive run-mode for the transport (status text + Exit-Preview button visibility). scrub and
   // preview are the two states of the preview-session envelope; stopped = editing.
   const runMode = useSyncExternalStore(onRunModeChange, getRunMode);
@@ -127,7 +135,12 @@ export default function TimelineEditor() {
   // dispatch gates SYNCHRONOUSLY. Relying on the preview effect's cleanup alone lets one already-
   // scheduled tick fire (React defers the cleanup), advancing the playhead past the grab point (C7).
   const previewRafRef = useRef(0);
+  // The CURRENT preview effect run's guard, or null while not previewing (#810 follow-up). Lets
+  // `registerModeOwnerDisplaced`'s callback — which fires OUTSIDE this effect's closure — stop
+  // THIS run's tick without touching the shared `isPreviewPlaying` flag. See previewLoopGuard.ts.
+  const previewLoopGuardRef = useRef<PreviewLoopGuard | null>(null);
   const stopPreviewLoop = useCallback(() => {
+    previewLoopGuardRef.current?.stop();
     cancelAnimationFrame(previewRafRef.current);
     previewRafRef.current = 0;
     setTimelinePreviewActive(false); // close audio + dispatch gates now, not after the deferred cleanup
@@ -466,6 +479,25 @@ export default function TimelineEditor() {
     return () => clearPreviewSaveHandler(mine);
   }, [playing, runMode]);
 
+  // ── Displacement (#810): the Animation panel taking the mode (a clip scrub/preview) ends OUR
+  // preview GLOBALLY — `RunMode` is single-valued — but nothing else tells this panel's rAF loop
+  // to stop, and its tick body never consults `getRunMode()`.
+  //
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Animation panel
+  // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
+  // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
+  // itself: Animation enters first (no notify yet), Timeline's async session-open resolves a
+  // microtask later and takes the mode, displacing Animation — whose callback (the first #810
+  // pass) then killed the flag Timeline's own just-started preview was keyed on. Confirmed live in
+  // `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS run's guard is
+  // what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole lifetime, not
+  // gated on `playing` — a displacement can arrive between preview sessions just as easily as
+  // during one, and the callback is a no-op when no guard is live.
+  useEffect(() => registerModeOwnerDisplaced('timeline', () => {
+    previewLoopGuardRef.current?.stop();
+    previewRafRef.current = 0;
+  }), []);
+
   // ── Preview playback loop ──
   // ── ▶ Preview: a real FORWARD playthrough — poses (keyframe + skeletal seek + activation) AND
   //    fires signals/audio/OnSequence via previewTimelineStep, with the sim otherwise stopped. The
@@ -473,16 +505,24 @@ export default function TimelineEditor() {
   //    audio/dispatch gates only while advancing; scrub/⏮/unmount revert. ──
   useEffect(() => {
     if (!playing) return;
-    let raf = 0;
+    if (!panelDrivesPreview(playing, previewOwner, 'timeline')) return; // the Animation panel's ▶, not ours
+    // Created synchronously (before the await below) so a displacement landing WHILE we are still
+    // opening our own session — e.g. this panel held `scrub` ownership a moment ago and gets
+    // displaced before it ever calls its own `enterPreviewMode` — is still observed once the await
+    // resolves (#810 follow-up).
+    const guard = createPreviewLoopGuard();
+    previewLoopGuardRef.current = guard;
     let last = performance.now();
     let cancelled = false;
     void (async () => {
       await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
-      if (cancelled) return;
+      if (cancelled || guard.stopped) return; // displaced before we ever took the mode ourselves
       setTimelinePreviewActive(true);      // open audio + action-dispatch gates
       enterPreviewMode(true, 'timeline');  // carry the run-mode signal (gates still read the active flag until Phase 4)
       const tick = () => {
-        raf = requestAnimationFrame(tick);
+        if (guard.stopped) return; // displaced — do not reschedule (checked BEFORE scheduling)
+        const raf = requestAnimationFrame(tick);
+        guard.arm(raf);
         previewRafRef.current = raf; // keep the ref live so scrub()/exit can cancel synchronously (C7)
         const now = performance.now();
         const dt = Math.min((now - last) / 1000, 0.05);
@@ -499,7 +539,8 @@ export default function TimelineEditor() {
         fireDirtyListeners();
         if (t >= cur.duration) useEditorStore.getState().setPreviewPlaying(false); // stop at the end (non-looping)
       };
-      raf = requestAnimationFrame(tick);
+      const raf = requestAnimationFrame(tick);
+      guard.arm(raf);
       previewRafRef.current = raf;
     })();
     // Pause/stop/unmount clears the active flag (silences audio, blocks dispatch) but KEEPS the
@@ -508,12 +549,25 @@ export default function TimelineEditor() {
     // a real teardown (unmount/world-swap/asset-switch) runs its own exit effect → stopped.
     // Guard (review L1): a scrub()/⏮ during preview flips `playing` off AND synchronously sets mode
     // 'scrub' BEFORE this cleanup runs — only freeze if we're still the live preview, else we'd
-    // clobber the just-set scrub back to 'preview'.
+    // clobber the just-set scrub back to 'preview'. Also: a DISPLACEMENT (not a scrub/exit of our
+    // own) already stopped the guard and cleared `previewRafRef` above, and does NOT flip `playing`
+    // (see the registration comment) — so this cleanup only runs here for OUR OWN teardown, never
+    // as a side effect of losing the mode to another panel. If it ever ran on displacement too, the
+    // `getRunMode() === 'preview'` check below would already read the NEW owner's mode and decline
+    // — same guard `enterPreviewMode`'s ordering relies on (see playMode.ts).
     return () => {
-      cancelled = true; cancelAnimationFrame(raf); previewRafRef.current = 0; setTimelinePreviewActive(false);
+      cancelled = true;
+      guard.stop();
+      // Release the ref only if it is still OURS. React runs this cleanup before the next run's
+      // body, so an unconditional null is safe TODAY — but "null it if it is still mine" is the
+      // exact shape #810 exists to delete, and an ordering change would make this clear a live
+      // guard with nothing to re-seat it.
+      if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null;
+      previewRafRef.current = 0;
+      setTimelinePreviewActive(false);
       if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline');
     };
-  }, [playing, rootId]);
+  }, [playing, previewOwner, rootId]);
 
   // ── Follow the live Director during real Play (Game view) ──
   // In Play mode the pipeline advances the bound Director; mirror its `time` onto the ruler playhead
@@ -549,7 +603,11 @@ export default function TimelineEditor() {
     // the run-mode reset both happened already, but `isPreviewPlaying` stayed true with no
     // panel to drive it — the same lie AnimationEditor's `isRecording` told. The binding is
     // kept on purpose so reopening the tab restores the timeline.
-    useEditorStore.getState().setPreviewPlaying(false);
+    // ⚠️ Only if the preview is OURS (or unclaimed). `isPreviewPlaying` is shared with the
+    // Animation panel, so an unguarded clear here stops ITS playback when this idle tab is merely
+    // closed or dragged to another tabset — see `panelMayStopPreview`.
+    const st = useEditorStore.getState();
+    if (panelMayStopPreview(st.previewOwner, 'timeline')) st.setPreviewPlaying(false);
   }, []);
 
   // A scene load / hot-reload swaps the world out from under the panel. Two things must happen:
@@ -592,7 +650,7 @@ export default function TimelineEditor() {
           // than silently no-op (common when the timeline stays open after switching scenes).
           if (!playing && rootId == null) { s.showToast('This scene has no Director bound to this timeline — nothing to preview. Open the scene that uses it (or add a Director whose timeline is this one).', 'warn'); return; }
           if (!playing && s.playheadTime >= (doc?.duration ?? 0)) s.setPlayhead(0);
-          s.setPreviewPlaying(!playing);
+          s.setPreviewPlaying(!playing, 'timeline');
         }}>{playing ? '⏸ Pause' : '▶ Play'}</button>
         <button data-ui-id="timeline.transport.rewind" style={btn} onClick={() => scrub(0)}>⏮</button>
         {/* Explicit way OUT of the preview envelope — reverts to authored (shown only while in preview). */}
