@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
+import { readScannedSource } from '@modoki/engine/testing';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -91,9 +92,8 @@ describe('/api/editor-action', () => {
   it('the teardown reasons above are the ones main.ts ACTUALLY sends (guard against drift)', async () => {
     // A hand-written list of strings rots silently — and a rotted list here fails OPEN, because an
     // unmatched message is treated as the op speaking. Read them out of the source instead.
-    const { readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const src = readFileSync(join(__dirname, '../../electron/main.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../electron/main.ts')).code;
     const sent = [...src.matchAll(/failPendingRenderer\(\s*'([^']+)'/g)].map((m) => m[1]);
     expect(sent.length, 'no failPendingRenderer calls found — did it move or get renamed?').toBeGreaterThan(0);
     for (const reason of sent) {
@@ -149,7 +149,7 @@ describe('drift guard: every literal MCP editorAction() name survives the router
   const mcpToolDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src/tools');
   const mcpSource = fs.readdirSync(mcpToolDir)
     .filter((f) => f.endsWith('.ts'))
-    .map((f) => fs.readFileSync(path.join(mcpToolDir, f), 'utf-8'))
+    .map((f) => readScannedSource(path.join(mcpToolDir, f)).code)
     .join('\n');
   const actionNames = [...mcpSource.matchAll(/editorAction\(\s*'([^']+)'/g)].map((m) => m[1]);
   const uniqueActionNames = [...new Set(actionNames)];

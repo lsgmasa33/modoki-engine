@@ -72,10 +72,11 @@
  *  `onViewUpdate`, above.
  *
  *  ── Why this purges DEAD renderer uids, not a live-set exclusion ────────────────────────────────
- *  `Canvas2DPool.rebuildSlotApp` passes the uid(s) of the renderer(s) it has destroyed for this slot
- *  and not yet swept (see `Canvas2DSlot.pendingDeadRendererUids` — usually one, but a rebuild whose
- *  `init()` timed out leaves its dead uid for the NEXT successful rebuild to sweep alongside its
- *  own). Those renderers no longer exist, so any `_gpuData[deadUid]` entry left on a surviving node
+ *  `Canvas2DPool` passes `deadRendererUids` — every renderer this PROCESS has destroyed, recorded
+ *  by both `rebuildSlotApp` and `teardownSlot` (see its doc comment in `canvas2DPool.ts` for why it
+ *  is process-wide and append-only rather than per-slot: a dead uid is safe to purge from anything,
+ *  anywhere, forever, and draining it on one slot's walk would strand a uid still stale on a shared
+ *  object reachable from another). Those renderers no longer exist, so any `_gpuData[deadUid]` entry left on a surviving node
  *  can never belong to a live renderer — deleting it needs no reasoning about what else is live. An
  *  earlier revision of this function instead took a caller-supplied "live renderer uids" set and
  *  deleted every key NOT in it; that was wrong in a way the single-pool tests could not see. Pixi
@@ -92,17 +93,14 @@
  *  old live-set sweep purged opportunistically: ANY later rebuild, on ANY slot in the pool, swept
  *  every non-live uid it found — including renderers destroyed by `teardownSlot` (reached from
  *  `destroyPool`, the `renderAll` shrink pass, and `reclaimIfUnclaimed`), not just ones destroyed by
- *  a rebuild. The uid-set scheme above sweeps only uids THIS slot recorded via a rebuild, so those
- *  other teardown paths' uids are no longer collected by anything. That is the trade for fixing the
- *  cross-pool correctness bug above (a live-set sweep could delete a LIVE renderer's entry off a
- *  shared resource) — a correctness bug beats a coverage regression. What accumulates on the
- *  now-uncollected paths is mostly **null-valued keys**, not retained GPU objects:
- *  `GCManagedHash.remove()` nulls a managed pipe's entry on a clean teardown (see the file header
- *  above), so a `teardownSlot` uid mostly leaves dead map entries behind, not live references. How
- *  much of that is real: concretely, each SceneView mount/unmount runs
- *  `editorCanvas2DPool.destroyPool()` and leaves one `_gpuData` key per process-global
- *  `TextureSource` shared with the game pool — unmeasured, and no teardown-path purge is built here
- *  to close it. */
+ *  a rebuild. For a while the replacement swept only uids recorded by a rebuild, which left those
+ *  other teardown paths uncollected — each SceneView mount/unmount runs
+ *  `editorCanvas2DPool.destroyPool()` and left one `_gpuData` key per process-global
+ *  `TextureSource` shared with the game pool. **That reach limit is now CLOSED (#801):**
+ *  `teardownSlot` records into the same process-wide `deadRendererUids` set as `rebuildSlotApp`, so
+ *  a uid retired by any path is purged by the next revalidation walk. Both properties hold at once
+ *  — the sweep is including-DEAD rather than excluding-LIVE, so it can never delete a live
+ *  renderer's entry off a shared resource, and it no longer misses the teardown paths either. */
 
 import type { Container } from 'pixi.js';
 
@@ -188,9 +186,9 @@ function markViewUpdated(node: WalkableNode): number {
  *                            no renderer ever ran on this slot yet) — in which case nothing is
  *                            purged, but the `onViewUpdate` pass still runs. Accepting the whole
  *                            set (not just the renderer from the CURRENT rebuild attempt) matters
- *                            when a prior attempt's `init()` timed out: that attempt never reached
- *                            its own purge call, so its dead uid is still owed a sweep — see
- *                            `Canvas2DSlot.pendingDeadRendererUids`'s doc comment in
+ *                            because a dead uid outlives the attempt that killed it — a timed-out
+ *                            `init()` never reaches a purge, and a renderer torn down via
+ *                            `teardownSlot` never had one — see `deadRendererUids`'s doc comment in
  *                            `canvas2DPool.ts`. Every uid in the set is still provably safe to
  *                            purge unconditionally: each one names a renderer that has already
  *                            been replaced.

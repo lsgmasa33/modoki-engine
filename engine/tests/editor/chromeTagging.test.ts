@@ -14,12 +14,12 @@
  *  list and CLAUDE.md in the same commit. Deleting one silently is not. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const ED = path.resolve(__dirname, '../../packages/modoki/src/editor');
-const read = (rel: string) => fs.readFileSync(path.join(ED, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(ED, rel)).code;
 
 /** Static ids appear verbatim; dynamic ones are template literals, so we match the
  *  literal prefix up to the first interpolation. */
@@ -447,7 +447,14 @@ describe('data-ui-id tagging has not rotted', () => {
     //
     // Keyed with `repoFiles()`'s own `rel` — repo-root-relative, git POSIX (#799/#771/#805 Phase
     // 4) — not the engine-relative form this used before migrating off a hand-rolled walker.
-    'engine/packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput // Bind the RAW stored name'],
+    //
+    // ⚠️ **The snippet must anchor on CODE, not on the comment beside it (#816).** This entry read
+    // `'<BufferedTextInput // Bind the RAW stored name'` until the scan started stripping comments
+    // — at which point the anchor text no longer existed in what was scanned, the exemption stopped
+    // matching, and an already-tagged field was reported as untagged. An allowlist keyed on prose
+    // is disarmed by any change to that prose, including someone simply rewording it. Binding the
+    // key to the prop the control actually reads is both stripping-proof and a truer identifier.
+    'engine/packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput value={editableEntityName('],
   };
 
   it('every BufferedNumberInput/BufferedTextInput passes a dataUiId prop (#724)', () => {
@@ -455,7 +462,7 @@ describe('data-ui-id tagging has not rotted', () => {
     let scanned = 0;
     for (const root of SCAN_ROOTS) {
       for (const { abs: file, rel } of listTsxFiles(root)) {
-        const src = fs.readFileSync(file, 'utf8');
+        const src = readScannedSource(file).code;
         const exempt = DATA_UI_ID_EXEMPT[rel] ?? [];
         for (const hit of findBufferedInputs(src)) {
           scanned++;
@@ -503,7 +510,7 @@ describe('data-ui-id tagging has not rotted', () => {
       { file: 'packages/modoki/src/editor/panels/inspectorFields.tsx', component: 'FieldValueWidget' },
     ];
     for (const { file, component } of HELPERS) {
-      const src = fs.readFileSync(path.resolve(__dirname, '../..', file), 'utf8');
+      const src = readScannedSource(path.resolve(__dirname, '../..', file)).code;
       const params = extractFunctionParams(src, component);
       expect(params, `${file}: could not find "function ${component}(" — has it been renamed or refactored?`).not.toBeNull();
       const m = /\bdataUiId\s*(\??)\s*:/.exec(params!);

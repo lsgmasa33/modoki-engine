@@ -9,13 +9,13 @@
  *  source-level assertion that it actually references `defaultAtlasSource`. */
 
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { registerBuiltinCreatableAssets } from '../../src/editor/panels/builtinCreatableAssets';
 import { getCreatableAssets } from '../../src/editor/panels/creatableAssets';
 import { defaultAtlasSource } from '../../src/runtime/loaders/spriteAtlas';
+import { readScannedSource } from '../helpers/sourceScanner';
 
-const src = (rel: string) => fs.readFileSync(path.join(__dirname, '../../src', rel), 'utf8');
+const src = (rel: string) => readScannedSource(path.join(__dirname, '../../src', rel)).code;
 
 describe('atlas default-document parity (#423)', () => {
   it('the Assets panel "Create Atlas" body matches { id, ...defaultAtlasSource() }', () => {
@@ -76,7 +76,7 @@ describe('atlas default-document parity (#423)', () => {
   });
 
   it('reimport-atlas.ts\'s readAtlasSource sources its fallback values from defaultAtlasSource', () => {
-    const s = fs.readFileSync(path.join(__dirname, '../../../../plugins/reimport-atlas.ts'), 'utf8');
+    const s = readScannedSource(path.join(__dirname, '../../../../plugins/reimport-atlas.ts')).code;
     expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/packages\/modoki\/src\/runtime\/loaders\/spriteAtlas'/);
     expect(s).toMatch(/const defaults = defaultAtlasSource\(\)/);
     // The range guards (`> 0`, `>= 0`) and the `raw.texture` preservation are readAtlasSource's

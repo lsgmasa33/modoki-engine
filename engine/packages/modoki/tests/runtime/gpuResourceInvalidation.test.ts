@@ -7,7 +7,7 @@
  *  is what actually restores a blank frame, not the `_gpuData` purge alone).
  *
  *  The purge target is a caller-supplied `deadRendererUids` set (renderers that have already been
- *  destroyed and are still owed a sweep — see `Canvas2DSlot.pendingDeadRendererUids`), not a
+ *  destroyed — see `deadRendererUids` in `canvas2DPool.ts`), not a
  *  "live renderer uids" set — see the file header for why a live-set exclusion is wrong once more
  *  than one renderer/pool exists. */
 

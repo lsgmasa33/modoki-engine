@@ -22,15 +22,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DEVICE_STATUS_TARGET_FIELDS } from '../../tools/game-debug-mcp/src/mcp-tools';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SRC = join(__dirname, '../../plugins/backend/deviceConnection.ts');
 
 /** The `target: { … } | null` member of `DeviceConnectStatus`, by its field names. */
 function realTargetFields(): string[] {
-  const src = readFileSync(SRC, 'utf8');
+  const src = readScannedSource(SRC).code;
   const iface = /export interface DeviceConnectStatus \{([\s\S]*?)\n\}/.exec(src);
   expect(iface, 'DeviceConnectStatus not found — did the interface move or get renamed?').toBeTruthy();
   const target = /^\s*target:\s*\{([^}]*)\}/m.exec(iface![1]);
@@ -66,7 +66,7 @@ describe('device MCP status mirror vs DeviceConnectStatus', () => {
   it('no device tool reads a status field through an inline cast that could invent one', () => {
     // The mechanism, not just the two instances: every `/api/device/status` read must go through
     // the typed mirror, so a future field can't be conjured by a fresh `as { … }`.
-    const src = readFileSync(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
     const reads = [...src.matchAll(/backendGet\('\/api\/device\/status'\)\)\s*as\s+([A-Za-z_$][\w$]*|\{[^;\n]*)/g)]
       .map((m) => m[1].trim());
     expect(reads.length, 'no status reads found — did the route or helper name change?').toBeGreaterThan(0);

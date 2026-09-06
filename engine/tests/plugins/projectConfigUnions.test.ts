@@ -105,8 +105,8 @@ describe('TONE_MAPPINGS stays in step with resolveToneMapping', () => {
     // that keeps them honest. A name added to the resolver but not here would be rejected as
     // out-of-union despite working; a name here but not in the resolver would silently render as
     // ACESFilmic via the `default` branch.
-    const src = await import('node:fs').then((fs) =>
-      fs.readFileSync('engine/packages/modoki/src/runtime/rendering/renderSettings.ts', 'utf8'));
+    const src = await import('@modoki/engine/testing').then(({ readScannedSource }) =>
+      readScannedSource('engine/packages/modoki/src/runtime/rendering/renderSettings.ts').code);
     const body = src.slice(src.indexOf('export function resolveToneMapping'));
     const end = body.indexOf('\n}');
     const cases = [...body.slice(0, end).matchAll(/case '([^']+)':/g)].map((m) => m[1]);

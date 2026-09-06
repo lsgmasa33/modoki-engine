@@ -34,7 +34,7 @@ import { Application, Container } from 'pixi.js';
 import { getWebGPUSupported } from './gpuDetect';
 import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
-import { createRendererRecovery, type RendererRecovery } from './rendererRecovery';
+import { createRendererRecovery, type RendererRecovery, REBUILD_BRINGUP_TIMEOUT_MS } from './rendererRecovery';
 import {
   attachContextLossListeners,
   attachDeviceLostListener as attachDeviceLostListenerPrimitive,
@@ -42,6 +42,7 @@ import {
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { noteGpuContextCreated, noteGpuContextDestroyed, liveGpuContextCount } from '../core/gpuContextTracking';
 import { revalidateSubtreeAfterRendererRebuild } from './gpuResourceInvalidation';
+import { withTimeout } from '../core/abandonment';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
  *  honor an explicit `pixi.backend` render-setting ('webgpu'/'webgl'), else fall
@@ -145,15 +146,23 @@ export interface Canvas2DSlot {
    *  once `slot.ready` settles AND from `teardownSlot`, so the watchdog can never fire into a
    *  torn-down slot and no fake-timer test is left holding a live timer. Idempotent. */
   initWatchdog?: () => void;
-  /** Renderers destroyed for this slot whose `_gpuData` has not been purged yet (#678). A rebuild
-   *  whose `init()` throws (see `APP_INIT_TIMEOUT_MS`) leaves entries here for the NEXT attempt to
-   *  sweep — `rebuildSlotApp` accumulates onto this array before the timed-out init, and the
-   *  `revalidateSubtreeAfterRendererRebuild` call after a SUCCESSFUL init purges and clears the
-   *  whole list, not just the uid from the attempt that succeeded. Without this, a renderer whose
-   *  init timed out is never purged by any path: `slot.app` on the retry is the abandoned,
-   *  never-initialised Application from the failed attempt, so capturing just its uid purges
-   *  nothing for the ORIGINAL dead renderer. */
-  pendingDeadRendererUids?: number[];
+  /** This slot is mid-REBUILD and still owes its surviving subtree the post-rebuild cure —
+   *  `revalidateSubtreeAfterRendererRebuild` plus the full-redraw flag (#678, #801).
+   *
+   *  ⚠️ Set by `rebuildSlotApp` BEFORE the init and discharged by `initSlotApp`'s own success
+   *  path, deliberately — NOT by `rebuildSlotApp`'s tail, where it used to live. A rebuild whose
+   *  `init()` exceeds `APP_INIT_TIMEOUT_MS` REJECTS but does not CANCEL: `rebuildSlotApp` throws
+   *  at the `await` and everything below it is unreachable, while the abandoned `init()` runs on.
+   *  Once recovery has spent its attempts nothing reassigns `slot.app`, so that late init's
+   *  `slot.app !== app` bail-out does not fire either and it takes the FULL success path — a
+   *  healthy live renderer with the surviving subtree attached and no `onViewUpdate()` on any of
+   *  it, which is #678's blank frame wearing a different hat. Putting the cure on the same success
+   *  path as the bring-up means whichever attempt actually produces a renderer is the attempt that
+   *  cures it, and there is no longer a second place where "it worked" is decided.
+   *
+   *  Not needed for a FIRST init (there is no surviving subtree and no dead renderer), which is
+   *  why this is a flag rather than something `initSlotApp` infers. */
+  revalidateOwed?: boolean;
 }
 
 /** How long a REBUILD's `Application.init()` (after context loss) may take before it counts as
@@ -171,16 +180,48 @@ export interface Canvas2DSlot {
  *  reachable only from a `webglcontextlost` event, which needs a context that came up in the first
  *  place — so the only honest improvement available for the first init is to make a slow bring-up
  *  LOUD, not to fail it. See `createSlot`. */
-const APP_INIT_TIMEOUT_MS = 8000;
+// Sourced from `rendererRecovery`, not re-typed: the 2D pool and the 3D viewports share one
+// rebuild policy and must not disagree about when a bring-up has failed. This alias exists only
+// because the local name carries the measured history below; the NUMBER has exactly one home.
+// ⚠️ Used for two things at this one value: the REBUILD bound (rejects, retryable) and the FIRST
+// -init watchdog (warns only, never rejects — see `createSlot`). That asymmetry is the measured
+// part; see `REBUILD_BRINGUP_TIMEOUT_MS`'s own comment.
+const APP_INIT_TIMEOUT_MS = REBUILD_BRINGUP_TIMEOUT_MS;
 
-/** Reject if `p` has not settled within `ms`. The rejection is what lets `rendererRecovery` retry
- *  with backoff; without it a hung bring-up stalls recovery forever, in silence. */
-function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`${what} did not settle within ${ms}ms`)), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
-  });
-}
+/** Every Pixi renderer this PROCESS has destroyed, by uid — the purge keys for
+ *  `revalidateSubtreeAfterRendererRebuild` (#678, #801).
+ *
+ *  ⚠️ **Module-level, not per-slot, and append-only.** Both halves are deliberate.
+ *
+ *  MODULE-LEVEL because the insight that makes this design safe — *a dead renderer's uid is safe
+ *  to purge from anything, anywhere, forever* — needs no live-set reasoning and therefore needs no
+ *  slot scoping. Per-slot cost three things: it could not reach renderers destroyed via
+ *  `teardownSlot` (`destroyPool`, the `renderAll` shrink pass, `reclaimIfUnclaimed`), which is a
+ *  reach limit a previous round documented and accepted UNMEASURED; it could not let one pool's
+ *  dead uid be swept off a process-global `TextureSource` that another pool's subtree also holds
+ *  (`editorCanvas2DPool` is live alongside `defaultPool`); and it forced every reader to re-derive
+ *  slot-reuse safety by hand.
+ *
+ *  This is strictly a SUPERSET of the old per-slot reach and structurally cannot reintroduce the
+ *  cross-pool bug from an earlier round: that bug was *excluding-live* (building a live-uid set
+ *  from one pool's slots and purging everything else, which deletes another pool's still-live
+ *  entry off a shared texture). This is *including-dead*, which has no such failure mode.
+ *
+ *  APPEND-ONLY because draining it on a walk would be wrong the moment a second pool exists: slot
+ *  A's walk would clear a uid that is still stale on a shared object reachable from slot B, and
+ *  nothing would ever purge it again. Re-purging an already-purged uid is a no-op (`delete` on an
+ *  absent key), so keeping them costs a `delete` per node per uid and nothing else.
+ *
+ *  ⚠️ **Bounded, but not small in the EDITOR.** It grows by one per initialized slot per
+ *  `teardownSlot`, and `destroyPool()` runs on every SceneView unmount, every `Game.tsx` stop, every
+ *  layout change and every HMR remount — tens to hundreds over a long session, not "a handful". The
+ *  memory is trivial (numbers); what is not trivial is that
+ *  `revalidateSubtreeAfterRendererRebuild` loops the uids INSIDE its node loop, so a recovery walk
+ *  is O(nodes x dead-uids) at the one moment the device is already in trouble. If that is ever
+ *  measured to matter, the fix is to prune uids whose entries are provably gone, not to go back to
+ *  per-slot. A GAME process — where the recovery path actually runs — destroys renderers only on
+ *  scene swap and teardown, so there it really is a handful. */
+const deadRendererUids = new Set<number>();
 
 const MAX_SLOTS = 6;
 /** Frames a slot must throw consecutively before we treat it as stuck (not a blip). */
@@ -369,15 +410,15 @@ export class Canvas2DPool {
     let deadRendererUid: number | undefined;
     try { deadRendererUid = slot.app.renderer?.uid; } catch { /* renderer already dead — fine, see
       above: the purge below simply has nothing to purge this time */ }
-    // Accumulate onto the slot, not just a local — see `pendingDeadRendererUids`'s doc comment.
-    // If the `init()` below TIMES OUT this uid must survive to the NEXT rebuild attempt, because
-    // this attempt returns early (via the `!slot.initialized` guard) without ever reaching the
-    // purge call. Not gated on `slot.initialized`: on a retry after a timed-out init, `slot.app` is
-    // the abandoned, pre-`init()` Application from the failed attempt, whose `.renderer` is
-    // `undefined` — `deadRendererUid` reads as `undefined` there and this push is a no-op.
-    if (typeof deadRendererUid === 'number') {
-      (slot.pendingDeadRendererUids ??= []).push(deadRendererUid);
-    }
+    // Record it PROCESS-wide, not on the slot — see `deadRendererUids`. Recorded BEFORE the init
+    // below, because that init can time out and this uid must outlive the attempt that captured
+    // it. Not gated on `slot.initialized`: on a retry after a timed-out init, `slot.app` is the
+    // abandoned, pre-`init()` Application from the failed attempt, whose `.renderer` is
+    // `undefined` — `deadRendererUid` reads as `undefined` there and this is a no-op.
+    if (typeof deadRendererUid === 'number') deadRendererUids.add(deadRendererUid);
+    // This slot now owes its surviving subtree the post-rebuild cure. Discharged by whichever
+    // `initSlotApp` actually brings a renderer up — see `revalidateOwed`.
+    slot.revalidateOwed = true;
 
     // Detach the surviving scene graph BEFORE destroying, so the old app cannot take it down.
     slot.container.removeFromParent();
@@ -427,57 +468,15 @@ export class Canvas2DPool {
     // retries, nothing reports, and the surface stays blank in silence. That is exactly what the
     // first version of this did (measured: the loss was logged, and neither a success nor a
     // failure ever followed). A timeout converts it into a retryable rejection.
-    await withTimeout(this.initSlotApp(slot), APP_INIT_TIMEOUT_MS, 'Pixi Application.init');
-    // `initSlotApp` can complete having THROWN THE APP AWAY — the slot was disposed mid-rebuild, or
-    // a later rebuild superseded this one. Reporting success there would log "renderer rebuilt"
-    // for a renderer that does not exist, which is the same class of lie as the silent decline
-    // this commit's `onSkipped` exists to remove.
-    if (!slot.initialized) return;
-    slot.contextLost = false;
-
-    // #678 — revalidate the surviving scene graph after the rebuild. Two independent jobs, one
-    // walk (`gpuResourceInvalidation.ts`'s file header has the full mechanism + isolation-test
-    // evidence):
-    //  - mark every surviving view dirty via `onViewUpdate()`, so the graphics pipe takes its
-    //    rebuild branch again on the NEW renderer instead of leaving an empty batch. THIS is what
-    //    actually restores the frame.
-    //  - purge `deadRendererUid`'s `_gpuData` entry off every surviving node. Pixi's own
-    //    `GCManagedHash`-backed pipes null this out on a clean teardown, but `SpritePipe` and
-    //    `MeshPipe` are unmanaged and a context loss that THROWS mid-teardown can leave the
-    //    nulling partial — so some real orphans do survive. Worth fixing on its own merits
-    //    (unbounded growth of a per-process cache under repeated context losses); device-tested to
-    //    NOT be what fixes the blank frame on its own.
-    // The WHOLE accumulated set is passed — NOT just this attempt's `deadRendererUid` — because a
-    // PRIOR attempt's timed-out `init()` can have left its own dead uid unpurged (see
-    // `pendingDeadRendererUids`'s doc comment). Also NOT a caller-built "live uid set": a prior
-    // version of this call built a live set from THIS pool's own `this.slots` and purged
-    // everything else; that is wrong the moment a SECOND pool exists, because Pixi
-    // `TextureSource`s are process-global and shared across pools — `editorCanvas2DPool`
-    // (`editor/rendering/editorScene2D.ts`) is live alongside `defaultPool`, so a live set built
-    // from one pool's slots alone would delete the OTHER pool's still-live renderer's entry off a
-    // shared texture. Purging only uids that are PROVABLY dead (renderers this slot has actually
-    // destroyed) needs no live-set reasoning and cannot make that mistake. See
-    // `gpuResourceInvalidation.ts`'s file header for the full argument.
-    const deadUids = slot.pendingDeadRendererUids;
-    const { gpuDataPurged, viewsMarked } =
-      revalidateSubtreeAfterRendererRebuild(slot.container, deadUids);
-    // Clear only AFTER the purge call returns — a purge that throws must not lose the record of
-    // what still needs sweeping.
-    slot.pendingDeadRendererUids = undefined;
-
-    // The new renderer starts with an EMPTY frame, and Scene2D only redraws what it believes
-    // changed — so without a full redraw the surface stays blank behind a perfectly healthy
-    // context, which is the original bug wearing a different hat. Raised as a FLAG the renderer
-    // consumes rather than by calling `markScene2DDirty()` here: the pool must not import
-    // Scene2D. Scene2D already depends on the pool, and reaching back would make the two mutually
-    // recursive for no gain.
-    this._rebuiltSinceLastRender = true;
-    const uidCount = deadUids?.length ?? 0;
-    console.warn(
-      `[canvas2DPool] 2D renderer rebuilt after context loss (entity ${slot.entityId}` +
-      `${uidCount > 0 ? `, dead renderer uid(s) ${deadUids!.join(', ')}` : ''}). ` +
-      `Purged ${gpuDataPurged} stale GPU-data entries` +
-      `${uidCount > 1 ? ` across ${uidCount} dead renderers` : ''}, re-marked ${viewsMarked} views (#678).`,
+    await withTimeout(
+      this.initSlotApp(slot), APP_INIT_TIMEOUT_MS, 'Pixi Application.init',
+      // #801 — the timeout REJECTS but does not CANCEL, and once recovery has spent its attempts
+      // nothing reassigns `slot.app`, so a late-arriving init's `slot.app !== app` bail-out does
+      // not fire and it brings a renderer up for real. That is ADOPTED deliberately: a working
+      // surface beats a blank one. It is safe only because the cure now lives on `initSlotApp`'s
+      // own success path (see `revalidateOwed`) — before that it was adopted by accident, uncured,
+      // which is exactly #678's blank frame.
+      { adopt: 'a late init is taken: initSlotApp cures whichever attempt actually produces a renderer' },
     );
   }
 
@@ -549,6 +548,46 @@ export class Canvas2DPool {
     app.stage.addChild(slot.container);
     slot.initialized = true;
     noteGpuContextCreated();
+    // #678/#801 — the post-rebuild cure, on the SAME success path as the bring-up it cures.
+    //
+    // It used to live in `rebuildSlotApp`'s tail, which meant success was decided in two places
+    // and a timeout was enough to make them disagree: `rebuildSlotApp` threw at its `await` while
+    // this function ran on and brought a live renderer up, uncured. Here it cannot be skipped,
+    // whichever attempt wins.
+    //
+    // Two independent jobs, one walk (`gpuResourceInvalidation.ts`'s file header has the full
+    // mechanism + isolation-test evidence):
+    //  - mark every surviving view dirty via `onViewUpdate()`, so the graphics pipe takes its
+    //    rebuild branch again on the NEW renderer instead of leaving an empty batch. THIS is what
+    //    actually restores the frame.
+    //  - purge every dead renderer's `_gpuData` entry off every surviving node. Pixi's own
+    //    `GCManagedHash`-backed pipes null this out on a clean teardown, but `SpritePipe` and
+    //    `MeshPipe` are unmanaged and a context loss that THROWS mid-teardown can leave the
+    //    nulling partial — so some real orphans do survive. Worth fixing on its own merits;
+    //    device-tested to NOT be what fixes the blank frame on its own.
+    if (slot.revalidateOwed) {
+      slot.revalidateOwed = false;
+      slot.contextLost = false;
+      const { gpuDataPurged, viewsMarked } =
+        revalidateSubtreeAfterRendererRebuild(slot.container, deadRendererUids);
+      // The new renderer starts with an EMPTY frame, and Scene2D only redraws what it believes
+      // changed — so without a full redraw the surface stays blank behind a perfectly healthy
+      // context, which is the original bug wearing a different hat. Raised as a FLAG the renderer
+      // consumes rather than by calling `markScene2DDirty()` here: the pool must not import
+      // Scene2D. Scene2D already depends on the pool, and reaching back would make the two
+      // mutually recursive for no gain.
+      this._rebuiltSinceLastRender = true;
+      // ⚠️ Name the uids, not just the count. On a device this console line is the ONLY
+      // instrument (see this file's header), and "12 known process-wide" cannot be correlated with
+      // anything; the uids can. Falls back to a count once the set is too long to be readable —
+      // which only happens in a long editor session, where a device log is not the instrument.
+      const uids = [...deadRendererUids];
+      console.warn(
+        `[canvas2DPool] 2D renderer rebuilt after context loss (entity ${slot.entityId}, `
+        + `dead renderer uid(s) ${uids.length <= 8 ? uids.join(', ') : `${uids.length} known process-wide`}). `
+        + `Purged ${gpuDataPurged} stale GPU-data entries, re-marked ${viewsMarked} views (#678).`,
+      );
+    }
     // Unlike the WebGL listeners (attached at CREATION, before init, specifically to catch a
     // boot-time loss — see `createSlot`), this one can only attach AFTER `init()`: the GPUDevice
     // this reads off `app.renderer.gpu.device` does not exist until init has actually brought the
@@ -709,7 +748,20 @@ export class Canvas2DPool {
     slot.detachDeviceLost = undefined;
     slot.unpassthrough?.();
     slot.container.destroy();
-    if (slot.initialized) { slot.app.destroy(true); noteGpuContextDestroyed(); }
+    if (slot.initialized) {
+      // #801 — record this renderer as dead BEFORE destroying it, exactly as `rebuildSlotApp`
+      // does. Teardown was the reach limit of the old per-slot registry: `destroyPool`, the
+      // `renderAll` shrink pass and `reclaimIfUnclaimed` all destroy a renderer through here and
+      // recorded NOTHING, so its uid was never purged off a process-global `TextureSource` that
+      // another pool's subtree still holds. A SceneView mount/unmount cycle leaves one such
+      // null-valued key per shared source. Read defensively for the same reason as in
+      // `rebuildSlotApp`: a dead renderer can throw on a bare `uid` read.
+      let uid: number | undefined;
+      try { uid = slot.app.renderer?.uid; } catch { /* already dead — nothing to record */ }
+      if (typeof uid === 'number') deadRendererUids.add(uid);
+      slot.app.destroy(true);
+      noteGpuContextDestroyed();
+    }
     slot.recovery?.dispose();
   }
 

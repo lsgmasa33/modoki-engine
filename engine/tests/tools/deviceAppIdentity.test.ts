@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const getInfo = vi.fn();
 vi.mock('@capacitor/app', () => ({ App: { getInfo: () => getInfo() } }));
@@ -117,7 +118,7 @@ describe('handleAppIdentity — the leased device\'s hardware', () => {
  *  the only way to assert WHICH plugin is asked, since a mock answers either name happily. */
 describe('the hardware probe reads a plugin that is actually present (#146)', () => {
   it('asks capacitor-game-debug, never @capacitor/device', () => {
-    const src = readFileSync(path.join(__dirname, '../../app/debug/bridge.ts'), 'utf8');
+    const src = readScannedSource(path.join(__dirname, '../../app/debug/bridge.ts')).code;
     const fn = src.slice(src.indexOf('async function readDeviceHardware'));
     const body = fn.slice(0, fn.indexOf('\n}'));
     expect(body).toContain("import('capacitor-game-debug')");

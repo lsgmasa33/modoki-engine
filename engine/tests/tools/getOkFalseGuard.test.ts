@@ -26,8 +26,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const ROUTE_FILES = [
   '../../plugins/backend/editorBackendRouter.ts',
@@ -89,7 +89,7 @@ export function okFalseResponses(text: string): Array<{ hasStatus: boolean; snip
 describe('a GET route never answers a bare 200 with ok:false', () => {
   const blocks = ROUTE_FILES.flatMap((rel) => {
     const abs = join(__dirname, rel);
-    return getBlocks(rel, readFileSync(abs, 'utf8'));
+    return getBlocks(rel, readScannedSource(abs).code);
   });
 
   it('the scan has real targets (a text guard that finds nothing passes silently)', () => {
@@ -170,7 +170,7 @@ function postBlocks(file: string, src: string): Block[] {
 }
 
 describe('a POST route\'s ok:false always says WHY', () => {
-  const blocks = ROUTE_FILES.flatMap((f) => postBlocks(f, readFileSync(join(__dirname, f), 'utf8')));
+  const blocks = ROUTE_FILES.flatMap((f) => postBlocks(f, readScannedSource(join(__dirname, f)).code));
 
   it('reaches the POST routes at all (a text guard that lost its target fails OPEN)', () => {
     expect(blocks.length, 'no POST route blocks found — did the route dispatch shape change?').toBeGreaterThan(5);

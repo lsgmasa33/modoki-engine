@@ -17,20 +17,24 @@
  *  any one call site, so no per-tool test would catch a code quietly going stale. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ERROR_CODES } from '../../tools/shared/mcpResult';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const DOC_PATH = path.join(REPO_ROOT, 'docs/mcp-tool-conventions.md');
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'docs/mcp-tool-conventions.md is Markdown prose — the closed code set is parsed out of its text',
+} as const;
 
 /** Parse the `Closed code set (…): \`A\` · \`B\` · …` line straight out of the doc, rather than
  *  hand-copying it into the test — a hand-copied list is exactly the kind of second source that
  *  goes stale the moment either side is edited alone. */
 function docCodes(): string[] {
-  const src = fs.readFileSync(DOC_PATH, 'utf-8');
+  const src = readScannedSource(DOC_PATH, DOC_AS_PROSE).raw;
   const m = src.match(/Closed code set[^:]*:\s*([\s\S]*?)\.\n/);
   if (!m) throw new Error(`could not find the "Closed code set" line in ${DOC_PATH} §5 — has it been reworded?`);
   return [...m[1].matchAll(/`([A-Z_]+)`/g)].map((x) => x[1]);
@@ -82,8 +86,8 @@ describe('the §5 error-code set (docs/mcp-tool-conventions.md) stays closed and
    *  typo in the duplicated union would have gone uncaught. This is the check that actually
    *  enforces the claim. (Found by the close-out review of the commit that added it.) */
   it('sceneMutate.ts\'s locally-spelled EntityResolveCode is a real subset of ERROR_CODES', () => {
-    const src = fs.readFileSync(
-      path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime/scene/sceneMutate.ts'), 'utf-8');
+    const src = readScannedSource(
+      path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime/scene/sceneMutate.ts')).code;
     const m = src.match(/export type EntityResolveCode\s*=([^;]+);/);
     expect(m, 'EntityResolveCode declaration not found — has it moved or been renamed?').toBeTruthy();
     const codes = [...m![1].matchAll(/'([A-Z_]+)'/g)].map((x) => x[1]);
@@ -103,7 +107,7 @@ describe('the §5 error-code set (docs/mcp-tool-conventions.md) stays closed and
     // match the code's own name inside an unrelated comment or variable name.
     const files = allSourceFiles(SCAN_DIRS);
     const sources = files.map((f) => {
-      const src = fs.readFileSync(f, 'utf-8');
+      const src = readScannedSource(f).code;
       return f === MCP_RESULT_PATH ? withoutDeclaration(src) : src;
     });
 

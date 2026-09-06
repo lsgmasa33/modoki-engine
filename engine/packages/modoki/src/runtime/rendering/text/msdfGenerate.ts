@@ -18,6 +18,7 @@
  */
 
 import { MSDF, type MSDFAtlas } from '@zappar/msdf-generator';
+import { withTimeout, TimeoutError } from '../../core/abandonment';
 
 export type { MSDFAtlas };
 
@@ -70,12 +71,6 @@ let genQueue: Promise<unknown> = Promise.resolve();
 const INIT_TIMEOUT_MS = 10_000;
 const GENERATE_TIMEOUT_MS = 30_000;
 
-function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`[msdfGenerate] ${what} timed out after ${ms}ms — the MSDF worker is unreachable (missing worker script or wasm?)`)), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
-  });
-}
 
 /** The wasm binary's URL, resolved through the BUNDLER rather than by the worker.
  *
@@ -119,11 +114,45 @@ async function getGenerator(): Promise<MSDF> {
   initPromise = (async () => {
     const url = await wasmUrl();
     const msdf = new MSDF(url ? { wasmUrl: url } : {});
-    await withTimeout(msdf.initialize(), INIT_TIMEOUT_MS, 'worker init');
+    await withTimeout(
+      msdf.initialize(),
+      INIT_TIMEOUT_MS,
+      'MSDF worker init',
+      // #818 — a SLOW-but-alive init still brings a Worker + ~1.5 MB wasm up, after we have
+      // given up. `instance` is never set on this path, and `instance` is the only handle the
+      // module keeps, so `disposeMsdfGenerator` below cannot reach it: without this the Worker
+      // is orphaned for the life of the realm. Safe to dispose here because a FINISHED init
+      // leaves the worker idle, so `dispose()`'s comlink round-trip is answerable — which is
+      // NOT true of the `generateAtlas` timeout below; see its comment.
+      { onSettled: () => { void msdf.dispose().catch(() => { /* already dead — nothing to reclaim */ }); } },
+      'the MSDF worker is unreachable (missing worker script or wasm?)',
+    );
     instance = msdf;
     return msdf;
   })();
   return initPromise;
+}
+
+/** Stop using `gen` for good — a generation timed out with the call still inside its worker, so
+ *  this worker can no longer be trusted to hold the one-font-at-a-time invariant (#817).
+ *
+ *  Guarded on identity: a generator that has already been replaced (by an earlier retirement, or
+ *  by `disposeMsdfGenerator`) must not have its successor torn out from under it. The dispose is
+ *  deliberately fire-and-forget — it queues behind the stuck call and terminates the worker
+ *  whenever that finally returns, which may be never.
+ *
+ *  ⚠️ **The cost is per TIMEOUT, not one worker for the process.** Each retirement can strand a
+ *  Worker whose call never returns, and nulling `initPromise` also discards the memoized
+ *  init-failure fast path `getGenerator` advertises — so N fonts against a pathological worker cost
+ *  N stranded Workers plus a fresh 10s init apiece, and nothing caps that. Accepted deliberately:
+ *  the alternative is wrong-typeface glyphs, silently. If this is ever seen firing repeatedly, the
+ *  fix is a retirement counter that stops rebuilding rather than a change to this trade. */
+function retireGenerator(gen: MSDF): void {
+  if (instance === gen) {
+    instance = null;
+    initPromise = null;
+  }
+  void gen.dispose().catch(() => { /* a worker that will not answer is already unreachable */ });
 }
 
 /** Generate an MSDF atlas for `charset` from raw font bytes. Returns the lib's
@@ -142,14 +171,39 @@ export async function generateMsdf(
     // Bounded too, not just init: a worker that dies MID-call leaves the comlink reply
     // outstanding forever, and because every generation is queued behind this one, a
     // single hang would wedge the queue for every font in the app.
-    return withTimeout(gen.generateAtlas({
-      font,
-      charset,
-      ...(opts.fontSize != null ? { fontSize: opts.fontSize } : {}),
-      ...(opts.fieldRange != null ? { fieldRange: opts.fieldRange } : {}),
-      ...(opts.padding != null ? { padding: opts.padding } : {}),
-      ...(opts.textureSize ? { textureSize: opts.textureSize } : {}),
-    }), GENERATE_TIMEOUT_MS, `generation of ${charset.length} glyph(s)`);
+    try {
+      return await withTimeout(gen.generateAtlas({
+        font,
+        charset,
+        ...(opts.fontSize != null ? { fontSize: opts.fontSize } : {}),
+        ...(opts.fieldRange != null ? { fieldRange: opts.fieldRange } : {}),
+        ...(opts.padding != null ? { padding: opts.padding } : {}),
+        ...(opts.textureSize ? { textureSize: opts.textureSize } : {}),
+      }), GENERATE_TIMEOUT_MS, `generation of ${charset.length} glyph(s)`,
+      // The late atlas itself owns nothing — we drop it. What matters is the WORKER it was
+      // computed in, and that is handled by retiring the generator below rather than here,
+      // because the disposition is about the executor, not about this value.
+      { discard: 'a late atlas for a generation the caller already gave up on is dropped; the WORKER is retired instead — see the catch below' });
+    } catch (e) {
+      // #817 — the timeout releases the lock (`genQueue` settles below) while the abandoned
+      // `generateAtlas` is STILL RUNNING inside the worker. The next generation would then
+      // enter `loadFont` on a different font in the same worker — precisely the font-swap
+      // window the lock above exists to close, and the failure is silent wrong-font glyphs.
+      //
+      // ⚠️ We cannot cancel it and we cannot wait for it. `MSDF.dispose()` does
+      // `await client.dispose()` — a comlink round-trip — BEFORE `terminate()`, and that
+      // message queues behind the running `generateAtlas`, so dispose HANGS on exactly the
+      // case we need it for. And holding the lock until the call settles would restore the
+      // wedge the timeout was added to remove (see the comment above).
+      //
+      // So: retire the generator. The next `getGenerator()` builds a brand-new MSDF with a
+      // brand-new Worker, and a fresh worker cannot be corrupted by the old one's in-flight
+      // call — the window is per-worker. The fire-and-forget dispose inside `retireGenerator`
+      // still terminates the old worker if its call ever finishes; if it never does, we have
+      // leaked ONE worker, which is the deliberate trade against wrong glyphs.
+      if (e instanceof TimeoutError) retireGenerator(gen);
+      throw e;
+    }
   });
   // Swallow on the CHAIN only (never on the returned promise): one failed generation
   // must not reject every generation queued behind it, nor leave the chain rejected.

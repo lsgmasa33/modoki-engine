@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
-import fs from 'node:fs';
 import os from 'node:os';
 import realFs from 'node:fs';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   resolveUserDataDir,
   resolveToolchainDir,
@@ -216,7 +216,7 @@ describe('shouldOverrideUserData', () => {
  * So assert the source order directly: any userData read above the setPath re-breaks it.
  */
 describe('main.ts must fix userData before anything reads it', () => {
-  const raw = fs.readFileSync(path.join(__dirname, '..', '..', 'electron', 'main.ts'), 'utf8');
+  const raw = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'main.ts')).code;
   // Comments here DISCUSS getPath('userData')/setName by name, so match against CODE only —
   // blank the comment lines rather than drop them, to keep every offset comparable.
   const src = raw
@@ -322,7 +322,7 @@ describe('adoptLegacyToolchain', () => {
  * cut had exactly this bug: the smoke log showed Node provisioned into the fresh dir.
  */
 describe('main.ts must adopt the toolchain before anything provisions it', () => {
-  const raw = realFs.readFileSync(path.join(__dirname, '..', '..', 'electron', 'main.ts'), 'utf8');
+  const raw = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'main.ts')).code;
   const src = raw.split('\n').map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l)).join('\n');
 
   it('adoptLegacyToolchain runs at module scope, above initFileLog()', () => {

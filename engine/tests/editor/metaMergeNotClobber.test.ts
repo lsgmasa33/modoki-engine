@@ -29,12 +29,12 @@
  *  the way a redundant literal can. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
-const read = (rel: string) => readFileSync(path.join(SRC, rel), 'utf-8');
+const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
 
 /** `repoFiles()`'s own `rel` is repo-root-relative (`engine/packages/modoki/src/editor/...`);
  *  WRITERS is keyed SRC-relative (`panels/Inspector.tsx`). Stripped by a plain prefix check, not
@@ -297,7 +297,7 @@ describe('meta sidecar writers merge instead of replacing', () => {
   it('the server really does REPLACE — the premise this rule rests on', () => {
     // If writeMetaSidecar ever starts merging, this rule becomes unnecessary and this test says
     // so, rather than the rule quietly outliving its reason.
-    const sidecar = readFileSync(path.resolve(__dirname, '../../plugins/meta-sidecar.ts'), 'utf-8');
+    const sidecar = readScannedSource(path.resolve(__dirname, '../../plugins/meta-sidecar.ts')).code;
     expect(sidecar).toMatch(/writeJsonAtomic\(sidecarPath\(absPath\), committed\)/);
     expect(sidecar).not.toMatch(/readMetaSidecar\(absPath\)[\s\S]{0,200}\.\.\./); // no read-and-merge
   });

@@ -9,7 +9,6 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import fsSync from 'node:fs';
 import pathMod from 'node:path';
 import path from 'path';
 import fs from 'fs';
@@ -25,6 +24,7 @@ import {
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
+import { readScannedSource } from '@modoki/engine/testing';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -1254,9 +1254,9 @@ describe('classifySceneChange — animation (C7)', () => {
  * where it mattered. Duplicated logic rots; one function cannot.
  */
 describe('the Electron watcher must not re-implement classifySceneChange', () => {
-  const src = fsSync.readFileSync(
-    pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'), 'utf8',
-  );
+  const src = readScannedSource(
+    pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'),
+  ).code;
   const code = src.split('\n').map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l)).join('\n');
 
   it('calls the shared classifier', () => {
@@ -1351,7 +1351,7 @@ describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
 // the handler body with stable anchors and fails LOUDLY (not vacuously) if either anchor
 // goes missing, so the test cannot silently stop checking anything.
 describe('/api/ota/publish route has no collision guard of its own (#577)', () => {
-  const source = fs.readFileSync(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts'), 'utf8');
+  const source = readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code;
   const START_ANCHOR = "req.url === '/api/ota/publish'";
   const END_ANCHOR = '})().finally(otaRelease.onPipelineEnd);';
 

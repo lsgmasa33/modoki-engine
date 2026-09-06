@@ -2,6 +2,8 @@
  *  imports, so they're directly unit-testable. bridge.ts imports these instead of the tests
  *  re-implementing them (which let copies silently drift from the shipping code — code-review T7). */
 
+import { withTimeout } from '@modoki/engine/runtime/core/abandonment';
+
 /** Native (iOS drawHierarchy) capture dims, kept by the bridge after a native screenshot. */
 export interface LastScreenInfo { imageWidth: number; imageHeight: number; screenWidth: number; screenHeight: number }
 /** Per-request adb capture dims, passed by the MCP with a tap/drag (Android). */
@@ -182,18 +184,22 @@ export async function handleEval(
     const fn = new AsyncFunction('modoki', code);
     const result = fn(arg);
     if (result && typeof (result as { then?: unknown }).then === 'function') {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`eval timed out after ${timeoutMs}ms (the code did not finish — an unresolved Promise, or a budget too small for what it awaits)`)), timeoutMs);
-      });
-      try {
-        return safeStringify(await Promise.race([result, timeout]));
-      } finally {
-        // Release the timer as soon as the race settles. Without this a fast eval still pinned a
-        // pending timer for the FULL budget — harmless at 5s, but the budget is caller-supplied
-        // now, so a 25s ceiling would keep one alive long past the reply.
-        clearTimeout(timer);
-      }
+      // This site was already CORRECT — it cleared its timer, and `Promise.race` consumed the
+      // late rejection so nothing surfaced unhandled. It migrates to the shared helper anyway,
+      // because a guard that exempts the correct sites is not a guard (#801). The helper also
+      // keeps the timer-release this used to do by hand: without it a fast eval pinned a pending
+      // timer for the FULL budget, and the budget is caller-supplied, so a 25s ceiling would keep
+      // one alive long past the reply.
+      return safeStringify(await withTimeout(
+        result as Promise<unknown>,
+        timeoutMs,
+        'eval',
+        // The purest `discard` in the tree: the abandoned thing is arbitrary agent-supplied code.
+        // It cannot be cancelled and it owns nothing WE can reclaim — whatever side effects it
+        // has already started will land whenever they land, and no disposition here changes that.
+        { discard: 'agent-supplied eval code cannot be cancelled and owns no reclaimable resource; a late result is dropped' },
+        'the code did not finish — an unresolved Promise, or a budget too small for what it awaits',
+      ));
     }
     return safeStringify(result);
   } catch (e) {

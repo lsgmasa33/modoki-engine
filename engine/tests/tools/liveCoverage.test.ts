@@ -20,12 +20,12 @@
  *  open — see F2 in the ledger.
  */
 
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect, afterEach } from 'vitest';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { COVERED_BY_SMOKE, LIVE_UNCOVERED } from '../../tools/modoki-mcp/src/liveCoverage';
 import { loadSurface, type Surface } from './mcpSurface';
+import { readScannedSource } from '@modoki/engine/testing';
 
 let surface: Surface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -102,7 +102,7 @@ describe('T3 live coverage is declared, total, and honest', () => {
   const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
 
   it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
-    const smokeSrc = readFileSync(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs'), 'utf8');
+    const smokeSrc = readScannedSource(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs')).code;
     const missing = COVERED_BY_SMOKE.filter((n) => !(n in KNOWN_UNCOVERED) && !smokeSrc.includes(n));
     expect(missing,
       'COVERED_BY_SMOKE claims a real case exists in test-smoke.mjs for these tools, but the name '

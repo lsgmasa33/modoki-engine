@@ -222,6 +222,43 @@ describe('rendererRecovery — a failed rebuild is retried (#156)', () => {
     expect(t.scheduled).toBe(0);
   });
 
+  // #820 — WHY `REBUILD_BRINGUP_TIMEOUT_MS` exists, stated as a behaviour rather than a comment.
+  //
+  // `rendererRecovery` awaits `rebuild()`. A bring-up that HANGS rather than rejecting therefore
+  // latches `inFlight` forever: no retry, no `onError`, no give-up message — a surface black in
+  // total silence, which is strictly worse than a failure. This is the failure the 2D pool bounded
+  // years ago (`APP_INIT_TIMEOUT_MS`) and the 3D path did not, and it is why the shared bound now
+  // lives in this module beside the rest of the rebuild policy.
+  //
+  // The test pins the HAZARD, not the fix: this is what recovery does when handed an unbounded
+  // rebuild, so nobody re-introduces one thinking recovery will cope.
+  //
+  // ⚠️ Be clear about what this does NOT prove. It says nothing about whether `Scene3D` actually
+  // passes a bound, or adopts a late renderer — those decisions live inside a `useEffect` closure
+  // with no seam, and are UNTESTED. Deleting `Scene3D`'s `withTimeout` argument, its supersession
+  // token or its `adoptRenderer` call breaks nothing in `verify`. Extracting that decision into a
+  // `.ts` beside `Scene3D.tsx`, the way the 2D pool's lives in `canvas2DPool.ts`, is what would
+  // close it.
+  it('a rebuild that never settles latches recovery — the reason bring-up must be bounded', async () => {
+    const rebuild = vi.fn(() => new Promise<void>(() => { /* never settles: a hung bring-up */ }));
+    const onError = vi.fn();
+    const { t, recovery } = harness({ rebuild, onError });
+
+    recovery.request();
+    await t.fire();
+    expect(rebuild, 'the first attempt runs').toHaveBeenCalledTimes(1);
+
+    // Every later loss is swallowed by the in-flight latch, and no retry is ever scheduled.
+    recovery.request();
+    await t.fire();
+    recovery.request();
+    await t.fire();
+
+    expect(rebuild, 'no second attempt — `inFlight` never clears').toHaveBeenCalledTimes(1);
+    expect(t.scheduled, 'nothing is scheduled, so nothing will ever wake this up').toBe(0);
+    expect(onError, 'and the viewport is never told anything at all').not.toHaveBeenCalled();
+  });
+
   it('tells the viewport whether a retry is coming, so it cannot cry permanent too early', async () => {
     const onError = vi.fn();
     const rebuild = vi.fn().mockRejectedValue(new Error('dead'));

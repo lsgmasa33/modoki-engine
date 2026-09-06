@@ -16,12 +16,18 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadSurface, realRequests, STUB_BACKEND, type Surface } from './mcpSurface';
 import { ERROR_CODES, type ErrorCode } from '../../tools/modoki-mcp/src/result';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
+import { readScannedSource } from '@modoki/engine/testing';
+
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'docs/mcp-tool-conventions.md is Markdown prose — checking each code is documented by name',
+} as const;
 
 let surface: Surface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -451,7 +457,7 @@ describe('§5 — no tool may bypass the envelope', () => {
   it('no tool module hand-rolls a failure result', () => {
     const offenders: string[] = [];
     for (const f of files) {
-      const src = readFileSync(join(TOOLS_DIR, f), 'utf8');
+      const src = readScannedSource(join(TOOLS_DIR, f)).code;
       // `fail(...)` / `httpFailure(...)` are the only sanctioned constructors; both live in the
       // context. A literal `isError` in a tool module means a failure that skipped the envelope.
       if (/isError\s*:/.test(src)) offenders.push(f);
@@ -463,10 +469,10 @@ describe('§5 — no tool may bypass the envelope', () => {
     // Keeping it "as an escape hatch" is how the surface diverged: nothing forced a call site to
     // supply a code, a cause, or the options, so most supplied none of the three. Its absence is
     // what makes §5 enforced by the type checker rather than by this file.
-    const ctxSrc = readFileSync(join(TOOLS_DIR, '../context.ts'), 'utf8');
+    const ctxSrc = readScannedSource(join(TOOLS_DIR, '../context.ts')).code;
     expect(ctxSrc).not.toMatch(/^\s*err:\s*\(msg/m);
     for (const f of files) {
-      expect(readFileSync(join(TOOLS_DIR, f), 'utf8'), `${f} still destructures err from ctx`)
+      expect(readScannedSource(join(TOOLS_DIR, f)).code, `${f} still destructures err from ctx`)
         .not.toMatch(/\berr\s*,/);
     }
   });
@@ -474,7 +480,7 @@ describe('§5 — no tool may bypass the envelope', () => {
   it('every code in the closed set is spelled the same in the conventions doc', () => {
     // A code the doc doesn't list is a code nobody can look up; a code the doc lists but the
     // surface can't emit is a promise the surface doesn't keep.
-    const doc = readFileSync(join(__dirname, '../../../docs/mcp-tool-conventions.md'), 'utf8');
+    const doc = readScannedSource(join(__dirname, '../../../docs/mcp-tool-conventions.md'), DOC_AS_PROSE).raw;
     for (const code of ERROR_CODES) expect(doc, `${code} is not documented`).toContain(code);
   });
 });

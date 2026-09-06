@@ -18,12 +18,14 @@ import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, t
 import { registerBoundsProvider } from '../core/screenBounds';
 import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
+import { withTimeout, TimeoutError } from '../core/abandonment';
+import { createSupersessionToken } from '../core/liveness';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { disposeVideoTextures } from './videoTextureSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost, makeViewportLossPolicy, attachUncapturedErrorListener } from '../core/activeRenderer';
 import { attachRendererLossHandling } from './rendererLossHandling';
-import { createRendererRecovery } from './rendererRecovery';
+import { createRendererRecovery, REBUILD_BRINGUP_TIMEOUT_MS } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { gpuPassScope } from '../core/gpuTimings';
@@ -148,9 +150,58 @@ export default function Scene3D() {
     //
     // A lost three renderer cannot be revived (`_isDeviceLost` is never cleared anywhere in
     // three), which is why this rebuilds rather than restores. See `core/activeRenderer.ts`.
-    const bringUp = async () => {
-      const r = await createRenderer(container, config.preferWebGPU);
-      if (disposed) { r.dispose(); r.domElement.remove(); return; }
+    // #820 — a bring-up can be SUPERSEDED. `recovery.rebuild` is `teardown(); await bringUp()`,
+    // and the initial `bringUp()` below runs OUTSIDE recovery's single-flight latch, so a loss
+    // reported during boot starts a second one while the first is still awaiting `createRenderer`.
+    // (The loss filter further down cannot stop it: `if (info.renderer && renderer && …)` is a
+    // no-op while `renderer` is still undefined.) The guard below used to check only `disposed`,
+    // which cannot see supersession at all — even though the listener wired three lines later
+    // already asks exactly this question as `renderer !== r`. `docs/async-lifetime.md` calls this
+    // the supersession token; use the shared one rather than a sixth hand-rolled comparison.
+    const bringUpToken = createSupersessionToken();
+
+    /** Take a freshly-created renderer into service, or dispose it if it lost its race.
+     *
+     *  Extracted so the TIMED-OUT path can reach it too. A bound on bring-up without this is
+     *  strictly worse than no bound: a slow-but-alive `createRenderer` would reject three times,
+     *  recovery would stop scheduling (`failures === maxAttempts`), the late renderers would each
+     *  be thrown away, and the surface would stay black for the life of the realm — where before
+     *  the bound it simply succeeded, late. `canvas2DPool` learned this on the 2D side and answered
+     *  it by curing whichever attempt actually produces a renderer (`revalidateOwed`); this is the
+     *  same answer. **A working surface beats a blank one.**
+     *
+     *  `stillCurrent` is what makes adopting a LATE renderer safe: a newer attempt calls
+     *  `bringUpToken.begin()` and turns every earlier check false, so a superseded arrival is
+     *  disposed rather than fighting the winner for `renderer`. */
+    const adoptRenderer = (r: Awaited<ReturnType<typeof createRenderer>>, stillCurrent: () => boolean): boolean => {
+      if (disposed || !stillCurrent()) {
+        try { r.dispose(); r.domElement.remove(); } catch { /* already dead */ }
+        return false;
+      }
+      return true;
+    };
+
+    /** @param timeoutMs Bound `createRenderer`. REBUILDS only — see the call sites. */
+    const bringUp = async (timeoutMs?: number) => {
+      const stillCurrent = bringUpToken.begin();
+      const create = createRenderer(container, config.preferWebGPU);
+      const r = timeoutMs === undefined
+        ? await create
+        : await withTimeout(create, timeoutMs, 'Scene3D renderer bring-up', {
+          // A renderer that arrives after we gave up is ADOPTED if nothing superseded it, and
+          // disposed if something did. See `adoptRenderer` — throwing it away unconditionally is
+          // what turns a slow device into a permanently black one.
+          onSettled: (res) => {
+            if (!res.ok) return;
+            if (adoptRenderer(res.value, stillCurrent)) install(res.value);
+          },
+        });
+      if (!adoptRenderer(r, stillCurrent)) return;
+      install(r);
+    };
+
+    /** Wire a renderer that `adoptRenderer` has cleared for service. */
+    function install(r: Awaited<ReturnType<typeof createRenderer>>) {
       renderer = r;
       // `isStale` also compares against the OUTER `renderer` (not just `disposed`) so a later
       // rebuild that reassigns `renderer` to a NEWER instance immediately disarms an
@@ -165,7 +216,7 @@ export default function Scene3D() {
       );
       detachUncapturedError = attachUncapturedErrorListener(r);
       startRenderLoop();
-    };
+    }
 
     /** Run the installed teardown exactly once, then forget it — so a bring-up that fails
      *  before installing a new one can't leave the unmount path calling a stale closure over
@@ -177,7 +228,15 @@ export default function Scene3D() {
     };
 
     const recovery = createRendererRecovery({
-      rebuild: async () => { teardown(); await bringUp(); },
+      // ⚠️ Bounded on the REBUILD path ONLY, and that asymmetry is measured, not stylistic.
+      // `canvas2DPool.ts`'s `APP_INIT_TIMEOUT_MS` comment records that a rejecting 8s bound on a
+      // FIRST init turned a merely SLOW cold bring-up (8.5s on a low-end GPU) into a permanent
+      // failure — the init succeeded at 8.5s with nothing left listening. So the 2D side warns on
+      // first init and only REJECTS on rebuilds, and this mirrors it: the initial `bringUp()`
+      // below passes no bound. Without any bound here, though, a `createRenderer` that HANGS
+      // latches `rendererRecovery`'s `inFlight` forever — no retry, no onError, no give-up
+      // message — which is the exact silence the 2D timeout exists to remove (#820).
+      rebuild: async () => { teardown(); await bringUp(REBUILD_BRINGUP_TIMEOUT_MS); },
       isDisposed: () => disposed,
       // `description` first (it is what survives the device bridge — a bare non-Error logged
       // straight to the console is the `{}` that started #156), then the raw value, so a desktop
@@ -816,8 +875,6 @@ export default function Scene3D() {
           // Guard the GPU ops with a timeout so a stalled/lost device can't leave
           // `capturing` stuck true and permanently park the live loop (P2-4). The
           // reject propagates to the finally, which always resets `capturing`.
-          const withTimeout = <T,>(p: Promise<T>, ms: number, what: string) =>
-            Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`offscreen render timed out (${what}, ${ms}ms)`)), ms))]);
 
           const prevRT = r.getRenderTarget();
           r.setRenderTarget(rt);
@@ -834,7 +891,23 @@ export default function Scene3D() {
             let buf: Uint8Array;
             let backend: ReadbackBackend;
             if (r.readRenderTargetPixelsAsync) {
-              buf = await withTimeout(r.readRenderTargetPixelsAsync(rt, 0, 0, w, h), 10000, 'readback'); // WebGPU returns it
+              buf = await withTimeout(
+                r.readRenderTargetPixelsAsync(rt, 0, 0, w, h), 10000, 'offscreen readback',
+                // #819 — the read is still using `rt` when we give up. Disposing it here would
+                // pull the target out from under a live read, so the dispose waits for the read
+                // to actually finish. If it never does, this `rt` is leaked until realm death:
+                // the deliberate trade against a second capture rendering into a target the
+                // first one is still reading.
+                //
+                // ⚠️ SCOPE: this closes the POOLED-REUSE route only. `cleanupRef`'s teardown
+                // disposes `captureRT` unconditionally, and it runs on the recovery path too — so
+                // a device loss during a stalled read still disposes the target underneath it, and
+                // this `onSettled` then disposes it a second time. Both are survivable today
+                // (three's `RenderTarget.dispose()` only dispatches an event, and both backends'
+                // handlers are idempotent), which is why this is not chased further here; do not
+                // read the comment above as a general guarantee that a live read owns its target.
+                { onSettled: () => { try { rt.dispose(); } catch { /* already gone */ } } },
+              ); // WebGPU returns it
               backend = 'webgpu';
             } else {
               buf = new Uint8Array(w * h * 4);
@@ -844,6 +917,16 @@ export default function Scene3D() {
             const img = c2d.createImageData(w, h);
             img.data.set(readbackToRGBA(buf, w, h, backend));
             c2d.putImageData(img, 0, 0);
+          } catch (e) {
+            // #819 — `capturing` is released in the outer `finally` below even on a timeout, and
+            // that is DELIBERATE (P2-4: a stalled device must not park the live loop forever).
+            // But the abandoned read still owns `rt`, and `captureRT` is POOLED — the next
+            // capture would `setRenderTarget(rt)` and render into a target the stalled read is
+            // still reading. Retire it instead: dropping the pool's reference makes the next
+            // capture allocate a fresh one, and the retired target is disposed by the
+            // `onSettled` above whenever the read finally returns.
+            if (e instanceof TimeoutError && captureRT === rt) captureRT = null;
+            throw e;
           } finally {
             // Always restore the renderer's target, even if the GPU op timed out,
             // so the live loop resumes against the right framebuffer.

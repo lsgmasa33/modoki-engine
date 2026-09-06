@@ -20,8 +20,8 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '../helpers/sourceScanner';
 
 // Fakes for the two conversions: real generation needs an actual GPU context, which this suite
 // doesn't have. What matters here is OWNERSHIP — one generator/target per call, its scratch state
@@ -144,7 +144,7 @@ afterEach(() => {
 // silently black. So this reads the SOURCE TEXT instead, and asserts the one line that matters.
 describe('envPmrem.ts imports the WebGPU PMREMGenerator, not the core one', () => {
   it('imports PMREMGenerator from three/webgpu and never references THREE.PMREMGenerator', () => {
-    const src = readFileSync(join(__dirname, '../../src/runtime/rendering/envPmrem.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../src/runtime/rendering/envPmrem.ts')).code;
     expect(src).toMatch(/import\s*\{[^}]*PMREMGenerator[^}]*\}\s*from\s*'three\/webgpu'/);
     // Checks actual USE (`new THREE.PMREMGenerator(`), not the file's own warning comment about
     // it — that comment names `THREE.PMREMGenerator` on purpose, to explain why it's wrong.

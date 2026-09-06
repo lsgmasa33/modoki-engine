@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.join(__dirname, '../..');
 
@@ -122,7 +123,7 @@ function declaredRoutes(): Set<string> {
 function definedRoutes(): Set<string> {
   const out = new Set<string>();
   for (const rel of ROUTE_FILES) {
-    const src = fs.readFileSync(path.join(REPO, rel), 'utf-8');
+    const src = readScannedSource(path.join(REPO, rel)).code;
     for (const m of src.matchAll(/'(\/api\/[a-zA-Z0-9/._-]+)'/g)) {
       // `/api/input/` is the PREFIX test the input router dispatches on, not a route.
       if (!m[1].endsWith('/')) out.add(m[1]);

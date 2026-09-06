@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
@@ -270,7 +270,7 @@ describe('the real devicectl invocation', () => {
     // connected" with a phone sitting right there. These tests inject the listing string, so the
     // real command is only exercised on a Mac with a device attached; this asserts the shape of
     // the command itself, which is the part they cannot reach.
-    const src = readFileSync(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts'), 'utf8');
+    const src = readScannedSource(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts')).code;
     // ⚠️ Read the shared `DEVICECTL_ARGV`, not a function body. #168 split the listing into an
     // async seam (the POLLED route, which must not block the Electron main process) and a sync
     // twin (`ensureWdaRunning`, whose critical section must stay await-free), and slicing one

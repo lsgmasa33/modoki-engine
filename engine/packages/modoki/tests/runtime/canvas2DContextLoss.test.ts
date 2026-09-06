@@ -20,6 +20,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Pixi is mocked: a real Application needs a GPU. What matters is the wiring, not Pixi.
 const created: Array<{ destroyed: boolean; destroyArg: unknown }> = [];
+  /** Process-monotonic, like Pixi's own. NEVER reset per test — see `uid` below. */
+  let nextRendererUid = 0;
 /** Lets a test HOLD `Application.init()` open. The timeout/retry race lives entirely inside that
  *  window, and a mock that always resolves immediately cannot express it. */
 const initGate: { hold: Promise<void> | null } = { hold: null };
@@ -46,12 +48,18 @@ vi.mock('pixi.js', () => {
   class Application {
     stage = new Container();
     ticker = { stop() {} };
-    // A predictable, sequential uid — mirroring Pixi's real incrementing-int `renderer.uid`
-    // scoped to the process (see gpuResourceInvalidation.ts's file header for why that matters:
-    // a REBUILT renderer's fresh uid can collide with a stale `_gpuData` key). Assigned from
-    // `created.length` BEFORE this instance is pushed, so the Nth Application built in a test
-    // (0-based, reset per test by `created.length = 0` in beforeEach) gets uid N.
-    uid = created.length;
+    // A predictable, sequential uid — mirroring Pixi's real incrementing-int `renderer.uid`.
+    //
+    // ⚠️ MONOTONIC ACROSS THE WHOLE FILE, deliberately, and NOT reset in `beforeEach` with
+    // `created`. Real Pixi mints uids from a module-level counter that this repo never resets
+    // (`resetUids()` has zero callers — see the note above the `_gpuData` purge suite), so two
+    // renderers can NEVER share a uid within a process. This fake used to derive the uid from
+    // `created.length`, which restarts at 0 every test, and that modelled uid RECYCLING — a
+    // behaviour the real dependency does not have. It was invisible while the dead-uid registry
+    // was per-slot; #801 made it process-wide (a dead uid is safe to purge from anything,
+    // anywhere, forever) and a recycled uid then read as "pool B's live renderer is dead".
+    // A fake must not be more permissive than the thing it stands in for.
+    uid = nextRendererUid++;
     renderer!: { resize(): void; screen: { width: number; height: number }; uid: number; gpu?: { device: { lost: Promise<{ reason?: string; message?: string }> } } };
     private rec = { destroyed: false, destroyArg: undefined as unknown };
     constructor() {
@@ -528,7 +536,7 @@ describe('canvas2DPool.rebuildSlotApp — stale _gpuData purge (#678)', () => {
     // uid was then lost: on the RETRY, `rebuildSlotApp` starts over and only knows about the
     // retry's OWN (never-initialized) app, not the renderer that originally died. So the original
     // dead renderer's `_gpuData` entries were never purged by any path. The fix accumulates dead
-    // uids on `slot.pendingDeadRendererUids` across attempts instead of a single local.
+    // uids in the module-level `deadRendererUids` set across attempts instead of a single local.
     vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.useFakeTimers();
@@ -702,6 +710,161 @@ describe('canvas2DPool — WebGPU device.lost (#794)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     vi.useRealTimers();
     expect(created.length, 'no rebuild must be queued from a phantom device loss').toBe(madeBefore);
+  });
+});
+
+describe('canvas2DPool.rebuildSlotApp — the cure lives on initSlotApp\'s success path, not rebuildSlotApp\'s tail (#801)', () => {
+  it('an init that resolves after recovery has given up still gets the cure', async () => {
+    // Pins the move itself: the cure used to sit in `rebuildSlotApp`'s tail, AFTER
+    // `await withTimeout(this.initSlotApp(slot), ...)`. A timeout REJECTS but does not CANCEL, so
+    // once every retry has timed out and recovery has spent its budget, `rebuildSlotApp` has
+    // already thrown on every attempt and its tail never runs — yet `initSlotApp` itself, unbounded
+    // underneath the timeout, can still be running and can still succeed later (a genuinely
+    // slow-but-alive driver, exactly the case `APP_INIT_TIMEOUT_MS`'s own doc comment describes).
+    // With the cure on the OLD path that late success would come up utterly uncured: no purge, no
+    // `onViewUpdate`, no full-redraw flag — a live, healthy renderer behind a permanently blank
+    // frame. The fix moved the cure onto `initSlotApp`'s own success path, gated on
+    // `slot.revalidateOwed`, so it fires no matter which attempt's `init()` is the one that wins.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+
+    const slot = pool.allocate(70)!;
+    await slot.ready;
+    const originalUid = slot.app.renderer.uid;
+
+    // A surviving display object carrying BOTH halves of the cure's target: a stale `_gpuData`
+    // entry keyed under the renderer about to die, and an `onViewUpdate` the graphics pipe needs
+    // called to take its rebuild branch again on the eventual new renderer.
+    const survivor: { onViewUpdate: () => void; _gpuData: Record<number, unknown> } = {
+      onViewUpdate: vi.fn(),
+      _gpuData: { [originalUid]: 'sentinel' },
+    };
+    slot.container.addChild(survivor as unknown as never);
+
+    // Hang EVERY rebuild attempt's `Application.init()` — a dead-GPU driver that never comes back
+    // in time for any of the bounded retries, only later.
+    let releaseInit!: () => void;
+    initGate.hold = new Promise<void>((r) => { releaseInit = r; });
+
+    fireLost(slot.canvas);
+    // Past all three bounded attempts (250 + 8000, then +500 + 8000, then +1000 + 8000 =
+    // 25,750ms — DEFAULT_REBUILD_DELAY_MS=250, APP_INIT_TIMEOUT_MS=8000,
+    // DEFAULT_MAX_REBUILD_ATTEMPTS=3, backoff = delayMs * 2**failures): recovery has now given up
+    // and scheduled nothing further, while all three `initSlotApp` calls are still hanging
+    // underneath their (already-rejected) timeouts, on the SAME never-yet-resolved gate.
+    await vi.advanceTimersByTimeAsync(26_000);
+
+    // Intermediate state: recovery gave up before any attempt's `init()` ever settled, so the cure
+    // cannot have run yet.
+    expect(
+      pool.consumeRebuildFlag(),
+      'recovery gave up while every attempt was still hung — no successful rebuild, so no cure yet',
+    ).toBe(false);
+    // consumeRebuildFlag() is read-and-clear: re-checking proves the FIRST read did not itself
+    // manufacture the false by clearing a true it never should have cleared.
+    expect(pool.consumeRebuildFlag(), 'still false — reading it does not flip it').toBe(false);
+    expect(survivor.onViewUpdate, 'not cured yet').not.toHaveBeenCalled();
+
+    // Now let the slow-but-alive driver finally come up — this is the retry attempt (the last one
+    // to have taken the slot) actually finishing its `Application.init()`.
+    releaseInit();
+    vi.useRealTimers();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(slot.initialized, 'the late-settling init must still be adopted').toBe(true);
+    expect(survivor.onViewUpdate, 'a surviving view must be marked dirty even on this late a cure').toHaveBeenCalled();
+    expect(
+      survivor._gpuData[originalUid],
+      'the original dead renderer\'s entry must be purged by the late cure too',
+    ).toBeUndefined();
+    expect(slot.contextLost, 'the slot must read as healthy again').toBe(false);
+    expect(pool.consumeRebuildFlag(), 'the late-arriving success still owes (and now pays) a full redraw').toBe(true);
+  });
+});
+
+describe('canvas2DPool — deadRendererUids is append-only across rebuilds, not reset per attempt (#801)', () => {
+  it('a stale entry added after the FIRST rebuild, under either dead uid, is purged by the SECOND', async () => {
+    // Before #801 this registry lived on the slot and was effectively scoped to a single
+    // rebuild's own dead uid; nothing pinned that a uid retired by an EARLIER rebuild stays
+    // purgeable by a LATER one. The module-level `deadRendererUids` Set is append-only forever —
+    // this is the replacement coverage for that.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+
+    const slot = pool.allocate(80)!;
+    await slot.ready;
+    const uid1 = slot.app.renderer.uid;
+
+    fireLost(slot.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    const uid2 = slot.app.renderer.uid;
+    expect(uid2, 'precondition: the first rebuild produced a new uid').not.toBe(uid1);
+
+    // Added AFTER the first rebuild's cure already ran, so this node was never touched by it — it
+    // carries stale references to BOTH the renderer that just died (uid1) and the one that is
+    // about to (uid2).
+    const stale: { _gpuData: Record<number, unknown> } = {
+      _gpuData: { [uid1]: 'from-cycle-1', [uid2]: 'about-to-die' },
+    };
+    slot.container.addChild(stale as unknown as never);
+
+    fireLost(slot.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(slot.app.renderer.uid, 'precondition: the second rebuild produced a THIRD uid').not.toBe(uid2);
+    expect(
+      stale._gpuData[uid1],
+      'an OLDER dead uid must still be purgeable on a LATER rebuild — the registry is append-only',
+    ).toBeUndefined();
+    expect(
+      stale._gpuData[uid2],
+      'the renderer that just died in THIS rebuild must be purged',
+    ).toBeUndefined();
+  });
+});
+
+describe('canvas2DPool.teardownSlot — reaches the process-wide dead-uid registry too (#801)', () => {
+  it("a uid retired via teardown (not a rebuild) is later purged by a rebuild on a DIFFERENT slot", async () => {
+    // The reach limit the old per-slot registry could not cover: `teardownSlot` (destroyPool, the
+    // `renderAll` shrink pass, `reclaimIfUnclaimed`) destroys a renderer through a path that is not
+    // a rebuild at all, so nothing local to a rebuild could ever have recorded that uid. If
+    // `teardownSlot` does not ALSO record into `deadRendererUids`, a shared resource (a
+    // process-global Pixi `TextureSource`) holding a stale entry for that renderer is never purged
+    // by any later rebuild, anywhere.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+
+    // Slot X: torn down via `teardownSlot` (unmount, then destroyPool sees no claim left), NOT a
+    // rebuild.
+    const slotX = pool.mount(90)!;
+    await slotX.ready;
+    const uidX = slotX.app.renderer.uid;
+    pool.unmount(90);
+    pool.destroyPool();
+    expect(slotX.destroyed, 'precondition: X actually went through teardownSlot').toBe(true);
+
+    // A different, live slot whose surviving node happens to carry a stale reference to X's
+    // renderer — exactly the shape of a process-global TextureSource shared across slots/pools
+    // (see the TWO POOLS suite above).
+    const slotY = pool.allocate(91)!;
+    await slotY.ready;
+    const stale: { _gpuData: Record<number, unknown> } = { _gpuData: { [uidX]: 'owned-by-x' } };
+    slotY.container.addChild(stale as unknown as never);
+
+    fireLost(slotY.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    await slotY.ready;
+
+    expect(
+      stale._gpuData[uidX],
+      'teardownSlot must record its dead uid too — a rebuild elsewhere must be able to purge it',
+    ).toBeUndefined();
   });
 });
 

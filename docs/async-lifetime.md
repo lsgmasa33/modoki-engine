@@ -192,6 +192,90 @@ worth its merge cost while the token vocabulary is doing the work.
 So the ordinary path stays a human one: when you write a deferral in a function that later writes
 shared state, pick a token from the table.
 
+## The other half: what still belongs to the operation you gave up on
+
+Liveness answers *"am I still current?"*. It does not answer the question a **timeout** raises, which
+is the mirror image: *"what still belongs to the operation I stopped waiting for?"*
+
+A timeout REJECTS the caller. It does not CANCEL the callee — and in this engine it cannot, because
+none of the operations we bound accepts an `AbortSignal`: a Pixi `Application.init()`, a worker's
+`generateAtlas()`, a WebGPU `onSubmittedWorkDone()`, a `readRenderTargetPixelsAsync()`, a
+`createRenderer()`. The abandoned operation keeps running, and whatever it holds stays held.
+
+`withTimeout` was hand-rolled **six** times before this was decided — four named helpers
+(`canvas2DPool`, `gpuClock`, `rampProbeRunner`, `msdfGenerate`) and two inline copies (`Scene3D`,
+`app/debug/bridgeHelpers`) — and half of them never asked the question. Five defects, one shape:
+
+| # | The abandoned operation still held | What went wrong |
+|---|---|---|
+| #801 | the slot, while the *cure* sat on the caller's success path | a late `init()` brought up a live renderer nothing revalidated — a blank frame behind a healthy context |
+| #817 | the worker, while `genQueue` was released | the next generation entered `loadFont` on a different font — silent wrong-typeface glyphs |
+| #818 | the `MSDF` instance the timeout stopped us recording | a Worker + wasm orphaned beyond `dispose`'s reach — **partially fixed only**, see below |
+| #819 | the pooled `captureRT` the readback was still reading | the next capture rendered into it underneath |
+| #820 | the renderer, and both detacher handles | a superseded bring-up assigned them anyway |
+
+⚠️ **#801 and #820 both answer with `adopt`, and that is not incidental.** Bounding an operation
+whose late result you then THROW AWAY is strictly worse than not bounding it: a slow-but-alive
+bring-up that used to succeed at 8.5 s instead exhausts its retries and leaves a permanently black
+surface. Both sites therefore route the late arrival back into the same success path the on-time one
+takes — `initSlotApp`'s cure for 2D, `adoptRenderer` for 3D — with a supersession token deciding
+whether it is still wanted. **If you add a bound, say where the late result goes before you add
+it.**
+
+### The rule
+
+**`runtime/core/abandonment.ts` is the one `withTimeout`, and the disposition is a REQUIRED argument.**
+
+```ts
+await withTimeout(p, ms, 'what', { discard: 'why the late value owns nothing' });
+```
+
+Three answers, and you must write one down:
+
+| Disposition | Means | Example |
+|---|---|---|
+| `{ adopt: why }` | a late settlement is handled on its OWN path | `canvas2DPool` — `initSlotApp` cures whichever attempt wins |
+| `{ discard: why }` | the late value owns nothing reclaimable | `gpuClock`'s stale duration; `handleEval`'s uncancellable agent code |
+| `{ onSettled }` | it holds something that must be released | `Scene3D` disposing a late renderer; `msdfGenerate` disposing a late worker |
+
+`adopt` and `discard` are both runtime no-ops. The distinction is type-level and load-bearing **at the
+source line**: the string is a written justification the next author gets for free instead of
+reconstructing — or, as happened five times, not reconstructing and getting it wrong.
+
+⚠️ **`onSettled` only fires on SETTLEMENT, so it cannot clean up after an operation that never
+settles at all.** #818 is the honest example: `MSDF.initialize()` creates its Worker synchronously
+before its own `await`, and the failure its timeout exists for — a 404'd worker script or wasm —
+is one where the comlink reply *never arrives*. The disposition fixes the slow-but-alive case and
+does nothing for the never-settles case, where the Worker is created, orphaned, and unreachable
+exactly as before. No fix is available with that library: `MSDF.dispose()` awaits a round-trip into
+the worker before `terminate()`, so `terminate()` cannot be reached. Say so rather than implying
+coverage — this is a real hole in the family, not a solved member.
+
+⚠️ **Sometimes the right disposition is to retire the EXECUTOR, not the value.** `msdfGenerate` cannot
+wait for the abandoned generation (that restores the wedge the timeout exists to remove) and cannot
+cancel it (`MSDF.dispose()` awaits a comlink round-trip *before* `terminate()`, so it queues behind
+the very call that is stuck). It retires the generator instead: the next call builds a fresh Worker,
+and the window is per-worker. `Scene3D` does the same with its pooled render target.
+
+### Enforcement
+
+`engine/tests/architecture/abandonmentIsShared.test.ts`, the sibling of the liveness guard and built
+the same way — a paired detector (a `new Promise` rejector, and a `setTimeout` that calls *that*
+identifier), a census floor, and fixture tests so narrowing it is visible. Its blind spots are stated
+in its header; the load-bearing one is that a rejection routed through a **named function** needs the
+call graph and is not matched.
+
+⚠️ It found the sixth copy itself. The sweep that designed the family scanned
+`engine/packages/modoki/src` and missed `engine/app/debug/bridgeHelpers.ts`.
+
+### Deliberately not solved
+
+- **Cancellation.** Nothing here cancels. If a real `AbortSignal` becomes available for one of these
+  operations, wire it at that call site rather than leaning harder on this helper.
+- **Knowing your timeout is too tight.** The primitive never logs "the thing you gave up on finished
+  anyway, 400 ms later" — so it cannot tell you a bound is wrong, only let you clean up after it. A
+  caller that wants that signal builds it into its own `onSettled`.
+
 ## Deliberate gaps
 
 Two places do not follow the rule, on purpose. Neither is a defect to re-file.
@@ -209,3 +293,5 @@ Two places do not follow the rule, on purpose. Neither is a defect to re-file.
   is a realm death; scene scope is where teardown is real.
 - [scene-loading.md](./scene-loading.md) — the scene load/swap lifecycle these guards protect.
 - [architecture-layers.md](./architecture-layers.md) — why the helper lives in L0 `runtime/core/`.
+- [rendering.md](./rendering.md) § "The 2D path needs the same recovery" — the renderer-side
+  story behind #801, and why a recovery's cure must sit on the same success path as its bring-up.

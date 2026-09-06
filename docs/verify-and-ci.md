@@ -445,12 +445,22 @@ hands back both views from one read, so it keeps `code` for the eight and `raw` 
 `SRC` and `SRC_WITH_PROSE` so reaching for prose stays a deliberate act rather than the default.
 
 **Both halves are enforced by `commentStripperIsShared.test.ts`** — no hand-rolled stripper
-anywhere, and no raw read of repo source inside `engine/tests/architecture/**`. That directory is
-the scope on purpose: of 1,234 test files, 113 still carry a raw utf8 read, but almost all read back
-a fixture the test itself just wrote, where there is nothing to strip — inside the architecture
-directory it is 55 of 59. A read elsewhere is a deliberate false negative rather than a 55-entry
-allowlist, which would be the same hole one level up. The 27 that are real guards are tracked in
-#816.
+anywhere, and no raw read of repo source in **either vitest project**, `engine/tests/**` and
+`engine/packages/modoki/tests/**`.
+
+⚠️ **It was scoped to `engine/tests/architecture/` first, and that narrowing was a mistake worth
+recording (#812 → #816).** The argument was that of 1,234 test files only ~113 carry a raw utf8
+read, and almost all of those read back a fixture the test itself just wrote — so a repo-wide rule
+would need a ~55-entry allowlist, which is the same fail-open hole one level up. True about the
+FILES, wrong about the RULE: the exclusions already discriminate a fixture read from a source scan
+by what it *is* (wrapped in `JSON.parse`, wrapped in `stripComments`, or a Markdown path), so the
+directory was standing in for a test that had already been written. Widening the roots needed **no
+allowlist at all** and found **28 more real source-scanning guards** — in `assets`, `editor`,
+`electron`, `plugins`, `tools` and the package suite, i.e. every root the narrowing had excused.
+
+The generalisable bit: **a scope restriction is a claim about where a defect can occur.** If the
+rule's own exclusions can tell the classes apart, the restriction is buying nothing and hiding
+whatever sits outside it.
 
 ⚠️ **Both directions of this defect are fail-OPEN, and the second one is the easy one to miss.** A
 **forbidden**-pattern guard goes green because a comment HID the offender. A **required**-pattern

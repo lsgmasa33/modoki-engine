@@ -157,18 +157,41 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * the first can still be satisfied by a comment; a guard with only the second can still be blind
  * to half the corpus.
  *
- * ⚠️ **Scoped to `engine/tests/architecture/**` deliberately, and the scope is doing real work.**
- * A census of all 1,234 test files found 113 with a raw utf8 read, but the overwhelming majority
- * read a fixture the test itself just WROTE, where there is nothing to strip and no defect —
- * inside THIS directory it is 55 of 59. The class is "a guard scanning the repo's own source", and
- * this directory is where those live. A read elsewhere is not caught here — a deliberate
- * false-negative rather than a 55-entry allowlist, which would be the same hole one level up. The
- * 27 real guards in the other test roots are tracked in #816.
+ * ⚠️ **Scope: BOTH vitest projects, every test root (#816).** It began at
+ * `engine/tests/architecture/` alone, on the argument that of 1,234 test files only ~113 carry a
+ * raw utf8 read and the overwhelming majority of those read back a fixture the test itself just
+ * WROTE — so a repo-wide rule would need a ~55-entry allowlist, which is the same fail-open hole
+ * one level up.
  *
- * The shape below therefore matches a read whose PATH is built from a repo-root token, which is
- * what separates "scan `engine/app/ecs/registerTraits.ts`" from "read back my own tmp fixture".
+ * ⚠️ **That argument was true about the FILES and wrong about the RULE.** The exclusions below
+ * (`WRAPPED_BEFORE`, `WRAPPED_AFTER`, `MARKDOWN_READ`) already discriminate a fixture read from a
+ * source scan by WHAT IT IS; the directory was standing in for a test that had already been
+ * written. Widening the roots needed no allowlist at all and found 28 real source-scanning guards
+ * outside the original directory — in `assets`, `editor`, `electron`, `plugins`, `tools` and the
+ * package suite, every root that was excused.
+ *
+ * The shape below matches a read whose PATH is built from a repo-root token, which is what
+ * separates "scan `engine/app/ecs/registerTraits.ts`" from "read back my own tmp fixture".
  */
-const ARCH_DIR = 'engine/tests/architecture/';
+/**
+ * Every test root that owns source-scanning guards — the rule's scope.
+ *
+ * ⚠️ **This started as `engine/tests/architecture/` alone, and the narrowing was wrong.** The
+ * argument was that of 1,234 test files only a minority scan repo source, so a repo-wide rule
+ * would need a ~55-entry allowlist of files that legitimately read back their own fixtures. That
+ * is true and it is not a reason to stop looking: the exclusions below (`WRAPPED_BEFORE`,
+ * `WRAPPED_AFTER`, `MARKDOWN_READ`) do the discriminating, so a fixture read is excused by WHAT IT
+ * IS rather than by which directory it happens to sit in. Widening the roots found real
+ * source-scanning guards in every one of them.
+ *
+ * ⚠️ `engine/packages/modoki/tests` is a SECOND vitest project. It is in scope here deliberately —
+ * `corpusProducerIsShared.test.ts` records the same root as its own open hole, from the
+ * enumeration side.
+ */
+const SCANNED_ROOTS = [
+  'engine/tests/',
+  'engine/packages/modoki/tests/',
+];
 
 /**
  * Every `readFileSync(…, 'utf8')` call, as source text.
@@ -194,10 +217,10 @@ const READ_CALL =
  * and so were several of the guards #812 enumerated, which had to be found by reading rather than
  * by this rule.
  *
- * Kept anyway, because the alternative is worse in the direction that matters: widening it to every
- * utf8 read in this directory means allowlisting ~57 files that legitimately read their own
- * fixtures, and a 55-entry allowlist is the same fail-open hole one level up. What this rule buys
- * is that the COMMON shape cannot come back silently. It is not a proof that the class is closed.
+ * Kept anyway, because the alternative is worse in the direction that matters: matching EVERY utf8
+ * read means reporting the ~55 files that legitimately read back their own fixtures, and an
+ * allowlist that size is the same fail-open hole one level up. What this rule buys is that the
+ * COMMON shape cannot come back silently. It is not a proof that the class is closed.
  */
 const REPO_ROOTED =
   /ROOT\b|[Rr]epoRoot|\bREPO\b|[A-Z][A-Z_]*_DIR\b|__dirname|['"](?:engine|games|demos|docs|qa)\//;
@@ -222,6 +245,10 @@ const WRAPPED_BEFORE = [
   // wrapper and the match is a newline, indentation AND a `fs.` qualifier. Requiring adjacency made
   // this exclusion match almost nothing, and the rule reported fifteen correct files as offenders.
   /JSON\s*\.\s*parse\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
+  // ⚠️ `yaml.load` is `JSON.parse` for a different format — `packagingManifest` reads
+  // electron-builder.yml straight into it and was reported as an offender for it. A parser is a
+  // parser; the list is about SHAPE, not about which library.
+  /yaml\s*\.\s*(?:load|parse)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
   /strip(?:Comments|CommentsAndStrings)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
 ];
 
@@ -236,7 +263,22 @@ const WRAPPED_BEFORE = [
  * is excused. That is the conservative direction for a rule whose false POSITIVES are what get its
  * allowlist grown until it means nothing.
  */
-const WRAPPED_AFTER = /\b(?:JSON\s*\.\s*parse|strip(?:Comments|CommentsAndStrings)|assertScanIsSane)\s*\(/;
+const WRAPPED_AFTER =
+  /\b(?:JSON\s*\.\s*parse|yaml\s*\.\s*(?:load|parse)|strip(?:Comments|CommentsAndStrings)|assertScanIsSane)\s*\(/;
+
+/**
+ * Identifiers this file assigns from `mkdtemp`/`tmpdir` — scratch paths wearing a repo-root NAME.
+ *
+ * ⚠️ **The mirror of `REPO_ROOTED`'s documented blind spot, in the other direction.** That one is a
+ * false NEGATIVE (a repo path held in a variable the rule cannot see); this is a false POSITIVE —
+ * `otaCliScripts.test.ts` writes `const repoRoot = fs.mkdtempSync(...)` and every read off it is a
+ * fixture the test itself just created. The rule matched the identifier's NAME, which is not
+ * evidence about what it holds. It was reported as an offender until this existed.
+ */
+const scratchRootIdents = (code: string): string[] =>
+  [...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*=[^;\n]*?(?:mkdtempSync|mkdtemp|tmpdir)\s*\(/g)]
+    .map((m) => m[1])
+    .concat([...code.matchAll(/([\w$]+)\s*=\s*makeScratch[\w$]*\s*\(/g)].map((m) => m[1]));
 
 /** `.md` names a file with no comment syntax these guards can be blinded by. */
 const MARKDOWN_READ = /\.md['"]|\bMD\b|markdown/i;
@@ -247,9 +289,13 @@ const MARKDOWN_READ = /\.md['"]|\bMD\b|markdown/i;
  * `before` is the text immediately preceding the read, which is where a `JSON.parse(` or
  * `stripComments(` wrapper sits.
  */
-const rawSourceReads = (code: string): string[] =>
-  [...code.matchAll(READ_CALL)]
+const rawSourceReads = (code: string): string[] => {
+  const scratch = scratchRootIdents(code);
+  const usesScratch = (call: string): boolean =>
+    scratch.some((id) => new RegExp(`(^|[^\\w$])${id}\\b`).test(call));
+  return [...code.matchAll(READ_CALL)]
     .filter((m) => REPO_ROOTED.test(m[0]))
+    .filter((m) => !usesScratch(m[0]))
     .filter((m) => !MARKDOWN_READ.test(m[0]))
     .filter((m) => {
       const before = code.slice(Math.max(0, m.index - 40), m.index);
@@ -260,6 +306,7 @@ const rawSourceReads = (code: string): string[] =>
       return !WRAPPED_AFTER.test(after);
     })
     .map((m) => m[0]);
+};
 
 /**
  * Files allowed to read repo source raw, each for a stated reason.
@@ -284,15 +331,25 @@ describe('an architecture guard reads source through the shared reader (#812)', 
   // (the dataflow limit below). Reverting it is caught by a bespoke assertion in
   // `moduleGraphCommentEdges.test.ts`, not by this rule. What the widening buys is the NEXT
   // helper, whose read is repo-rooted — previously that file was not even enumerated.
-  const archFiles = fs.readdirSync(path.join(REPO_ROOT, ARCH_DIR), { recursive: true })
-    .map((n) => String(n).replace(/\\/g, '/'))
-    .filter((n) => n.endsWith('.ts') || n.endsWith('.tsx'))
-    .map((n) => `${ARCH_DIR}${n}`)
+  const archFiles = SCANNED_ROOTS
+    .filter((root) => fs.existsSync(path.join(REPO_ROOT, root)))
+    .flatMap((root) => fs.readdirSync(path.join(REPO_ROOT, root), { recursive: true })
+      .map((n) => String(n).replace(/\\/g, '/'))
+      .filter((n) => n.endsWith('.ts') || n.endsWith('.tsx'))
+      .map((n) => `${root}${n}`))
     .map((rel) => ({ rel, code: readScannedSource(path.join(REPO_ROOT, rel)).code }));
 
-  it('reaches a non-empty set of architecture guards', () => {
+  it('reaches a non-empty set of guards, in BOTH vitest projects', () => {
     // Without this the rule below is a cheerful no-op the day the path prefix changes.
-    expect(archFiles.length, 'the walk found no architecture guards').toBeGreaterThan(50);
+    expect(archFiles.length, 'the walk found no guards').toBeGreaterThan(400);
+    // ⚠️ Per-root floors, not just a total: a total alone is satisfied by one root while another
+    // has silently stopped being walked, which is the vacuous-pass shape this file exists to stop.
+    for (const root of SCANNED_ROOTS) {
+      expect(
+        archFiles.filter((f) => f.rel.startsWith(root)).length,
+        `${root} contributed no files — that root has dropped out of the rule`,
+      ).toBeGreaterThan(20);
+    }
   });
 
   it('THE DETECTOR FIRES: it recognises a repo-source read and ignores a tmp fixture', () => {
@@ -331,6 +388,23 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     // `ssrLoaderDefines`, a real unmigrated source scan, from both this rule and #816's census.
     expect(fires(`const s = fs.${READ}path.join(ENGINE_ROOT, file), 'utf8');`),
       'a *_ROOT constant is still a repo root').toBe(1);
+
+    // ⚠️ **The FALSE-POSITIVE direction, which is the one that grows an allowlist.** Both were
+    // reported as offenders against correct code when #816 widened the roots.
+    // A parser is a parser — `yaml.load` is `JSON.parse` for another format.
+    expect(fires(`const cfg = yaml.load(${READ}path.join(repoRoot, 'electron-builder.yml'), 'utf8'));`),
+      'yaml.load is parse-only, exactly like JSON.parse').toBe(0);
+    // An identifier NAMED like a repo root but ASSIGNED from mkdtemp holds a scratch path. The
+    // rule matched the name, which is not evidence about what the variable holds.
+    expect(fires([
+      "const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-'));",
+      `const s = fs.${READ}path.join(repoRoot, 'out.txt'), 'utf8');`,
+    ].join('\n')), 'a mkdtemp scratch dir named repoRoot is not the repo').toBe(0);
+    // ...and the same file's REAL root still fires, so the exclusion is not a blanket off-switch.
+    expect(fires([
+      "const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-'));",
+      `const s = fs.${READ}path.join(ENGINE_ROOT, 'vite.config.ts'), 'utf8');`,
+    ].join('\n')), 'a scratch ident must not excuse a genuine repo read in the same file').toBe(1);
   });
 
   it('THE RULE IS WIRED: a planted offender is reported', () => {

@@ -14,11 +14,11 @@
  *  conditioned on `app.isPackaged`, and it happens on `process.env` (so children inherit it —
  *  `devServer.ts` spawns Vite with `...process.env`, and build-web.mjs runs under that). */
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const MAIN = path.join(__dirname, '../../electron/main.ts');
-const src = fs.readFileSync(MAIN, 'utf8');
+const src = readScannedSource(MAIN).code;
 
 describe('main.ts publishes the packaged signal to child processes', () => {
   it('sets process.env.MODOKI_PACKAGED, gated on app.isPackaged', () => {
@@ -37,7 +37,7 @@ describe('main.ts publishes the packaged signal to child processes', () => {
   it('devServer spawns the Vite child with the inherited env (the delivery path)', () => {
     // If this ever stops spreading process.env, the signal above silently stops arriving and
     // the packaged editor goes back to killing its own dev server on the first native build.
-    const dev = fs.readFileSync(path.join(__dirname, '../../electron/devServer.ts'), 'utf8');
+    const dev = readScannedSource(path.join(__dirname, '../../electron/devServer.ts')).code;
     expect(dev, 'devServer.ts must spawn Vite with `...process.env` for MODOKI_PACKAGED to reach it')
       .toMatch(/env:\s*\{\s*\.\.\.process\.env/);
   });

@@ -3050,18 +3050,56 @@ entries) and the frame stayed blank. Isolation on the fixed build:
 
 **The `_gpuData` purge is kept, re-scoped.** It deletes only uids of renderers that are provably
 DEAD — safe precisely because those renderers no longer exist, so no live-set reasoning is needed.
-⚠️ It is a **set**, not one uid: a rebuild whose `init()` exceeds `APP_INIT_TIMEOUT_MS` never
-reaches the purge, so each slot ACCUMULATES its dead uids (`pendingDeadRendererUids`) and whichever
-attempt finally succeeds sweeps them all. ⚠️ **Known reach limit, unmeasured:** the purge is
-per-slot, so it does NOT reach renderers destroyed via `teardownSlot` (`destroyPool`, the
-`renderAll` shrink pass, `reclaimIfUnclaimed`) — e.g. a SceneView mount/unmount leaves one
-null-valued key per shared `TextureSource`. That is a deliberate trade for the cross-pool
-correctness fix below, not an oversight. ⚠️ An earlier version took a "live renderer uids" set
+⚠️ It is a **set**, not one uid: a dead uid outlives the attempt that killed it — a rebuild whose
+`init()` exceeds `APP_INIT_TIMEOUT_MS` never reaches a purge, and a renderer torn down via
+`teardownSlot` never had one — so whichever rebuild next succeeds sweeps them all. The purge is
+**process-wide and append-only** (`deadRendererUids`), which is what closed the reach limit this
+paragraph used to record as an accepted trade: while it was per-slot it could not reach renderers
+destroyed via `teardownSlot` (`destroyPool`, the `renderAll` shrink pass, `reclaimIfUnclaimed`), so
+a SceneView mount/unmount left one null-valued key per shared `TextureSource`. `teardownSlot` now
+records too. It is append-only rather than drained-on-walk because draining is wrong the moment a
+second pool exists — slot A's walk would clear a uid still stale on a shared object reachable only
+from slot B, and nothing would ever purge it again; re-purging an already-purged uid is a `delete`
+on an absent key, i.e. free. ⚠️ An earlier version took a "live renderer uids" set
 built from one pool's own slots and deleted every key not in it; that is **wrong**, because
 `defaultPool` and `editorCanvas2DPool` are both live at once and Pixi `TextureSource`s are
 process-global, so it would delete the editor renderer's live entry off a shared texture — a leak
 introduced by a leak fix. Renderer uids come from a monotonic counter that is never reused, so
 there is no uid-collision hazard to defend against either.
+
+⚠️ **That last fact is now load-bearing, and the test fake used to contradict it.** A process-wide
+append-only set is only safe because a live renderer can never share a uid with a dead one — Pixi
+mints uids from a module counter and `resetUids()` has zero callers here. `canvas2DContextLoss.test.ts`'s
+fake derived its uid from `created.length` and reset that in `beforeEach`, i.e. it modelled uid
+RECYCLING, which the real library does not do. That was invisible while the registry was per-slot,
+and the moment it went process-wide the fake reported one pool's LIVE renderer as dead. The fake is
+now monotonic across the file. The general form is worth keeping: **a fake must not be more
+permissive than the thing it stands in for** — it will defend a bug the real dependency cannot have.
+
+**Half 3 — the cure was on the wrong function's success path (#801).** Halves 1 and 2 left one
+door open, and it is the subtlest of the three: `rebuildSlotApp` bounded its `init()` with a
+timeout, then did the revalidation *after* the `await`. A timeout **rejects but does not cancel**.
+So when a bring-up ran long, `rebuildSlotApp` threw at the `await` and everything below it —
+`contextLost = false`, the purge, the `onViewUpdate` sweep, the full-redraw flag — became
+unreachable, while `initSlotApp` carried on underneath and eventually brought a renderer up for
+real. Once `rendererRecovery` had spent its three attempts, nothing reassigned `slot.app`, so that
+late init's own `slot.app !== app` bail-out did not fire either: it took the full success path and
+attached the surviving subtree to a healthy renderer that nothing had revalidated. **Half 2's exact
+symptom, produced by Half 2's own fix being unreachable.**
+
+The repair is not another guard. The defect was that **success was decided in two places** — the
+callee brought the renderer up, the caller cured it — and a timeout was enough to make them
+disagree. The cure now lives on `initSlotApp`'s own success path, gated by a `revalidateOwed` flag
+the rebuild sets before it starts, so whichever attempt actually produces a renderer is the attempt
+that cures it, and a late one is adopted deliberately rather than by accident. **A working surface
+beats a blank one** — that is a choice, and the code used to make the worst version of it: adopt
+the renderer, withhold the cure.
+
+The general lesson, which is why this is written here and not in the ticket: *a recovery whose cure
+lives on a different function's success path from its bring-up has two places where "it worked" is
+decided, and a timeout is enough to split them.* The timeout half of that belongs to a family of
+five — see [async-lifetime.md](./async-lifetime.md) § "The other half: what still belongs to the
+operation you gave up on", which owns the shared `withTimeout` and its guard.
 
 ### Detection is a shared contract now; policy stays per-surface (#795)
 
@@ -4218,7 +4256,7 @@ consequences the pool now handles explicitly, each with a mutation-verified test
   mutating the live slot: a rebuild's forced loss would flip `contextLost` back to true on the
   freshly healthy renderer and queue a redundant second rebuild.
 - `initSlotApp` must **capture** `slot.app` rather than re-read it after its `await`. `rebuildSlotApp`
-  reassigns `slot.app`, so a rebuild whose `init()` exceeds `REBUILD_INIT_TIMEOUT_MS` (rejected, but
+  reassigns `slot.app`, so a rebuild whose `init()` exceeds `APP_INIT_TIMEOUT_MS` (rejected, but
   *not* cancelled) would resume on the retry's Application — double-counting the context budget while
   the timed-out one is never destroyed at all: a leaked live GPU context.
 

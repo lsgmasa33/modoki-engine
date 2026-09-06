@@ -18,6 +18,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -32,7 +33,7 @@ function declaredSectionTitles(): Map<string, Set<string>> {
   ].filter((f) => fs.existsSync(path.join(ROOT, f)));
   const out = new Map<string, Set<string>>();
   for (const f of files) {
-    const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+    const src = readScannedSource(path.join(ROOT, f)).code;
     for (const [, title] of src.matchAll(/section: '([^']+)'/g)) {
       out.set(f, (out.get(f) ?? new Set()).add(title));
     }
@@ -47,7 +48,7 @@ function literalSubSectionTitles(): string[] {
   const dir = path.join(ROOT, 'engine/packages/modoki/src/editor');
   const found: string[] = [];
   for (const { abs: p } of repoFiles({ under: dir, match: /\.tsx$/, floor: 60 })) {
-    for (const [, t] of fs.readFileSync(p, 'utf8').matchAll(/<SubSection title="([^"]+)"/g)) found.push(t);
+    for (const [, t] of readScannedSource(p).code.matchAll(/<SubSection title="([^"]+)"/g)) found.push(t);
   }
   return found;
 }
@@ -83,7 +84,7 @@ describe('SubSection ui ids', () => {
   it('the slug helper matches the implementation it mirrors', () => {
     // If widgets.tsx changes its slugging, this file's copy must move with it or every
     // assertion above silently tests the wrong function.
-    const src = fs.readFileSync(path.join(ROOT, 'engine/packages/modoki/src/editor/panels/assetViews/widgets.tsx'), 'utf8');
+    const src = readScannedSource(path.join(ROOT, 'engine/packages/modoki/src/editor/panels/assetViews/widgets.tsx')).code;
     expect(src).toContain("return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');");
   });
 });

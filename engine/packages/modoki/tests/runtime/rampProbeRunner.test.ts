@@ -18,7 +18,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 import {
-  withTimeout, escapableIntervalMs, runRamp, runBootRampProbe, runCpuRamp,
+  escapableIntervalMs, runRamp, runBootRampProbe, runCpuRamp,
 } from '../../src/runtime/rendering/rampProbeRunner';
 import { createGlProbeSurface } from '../../src/runtime/rendering/rampWorkloadGL';
 import { ESCAPE_MULTIPLE, ABORT_FRAME_MS } from '../../src/runtime/rendering/rampProbe';
@@ -79,22 +79,9 @@ function fakeGl() {
   return { gl, calls };
 }
 
-describe('withTimeout', () => {
-  it('resolves with the inner value when it settles before the deadline', async () => {
-    await expect(withTimeout(Promise.resolve('ok'), 1_000)).resolves.toBe('ok');
-  });
-
-  it('REJECTS a promise that never settles, once the deadline elapses', async () => {
-    vi.useFakeTimers();
-    const never = new Promise<string>(() => { /* never resolves — the case a fast mock cannot prove */ });
-    const pending = withTimeout(never, 1_000);
-    // Attach the rejection assertion before advancing — otherwise the rejection could fire
-    // "unhandled" between the advance and the `expect`, which vitest treats as a test failure.
-    const assertion = expect(pending).rejects.toThrow(/timed out after 1000ms/);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await assertion;
-  });
-});
+// `withTimeout`'s own mechanism (timeout wins vs. settles-in-time, timer cleared, etc.) used to be
+// tested HERE against a local copy. It now lives in `runtime/core/abandonment.ts`, shared by every
+// call site, with its coverage in `abandonment.test.ts` — nothing left here to test redundantly.
 
 // ⚠️ **`awaitOrDispose` AND ITS THREE TESTS WERE DELETED HERE (#203), AND THE HAZARD WITH THEM.**
 // It existed because `runBootRampProbe` raced `makeWebGPURenderer` against a 5 s timeout, and
