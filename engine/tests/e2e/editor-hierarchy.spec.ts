@@ -123,10 +123,12 @@ test('Create Prefab serializes the subtree and POSTs a .prefab.json (write inter
   // The literal is deliberate here — this spec asserts the BYTES that reached disk, so importing
   // the constant would let a wrong constant vouch for itself.
   //
-  // ⚠️ BUMPING `PREFAB_FORMAT_VERSION` MEANS UPDATING THIS LINE, and nothing local will say so:
-  // e2e is not part of `npm run verify`, so the bump goes green on every clone and this assertion
-  // fails only on the public runner AFTER the push. That is exactly how `main` reached 3 with this
-  // line still reading 2 — two public runs red before the hub noticed.
+  // ⚠️ BUMPING `PREFAB_FORMAT_VERSION` MEANS UPDATING THIS LINE. e2e is not part of
+  // `npm run verify`, so the bump goes green on every clone and this assertion fails only on the
+  // public runner AFTER the push — that is exactly how `main` reached 3 with this line still
+  // reading 2, two public runs red before the hub noticed. `tests/architecture/
+  // prefabFormatVersionLiteral.test.ts` now compares the two as TEXT inside `verify`, so the
+  // mismatch is caught locally; keep that guard's regex in mind if you reword this assertion.
   expect(prefab.version).toBe(3);
   expect(prefab.name).toBe('CenterCube');
 });
