@@ -13,6 +13,7 @@ import {
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
   getShadowCasterCapStats,
   getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
+  getFrameLoopHealth, getCurrentFPS,
 } from '@modoki/engine/runtime';
 import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
@@ -112,11 +113,33 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
       }
     : null;
 
+  // ── Frame-loop liveness (#682) — computed BEFORE `ok` on purpose ──
+  // The one signal that answers "are frames ACTUALLY being pumped right now" rather than what the
+  // run mode INTENDS — without it, every frame-fed field below (perf, refs, transforms, offScreen)
+  // can be reporting last-live-frame data over a dead rAF chain with `ok:true` on top of it, which
+  // is worse than a hang because the caller acts on it. Same "healthy means silent" convention as
+  // the editor's `frameLoopFields()` (`agentEditorOps.ts`) — mirrored here rather than imported,
+  // because that module is EDITOR-only (`@modoki/engine/editor`) and this file is shared by the
+  // DEVICE bridge too, so importing it would pull editor chrome into the shipped game bundle.
+  // `getFrameLoopHealth()` itself is a pure, synchronous read (no await, no rAF) — safe from any
+  // handler, including this one.
+  const frameLoop = getFrameLoopHealth();
+  const frameLoopFields = (frameLoop.status === 'running' && frameLoop.recovered === 0)
+    ? {}
+    : { frameLoop };
+  // A stalled/unrecoverable loop is a HARD problem, unlike `frameLoopFields`'s own broader
+  // "healthy means silent" inclusion rule (which also surfaces a merely `'hidden'` or just-
+  // recovered loop — informational, not a failure). Close-out (LOW 6): this used to be reported
+  // ALONGSIDE `ok:true, summary:'No issues detected.'` — the exact contradiction #152's `olderErrors`
+  // note above already names as the failure mode to avoid, just for a different field. Every
+  // frame-fed field this op reports is unreliable while the loop is down, so the verdict must say so.
+  const frameLoopDown = frameLoop.status === 'stalled' || frameLoop.unrecoverable;
+
   // Hard problems fail `ok`. zeroScale is a SOFT signal — an entity can be intentionally scaled to
   // 0 (hidden, or a pop-in animation at t=0), so it does NOT fail `ok`; but it must still be
   // SURFACED so `ok:true` never sits next to a populated `transforms.zeroScale` claiming "No
   // issues detected" (the contradiction the audit flagged). off-screen stays soft + unlisted. (C7 re-audit.)
-  const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0;
+  const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0 && !frameLoopDown;
   const zeroScaleNote = zeroScale.length ? `${zeroScale.length} zero-scale (invisible) entit(ies)` : '';
   // Older errors do NOT fail `ok` — that is what pinned the verdict forever and is why the window
   // exists. They do get SAID, in every branch, because a summary reading "No issues detected."
@@ -143,7 +166,18 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // ALWAYS present, unlike the fault channels above, because "is it fast enough?" has no
   // healthy-means-silent answer — the 30fps target is a number that must be readable at any
   // time, not only once something has already gone wrong.
-  const perf = readPerfProfile();
+  //
+  // `perf.frame.fps` (below) is a MEDIAN over `getFrameProfile()`'s sample ring, which stops
+  // filling the moment the frame loop stops calling `recordFrame` — so once frames die it reports
+  // the LAST healthy fps forever, with nothing here saying so (#682). `getCurrentFPS()` is the
+  // fix: it self-zeroes once `msSinceRealFrame() >= STALL_MS` (`frameDriver.ts`), the same
+  // accessor the editor's own live fps reading already uses (`agentEditorOps.ts`'s `fps` field).
+  // Surfaced as a SEPARATE `currentFps` field rather than overwriting `perf.frame.fps` — that
+  // field is `readPerfProfile()`'s own documented median-fps computation, and silently replacing
+  // its value would make `perf.frame` lie about what it actually measured. `frameLoop` above
+  // (when present) already explains WHY the two can disagree; this is what lets a caller who never
+  // asks for `frameLoop` still catch a stale reading.
+  const perf = { ...readPerfProfile(), currentFps: getCurrentFPS() };
 
   // ── Quality tier (#121 P3) ──
   // The tier AND why it was chosen. Without the reason a surprising tier is unexplainable
@@ -195,6 +229,7 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
       : {}),
     ...(lightCap.engaged ? { lightCap } : {}),
     ...(shadowCap.engaged ? { shadowCap } : {}),
+    ...frameLoopFields,
     perf,
     refs: { issues: refIssues, count: refIssues.length },
     transforms: { nan, zeroScale },
@@ -210,6 +245,9 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
           return notes ? `No blocking issues. Note: ${notes}.` : 'No issues detected.';
         })()
       : [
+          // Named first — a dead frame loop is the reason every OTHER field below may be stale,
+          // so it belongs ahead of the symptoms it can cause rather than buried among them.
+          frameLoopDown && `frame loop ${frameLoop.status}${frameLoop.unrecoverable ? ' (unrecoverable)' : ''} — every frame-fed field in this report may be stale`,
           refIssues.length && `${refIssues.length} bad asset ref(s)`,
           nan.length && `${nan.length} NaN transform field(s)`,
           zeroScaleNote,

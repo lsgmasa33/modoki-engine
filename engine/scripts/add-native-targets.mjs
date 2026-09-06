@@ -37,6 +37,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
+import { acquireBuildClaim } from './buildClaimsStore.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -143,55 +144,95 @@ const makeRunShell = (projectRoot) => (label, cmd, cwd) => new Promise((resolve)
 const results = [];
 for (const spec of specs) {
   const projectRoot = path.join(repoRoot, spec);
-  const cfgPath = path.join(projectRoot, 'project.config.json');
-  if (!fs.existsSync(cfgPath)) { results.push([spec, '-', 'SKIP: no project.config.json']); continue; }
-  // The MERGED config, not the raw file — see loadPluginModules().
-  const cfg = loadProjectConfig(projectRoot);
-  // The SAME two-part check the editor's /api/add-native-target route runs (#589) — this script
-  // reaches the identical scaffoldNativeTarget with no validation of its own, so a hand-edited
-  // project.config.json the route would refuse (a space in appId, an empty required field) sailed
-  // straight through the CLI and into capacitor.config.json, then the iOS bundle identifier /
-  // Android applicationId. The union-errors pass is SEPARATE from validateBuildConfig because
-  // validateBuildConfig sees the already-RESOLVED config, where a bad value has been coerced to
-  // its default and is no longer there to complain about (#39). What this guards is artifact
-  // IDENTITY (app.appId → bundle id / applicationId, build.appleTeamId → DEVELOPMENT_TEAM), not
-  // HTTP hygiene — which is why a CLI needs it exactly as much as a route does. Runs BEFORE the
-  // platform loop (and so before the `if (DRY)` branch below) so `--dry-run` reports the same
-  // verdict the real run would give — sibling of #582, same class: a guard the route enforces
-  // before spawning a CLI that the CLI itself lacked. No `--force` override, by design: bypassing
-  // this is an owner call, not a flag.
-  const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
-  if (cfgErrors.length) {
-    console.error(`\n═══ ${spec} — INVALID project settings, not scaffolded ═══\n${cfgErrors.map((e) => `  • ${e}`).join('\n')}`);
-    results.push([spec, '-', `SKIP: invalid project settings (${cfgErrors.length})`]);
-    continue;
-  }
-  for (const platform of PLATFORMS) {
-    const complete = isNativeTargetScaffolded(projectRoot, platform);
-    if (complete && !FORCE) {
-      results.push([spec, platform, 'skip: already present']);
-      continue;
-    }
-    if (DRY) {
-      results.push([spec, platform, complete ? 'WOULD FORCE-REMOVE + RESCAFFOLD' : 'WOULD SCAFFOLD']);
-      continue;
-    }
-    console.log(`\n═══ ${spec} → ${platform}  (appId ${cfg.app?.appId ?? '(none)'}) ═══`);
+
+  // Cross-process build claim (#650), one per project — this script can scaffold several
+  // projects in one invocation, and each has its OWN <project>/dist to protect, not one shared
+  // between them. Acquired EARLY, before even the config-existence check below: the editor's
+  // `/api/add-native-target` takes its slot before any preflight for the same reason (a refused
+  // scaffold must do nothing at all), and here that includes `scaffoldNativeTarget`'s own heals,
+  // which mutate the project just like build-web.mjs's do. REFUSES AND EXITS this project's
+  // loop iteration (not the whole batch — a busy project skips; the others still run) rather
+  // than waiting: a scripted scaffold must not hang on an interactive editor.
+  //
+  // Skipped entirely in `--dry-run`: a dry run makes no mutation at all (it only ever reports
+  // what WOULD happen), so there is nothing here for a claim to protect.
+  let claim = null;
+  if (!DRY) {
+    // `acquireBuildClaim` can THROW rather than refuse (e.g. `~/.modoki` is uncreatable, or its
+    // lock is genuinely wedged past its deadline). Uncaught here it would crash the whole batch
+    // with a raw stack trace instead of the per-project `REFUSED`/`FAILED` reporting every other
+    // failure in this loop gets — catch it and treat it the same way a held-elsewhere refusal is
+    // treated: skip this project, keep going with the rest of the batch.
     try {
-      // `force` here just tells scaffoldNativeTarget it's allowed to remove an ALREADY-complete
-      // folder (not just an incomplete leftover) — the removal itself, and the Firebase-survivor
-      // guard around it, live entirely inside scaffoldNativeTarget now (not duplicated here), so
-      // --force goes through the exact same code path as the automatic incomplete-folder repair.
-      const { warnings } = await scaffoldNativeTarget({
-        projectRoot, platform, buildCwd: repoRoot, cfg,
-        send: (m) => console.log(m), runShell: makeRunShell(projectRoot),
-        force: FORCE,
-      });
-      for (const w of warnings) console.log(`⚠️  ${w}`);
-      results.push([spec, platform, warnings.length ? `ok (${warnings.length} warning(s))` : 'ok']);
+      const claimed = acquireBuildClaim(projectRoot, `native scaffold (CLI): ${PLATFORMS.join('/')}`, { kind: 'cli' });
+      if (!claimed.ok) {
+        console.error(`\n═══ ${spec} — ${claimed.message} ═══`);
+        results.push([spec, '-', 'REFUSED: build claim held elsewhere']);
+        continue;
+      }
+      claim = claimed;
     } catch (e) {
-      results.push([spec, platform, `FAILED: ${e instanceof Error ? e.message : String(e)}`]);
+      console.error(`\n═══ ${spec} — ${e instanceof Error ? e.message : String(e)} ═══`);
+      results.push([spec, '-', 'REFUSED: could not take the build claim']);
+      continue;
     }
+  }
+  try {
+    const cfgPath = path.join(projectRoot, 'project.config.json');
+    if (!fs.existsSync(cfgPath)) { results.push([spec, '-', 'SKIP: no project.config.json']); continue; }
+    // The MERGED config, not the raw file — see loadPluginModules().
+    const cfg = loadProjectConfig(projectRoot);
+    // The SAME two-part check the editor's /api/add-native-target route runs (#589) — this script
+    // reaches the identical scaffoldNativeTarget with no validation of its own, so a hand-edited
+    // project.config.json the route would refuse (a space in appId, an empty required field) sailed
+    // straight through the CLI and into capacitor.config.json, then the iOS bundle identifier /
+    // Android applicationId. The union-errors pass is SEPARATE from validateBuildConfig because
+    // validateBuildConfig sees the already-RESOLVED config, where a bad value has been coerced to
+    // its default and is no longer there to complain about (#39). What this guards is artifact
+    // IDENTITY (app.appId → bundle id / applicationId, build.appleTeamId → DEVELOPMENT_TEAM), not
+    // HTTP hygiene — which is why a CLI needs it exactly as much as a route does. Runs BEFORE the
+    // platform loop (and so before the `if (DRY)` branch below) so `--dry-run` reports the same
+    // verdict the real run would give — sibling of #582, same class: a guard the route enforces
+    // before spawning a CLI that the CLI itself lacked. No `--force` override, by design: bypassing
+    // this is an owner call, not a flag.
+    const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+    if (cfgErrors.length) {
+      console.error(`\n═══ ${spec} — INVALID project settings, not scaffolded ═══\n${cfgErrors.map((e) => `  • ${e}`).join('\n')}`);
+      results.push([spec, '-', `SKIP: invalid project settings (${cfgErrors.length})`]);
+      continue;
+    }
+    for (const platform of PLATFORMS) {
+      const complete = isNativeTargetScaffolded(projectRoot, platform);
+      if (complete && !FORCE) {
+        results.push([spec, platform, 'skip: already present']);
+        continue;
+      }
+      if (DRY) {
+        results.push([spec, platform, complete ? 'WOULD FORCE-REMOVE + RESCAFFOLD' : 'WOULD SCAFFOLD']);
+        continue;
+      }
+      console.log(`\n═══ ${spec} → ${platform}  (appId ${cfg.app?.appId ?? '(none)'}) ═══`);
+      try {
+        // `force` here just tells scaffoldNativeTarget it's allowed to remove an ALREADY-complete
+        // folder (not just an incomplete leftover) — the removal itself, and the Firebase-survivor
+        // guard around it, live entirely inside scaffoldNativeTarget now (not duplicated here), so
+        // --force goes through the exact same code path as the automatic incomplete-folder repair.
+        const { warnings } = await scaffoldNativeTarget({
+          projectRoot, platform, buildCwd: repoRoot, cfg,
+          send: (m) => console.log(m), runShell: makeRunShell(projectRoot),
+          force: FORCE,
+        });
+        for (const w of warnings) console.log(`⚠️  ${w}`);
+        results.push([spec, platform, warnings.length ? `ok (${warnings.length} warning(s))` : 'ok']);
+      } catch (e) {
+        results.push([spec, platform, `FAILED: ${e instanceof Error ? e.message : String(e)}`]);
+      }
+    }
+  } finally {
+    // Released on every path out of the block above, `continue` included (a `continue` inside a
+    // `try` still runs its `finally` before moving the outer loop on) — so the SKIP branches
+    // release just as reliably as a real scaffold does.
+    claim?.release();
   }
 }
 
@@ -199,4 +240,4 @@ console.log('\n═══ summary ═══');
 for (const [spec, platform, status] of results) {
   console.log(`  ${spec.padEnd(26)} ${String(platform).padEnd(8)} ${status}`);
 }
-if (results.some(([, , s]) => s.startsWith('FAILED'))) process.exitCode = 1;
+if (results.some(([, , s]) => s.startsWith('FAILED') || s.startsWith('REFUSED'))) process.exitCode = 1;

@@ -1,5 +1,5 @@
 /**
- * `runtime/core/abandonment.ts` is the ONLY timeout-wrapping implementation in the tree (#801).
+ * `runtime/core/abandonment.ts` is the only timeout-wrapping implementation in SCAN_DIRS (#801).
  *
  * `withTimeout` was hand-rolled SIX times: four named helpers (`canvas2DPool.ts`, `gpuClock.ts`,
  * `rampProbeRunner.ts`, `text/msdfGenerate.ts`) and two inline copies (`Scene3D.tsx`,
@@ -65,11 +65,57 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const REPO = path.resolve(__dirname, '../../..');
 
 /** Same scope as the liveness guard: everything that can hold engine state across a deferral. */
+/** ⚠️ **Roots this guard does NOT scan, and the hand-rolled instances known to sit there (#830).**
+ *
+ *  The docblock above calls `SCAN_DIRS` a deliberate exclusion — "the helper is engine runtime code
+ *  and does not ship to those". That reason is real, but the CLAIM in the file's opening line was
+ *  wider than the check: ``runtime/core/abandonment.ts` is the ONLY timeout-wrapping implementation in the tree (#801)`. Running this guard's OWN
+ *  detector over the unscanned roots returns the entries below, so "in the tree" was never what was
+ *  verified.
+ *
+ *  These are PINNED rather than migrated, deliberately. Moving them onto the shared helper changes
+ *  behaviour in the Electron main process and in the device-connection path — code whose failure
+ *  modes need a physical device to exercise — and whether engine runtime code SHOULD be imported
+ *  there at all is a design question, not a refactor. Filed on #830.
+ *
+ *  What the pin buys: a FOURTH instance fails immediately instead of joining a silent population.
+ *  ⚠️ It also goes red when one of these is legitimately FIXED — that is intended. Removing an
+ *  entry should be a deliberate edit in the same commit as the migration, not something that
+ *  quietly stops being true. */
+const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
+  'engine/electron/main.ts :: rejects via reject',
+  'engine/plugins/backend/deviceCdp.ts :: rejects via reject',
+  'engine/plugins/backend/deviceConnection.ts :: rejects via reject',
+];
+
+
 const SCAN_DIRS = [
   'engine/packages/modoki/src/runtime',
   'engine/packages/modoki/src/editor',
   'engine/app',
 ];
+
+/** The roots this guard does NOT scan — **DERIVED, not hand-written (#830 review).**
+ *
+ *  ⚠️ This was a hand-listed four (`plugins`, `electron`, `tools`, `toolchain`) under a test titled
+ *  "the roots this guard does NOT scan", which is a universal claim — so the ledger below was
+ *  vouching for a subset while reading as though it covered everything. Exactly the defect this
+ *  whole change is about, in the fix for it.
+ *
+ *  Now: every top-level source root in the repo, minus the ones SCAN_DIRS already covers. A new
+ *  root is in the remainder the day it is created, without anyone remembering. */
+const UNSCANNED_ROOTS: readonly string[] = (() => {
+  const covered = (rel: string) => SCAN_DIRS.some((d) => rel === d || rel.startsWith(`${d}/`));
+  const roots = new Set<string>();
+  for (const { rel } of repoFiles({ match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 500 })) {
+    const parts = rel.split('/');
+    // Depth 2 for the multi-project roots (games/<id>, demos/<id>, engine/<area>), depth 1 for a
+    // flat one like `site/`. Both are compared against SCAN_DIRS' own repo-relative prefixes.
+    const root = parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
+    if (!covered(root) && !SCAN_DIRS.some((d) => d.startsWith(`${root}/`))) roots.add(root);
+  }
+  return [...roots].sort();
+})();
 
 /** The helper itself IS the implementation — its own timer is the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/abandonment.ts');
@@ -79,12 +125,12 @@ const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/abandonm
  *  written, and this was its 32nd offender. `floor` also subsumes the census this guard used to
  *  hand-roll: `repoFiles` throws when the match count drops below it, so a scan that collapses
  *  fails loudly instead of going quietly green. */
-function scannedFiles(): Array<{ rel: string; abs: string }> {
+function scannedFiles(roots: readonly string[] = SCAN_DIRS): Array<{ rel: string; abs: string }> {
   return repoFiles({
-    under: SCAN_DIRS,
+    under: [...roots],
     match: (rel) => /\.tsx?$/.test(rel) && !rel.includes('.test.'),
     exclude: ['node_modules', 'dist'],
-    floor: 500, // 862 when written
+    floor: 0,   // callers assert their own non-vacuity; SCAN_DIRS measured 862 when written
   });
 }
 
@@ -134,9 +180,9 @@ const EXEMPT = ['engine/packages/modoki/src/editor/createEditor.tsx'];
 
 interface Scanned { file: string; rejectors: string[]; offenders: string[] }
 
-function scan(): Scanned[] {
+function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
   const results: Scanned[] = [];
-  for (const { rel, abs } of scannedFiles()) {
+  for (const { rel, abs } of scannedFiles(roots)) {
     // The shared reader (#812), not a private `readFileSync` + strip: it picks the stripper from
     // the extension and REFUSES rather than guessing, which is the fail-open default that guard
     // exists to remove. ⚠️ It preserves source OFFSETS — see `timerRejects`'s window.
@@ -151,6 +197,27 @@ function scan(): Scanned[] {
 }
 
 describe('the shared abandonment helper is the only timeout implementation (#801)', () => {
+  it('SCAN_DIRS itself is non-vacuous (the floor moved onto the callers)', () => {
+    expect(scannedFiles().length, 'the SCAN_DIRS corpus collapsed — every check below would pass '
+      + 'having read nothing').toBeGreaterThan(500);
+  });
+
+  it('the roots this guard does NOT scan hold exactly the KNOWN hand-rolled timeouts (#830)', () => {
+    // Runs the guard's OWN detector over the unscanned roots, so this cannot drift from what the
+    // real check would say. A FOURTH instance fails here instead of joining a silent population.
+    const outside = scan(UNSCANNED_ROOTS)
+      .filter((r) => r.offenders.length)
+      .map((r) => `${r.file} :: rejects via ${r.offenders.join(', ')}`)
+      .sort();
+    expect(scannedFiles(UNSCANNED_ROOTS).length, 'the unscanned-roots corpus is empty — this '
+      + 'assertion would pass having examined nothing').toBeGreaterThan(50);
+    expect(outside, 'The set of hand-rolled timeouts OUTSIDE SCAN_DIRS changed. A new one means '
+      + 'the family (#801) has a fresh instance in a root this guard does not police — decide '
+      + 'deliberately whether it migrates onto the shared helper or joins the ledger with a '
+      + 'reason. One DISAPPEARING is good news: drop its ledger entry in the same commit.')
+      .toEqual([...KNOWN_OUTSIDE_SCAN_DIRS].sort());
+  });
+
   it('no file hand-rolls a promise timeout', () => {
     const offenders = scan()
       .filter((r) => r.offenders.length > 0)

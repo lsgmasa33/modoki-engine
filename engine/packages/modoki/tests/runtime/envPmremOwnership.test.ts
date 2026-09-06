@@ -518,6 +518,102 @@ describe('a failed cube build restores the renderer and source state it dirtied'
   });
 });
 
+describe('per-renderer discriminant (#775 — the cross-renderer bug this cache exists to avoid)', () => {
+  // envPmrem.ts:71-75 is explicit that the per-renderer WeakMap is deliberate, not incidental:
+  // holding a renderer strongly would pin a DISPOSED renderer alive (#720's shape), so the cache
+  // must stay keyed by renderer identity rather than collapsing to a single Map<source, target>.
+  // Every OTHER test in this file uses exactly one `const renderer = {}`, so a shared-Map
+  // regression would pass every one of them — these are the ones that would actually catch it.
+  it('two renderers deriving the SAME source get DISTINCT pmrem targets, each built once', () => {
+    const rendererA = {};
+    const rendererB = {};
+    const source = new THREE.DataTexture();
+
+    const fromA = getEnvPMREMTexture(rendererA, source);
+    const fromB = getEnvPMREMTexture(rendererB, source);
+
+    expect(pmrem.generateCalls, 'a second renderer must not reuse the first renderer\'s target').toBe(2);
+    expect(fromA).toBeTruthy();
+    expect(fromB).toBeTruthy();
+    expect(fromB, 'a shared Map<source, target> would hand renderer B the object built for A').not.toBe(fromA);
+  });
+
+  it('adding renderer B does not disturb renderer A\'s own cache hit', () => {
+    const rendererA = {};
+    const rendererB = {};
+    const source = new THREE.DataTexture();
+
+    const firstA = getEnvPMREMTexture(rendererA, source);
+    getEnvPMREMTexture(rendererB, source); // touches the cache for a second renderer in between
+    const secondA = getEnvPMREMTexture(rendererA, source);
+
+    expect(pmrem.generateCalls, 'A must still be served from cache — only A and B\'s own first builds').toBe(2);
+    expect(secondA).toBe(firstA);
+  });
+
+  it('two renderers deriving the SAME source get DISTINCT cube targets, each built once', () => {
+    const rendererA = {};
+    const rendererB = {};
+    const source = new THREE.DataTexture();
+
+    const fromA = getEnvCubeTexture(rendererA, source);
+    const fromB = getEnvCubeTexture(rendererB, source);
+
+    expect(cube.generateCalls, 'a second renderer must not reuse the first renderer\'s cube target').toBe(2);
+    expect(fromA).toBeTruthy();
+    expect(fromB).toBeTruthy();
+    expect(fromB).not.toBe(fromA);
+  });
+
+  it('disposeEnvDerivedFor(source) reaches BOTH renderers\' targets, not just the first one built', () => {
+    const rendererA = {};
+    const rendererB = {};
+    const source = new THREE.DataTexture();
+
+    const fromA = getEnvPMREMTexture(rendererA, source)!;
+    const fromB = getEnvPMREMTexture(rendererB, source)!;
+    expect(sourceForEnvDerived(fromA)).toBe(source);
+    expect(sourceForEnvDerived(fromB)).toBe(source);
+
+    disposeEnvDerivedFor(source);
+
+    expect(sourceForEnvDerived(fromA), 'renderer A\'s reverse mapping must be dropped').toBeUndefined();
+    expect(sourceForEnvDerived(fromB), 'renderer B\'s reverse mapping must be dropped too — not just A\'s').toBeUndefined();
+
+    // Neither renderer may be handed the disposed target on the next ask — both must rebuild.
+    const rebuiltA = getEnvPMREMTexture(rendererA, source);
+    const rebuiltB = getEnvPMREMTexture(rendererB, source);
+    expect(pmrem.generateCalls, 'both renderers rebuild after a source-keyed dispose').toBe(4);
+    expect(rebuiltA).not.toBe(fromA);
+    expect(rebuiltB).not.toBe(fromB);
+  });
+
+  it('a build failure on renderer A does not poison the retry on renderer B for the same source', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const rendererA = {};
+      const rendererB = {};
+      const source = new THREE.DataTexture();
+      source.image = { height: 512, width: 1024 } as never;
+      // The mock's `failSources` is source-keyed only (it can't tell renderers apart), so this
+      // stays failing for BOTH — which is exactly what lets this test tell "B was suppressed by
+      // A's cached failure" (no second generate call, straight to undefined) apart from "B made
+      // its own real attempt and that attempt also failed" (a second generate call). The negative
+      // cache is per-renderer (`envDerivedFailureCache` is a `WeakMap<renderer, ...>`,
+      // envPmrem.ts:89), so it must be the latter.
+      cube.failSources.add(source);
+
+      expect(getEnvCubeTexture(rendererA, source), 'A fails as instructed').toBeUndefined();
+      expect(cube.generateCalls).toBe(1);
+
+      expect(getEnvCubeTexture(rendererB, source), 'B fails too (never un-failed) but must still have tried').toBeUndefined();
+      expect(cube.generateCalls, 'a failure recorded for A must not short-circuit B\'s own attempt').toBe(2);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
 describe('syncEnvironment falls back to the raw equirect when there is no renderer (#775/#779)', () => {
   it('binds the raw equirect to scene.background, unchanged degrade', async () => {
     const world = createWorld();

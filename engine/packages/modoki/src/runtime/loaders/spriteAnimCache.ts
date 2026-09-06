@@ -62,9 +62,10 @@ function spriteAnimCacheKey(refOrPath: string): string | undefined {
  *  timing defaults) so downstream code never sees a malformed SpriteClip. */
 function normalizeClip(raw: unknown): SpriteClip {
   const d = defaultSpriteClip();
-  if (!raw || typeof raw !== 'object') return d;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return d;
   const c = raw as Partial<SpriteClip>;
   return {
+    ...c,
     frames: Array.isArray(c.frames) ? c.frames.filter((f): f is string => typeof f === 'string') : d.frames,
     fps: typeof c.fps === 'number' ? c.fps : d.fps,
     mode: c.mode === 'once' || c.mode === 'loop' || c.mode === 'pingpong' ? c.mode : d.mode,
@@ -79,7 +80,7 @@ function normalizeClip(raw: unknown): SpriteClip {
 export function normalizeSpriteAnim(json: Partial<SpriteAnimDef> | undefined): SpriteAnimDef {
   const clips: Record<string, SpriteClip> = {};
   const src = json?.clips;
-  if (src && typeof src === 'object') {
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
     for (const [name, clip] of Object.entries(src)) clips[name] = normalizeClip(clip);
   }
   return { ...json, id: json?.id, clips };

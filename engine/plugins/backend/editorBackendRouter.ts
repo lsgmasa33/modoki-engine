@@ -182,6 +182,16 @@ import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/cor
 import { PARTICLE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/particles/types';
 import { MATERIAL_FORMAT_VERSION } from '../../packages/modoki/src/runtime/traits/Renderable3D';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
+// Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
+// itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
+// `tsconfig.node.json`'s `lib: ["ES2023"]` (no DOM) — importing anything from `frameDriver.ts`
+// (even `import type`) pulls its whole `document`/`requestAnimationFrame`-using file into that
+// program and fails `tsc -b engine` (confirmed: `document`/`DOMHighResTimeStamp`/etc. unresolvable
+// there). See `frameLoopStatus.ts`'s header for the full story. Its whole purpose here is
+// `refuseUndeliverableDeviceInput`'s `InputDeliverabilityReply.frameLoop.status` field below, which
+// used to be a locally re-declared `string` — see that interface's comment for why a bare `string`
+// silently disarms the guard on a rename that `bridge.ts`'s type-checked twin would catch.
+import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
 // Format-version constant per `AssetSchemaType`, for /api/asset-write's too-new/unreadable
 // refusal (docs/format-versioning.md § 2b). Only types that actually carry a stamped `version`
@@ -195,7 +205,7 @@ import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
-import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
+import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM, isCdpRoutableMethod } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
 import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
@@ -538,6 +548,72 @@ function makeAssetResolver(ctx: BackendContext): AssetRefResolver | undefined {
   // over its guids. `a?.guid` tolerates a null/malformed entry, which used to throw out
   // of here and turn a 200 validation into a 500.
   return makeAssetRefResolver(assets.map((a) => a?.guid));
+}
+
+/** #682 close-out (HIGH 1): refuse a trusted-input dispatch BEFORE spending a CDP/WDA/synthetic
+ *  round trip on it, when the device's own frame loop cannot actually deliver it — the false
+ *  "ok … [input:trusted-cdp]" over a dead rAF chain that #682 exists to close.
+ *
+ *  THIS is the one seam every CDP-routable method (tap/drag/press-key/hover/scroll) passes
+ *  through regardless of transport, and that is why the guard lives here rather than in
+ *  `bridge.ts`'s `handleResolveAim`: the CDP/WDA routes resolve their aim (`resolve-aim`, an
+ *  in-page round trip) for tap/drag/hover/scroll, but `press-key` has no coordinates to resolve
+ *  and never makes that round trip at all — `tryDeviceCdpInput`'s `press-key` case dispatches
+ *  straight over the CDP session. A guard placed only in `handleResolveAim` would therefore
+ *  still miss press-key; this dispatch, which every one of the five reaches before any transport
+ *  is chosen, does not. `bridge.ts`'s own per-handler `frameLoopRefusal` already covers the
+ *  pure-synthetic path (no CDP/WDA session available at all) — this is belt and braces for that
+ *  case, and the only guard for the trusted ones.
+ *
+ *  Reuses the existing `input-deliverability` op (agentBridge.ts) rather than inventing a new
+ *  round trip: it already exists to ask the page "can input be delivered right now" for the
+ *  editor's own Chromium-occlusion check, its registry answers over every transport the device
+ *  bridge reaches (bridge.ts's `delegateToAgentOps` default case), and it now also reports
+ *  `getFrameLoopHealth()`.
+ *
+ *  Message text intentionally mirrors bridge.ts's `frameLoopRefusal` — duplicated, not shared.
+ *  ⚠️ NOT because there is nothing importable across the two processes (this file is the Node
+ *  backend; that one runs in-page) — that claim stopped being true once `tools/shared/` became a
+ *  real cross-process seam: this very file already reaches into it (`mcpResult.ts`'s `ErrorCode`
+ *  above), and `agentBridge.ts` — an in-page, device-shipped bundle, the same side of the process
+ *  boundary as `bridge.ts` — value-imports `tools/shared/simStepTiming.ts` (#822). A shared helper
+ *  there could serve both call sites; this one just hasn't been extracted. Keep the wording in
+ *  sync BY HAND until it is — a future edit to either message must update the other.
+ *
+ *  Fails OPEN on anything it cannot read as a `frameLoop` fact — a proxy throw, an app build
+ *  predating this field (or the op itself), an unparseable reply — the same "never refuse input
+ *  over a stale/absent probe" rule `releaseHeldBeforeTrustedGesture` (deviceCdp.ts) already
+ *  follows for its own best-effort device round trip.
+ *
+ *  ⚠️ Only `status` is typed against the shared leaf (`FrameLoopStatus`) below — `unrecoverable`,
+ *  `detail` and `msSinceLastFrame` stay hand-typed optionals with no shared source, so a wire-key
+ *  rename on the sender's side (agentBridge.ts's `input-deliverability` op) for any of those three
+ *  fields would NOT redden here: `obj.frameLoop?.unrecoverable` would just read `undefined` and
+ *  the "fails OPEN on anything it cannot read" behaviour above would swallow the drift silently.
+ *  Not a defect today (#682 close-out round 3, BLOCKER 2 follow-up) — noted so a future rename
+ *  doesn't trust this interface to catch it. */
+interface InputDeliverabilityReply {
+  frameLoop?: { status?: FrameLoopStatus; unrecoverable?: boolean; detail?: string; msSinceLastFrame?: number };
+}
+
+async function refuseUndeliverableDeviceInput(method: string, deadlineMs?: number): Promise<string | null> {
+  if (!isCdpRoutableMethod(method)) return null;
+  let raw: unknown;
+  // `deadlineMs` is the SAME op-sized transport deadline `/api/device/request`'s own `proxy`
+  // helper already computes (#153) from the request's `params.timeoutMs` (line ~1014 above) —
+  // passed through rather than left to the connection's flat 5000ms default. ⚠️ Narrower than it
+  // sounds: none of the CDP-routable input tools (tap/drag/press-key/hover/scroll) actually SEND
+  // `timeoutMs`, so `deadlineMs` is `undefined` for every real caller today and this probe still
+  // rides the flat 5000ms default — the extra-round-trip cost this comment describes only bites a
+  // caller that supplies `timeoutMs` (LOW 5, #682 close-out round 3).
+  try { raw = await deviceConnection.proxy('input-deliverability', {}, deadlineMs); } catch { return null; }
+  if (isDeviceFailureReply(raw)) return null; // old bridge, or the op genuinely errored — fall through
+  let obj: InputDeliverabilityReply;
+  try { obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as InputDeliverabilityReply; } catch { return null; }
+  const fl = obj?.frameLoop;
+  if (!fl || (fl.status !== 'stalled' && !fl.unrecoverable)) return null;
+  return `Error: refusing ${method} — ${fl.detail ?? `the frame loop has not ticked for ${fl.msSinceLastFrame}ms`} `
+    + 'Dispatching this input now would report success while the game never receives it.';
 }
 
 /**
@@ -1216,6 +1292,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // second call.
         return json({ result: native, wdaFallbackUnavailable: shot.reason });
       }
+      // #682 close-out (HIGH 1): ask BEFORE any CDP/WDA session discovery, so a dead frame loop
+      // costs one cheap round trip instead of a wasted adb/WDA probe as well. See
+      // `refuseUndeliverableDeviceInput`'s docblock for why this dispatch — not `handleResolveAim`
+      // — is the chokepoint that provably covers all five CDP-routable methods, `press-key`
+      // included.
+      const undeliverable = await refuseUndeliverableDeviceInput(b.method, deadline);
+      if (undeliverable) return json({ result: undeliverable });
       // GATED ON THE DEVICE BEING ANDROID, and on the CDP target being THIS lease's app (#142).
       // The mirror of the iOS gate below, and it was missing: CDP discovery runs entirely through
       // adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route

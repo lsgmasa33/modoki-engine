@@ -62,7 +62,7 @@ export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
 }
 
 export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false, dataUiId }: {
-  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId?: string;
+  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId: string;
 }) {
   // Enforce the hint's declared min/max on commit (previously display-only — see
   // BufferedNumberInput). Clamp in `parse` so a typed out-of-range value is capped.

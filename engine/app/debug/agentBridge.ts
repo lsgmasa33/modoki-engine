@@ -111,6 +111,11 @@ import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
 import { makeSchemaPusher } from './schemaPusher';
+// Single-sourced with the HOST side (`mcp-tools.ts`'s `device_step` tool, which must derive this
+// SAME default when a caller omits `timeoutMs`) — see `engine/tools/shared/simStepTiming.ts`
+// (#822). A VALUE import from `tools/shared`, not `import type`: see that file's docblock for why
+// this is a deliberate exception to the app→tools/shared "types only" convention.
+import { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
@@ -119,6 +124,7 @@ import {
   setGpuTimingEnabled, resetGpuTimings,
   collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
+  getFrameLoopHealth,
 } from '@modoki/engine/runtime';
 import {
   listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, type AgentToolDef,
@@ -331,6 +337,29 @@ export function sceneReloadSource(env: { hasBridge: boolean; hasHot: boolean }):
   return null;
 }
 
+/** A staleness note for a FRAME-FED read — worldTransforms, screen bounds, hit regions, a physics
+ *  query, the profiler, a watch sample. Every one of these is only as fresh as the frame the loop
+ *  last actually ran, and a dead rAF chain returns last-live-frame data with nothing saying so
+ *  (#682). Appended to the op's EXISTING `warnings` array rather than a new payload shape.
+ *
+ *  Same "healthy means silent" inclusion rule as the editor's `frameLoopFields()`
+ *  (`agentEditorOps.ts`): silent while `status==='running' && recovered===0`.
+ *  `getFrameLoopHealth()` already carries a ready-to-read `.detail` for the two cases that matter
+ *  most — `'idle'` (this was NEVER computed, not merely stale — the loop has never pumped a frame)
+ *  and `'stalled'` (this is the last frame that ran, N ms ago) — so this reuses it rather than
+ *  re-deriving the same facts twice. */
+function frameStalenessWarning(what: string): string | null {
+  const h = getFrameLoopHealth();
+  if (h.status === 'running' && h.recovered === 0) return null;
+  if (h.detail) return `${what}: ${h.detail}`;
+  // 'hidden' (benign — an occluded window — and carries no `.detail`) or 'running' just after a
+  // stall recovered: still worth saying, since either can mean this read spans a gap the caller
+  // has no other way to see.
+  return `${what}: the frame loop is ${h.status}` +
+    (h.recovered > 0 ? ` (recovered from a stall ${h.recovered} time(s) this session)` : '') +
+    ' — this may not be from the CURRENT frame.';
+}
+
 /** Build a plain-JSON dump of the live ECS world — the "verify without a
  *  screenshot" payload. Reuses `getAllEntities` (which already returns the trait
  *  names present per entity), resolving each name to its meta via a map built
@@ -343,6 +372,16 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
   const readTrait = params.full ? readTraitDataFull : readTraitData;
   const warnings: string[] = [];
+  // #682: `world`/`bounds` are FRAME-FED — `worldTransforms` is written by
+  // transformPropagationSystem, a frame callback, so both enrichers are only as fresh as the last
+  // frame the loop actually ran. The `world` guard below (`worldTransforms.get(info.id)`) used to
+  // be a SILENT omission either way: a loop that ran and then died returns last-live-frame values
+  // as current with nothing saying so, and a loop that never ran drops the key with no explanation
+  // at all (indistinguishable from "this entity has no computed world transform").
+  if (params.world || params.bounds) {
+    const w = frameStalenessWarning('world/bounds');
+    if (w) warnings.push(w);
+  }
   const all = getAllEntities();
   // Resource entities are mesh/material/prefab/env holders AND world-singleton
   // config traits (Time, Physics2D/3D, NPRPostFX). They clutter the DEFAULT
@@ -872,12 +911,21 @@ registerAgentOp('layout-bounds', (params) => {
   // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (ids, ints)
   // from the PRODUCER, so it is unaffected either way — but keep the rounding here regardless.
   const p = (params ?? {}) as LayoutBoundsParams & { precision?: number };
-  return roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision));
+  const result = roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision)) as Record<string, unknown>;
+  // #682: every rect here is FRAME-FED (a registered bounds provider runs at render time).
+  const w = frameStalenessWarning('layout bounds');
+  return w ? { ...result, warnings: [w] } : result;
 });
 
 // ── Enact Phase 2: numeric handle geometry — WHERE the draggable handles are in the
 // Canvas2D/SVG authoring editors, so `drag-handle`/`tap-handle` can aim without pixels. ──
-registerAgentOp('enact-handles', (params) => computeHandles((params ?? {}) as HandlesDumpParams));
+registerAgentOp('enact-handles', (params) => {
+  const result = computeHandles((params ?? {}) as HandlesDumpParams) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): the same frame-fed projection as `layout-bounds` — a Canvas2D
+  // provider's handle geometry is only as fresh as the last frame it actually ran on.
+  const w = frameStalenessWarning('enact handles');
+  return w ? { ...result, warnings: [w] } : result;
+});
 
 // Editor CHROME joins the same registry, so `tap_handle` drives a panel button with no new
 // input tool. Registered once here rather than per-panel: it is one DOM walk over
@@ -896,7 +944,14 @@ import.meta.hot?.dispose(() => unregisterChromeHandles());
 // ── Selector-aware input: resolve a CSS selector to a live viewport point (+ who is
 // actually on top of it) so the trusted-input host routes can aim without a round-trip
 // race. Renderer-side because only the renderer has the DOM. ──
-registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?? {}) as DomPointSpec));
+registerAgentOp('resolve-dom-point', (params) => {
+  const result = resolveDomPointReport((params ?? {}) as DomPointSpec) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): this is one of the values the TRUSTED CDP/WDA routes aim from
+  // (`resolveAimViaDevice` → `resolve-aim` → here for a selector aim) — the same frame-fed
+  // projection as `layout-bounds`/`hit-regions`, so it gets the same staleness note.
+  const w = frameStalenessWarning('resolve dom point');
+  return w ? { ...result, warnings: [w] } : result;
+});
 // #261 — consulted ONLY when an aim is about to be refused, to tell a transient (the dock is
 // mid-move) from a real one. Registered here rather than in agentEditorOps.ts because it needs
 // nothing from `editor/`: §9's rule is that an op reaching only the DOM belongs where BOTH
@@ -907,7 +962,14 @@ registerAgentOp('layout-settling', () => layoutSettleReport());
 // entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in
 // an earlier round-trip. Renderer-side because only the renderer holds the camera, the
 // PixiJS bounds, and the DOM. ──
-registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
+registerAgentOp('resolve-entity-point', (params) => {
+  const result = resolveEntityPointReport((params ?? {}) as EntityPointSpec) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): a 2D/3D entity's rect comes from the same registered bounds
+  // providers `layout-bounds` reads (`collectScreenBounds`) — frame-fed, and one of the values
+  // the TRUSTED routes aim from — so it gets the same staleness note.
+  const w = frameStalenessWarning('resolve entity point');
+  return w ? { ...result, warnings: [w] } : result;
+});
 
 // ── Can trusted input actually be DELIVERED to this window right now? ──
 // Chromium DROPS every `sendInputEvent` while the window is OCCLUDED (another app fully covers
@@ -921,10 +983,22 @@ registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((pa
 // `hasFocus` is the WEAKER sibling and is reported rather than refused: with the window visible
 // but not OS-focused, input DOES arrive, but Chromium fires no focus/blur/focusin/focusout, so
 // anything the editor does on a focus event silently does not happen.
-registerAgentOp('input-deliverability', () => ({
-  visibilityState: document.visibilityState,
-  hasFocus: document.hasFocus(),
-}));
+//
+// `frameLoop` (#682 close-out, HIGH 1): reused by `editorBackendRouter.ts`'s device-input
+// dispatch as the ONE round trip every CDP-routable method (tap/drag/press-key/hover/scroll)
+// makes before a transport is chosen — `handleResolveAim` alone cannot cover `press-key`, which
+// has no coordinates to resolve and so never round-trips through the page at all. Reported here,
+// not refused: this op only answers "can input be delivered right now", it dispatches nothing
+// itself, so a stalled loop is a FACT for the caller to act on rather than something for this op
+// to refuse.
+registerAgentOp('input-deliverability', () => {
+  const h = getFrameLoopHealth();
+  return {
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+    frameLoop: { status: h.status, unrecoverable: h.unrecoverable, detail: h.detail, msSinceLastFrame: h.msSinceLastFrame },
+  };
+});
 
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
 // Only errors inside this window gate `ok` (F14): a stale load-time / prior-scene error otherwise
@@ -1011,6 +1085,11 @@ registerAgentOp('profiler', (raw: unknown) => {
       const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
       // Sorted by cost, so the interesting frames come first regardless of when they happened.
       const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
+      // #682: `captureFrame` is called from inside `runFrame` (a frame callback) — a dead loop
+      // simply stops appending, so a capture that ran and then died reports its last frames as
+      // current with nothing saying so. Reported ONLY while still `capturing` — a capture the
+      // caller already `capture-stop`ped is expected to be frozen, not stale.
+      const w = cap.capturing ? frameStalenessWarning('profiler capture') : null;
       return {
         capturing: cap.capturing,
         frameCount: cap.frames.length,
@@ -1021,6 +1100,7 @@ registerAgentOp('profiler', (raw: unknown) => {
           // Only the costly branches — a full tree per frame is what blows the budget.
           top: flattenTree(f.tree).sort((a, b) => b.selfMs - a.selfMs).slice(0, 6),
         })),
+        ...(w ? { warnings: [w] } : {}),
       };
     }
     // P7 — GPU timestamp queries. Separate actions rather than a flag on `read` because enabling
@@ -1091,8 +1171,14 @@ registerAgentOp('profiler', (raw: unknown) => {
       // exists for the deliberate case (re-arming across a scene swap).
       return { reset: true };
     case 'read':
-    default:
-      return readPerfProfile({ markers: Number(params.markers ?? 12) });
+    default: {
+      const result = readPerfProfile({ markers: Number(params.markers ?? 12) }) as Record<string, unknown>;
+      // #682: `frame`/`gpu`/`restBreakdown` are all sampled from frames that actually ran — a dead
+      // loop stops filling the ring and this would otherwise report the last healthy reading
+      // forever with nothing saying so.
+      const w = frameStalenessWarning('profiler');
+      return w ? { ...result, warnings: [w] } : result;
+    }
   }
 });
 
@@ -1126,14 +1212,21 @@ registerAgentOp('watch-read', (params) => {
   // `roundFloats` COPIES, which matters here: `readWatch` hands back the LIVE `samples` arrays
   // that WatchTab renders. Rounding in place would degrade the human's sparkline.
   if (!out?.ok || !Array.isArray(out.series)) return out;
-  if (p.samples) return roundFloats(out, sig);
+  // #682: a watch samples the live world once per frame — a dead loop simply stops recording, and
+  // every stat here (first/last/min/max/delta/settled) is only as fresh as the last sample taken.
+  const staleness = frameStalenessWarning('watch');
+  if (p.samples) {
+    const rounded = roundFloats(out, sig) as Record<string, unknown>;
+    return staleness ? { ...rounded, warnings: [staleness] } : rounded;
+  }
   const totalSamples = out.series.reduce((n, s) => n + (typeof s.count === 'number' ? s.count : 0), 0);
-  return roundFloats({
+  const rounded = roundFloats({
     ...out,
     series: out.series.map(({ samples: _samples, ...rest }) => rest),
     totalSamples,
     hint: `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
-  }, sig);
+  }, sig) as Record<string, unknown>;
+  return staleness ? { ...rounded, warnings: [staleness] } : rounded;
 });
 registerAgentOp('watch-list', () => listWatches());
 registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string })?.id));
@@ -1255,6 +1348,9 @@ registerAgentOp('hit-regions', (raw: unknown) => {
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
   }
+  // #682: hit-test geometry is FRAME-FED (computed inside the hit-test from the live world).
+  const staleness = frameStalenessWarning('hit regions');
+  if (staleness) result.warnings = [staleness];
   return roundFloats(result, resolvePrecision(p.precision));
 });
 
@@ -1349,6 +1445,12 @@ registerAgentOp('scene-query', (params) => {
     return v as number[];
   };
 
+  // #682: a physics query reads the CURRENT Rapier world, which the physics system — a frame
+  // callback — is what actually advances. A dead loop freezes it mid-scene and this query would
+  // silently report a hit/miss against wherever things were when frames stopped.
+  const staleness = frameStalenessWarning('scene query');
+  const warningsField = staleness ? { warnings: [staleness] } : {};
+
   // ── point: the pick/hit-test query. Its result shape is deliberately DIFFERENT ──
   if (p.kind === 'point') {
     const pt = vec(p.point, 'point');
@@ -1358,7 +1460,7 @@ registerAgentOp('scene-query', (params) => {
     // impact point, no surface normal and no distance; padding those with zeros would make a
     // `distance:0` here mean something different from a `distance:0` on a raycast, which is
     // exactly the drift that rule exists to stop.
-    return { ok: true, kind: 'point', dim: p.dim, point: pt, hit: id == null ? null : queryHitRef(id) };
+    return { ok: true, kind: 'point', dim: p.dim, point: pt, hit: id == null ? null : queryHitRef(id), ...warningsField };
   }
 
   const origin = vec(p.origin, 'origin');
@@ -1415,7 +1517,7 @@ registerAgentOp('scene-query', (params) => {
 
   // 3. Everything that could have produced a false `null` is ruled out, so THIS null is a real
   //    miss and can be reported as one.
-  const base = { ok: true as const, kind: p.kind, dim: p.dim, origin, direction: dir };
+  const base = { ok: true as const, kind: p.kind, dim: p.dim, origin, direction: dir, ...warningsField };
   if (!raw) return { ...base, hit: null };
   const point = is2d ? [raw.x, raw.y] : [raw.x, raw.y, raw.z as number];
   const normal = is2d ? [raw.nx, raw.ny] : [raw.nx, raw.ny, raw.nz as number];
@@ -1930,21 +2032,10 @@ registerAgentOp('load-scene', async (params) => {
   return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
 });
 
-export const SIM_STEP_MAX_TIMEOUT_MS = 20000;
-
-/** The default budget for `sim-step`, DERIVED from the frame count rather than flat.
- *
- *  A flat default could not cover the op's own documented maximum: 600 frames is ~10s at 60fps and
- *  ~20s at 30fps, so `sim-step {frames:600}` — the max the same handler advertises — timed out
- *  against its own budget every time. Two limits sized independently with no cross-check is how a
- *  feature fails on its headline call.
- *
- *  Exported so the arithmetic is unit-testable: pinning it through the op itself would mean waiting
- *  out a real timeout (4.5s+ per assertion), which is why the flat-default regression survived a
- *  mutation check until this was extracted. */
-export function simStepDefaultTimeout(frames: number): number {
-  return Math.min(SIM_STEP_MAX_TIMEOUT_MS, Math.max(3000, frames * 40 + 500));
-}
+// SIM_STEP_MAX_TIMEOUT_MS / simStepDefaultTimeout are imported at the top of this file (from
+// `tools/shared/simStepTiming.ts`, #822) and re-exported here so existing importers of this
+// module (e.g. `liveLifecycleOps.test.ts`) are unaffected by the move.
+export { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout };
 
 // ── Sim control (#166 P3) — step an exact number of FRAMES on the device.
 //

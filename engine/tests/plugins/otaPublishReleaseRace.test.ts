@@ -160,6 +160,10 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
+    // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
+    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-'));
@@ -442,6 +446,10 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
+    // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
+    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-mandatory-'));
@@ -567,6 +575,10 @@ describe('ota-publish.mjs version-collision guard', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
+    // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
+    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-collision-'));
@@ -693,6 +705,10 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
+    // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
+    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-guards-'));
@@ -890,6 +906,10 @@ describe('ota-publish.mjs input validation (#649)', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
+    // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
+    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-validation-'));

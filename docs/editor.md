@@ -284,9 +284,11 @@ different fixes, and the second sends you to check a cable that was never the pr
 
 **Two refusals guard the pick**, both pure and unit-tested (`buildRefusal`, `pickRefusal`):
 
-- **A second concurrent build is refused.** `/api/build` takes no lock, `runBuild` fires an SSE
-  request per call, and a native OS menu is not covered by the DOM progress modal — so the modal
-  only *looks* like it is holding the door. Before every device row was a build this took a
+- **A second concurrent build is refused — here, in front of the server's own slot.** `/api/build`
+  does take a slot (#173's in-process one, plus #650's cross-process claim), but it refuses *after*
+  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call,
+  and a native OS menu is not covered by the DOM progress modal — so the modal only *looks* like it
+  is holding the door. This refusal keeps the second build from ever being sent. Before every device row was a build this took a
   deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
   gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
   into the single shared `buildStatus`. A build that already FAILED does not count as running: its

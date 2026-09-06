@@ -15,9 +15,10 @@
  *  See docs/editor-hmr.md. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const EDITOR = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/editor');
 
@@ -28,11 +29,14 @@ const ALLOW_NO_EPOCH = new Set<string>([
 ]);
 
 function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (/\.tsx?$/.test(name) && !/\.test\./.test(name)) out.push(p);
-  }
+  out.push(...repoFiles({
+    under: dir,
+    match: (rel) => {
+      const name = rel.split('/').pop() ?? rel;
+      return /\.tsx?$/.test(name) && !/\.test\./.test(name);
+    },
+    floor: 20,
+  }).map(({ abs }) => abs));
   return out;
 }
 

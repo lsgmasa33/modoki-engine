@@ -7,8 +7,29 @@
  *  import `agentBridge`, which needs a live ECS world — out of scope for this file).
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { handlePointer, handleType, _resetHeldPointerForTests } from '../../app/debug/bridge';
+import type { FrameLoopHealth } from '@modoki/engine/runtime';
+
+// Wrapped (not stubbed with an explicit export list) — `bridge.ts` imports several OTHER names
+// from this same barrel (`setJournalEnabled`, plus `createSupersessionToken`/`createTeardownToken`/
+// `getConsoleRingDropped` from its subpaths), and an explicit-list mock here would silently drop
+// whichever of those this file doesn't happen to name, breaking at BINDING rather than failing a
+// test (this lane has hit exactly that trap before). `getFrameLoopHealth` alone is overridden, and
+// only for the one test below that needs a forced 'stalled' reading — every other test in this
+// file calls straight through to the real implementation.
+vi.mock('@modoki/engine/runtime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@modoki/engine/runtime')>();
+  return { ...actual, getFrameLoopHealth: vi.fn(actual.getFrameLoopHealth) };
+});
+import { getFrameLoopHealth } from '@modoki/engine/runtime';
+const mockedGetFrameLoopHealth = vi.mocked(getFrameLoopHealth);
+
+const STALLED_HEALTH: FrameLoopHealth = {
+  status: 'stalled', refCount: 1, callbacks: 1, armed: true, fps: 0,
+  msSinceLastFrame: 3000, recovered: 0, recoveryAttempts: 1, unrecoverable: false,
+  detail: 'the frame loop has not ticked for 3000ms',
+};
 
 afterEach(() => {
   _resetHeldPointerForTests();
@@ -84,6 +105,31 @@ describe('handlePointer — sustained press held across calls', () => {
     const r = await handlePointer({ action: 'sideways', x: 1, y: 1 } as unknown as Record<string, unknown>);
     expect(r).toMatch(/^Error:/);
     expect(r).toMatch(/must be 'down', 'move', or 'up'/);
+  });
+
+  // #682 close-out round 3, MEDIUM 3: `down` landed while the frame loop was healthy, then it
+  // stalled — `up` must still be allowed to RELEASE the held press. The old (buggy) code ran
+  // `frameLoopRefusal('pointer')` before reading `action` at all, so `up` was refused exactly like
+  // `down`/`move`, and the press stayed held forever (the state-leaking outcome the refusal's own
+  // error text warns against). Mutation: hoisting `frameLoopRefusal('pointer')` back above the
+  // `action !== 'up'` guard (i.e. reverting to the pre-fix order) makes this fail — `up` comes
+  // back as the `Error: refusing pointer` text instead of `ok …/held:false`.
+  it('a stall AFTER down does not strand the held press — up still releases it', async () => {
+    withCanvas();
+    const down = await handlePointer({ action: 'down', x: 10, y: 20 });
+    expect(down).toMatch(/^ok /); // frame loop is healthy at this point — real getFrameLoopHealth()
+
+    mockedGetFrameLoopHealth.mockReturnValueOnce(STALLED_HEALTH); // loop stalls before `up`
+    const up = await handlePointer({ action: 'up', x: 10, y: 20 });
+    expect(up).not.toMatch(/^Error: refusing/);
+    expect(up).toMatch(/^ok /);
+    expect(up).toMatch(/held:false/); // the release actually ran — held state cleared
+    // `up` deliberately never calls `getFrameLoopHealth()` (that's the whole point of the fix), so
+    // the queued one-shot value above is NEVER consumed by it — left alone it leaks into whichever
+    // call happens to be the NEXT invocation across the whole suite (measured: it silently broke an
+    // unrelated `handleType` test in a LATER file position). Drain it explicitly so this test's
+    // mock state cannot leak past its own boundary.
+    mockedGetFrameLoopHealth();
   });
 });
 

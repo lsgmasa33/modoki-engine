@@ -15,6 +15,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createDeviceToolDef, type DeviceToolResult } from './registry.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
+// Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
+// `timeoutMs` and the device's own internal step budget can never independently drift (#822).
+import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -1751,7 +1754,15 @@ export function registerTools(server: McpServer) {
     },
     async ({ frames, scale, timeoutMs }) => writeCall('device_step', 'sim-step', {
       ...(frames !== undefined ? { frames } : {}), ...(scale !== undefined ? { scale } : {}),
-      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      // ALWAYS forward a timeoutMs, even when the caller omitted one (#822). The editor backend's
+      // `/api/device/request` route reads `params.timeoutMs` GENERICALLY to size the transport's
+      // round-trip deadline (deliberately so, #153) — an omitted value fell back to a flat 5s
+      // regardless of how many frames were requested, while the DEVICE derived its own, much
+      // larger budget from `frames` independently. `device_step {frames:600}` — the max this tool
+      // itself advertises — always timed out at the transport while the device kept faithfully
+      // stepping. Deriving it here with the SAME formula the device uses means the two can never
+      // diverge again.
+      timeoutMs: timeoutMs ?? simStepDefaultTimeout(frames ?? 1),
     }, 'step the paused device game by N frames', [
       'pause first: device_set_timescale {scale:0}',
     ]),
@@ -2164,7 +2175,7 @@ async function coordScaleOrRefusal(
         const note = (Array.isArray(result)
           ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
           : '') + unverifiedNote(body);
-        return { content: [{ type: 'text' as const, text: note + JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text' as const, text: note + encodeStructuredResult(result) }] };
       } catch (e) {
         return caughtFailure('device_crash_reports', 'read the device crash reports', e);
       }

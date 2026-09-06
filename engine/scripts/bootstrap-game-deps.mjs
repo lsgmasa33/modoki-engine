@@ -33,6 +33,19 @@
  * SAME install's postinstall, before `.bin` symlinks are linked. Here each
  * game's `npm install` is a fully-completed child process, so its `.bin` (incl.
  * rollup) is already linked by the time we invoke `build:plugins` afterwards.
+ *
+ * ── Vendor BEFORE install (#650, the other half of that issue) ──
+ * A game can depend on an engine-provided Capacitor plugin (`engine/packages/capacitor-*`) via a
+ * placeholder `"*"` version — those plugins are NOT on the public npm registry, so the placeholder
+ * is only ever installable once `vendorEnginePlugins` rewrites it to a real
+ * `file:plugins/<name>-<hash>.tgz` pointing at a freshly-packed tarball. Skipping that step (as
+ * this script did until now) meant `npm install` here resolved whatever tarball spec happened to
+ * already be committed — stale, on a clone where the plugin's SOURCE has since changed — with no
+ * error at all: npm installs a `file:` spec that already resolves just fine, it just isn't the
+ * CURRENT one. `engine/electron/main.ts`'s `ensureProjectDeps` runs vendor → install → write-marker
+ * in that order for exactly this reason (see its own comment, `:322-329`); this mirrors it. Loaded
+ * through `loadVendorPlugins.mjs` (not a direct import) because this is a plain `.mjs` script and
+ * `vendorPlugins.ts` is TypeScript — same seam `build-web.mjs`/`add-native-targets.mjs` already use.
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -40,6 +53,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from './projectRoots.mjs';
 import { projectNeedsInstall } from './projectNeedsInstall.mjs';
+import { loadVendorPlugins } from './loadVendorPlugins.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -58,6 +72,12 @@ const npmRun = (args, cwd) =>
 const projects = discoverProjects(repoRoot);
 let installed = 0;
 let built = 0;
+
+// Loaded ONCE, outside the loop — every project vendors the SAME engine plugins, so there is no
+// reason to re-bundle vendorPlugins.ts per project. `null` on a tarball snapshot (no
+// engine/plugins/*.ts) or a packaged install with no esbuild — degrades to skipping the vendor
+// step below, same as `build-web.mjs`/`add-native-targets.mjs` already do.
+const vendorMod = await loadVendorPlugins(repoRoot);
 
 for (const proj of projects) {
   const gameDir = proj.dir;
@@ -83,6 +103,26 @@ for (const proj of projects) {
   // iOS build failed on the missing package. npm is cheap when the tree is already satisfied
   // (~0.3s for a no-op), so re-running it is the honest check. `bootstrap-mcp-deps.mjs` carried
   // the same wrong shortcut for engine/tools/* and no longer does.
+
+  // Vendor BEFORE install (#650) — see the file header. `vendorResult` stays `null` when there is
+  // no vendor module to load (a tarball snapshot, or a packaged install with no esbuild) OR when
+  // this project has no engine plugin dependency at all; either way the install below still runs.
+  // Non-fatal like `main.ts`'s own try/catch: a vendoring failure here means the install a few
+  // lines down is now GUARANTEED to fail too (the placeholder `"*"` spec is not on the public
+  // registry), so it is more useful to let that failure surface with its own message than to
+  // abort a step earlier and hide it.
+  let vendorResult = null;
+  if (vendorMod) {
+    try {
+      vendorResult = vendorMod.vendorEnginePlugins(gameDir, repoRoot, { canBuild: true });
+      if (vendorResult.vendored.length) {
+        console.log(`[bootstrap-game-deps] vendored engine plugin(s) for ${label}: ${vendorResult.vendored.join(', ')}`);
+      }
+    } catch (e) {
+      console.warn(`[bootstrap-game-deps] WARNING: plugin vendoring failed for ${label} (continuing): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   console.log(`[bootstrap-game-deps] installing ${label} …`);
   try {
     // `--no-audit`: the root .npmrc sets audit=false, but npm reads a project .npmrc only from
@@ -92,6 +132,10 @@ for (const proj of projects) {
     // no-op install x26 projects = ~2h. Dependabot on GitHub is what actually reports vulns.
     npmRun(['install', '--no-audit'], gameDir);
     installed++;
+    // Records which tarball each plugin was installed from, so the next open/build can detect a
+    // stale extraction (same marker `ensureProjectDeps`/`build-web.mjs` write) — only meaningful
+    // when vendoring actually ran.
+    if (vendorResult) vendorMod.writeVendorMarker(gameDir, vendorResult.expectedVendor);
   } catch (e) {
     console.warn(
       `[bootstrap-game-deps] WARNING: npm install failed in ${label} — ` +

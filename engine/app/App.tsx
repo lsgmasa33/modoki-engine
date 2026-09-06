@@ -5,7 +5,7 @@ import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -24,6 +24,7 @@ import { checkAppOtaUpdate, confirmShellBoot, isPluginUnimplemented, subscribeOt
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
 import { findGame as findGameInRegistry } from './gameRegistry';
+import { waitTwoFramesBounded } from './bootFrameWait';
 import './App.css';
 
 // NOTE: the app shell no longer reaches into a specific game (it used to eagerly
@@ -39,6 +40,12 @@ import './App.css';
 // below is dead-code-eliminated and the ~800 KB editor chunk never ships.
 // (Previously gated on VITE_GAME_ONLY, which only the web-DEPLOY step set — so a
 // plain `MODOKI_PROJECT=… npm run build` leaked the whole editor into the bundle.)
+// The ceiling on both `waitTwoFramesBounded` boot waits below (#682) — reuses
+// `SCENE_PAINT_MAX_WAIT_MS`, the ceiling the adjacent `waitForScenePaint` gate already uses (and
+// this file already imports), so the two halves of "there is something under the overlay" time
+// out on the same budget without a second literal to drift out of sync with it.
+const TWO_FRAME_WAIT_TIMEOUT_MS = SCENE_PAINT_MAX_WAIT_MS;
+
 const GAME_ONLY = !__MODOKI_EDITOR__;
 const EditorApp = GAME_ONLY ? null : lazy(() => import('./editor/setup').then(m => m.createGameEditor()));
 
@@ -481,6 +488,20 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         if (cancelled) return;
 
 
+        // Did a `waitTwoFramesBounded` call EVER see the rAF chain actually deliver a frame during
+        // this boot? Gates `confirmShellBoot()` below (#682 close-out, LOW 6): that call used to
+        // fire unconditionally once boot reached it, so a dead rAF chain — the very thing
+        // `bootFrameWait.ts`'s header describes as "a permanent black screen and a bundle the
+        // native watchdog then rolls back" — instead got CONFIRMED as a good boot 5s later,
+        // exactly backwards. Starts false and needs a real 'frames' outcome to flip.
+        // ⚠️ A window that is HIDDEN for a while (an OTA relaunch that lands backgrounded, or one
+        // that never gets foregrounded in time) is NOT treated as a dead loop below — see
+        // `bootFrameWait.ts`'s header. `waitTwoFramesBounded` pauses its own ceiling while hidden
+        // and re-arms a fresh one on `visibilitychange`, so `'timeout'` here still means what the
+        // two `console.warn`s below say it means: the document was visible and the chain genuinely
+        // never delivered, not merely that the tab wasn't in front.
+        let bootFramesConfirmed = false;
+
         // Mount renderers BEFORE scene load so their registerBeforeSwap hooks
         // (Scene3D shader prewarm, Scene2D sprite preload) are registered in
         // time. configReady gates the mount; the opaque LoadingOverlay covers
@@ -492,7 +513,13 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           // run (registering beforeSwap hooks). Two rAFs to cover PixiJS
           // Application async init. If hooks aren't registered in time, the
           // existing async fallbacks (makeSprite, syncRenderables) handle it.
-          await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+          // Bounded (#682): a dead rAF chain must not hang the whole boot sequence forever.
+          const mountWait = await waitTwoFramesBounded(TWO_FRAME_WAIT_TIMEOUT_MS);
+          if (mountWait === 'timeout') {
+            console.warn('[GameShell] renderer-mount two-frame wait hit its ceiling — the frame loop may be dead; continuing boot anyway');
+          } else {
+            bootFramesConfirmed = true;
+          }
           if (cancelled) return;
         }
 
@@ -590,7 +617,15 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // time, so the paint above cannot have included it), and the submitted frame has to reach
         // the swapchain. Kept as well as the wait above, not replaced by it — they cover different
         // halves of "there is something under the overlay".
-        await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        // ⚠️ Bounded (#682): on a 2D/UI-only project (no3D, or no bootScenePath) this is the ONLY
+        // gate before the OTA boot-confirm and the overlay dismissal below — a dead rAF chain here
+        // used to be a PERMANENT black screen and a bundle the native watchdog then rolls back.
+        const renderWait = await waitTwoFramesBounded(TWO_FRAME_WAIT_TIMEOUT_MS);
+        if (renderWait === 'timeout') {
+          console.warn('[GameShell] post-render two-frame wait hit its ceiling — the frame loop may be dead; dismissing the loading overlay anyway');
+        } else {
+          bootFramesConfirmed = true;
+        }
         if (cancelled) return;
 
         // OTA boot-watchdog confirm (docs/ota-updates.md):
@@ -605,7 +640,14 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // not the one rendering — confirming it credits the new bundle with the old one's
         // successful boot. `confirmShellBoot` decides that and names the version it confirms;
         // see its doc comment (found by #553's close-out sweep).
-        if (Capacitor.isNativePlatform()) void confirmShellBoot();
+        // ⚠️ ALSO gated on `bootFramesConfirmed` (#682 close-out, LOW 6): neither
+        // `waitTwoFramesBounded` call above ever saw a real frame means this boot never painted
+        // anything, and confirming it anyway is the exact regression `bootFrameWait.ts`'s own
+        // header warns about — see the two call sites above for detail.
+        if (Capacitor.isNativePlatform()) {
+          if (bootFramesConfirmed) void confirmShellBoot();
+          else console.warn('[GameShell] skipping confirmShellBoot() — no frame rendered during boot (the frame loop may be dead); the native watchdog should not confirm this bundle');
+        }
 
         // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
         // previously nothing called this, so the splash dismissed on Capacitor's own

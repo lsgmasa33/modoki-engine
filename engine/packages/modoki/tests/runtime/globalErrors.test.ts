@@ -41,6 +41,11 @@ beforeEach(() => {
   // `--sequence.shuffle.tests`. Caught in close-out review by copying that guard below the
   // staleness tests and watching it fail (101 errors instead of 100).
   sessionStorage.clear();
+  // ⚠️ Same "every key" reasoning as sessionStorage.clear() above, for the SIBLING early buffer
+  // (#636): a leftover `__MODOKI_EARLY_ERRORS__` from one test is harmless once drained (`done`
+  // latches true), but a test that SEEDS a fresh one and never lets it drain would otherwise leak
+  // into whichever test runs next.
+  delete (globalThis as { __MODOKI_EARLY_ERRORS__?: unknown }).__MODOKI_EARLY_ERRORS__;
   realError = console.error;
   realWarn = console.warn;
   // ⚠️ BOUND TO THIS TEST'S OWN ARRAYS, not to the shared `sink` binding. `vi.resetModules()`
@@ -608,5 +613,245 @@ describe('globalErrors — [reload] breadcrumb at boot', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe('globalErrors — early error buffer drain (#636)', () => {
+  /**
+   * Shape published by the fatal-load guard's early-error buffer in `engine/index.html`.
+   * Duplicated here rather than imported — mirrors `consoleRing.test.ts`'s `seedEarlyConsole` for
+   * the sibling `__MODOKI_EARLY_CONSOLE__` buffer: nothing outside the guard itself and
+   * `drainEarlyErrors` should ever construct one of these.
+   */
+  interface EarlyErrorEntry {
+    kind: 'error' | 'unhandledrejection';
+    error?: unknown;
+    message?: string;
+    filename?: string;
+    lineno?: number;
+    colno?: number;
+    reason?: unknown;
+    ts?: number;
+  }
+  interface EarlyErrorState { entries: EarlyErrorEntry[]; done: boolean; dropped: number }
+  function seedEarlyErrors(state: Partial<EarlyErrorState> = {}): EarlyErrorState {
+    const full: EarlyErrorState = { entries: [], done: false, dropped: 0, ...state };
+    (globalThis as { __MODOKI_EARLY_ERRORS__?: EarlyErrorState }).__MODOKI_EARLY_ERRORS__ = full;
+    return full;
+  }
+
+  // ⚠️ These tests do NOT use the shared `load()` helper. `load()` calls
+  // `__resetGlobalErrorsForTest()` right after `installGlobalErrorHandlers()`, which resets the
+  // boot QUEUE — and a seeded buffer drains INTO that queue during install, before a crashlytics
+  // service is registered. `load()` would wipe it before any test could observe it. This is the
+  // same reason the `[reload] breadcrumb at boot` tests just above assemble the module by hand.
+
+  it('drains a pre-seeded uncaught error into exactly one recordError, labeled [uncaught-early]', async () => {
+    vi.resetModules();
+    const err = new Error('boot-time throw');
+    seedEarlyErrors({ entries: [{ kind: 'error', error: err, message: err.message, filename: 'App.tsx', lineno: 5, colno: 9 }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors).toHaveLength(1);
+    expect(sink.errors[0]).toContain('[uncaught-early]');
+    expect(sink.errors[0]).toContain('boot-time throw');
+    expect(sink.errors[0]).toContain('(App.tsx:5:9)');
+  });
+
+  it('drains a pre-seeded unhandledrejection into exactly one recordError, labeled [unhandledrejection-early]', async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [{ kind: 'unhandledrejection', reason: new Error('early rejection') }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors).toHaveLength(1);
+    expect(sink.errors[0]).toContain('[unhandledrejection-early]');
+    expect(sink.errors[0]).toContain('early rejection');
+  });
+
+  it('sets done = true and empties entries — single-drain, like drainEarlyConsole', async () => {
+    vi.resetModules();
+    const early = seedEarlyErrors({ entries: [{ kind: 'error', error: new Error('x') }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(early.done).toBe(true);
+    expect(early.entries).toEqual([]);
+  });
+
+  it('a second installGlobalErrorHandlers() does not double-drain', async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [{ kind: 'error', error: new Error('once') }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    g.installGlobalErrorHandlers(); // idempotent no-op — must not re-read an already-drained buffer
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors.filter((e) => e.includes('once'))).toHaveLength(1);
+  });
+
+  /**
+   * The risky half (#636's design doc calls this out explicitly): a buffered error replayed
+   * without claiming it first would file the fault TWICE once Capacitor's bridge or React's
+   * boundary re-logs the same object through `console.error` — the exact "two issues per fault"
+   * symptom `alreadyReported` exists to prevent (see the WeakSet's doc comment above).
+   */
+  it('claims the buffered error object BEFORE reporting, so a later console.error(sameObject) does not double-report', async () => {
+    vi.resetModules();
+    const err = new Error('claimed early');
+    seedEarlyErrors({ entries: [{ kind: 'error', error: err, message: err.message }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+    expect(sink.errors, 'the early drain itself must have reported it').toHaveLength(1);
+
+    console.error(err); // the SAME object, exactly what a re-logging bridge/boundary would pass
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sink.errors, 'the claim must stand the console.error copy of the SAME object down').toHaveLength(1);
+  });
+
+  // The negative control the claim test above needs: proof this isn't passing by dropping
+  // console.error reports altogether. A DIFFERENT object must still get through.
+  it('does NOT suppress a DIFFERENT error reported through console.error', async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [{ kind: 'error', error: new Error('claimed early'), message: 'claimed early' }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+    expect(sink.errors).toHaveLength(1);
+
+    console.error(new Error('a totally different fault'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sink.errors).toHaveLength(2);
+    expect(sink.errors[1]).toContain('a totally different fault');
+  });
+
+  it('a dropped > 0 count surfaces one breadcrumb (a log, not an error)', async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [], dropped: 5 });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors).toEqual([]);
+    expect(sink.logs).toHaveLength(1);
+    expect(sink.logs[0]).toContain('5');
+    expect(sink.logs[0]).toContain('[modoki]');
+  });
+
+  // #682 close-out MEDIUM 3: `engine/index.html`'s `EARLY_ERROR_CAP` (28) must stay comfortably
+  // under `MAX_PER_BURST_WINDOW` (30) — the drain below feeds every buffered entry through THIS
+  // SAME shared rate limiter synchronously, in one burst, and a `[reload]` breadcrumb can already
+  // have spent one slot before the drain starts. With the old cap of 32 this pair of tests would
+  // have shown the "dropped" breadcrumb — the one thing that makes the cap honest — silently
+  // refused by the very limiter it exists to report on.
+  it('at the cap (28 entries), the dropped-count breadcrumb still gets through even after a [reload] breadcrumb spent a slot', async () => {
+    vi.resetModules();
+    const spy = vi.spyOn(performance, 'getEntriesByType').mockReturnValue([{ type: 'reload' }] as unknown as PerformanceEntryList);
+    try {
+      // Worst case: buffer full to `EARLY_ERROR_CAP` (28) with more dropped on top, on a RELOAD
+      // boot — 1 (reload) + 28 (errors) + 1 (dropped breadcrumb) = 30, exactly MAX_PER_BURST_WINDOW.
+      const entries = Array.from({ length: 28 }, (_, i) => ({ kind: 'error' as const, error: new Error(`e${i}`), message: `e${i}` }));
+      seedEarlyErrors({ entries, dropped: 2 });
+
+      const g = await import('../../src/runtime/core/globalErrors');
+      const a = await import('../../src/runtime/core/appServices');
+      g.installGlobalErrorHandlers();
+      a.registerAppServices({ crashlytics: svc });
+
+      expect(sink.logs.some((m) => m.includes('[reload]'))).toBe(true);
+      expect(sink.errors).toHaveLength(28); // every buffered entry got through
+      expect(sink.logs.some((m) => m.includes('2') && m.includes('dropped'))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('one entry OVER that budget silently refuses the dropped-count breadcrumb — the regression this cap exists to prevent', async () => {
+    vi.resetModules();
+    const spy = vi.spyOn(performance, 'getEntriesByType').mockReturnValue([{ type: 'reload' }] as unknown as PerformanceEntryList);
+    try {
+      // 1 (reload) + 29 (errors) already exhausts the 30-per-window budget, so the dropped-count
+      // breadcrumb — attempt #31 — is refused by `allow()`. This is the shape MEDIUM 3 found live
+      // with the old EARLY_ERROR_CAP of 32.
+      const entries = Array.from({ length: 29 }, (_, i) => ({ kind: 'error' as const, error: new Error(`e${i}`), message: `e${i}` }));
+      seedEarlyErrors({ entries, dropped: 1 });
+
+      const g = await import('../../src/runtime/core/globalErrors');
+      const a = await import('../../src/runtime/core/appServices');
+      g.installGlobalErrorHandlers();
+      a.registerAppServices({ crashlytics: svc });
+
+      expect(sink.errors).toHaveLength(29);
+      expect(sink.logs.some((m) => m.includes('dropped'))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('survives a reason whose stack getter throws — draining must not amplify the fault', async () => {
+    vi.resetModules();
+    const hostile = new Error('hostile');
+    Object.defineProperty(hostile, 'stack', { get() { throw new Error('nested'); } });
+    seedEarlyErrors({ entries: [{ kind: 'unhandledrejection', reason: hostile }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    expect(() => g.installGlobalErrorHandlers()).not.toThrow();
+    expect(() => a.registerAppServices({ crashlytics: svc })).not.toThrow();
+  });
+
+  // #682 close-out round 3, MEDIUM 3: `EarlyErrorEntry.ts` (the guard's own `performance.now()` at
+  // CAPTURE time, set in `engine/index.html`) used to be written and typed but never read by this
+  // drain — a field with no consumer. It reports "how far into boot" the fault happened, which the
+  // drain time cannot (install can run long after the entry was captured).
+  it("surfaces the buffered entry's own capture time in the reported message, not the drain time", async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [{ kind: 'error', error: new Error('timed'), message: 'timed', ts: 1234.6 }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors).toHaveLength(1);
+    expect(sink.errors[0]).toContain('(t=1235ms)'); // rounded, and CAPTURE time, not drain time
+  });
+
+  it('an entry with no `ts` (older buffer, or a genuinely absent capture time) reports cleanly — no "undefined"/"NaN" in the message', async () => {
+    vi.resetModules();
+    seedEarlyErrors({ entries: [{ kind: 'error', error: new Error('untimed'), message: 'untimed' }] });
+
+    const g = await import('../../src/runtime/core/globalErrors');
+    const a = await import('../../src/runtime/core/appServices');
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: svc });
+
+    expect(sink.errors).toHaveLength(1);
+    expect(sink.errors[0]).not.toContain('undefined');
+    expect(sink.errors[0]).not.toContain('NaN');
+    expect(sink.errors[0]).not.toContain('(t=');
   });
 });

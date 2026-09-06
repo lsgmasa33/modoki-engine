@@ -18,6 +18,54 @@
       // message. The debounce avoids false positives from a transient mid-mount error.
       (function () {
         var shown = false, scheduled = false;
+        // Early error buffer (#636). Same reasoning as the #633 console shim just below, applied to
+        // `window` `error`/`unhandledrejection` instead of `console.*`: rolldown inlines main.tsx's
+        // side-effect imports (installGlobalErrorHandlers among them) into the entry chunk's BODY,
+        // which runs after every static import — so a throw during module evaluation anywhere in
+        // App.tsx's graph fires before that listener exists and is never mirrored to Crashlytics.
+        // This script's OWN listeners (below) are registered at HTML parse time, before any of that
+        // — the earliest thing in the page that can see it — so they buffer every error here too.
+        //
+        // `installGlobalErrorHandlers` (runtime/core/globalErrors.ts) DRAINS this and DISARMS it
+        // (`done = true`) — a single drain, and a buffer separate from `__MODOKI_EARLY_CONSOLE__`
+        // below (the two do not interact). That drain only runs on a boot that reaches it: a throw
+        // fatal enough that `installGlobalErrorHandlers` itself never executes leaves this buffer
+        // populated but never reported — that failed-boot case is #825, not something this closes.
+        //
+        // ⚠️ `error`/`reason` are stored BY REFERENCE — no clone, no stringify. Object identity is
+        // load-bearing: globalErrors.ts's de-dup `WeakSet` keys on the exact object, and a copy would
+        // let one fault file two Crashlytics issues.
+        //
+        // Unlike `consider()` below, this buffers EVERY error, not only ones matching `isLoadError` —
+        // buffering is invisible and cheap, so telemetry gets full coverage even where the fallback
+        // screen deliberately does not fire.
+        var earlyErrors = { entries: [], done: false, dropped: 0 };
+        globalThis.__MODOKI_EARLY_ERRORS__ = earlyErrors;
+        // MUST stay AT MOST `MAX_PER_BURST_WINDOW` (globalErrors.ts, currently 30) minus 2 — that is
+        // NO SLACK, not headroom: the drain (`drainEarlyErrors`) fires every buffered entry through
+        // that SAME shared rate limiter synchronously, in one burst window, and a `[reload]`
+        // breadcrumb can ALREADY have spent one slot before the drain even starts
+        // (installGlobalErrorHandlers, on a reload boot) — plus the drain's own "N dropped (early
+        // buffer cap)" breadcrumb needs a slot too, or it is silently refused right when it is the
+        // one thing making the cap honest. At the current 28/30, a full buffer on a reload boot fills
+        // the window to EXACTLY 30/30 — the first real `console.warn` in the following ≤5s is
+        // refused. This file cannot import that constant (a plain inline `<script>`, no bundler), so
+        // the two must be kept in sync BY HAND — `globalErrors.test.ts`'s "early error buffer drain
+        // (#636)" describe block (NOT `earlyErrorBuffer.test.ts`, which only exercises this buffer's
+        // OWN cap/drop logic, never the shared limiter) pins that the dropped-count breadcrumb still
+        // gets through at this cap; `earlyErrorBuffer.test.ts` separately asserts this literal never
+        // exceeds `MAX_PER_BURST_WINDOW - 2`.
+        var EARLY_ERROR_CAP = 28;
+        function earlyErrorNow() {
+          try { return performance.now(); } catch (_) { return 0; }
+        }
+        function bufferEarlyError(entry) {
+          try {
+            if (earlyErrors.done) return;
+            if (earlyErrors.entries.length < EARLY_ERROR_CAP) earlyErrors.entries.push(entry);
+            else earlyErrors.dropped++;
+          } catch (_) { /* never let the guard itself throw */ }
+        }
         function isLoadError(msg) {
           return /does not provide an export|Failed to fetch dynamically imported|Importing a module script failed|error loading dynamically imported|Unable to resolve|Cannot find module|SyntaxError|Unexpected (token|identifier|end)/i.test(msg || '');
         }
@@ -84,8 +132,22 @@
             }, 1400);
           } catch (_) { /* never let the guard itself throw */ }
         }
-        window.addEventListener('error', function (e) { consider(e && (e.message || (e.error && e.error.message))); });
-        window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; consider(r && (r.message || String(r))); });
+        window.addEventListener('error', function (e) {
+          bufferEarlyError({
+            kind: 'error',
+            error: e && e.error,
+            message: e && e.message,
+            filename: e && e.filename,
+            lineno: e && e.lineno,
+            colno: e && e.colno,
+            ts: earlyErrorNow(),
+          });
+          consider(e && (e.message || (e.error && e.error.message)));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          bufferEarlyError({ kind: 'unhandledrejection', reason: e && e.reason, ts: earlyErrorNow() });
+          var r = e && e.reason; consider(r && (r.message || String(r)));
+        });
       })();
     </script>
     <!-- modoki:early-console:start -->

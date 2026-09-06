@@ -145,6 +145,7 @@ export function normalizeAnimationClip(json: Partial<AnimationClipDef>): Animati
     loop: json.loop ?? true,
     tracks: Array.isArray(json.tracks)
       ? json.tracks.map((tr) => ({
+          ...tr,
           path: tr.path ?? '',
           trait: tr.trait ?? '',
           field: tr.field ?? '',
@@ -174,11 +175,12 @@ export function normalizeAnimationClip(json: Partial<AnimationClipDef>): Animati
       : [],
     deformTracks: Array.isArray(json.deformTracks)
       ? json.deformTracks.map((dt) => ({
+          ...dt,
           path: dt.path ?? '',
           part: dt.part ?? '',
           keys: Array.isArray(dt.keys)
             ? dt.keys
-                .map((k) => ({ t: k.t ?? 0, offsets: Array.isArray(k.offsets) ? k.offsets : [] }))
+                .map((k) => ({ ...k, t: k.t ?? 0, offsets: Array.isArray(k.offsets) ? k.offsets : [] }))
                 .sort((a, b) => a.t - b.t)
             : [],
         }))

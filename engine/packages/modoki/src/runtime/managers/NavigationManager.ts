@@ -58,7 +58,6 @@ class NavigationManagerImpl implements ManagerDef {
   scope = 'app' as const;
 
   private history: string[] = [];
-
   /** Push a scene onto the back-stack, deduping a consecutive repeat (rapid
    *  double-nav) and bounding total depth. */
   private pushHistory(scene: string): void {
@@ -96,26 +95,48 @@ class NavigationManagerImpl implements ManagerDef {
     return this.history.length > 0;
   }
 
-  /** Navigate to a scene (GUID or path), pushing the current scene onto history
-   *  so `back()` can return to it. */
+  /** Navigate to a scene (GUID or path), recording the scene we LEAVE so `back()`
+   *  can return to it.
+   *
+   *  ⚠️ **History is mutated only AFTER the load commits** (#808), and that ordering
+   *  is the whole fix — not an incidental style. It used to push before the `await`,
+   *  so a rejected load left the stack off by one and `back()` lost its entry
+   *  outright; `sceneManager.loadScene` rejects on a refused format, a 404, a
+   *  teardown race, and — most often — on being SUPERSEDED by a newer navigation.
+   *
+   *  Two repair attempts were tried and both were worse, which is why this reads as
+   *  it does. Restoring a snapshot in a `catch` discards the work of whichever
+   *  navigation superseded this one. Gating that restore on a supersession epoch
+   *  then answers the wrong question — *am I still the latest?* rather than *is my
+   *  own mutation still on the stack?* — and those diverge whenever the superseding
+   *  call mutates nothing (navigating to the scene you are already on, an inert
+   *  `back()`, a `dispose()`), each of which silently leaks the push instead.
+   *  Not mutating until there is something to record makes every one of those
+   *  cases vacuous: a navigation that never happened leaves no trace to undo. */
   async loadScene(ref: unknown): Promise<void> {
     const path = resolvePath(ref);
     if (!path) { console.warn(`[navigation] could not resolve scene "${String(ref)}"`); return; }
+    // Read the scene we are LEAVING before the await — afterwards `getCurrent()` is
+    // the new one. But do not touch `history` until the load has COMMITTED.
     const current = sceneManager.getCurrent()?.path;
+    await sceneManager.loadScene(path);
     if (current && current !== path) {
       // Forward-navigating to the scene we'd `back()` into is an oscillation
       // (A→B→A→B…) — collapse it instead of growing the stack unboundedly.
       if (this.history[this.history.length - 1] === path) this.history.pop();
       else this.pushHistory(current);
     }
-    await sceneManager.loadScene(path);
   }
 
   /** Navigate to the previous scene, if any. Inert (no-op) at the root. */
   async back(): Promise<void> {
-    const prev = this.history.pop();
+    // Read without popping — the pop happens only once the load has COMMITTED.
+    const prev = this.history[this.history.length - 1];
     if (!prev) return;
     await sceneManager.loadScene(prev);
+    // Still the entry we loaded? A navigation that interleaved may have pushed
+    // since, and that one owns the top of the stack now.
+    if (this.history[this.history.length - 1] === prev) this.history.pop();
   }
 
   /** Navigate without recording history. */

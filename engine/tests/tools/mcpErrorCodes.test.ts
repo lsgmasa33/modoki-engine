@@ -41,11 +41,20 @@ function docCodes(): string[] {
 }
 
 /** Where a code can legitimately be EMITTED (as opposed to merely declared in `ERROR_CODES`
- *  itself). Matches the four surfaces named in the QA-TOOL-0003 brief. */
-const SCAN_DIRS = ['tools/modoki-mcp/src', 'tools/shared', 'app', 'plugins'].map((d) => path.join(REPO_ROOT, 'engine', d));
+ *  itself).
+ *
+ *  ⚠️ **This was four directories, and the file's own comment below (`:82-89`) recorded the hole:
+ *  "That guard's SCAN_DIRS never included `packages/modoki/src`, and it passes for an unrelated
+ *  reason." The remedy landed then was one hand-written test for the one file somebody had noticed
+ *  — the BOUND was left in place, so the next file outside it had the same problem (#830).**
+ *
+ *  `packages/modoki/src` and `electron` are now in scope. Measured: adding them is GREEN, so the
+ *  exclusion was costing coverage without buying anything, and the emitting surface is now the one
+ *  the docstring claims rather than the four somebody listed. */
+const SCAN_DIRS = ['tools/modoki-mcp/src', 'tools/shared', 'app', 'plugins', 'packages/modoki/src', 'electron'].map((d) => path.join(REPO_ROOT, 'engine', d));
 
 /** Every `.ts`/`.tsx` across all of `SCAN_DIRS`, via the shared corpus producer
- *  (#799/#771/#805 Phase 4). Floored well under the 169 measured today. */
+ *  (#799/#771/#805 Phase 4). Floored well under the 169 measured before #830 widened SCAN_DIRS (more now). */
 function allSourceFiles(dirs: string[]): string[] {
   return repoFiles({ under: dirs, match: /\.(ts|tsx)$/, floor: 100 }).map(({ abs }) => abs);
 }

@@ -1,5 +1,10 @@
 /**
- * `runtime/core/liveness.ts` is the ONLY epoch/generation liveness token in the tree (#573).
+ * `runtime/core/liveness.ts` is the only epoch/generation liveness token in SCAN_DIRS (#573).
+ *
+ * ⚠️ **"in SCAN_DIRS", not "in the tree" (#830).** The original wording claimed the whole
+ * repo while the check read three roots of six. Running this guard's own detector over the
+ * rest returns real hits, pinned in KNOWN_OUTSIDE_SCAN_DIRS below — so the claim is now the
+ * one the code actually verifies, and the gap is tracked instead of implied.
  *
  * Five ad-hoc conventions for "am I still the live session?" grew up independently here, and about
  * twenty tickets in ten days were one defect found twenty times. The owner's decision was one
@@ -83,23 +88,120 @@ const REPO = path.resolve(__dirname, '../../..');
 
 /** Everything that can hold engine state across a deferral. `engine/app` is included because three
  *  of the migrated sites lived there (ota, editor/setup, debug/bridge). */
+/** ⚠️ **Roots this guard does NOT scan, and the hand-rolled instances known to sit there (#830).**
+ *
+ *  The docblock above calls `SCAN_DIRS` a deliberate exclusion — "the helper is engine runtime code
+ *  and does not ship to those". That reason is real, but the CLAIM in the file's opening line was
+ *  wider than the check: ``runtime/core/liveness.ts` is the ONLY epoch/generation liveness token in the tree (#573)`. Running this guard's OWN
+ *  detector over the unscanned roots returns the entries below, so "in the tree" was never what was
+ *  verified.
+ *
+ *  These are PINNED rather than migrated, deliberately. Moving them onto the shared helper changes
+ *  behaviour in the Electron main process and in the device-connection path — code whose failure
+ *  modes need a physical device to exercise — and whether engine runtime code SHOULD be imported
+ *  there at all is a design question, not a refactor. Filed on #830.
+ *
+ *  What the pin buys: a FOURTH instance fails immediately instead of joining a silent population.
+ *  ⚠️ It also goes red when one of these is legitimately FIXED — that is intended. Removing an
+ *  entry should be a deliberate edit in the same commit as the migration, not something that
+ *  quietly stops being true. */
+const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
+  'engine/plugins/backend/deviceConnection.ts :: sessionGeneration',
+
+  /* ── GAME code (#830 review). Surfaced once UNSCANNED_ROOTS stopped being a hand-listed four.
+   * Not migrated for the same reason as the engine-side rows: `@modoki/engine/runtime/core/liveness`
+   * IS importable from a game, so this is a DESIGN question (should game logic take an engine
+   * runtime dependency for this?) rather than a refactor — and these are six gameplay paths that
+   * cannot be exercised without playing them. Classified individually rather than as a block: */
+
+  // REAL — the textbook #573 shape. `let payoutEpoch = 0` … `const epoch = payoutEpoch` …
+  // `if (epoch !== payoutEpoch) return` around an await (`systems.ts:4754-4767`), and the file's
+  // own comment already calls it a banner. Three separate counters in one file.
+  'games/court/runtime/systems.ts :: payoutEpoch, bonusSpinEpoch, storeInFlightGen',
+  // REAL — `private generation = 0` guarding `initLLM()`/`newGame()`; its own docblock (`:15`,
+  // `:47`, `:91`) describes the abandoned-generation branch it exists for.
+  'games/chess/runtime/ChessManager.ts :: generation',
+  // REAL — same shape as chess, same subsystem.
+  'games/llm-test/runtime/LLMManager.ts :: generation',
+  // REAL — ad-hoc init/fullscreen-ad epochs in the shared app-services package.
+  'games/court/packages/app-services/src/ads.ts :: initEpoch, fullscreenAdGen',
+  'games/3d-test/packages/app-services/src/ads.ts :: initEpoch',
+  // REAL — an IAP epoch guarding an awaited purchase flow.
+  'games/wordweave/runtime/systems.ts :: iapEpoch',
+  // ⚠️ FALSE POSITIVE, kept so the set is exact rather than silently filtered. `k` is a convex-hull
+  // LOOP INDEX (`let k = hi.length - 1` at :493, `let k = 0` at :505) that happens to be
+  // zero-initialised and compared, which is all the detector can see. Do NOT "migrate" it. If the
+  // detector ever learns to tell a loop counter from a liveness token, this row goes with it.
+  'games/sling/runtime/field/nav.ts :: k',
+];
+
+
 const SCAN_DIRS = [
   'engine/packages/modoki/src/runtime',
   'engine/packages/modoki/src/editor',
   'engine/app',
 ];
 
+/** The roots this guard does NOT scan — **DERIVED, not hand-written (#830 review).**
+ *
+ *  ⚠️ This was a hand-listed four (`plugins`, `electron`, `tools`, `toolchain`) under a test titled
+ *  "the roots this guard does NOT scan", which is a universal claim — so the ledger below was
+ *  vouching for a subset while reading as though it covered everything. Exactly the defect this
+ *  whole change is about, in the fix for it.
+ *
+ *  Now: every top-level source root in the repo, minus the ones SCAN_DIRS already covers. A new
+ *  root is in the remainder the day it is created, without anyone remembering. */
+const UNSCANNED_ROOTS: readonly string[] = (() => {
+  const covered = (rel: string) => SCAN_DIRS.some((d) => rel === d || rel.startsWith(`${d}/`));
+  const roots = new Set<string>();
+  for (const { rel } of repoFiles({ match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 500 })) {
+    const parts = rel.split('/');
+    // Depth 2 for the multi-project roots (games/<id>, demos/<id>, engine/<area>), depth 1 for a
+    // flat one like `site/`. Both are compared against SCAN_DIRS' own repo-relative prefixes.
+    const root = parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
+    if (!covered(root) && !SCAN_DIRS.some((d) => d.startsWith(`${root}/`))) roots.add(root);
+  }
+  return [...roots].sort();
+})();
+
+/** The ledger rows whose ROOT this checkout actually has — **derived, symmetric with the scan.**
+ *
+ *  ⚠️ `UNSCANNED_ROOTS` is computed from what is on disk; `KNOWN_OUTSIDE_SCAN_DIRS` is written by
+ *  hand and absolute. That asymmetry is a defect: the public engine snapshot
+ *  (`scripts/publish-engine-oss.sh`) ships no `games/`, so seven of the eight rows have no root to
+ *  come from, the detector correctly returns one hit, and an exact-set assertion goes RED on the
+ *  public gate over content that was never supposed to be there. It did — caught by
+ *  `verify:publish` at the hub, which is the only place that runs the guards inside the snapshot.
+ *
+ *  This filters the EXPECTATION by the same root list the SCAN used, so the two can only disagree
+ *  about tokens, never about which roots exist. Note what it deliberately does NOT do: skip the
+ *  test. The `engine/plugins` row is checkable in the snapshot and still is, so a fresh ad-hoc
+ *  epoch in shipped engine code fails on the public gate exactly as it does here.
+ *
+ *  ⚠️ It is NOT a licence to leave a row unbacked in THIS repo — every root is present in a
+ *  developer clone, so a stale row still fails here, at authorship, which is where it should. */
+function expectedOutsideRows(): string[] {
+  const rooted = (rel: string) => {
+    const parts = rel.split('/');
+    return parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
+  };
+  return KNOWN_OUTSIDE_SCAN_DIRS
+    .filter((row) => UNSCANNED_ROOTS.includes(rooted(row.split(' :: ')[0])))
+    .slice()
+    .sort();
+}
+
 /** The helper itself implements the token, so its own counters are the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/liveness.ts');
 
 /** Every `.ts`/`.tsx` production source file under `SCAN_DIRS`, via the shared corpus producer
  *  (#799/#771/#805 Phase 4). Floored well under the 851 measured today. */
-function listSourceFiles(): string[] {
+function listSourceFiles(roots: readonly string[] = SCAN_DIRS): string[] {
   return repoFiles({
-    under: SCAN_DIRS.map((rel) => path.join(REPO, rel)),
+    under: roots.map((rel) => path.join(REPO, rel)),
     match: (rel: string) => /\.tsx?$/.test(rel) && !path.posix.basename(rel).includes('.test.'),
     exclude: ['node_modules', 'dist'],
-    floor: 600,
+    floor: 0,   // callers assert their own non-vacuity; SCAN_DIRS measured >600 when written
   }).map(({ abs }) => abs);
 }
 
@@ -140,9 +242,9 @@ function livenessPair(src: string, name: string): boolean {
 
 interface Scanned { file: string; counters: string[]; offenders: string[] }
 
-function scan(): Scanned[] {
+function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
   const results: Scanned[] = [];
-  for (const file of listSourceFiles()) {
+  for (const file of listSourceFiles(roots)) {
     const src = stripComments(fs.readFileSync(file, 'utf8'));
     const counters = [...src.matchAll(DECL)].map((m) => m[1]);
     const offenders = file === HELPER
@@ -154,6 +256,26 @@ function scan(): Scanned[] {
 }
 
 describe('the shared liveness token is the only epoch/generation implementation (#573)', () => {
+  it('SCAN_DIRS itself is non-vacuous (the floor moved onto the callers)', () => {
+    expect(listSourceFiles().length, 'the SCAN_DIRS corpus collapsed — every check below would '
+      + 'pass having read nothing').toBeGreaterThan(600);
+  });
+
+  it('the roots this guard does NOT scan hold exactly the KNOWN ad-hoc tokens (#830)', () => {
+    // The guard's OWN detector, pointed at the roots it does not police, so this cannot drift
+    // from what the real check would say.
+    const outside = scan(UNSCANNED_ROOTS)
+      .filter((r) => r.offenders.length)
+      .map((r) => `${r.file} :: ${r.offenders.join(', ')}`)
+      .sort();
+    expect(listSourceFiles(UNSCANNED_ROOTS).length, 'the unscanned-roots corpus is empty — this '
+      + 'assertion would pass having examined nothing').toBeGreaterThan(50);
+    expect(outside, 'The set of ad-hoc liveness tokens OUTSIDE SCAN_DIRS changed. A new one means '
+      + '#573\'s family has a fresh instance in a root this guard does not police. One '
+      + 'DISAPPEARING is good news: drop its ledger entry in the same commit.')
+      .toEqual(expectedOutsideRows());
+  });
+
   it('no file hand-rolls a counter that is captured across a deferral and compared', () => {
     const offenders = scan()
       .filter((r) => r.offenders.length > 0)

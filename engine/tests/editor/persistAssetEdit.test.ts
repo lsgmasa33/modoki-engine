@@ -45,6 +45,26 @@ describe('persistAssetEdit reports a write that did not land', () => {
     expect(invalidate).toHaveBeenCalledWith(PATH, DOC);
   });
 
+  it('writes a TRAILING NEWLINE — asserted on the bytes, not a parsed round-trip (#831)', () => {
+    // ⚠️ Byte-level on purpose. `JSON.parse(content)` succeeds identically with or without the
+    // newline, so a round-trip assertion passes without the fix and proves nothing. The defect it
+    // guards is a diff artefact, and only the raw string can see it: every committed asset JSON
+    // ends with a newline, `JSON.stringify` emits none, and each editor write stripped it —
+    // turning a one-field edit into a diff carrying `\ No newline at end of file`.
+    const sent: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
+      sent.push(init.body);
+      return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+
+    void persistAssetEdit(PATH, DOC, invalidate);
+
+    expect(sent, 'the write never reached fetch — this assertion would pass vacuously').toHaveLength(1);
+    const content = (JSON.parse(sent[0]) as { content: string }).content;
+    expect(content.endsWith('\n'), `content does not end with a newline: ${JSON.stringify(content.slice(-12))}`).toBe(true);
+    expect(content.endsWith('\n\n'), 'content ends with TWO newlines — the fix double-applied').toBe(false);
+  });
+
   it('names the file and the REASON when the backend refuses', async () => {
     // A 403 (path outside the asset roots) and a 500 need different fixes, so the route's own
     // message is preferred over a bare status.

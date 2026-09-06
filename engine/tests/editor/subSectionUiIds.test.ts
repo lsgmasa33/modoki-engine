@@ -15,7 +15,6 @@
  *  (the Inspector groups by name), so that case is not a collision. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -27,15 +26,46 @@ const slug = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
 
 /** Section titles declared in trait editor metadata, grouped by the file that declares them. */
 function declaredSectionTitles(): Map<string, Set<string>> {
-  const files = [
-    'engine/app/ecs/registerTraits.ts',
-    'engine/app/editor/setup.ts',
-  ].filter((f) => fs.existsSync(path.join(ROOT, f)));
+  // ⚠️ **DERIVED (#830).** This was a two-file hand list — `registerTraits.ts` and
+  // `editor/setup.ts` — behind a `.filter(existsSync)` that degraded SILENTLY on a rename (the
+  // vacuity pin only fires if BOTH vanish). Measured 2026-09-06, that list was wrong in both
+  // directions at once: `editor/setup.ts` declares no `section:` at all and contributed nothing,
+  // while `games/court/runtime/systems.ts` DOES declare trait-editor sections into the same
+  // Inspector and was never read. A cross-declarer collision is precisely what this guard exists
+  // to prevent, so the one declarer it could not see was the one that mattered.
+  //
+  // The marker is the declaration itself. Games and demos are in scope because a project
+  // registers its trait metadata into the SAME Inspector as the engine — the ids share one
+  // namespace and carry no owner segment.
+  const files = repoFiles({
+    under: ['engine', 'games', 'demos'],
+    match: (rel) => /\.tsx?$/.test(rel) && !rel.includes('.test.'),
+    exclude: ['node_modules', 'dist'],
+    floor: 500,
+  })
+    .filter(({ abs }) => readScannedSource(abs).code.includes("section: '"))
+    .map(({ rel }) => rel);
   const out = new Map<string, Set<string>>();
   for (const f of files) {
     const src = readScannedSource(path.join(ROOT, f)).code;
     for (const [, title] of src.matchAll(/section: '([^']+)'/g)) {
       out.set(f, (out.get(f) ?? new Set()).add(title));
+    }
+    // ⚠️ **The literal form is not the only form, and missing the other one made this whole
+    // widening a no-op (#830 review).** `registerTraits.ts:978` declares
+    // `const S = (section: string, extra?) => ({ section, ...extra })` and UIElement spells its
+    // sections as `S('Layout')`, `S('Padding')`, `S('Text Shadow')` … — **11 live titles** that
+    // `section: '` cannot see. Mutation-proven before this line existed: adding
+    // `section: 'Text-Shadow'` to Court slugs onto UIElement's `S('Text Shadow')` and all four
+    // tests still passed, which is precisely the cross-declarer collision the file exists to
+    // prevent.
+    //
+    // The helper NAME is derived per file rather than hardcoded to `S`: another declarer is free
+    // to call it something else, and a marker that only knows one spelling is the defect this
+    // family is about.
+    for (const [, helper] of src.matchAll(/\bconst\s+(\w+)\s*=\s*\(\s*section:\s*string/g)) {
+      const call = new RegExp(`\\b${helper}\\(\\s*'([^']+)'`, 'g');
+      for (const [, title] of src.matchAll(call)) out.set(f, (out.get(f) ?? new Set()).add(title));
     }
   }
   return out;

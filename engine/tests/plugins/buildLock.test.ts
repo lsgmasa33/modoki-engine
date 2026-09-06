@@ -1,7 +1,28 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { acquireBuild, activeBuild, describeBuildConflict, releasePolicy, resetBuildLockForTests } from '../../plugins/backend/buildLock';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { acquireBuild, activeBuild, acquireBuildSlot, describeBuildConflict, releasePolicy, resetBuildLockForTests } from '../../plugins/backend/buildLock';
+import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 
 afterEach(() => resetBuildLockForTests());
+
+// `acquireBuildSlot` (#650) touches the cross-process claims FILE, unlike every other test in
+// this file — isolated the same way buildClaimsStore.test.ts is, so a bug here can never reach
+// the developer's real `~/.modoki`.
+let home: string;
+let prevHome: string | undefined;
+beforeEach(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  prevHome = process.env.MODOKI_HOME;
+  process.env.MODOKI_HOME = home;
+});
+afterEach(() => {
+  resetBuildClaimsForTests();
+  if (prevHome === undefined) delete process.env.MODOKI_HOME;
+  else process.env.MODOKI_HOME = prevHome;
+  fs.rmSync(home, { recursive: true, force: true });
+});
 
 describe('buildLock', () => {
   it('grants the slot when nothing is running', () => {
@@ -15,6 +36,9 @@ describe('buildLock', () => {
     const second = acquireBuild('android build', 1000);
     expect(second.ok).toBe(false);
     if (second.ok) throw new Error('unreachable');
+    // acquireBuild is purely in-process and never returns the cross-process UNKNOWN variant (#650)
+    // — narrow past it anyway since the type is now shared with acquireBuildSlot's result.
+    if (!second.held) throw new Error('unreachable');
     // The refusal must identify the IN-FLIGHT build, not the one being refused — the caller's
     // question is "what is already running", and answering with their own platform is useless.
     expect(second.held.label).toBe('ios build');
@@ -157,6 +181,152 @@ describe('buildLock — end-to-end through the release policy', () => {
     p.onResponseClose(); // client vanished; xcodebuild is still being torn down
     expect(acquireBuild('android build').ok).toBe(false);
     p.onPipelineEnd();   // the child finally exits
+    expect(acquireBuild('android build').ok).toBe(true);
+  });
+});
+
+// #650: acquireBuildSlot composes the in-process flag above WITH the cross-process claim
+// (buildClaimsStore.mjs), so an editor route is refused not only by its own in-flight build but
+// by a CLI script (or a second editor process) holding the SAME project's claim, and vice versa.
+describe('acquireBuildSlot — in-process AND cross-process (#650)', () => {
+  it('grants when both layers are free', () => {
+    const r = acquireBuildSlot('ios build', '/proj/a');
+    expect(r.ok).toBe(true);
+    expect(activeBuild()?.label).toBe('ios build');
+    expect(readBuildClaim('/proj/a')?.label).toBe('ios build');
+  });
+
+  it('refuses on an in-process conflict WITHOUT ever touching the cross-process claim file', () => {
+    acquireBuild('ios build'); // takes the in-process slot directly, bypassing acquireBuildSlot
+    const second = acquireBuildSlot('android build', '/proj/b');
+    expect(second.ok).toBe(false);
+    if (second.ok) throw new Error('unreachable');
+    expect(second.message).toContain('ios build');
+    // The in-process refusal is correctly worded "in this editor" — acquireBuildSlot never got
+    // far enough to write a cross-process claim for a project nothing has actually built yet.
+    expect(readBuildClaim('/proj/b')).toBeNull();
+  });
+
+  it('refuses on a CROSS-PROCESS conflict (a CLI build already holds the claim), naming it distinctly from an in-process one', () => {
+    const cli = acquireBuildClaim('/proj/c', 'web build (CLI)', { kind: 'cli' });
+    if (!cli.ok) throw new Error('unreachable');
+    const editor = acquireBuildSlot('ios build', '/proj/c');
+    expect(editor.ok).toBe(false);
+    if (editor.ok) throw new Error('unreachable');
+    expect(editor.message).toContain('command-line build');
+    expect(editor.message).toContain('web build (CLI)');
+  });
+
+  it('releases the in-process slot again when the cross-process claim is refused — no false self-refusal on the very next attempt', () => {
+    const cli = acquireBuildClaim('/proj/d', 'web build (CLI)', { kind: 'cli' });
+    if (!cli.ok) throw new Error('unreachable');
+    const refused = acquireBuildSlot('ios build', '/proj/d');
+    expect(refused.ok).toBe(false);
+    // The in-process slot must be free again — acquireBuildSlot took it, then gave it straight
+    // back on the cross-process refusal, so THIS backend has no build actually running.
+    expect(activeBuild()).toBeNull();
+    cli.release();
+    expect(acquireBuildSlot('android build', '/proj/d').ok).toBe(true);
+  });
+
+  it('release() gives back BOTH layers, exactly once each', () => {
+    const r = acquireBuildSlot('ios build', '/proj/e');
+    if (!r.ok) throw new Error('unreachable');
+    r.release();
+    expect(activeBuild()).toBeNull();
+    expect(readBuildClaim('/proj/e')).toBeNull();
+    // Idempotent, same contract as acquireBuild's own release.
+    expect(() => r.release()).not.toThrow();
+  });
+
+  it('a stale release cannot free a LATER acquireBuildSlot on the same project (both layers)', () => {
+    const first = acquireBuildSlot('web build', '/proj/f');
+    if (!first.ok) throw new Error('unreachable');
+    first.release();
+    const second = acquireBuildSlot('ios build', '/proj/f');
+    expect(second.ok).toBe(true);
+    first.release(); // the old closure fires late
+    expect(activeBuild()?.label).toBe('ios build');
+    expect(readBuildClaim('/proj/f')?.label).toBe('ios build');
+  });
+});
+
+// A genuine FAILURE taking the cross-process claim (not a conflict) — `~/.modoki` uncreatable, or
+// its lock genuinely wedged past its deadline — makes `acquireBuildClaim` THROW rather than return
+// a refusal. `acquireBuild` above already took the in-process slot by the time that happens; the
+// bug this guards is `active` staying set for the life of the backend process when nothing wraps
+// that call, so every LATER build attempt would wrongly refuse "in this editor" until a restart —
+// over a build that never actually started.
+describe('acquireBuildSlot — a genuine failure taking the cross-process claim does not leak the in-process slot', () => {
+  /** Fail ONLY the build-claims lock mkdir, the way an uncreatable `~/.modoki` (or any other
+   *  non-EEXIST mkdir failure) does — same technique as `vendorPlugins.test.ts`'s `denyLockMkdir`,
+   *  applied to `buildClaimsStore.mjs`'s own lock file instead of the plugin-build one. */
+  function denyBuildClaimsLockMkdir() {
+    const real = fs.mkdirSync;
+    return vi.spyOn(fs, 'mkdirSync').mockImplementation(((p: fs.PathLike, o?: object) => {
+      if (String(p).endsWith('.build-claims.lock')) {
+        throw Object.assign(new Error('EACCES: permission denied, mkdir'), { code: 'EACCES' });
+      }
+      return (real as (p: fs.PathLike, o?: object) => string | undefined)(p, o);
+    }) as typeof fs.mkdirSync);
+  }
+
+  it('releases the in-process slot and reports a message, rather than propagating the throw or leaking the slot', () => {
+    const spy = denyBuildClaimsLockMkdir();
+    let r: ReturnType<typeof acquireBuildSlot>;
+    try {
+      r = acquireBuildSlot('ios build', '/proj/leak-a');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.message).toMatch(/Could not create the build-claims lock directory/);
+    // The load-bearing assertion: the in-process slot must be free again, not held for the life of
+    // this backend process — the mutation this catches is buildLock.ts's own `try` being removed.
+    expect(activeBuild()).toBeNull();
+    expect(acquireBuild('android build').ok).toBe(true);
+  });
+});
+
+// #799 follow-up (BLOCKER 1): `withLock` throwing on a non-EEXIST errno was only ever wrapped on
+// the ACQUIRE side (the describe block just above) — `releaseBuildClaimByToken` called it bare, so
+// `release()` itself became a throwing function. Reproduced the same way as the acquire-side bug:
+// take a claim normally, then deny the SAME lock-directory mkdir on the RELEASE path instead.
+// Before the fix this made `r.release()` throw AND skipped `local.release()` (a bare
+// `cross.release(); local.release();` in buildLock.ts's composed release), so `active` stayed set
+// for the life of the backend process — every LATER build wrongly refused "in this editor" until a
+// restart, over a build that had actually finished.
+describe('acquireBuildSlot — release() never throws, and frees the in-process slot even when the cross-process release fails (#799 follow-up)', () => {
+  function denyBuildClaimsLockMkdir() {
+    const real = fs.mkdirSync;
+    return vi.spyOn(fs, 'mkdirSync').mockImplementation(((p: fs.PathLike, o?: object) => {
+      if (String(p).endsWith('.build-claims.lock')) {
+        throw Object.assign(new Error('EACCES: permission denied, mkdir'), { code: 'EACCES' });
+      }
+      return (real as (p: fs.PathLike, o?: object) => string | undefined)(p, o);
+    }) as typeof fs.mkdirSync);
+  }
+
+  it('release() does not throw, and the in-process slot is freed even though the cross-process claim could not be updated', () => {
+    const r = acquireBuildSlot('ios build', '/proj/release-fail-a');
+    if (!r.ok) throw new Error('unreachable');
+    expect(activeBuild()?.label).toBe('ios build');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const spy = denyBuildClaimsLockMkdir();
+    try {
+      expect(() => r.release()).not.toThrow();
+    } finally {
+      spy.mockRestore();
+      warn.mockRestore();
+    }
+
+    // The load-bearing assertion, mirroring the acquire-path test above: the in-process slot is
+    // free again — a `try { cross.release() } finally { local.release() }` composition in
+    // buildLock.ts, not two bare statements, is what keeps this true independent of whether the
+    // cross-process side itself throws.
+    expect(activeBuild()).toBeNull();
     expect(acquireBuild('android build').ok).toBe(true);
   });
 });

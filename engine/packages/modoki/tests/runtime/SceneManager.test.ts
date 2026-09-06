@@ -15,6 +15,12 @@ const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, s
 const EntityAttributes = trait({ name: '', isActive: true, sortOrder: 0, parentId: 0, layer: '' as '' | '3d' | '2d' | 'ui', guid: '' });
 const Renderable3D = trait({ mesh: '', material: '', isVisible: true });
 const PlayerProfile = trait({ score: 0, level: 1 });
+// v3/v4 UI traits — registered only so the v3→v4→v5 UI migration test can prove
+// they were actually deleted (getTraitByName must resolve them for entity.has(...)
+// to mean anything); the real registry does not carry them post-v5.
+const UIStyle = trait({});
+const UIText = trait({});
+const UIContent = trait({});
 
 // ── GLTFLoader mock (for acquireMesh transitive model load) ─────────────
 
@@ -52,7 +58,12 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
     { name: 'Renderable3D', trait: Renderable3D, category: 'component', fields: { mesh: { type: 'string' }, material: { type: 'string' }, isVisible: { type: 'boolean' } } },
     { name: 'PlayerProfile', trait: PlayerProfile, category: 'component', fields: { score: { type: 'number' }, level: { type: 'number' } } },
+    { name: 'UIStyle', trait: UIStyle, category: 'component', fields: {} },
+    { name: 'UIText', trait: UIText, category: 'component', fields: {} },
+    { name: 'UIContent', trait: UIContent, category: 'component', fields: {} },
     { name: 'Persistent', trait: null as any, category: 'tag', fields: {} }, // patched in beforeEach
+    { name: 'UIElement', trait: null as any, category: 'component', fields: {} }, // patched in beforeEach — real trait, for the v3→v5 UI migration test
+    { name: 'RenderableUI', trait: null as any, category: 'tag', fields: {} }, // patched in beforeEach
   ];
   return {
     getAllTraits: () => traits,
@@ -146,9 +157,15 @@ beforeEach(async () => {
   // Patch the Persistent trait into our trait registry mock so it matches the
   // real Persistent trait that SceneManager imports
   const { Persistent } = await import('../../src/runtime/traits/Persistent');
+  const { UIElement } = await import('../../src/runtime/traits/UIElement');
+  const { RenderableUI } = await import('../../src/runtime/traits/RenderableUI');
   const { getAllTraits } = await import('../../src/runtime/core/ecs/traitRegistry');
   const persistentMeta = getAllTraits().find((m: any) => m.name === 'Persistent');
   if (persistentMeta) (persistentMeta as any).trait = Persistent;
+  const uiElementMeta = getAllTraits().find((m: any) => m.name === 'UIElement');
+  if (uiElementMeta) (uiElementMeta as any).trait = UIElement;
+  const renderableUIMeta = getAllTraits().find((m: any) => m.name === 'RenderableUI');
+  if (renderableUIMeta) (renderableUIMeta as any).trait = RenderableUI;
 
   // Register material GUIDs → paths on the fresh module graph (resetModules
   // wipes the manifest). SceneManager resolves resources[].path / material refs
@@ -276,15 +293,18 @@ describe('SceneManager — basic load', () => {
     worldBefore.destroy();
   });
 
-  /** #784 phase C adversarial review, finding 1 — `SceneManager.collectSceneResourceRefs`
-   *  ends with `sceneData.version = Math.max(sceneData.version ?? 6, 6)`, which runs BEFORE
-   *  `loadSceneFile`'s own too-new/unreadable guard and numerically COERCES a non-numeric
-   *  version into a valid number — so by the time the guard runs on a `SceneManager`-driven
-   *  load, an `unreadable` scene has already been laundered into `ok`. Driven through
-   *  `SceneManager.loadScene` (not `loadSceneFile` directly, which is the whole point: that
-   *  guard alone cannot catch this, because `SceneManager` mutates the object before ever
-   *  calling it) for a string version, a float version and a `null` version — three shapes of
-   *  the same `unreadable` verdict (docs/format-versioning.md § 2a). */
+  /** #784 phase C adversarial review, finding 1 — `SceneManager` classifies a scene's format
+   *  version itself, in `loadScene`'s caller loop, before `collectSceneResourceRefs` and
+   *  before `loadSceneFile`'s own too-new/unreadable guard ever runs. (`collectSceneResourceRefs`
+   *  used to end with a `sceneData.version = Math.max(sceneData.version ?? 6, 6)` raise that
+   *  numerically coerced a non-numeric version into a valid one before that guard could see it —
+   *  removed in #807, since it also laundered a v3/v4/v5 scene's version past the migration
+   *  ladder; it played no part in catching THIS case, which is `SceneManager`'s own upfront
+   *  classification.) Driven through `SceneManager.loadScene` (not `loadSceneFile` directly,
+   *  which is the whole point: that guard alone cannot catch this, because `SceneManager`
+   *  mutates the object and spawns entities from it before ever calling `loadSceneFile`) for a
+   *  string version, a float version and a `null` version — three shapes of the same
+   *  `unreadable` verdict (docs/format-versioning.md § 2a). */
   it.each([
     ['a string version', '5'],
     ['a non-integer version', 2.5],
@@ -312,6 +332,86 @@ describe('SceneManager — basic load', () => {
     expect(corruptCount).toBe(0);
 
     worldBefore.destroy();
+  });
+
+  /** #807 — `collectSceneResourceRefs` used to end with `sceneData.version =
+   *  Math.max(sceneData.version ?? 6, 6)`, raising a v3 scene's version straight to 6
+   *  BEFORE `loadSceneFile`'s migration ladder ever ran on that same object. That made
+   *  `migrateSceneData` (v3→v4, `>= 4`), `migrateV4toV5` (v4→v5, `>= 5`) and
+   *  `migrateV5toV6` (v5→v6, `>= 6`) all no-ops — a genuinely old scene loaded with its
+   *  pre-migration shape intact instead of being reshaped.
+   *
+   *  Driven through `SceneManager.loadScene`, not `loadSceneFile` directly — the whole
+   *  point of the defect is that only the `SceneManager`-driven path mutated `version`
+   *  ahead of the ladder, so `loadSceneFile.test.ts`'s existing v3→v4/v4→v5/v5→v6
+   *  coverage passed even with the bug in place and could not have caught it.
+   *
+   *  Asserts the actual RESHAPING (v3's separate `UIStyle`/`UIText`/`UIContent` traits
+   *  merged into `UIElement`), not merely that the final version reached
+   *  `SCENE_FORMAT_VERSION` — that would be true with or without the fix. */
+  it('a v3 scene loaded through SceneManager actually runs the v3→v4→v5 UI migration', async () => {
+    fetchResponses['/v3ui.json'] = {
+      version: 3,
+      resources: [],
+      entities: [
+        {
+          id: 500,
+          traits: {
+            EntityAttributes: { name: 'Label', parentId: 0, layer: 'ui' },
+            RenderableUI: true,
+            // Stripped by migrateSceneData (v3→v4) because this entity carries RenderableUI.
+            Transform: { x: 5, y: 5 },
+            // v3/v4 shape: a bare UIElement plus separate style/text/content traits.
+            UIElement: { width: 100, height: 20 },
+            UIStyle: {
+              fontSize: 24, fontWeight: 'bold', textColor: 0xff0000, textAlign: 'center',
+              backgroundColor: 0x112233,
+            },
+            UIContent: { text: 'Hello' },
+          },
+        },
+      ],
+    };
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/v3ui.json');
+
+    const { getCurrentWorld } = await getWorld();
+    const { UIElement } = await import('../../src/runtime/traits/UIElement');
+    const world = getCurrentWorld();
+
+    let found: any = null;
+    world.query(EntityAttributes, UIElement).updateEach(([ea, el]: any[]) => {
+      if (ea.name === 'Label') found = { ea, el };
+    });
+    expect(found).not.toBeNull();
+
+    // migrateSceneData (v3→v4) moved these from UIStyle into UIText; migrateV4toV5
+    // (v4→v5) then merged UIText/UIStyle/UIContent onto UIElement itself.
+    expect(found.el.fontSize).toBe(24);
+    expect(found.el.fontWeight).toBe('bold');
+    expect(found.el.textColor).toBe(0xff0000);
+    expect(found.el.textAlign).toBe('center');
+    expect(found.el.backgroundColor).toBe(0x112233);
+    expect(found.el.text).toBe('Hello');
+
+    // The separate v3/v4 traits must be gone — folded into UIElement, not merely copied.
+    let entity: any = null;
+    world.query(EntityAttributes).updateEach((_c: any[], e: any) => {
+      const attrs = e.get(EntityAttributes);
+      if (attrs.name === 'Label') entity = e;
+    });
+    // Transform is stripped by migrateSceneData (v3→v4) for RenderableUI entities —
+    // asserting it isolates the v3→v4 rung: without it, this test can't tell "both
+    // rungs ran" from "only v4→v5 ran" (fontSize etc. reach UIElement either way).
+    expect(entity.has(Transform)).toBe(false);
+    const { getTraitByName } = await import('../../src/runtime/core/ecs/traitRegistry');
+    for (const traitName of ['UIStyle', 'UIText', 'UIContent'] as const) {
+      const meta = getTraitByName(traitName);
+      expect(meta).toBeDefined();
+      expect(entity.has(meta!.trait)).toBe(false);
+    }
+
+    world.destroy();
   });
 
   it('loads from opts.preloaded without fetching the scene path', async () => {

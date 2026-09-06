@@ -604,17 +604,52 @@ const MAX_REPORTED_DIFF_PATHS = 5;
  *  not rewrite anything on extract. (A transient mismatch was seen once mid-measurement, while an
  *  editor running against the same checkout was concurrently re-vendoring/reinstalling the same
  *  project — re-measuring after it settled showed a clean match; that is a live-process race, not
- *  an npm normalization to design around.) */
-export function verifyInstalledMatchesTarball(projectRoot: string): string[] {
+ *  an npm normalization to design around.)
+ *
+ *  @returns `{ problems, reason }` — `reason: 'unreadable-package-json'` when the project's own
+ *    `package.json` EXISTS but could not be read/parsed, in which case `problems` is `[]` but that
+ *    `[]` means "could not check", never "verified clean". Before #731 this function conflated the
+ *    two: an unreadable `package.json` and a project that vendors no engine plugins both read back
+ *    as `[]`, and the caller treated both as "nothing wrong" — the exact
+ *    null-conflates-absent-with-unknown shape #714 fixed one level up in `loadEnginePluginModule`.
+ *    It was also the ONE fail-open path left in this function: every neighbouring catch here
+ *    (`readTarball` below, and the tarball read a few lines down) already fails CLOSED, pushing a
+ *    problem rather than swallowing. This makes the whole function agree with itself. The caller
+ *    decides what "could not check" means — here that's WARN, not throw (see
+ *    `verifyInstalledMatchesTarball`'s two call sites): the existing throw this feeds says
+ *    "node_modules is STALE", which would be the wrong diagnosis for an unreadable `package.json`.
+ *    Polarity doctrine: `device.mjs`'s `checkIosPhoneCollision` (MATCH / MISMATCH / UNKNOWN) —
+ *    "cannot tell" must collapse into neither side.
+ *
+ *    ⚠️ A MISSING `package.json` is a THIRD, distinct case — ABSENT, not unknown — and reads back
+ *    as `reason: null` (the same as "vendors nothing"), never `'unreadable-package-json'`. Several
+ *    real projects genuinely have no `package.json` of their own (`games/2d-physics-demo`,
+ *    `3d-physics-demo`, `agy`, `particle`), and that is the ordinary, silent case — there is no
+ *    engine plugin dependency to possibly be stale, so there is nothing to check. Conflating
+ *    `ENOENT` with a genuine read/parse failure was #731's OWN defect in the other direction: a
+ *    native build of one of those four projects reported "could ship the wrong plugin bytes
+ *    undetected" for having no `package.json` to begin with, which is false. Only a `package.json`
+ *    that EXISTS but won't read/parse is the genuine unknown. */
+export function verifyInstalledMatchesTarballResult(
+  projectRoot: string,
+): { problems: string[]; reason: null | 'unreadable-package-json' } {
   const problems: string[] = [];
   const pkgPath = path.join(projectRoot, 'package.json');
   let deps: Record<string, string> | undefined;
   try {
     deps = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).dependencies;
-  } catch {
-    return problems; // no readable package.json — nothing to check
+  } catch (e) {
+    // ENOENT — no package.json at all — is ABSENT, not unknown: several real projects (games with
+    // native targets but no npm-managed deps of their own, e.g. 2d-physics-demo/3d-physics-demo/
+    // agy/particle) simply have none, and that is a normal, silent case with nothing to check —
+    // not a "could not check" that a caller should warn about. Any OTHER failure (a truncated or
+    // merge-conflicted package.json that EXISTS but won't read/parse) is the genuine unknown this
+    // function's whole point is to tell apart from "verified clean". Same split as
+    // `buildClaimsStore.mjs`'s `readClaimsResult`.
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { problems, reason: null };
+    return { problems, reason: 'unreadable-package-json' }; // present but unreadable/unparseable
   }
-  if (!deps) return problems;
+  if (!deps) return { problems, reason: null };
 
   // The only spec shape vendorEnginePlugins ever writes (see its header) — matching it is how we
   // recognize "an engine plugin this project vendors" without needing engineRoot/listEnginePlugins.
@@ -658,7 +693,14 @@ export function verifyInstalledMatchesTarball(projectRoot: string): string[] {
       problems.push(`${name}: node_modules/${name} does not match ${relTgz} — ${shown.join(', ')}${more}`);
     }
   }
-  return problems;
+  return { problems, reason: null };
+}
+
+/** Thin wrapper over {@link verifyInstalledMatchesTarballResult} for a caller that only wants the
+ *  problem list — the plain string[] contract every caller relied on before #731. A caller that
+ *  needs to tell "verified clean" apart from "could not check" uses the Result function instead. */
+export function verifyInstalledMatchesTarball(projectRoot: string): string[] {
+  return verifyInstalledMatchesTarballResult(projectRoot).problems;
 }
 
 /** The packed `package/package.json`'s `version` field inside a committed tarball, or `null` if

@@ -142,6 +142,45 @@ consequences worth knowing:
   the editor's own write (`selfWrite`), because everything in the registry was already applied to
   the live cache: without that, the flush's own watcher event comes back ~150 ms later and
   `dropParkedWriteFor` discards whatever the human parked in the meantime.
+- **`replace:true` means the normalizer's OUTPUT is the whole file — spread the source at EVERY
+  level it rebuilds, not just the top (#821).** `normalizeTimeline`/`normalizeAnimationClip`/
+  `normalizeSpriteAnim` each rebuild their document from an enumerated field list; the top level
+  of all three carried a `...json` spread already, but the `.map()`s that rebuild a nested entry
+  (a timeline clip/marker/cue/span, an animation track/deform-track/deform-keyframe, a
+  sprite-anim clip) did not, so a key none of them named survived a top-level round-trip and was
+  silently deleted from a nested one on the first panel save. The fix spreads the source entry
+  FIRST in each rebuilt object literal, named/normalized fields after — "a key this build
+  understands wins over a stale copy of itself," the same invariant `mergeUnknownFields` enforces
+  at the top level — which also preserves each unknown key's original POSITION in the object
+  wherever the rebuild spreads the source directly (`{ ...c, ... }`, `{ ...m, ... }`, etc.).
+  **The general property: a key's ORIGINAL POSITION survives wherever the rebuild spreads the
+  source object itself; it does NOT survive at a site that destructures owned keys out and
+  spreads `...rest` instead** — those owned keys move to the end whenever the entry carries an
+  extra key. Two sites do this today: the control-clip branch (`start`/`duration`/`prefab`/
+  `transform`) and `normalizeTrack`'s track-level destructure (`type`/`clips`/`markers`/`cues`/
+  `spans`) — an authored `id,type,futureField,clips,name` normalizes to
+  `id,futureField,name,target,muted,type,clips`. Treat this as a property of the shape, not a
+  closed list: any future site built the same way (destructure-and-`...rest`) inherits it. A per-
+  entry `known`-list keyed to `mergeUnknownFields`/`collectUnknownFields`
+  was considered and rejected; those are whole-document one-shots and would need a distinct list
+  per branch for no benefit over the spread. Two documents that LOOK like the same shape are not
+  members of this defect: `normalizeParticleDef` already spreads at every level (a working
+  counterexample, not a fix target), and `normalizeRig2D`/`normalizePart`/`coerceRigBones` share
+  the shape but sit off the `replace:true` write path — `SkinEditor.tsx` parks the raw
+  `Rig2DFile`, not this normalizer's output — and `normalizeAnimSet` is dead code on this path:
+  `AnimSetAssetView.tsx` never calls it and doesn't use `useParkedAssetDoc`. Tests:
+  `tests/runtime/assetDocPassthrough.test.ts`.
+  - ⚠️ **Spread the keys you do NOT own — a blanket `...source` resurrects what the normalizer
+    just decided to discard.** "Preserve unknown keys" is not "preserve everything", and the
+    difference bites wherever a rebuild deliberately re-decides a NAMED key. Caught in review on
+    the control-clip branch: its documented precedence (*prefab > particle > subdirector*) exists
+    to make an over-specified clip come out prefab-ONLY, and `transform` is omitted precisely
+    when `normalizeControlTransform` REJECTS it — a blanket `...c` put both back, so the clip kept
+    two discriminants and a malformed transform that had just failed validation. The shape that
+    works is to destructure the owned keys out and spread the `...rest`. **A passthrough test
+    cannot catch this** — an unknown key survives either way — so a rebuild that drops or
+    re-decides anything needs a second test asserting the DROP still happens, alongside the one
+    asserting the carry-through.
 
 **A save ALWAYS flushes the registry, whatever the scene does.** The flush used to live inside
 `saveScene`, after the scene write had succeeded, so five refusals silently swallowed it: run-mode

@@ -6,7 +6,7 @@
  * not optional hygiene.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -474,5 +474,55 @@ describe('ttlMs is clamped — an owner-claim must not be able to outlive its ow
     expect(written.ttlMs).toBe(MAX_CLAIM_TTL_MS);
     // ...and it really does expire: one ms past the ceiling is stale.
     expect(isStale(written, { now: written.at + MAX_CLAIM_TTL_MS + 1 })).toBe(true);
+  });
+});
+
+// #650's `buildClaimsStore.mjs` found the identical spin hole in its OWN copy of this exact
+// `withLock` shape and fixed it there; this is the same fix applied HERE, to the pre-existing
+// original — see that file's own header for the full mechanism. `mkdirSync(lock)` throwing
+// EACCES/EROFS/ENOSPC (not EEXIST) used to fall into the SAME bare `catch` as genuine contention:
+// `fs.statSync(lock)` then threw ENOENT (the lock dir was never created), whose own catch did
+// `continue`, retrying the identical failing `mkdirSync` forever with no deadline check in that
+// path at all. Only EEXIST means "someone else holds the lock"; anything else is a real failure
+// and must throw immediately — this module's own "give up and proceed unlocked past the deadline"
+// behaviour (unlike buildClaimsStore.mjs's throw) is UNCHANGED for genuine EEXIST contention; only
+// the non-EEXIST branch moves from spin to throw.
+describe('withLock — a non-EEXIST mkdirSync failure throws IMMEDIATELY, never spinning (#650 sibling spin fix)', () => {
+  /** Fail ONLY the device-claims lock mkdir, the way an unwritable `~/.modoki` does — same
+   *  technique as `vendorPlugins.test.ts`'s `denyLockMkdir` / `buildClaimsStore.test.ts`'s own
+   *  copy of it, applied to this store's lock file. */
+  function denyLockMkdir(code: 'EACCES' | 'EROFS' | 'ENOSPC') {
+    const real = fs.mkdirSync;
+    return vi.spyOn(fs, 'mkdirSync').mockImplementation(((p: fs.PathLike, o?: object) => {
+      if (String(p).endsWith('.device-claims.lock')) {
+        throw Object.assign(new Error(`${code}: simulated, mkdir '${p}'`), { code });
+      }
+      return (real as (p: fs.PathLike, o?: object) => string | undefined)(p, o);
+    }) as typeof fs.mkdirSync);
+  }
+
+  it.each(['EACCES', 'EROFS', 'ENOSPC'] as const)('%s throws naming the path and the errno, and never writes a claim', (code) => {
+    const spy = denyLockMkdir(code);
+    try {
+      expect(() => claimDevice({ deviceId: adbDeviceId('SIM-SPIN-A') })).toThrow(
+        new RegExp(`Could not create the device-claims lock directory.*${code}`, 's'),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(claimsFilePath())).toBe(false);
+  });
+
+  it('returns almost immediately — proves it did NOT spin, not merely that it eventually threw', () => {
+    const spy = denyLockMkdir('EACCES');
+    const started = Date.now();
+    try {
+      expect(() => claimDevice({ deviceId: adbDeviceId('SIM-SPIN-B') })).toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    // Generous relative to the bug this catches (an unbounded spin) — see
+    // buildClaimsStore.test.ts's identical assertion for why this isn't a tight timing bound.
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

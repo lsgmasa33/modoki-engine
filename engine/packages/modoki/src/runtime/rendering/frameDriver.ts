@@ -16,6 +16,11 @@ import { pollGpuTimings } from '../core/gpuTimings';
 // it used to leave. `activeRenderer` imports only `three` types + `./clock`, so this is L2→L0
 // (rendering → core) and adds no cycle.
 import { getGpuFaultState, onRendererLost, type GpuFaultState } from '../core/activeRenderer';
+// Split out to a DOM-free leaf (this file is not) so a Node-side consumer with no "DOM" lib can
+// type against the union without pulling this whole file's `document`/`requestAnimationFrame`
+// usage into its program — see that file's header for the concrete failure (editorBackendRouter.ts
+// / tsconfig.node.json, #682 close-out round 3, BLOCKER 2).
+import type { FrameLoopStatus } from './frameLoopStatus';
 
 type FrameCallback = () => void;
 
@@ -576,7 +581,7 @@ function stopWatchdog() {
  *   - `'stalled'`  — armed with live start refs, document visible, no frame for >2s. The
  *                    wedge. `recoveryAttempts` says whether self-repair has been tried. */
 export interface FrameLoopHealth {
-  status: 'running' | 'hidden' | 'idle' | 'stalled';
+  status: FrameLoopStatus;
   refCount: number;
   callbacks: number;
   armed: boolean;

@@ -39,9 +39,9 @@
  * mutation is covered elsewhere.
  */
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -54,6 +54,7 @@ import {
   stripHashComments,
   stripSwiftComments,
 } from './sourceScanner';
+import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = join(HERE, '../../src/runtime');
@@ -210,29 +211,27 @@ describe('the sanity assertions can actually fail', () => {
 });
 
 describe('⚠️ the FORWARD guard: no file the engine guards scan is damaged by the scanner', () => {
-  const tsFiles = (dir: string): string[] => {
-    const out: string[] = [];
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) out.push(...tsFiles(full));
-      else if (/\.tsx?$/.test(name)) out.push(full);
-    }
-    return out;
-  };
+  const tsFiles = (dir: string): string[] => repoFiles({
+    under: dir,
+    match: /\.tsx?$/,
+    floor: 400,
+  }).map(({ abs }) => abs);
 
   /** Files under `dir` matching `extRe`, skipping build output. `dir` missing entirely (a public
    *  checkout's `games/`/`demos/`) degrades to an empty list rather than throwing — the repo
    *  convention for a glob over an optional tree. */
+  // Via the shared corpus producer (#814) — `extRe` is matched against the BASENAME, as the
+  // hand-rolled walker did, so every caller's regex keeps its original meaning. `floor: 0` because
+  // several roots are legitimately absent in a partial checkout and every caller below carries its
+  // own `minFiles` non-vacuity assertion.
   const collectFiles = (dir: string, extRe: RegExp): string[] => {
     if (!existsSync(dir)) return [];
-    const out: string[] = [];
-    for (const name of readdirSync(dir)) {
-      if (name === 'node_modules' || name === 'dist') continue;
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) out.push(...collectFiles(full, extRe));
-      else if (extRe.test(name)) out.push(full);
-    }
-    return out;
+    return repoFiles({
+      under: dir,
+      match: (rel) => extRe.test(basename(rel)),
+      exclude: ['node_modules', 'dist'],
+      floor: 0,
+    }).map(({ abs }) => abs);
   };
 
   // `<root>/<project>/<sub>` across every project dir (each `games/<id>` or `demos/<id>`) — same

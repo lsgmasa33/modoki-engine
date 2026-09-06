@@ -290,8 +290,11 @@ name rather than passing vacuously — § 4's own "anchor" lesson, applied corre
 **A fifth trap, and it defeated this family's own guard once: a classifier is only as good as
 everything UPSTREAM of it.** C3 put the scene verdict at the top of `loadSceneFile`, argued in its
 own comment that this was the single entry every path funnels through, and shipped green — but
-`SceneManager.collectSceneResourceRefs` ends with `sceneData.version = Math.max(sceneData.version ??
-6, 6)` and runs *earlier*, on the same object. `Math.max` numerically coerces, so `"5"`, `"13"`,
+`SceneManager.collectSceneResourceRefs` ended with `sceneData.version = Math.max(sceneData.version ??
+6, 6)` and ran *earlier*, on the same object. (Past tense throughout this paragraph: that line was
+**deleted in #807** — see the ⚠️ note below. It is quoted here because the trap is what matters, and
+a reader grepping the repo for it will not find it in any source file.) `Math.max` numerically
+coerces, so `"5"`, `"13"`,
 `2.5` and `null` all reached the guard as a clean `ok`: the entire `unreadable` half of the
 disposition was dead in production, while a unit test calling `loadSceneFile` directly proved it
 worked. **Ask what mutates the document between the bytes and your verdict** — and prefer to
@@ -299,9 +302,21 @@ classify where the bytes are first parsed, not where they are first used. The te
 caught it is the one driven through the real caller; the one that did not is the one that called
 the classified function directly.
 
-⚠️ Related, still unfixed and filed separately: that same `Math.max` also RAISES an older numeric
-version to 6, so a genuine v3 scene is stamped 6 and skips the v3→v6 rungs entirely. Latent only
-because the committed corpus bottoms out at v9.
+⚠️ Related, now fixed (#807): that same `Math.max` also RAISED an older numeric version to 6, so a
+genuine v3 scene got stamped 6 and skipped the v3→v6 rungs entirely — latent only because the
+committed corpus bottoms out at v9. The fix deletes the raise outright rather than adjusting it:
+`sceneData.resources = allRefs` (the line just above it) already records the real fact — "this
+scene now has a resources manifest" — in the correct field, and the version raise was a second,
+wrong way of saying it: a manifest-collected fact written into the FORMAT-version field (§ 0's three
+kinds of version are not interchangeable). Nothing downstream needed it: `migrateV5toV6` only synthesizes `resources` when it's
+absent, and `collectSceneResourceRefs` had already set it; the numeric-coercion half is handled
+upstream by `SceneManager`'s own `classifyFormatVersion` call, which refuses `too-new`/`unreadable`
+before `collectSceneResourceRefs` ever runs. The lesson above still stands and is the reason this
+was catchable at all: the regression test lives in `SceneManager.test.ts`, driven through the real
+`SceneManager.loadScene` entry point (seeding a v3 fixture and asserting the v3→v4→v5 UI-trait
+reshaping actually happened), not in `loadSceneFile.test.ts` — that file's existing v3→v4/v4→v5/v5→v6
+coverage calls `loadSceneFile` directly and passed with the bug fully in place, exactly as § 4's
+fifth trap predicts.
 
 ⚠️ **And a non-trap, recorded because it was written down as fact first.** That fix also claimed
 the quarantine file would be scanned as an asset unless its suffix was explicitly skipped, reasoning

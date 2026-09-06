@@ -13,18 +13,20 @@
  *
  *  Both are fixed; this guard is what makes a third instance fail at test time instead of costing
  *  someone an afternoon. It asserts the two SHAPES, not the two files, so a new spawner or a new
- *  MCP server is covered without anyone remembering to add it here.
+ *  MCP server is covered without anyone remembering to add it here — and as of #830 that sentence
+ *  is TRUE of the spawner half, which until then was a hand-list of two checked against itself.
  *
  *  Deliberately NOT asserted: that a derived port has any particular value (that is
  *  `clonePortCli.test.ts`'s job), and the per-clone `.claude/settings.local.json` files, which are
  *  gitignored precisely so they CAN hold a literal port. */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
 import { CLONE_BACKEND_PORTS, vitePortForBackend, cdpPortForBackend } from '../../scripts/editorPorts.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 
 const REPO = path.resolve(__dirname, '../../..');
 const read = (rel: string) => readScannedSource(path.join(REPO, rel)).code;
@@ -75,17 +77,88 @@ describe.skipIf(skip)('committed MCP configs do not hardcode a per-clone port (#
 });
 
 describe.skipIf(skip)('every harness that SPAWNS the packaged app pins a per-clone backend port (#68)', () => {
-  /** Scripts that launch the packaged binary. Found by the marker every such script needs — it must
-   *  resolve the executable inside the app dir — rather than by a hand-listed set, so a NEW spawner
-   *  is covered the day it is written. */
-  const SPAWNERS = ['engine/scripts/smoke-packaged.sh', 'engine/scripts/assert-app-csp.mjs'];
+  /** Scripts that launch the packaged binary.
+   *
+   *  ⚠️ **The comment here used to claim this set was "found by the marker … rather than by a
+   *  hand-listed set, so a NEW spawner is covered the day it is written." It was a hand-list of
+   *  two, and the check below filtered SPAWNERS by itself and compared the result to SPAWNERS —
+   *  which can detect a DELETED entry and never an ADDED one (#830).** Four more scripts resolved
+   *  the packaged binary through the identical marker and were invisible to it:
+   *  `assert-app-renders.sh`, `launch-editor.sh`, `repro-cold-boot.sh`, `test-packaged.sh`. All
+   *  four happened to pin their port, so the hole was latent — but the guard was structurally
+   *  incapable of noticing a fifth.
+   *
+   *  Now DERIVED for real. The marker is a reference to `packagedAppPaths.mjs`: a script cannot
+   *  launch the packaged app without asking it where the binary is, so anything that spawns one
+   *  names it. That over-captures slightly — three files reference the resolver without launching
+   *  anything — and over-capturing is the safe direction: each is an EXEMPT row with a reason,
+   *  rather than a silent absence. */
+  const SPAWNERS = [
+    'engine/scripts/assert-app-csp.mjs',
+    'engine/scripts/assert-app-renders.sh',
+    'engine/scripts/launch-editor.sh',
+    'engine/scripts/repro-cold-boot.sh',
+    'engine/scripts/smoke-packaged.sh',
+    'engine/scripts/test-packaged.sh',
+  ];
 
-  it('the spawner list still matches what actually resolves the packaged binary', () => {
-    // If this fails, a spawner was added or renamed: add it above (and pin its port) rather than
-    // relaxing the check — an unpinned spawner is exactly the #68 defect.
-    const resolvesBinary = SPAWNERS.filter((f) => existsSync(path.join(REPO, f)))
-      .filter((f) => /binInAppDir|appDir|\bbin\b/.test(read(f)));
-    expect(resolvesBinary.sort()).toEqual([...SPAWNERS].sort());
+  /** Spawners that deliberately do NOT derive a per-clone port, with the reason each is safe.
+   *  Kept separate from SPAWNERS so the port assertion still RUNS for them and states its verdict,
+   *  rather than the script quietly falling out of the list. */
+  const DERIVATION_EXEMPT = new Set([
+    // `PORT="${PORT:-5188}"` (:47), chosen to sit OUTSIDE every clone lane (5179-5183) rather than
+    // inside one: this harness relaunches the packaged app a dozen times in a row, and the comment
+    // at :45 is explicit that a run must not be able to drive — or be mistaken for — a live editor.
+    // Deriving a per-clone port would put it back INSIDE the range it is avoiding. It is also an
+    // env-overridable default, the same `${VAR:-…}` shape the MCP half of this file sanctions.
+    // ⚠️ Residual, and unfixed on purpose: two clones running repro-cold-boot AT THE SAME TIME
+    // still collide on 5188. That is a real but narrow window (a manual, long-running repro
+    // harness), and closing it by deriving would reintroduce the larger hazard above. Pass PORT=
+    // explicitly if you need two at once.
+    'engine/scripts/repro-cold-boot.sh',
+  ]);
+
+  it('the spawner list covers everything that resolves the packaged binary', () => {
+    assertDeclaredListIsComplete({
+      label: 'SPAWNERS in clonePortHardcoding.test.ts',
+      declared: SPAWNERS,
+      population: repoFiles({ under: 'engine/scripts', match: /\.(mjs|sh|mts)$/, floor: 20 })
+        .map(({ rel }) => rel)
+        .filter((rel) => read(rel).includes('packagedAppPaths')),
+      floor: 6,
+      exempt: [
+        {
+          item: 'engine/scripts/packagedAppPaths.mjs',
+          reason: 'The RESOLVER itself — it is what a spawner asks; it launches nothing.',
+        },
+        {
+          item: 'engine/scripts/clean-packaged-cache.mjs',
+          reason: 'Imports `productName`/`killPackaged` to KILL and clean a packaged install — it '
+            + 'never launches one, so there is no port for it to pin. Its own subprocesses are '
+            + 'tasklist/pgrep/diskutil, all detection and eject.',
+        },
+      ],
+      fix: 'A new script that spawns the packaged app must pin MODOKI_BACKEND_PORT (derive one '
+        + 'with clonePort.mjs) and be listed in SPAWNERS. An unpinned spawner binds whatever is '
+        + 'free — which is 5179, the HUB clone\'s lane — and silently drives the wrong checkout.',
+    });
+  });
+
+  it('every DERIVATION_EXEMPT row still names a spawner that does NOT derive (#830 review)', () => {
+    // `derives || DERIVATION_EXEMPT.has(rel)` is true either way, so a row survives its own reason:
+    // migrate repro-cold-boot.sh onto clonePort.mjs and the carve-out keeps "exempting" a script
+    // that would now pass on its own. Same rule the EXEMPT ledgers elsewhere carry — an exemption
+    // must currently be load-bearing or it is decoration.
+    const useless = [...DERIVATION_EXEMPT]
+      .filter((rel) => /clonePort|editorPorts/.test(read(rel)))
+      .sort();
+    expect(useless, 'These DERIVATION_EXEMPT rows name scripts that now DO derive their port. '
+      + 'Delete them — the carve-out is vouching for nothing, and would silently excuse the script '
+      + 'if it ever stopped deriving again.').toEqual([]);
+    // And the row must still name a real spawner, or it is excusing a file nothing checks.
+    const orphaned = [...DERIVATION_EXEMPT].filter((rel) => !SPAWNERS.includes(rel)).sort();
+    expect(orphaned, 'These DERIVATION_EXEMPT rows are not in SPAWNERS, so nothing they excuse is '
+      + 'ever tested.').toEqual([]);
   });
 
   for (const rel of SPAWNERS) {
@@ -99,10 +172,19 @@ describe.skipIf(skip)('every harness that SPAWNS the packaged app pins a per-clo
     });
 
     it(`${rel} derives that port per clone rather than hardcoding one`, () => {
+      // ⚠️ **This marker used to be `/clonePort/` alone, and that was too narrow (#830).** There
+      // are TWO sanctioned derivations, and root CLAUDE.md names the other one as the primary:
+      // "Every launch path derives the backend port from the CLONE DIRECTORY
+      // (engine/scripts/editorPorts.mjs, the one authored table)". `launch-editor.sh:84` and
+      // `test-packaged.sh` both derive correctly through `editorPorts.mjs` and were invisible to
+      // the old guard — it simply never scanned them, so the narrowness never showed. Widening
+      // the SPAWNER list is what exposed it: a marker is only tested by the population it meets.
+      const derives = /clonePort|editorPorts/.test(read(rel));
       expect(
-        /clonePort/.test(read(rel)),
-        `${rel} must derive its port from clonePort.mjs (#20/#69 — the ONE implementation), not pick `
-        + 'a constant: two clones running this at once would otherwise collide.',
+        derives || DERIVATION_EXEMPT.has(rel),
+        `${rel} must derive its port from clonePort.mjs or editorPorts.mjs (#20/#69/#349 — the `
+        + 'sanctioned implementations), not pick a constant: two clones running this at once '
+        + 'would otherwise collide.',
       ).toBe(true);
     });
   }

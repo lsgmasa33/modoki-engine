@@ -468,13 +468,28 @@ class SceneManagerImpl implements SceneManager {
       let data: SceneData;
       if (opts.preloaded) {
         // F3: treat `preloaded` as caller-owned + read-only. The per-scene resource
-        // pipeline below (step 6) mutates `resources`/`version` in place, so
-        // shallow-clone first — otherwise the dev-server / agent-bridge caller that
-        // holds onto the same parsed object after this call gets a silently
-        // rewritten `resources` (the full transitive prefab walk, not what it
-        // passed) and a bumped `version`. A shallow clone is enough: only
-        // top-level fields are overwritten (whole-array / scalar replacement, not
-        // deep edits), and the migration chain likewise reassigns whole fields.
+        // pipeline below (step 6) rewrites `resources` in place, and the migration
+        // ladder in step 9 bumps `version`, so shallow-clone first — otherwise the
+        // dev-server / agent-bridge caller that holds onto the same parsed object
+        // after this call gets a silently rewritten `resources` (the full transitive
+        // prefab walk, not what it passed) and a bumped `version`.
+        // ⚠️ The shallow clone protects the TOP LEVEL ONLY, and this comment used to
+        // claim more than that ("the migration chain likewise reassigns whole
+        // fields"). That is false: `migrateSceneData` does `delete styleObj[f]` and
+        // `delete entry.traits.Transform`, and `migrateV4toV5` does
+        // `Object.assign(el, src)` — deep edits on the very entry objects a shallow
+        // clone SHARES with the caller. #807 widened the exposure by making those
+        // rungs reachable through here at all (they were skipped while
+        // `collectSceneResourceRefs` stamped the version to 6 first).
+        // Latent, not live: all FIVE production `preloaded` callers were checked —
+        // `agentBridge` passes a freshly-parsed object, `applyPrefabUndo` passes a
+        // `clone(scene)`, and `timelinePreview`/`playMode`/`prefabEdit` all build
+        // theirs at `SCENE_FORMAT_VERSION` (the latter two via `serializeScene`), so
+        // no ladder rung runs on a caller-owned document today. A caller that ever
+        // passes a genuinely pre-v6 object it intends to keep needs a deep clone,
+        // not this one. Enumerate with
+        // `grep -rn "preloaded:" --include='*.ts' engine/` before trusting this list —
+        // it said "four" once and `playMode.ts` was the one it missed.
         data = { ...opts.preloaded };
       } else {
         // assetUrl() is a no-op in dev/native (BASE_URL '/'), prefixes for sub-path web
@@ -612,14 +627,19 @@ class SceneManagerImpl implements SceneManager {
       const preparedSceneData = new Map<string, SceneData>();
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
-        // Classify HERE, before `collectSceneResourceRefs` — its own tail
-        // (`sceneData.version = Math.max(sceneData.version ?? 6, 6)`) numerically
-        // coerces the raw version (a string like "5", a float, `null`) into a valid
-        // number, so by the time `loadSceneFile`'s own guard runs (further below,
-        // on the ALREADY-mutated object) a too-new/unreadable scene has already been
-        // laundered into `ok`. `SceneManager` is the only non-test caller of
-        // `loadSceneFile`, so without this the `unreadable` half of the guard is
-        // dead in production (#784 phase C adversarial review, finding 1).
+        // Classify HERE, before `collectSceneResourceRefs`, for ONE reason: it must
+        // refuse a too-new/unreadable scene before that method acquires its
+        // resources — walking and fetching the whole transitive prefab chain — and
+        // before entities are spawned for a scene that is going to be refused
+        // anyway (#784 phase C adversarial review, finding 1).
+        // ⚠️ NOT because it must precede `loadSceneFile`'s ladder or its two
+        // unconditional mutators (`assignSyntheticEntityIds` /
+        // `stripLegacyCameraFrameShowGizmo`). That reason was written here and is
+        // FALSE: all three live inside `loadSceneFile`, whose own
+        // `classifyFormatVersion` runs ahead of them for every caller, so deleting
+        // this early classify would still refuse the scene before any of them
+        // touched it. Stated so the next reader does not check the cited hazard,
+        // find it does not exist, and delete this call as cargo cult.
         // `loadSceneFile`'s own classification stays in place as the backstop for
         // every other caller (tests, tools, future direct callers) — both route
         // through the same `classifyFormatVersion` and the same
@@ -1236,7 +1256,8 @@ class SceneManagerImpl implements SceneManager {
    *  manifest may be missing entries like HDRs added after first
    *  serialization), pull in timeline-referenced audio/prefab refs, then
    *  iteratively walk prefabs (fetched + cached under `sceneId`) for THEIR OWN
-   *  nested resources. Mutates `sceneData.resources`/`.version` in place.
+   *  nested resources. Mutates `sceneData.resources` in place (and, since #807,
+   *  nothing else — it no longer touches `.version`).
    *
    *  Does NOT acquire anything — that's a separate pass in the caller so every
    *  toLoad scene's total is known before the first onProgress call. Without
@@ -1320,17 +1341,21 @@ class SceneManagerImpl implements SceneManager {
     }
 
     // Persist the merged manifest back onto the scene data so downstream code
-    // (the respawn call above, telemetry) sees the full picture.
+    // (the respawn call above, telemetry) sees the full picture. This is the
+    // real fact worth recording — "this scene now has a resources manifest" —
+    // and it belongs in `resources`, not `version`: a format version is a DATA
+    // FORMAT fact, not a place to note that a manifest was collected. Deleted the
+    // `sceneData.version = Math.max(sceneData.version ?? 6, 6)` raise that used to
+    // sit here (#807) — it ran before `loadSceneFile`'s migration ladder on this
+    // same object, so a v3/v4/v5 scene got stamped straight to 6 and the
+    // `migrateSceneData`/`migrateV4toV5`/`migrateV5toV6` rungs became no-ops.
+    // Safe to delete outright: `migrateV5toV6` only synthesizes `resources` when
+    // `!data.resources`, and `allRefs` is already assigned above, so removing the
+    // raise costs that rung nothing; the numeric-coercion half it also
+    // incidentally provided is handled upstream by `classifyFormatVersion`
+    // (`loadScene`'s caller loop, above) refusing `too-new`/`unreadable` before
+    // this method ever runs.
     sceneData.resources = allRefs;
-    // ⚠️ This numerically COERCES a non-numeric `version` (a string, a float, `null`)
-    // into a valid number, and RAISES an older numeric one to 6 — either would launder
-    // a too-new/unreadable scene into `ok` for any classifier running after this point.
-    // That is why scene format classification happens in `loadScene`'s caller loop
-    // (above, before this method is ever invoked), not here or downstream of here.
-    // Left as-is rather than fixed in this pass: raising an older version also skips
-    // the v3→v6 migration rungs for a genuinely old scene — a separate pre-existing
-    // defect, filed rather than folded into an unreviewed change here.
-    sceneData.version = Math.max(sceneData.version ?? 6, 6);
     return allRefs;
   }
 

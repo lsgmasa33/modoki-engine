@@ -64,13 +64,13 @@ export function AnimSetAssetView({ path }: { path: string }) {
         <div key={clip.name + i} style={{ borderTop: '1px solid #333', paddingTop: 6, marginTop: 6 }}>
           <div style={{ color: '#ddd', fontSize: '11px', fontWeight: 'bold', marginBottom: 2 }}>{clip.name}</div>
           <NumberField label="Speed" value={clip.speed ?? 1} step={0.1} wide
-            onChange={v => writeClipField(i, 'speed', v)} />
+            onChange={v => writeClipField(i, 'speed', v)} dataUiId={`assetView.animSet.clip.${i}.speed`} />
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
             <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Loop</span>
             <input type="checkbox" checked={clip.loop ?? true} onChange={e => writeClipField(i, 'loop', e.target.checked)} />
           </div>
           <NumberField label="Fade Duration" value={clip.fadeDuration ?? 0} step={0.05} wide
-            onChange={v => writeClipField(i, 'fadeDuration', Math.max(0, v))} />
+            onChange={v => writeClipField(i, 'fadeDuration', Math.max(0, v))} dataUiId={`assetView.animSet.clip.${i}.fadeDuration`} />
         </div>
       ))}
     </>

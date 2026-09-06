@@ -23,6 +23,8 @@ import path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 
 const REPO = path.join(__dirname, '../..');
 
@@ -137,6 +139,36 @@ describe('backend route coverage', () => {
     for (const rel of ROUTE_FILES) {
       expect(fs.existsSync(path.join(REPO, rel)), `${rel} is gone — repoint ROUTE_FILES`).toBe(true);
     }
+  });
+
+  it('ROUTE_FILES covers every file that dispatches on /api/ (#830)', () => {
+    // ⚠️ The comment on ROUTE_FILES says "Pinned rather than globbed: a NEW router file should
+    // fail this list loudly instead of having its routes silently escape the audit." The only
+    // check was the `existsSync` loop above — which detects a REMOVED router and never an ADDED
+    // one. That is the direction that matters, and this is the assertion that makes the comment
+    // true. `getOkFalseGuard.test.ts` had the same list, three entries shorter, and nothing
+    // compared the two.
+    assertDeclaredListIsComplete({
+      label: 'ROUTE_FILES in routeCoverage.test.ts',
+      declared: ROUTE_FILES,
+      // A DISPATCHER compares a request path against `/api/…`; ~35 files under engine/ merely
+      // mention such a literal and are clients.
+      population: repoFiles({ under: 'engine', match: /\.(ts|mjs)$/, floor: 100 })
+        .map(({ rel }) => rel)
+        .filter((rel) => !/\/tests?\//.test(rel))
+        .filter((rel) => /(===|==|startsWith\()\s*'\/api\//
+          .test(readScannedSource(path.join(REPO, '..', rel)).code))
+        .map((rel) => rel.replace(/^engine\//, '')),
+      floor: 5,
+      extraDeclared: [{
+        item: 'electron/devServer.ts',
+        reason: 'Not a dispatcher — it CALLS one route (`http.get(new URL(IDENTITY_PATH, url))`, '
+          + ':276) and owns the `/api/dev-server-identity` constant this catalogue needs. Listed '
+          + 'deliberately; the marker is right to miss it.',
+      }],
+      fix: 'A new /api/* router must be listed in ROUTE_FILES, or its routes escape the '
+        + 'agent-reachability audit entirely.',
+    });
   });
 
   it('the scan finds a realistic number of routes (guards against a regex that matches nothing)', () => {

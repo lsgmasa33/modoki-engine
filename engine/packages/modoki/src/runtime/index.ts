@@ -647,6 +647,14 @@ export { rotate3DSystem } from './rendering/rotate3DSystem';
 export { materialInstanceSystem, resetMaterialInstanceClocks } from './rendering/materialInstanceSystem';
 export { resetMaterialInstanceClones } from './rendering/materialInstanceClones';
 export { animationSystem } from './animation/animationSystem';
+// #731: parseAnimClipBankResult (the safe variant that tells "no bank" apart from "malformed
+// bank") was reachable only via a deep relative import within this package — no consumer outside
+// it (a game, the app shell) could reach it at all. Exported beside its plain delegate, same shape
+// as audio/clipBank's pair above.
+export {
+  parseAnimClipBank, parseAnimClipBankResult, stringifyAnimClipBank,
+  type AnimatorClip, type AnimClipBankResult,
+} from './animation/animClipBank';
 export { spriteAnimationSystem } from './animation/spriteAnimationSystem';
 export { skin2DSystem } from './skinning/skin2DSystem';
 export {
@@ -716,7 +724,10 @@ export {
   type CacheEntry, type AdmissionResult,
 } from './video/videoCachePolicy';
 export { cueSound, cueClip, drainAudioCues, clearAudioCues, type AudioCue } from './audio/audioCues';
-export { parseClipBank, stringifyClipBank, clipRefForKey, type ClipBankEntry } from './audio/clipBank';
+export {
+  parseClipBank, parseClipBankResult, stringifyClipBank, clipRefForKey,
+  type ClipBankEntry, type ClipBankResult,
+} from './audio/clipBank';
 export { getAudioContext, hasAudioSupport, disposeAudioContext } from './audio/audioContext';
 export {
   acquireAudio, releaseAudioForScene, disposeAllAudioBuffers, getCachedAudioBuffer, resolveAudioUrl,

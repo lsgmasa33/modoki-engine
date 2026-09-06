@@ -73,9 +73,21 @@ const MAX_ERRORS_PER_SESSION = 100;
 const MAX_WARNS_PER_SESSION = 100;
 const MAX_BREADCRUMBS_PER_SESSION = 500;
 /** Burst ceiling, for the flood that DEFEATS dedupe by varying its text (an entity id in the
- *  message). Sliding window, deliberately coarse. */
+ *  message). Sliding window, deliberately coarse.
+ *
+ *  ⚠️ `engine/index.html`'s fatal-load guard has its OWN `EARLY_ERROR_CAP`, bounding how many
+ *  pre-install errors `drainEarlyErrors` (below) can feed through THIS SAME limiter in one
+ *  synchronous burst — it must stay AT MOST this value `-2` (currently exactly `-2`, i.e. NO
+ *  slack: `EARLY_ERROR_CAP` is 28, this is 30), where the 2 reserved slots are a `[reload]`
+ *  breadcrumb that can spend one first, plus the drain's own "dropped" breadcrumb, which needs
+ *  the other or the cap that is supposed to make drops honest gets silently refused itself. That
+ *  file is a plain inline `<script>` and cannot import this constant, so raising this one without
+ *  lowering it there — or without re-deriving the margin — reopens #636's silent-drop bug.
+ *  `earlyErrorBuffer.test.ts` asserts the `-2` relationship against this exported value directly
+ *  (#682 close-out round 3, MEDIUM 3) — a HAND-KEPT margin with nothing checking it is exactly how
+ *  `EARLY_ERROR_CAP` drifted to 32 (2 OVER the headroom, not under it) in the first place. */
 const BURST_WINDOW_MS = 5000;
-const MAX_PER_BURST_WINDOW = 30;
+export const MAX_PER_BURST_WINDOW = 30;
 /** How many DISTINCT message texts the dedupe table remembers before starting a new generation.
  *  It is a bound on memory, not on sending — see the note in `allow()`. */
 const MAX_DISTINCT_TRACKED = 500;
@@ -409,6 +421,82 @@ export function reportReactError(error: unknown, componentStack?: string | null)
   captureToCrashlytics('error', `[react] ${describe(error)}${stack}`);
 }
 
+/** Shape published by the fatal-load guard's early-error buffer in engine/index.html (#636). */
+interface EarlyErrorEntry {
+  kind: 'error' | 'unhandledrejection';
+  error?: unknown;
+  message?: string;
+  filename?: string;
+  lineno?: number;
+  colno?: number;
+  reason?: unknown;
+  ts?: number;
+}
+interface EarlyErrorState {
+  entries: EarlyErrorEntry[];
+  done: boolean;
+  dropped: number;
+}
+
+/**
+ * Drain the fatal-load guard's pre-install error buffer (#636) — the mirror of #633's
+ * `drainEarlyConsole` (`consoleRing.ts`), for the OTHER inline script in `engine/index.html`: the
+ * fatal-load guard, which registers `window` `error`/`unhandledrejection` listeners at HTML-parse
+ * time, before rolldown's bundled entry chunk has run a single static import (see that guard's own
+ * header comment for the measured byte offsets this covers) — but only for a boot that reaches
+ * THIS function at all; a boot that never does leaves the buffer undrained, which is #825.
+ *
+ * ⚠️ Claim the carried error/reason object BEFORE reporting — the same protocol the live listener
+ * below uses (`alreadyReported.add` before `captureToCrashlytics`), and for the same reason: it is
+ * what stops one fault from becoming a second Crashlytics issue when Capacitor's bridge or React's
+ * boundary later re-logs the same object through `console.error`.
+ *
+ * Reports go straight through `captureToCrashlytics`, never `captureConsoleError` — that path only
+ * dedupes a LONE `Error` argument (`args.length === 1 && args[0] instanceof Error`), and a replayed
+ * uncaught error was never a console call.
+ *
+ * Single-drain and a SEPARATE buffer from the console ring's `__MODOKI_EARLY_CONSOLE__` — the two
+ * do not interact, and this must not touch `drainEarlyConsole`.
+ */
+function drainEarlyErrors(): void {
+  const early = (globalThis as { __MODOKI_EARLY_ERRORS__?: EarlyErrorState }).__MODOKI_EARLY_ERRORS__;
+  if (!early || early.done) return;
+  early.done = true;
+  const pending = early.entries;
+  early.entries = [];
+  for (const it of pending) {
+    // Per-entry try/catch, same reasoning as drainEarlyConsole's loop: `describe()` already guards
+    // against a hostile value, but this runs unconditionally at install time and one bad buffered
+    // entry must not take the rest of the drain — or boot — down with it.
+    try {
+      // `it.ts` is the guard's own `performance.now()` at the moment THIS entry was captured —
+      // often long before the drain itself runs (install can happen well after boot; see this
+      // function's header). `captureToCrashlytics` carries no separate timestamp field to feed, so
+      // (unlike `consoleRing.ts`'s `drainEarlyConsole`, which threads its buffered `mono` through
+      // the RING's own `mono` field) the only place to put it is the message text itself — without
+      // it every early fault reads as having happened "now", at drain time, which is exactly the
+      // moment it did NOT happen.
+      const when = typeof it.ts === 'number' && Number.isFinite(it.ts) ? ` (t=${Math.round(it.ts)}ms)` : '';
+      if (it.kind === 'unhandledrejection') {
+        if (it.reason !== null && typeof it.reason === 'object') alreadyReported.add(it.reason as object);
+        captureToCrashlytics('error', `[unhandledrejection-early] ${describe(it.reason)}${when}`);
+      } else {
+        const where = it.filename ? ` (${it.filename}:${it.lineno}:${it.colno})` : '';
+        if (it.error !== null && typeof it.error === 'object') alreadyReported.add(it.error as object);
+        const msg = it.error !== undefined && it.error !== null ? describe(it.error) : describe(it.message);
+        captureToCrashlytics('error', `[uncaught-early] ${msg}${where}${when}`);
+      }
+    } catch {
+      /* never let one unreportable buffered entry break the rest of the drain */
+    }
+  }
+  if (early.dropped > 0) {
+    try {
+      captureToCrashlytics('breadcrumb', `[modoki] ${early.dropped} pre-install error event(s) dropped (early buffer cap)`);
+    } catch { /* same reasoning as the loop above */ }
+  }
+}
+
 /**
  * True when THIS boot is a same-origin reload rather than a fresh navigation.
  *
@@ -483,6 +571,10 @@ export function installGlobalErrorHandlers(): void {
         } catch { /* ignore */ }
       });
     }
+
+    // Drain the fatal-load guard's pre-install buffer AFTER the listeners above are registered, so
+    // anything thrown while draining is itself covered by them.
+    drainEarlyErrors();
 
     if (typeof console !== 'undefined') {
       const realError = console.error.bind(console);

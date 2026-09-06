@@ -168,16 +168,26 @@ function str(x: unknown, fallback = ''): string {
 }
 
 const TRS_FIELDS = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
-/** Sanitize a control-clip prefab transform override: keep only finite numeric TRS fields; return
- *  undefined when nothing valid remains (so an empty/absent override is simply omitted). */
+/** Sanitize a control-clip prefab transform override: of the nine TRS fields it OWNS, keep only
+ *  the finite numeric ones and drop the rest; every other key is a passenger and is carried
+ *  through unchanged (#821). Returns undefined only when the result would be an empty object —
+ *  a genuinely empty/absent override — never merely because every TRS field failed validation,
+ *  since a surviving unknown key must not be destroyed along with them. */
 function normalizeControlTransform(t: unknown): ControlClipBlock['transform'] | undefined {
   if (!t || typeof t !== 'object') return undefined;
   const src = t as Record<string, unknown>;
-  const out: Record<string, number> = {};
+  // Carry unknown keys through (#821) — this function only OWNS the nine TRS fields
+  // (it validates/coerces those); anything else is a passenger. A TRS field is deleted
+  // rather than resurrected when it fails validation, matching "nothing valid remains".
+  const out: Record<string, unknown> = { ...src };
   for (const k of TRS_FIELDS) {
-    if (typeof src[k] === 'number' && Number.isFinite(src[k])) out[k] = src[k] as number;
+    if (typeof src[k] === 'number' && Number.isFinite(src[k])) {
+      out[k] = src[k] as number;
+    } else {
+      delete out[k];
+    }
   }
-  return Object.keys(out).length ? out : undefined;
+  return Object.keys(out).length ? (out as ControlClipBlock['transform']) : undefined;
 }
 
 /** The audio-cue clip refs (GUIDs) a timeline references — the ONLY transitively-owned
@@ -217,7 +227,14 @@ export function collectTimelineVideoRefs(def: TimelineDef): string[] {
 /** Normalize one track by kind: fill defaults, drop malformed entries, sort by time.
  *  An unknown/invalid `type` yields null (dropped by the caller). */
 function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | null {
-  const base = { id: str(tr.id), name: str((tr as TrackBase).name, 'Track'), target: str((tr as TrackBase).target), muted: (tr as TrackBase).muted === true };
+  // Strip the keys this function OWNS before spreading — `type` and every kind's own
+  // payload array (`clips`/`markers`/`cues`/`spans`) — so a track re-typed (or authored
+  // with a leftover field from another kind) does not carry a FOREIGN kind's payload
+  // through `base`; every branch below sets its own `type` and array field explicitly.
+  // A genuinely unknown track-level key is not one of these and still passes through.
+  const { type: _type, clips: _clips, markers: _markers, cues: _cues, spans: _spans, ...rest } =
+    tr as Partial<TrackDef> & { type?: string; clips?: unknown; markers?: unknown; cues?: unknown; spans?: unknown };
+  const base = { ...rest, id: str(tr.id), name: str((tr as TrackBase).name, 'Track'), target: str((tr as TrackBase).target), muted: (tr as TrackBase).muted === true };
   switch (tr.type) {
     case 'animation': {
       const clips = Array.isArray((tr as AnimationTrackDef).clips) ? (tr as AnimationTrackDef).clips : [];
@@ -225,7 +242,7 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
         ...base, type: 'animation',
         clips: clips
           .filter((c) => c && typeof c.clip === 'string' && c.clip.length > 0)
-          .map((c) => ({ start: num(c.start, 0), duration: c.duration === undefined ? undefined : num(c.duration, 0), clip: c.clip, scrub: c.scrub !== false }))
+          .map((c) => ({ ...c, start: num(c.start, 0), duration: c.duration === undefined ? undefined : num(c.duration, 0), clip: c.clip, scrub: c.scrub !== false }))
           .sort((a, b) => a.start - b.start),
       };
     }
@@ -235,7 +252,7 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
         ...base, type: 'signal',
         markers: markers
           .filter((m) => m && typeof m.action === 'string' && m.action.length > 0)
-          .map((m) => ({ t: num(m.t, 0), action: m.action, params: m.params && typeof m.params === 'object' ? m.params : undefined }))
+          .map((m) => ({ ...m, t: num(m.t, 0), action: m.action, params: m.params && typeof m.params === 'object' ? m.params : undefined }))
           .sort((a, b) => a.t - b.t),
       };
     }
@@ -245,7 +262,7 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
         ...base, type: 'audio',
         cues: cues
           .filter((c) => c && typeof c.clip === 'string' && c.clip.length > 0)
-          .map((c) => ({ t: num(c.t, 0), clip: c.clip, bus: c.bus, volume: c.volume === undefined ? undefined : num(c.volume, 1), pitch: c.pitch === undefined ? undefined : num(c.pitch, 1) }))
+          .map((c) => ({ ...c, t: num(c.t, 0), clip: c.clip, bus: c.bus, volume: c.volume === undefined ? undefined : num(c.volume, 1), pitch: c.pitch === undefined ? undefined : num(c.pitch, 1) }))
           .sort((a, b) => a.t - b.t),
       };
     }
@@ -255,7 +272,7 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
         ...base, type: 'activation',
         spans: spans
           .filter((s) => s && (typeof s.start === 'number' || typeof s.end === 'number'))
-          .map((s) => ({ start: num(s.start, 0), end: num(s.end, 0) }))
+          .map((s) => ({ ...s, start: num(s.start, 0), end: num(s.end, 0) }))
           .filter((s) => s.end > s.start)
           .sort((a, b) => a.start - b.start),
       };
@@ -266,7 +283,7 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
         ...base, type: 'video',
         clips: clips
           .filter((c) => c && typeof c.clip === 'string' && c.clip.length > 0)
-          .map((c) => ({ start: num(c.start, 0), duration: c.duration === undefined ? undefined : num(c.duration, 0), clip: c.clip }))
+          .map((c) => ({ ...c, start: num(c.start, 0), duration: c.duration === undefined ? undefined : num(c.duration, 0), clip: c.clip }))
           .sort((a, b) => a.start - b.start),
       };
     }
@@ -282,13 +299,21 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
             const start = num(c.start, 0);
             const duration = c.duration === undefined ? undefined : num(c.duration, 0);
             const hasPrefab = typeof c.prefab === 'string' && c.prefab.length > 0;
+            // Carry unknown keys through (#821) — but ONLY keys this function does not
+            // own. These six are re-decided right below, so a blanket `...c` would
+            // resurrect exactly what the normalizer just decided to discard: the
+            // precedence rule deliberately DROPS the losing discriminants (an
+            // over-specified clip must come out as prefab-only, not prefab+particle),
+            // and `transform` is omitted precisely when it FAILED normalization.
+            const { start: _start, duration: _duration, prefab: _prefab, particle: _particle,
+                    subdirector: _subdirector, transform: _transform, ...rest } = c;
             // Precedence when over-specified: prefab > particle > subdirector (deterministic).
             if (hasPrefab) {
               const transform = normalizeControlTransform(c.transform);
-              return transform ? { start, duration, prefab: c.prefab, transform } : { start, duration, prefab: c.prefab };
+              return transform ? { ...rest, start, duration, prefab: c.prefab, transform } : { ...rest, start, duration, prefab: c.prefab };
             }
-            if (c.particle === true) return { start, duration, particle: true };
-            return { start, duration, subdirector: true };
+            if (c.particle === true) return { ...rest, start, duration, particle: true };
+            return { ...rest, start, duration, subdirector: true };
           })
           .sort((a, b) => a.start - b.start),
       };

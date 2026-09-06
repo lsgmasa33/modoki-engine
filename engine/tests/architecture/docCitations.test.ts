@@ -244,10 +244,12 @@ function docRootsFor(relFile: string): string[] {
 
 /** True only where the FULL `docs/` tree is present.
  *
- *  The OSS snapshot trims docs as well as games: `docs/plans/`, `docs/reviews/`, and the three
- *  private top-level docs (`todo`, `doc-conventions`, `engine-oss-publishing`, `devices`,
- *  `apple-signing`, `projects`, `model-routing` — seven, and the list grows) are all dropped by
- *  publish-engine-oss.sh. A shipped doc citing `docs/todo.md` is therefore CORRECT here and
+ *  The OSS snapshot trims docs as well as games: `docs/plans/`, `docs/reviews/` and the private
+ *  top-level docs are all dropped by publish-engine-oss.sh, whose `grep -vE` chain is the
+ *  authoritative list. ⚠️ **Deliberately not enumerated or counted here (#758)** — this sentence
+ *  used to open "the three private top-level docs" and then name seven, which is what a
+ *  hand-copied count does. `engine/tests/assets/publishExclusions.test.ts` asserts the real list;
+ *  a pointer cannot rot. A shipped doc citing `docs/todo.md` is therefore CORRECT here and
  *  unresolvable there — measured: the snapshot flagged exactly that, from five call sites.
  *
  *  Gated on the docs tree rather than on project presence deliberately. Both happen to be false in
@@ -908,9 +910,9 @@ describe('cited doc paths resolve (#194)', () => {
       return;
     }
     // ⚠️ GATED, and the gate is load-bearing — the sibling absorbedByPaths test learned this the
-    // expensive way. publish-engine-oss.sh strips `docs/{plans,reviews}/`, seven private top-level
-    // docs (todo, doc-conventions, engine-oss-publishing, devices, apple-signing, projects,
-    // model-routing) and all of `games/`. Measured against that trim list: 59 links in files that
+    // expensive way. publish-engine-oss.sh strips `docs/{plans,reviews}/`, the private top-level
+    // docs (its own `grep -vE` chain is the list — not copied here, see the docblock) and all of
+    // `games/`. Measured against that trim list: 59 links in files that
     // SURVIVE the snapshot point at targets that do not, so ungated this would fail
     // oss-ci-snapshot.yml on every push to main. Those 59 are a real publishing concern — a public
     // reader follows them into a 404 — but that belongs to the publish scanner, not here.

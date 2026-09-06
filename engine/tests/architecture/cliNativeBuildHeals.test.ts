@@ -32,64 +32,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
 const assetScanner = path.join(repoRoot, 'engine', 'plugins', 'vite-asset-scanner.ts');
 
-/** Strip `//…` line comments and `/*…*\/` block comments from `src`, without touching
- *  comment-LOOKING text inside a string/template literal (both subject files contain
- *  `https://` URLs in strings, which a naive regex would truncate mid-line). Tracks
- *  single/double/backtick string state and treats a backslash as escaping the next character, so
- *  a quote-in-a-string doesn't end it early. Not a full JS parser — it only has to survive real
- *  source, not arbitrary JS.
- *
- *  Why this exists (#685 FIX 5): the two describe blocks below locate a call by the first
- *  TEXTUAL occurrence of its name (`src.indexOf('verifyInstalledMatchesTarball(')`). A doc-comment
- *  MENTION of that name — placed after the real block, with the actual call moved inside it —
- *  would satisfy every position-based assertion below while the mechanism itself is unreachable;
- *  a mention placed before the guarding `if` would conversely turn a correct file red. Stripping
- *  comments before locating anything closes both holes. */
-function stripComments(src: string): string {
-  let out = '';
-  let i = 0;
-  const n = src.length;
-  while (i < n) {
-    const c = src[i];
-    const c2 = src[i + 1];
-    if (c === '"' || c === "'" || c === '`') {
-      const quote = c;
-      out += c;
-      i++;
-      while (i < n && src[i] !== quote) {
-        if (src[i] === '\\' && i + 1 < n) { out += src[i] + src[i + 1]; i += 2; continue; }
-        out += src[i];
-        i++;
-      }
-      if (i < n) { out += src[i]; i++; } // closing quote
-      continue;
-    }
-    if (c === '/' && c2 === '/') {
-      while (i < n && src[i] !== '\n') i++; // drop through to the newline, which is kept below
-      continue;
-    }
-    if (c === '/' && c2 === '*') {
-      i += 2;
-      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
-        if (src[i] === '\n') out += '\n'; // keep newlines so nearby line-based reasoning survives
-        i++;
-      }
-      i += 2; // skip the closing */
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
-}
-
 describe('build-web.mjs heals the native project on --target native (#148, #150)', () => {
-  const src = fs.readFileSync(buildWeb, 'utf8');
+  const src = readScannedSource(buildWeb).code;
 
   it('imports the generalized engine-plugin loader', () => {
     expect(src).toMatch(/import\s*\{[^}]*loadEnginePluginModule[^}]*\}\s*from\s*'\.\/loadVendorPlugins\.mjs'/);
@@ -165,9 +115,9 @@ describe('build-web.mjs heals the native project on --target native (#148, #150)
 // UNCONDITIONALLY — structurally, by matching braces, not merely "the string appears somewhere"
 // (a naive `toContain` would still pass with the call nested inside the `if`).
 describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALLY, not gated on step 4 (#685)', () => {
-  // Comments stripped (#685 FIX 5) — see stripComments' own header for why a doc-comment mention
-  // of the call name would otherwise fool the position-based assertions below.
-  const src = stripComments(fs.readFileSync(buildWeb, 'utf8'));
+  // Comments stripped (#685 FIX 5), through the shared scanner (#812) — a doc-comment mention of
+  // the call name would otherwise fool the position-based assertions below.
+  const src = readScannedSource(buildWeb).code;
 
   /** Index of the `}` that closes the brace opened at `openBraceIdx` (which must itself be `{`). */
   function matchingBraceEnd(text: string, openBraceIdx: number): number {
@@ -189,8 +139,11 @@ describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALL
   const blockStart = src.indexOf('if (vendorMod) {');
   const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
 
-  it('calls verifyInstalledMatchesTarball', () => {
-    expect(src).toContain('verifyInstalledMatchesTarball(');
+  it('calls verifyInstalledMatchesTarballResult', () => {
+    // #731: switched from the plain verifyInstalledMatchesTarball to the Result variant so this
+    // step can tell "no problems" apart from "could not even read package.json" and warn instead
+    // of reporting the check as clean.
+    expect(src).toContain('verifyInstalledMatchesTarballResult(');
   });
 
   it('the call sits AFTER step 4\'s `if (depsChanged || v?.needsInstall)` block closes, not inside it', () => {
@@ -200,13 +153,23 @@ describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALL
     expect(openBrace).toBeGreaterThan(-1);
     const closeBrace = matchingBraceEnd(src, openBrace);
 
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
     expect(verifyIdx).toBeGreaterThan(-1);
     expect(verifyIdx).toBeGreaterThan(closeBrace);
   });
 
+  it('warns (does not throw) when package.json could not be read (#731)', () => {
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
+    expect(blockStart).toBeGreaterThan(-1);
+    expect(verifyIdx).toBeGreaterThan(blockStart);
+    expect(verifyIdx).toBeLessThan(blockEnd);
+    const nextChunk = src.slice(verifyIdx, blockEnd);
+    expect(nextChunk).toMatch(/unreadable-package-json/);
+    expect(nextChunk).toMatch(/console\.warn/);
+  });
+
   it('throws (does not merely log), documents the SAFE remedy, and never auto-repairs', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
     expect(blockStart).toBeGreaterThan(-1);
     expect(verifyIdx).toBeGreaterThan(blockStart);
     expect(verifyIdx).toBeLessThan(blockEnd);
@@ -254,9 +217,9 @@ describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALL
 // Build menu is the CANONICAL path (root CLAUDE.md), so a CLI-only guard protects the path
 // fewer humans use. This pins both.
 describe('the editor /api/build runs the same #685 check as the CLI, unconditionally', () => {
-  // Comments stripped (#685 FIX 5) — see stripComments' own header for why a doc-comment mention
-  // of the call name would otherwise fool the position-based assertions below.
-  const src = stripComments(fs.readFileSync(assetScanner, 'utf8'));
+  // Comments stripped (#685 FIX 5), through the shared scanner (#812) — a doc-comment mention of
+  // the call name would otherwise fool the position-based assertions below.
+  const src = readScannedSource(assetScanner).code;
 
   function matchingBraceEnd(text: string, openBraceIdx: number): number {
     let depth = 0;
@@ -273,9 +236,11 @@ describe('the editor /api/build runs the same #685 check as the CLI, uncondition
   const blockStart = src.indexOf('if (stale.length)');
   const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
 
-  it('imports and calls verifyInstalledMatchesTarball', () => {
-    expect(src).toMatch(/import\s*\{[^}]*verifyInstalledMatchesTarball[^}]*\}\s*from\s*'\.\/vendorPlugins'/);
-    expect(src).toContain('verifyInstalledMatchesTarball(');
+  it('imports and calls verifyInstalledMatchesTarballResult', () => {
+    // #731: switched from the plain verifyInstalledMatchesTarball to the Result variant — see the
+    // build-web.mjs describe block above for the same change on the CLI side.
+    expect(src).toMatch(/import\s*\{[^}]*verifyInstalledMatchesTarballResult[^}]*\}\s*from\s*'\.\/vendorPlugins'/);
+    expect(src).toContain('verifyInstalledMatchesTarballResult(');
   });
 
   it("the call sits AFTER the install `if (depHeal.changed || v.needsInstall)` block closes, not inside it", () => {
@@ -283,13 +248,22 @@ describe('the editor /api/build runs the same #685 check as the CLI, uncondition
     expect(ifIdx).toBeGreaterThan(-1);
     const openBrace = src.indexOf('{', ifIdx);
     const closeBrace = matchingBraceEnd(src, openBrace);
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
     expect(verifyIdx).toBeGreaterThan(-1);
     expect(verifyIdx).toBeGreaterThan(closeBrace);
   });
 
+  it('sends a warning (does not fail the build) when package.json could not be read (#731)', () => {
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
+    expect(verifyIdx).toBeGreaterThan(-1);
+    expect(blockStart).toBeGreaterThan(-1);
+    const chunk = src.slice(verifyIdx, blockStart);
+    expect(chunk).toMatch(/unreadable-package-json/);
+    expect(chunk).toMatch(/send\(/);
+  });
+
   it('fails the build on a problem, documents the SAFE remedy, and never auto-repairs', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
+    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
     expect(blockStart).toBeGreaterThan(-1);
     // Here the call sits BEFORE its own `if (stale.length) { … }` — unlike the build-web.mjs
     // block above, whose call is nested inside `if (vendorMod) { … }`.
@@ -321,8 +295,76 @@ describe('the editor /api/build runs the same #685 check as the CLI, uncondition
   });
 });
 
+// ── #731 equivalence, take 2. The previous version of this block proved the two call sites' own
+// STRING LITERALS matched byte for byte (`eval`-ing each extracted argument expression) — a
+// text-extraction guard that (a) still passed when the `if` guarding either call was defeated
+// (e.g. `if (false && verifyReason === 'unreadable-package-json')` — condition and message both
+// intact, still finds and evals the same literal), (b) broke on an unbounded forward `indexOf`
+// latching onto an unrelated later call of the same name if the real one were ever deleted, and
+// (c) — the fatal one — went RED the moment the fix it was implicitly asking for actually landed:
+// extracting the shared text into ONE function, as `staleNodeModulesWarning.mjs`'s own header
+// explains, leaves no per-file literal for either side to `eval` at all.
+//
+// With the text now living in exactly one place, byte-for-byte drift between the two messages is
+// no longer a reachable failure mode — there is only one copy to drift from. What replaces the old
+// test is REACHABILITY (both files import the shared function and call it, rather than each
+// re-inlining its own string) plus a DIRECT test of the producer's own output, below.
+describe('build-web.mjs and the editor /api/build share ONE stale-package.json warning producer (#731 equivalence)', () => {
+  function matchingBraceEnd(text: string, openBraceIdx: number): number {
+    let depth = 0;
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+    }
+    throw new Error('no matching close brace found');
+  }
+
+  const buildWebSrc = readScannedSource(buildWeb).code;
+  const scannerSrc = readScannedSource(assetScanner).code;
+
+  it('both files import describeUnreadablePackageJsonWarning from the shared .mjs module', () => {
+    expect(buildWebSrc).toMatch(/import\s*\{\s*describeUnreadablePackageJsonWarning\s*\}\s*from\s*'\.\/staleNodeModulesWarning\.mjs'/);
+    expect(scannerSrc).toMatch(/import\s*\{\s*describeUnreadablePackageJsonWarning\s*\}\s*from\s*'\.\.\/scripts\/staleNodeModulesWarning\.mjs'/);
+  });
+
+  it('build-web.mjs calls the shared producer, inside console.warn, inside its OWN unreadable-package-json branch', () => {
+    const ifIdx = buildWebSrc.indexOf("if (verifyReason === 'unreadable-package-json')");
+    expect(ifIdx).toBeGreaterThan(-1);
+    const openBrace = buildWebSrc.indexOf('{', ifIdx);
+    const closeBrace = matchingBraceEnd(buildWebSrc, openBrace);
+    const branch = buildWebSrc.slice(openBrace, closeBrace);
+    // Nested — not merely present somewhere in the branch — so a call that ignores the producer's
+    // return value (e.g. a stray `describeUnreadablePackageJsonWarning(projectRoot);` beside an
+    // unrelated console.warn) does not pass this.
+    expect(branch).toMatch(/console\.warn\([^)]*describeUnreadablePackageJsonWarning\(projectRoot\)/);
+  });
+
+  it('the editor route calls the shared producer, inside send(), inside its OWN unreadable-package-json branch', () => {
+    const ifIdx = scannerSrc.indexOf("if (staleCheckReason === 'unreadable-package-json')");
+    expect(ifIdx).toBeGreaterThan(-1);
+    const openBrace = scannerSrc.indexOf('{', ifIdx);
+    const closeBrace = matchingBraceEnd(scannerSrc, openBrace);
+    const branch = scannerSrc.slice(openBrace, closeBrace);
+    expect(branch).toMatch(/send\(\s*describeUnreadablePackageJsonWarning\(projectRoot\)\s*\)/);
+  });
+});
+
+describe('describeUnreadablePackageJsonWarning (the shared #685/#731 producer)', () => {
+  it('names the project root, the #685 check, and why it matters — asserted DIRECTLY, not via a caller', async () => {
+    const { describeUnreadablePackageJsonWarning } = await import('../../scripts/staleNodeModulesWarning.mjs');
+    const msg = describeUnreadablePackageJsonWarning('/tmp/fixture-project');
+    expect(msg).toContain('/tmp/fixture-project/package.json');
+    expect(msg).toMatch(/could not be read or parsed/);
+    expect(msg).toContain('#685');
+    expect(msg).toMatch(/stale-node_modules check did NOT run/);
+    expect(msg).toMatch(/undetected/);
+    // No caller-specific prefix baked in here — build-web.mjs adds its own "[build-web] " on top.
+    expect(msg.startsWith('[build-web]')).toBe(false);
+  });
+});
+
 describe('build-web.mjs validates project config before it builds anything (#589 sibling)', () => {
-  const src = fs.readFileSync(buildWeb, 'utf8');
+  const src = readScannedSource(buildWeb).code;
 
   // `/api/build` runs projectConfigUnionErrors + validateBuildConfig for EVERY target
   // (web/playable/ios/android alike) before its platform branch — vite-asset-scanner.ts's
@@ -361,6 +403,47 @@ describe('build-web.mjs validates project config before it builds anything (#589
     expect(nextChunk).toMatch(/process\.exit\(1\)/);
     // The issue explicitly leaves a bypass as an owner call — this check must not grow one.
     expect(nextChunk).not.toMatch(/--force/);
+  });
+});
+
+// ── #731: validateProjectConfig used to skip in TOTAL SILENCE — `if (!cfgMod) return;` — on a
+// source checkout with an incomplete `npm install` exactly as much as on the legitimate
+// packaged-editor case, the same null-conflates-absent-with-unknown shape #714 fixed one level up
+// in the loader itself (pinned below by the unmodified "loadEnginePluginModule degrades instead of
+// throwing" describe block — the reason discriminant itself is not re-tested here). What's new
+// here is that build-web.mjs's OWN degrade branch now consumes that reason instead of discarding
+// it silently.
+describe('build-web.mjs warns (never silently) when the project-config gate cannot load (#731)', () => {
+  const src = readScannedSource(buildWeb).code;
+
+  function matchingBraceEnd(text: string, openBraceIdx: number): number {
+    let depth = 0;
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+    }
+    throw new Error('no matching close brace found');
+  }
+
+  const fnStart = src.indexOf('async function validateProjectConfig()');
+  const fnEnd = matchingBraceEnd(src, src.indexOf('{', fnStart));
+
+  it('uses loadEnginePluginModuleResult for the load, not the plain null-returning wrapper', () => {
+    expect(fnStart).toBeGreaterThan(-1);
+    const fnBody = src.slice(fnStart, fnEnd);
+    expect(fnBody).toMatch(/loadEnginePluginModuleResult\(repoRoot, path\.join\('plugins', 'load-project-config\.ts'\)\)/);
+  });
+
+  it('warns with the reason and RETURNS — never process.exit — when the module cannot load', () => {
+    const ifIdx = src.indexOf('if (!cfgMod)', fnStart);
+    expect(ifIdx).toBeGreaterThan(-1);
+    expect(ifIdx).toBeLessThan(fnEnd);
+    const ifOpenBrace = src.indexOf('{', ifIdx);
+    const ifCloseBrace = matchingBraceEnd(src, ifOpenBrace);
+    const branch = src.slice(ifIdx, ifCloseBrace);
+    expect(branch).toMatch(/reason === 'no-esbuild'/);
+    expect(branch).toMatch(/console\.warn/);
+    expect(branch).not.toMatch(/process\.exit/);
   });
 });
 
@@ -439,10 +522,9 @@ describe('loadEnginePluginModule degrades instead of throwing', () => {
  *  have nothing go red. Same rule, same reason: `npm install --package-lock-only` CREATES the
  *  state (#685, measured 2026-09-05), so its ONLY permitted mention is the warning not to run it. */
 describe('the lockfile-integrity guard prints the SAFE remedy too', () => {
-  const src = fs.readFileSync(
+  const src = readScannedSource(
     path.join(repoRoot, 'engine', 'tests', 'architecture', 'vendoredPluginFreshness.test.ts'),
-    'utf8',
-  );
+  ).code;
 
   it('never offers --package-lock-only as a remedy step', () => {
     const msgIdx = src.indexOf('Lockfile integrity does not match');

@@ -64,7 +64,13 @@ export function persistAssetEdit(
 ): Promise<void> {
   const write = backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content: JSON.stringify(updated, null, 2) }),
+    // ⚠️ The trailing `\n` is not cosmetic (#831). Every committed asset JSON has one, and
+    // `JSON.stringify` emits none — so each editor write silently stripped it and produced a
+    // `\ No newline at end of file` line in the diff of an otherwise one-field edit. Measured
+    // 2026-09-06: 101 of 108 committed .mat/.animset/.atlas files had already lost it this way.
+    // Existing files converge as they are next edited; they are deliberately NOT swept here, since
+    // a 101-file rewrite of games/ and demos/ is a far larger blast radius than the defect.
+    body: JSON.stringify({ path, content: `${JSON.stringify(updated, null, 2)}\n` }),
   })
     .then(async (res) => {
       if (res.ok) return;

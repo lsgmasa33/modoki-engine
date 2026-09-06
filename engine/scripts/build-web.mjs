@@ -18,6 +18,8 @@ import { parseBuildTarget } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { loadEnginePluginModule, loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
+import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { describeUnreadablePackageJsonWarning } from './staleNodeModulesWarning.mjs';
 
 // --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
 // WHY there is no default in either direction (#40).
@@ -68,6 +70,47 @@ const node = process.execPath;
 const q = (s) => JSON.stringify(s);
 const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
 
+/** Cross-process build claim (#650). `buildLock.ts`'s in-process slot cannot see this script — a
+ *  hand-run `npm run build` is a SEPARATE process — so nothing stopped it racing the editor's own
+ *  OTA publish (or another CLI build) into the SAME `<project>/dist`, producing a torn bundle that
+ *  ships to every installed device. Acquired HERE, before the try block below runs a single thing
+ *  (including `validateProjectConfig`, its first line) — the same reasoning `/api/build` itself
+ *  uses (vite-asset-scanner.ts: "BEFORE any config load or preflight so a refused build does
+ *  nothing at all"). REFUSES AND EXITS rather than waiting: a scripted build must not hang on an
+ *  interactive editor, matching what the editor's own routes already do.
+ *
+ *  Gated on `proj`, like `validateProjectConfig`/`healNativeProject` below: a bare
+ *  `npm run build:editor` (no MODOKI_PROJECT) never reaches a project-scoped `dist` at all, so
+ *  there is nothing here to claim.
+ *
+ *  Released in the `finally` below on the normal-completion and thrown-error paths. Several call
+ *  sites further down (`validateProjectConfig`'s own `process.exit(1)`) exit the process directly,
+ *  which does NOT run a wrapping `finally` — Node's `process.exit()` terminates before pending
+ *  `finally` blocks get a turn. Those are covered instead by `acquireBuildClaim`'s own `exit`-event
+ *  backstop (installed automatically on a successful claim), which fires on every process
+ *  termination path, `process.exit()` included. */
+let buildClaim = null;
+if (proj) {
+  const projectRoot = path.resolve(repoRoot, proj);
+  // `acquireBuildClaim` can THROW rather than refuse (e.g. `~/.modoki` is uncreatable, or its lock
+  // is genuinely wedged past its deadline — buildClaimsStore.mjs's `withLock`). This script has no
+  // wrapping `try` yet at this point in the file — the one below starts AFTER this block — so an
+  // uncaught throw here would crash with a raw Node stack trace instead of the `[build-web] …`
+  // message every other failure path in this file gives. Catch it here, at the point the claim is
+  // taken, and fail the same way `!claimed.ok` already does.
+  try {
+    const claimed = acquireBuildClaim(projectRoot, `${target} web build (CLI)`, { kind: 'cli' });
+    if (!claimed.ok) {
+      console.error(`[build-web] ${claimed.message}`);
+      process.exit(1);
+    }
+    buildClaim = claimed;
+  } catch (e) {
+    console.error(`[build-web] ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+}
+
 /** The SAME two-part project-config check the editor's `/api/build` route runs — for every
  *  target alike (`vite-asset-scanner.ts`'s `/api/build` handler runs it once, before the platform
  *  branch, so it covers web/playable/ios/android identically; this mirrors that, not a
@@ -89,11 +132,30 @@ const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEn
  *  `npm run build:editor` never reaches this script at all). Degrades to a no-op like the heals
  *  below when the engine plugin can't be loaded — in the packaged editor that's esbuild pruned as
  *  a devDependency, not missing engine sources — and in THAT case the SOURCE route already
- *  validated before spawning this script as a build step. */
+ *  validated before spawning this script as a build step.
+ *
+ *  ⚠️ Uses `loadEnginePluginModuleResult` (#731), not the plain null-returning wrapper: the old
+ *  `if (!cfgMod) return;` skipped this whole gate in TOTAL SILENCE, on a source checkout with an
+ *  incomplete `npm install` as much as on the legitimate packaged-editor case — the exact
+ *  null-conflates-absent-with-unknown shape #714 fixed one level up. Warn with WHICH cause it was,
+ *  same as the vendor-plugins load above, and never fail the build over it — this gate's own
+ *  defence for the packaged-editor case (the SOURCE route already validated) still holds. */
 async function validateProjectConfig() {
   if (!proj) return;
-  const cfgMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'load-project-config.ts'));
-  if (!cfgMod) return;
+  const { module: cfgMod, reason } = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'load-project-config.ts'));
+  if (!cfgMod) {
+    const why = reason === 'no-esbuild'
+      ? 'esbuild is not installed, so load-project-config.ts could not be loaded (expected inside a '
+        + 'packaged editor, which ships no devDependencies; on a source checkout it means the '
+        + 'install is incomplete — run `npm install` at the repo root)'
+      : 'there is no engine/plugins/load-project-config.ts here — this is not a source checkout, so '
+        + 'there is nothing to check';
+    console.warn(
+      `[build-web] ⚠️ ${why}. The project-config validation gate did NOT run, so an invalid `
+        + 'project.config.json (e.g. a `capacitor.orientation` typo) could ship undetected.',
+    );
+    return;
+  }
   const { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } = cfgMod;
   const projectRoot = path.resolve(repoRoot, proj);
   const cfg = loadProjectConfig(projectRoot);
@@ -136,10 +198,12 @@ async function validateProjectConfig() {
  *   4. `npm install`, gated on EITHER heal having changed something (`depHeal.changed ||
  *      v.needsInstall`) — a tarball or a new dep spec is inert until installed, and gating on
  *      only one of the two conditions would silently skip the other's install.
- *   5. `verifyInstalledMatchesTarball` — runs UNCONDITIONALLY, whether or not step 4 installed
- *      anything (#685). Every signal step 4's gate trusts (the dep spec, the lockfiles, the
- *      install marker) can agree "nothing to do" while `node_modules/<plugin>` on disk still
- *      holds a PREVIOUS tarball's bytes — that IS the #685 failure, and it is exactly the case a
+ *   5. `verifyInstalledMatchesTarballResult` (#731's Result variant — see the call site below for
+ *      why the plain `verifyInstalledMatchesTarball` isn't enough here) — runs UNCONDITIONALLY,
+ *      whether or not step 4 installed anything (#685). Every signal step 4's gate trusts (the dep
+ *      spec, the lockfiles, the install marker) can agree "nothing to do" while
+ *      `node_modules/<plugin>` on disk still holds a PREVIOUS tarball's bytes — that IS the #685
+ *      failure, and it is exactly the case a
  *      gate keyed to "something changed" cannot see. So step 5 is a separate, unconditional read
  *      of what's actually on disk, not part of step 4's `if`. On a mismatch it throws — no
  *      auto-repair (see the call site's own comment for why).
@@ -261,7 +325,15 @@ async function healNativeProject() {
     );
   }
   if (vendorMod) {
-    const problems = vendorMod.verifyInstalledMatchesTarball(projectRoot);
+    // ⚠️ `verifyInstalledMatchesTarballResult` (#731) — same shape as `loadEnginePluginModuleResult`
+    // above: this project's OWN `package.json` may be unreadable (truncated, merge-conflicted), and
+    // that must not read as "verified clean" any more than a missing engine checkout should. Warn,
+    // don't throw — the throw below diagnoses "node_modules is STALE", which would be the wrong
+    // message for a `package.json` this check could not even read.
+    const { problems, reason: verifyReason } = vendorMod.verifyInstalledMatchesTarballResult(projectRoot);
+    if (verifyReason === 'unreadable-package-json') {
+      console.warn(`[build-web] ${describeUnreadablePackageJsonWarning(projectRoot)}`);
+    }
     if (problems.length) {
       throw new Error(
         `[build-web] node_modules is STALE for ${problems.length} vendored plugin(s) — a native build `
@@ -352,4 +424,10 @@ try {
   const fromChild = e && (typeof e.status === 'number' || e.signal != null);
   if (!fromChild) console.error(`[build-web] ${e instanceof Error ? e.message : String(e)}`);
   process.exit(1);
+} finally {
+  // Covers the normal-completion path (the build succeeded and fell out of the try normally) and
+  // any throw that reaches here WITHOUT going through `catch`'s own `process.exit(1)` above — that
+  // exit call terminates before this `finally` gets a turn, so IT is covered by
+  // `acquireBuildClaim`'s own exit-hook backstop instead (see the claim's own comment).
+  buildClaim?.release();
 }

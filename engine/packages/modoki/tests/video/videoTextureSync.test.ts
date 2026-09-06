@@ -190,6 +190,29 @@ describe('syncVideoTextures — binding', () => {
     expect(matOf(mesh).map).toBe(tex);
     expect(videoTextureCount(state)).toBe(1);
   });
+
+  it('gives each RenderState its own texture over the SAME element', () => {
+    // Two viewports (SceneView + GameView), one decoder — sharing a texture would upload
+    // into one renderer's context and show black in the other. See the file header.
+    const mesh = fakeMesh();
+    const id = spawnVideo(mesh);
+    const other: State = { ecsObjects: new Map() };
+    const otherMesh = fakeMesh();
+    other.ecsObjects.set(id, otherMesh);
+
+    sync(world, state);
+    sync(world, other);
+
+    const texA = matOf(mesh).map as FakeVideoTexture;
+    const texB = matOf(otherMesh).map as FakeVideoTexture;
+    expect(texA).not.toBe(texB);
+    expect(texA.el).toBe(elements.get(id));
+    expect(texB.el).toBe(elements.get(id));
+    expect(videoTextureCount(state)).toBe(1);
+    expect(videoTextureCount(other)).toBe(1);
+
+    disposeVideoTextures(other);
+  });
 });
 
 describe('syncVideoTextures — teardown (the crash)', () => {

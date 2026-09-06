@@ -61,7 +61,16 @@ const REPO = SELF_URL
  * narrow otherwise: widening it to `engine/` would make the gate a no-op on most sessions, which
  * is the cost it exists to avoid.
  */
-export const WATCHED = ['games/court', 'engine/packages/modoki/src/runtime/rendering/text'];
+export const WATCHED = [
+  'games/court',
+  'engine/packages/modoki/src/runtime/rendering/text',
+  // #787: narrationRoom.test.ts derives its whole device sweep from DEVICE_PRESETS here,
+  // and adBannerReserve.test.ts transcribes a value out of it. Without this entry a clone
+  // that re-measures a preset and touches nothing under games/court skips the one suite
+  // built to catch the effect — silently, because the assertions stay green (tablets
+  // never bind); what rots is the prose. Guarded by courtSweepScope.test.ts.
+  'engine/packages/modoki/src/editor/scene/devicePresets.ts',
+];
 
 /** Runs a git command in the repo, or `null` if it cannot. Injectable so a test can bind it to a
  *  throwaway repo — the merge-vs-authored distinction is a fact about commit topology, and nothing

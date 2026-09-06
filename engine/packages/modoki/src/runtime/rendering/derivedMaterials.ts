@@ -143,10 +143,18 @@ export function collectDerivedChain(m: THREE.Material, out: Set<THREE.Material>)
  *
  *  Same shape and same reason as `retiredMaterials` for bases: the cache/system that owned the
  *  material cannot know whether a mesh is drawing it right now, and disposing on the spot is the
- *  #317 use-after-free one level out. The value is the owner's dispose step — for a tint clone
- *  that is a bare `dispose()`, for a MaterialInstance clone it also frees the per-instance map
- *  the clone owns outright, for a light-mask variant it drops the module's `owned` entry too, and
- *  for an orphaned owned material (#477) it is likewise a bare `dispose()`. */
+ *  #317 use-after-free one level out. The value is the owner's dispose step, so an owner CAN free
+ *  more than the material itself.
+ *
+ *  ⚠️ Today every caller passes a bare `() => m.dispose()` — all four of them
+ *  (`lightMaskVariants.ts:309`, `scene3DSync.ts:167`, `:1692`, `:3024`). The value side is
+ *  therefore degenerate, and this map behaves identically to a `Set<Material>` plus a
+ *  `m.dispose()` at the sweep. Two owners named here previously do NOT in fact use it:
+ *  `materialInstanceClones.ts` never calls `retireDerivedMaterial` at all (it routes through
+ *  `cloneDerived` + `retireVariantsOf`), and `lightMaskVariants` drops its `owned` entry at
+ *  `:307`, BEFORE retiring, deliberately rather than inside the closure. The closure stays
+ *  because the retire contract is the right shape for an owner that needs it — but do not read
+ *  this as evidence that one exists. */
 const retiredDerived = new Map<THREE.Material, () => void>();
 
 /** Queue `clone` for freeing once the sweep establishes that nothing binds it. Idempotent: a

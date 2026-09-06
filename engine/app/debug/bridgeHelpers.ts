@@ -37,10 +37,12 @@ function isThenable(v: unknown): boolean {
  *  the value actually held (a log line can carry secrets).
  *
  *  ⚠️ Deliberately a COPY of `describeShape` in `engine/tools/shared/mcpResult.ts` rather than an
- *  import of it (#648). Every existing `engine/app` → `tools/shared` reference is `import type`,
- *  which costs the bundle nothing; a VALUE import would pull MCP result-formatting code into the
- *  bundle that ships to devices. Eight lines on this side of that boundary is the cheaper trade.
- *  If this ever needs to change, change both — they are the same refusal vocabulary. */
+ *  import of it (#648). Every OTHER `engine/app` → `tools/shared` reference is `import type`, which
+ *  costs the bundle nothing — `agentBridge.ts`'s `simStepTiming.ts` import is the one deliberate
+ *  VALUE-import exception (#822), and its own docblock explains why THAT one is worth the cost. A
+ *  value import here would pull MCP result-formatting code into the bundle that ships to devices for
+ *  no comparable reason. Eight lines on this side of that boundary is the cheaper trade. If this
+ *  ever needs to change, change both — they are the same refusal vocabulary. */
 export function describeShape(v: unknown): string {
   if (v === null) return 'null';
   if (Array.isArray(v)) return 'an array';

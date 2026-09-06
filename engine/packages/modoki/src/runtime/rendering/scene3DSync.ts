@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
+import { installGlProgramReleaseHatch } from './glProgramRelease';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
@@ -4781,6 +4782,11 @@ export async function makeWebGPURenderer(
   // all just call `.dispose()` as they already did. Guarded so a stray double-dispose can't
   // decrement twice for one context.
   noteGpuContextCreated();
+  // #715: three's webgl-fallback backend never issues a GL delete for a compiled program/shader
+  // (see glProgramRelease.ts's doc for the measurement) — a leak that accumulates for the life of
+  // this context. Guarded to a no-op on the WebGPU backend and to a loud, self-disabling no-op if
+  // three's private internals this depends on ever move.
+  installGlProgramReleaseHatch(r);
   let contextLive = true;
   const rawDispose = r.dispose.bind(r);
   r.dispose = (...args: Parameters<typeof rawDispose>) => {

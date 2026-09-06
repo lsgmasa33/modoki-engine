@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as tar from 'tar';
-import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion, verifyInstalledMatchesTarball } from '../../plugins/vendorPlugins';
+import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion, verifyInstalledMatchesTarball, verifyInstalledMatchesTarballResult } from '../../plugins/vendorPlugins';
 import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -354,6 +354,61 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
       dependencies: { 'not-a-vendored-plugin': '^1.0.0' },
     }, null, 2));
     expect(verifyInstalledMatchesTarball(projectRoot)).toEqual([]);
+  });
+
+  // ── #731: an unreadable package.json must read as "could not check", never "verified clean" ──
+  // Before #731 `verifyInstalledMatchesTarball` swallowed this exact case and returned `[]` —
+  // indistinguishable from a project that simply vendors no engine plugins — so a truncated or
+  // merge-conflicted project package.json shipped stale plugin bytes with every signal green.
+  describe('verifyInstalledMatchesTarballResult tells "could not check" apart from "verified clean" (#731)', () => {
+    it('reports reason "unreadable-package-json" and NO problems when package.json does not parse', () => {
+      const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+      fs.writeFileSync(path.join(projectRoot, 'package.json'), '{ this is not valid json');
+      const r = verifyInstalledMatchesTarballResult(projectRoot);
+      expect(r.reason).toBe('unreadable-package-json');
+      // `[]` here means "could not check" — the accept-side test below is what proves `[]` can
+      // ALSO mean "verified clean", so a caller must branch on `reason`, never on `problems` alone.
+      expect(r.problems).toEqual([]);
+    });
+
+    // A MISSING package.json is NOT the same case as a corrupt/unreadable one — it is ABSENT, not
+    // unknown. This test used to assert the OPPOSITE ('unreadable-package-json'), which was itself
+    // a #731-shaped defect: fs.readFileSync's ENOENT landed in the same bare catch as a genuine
+    // parse failure, so four real projects with no package.json of their own
+    // (games/2d-physics-demo, 3d-physics-demo, agy, particle — none of them npm-managed, all with
+    // native targets) reported "could ship the wrong plugin bytes undetected" on every native
+    // build, which is false: there is no engine-plugin dependency that COULD be declared, let alone
+    // stale. Fixed to split ENOENT (→ reason: null, same as "vendors nothing") from every other
+    // read/parse failure (→ reason: 'unreadable-package-json', the genuine unknown) — the same
+    // absent-vs-unknown split `buildClaimsStore.mjs`'s `readClaimsResult` already makes.
+    it('reports reason null (not "unreadable-package-json") when package.json is simply missing — ABSENT, not unknown', () => {
+      const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+      // No package.json written at all — fs.readFileSync throws ENOENT, which must NOT read as
+      // "could not check": there is nothing here that could possibly vendor a stale plugin.
+      const r = verifyInstalledMatchesTarballResult(projectRoot);
+      expect(r.reason).toBeNull();
+      expect(r.problems).toEqual([]);
+    });
+
+    it('the accept side: reason is null on a readable package.json, whether or not it vendors a plugin', () => {
+      const projectRoot = freshProjectRoot();
+      packTarball(projectRoot, '// v1\n');
+      installFromTarball(projectRoot);
+      const r = verifyInstalledMatchesTarballResult(projectRoot);
+      expect(r.reason).toBeNull();
+      expect(r.problems).toEqual([]);
+    });
+
+    it('the old string[] contract is a thin delegate — same problems either way', () => {
+      const projectRoot = freshProjectRoot();
+      packTarball(projectRoot, '// v1\n');
+      installFromTarball(projectRoot);
+      fs.writeFileSync(
+        path.join(projectRoot, 'node_modules', PLUGIN, 'ios', 'Sources', 'Plugin.swift'),
+        '// STALE — bytes from a previous tarball\n',
+      );
+      expect(verifyInstalledMatchesTarball(projectRoot)).toEqual(verifyInstalledMatchesTarballResult(projectRoot).problems);
+    });
   });
 });
 

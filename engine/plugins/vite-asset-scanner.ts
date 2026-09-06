@@ -17,11 +17,12 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
+import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
-import { acquireBuild, releasePolicy } from './backend/buildLock';
+import { acquireBuildSlot, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 // From the standalone zero-import file, NOT assetManifest.ts — that module transitively
@@ -76,7 +77,7 @@ import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spr
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
-import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarball } from './vendorPlugins';
+import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
 import {
@@ -1724,16 +1725,17 @@ export function assetScannerPlugin(): Plugin {
           const buildCwd = editorRoot || projectRoot;
           const nativeDir = path.join(projectRoot, platform);
 
-          // The SAME slot /api/build and /api/ota/publish take (#173 close-out). The scaffold runs
-          // the identical `build-web.mjs --target native` into the identical `<project>/dist`
-          // (addNativeTarget.ts), and additionally `npm install`s and `cap add`s into the project —
-          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules. Nothing
-          // deduped two calls for the same platform before this. This lock stops two scaffolds
-          // racing each other; it does nothing about ONE scaffold getting killed mid-`cap add` —
-          // that's #581, and the half-written folder it leaves behind is no longer read as
-          // "already scaffolded" (see isNativeTargetScaffolded + the repair step it drives in
-          // scaffoldNativeTarget, below).
-          const scaffoldSlot = acquireBuild(`${platform} native scaffold`);
+          // The SAME slot /api/build and /api/ota/publish take (#173 close-out), and — since #650
+          // — the SAME cross-process claim a CLI script (`add-native-targets.mjs`) takes too. The
+          // scaffold runs the identical `build-web.mjs --target native` into the identical
+          // `<project>/dist` (addNativeTarget.ts), and additionally `npm install`s and `cap add`s
+          // into the project — so racing a build corrupts dist, and racing ITSELF corrupts
+          // node_modules. Nothing deduped two calls for the same platform before this. This lock
+          // stops two scaffolds racing each other; it does nothing about ONE scaffold getting
+          // killed mid-`cap add` — that's #581, and the half-written folder it leaves behind is no
+          // longer read as "already scaffolded" (see isNativeTargetScaffolded + the repair step it
+          // drives in scaffoldNativeTarget, below).
+          const scaffoldSlot = acquireBuildSlot(`${platform} native scaffold`, projectRoot);
           if (!scaffoldSlot.ok) {
             send(`[native] ${scaffoldSlot.message}`);
             sendStatus(`FAILED:Another job is already running\n${scaffoldSlot.message}`);
@@ -1911,13 +1913,15 @@ export function assetScannerPlugin(): Plugin {
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* client disconnected */ } };
 
           // ONE build at a time (#173). #170's client guard covers the Build MENU; it cannot cover
-          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Taken
+          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Nor can
+          // it cover a CLI script (`build-web.mjs`) running by hand in a terminal — closed by #650's
+          // cross-process claim, held ALONGSIDE the in-process slot by `acquireBuildSlot`. Taken
           // AFTER the SSE headers so the refusal reaches the client as a `FAILED:` status (the
           // route's convention for a deliberate refusal — a bare status is pushed into the log by
           // `consumeBuildStream` and then surfaces as "stream ended without a final status", i.e. an
           // actionable refusal disguised as a protocol anomaly), and BEFORE any config load or
           // preflight so a refused build does nothing at all.
-          const slot = acquireBuild(`${platform}${isRelease ? ' release' : ''} build`);
+          const slot = acquireBuildSlot(`${platform}${isRelease ? ' release' : ''} build`, projectRoot);
           if (!slot.ok) {
             send(`[build] ${slot.message}`);
             sendStatus(`FAILED:Another job is already running\n${slot.message}`);
@@ -2820,7 +2824,14 @@ export function assetScannerPlugin(): Plugin {
               // `/api/build` and the CLI `--target native` recipe are documented as equivalent
               // (docs/build.md), and #148 is precisely what a divergence between them costs —
               // a guard in only one path leaves the OTHER able to ship the previous native code.
-              const stale = verifyInstalledMatchesTarball(projectRoot);
+              //
+              // ⚠️ `verifyInstalledMatchesTarballResult` (#731): an unreadable `package.json` for
+              // THIS project must not read as "verified clean" — warn and keep going rather than
+              // silently skipping the check, matching build-web.mjs's own warn-not-throw call.
+              const { problems: stale, reason: staleCheckReason } = verifyInstalledMatchesTarballResult(projectRoot);
+              if (staleCheckReason === 'unreadable-package-json') {
+                send(describeUnreadablePackageJsonWarning(projectRoot));
+              }
               if (stale.length) {
                 sendStatus('FAILED:stale node_modules');
                 send(`\nBuild failed — node_modules is STALE for ${stale.length} vendored plugin(s); this build would ship the WRONG native code (#685):`);
@@ -3033,14 +3044,16 @@ export function assetScannerPlugin(): Plugin {
           // `node: command not found`, i.e. the publish was impossible in the one build where the
           // editor is most likely to be used and the failure said nothing about why. (§9: the
           // build family should not have two different notions of "the environment a step runs in".)
-          // The SAME slot the build takes (#173 close-out). This route runs the byte-identical
-          // `build-web.mjs --target native` into the byte-identical `<project>/dist` as
-          // /api/build's web step — and then UPLOADS that dist. So a publish racing a build does not
-          // merely corrupt a local artifact: it ships the torn bundle to every installed device that
-          // checks for an update, with no review step in between. Strictly worse than the case the
-          // lock was written for, and reachable by one human doing two ordinary things in one window
-          // (start Build → iOS, then open Publish OTA while it runs).
-          const otaSlot = acquireBuild('OTA publish');
+          // The SAME slot the build takes (#173 close-out), and — since #650 — the SAME
+          // cross-process claim `ota-publish.mjs` takes when run by hand. This route runs the
+          // byte-identical `build-web.mjs --target native` into the byte-identical
+          // `<project>/dist` as /api/build's web step — and then UPLOADS that dist. So a publish
+          // racing a build does not merely corrupt a local artifact: it ships the torn bundle to
+          // every installed device that checks for an update, with no review step in between.
+          // Strictly worse than the case the lock was written for, and reachable by one human doing
+          // two ordinary things in one window (start Build → iOS, then open Publish OTA while it
+          // runs) — or one human running `ota-publish.mjs` by hand while either is happening.
+          const otaSlot = acquireBuildSlot('OTA publish', projectRoot);
           if (!otaSlot.ok) {
             send(`[ota] ${otaSlot.message}`);
             sendStatus(`FAILED:Another job is already running\n${otaSlot.message}`);

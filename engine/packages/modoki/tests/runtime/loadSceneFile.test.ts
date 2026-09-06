@@ -1078,6 +1078,8 @@ describe('collectResourceRefsFromEntities', () => {
   const MODEL_GUID = 'b1000000-0000-4000-8000-000000000010';
   const PREFAB_GUID = 'b1000000-0000-4000-8000-000000000011';
   const ENV_GUID = 'b1000000-0000-4000-8000-000000000012';
+  const AUDIO_GUID = 'b1000000-0000-4000-8000-000000000020';
+  const ANIM_CLIP_GUID = 'b1000000-0000-4000-8000-000000000021';
 
   it('collects Renderable3D mesh and material refs', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
@@ -1126,6 +1128,54 @@ describe('collectResourceRefsFromEntities', () => {
       { traits: { PrefabInstance: { source: PREFAB_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'prefab', path: PREFAB_GUID });
+  });
+
+  it('collects AudioSource.clips bank refs', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { AudioSource: { clips: JSON.stringify([{ key: 'hit', ref: AUDIO_GUID }]) } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'audio', path: AUDIO_GUID });
+  });
+
+  // #731: parseClipBank's own never-throws contract collapses "no bank" and "malformed bank" into
+  // the same `[]` — this asserts the OBSERVABLE consequence loadSceneFile.ts now fixes: a corrupt
+  // bank still yields no refs (unchanged — the game plays silence, no acquire to make), but it is
+  // no longer SILENT about it.
+  it('warns (and still collects nothing) for a malformed AudioSource.clips bank, instead of failing silently', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const refs = collectResourceRefsFromEntities([
+        { traits: { AudioSource: { clips: '{ not valid json' } } },
+      ]);
+      expect(refs).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('malformed AudioSource.clips bank'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('collects Animator.clips bank refs', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { Animator: { clips: JSON.stringify([{ name: 'idle', clip: ANIM_CLIP_GUID }]) } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'animation', path: ANIM_CLIP_GUID });
+  });
+
+  it('warns (and still collects nothing) for a malformed Animator.clips bank, instead of failing silently', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const refs = collectResourceRefsFromEntities([
+        { traits: { Animator: { clips: '{ not valid json' } } },
+      ]);
+      expect(refs).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('malformed Animator.clips bank'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('collects Renderable2D sprite (texture) ref by GUID', async () => {

@@ -94,7 +94,8 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     return (
       <>
         {keys.map((key) => (
-          <ParamField key={key} name={key} param={schema[key]} value={merged[key]} mixed={mixed.has(key)} onChange={(v) => writeParamAll(key, v)} />
+          <ParamField key={key} name={key} param={schema[key]} value={merged[key]} mixed={mixed.has(key)} onChange={(v) => writeParamAll(key, v)}
+            idPrefix="assetView.materialBatch.param" />
         ))}
       </>
     );
@@ -106,16 +107,16 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
   return (
     <>
       <ColorField label="Color" value={(merged.color as number) ?? DEFAULT_COLOR} mixed={isMixed('color')} onChange={(v) => writeFieldAll('color', v)} />
-      {!isUnlit && <NumberField label="Roughness" value={(merged.roughness as number) ?? 1} step={0.01} wide mixed={isMixed('roughness')} onChange={(v) => writeFieldAll('roughness', v)} />}
-      {!isUnlit && <NumberField label="Metalness" value={(merged.metalness as number) ?? 0} step={0.01} wide mixed={isMixed('metalness')} onChange={(v) => writeFieldAll('metalness', v)} />}
+      {!isUnlit && <NumberField label="Roughness" value={(merged.roughness as number) ?? 1} step={0.01} wide mixed={isMixed('roughness')} onChange={(v) => writeFieldAll('roughness', v)} dataUiId="assetView.materialBatch.roughness" />}
+      {!isUnlit && <NumberField label="Metalness" value={(merged.metalness as number) ?? 0} step={0.01} wide mixed={isMixed('metalness')} onChange={(v) => writeFieldAll('metalness', v)} dataUiId="assetView.materialBatch.metalness" />}
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
         <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Transparent</span>
         <input type="checkbox" checked={isMixed('transparent') ? false : !!merged.transparent} ref={(el) => { if (el) el.indeterminate = isMixed('transparent'); }} onChange={(e) => writeFieldAll('transparent', e.target.checked)} />
       </div>
-      <NumberField label="Opacity" value={(merged.opacity as number) ?? 1} step={0.01} wide mixed={isMixed('opacity')} onChange={(v) => writeFieldAll('opacity', v)} />
+      <NumberField label="Opacity" value={(merged.opacity as number) ?? 1} step={0.01} wide mixed={isMixed('opacity')} onChange={(v) => writeFieldAll('opacity', v)} dataUiId="assetView.materialBatch.opacity" />
       <DropdownField label="Side" value={(merged.side as string) ?? 'front'} mixed={isMixed('side')} options={['front', 'double', 'back']} onChange={(v) => writeFieldAll('side', v)} />
       {!isUnlit && <ColorField label="Emissive" value={(merged.emissive as number) ?? 0} mixed={isMixed('emissive')} onChange={(v) => writeFieldAll('emissive', v)} />}
-      {!isUnlit && <NumberField label="Emissive Intensity" value={(merged.emissiveIntensity as number) ?? 1} step={0.05} wide mixed={isMixed('emissiveIntensity')} onChange={(v) => writeFieldAll('emissiveIntensity', v)} />}
+      {!isUnlit && <NumberField label="Emissive Intensity" value={(merged.emissiveIntensity as number) ?? 1} step={0.05} wide mixed={isMixed('emissiveIntensity')} onChange={(v) => writeFieldAll('emissiveIntensity', v)} dataUiId="assetView.materialBatch.emissiveIntensity" />}
     </>
   );
 }

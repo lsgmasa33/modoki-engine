@@ -19,6 +19,18 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
  * ⚠️ This guard PARSES the import list rather than grepping the file, because the file explains
  * itself in a comment naming both `installErrorCapture` and `App.tsx` — a text match would be
  * satisfied by the explanation of the rule instead of the rule.
+ *
+ * ⚠️ SOURCE ORDER IS NECESSARY, NOT SUFFICIENT, and this guard can only see the necessary half —
+ * its sibling `deviceConsoleCaptureInstallOrder.test.ts` says so out loud; this file did not (#636).
+ * Measured on a real bundle (`games/wordweave/dist/assets/index-mD_oY731.js`, 487,006 bytes): the
+ * four installs (this one among them) sit in ONE comma-expression at byte ~368,600, while the
+ * entry's last static import finishes at byte ~5,497 — a throw during module evaluation anywhere in
+ * `App.tsx`'s static import graph fires ~363 kB before `installGlobalErrorHandlers` exists to catch
+ * it, and is never reported to Crashlytics. Do not read a green here as "every boot-time error is
+ * captured" — `engine/index.html`'s fatal-load guard buffers an error from that same window
+ * (`__MODOKI_EARLY_ERRORS__`), but the drain (`globalErrors.ts`'s `drainEarlyErrors`) only runs once
+ * `installGlobalErrorHandlers` itself is reached, so it covers an early fault on a boot that
+ * COMPLETES — a boot that never does is #825, still open.
  */
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../app');

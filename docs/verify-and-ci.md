@@ -475,6 +475,62 @@ The generalisable bit: **a scope restriction is a claim about where a defect can
 rule's own exclusions can tell the classes apart, the restriction is buying nothing and hiding
 whatever sits outside it.
 
+### The second half of that rule: a scope bound ships with an assertion, or it is a comment
+
+**A comment naming a hole is not a guard over it** (#830, 2026-09-06). Applying the rule above to
+the rest of the repo found **ten more** guards whose declared scope was narrower than the claim in
+their own docblock — and the striking part is that most of them *said so*. `corpusProducerIsShared`
+called its own scope "a real hole, not a tidy boundary"; `chromeTagging` had an `HONEST SCOPE` note;
+`mcpErrorCodes` recorded which directory it never scanned. Every one of those admissions was
+accurate, and every one was inert. Prose does not fail a build.
+
+⚠️ **The sharpest version — and the one to look for first — is a self-check that filters the
+hand-list BY ITSELF.** Four sites independently wrote it. `clonePortHardcoding.test.ts` is the
+clearest:
+
+```ts
+const resolvesBinary = SPAWNERS.filter(existsSync).filter(hasMarker);
+expect(resolvesBinary.sort()).toEqual([...SPAWNERS].sort());
+```
+
+under a comment claiming the set was *"found by the marker … rather than by a hand-listed set, so a
+NEW spawner is covered the day it is written"*. It can detect a **deleted** entry and never an
+**added** one — and the population is the thing that grows. Four unlisted spawners were sitting
+outside it.
+
+**The fix has three shapes, and picking the wrong one is how the defect returns:**
+
+| Shape | When | Example |
+|---|---|---|
+| **Derive** — delete the list | the subject is enumerable by a marker, or the type checker can enumerate it | `NumberField.dataUiId` made REQUIRED, so `tsc` names every call site (#772) |
+| **Widen + migrate** | the scope is a directory bound, so there is no list to assert | `corpusProducerIsShared`'s `under` → the repo (#814) |
+| **Assert completeness** | the list must stay, so make its gap RED | `assertDeclaredListIsComplete` (#830) |
+
+`engine/tests/helpers/declaredList.ts` is the shared helper for the third: *enumerate the population
+by its marker, assert the hand-list equals it*, with a reasoned exemption ledger whose every row
+must CURRENTLY be flagged. `testFilesAreCollected.test.ts` is the older, hand-written instance of
+the same idea and is worth reading as the reference.
+
+⚠️ **The marker is the judgement; the helper only makes the comparison honest.** A marker that is
+subtly too narrow re-creates the defect one level down with every test still green. Two ways that
+actually happened while writing this:
+
+- **A marker only meets its population once you widen the scope.** `clonePortHardcoding`'s
+  "derives a per-clone port" check tested for `clonePort.mjs` alone, while `CLAUDE.md` names
+  `editorPorts.mjs` as the primary derivation. Both `launch-editor.sh` and `test-packaged.sh`
+  derive correctly and would have FAILED it — the narrowness was invisible until the list grew to
+  include them.
+- **Comment-stripping silently changes a population.** A marker run over `readScannedSource(…).code`
+  cannot see a mention that lives in a docblock, so `packagedAppPaths.d.mts` dropped out of its own
+  population and `launch-editor.sh`'s `clonePort` references (all comments) did not count.
+
+**And the honest limit is part of the fix.** Where a marker cannot reach file granularity, say so in
+the guard rather than implying otherwise: `courtSweepScope.test.ts` asserts coverage at BARREL level
+because Court's tests import the runtime barrel 104 times, and per-file coverage would resolve to
+watching all of `src/runtime` — which `courtAuthored.mjs` rules out as making the gate a no-op. A
+guard whose scope claim is wider than its reach is the defect this whole section is about, so a
+guard that states its own reach is not hedging.
+
 ⚠️ **Both directions of this defect are fail-OPEN, and the second one is the easy one to miss.** A
 **forbidden**-pattern guard goes green because a comment HID the offender. A **required**-pattern
 guard goes green because a comment SATISFIED the match — so the real call site can be deleted and

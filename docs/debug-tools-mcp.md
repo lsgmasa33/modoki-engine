@@ -1675,6 +1675,32 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   imports after chunks from App.tsx's own graph. The very first lines of a boot still belong to
   `device_native_logs` (logcat/OSLog), not to this ring.
 
+  **`frameLoop` answers "are frames actually being pumped right now?" structurally, instead of
+  leaving it to a console string (#682).** Both stalls above reached `diagnose` only *because* the
+  frame driver happens to `console.error` — an accidental tell, and one that a loop going `idle`
+  (refCount 0) does not even produce. The block is sourced from `getFrameLoopHealth()`
+  (`runtime/rendering/frameDriver.ts`) and follows the editor's healthy-means-silent convention
+  (`agentEditorOps.ts`'s `frameLoopFields`): absent while `status === 'running'`, present with a
+  ready-to-read `detail` the moment it is not. **A `stalled` or `unrecoverable` loop now fails `ok`
+  and is named in the summary** — `ok:true` above a `frameLoop.status:'stalled'` block was the same
+  self-contradiction the `zeroScale` note already fixed once. Alongside it, `perf.currentFps` comes
+  from `getCurrentFPS()`, which self-zeroes after `STALL_MS`; `perf.frame.fps` is a median over a
+  sample ring that STOPS FILLING when frames stop, so on a dead loop it reports the last healthy
+  value indefinitely. Read `currentFps` when the question is liveness.
+
+  ⚠️ **The same signal now gates INPUT, and the refusal lives at the router, not in the page.** A
+  dead rAF chain means `inputSystem` never samples, so a tap is delivered to the DOM and received by
+  nothing — the transport is `setTimeout`-based and answers happily either way, which made
+  `ok … [input:synthetic]` over a frozen world the worst available reply. The guard sits in
+  `/api/device/request` (`editorBackendRouter.ts`) *before* CDP/WDA discovery, because
+  `tryDeviceCdpInput`/`tryDeviceWdaInput` return before anything in `app/debug/bridge.ts` is
+  reached: a guard in the page would have covered the synthetic path only, and missed `press-key`
+  entirely (CDP dispatches it with no coordinate resolution at all). It fails OPEN on an unreadable
+  reply — an old bridge or a transport hiccup must not block input. Frame-fed READS
+  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `scene_query`, profiler, watch, and the
+  enact/resolve-point ops the trusted routes aim from) carry a staleness note on the existing
+  `warnings` array rather than a new payload shape.
+
   **The bridge's OWN `[debug-bridge]` chatter is deliberately NOT in this ring**, and that is load-
   bearing rather than tidiness: one line per `device_tap`/`drag`/`pointer`/`press_key`/`type_text`
   would let a burst of input ops evict the device ring's whole rolling tail (512 entries, 128

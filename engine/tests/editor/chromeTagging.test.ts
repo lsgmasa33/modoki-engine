@@ -231,8 +231,13 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
   },
   {
     file: 'panels/assetViews/MaterialAssetView.tsx',
-    ids: ['`assetView.material.param.${name}.${i}`'],
-    why: 'the per-component vecN shader-param fields — #724.',
+    ids: ['`${idPrefix}.${name}.${i}`'],
+    why: 'the per-component vecN shader-param fields — #724. ⚠️ The needle is the PREFIXED form '
+      + 'as of the #830 review: `ParamField` hardcoded `assetView.material.param.` for all three '
+      + 'of its callers, and two were wrong — ShaderAssetView renders it with the literal '
+      + 'name="default" once per shader param, so N params emitted N IDENTICAL ids, and '
+      + 'MaterialBatchView emitted the `material` namespace for `materialBatch` fields. The '
+      + 'namespace now comes from a REQUIRED `idPrefix`, so the type checker enumerates callers.',
   },
   {
     file: 'panels/assetViews/ModelAssetView.tsx',
@@ -376,18 +381,19 @@ describe('data-ui-id tagging has not rotted', () => {
   // one; `npm run typecheck` fails otherwise, and no regex can be out-parsed the way this scan
   // was.
   //
-  // ⚠️ This is NOT hypothetical residual risk — there IS a fifth, and it is already untagged
-  // today (found by a second adversarial review, close-out 2026-09-05, filed as #772):
-  // `NumberField` (`packages/modoki/src/editor/panels/assetViews/widgets.tsx:64`) has
-  // `dataUiId?: string`, already RENDERS `data-ui-id={dataUiId}` (plus a derived
-  // `${dataUiId}.slider`), and buffers its value via `useBufferedValue` directly rather than
-  // `<BufferedNumberInput>` — so both the regex scan above (wrong element name) and the
-  // required-prop fix above (wrong helper list) miss it. 26 of its 27 call sites pass no id (17
-  // in `MaterialAssetView.tsx`, 4 in `MaterialBatchView.tsx`, 3 in `ShaderAssetView.tsx`, 2 in
-  // `AnimSetAssetView.tsx`); only `Inspector.tsx:1082` is tagged. Tagging those 26 sites and
-  // making `NumberField.dataUiId` required is #772's own bounded, separately-claimable fix — not
-  // done here. Any future "a sixth wrapper" finding belongs in a note like this one, not silently
-  // folded into "residual risk is hypothetical."
+  // ⚠️ THAT SECOND HALF IS NO LONGER A HAND-WRITTEN LIST, and the reason is worth keeping.
+  // It named four components. There was a FIFTH — `NumberField`
+  // (`packages/modoki/src/editor/panels/assetViews/widgets.tsx`), which already RENDERED
+  // `data-ui-id={dataUiId}` plus a derived `${dataUiId}.slider`, but buffered through
+  // `useBufferedValue` rather than `<BufferedNumberInput>`. So the regex scan above missed it on
+  // the element name, and the required-prop check missed it on the helper list — 26 of its 27
+  // call sites shipped with no id, and this very note described that risk as hypothetical for as
+  // long as the gap existed (#772).
+  //
+  // **A hand list cannot report the member it does not contain.** So the check below now DERIVES
+  // the set: every component under SCAN_ROOTS that accepts a `dataUiId` prop must either require
+  // it, or be one of `SCANNED_PRIMITIVES` — whose call sites this scan enforces directly. A sixth
+  // wrapper is covered the day it is written, and does not need anybody to notice it.
   //
   // `DATA_UI_ID_EXEMPT` is the escape hatch, and it is deliberately near-empty: #724 tagged all
   // 26 sites this test found untagged (36 controls, counting shared helpers), leaving exactly ONE
@@ -397,6 +403,14 @@ describe('data-ui-id tagging has not rotted', () => {
   // `AssetRefField`/`NumRow`/`Num`/`FieldValueWidget` already do (and, now, must). Keyed by snippet
   // prefix rather than by line number on purpose, so an exemption cannot silently widen to a whole
   // file or go stale the moment the file shifts by a line.
+  /** The two PRIMITIVES the call-site scan below covers directly, by literal JSX tag — and the
+   *  single source for that scan's own regex, so the two mechanisms cannot drift apart. A
+   *  primitive is allowed to keep `dataUiId?:` OPTIONAL precisely because the scan enforces its
+   *  call sites one by one; every other component that accepts the prop has no such scan behind
+   *  it and must lean on the type checker instead. Keeping this list and the scan's regex as one
+   *  value is deliberate — their separation is what #772 was, one level up. */
+  const SCANNED_PRIMITIVES = ['BufferedNumberInput', 'BufferedTextInput'] as const;
+
   const SCAN_ROOTS = [
     path.resolve(__dirname, '../../packages/modoki/src/editor'),
     path.resolve(__dirname, '../../app'),
@@ -416,7 +430,7 @@ describe('data-ui-id tagging has not rotted', () => {
    *  comparison, a nested arrow function) doesn't end the element early. */
   function findBufferedInputs(src: string): Array<{ line: number; hasId: boolean; snippet: string }> {
     const results: Array<{ line: number; hasId: boolean; snippet: string }> = [];
-    const re = /<(BufferedNumberInput|BufferedTextInput)\b/g;
+    const re = new RegExp(`<(${SCANNED_PRIMITIVES.join('|')})\\b`, 'g');
     let m: RegExpExecArray | null;
     while ((m = re.exec(src))) {
       const start = m.index;
@@ -479,43 +493,102 @@ describe('data-ui-id tagging has not rotted', () => {
 
   // The other half of #724's coverage — the shared-helper surface the scan above cannot see
   // (see the ⚠️ HONEST SCOPE note). This does not re-run tsc (that's `npm run typecheck`'s job);
-  // it guards against the SOURCE regressing `dataUiId: string` back to `dataUiId?: string` on one
-  // of the four known wrappers, which would silently reopen the gap the type checker now closes.
-  //
-  // Structural, not a frozen text needle (close-out 2026-09-05: the prior version matched exact
-  // strings like `'dataUiId: string; dataUiLabel?: string }'`, which goes red on a pure reformat
-  // or the instant a sibling prop is added after `dataUiId` while it stays required — and its
-  // `not.toMatch(/dataUiId\?:\s*string/)` was FILE-WIDE, so an unrelated, legitimately-optional
-  // `dataUiId` on some OTHER component in the same file would fail it too). This instead extracts
-  // ONLY the named component's own parameter list (from `function <Name>(` to its matching `)` —
-  // paren-depth tracked, so a default-value arrow function inside it can't end the scan early)
-  // and checks the `dataUiId` prop declaration within THAT block alone.
-  function extractFunctionParams(src: string, name: string): string | null {
-    const m = new RegExp(`\\bfunction\\s+${name}\\s*\\(`).exec(src);
-    if (!m) return null;
-    const start = m.index + m[0].length - 1; // the '(' itself
-    let depth = 0;
-    for (let i = start; i < src.length; i++) {
-      if (src[i] === '(') depth++;
-      else if (src[i] === ')') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  // it guards against the SOURCE regressing `dataUiId: string` back to `dataUiId?: string` on any
+  // wrapper, which would silently reopen the gap the type checker now closes. The set of wrappers
+  // is DERIVED rather than listed (#772) — see below.
+
+
+  /** Every `dataUiId` prop DECLARATION under the scan roots, attributed to its owning component.
+   *
+   *  ⚠️ **DERIVED, not hand-listed (#772).** The previous version of this check named four
+   *  components outright — `AssetRefField`/`NumRow`/`Num`/`FieldValueWidget` — and `NumberField`
+   *  sat outside that list with the `data-ui-id` wiring already in place and 26 of its 27 call
+   *  sites passing no id. Nothing was broken; the list simply did not contain it, and **a hand
+   *  list cannot report the member it does not contain.** The file's own `HONEST SCOPE` note had
+   *  described the residual risk as hypothetical for as long as that fifth wrapper existed.
+   *
+   *  Scans `.ts` AND `.tsx`: restricting to `.tsx` would be the same defect one level down —
+   *  a bound nobody re-checks. Today every hit is in a `.tsx`, which is a measurement, not a rule. */
+  function dataUiIdDeclarations(): { rel: string; line: number; component: string; optional: boolean }[] {
+    const out: { rel: string; line: number; component: string; optional: boolean }[] = [];
+    const unattributed: string[] = [];
+    for (const root of SCAN_ROOTS) {
+      for (const { abs, rel } of repoFiles({ under: root, match: /\.tsx?$/, floor: 5 })) {
+        const src = readScannedSource(abs).code;
+        for (const m of src.matchAll(/\bdataUiId\s*(\??)\s*:\s*string/g)) {
+          const line = src.slice(0, m.index).split('\n').length;
+          // Attribute to the nearest PRECEDING function declaration. An arrow-function component
+          // has no such marker, so it lands in `unattributed` and FAILS the test loudly rather
+          // than being silently dropped — a scan that quietly skips what it cannot parse is the
+          // fail-open shape this whole file exists to close.
+          // ⚠️ **Both declaration forms, and the reason is that one form alone is WORSE than
+          // none (found by the #830 review, mutation-proven).** This matched only
+          // `function <Name>(`, and took the LAST one preceding the prop — so an ARROW component
+          // declared after a function declaration silently inherited that function's name. In
+          // `fields.tsx`, which declares `BufferedTextInput` and `BufferedNumberInput` as
+          // functions, a new `const SneakyField = ({ dataUiId }: { dataUiId?: string }) => …`
+          // was attributed to `BufferedNumberInput`, matched SCANNED_PRIMITIVES, and was
+          // EXEMPTED — 39/39 green over exactly the defect this check exists to catch, in the
+          // file most likely to grow the next field widget. The docblock's claim that an arrow
+          // component "lands in `unattributed` and FAILS loudly" was true only when no function
+          // declaration preceded it.
+          // ⚠️ The arrow form must NOT require its `=>`. This scan runs over the text BEFORE the
+          // prop declaration, and an arrow component's `=>` sits AFTER its parameter list — so a
+          // pattern anchored on `=>` never matches in the slice, and the attribution silently
+          // falls back to the previous `function` declaration. (Caught by mutation while fixing
+          // exactly that: the first attempt at this line still let `SneakyField` inherit
+          // `BufferedNumberInput`.) `[A-Z][a-zA-Z0-9]*` is PascalCase on purpose — it admits a
+          // component and rejects a SCREAMING_CASE const like SCANNED_PRIMITIVES.
+          const DECL = /\bfunction\s+([A-Z][a-zA-Z0-9]*)\s*\(|\bconst\s+([A-Z][a-zA-Z0-9]*)\s*(?::[^=\n]*)?=/g;
+          let component = '';
+          for (const f of src.slice(0, m.index).matchAll(DECL)) component = f[1] ?? f[2];
+          if (!component) { unattributed.push(`${rel}:${line}`); continue; }
+          out.push({ rel, line, component, optional: m[1] === '?' });
+        }
+      }
     }
-    return null;
+    expect(unattributed, [
+      'A `dataUiId` prop declaration could not be attributed to a `function <Name>(` component.',
+      'It is probably an arrow-function component. Extend the attributor above — do NOT drop it,',
+      'or this guard silently stops covering it, which is exactly the defect it exists to catch.',
+    ].join('\n')).toEqual([]);
+    return out;
   }
 
-  it('AssetRefField/NumRow/Num/FieldValueWidget keep dataUiId REQUIRED, not optional', () => {
-    const HELPERS: { file: string; component: string }[] = [
-      { file: 'packages/modoki/src/editor/panels/AssetRefField.tsx', component: 'AssetRefField' },
-      { file: 'packages/modoki/src/editor/panels/MaterialOverridesField.tsx', component: 'NumRow' },
-      { file: 'packages/modoki/src/editor/panels/SpriteEditor.tsx', component: 'Num' },
-      { file: 'packages/modoki/src/editor/panels/inspectorFields.tsx', component: 'FieldValueWidget' },
-    ];
-    for (const { file, component } of HELPERS) {
-      const src = readScannedSource(path.resolve(__dirname, '../..', file)).code;
-      const params = extractFunctionParams(src, component);
-      expect(params, `${file}: could not find "function ${component}(" — has it been renamed or refactored?`).not.toBeNull();
-      const m = /\bdataUiId\s*(\??)\s*:/.exec(params!);
-      expect(m, `${file}: ${component}'s prop type has no "dataUiId:" annotation — has it been removed?`).not.toBeNull();
-      expect(m![1], `${file}: ${component}'s dataUiId prop reverted to optional ("dataUiId?:") — must stay REQUIRED`).toBe('');
+  it('every dataUiId-accepting component REQUIRES the prop, unless the call-site scan covers it', () => {
+    const decls = dataUiIdDeclarations();
+
+    // Non-vacuity. A `>=` floor, well under the 7 measured today, so a legitimate refactor that
+    // merges two wrappers does not go red — but a scan that has stopped finding anything does.
+    // Deliberately NOT a floor on the number of OFFENDERS: that kind counts down to zero as the
+    // fix succeeds, which is a countdown to a red gate rather than a pin (see #814's note on the
+    // synthetic aliveness pins in `corpusProducerIsShared.test.ts`).
+    expect(decls.length, 'the dataUiId declaration scan found almost nothing — it has broken')
+      .toBeGreaterThanOrEqual(5);
+
+    // The scan above enforces the primitives' call sites directly, so THEY may stay optional.
+    // Everything else is a wrapper: the type checker is the only thing standing behind it.
+    const offenders = decls
+      .filter((d) => d.optional && !(SCANNED_PRIMITIVES as readonly string[]).includes(d.component))
+      .map((d) => `${d.rel}:${d.line}  ${d.component}`);
+
+    expect(offenders, [
+      'These components accept an OPTIONAL `dataUiId` but are not primitives the call-site scan',
+      'covers — so nothing enforces that their callers pass one, and their controls render with',
+      'no data-ui-id for `modoki_tap`/`modoki_type_text` to aim at. This is #772 recurring.',
+      'Fix: make the prop REQUIRED (`dataUiId: string`) and let the type checker enumerate the',
+      'call sites. Do not add the component to SCANNED_PRIMITIVES unless the call-site scan above',
+      'genuinely matches its literal JSX tag.',
+      '',
+      ...offenders,
+    ].join('\n')).toEqual([]);
+
+    // The other direction: a primitive that stopped being scanned would silently become an
+    // unguarded wrapper. Pin that the exemption set is still exactly what the scan matches.
+    for (const tag of SCANNED_PRIMITIVES) {
+      expect(decls.some((d) => d.component === tag),
+        `${tag} is in SCANNED_PRIMITIVES but declares no dataUiId prop — renamed or removed? `
+        + 'Its exemption is now vouching for nothing.').toBe(true);
     }
   });
 });

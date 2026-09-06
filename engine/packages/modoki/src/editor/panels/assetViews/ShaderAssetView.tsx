@@ -95,14 +95,15 @@ export function ShaderAssetView({ path }: { path: string }) {
             </div>
 
             {/* Default value — the type-appropriate widget (number/color/bool/vecN/texture). */}
-            <ParamField name="default" param={param} value={param.default} onChange={(v) => writeParamMeta(key, 'default', v)} />
+            <ParamField name="default" param={param} value={param.default} onChange={(v) => writeParamMeta(key, 'default', v)}
+              idPrefix={`assetView.shader.param.${key}`} />
 
             {/* Numeric range + step (float/vecN). min/max clamp the default + the driven range. */}
             {numeric && (
               <div style={{ display: 'flex', gap: 6 }}>
-                <NumberField label="min" value={typeof param.min === 'number' ? param.min : 0} step={0.01} wide onChange={(v) => writeParamMeta(key, 'min', v)} />
-                <NumberField label="max" value={typeof param.max === 'number' ? param.max : 1} step={0.01} wide onChange={(v) => writeParamMeta(key, 'max', v)} />
-                <NumberField label="step" value={typeof param.step === 'number' ? param.step : 0.01} step={0.01} wide onChange={(v) => writeParamMeta(key, 'step', v)} />
+                <NumberField label="min" value={typeof param.min === 'number' ? param.min : 0} step={0.01} wide onChange={(v) => writeParamMeta(key, 'min', v)} dataUiId={`assetView.shader.param.${key}.min`} />
+                <NumberField label="max" value={typeof param.max === 'number' ? param.max : 1} step={0.01} wide onChange={(v) => writeParamMeta(key, 'max', v)} dataUiId={`assetView.shader.param.${key}.max`} />
+                <NumberField label="step" value={typeof param.step === 'number' ? param.step : 0.01} step={0.01} wide onChange={(v) => writeParamMeta(key, 'step', v)} dataUiId={`assetView.shader.param.${key}.step`} />
               </div>
             )}
 

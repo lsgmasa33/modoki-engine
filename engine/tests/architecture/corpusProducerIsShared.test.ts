@@ -22,20 +22,23 @@
  *  is exactly the gap `commentStripperIsShared.test.ts` (#419) closed for comment stripping. This
  *  file is that guard's direct structural twin, one mechanism over.
  *
- *  ⚠️ **SCOPE — this guard covers `engine/tests/**` and `engine/scripts/**` ONLY, and that is a
- *  real hole, not a tidy boundary.** A close-out sweep with this file's own detector found **15**
- *  recursive walkers outside it, and the notable ones are the same mechanism, not lookalikes:
- *  five source-scanning guards in `engine/packages/modoki/tests/**` — a SECOND vitest project this
- *  never reads, including `determinismGuard` which `CLAUDE.md` calls load-bearing — and
- *  `scripts/scan-publish-safety.mjs`, which is what `npm run verify:publish` runs, walking the
- *  FILESYSTEM with its own hand-maintained skip list while `publish-engine-oss.sh` ships from
- *  `git ls-files`. Two definitions of "the corpus" for the one gate that keeps private values out
- *  of a public repo.
+ *  **SCOPE — the WHOLE REPO, as of #814.** It covered `engine/tests/**` and `engine/scripts/**`
+ *  only, and its own docblock called that "a real hole, not a tidy boundary" while nothing acted
+ *  on the admission. Widening found **18** producers outside the old scope — including the five
+ *  source-scanning guards in `engine/packages/modoki/tests/**` (a SECOND vitest project this never
+ *  read, `determinismGuard` among them, which `CLAUDE.md` calls load-bearing) and two `ls-files`
+ *  spawns the issue had not noticed at all. All are now migrated or on the EXEMPT ledger below.
  *
- *  Tracked as **#814** rather than widened here: widening `under` turns this guard red until all
- *  of them are migrated, which is a phase of work, not a close-out edit. **Do not read a green run
- *  of this file as "no hand-rolled producers exist"** — it means none exist in the two trees named
- *  above. A documented gap becomes a licence exactly when nobody writes the gap down.
+ *  ⚠️ **`scripts/scan-publish-safety.mjs` is NOT "a second definition of the corpus"** — #814
+ *  filed it that way and the claim is disproved. `publish-engine-oss.sh:568` invokes it over
+ *  `$STAGE`, which `:167` rsyncs from that script's OWN `git ls-files` manifest, so it is
+ *  downstream of the enumeration rather than a rival to it. Measured 2026-09-06: tracked=9243,
+ *  walked=24099, tracked-but-NOT-walked = **0**.
+ *
+ *  ⚠️ **A green run still does not mean "no hand-rolled producers exist" in one direction: the
+ *  OSS snapshot.** It ships no `games/`, `site/` or `scripts/` rows, so the per-root pins and six
+ *  EXEMPT entries are gated on `repoLayout`'s predicates there — see `ROOT_PRESENT`. In this repo
+ *  the claim is unqualified.
  *
  *  Scanned via `repoFiles()` itself — a hand-rolled walk in THIS guard would be the exact
  *  violation it exists to police, one level up. Comments are stripped with the shared
@@ -49,6 +52,23 @@ import * as fs from 'node:fs';
 import ts from 'typescript';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { hasInternalGames, hasPublishScripts } from '../helpers/repoLayout';
+
+/** ⚠️ **The OSS snapshot ships `engine build docs` and a few root files — NO `games/`, `site/` or
+ *  `scripts/` rows at all**, and it runs `npm test` on every push to `main`. So a per-root pin or
+ *  an EXEMPT row naming one of those roots is definitionally unsatisfiable there, and #814's
+ *  widening turned this file from "ships and passes" into "ships and fails". Gated on the thing
+ *  each check actually needs, per `repoLayout.ts`'s own note about proxies. */
+const ROOT_PRESENT: Record<string, boolean> = {
+  'games/': hasInternalGames(),
+  'site/': hasPublishScripts(),
+  'scripts/': hasPublishScripts(),
+};
+
+/** True when this checkout carries the root a path lives under. Anything not listed is under
+ *  `engine/`, which the snapshot always ships. */
+const rootIsPresent = (rel: string): boolean =>
+  Object.entries(ROOT_PRESENT).every(([root, present]) => present || !rel.startsWith(root));
 
 /** Rule 1's target, assembled from two halves rather than written as one literal — the same
  *  reason `commentStripperIsShared.test.ts`'s `BLOCK_LAZY` is split: spelling it out would make
@@ -220,25 +240,127 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
     reason: 'Walks a depth-capped (3) DerivedData/build-product tree hunting `.dSYM` bundles — '
       + 'build output, not repo content, and already bounded rather than a general corpus walk.',
   },
+
+  /* ═══════════════════════════════════════════════════════ #814: the roots the widening exposed.
+   * Rule 1 first. Neither of these enumerates a corpus — both ask git a single, bounded question,
+   * which repoFiles() is the wrong tool for. */
+  {
+    file: 'engine/electron/connectClaude.ts', rule: 'ls-files',
+    reason: 'Asks `--error-unmatch` about ONE named file to answer "is this tracked?" — a '
+      + 'predicate, not an enumeration. repoFiles() would list the repo to answer a yes/no about a '
+      + 'single path, and its own git failure handling is the opposite of what this wants (it '
+      + 'returns \'unknown\' rather than falling back to a corpus).',
+  },
+  {
+    file: 'games/court/tests/sweepGate.test.ts', rule: 'ls-files',
+    reason: 'A POSITIVE CONTROL inside a mkdtemp THROWAWAY repo the test builds commit by commit: '
+      + 'it proves the merge actually carried the Court file, so the skip assertion after it is '
+      + 'not vacuous. repoFiles() reads THIS repo and could not see that one. Same shape as the '
+      + 'repoCorpus.test.ts entry above — the spawn IS the assertion.',
+  },
+
+  /* ─────────────────────────────────────────── Rule 2: a GAME cannot import engine/scripts (#29).
+   * These three walk tracked repo content and would otherwise be straightforward migrations. They
+   * are structurally barred: `games/<id>` is opened standalone and COPIED OUT of the monorepo, so
+   * a relative path from a game into `engine/scripts/` resolves only while it sits here —
+   * `engine/tests/assets/gamePortability.test.ts` forbids exactly that reach. It is the same
+   * forced duplication that makes `courtAuthored.mjs` and `sweepGate.ts` carry two copies of
+   * WATCHED, and the same one `projectRoots.mjs` documents. Not a backlog: there is nothing to
+   * migrate TO from inside a game. */
+  {
+    file: 'games/court/tests/courtCache.ts', rule: 'walker',
+    reason: 'Hashes Court\'s own source to key the sweep cache. Tracked content, but a game '
+      + 'cannot import engine/scripts/repoCorpus.mjs (#29 portability, gamePortability.test.ts). '
+      + 'Its HASH_ROOTS scope is a separate open question — see #830.',
+  },
+  {
+    file: 'games/court/tests/uiFontRoots.test.ts', rule: 'walker',
+    reason: 'Walks Court\'s asset tree to resolve font GUIDs. Same #29 bar as courtCache.ts.',
+  },
+  {
+    file: 'games/sling/tests/sling-assets.test.ts', rule: 'walker',
+    reason: 'Walks games/sling/runtime/assets to build a GUID->path map. Same #29 bar.',
+  },
+
+  /* ───────────────────────────────────────── Rule 2: BUILD-TIME or RUNTIME walks of a PROJECT dir
+   * or of build output — not the repo corpus. repoFiles() enumerates git-tracked-or-untracked-
+   * but-not-ignored files in THIS checkout, so it could not stand in for any of these even in
+   * principle: the directory each one walks is handed to it at build/run time and is frequently
+   * outside the repo entirely (an opened project, a dist/, a scaffold target). */
+  {
+    file: 'engine/electron/newProject.ts', rule: 'walker',
+    reason: 'Walks the freshly-scaffolded project OUTPUT it just copied, to token-substitute — '
+      + 'ephemeral and not yet tracked. Production twin of the newProject.test.ts entry above.',
+  },
+  {
+    file: 'engine/plugins/asset-tree-shaker.ts', rule: 'walker',
+    reason: 'Build-time walk of the OPEN PROJECT\'s asset tree to decide what ships. The project '
+      + 'may live outside this repo (a game copied out, #29), where repoFiles() sees nothing.',
+  },
+  {
+    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker',
+    reason: 'walkScripts() serves the editor backend at RUNTIME over the open project\'s dir — '
+      + 'again possibly outside this repo. A git enumeration is the wrong instrument for "what is '
+      + 'on disk right now" in a live editor.',
+  },
+  {
+    file: 'engine/plugins/detect-modules.ts', rule: 'walker',
+    reason: 'Build-time collectSceneFiles() over the open project\'s scenes/ subtree, to decide '
+      + 'which engine modules to bundle. Project dir, not repo corpus.',
+  },
+  {
+    file: 'engine/plugins/inlinePlayable.ts', rule: 'walker',
+    reason: 'Walks the playable BUILD OUTPUT to inline and then prune it — build output, never '
+      + 'tracked.',
+  },
+  {
+    file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker',
+    reason: 'Build-time scanDir() over the open project\'s assets to emit the manifest. Project '
+      + 'dir, not repo corpus.',
+  },
+  {
+    file: 'scripts/scan-publish-safety.mjs', rule: 'walker',
+    reason: 'Walks the assembled SNAPSHOT STAGE, not the repo — publish-engine-oss.sh:568 invokes '
+      + 'it as `scan-publish-safety.mjs "$STAGE"`, and $STAGE is rsynced (:167) from that script\'s '
+      + 'OWN `git ls-files` manifest. So it is downstream of the enumeration, not a second one. '
+      + '⚠️ #814 filed this as "a SECOND definition of the corpus"; that was DISPROVED and the '
+      + 'issue body corrected — measured 2026-09-06, tracked=9243 walked=24099, and files tracked '
+      + 'but NOT walked = 0.',
+  },
+  {
+    file: 'site/gen-sitemap.mjs', rule: 'walker',
+    reason: 'Walks site/.vitepress/dist — VitePress BUILD OUTPUT, gitignored, to emit sitemap.xml.',
+  },
 ];
 
 describe('corpus producers use the shared repoFiles()/repoCorpus.mjs (#799/#771/#805 Phase 2)', () => {
   const files = repoFiles({
-    under: ['engine/tests', 'engine/scripts'],
+    // ⚠️ **THE WHOLE REPO (#814).** This was `['engine/tests', 'engine/scripts']`, and that scope
+    // was not a tidy boundary — it was 16 unexamined producers, including `determinismGuard`,
+    // which CLAUDE.md calls load-bearing, and the publish-safety scanner. A green run used to mean
+    // "no hand-rolled producers in two trees"; it now means what the rule says.
     match: /\.(ts|mjs)$/,
     exclude: ['node_modules', 'dist'],
-    floor: 400,
+    floor: 1500,
   }).map(({ rel, abs }) => {
     const raw = fs.readFileSync(abs, 'utf8');
     return { rel, raw, code: stripComments(raw) };
   });
 
-  it('scans a substantial, floored set of files across BOTH engine/tests and engine/scripts', () => {
-    // The floor sits far under the real count (572 measured), so only a broken enumeration
-    // (a wrong `under`, a `match` that stops matching) can turn this red — never ordinary churn.
-    expect(files.length).toBeGreaterThan(400);
-    expect(files.some((f) => f.rel.startsWith('engine/tests/'))).toBe(true);
-    expect(files.some((f) => f.rel.startsWith('engine/scripts/'))).toBe(true);
+  it('scans a substantial, floored set of files across EVERY root a producer can live in', () => {
+    // The floor sits far under the real count (2831 measured 2026-09-06), so only a broken
+    // enumeration (a `match` that stops matching, a collapsed corpus) can turn this red — never
+    // ordinary churn. The per-root pins are the half that matters: an aggregate floor is satisfied
+    // by `engine/` alone while `games/`, `site/` and `scripts/` contribute nothing, which is
+    // exactly the shape of the scope bug this widening fixes (#814).
+    expect(files.length).toBeGreaterThan(1500);
+    for (const root of ['engine/tests/', 'engine/scripts/', 'engine/packages/modoki/tests/',
+      'engine/plugins/', 'engine/electron/', 'games/', 'site/', 'scripts/']) {
+      // Skipped in the OSS snapshot, which ships none of these roots — see ROOT_PRESENT.
+      if (!rootIsPresent(root)) continue;
+      expect(files.some((f) => f.rel.startsWith(root)), `no files scanned under ${root} — the `
+        + 'enumeration has narrowed and this guard is silently back to covering a subset').toBe(true);
+    }
   });
 
   it('the comment strip is length- and line-exact for every scanned file', () => {
@@ -294,7 +416,13 @@ describe('corpus producers use the shared repoFiles()/repoCorpus.mjs (#799/#771/
     for (const e of EXEMPT) {
       const f = byRel.get(e.file);
       if (!f) {
-        stale.push(`${e.file} — no longer exists in the scanned corpus; drop this entry`);
+        // ⚠️ ABSENT-BY-LAYOUT is not STALE. Six rows name files under games//site//scripts/,
+        // which the OSS snapshot does not ship — reporting those as stale there would demand
+        // deleting rows that are load-bearing in the private repo. Only a file whose ROOT is
+        // present and which has nonetheless vanished is a real stale entry.
+        if (rootIsPresent(e.file)) {
+          stale.push(`${e.file} — no longer exists in the scanned corpus; drop this entry`);
+        }
         continue;
       }
       const stillFlags = e.rule === 'ls-files'
@@ -363,7 +491,12 @@ describe('corpus producers use the shared repoFiles()/repoCorpus.mjs (#799/#771/
    * files with a `grep -vE`. The snapshot is a small explicit subset, not a subtraction, which is
    * why `engine/` surviving nearly whole is a fact to MEASURE rather than to reason to.
    */
-  it('both `under` roots are really scanned, and neither has been carved up', () => {
+  it('the engine/tests subtree is scanned SUBDIRECTORY by subdirectory, not carved up', () => {
+    // ⚠️ Renamed at #814: there is no `under` any more (the scan is the whole repo), so the old
+    // title "both `under` roots" described a filter that no longer exists. The assertion still
+    // earns its place and is NOT redundant with the per-root pin above: that one proves each ROOT
+    // contributes, this one proves each engine/tests SUBDIRECTORY does — a finer grain, and the
+    // one an `exclude` entry actually breaks.
     // Replaces a test that asserted `typeof hasInternalGames === 'function'` — which could not
     // fail, and so vouched for the note above without checking any part of it. The concrete edit
     // it missed: adding 'fixtures' to `exclude` drops the scan from 567 files to ~500 and the old

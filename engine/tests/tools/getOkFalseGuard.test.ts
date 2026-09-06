@@ -26,14 +26,33 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { join } from 'node:path';
+import path, { join } from 'node:path';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 import { readScannedSource } from '@modoki/engine/testing';
 
+/** ⚠️ **This listed THREE files while a sibling guard over the same subject listed six (#830).**
+ *  `routeCoverage.test.ts:31` enumerates "every file that dispatches on an `/api/*` path" as six;
+ *  this one scanned three, and nothing compared them. `electron/backendServer.ts` and
+ *  `plugins/vite-asset-scanner.ts` both dispatch on `/api/` and were never read here — so a bare
+ *  `200 {ok:false}` in either was invisible to the guard written to forbid exactly that.
+ *
+ *  Repo-relative now (they were `../../`-relative), so the completeness check below can compare
+ *  them against a repo-wide marker without two path vocabularies. */
+const REPO = path.resolve(__dirname, '../../..');
+
 const ROUTE_FILES = [
-  '../../plugins/backend/editorBackendRouter.ts',
-  '../../electron/main.ts',
-  '../../electron/inputRoutes.ts',
+  'engine/electron/backendServer.ts',
+  'engine/electron/inputRoutes.ts',
+  'engine/electron/main.ts',
+  'engine/plugins/backend/editorBackendRouter.ts',
+  'engine/plugins/vite-asset-scanner.ts',
 ];
+
+/** A file that DISPATCHES on an `/api/*` path — it compares a request path against one, rather
+ *  than merely naming a route it calls. That distinction is the whole marker: 35 files under
+ *  `engine/` mention an `/api/` literal and almost all are CLIENTS. */
+const DISPATCHES_ON_API = /(===|==|startsWith\()\s*'\/api\//;
 
 type Block = { file: string; route: string; line: number; text: string };
 
@@ -87,9 +106,22 @@ export function okFalseResponses(text: string): Array<{ hasStatus: boolean; snip
 }
 
 describe('a GET route never answers a bare 200 with ok:false', () => {
-  const blocks = ROUTE_FILES.flatMap((rel) => {
-    const abs = join(__dirname, rel);
-    return getBlocks(rel, readScannedSource(abs).code);
+  const blocks = ROUTE_FILES.flatMap((rel) => (
+    getBlocks(rel, readScannedSource(join(REPO, rel)).code)
+  ));
+
+  it('ROUTE_FILES covers every file that dispatches on /api/ (#830)', () => {
+    assertDeclaredListIsComplete({
+      label: 'ROUTE_FILES in getOkFalseGuard.test.ts',
+      declared: ROUTE_FILES,
+      population: repoFiles({ under: 'engine', match: /\.(ts|mjs)$/, floor: 100 })
+        .map(({ rel }) => rel)
+        .filter((rel) => !/\/tests?\//.test(rel))
+        .filter((rel) => DISPATCHES_ON_API.test(readScannedSource(join(REPO, rel)).code)),
+      floor: 5,
+      fix: 'A new /api/* router must be listed here, or a bare 200 {ok:false} in it is invisible '
+        + 'to the guard that exists to forbid one.',
+    });
   });
 
   it('the scan has real targets (a text guard that finds nothing passes silently)', () => {
@@ -170,7 +202,7 @@ function postBlocks(file: string, src: string): Block[] {
 }
 
 describe('a POST route\'s ok:false always says WHY', () => {
-  const blocks = ROUTE_FILES.flatMap((f) => postBlocks(f, readScannedSource(join(__dirname, f)).code));
+  const blocks = ROUTE_FILES.flatMap((f) => postBlocks(f, readScannedSource(join(REPO, f)).code));
 
   it('reaches the POST routes at all (a text guard that lost its target fails OPEN)', () => {
     expect(blocks.length, 'no POST route blocks found — did the route dispatch shape change?').toBeGreaterThan(5);

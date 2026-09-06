@@ -12,8 +12,8 @@ import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
-import { parseClipBank } from '../audio/clipBank';
-import { parseAnimClipBank } from '../animation/animClipBank';
+import { parseClipBankResult } from '../audio/clipBank';
+import { parseAnimClipBankResult } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
@@ -1283,7 +1283,13 @@ export function collectResourceRefsFromEntities(
     // handled by the loop above.
     const audioSrc = entry.traits['AudioSource'] as Record<string, unknown> | undefined;
     if (audioSrc && typeof audioSrc !== 'boolean') {
-      for (const c of parseClipBank(audioSrc.clips)) if (looksFetchable(c.ref)) add('audio', c.ref);
+      // #731: parseClipBank's own never-throws contract collapses "no bank" and "malformed bank"
+      // into the same `[]` — a corrupt AudioSource.clips bank would then silently ship with none
+      // of its clips acquired, and the game plays silence with no signal. The Result variant tells
+      // the two apart so the malformed case is at least visible.
+      const { entries: audioClips, malformed: audioClipsMalformed } = parseClipBankResult(audioSrc.clips);
+      if (audioClipsMalformed) console.warn(`[loadSceneFile] malformed AudioSource.clips bank — its clips will not be acquired: ${JSON.stringify(audioSrc.clips)}`);
+      for (const c of audioClips) if (looksFetchable(c.ref)) add('audio', c.ref);
     }
     // Animator.clips — the named keyframe-clip bank, a JSON-string `[{name, clip, …}]`.
     // Each `clip` is a `.anim.json` GUID; parse + collect so a multi-clip animator's clips
@@ -1291,7 +1297,11 @@ export function collectResourceRefsFromEntities(
     // ref), so Animator intentionally has NO entry in REF_FIELDS_BY_TRAIT.
     const animator = entry.traits['Animator'] as Record<string, unknown> | undefined;
     if (animator && typeof animator !== 'boolean') {
-      for (const c of parseAnimClipBank(animator.clips)) if (looksFetchable(c.clip)) add('animation', c.clip);
+      // #731: same fail-open shape as AudioSource.clips above — a malformed bank must not read as
+      // an empty, correctly-authored one.
+      const { entries: animClips, malformed: animClipsMalformed } = parseAnimClipBankResult(animator.clips);
+      if (animClipsMalformed) console.warn(`[loadSceneFile] malformed Animator.clips bank — its clips will not be acquired: ${JSON.stringify(animator.clips)}`);
+      for (const c of animClips) if (looksFetchable(c.clip)) add('animation', c.clip);
     }
     // Renderable2D.sprite is USUALLY a texture, but a video GUID is legal there too
     // (a moving picture on a 2D sprite). Type it by what the asset actually IS, not by
@@ -1467,17 +1477,19 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   //
   // Classification happens at BOTH this site and in `SceneManager.loadScene` (right
   // after `parseAssetJson`, before `collectSceneResourceRefs`) — not because it was
-  // moved, but because `SceneManager.collectSceneResourceRefs` mutates the very same
-  // object with `sceneData.version = Math.max(sceneData.version ?? 6, 6)` BEFORE ever
-  // calling this function, and `Math.max` numerically coerces a non-numeric version
-  // into a valid one. By the time the guard below runs on a `SceneManager`-driven
-  // load, it is looking at an already-laundered version and the `unreadable` verdict
-  // is unreachable through that path — `SceneManager` is the only non-test caller of
-  // `loadSceneFile` (#784 phase C adversarial review, finding 1). The guard stays
-  // HERE too because `loadSceneFile` is the single entry every OTHER path funnels
-  // through — `preloaded` snapshots, direct test/tool calls — and both sites route
-  // through the same `classifyFormatVersion` and the same `SceneFormatRefusedError`,
-  // so they cannot disagree on the verdict.
+  // moved, but because `SceneManager` mutates the same object (assigning
+  // `sceneData.resources`) and spawns entities from it before ever calling this
+  // function, so a too-new/unreadable scene must be refused before that happens,
+  // not merely before this function's own migration ladder runs — `SceneManager` is
+  // the only non-test caller of `loadSceneFile` (#784 phase C adversarial review,
+  // finding 1). The guard stays HERE too because `loadSceneFile` is the single
+  // entry every OTHER path funnels through — `preloaded` snapshots, direct
+  // test/tool calls — and both sites route through the same `classifyFormatVersion`
+  // and the same `SceneFormatRefusedError`, so they cannot disagree on the verdict.
+  // (#807 removed a `sceneData.version = Math.max(sceneData.version ?? 6, 6)` tail
+  // that used to sit at the end of `collectSceneResourceRefs` and ran before this
+  // guard on a `SceneManager`-driven load — it doesn't factor into either site's
+  // reasoning any more.)
   const verdict = classifyFormatVersion(data, SCENE_FORMAT_VERSION);
   if (verdict.kind === 'too-new') {
     throw new SceneFormatRefusedError(

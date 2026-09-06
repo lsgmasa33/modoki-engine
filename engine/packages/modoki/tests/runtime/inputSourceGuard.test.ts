@@ -13,10 +13,11 @@
  *  exception (dev-only tooling, not gameplay input), not a silent pass. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
+import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = join(HERE, '../../../../..');
@@ -60,18 +61,13 @@ function scanAll(files: string[]): { abs: string; rel: string; raw: string; code
 
 /** All .ts/.tsx (non-test) files under `dir`, skipping any path segment `skip`. */
 function tsFiles(dir: string, skip?: string): string[] {
-  const out: string[] = [];
-  if (!existsSync(dir)) return out;
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) {
-      if (skip && name === skip) continue;
-      out.push(...tsFiles(full, skip));
-    } else if (/\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name)) {
-      out.push(full);
-    }
-  }
-  return out;
+  if (!existsSync(dir)) return [];
+  return repoFiles({
+    under: dir,
+    match: (rel) => /\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel),
+    ...(skip ? { exclude: [skip] } : {}),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** Engine runtime (minus the sanctioned `input/` sources). */

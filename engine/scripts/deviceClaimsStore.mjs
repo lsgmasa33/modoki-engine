@@ -257,7 +257,19 @@ function withLock(fn) {
     try {
       fs.mkdirSync(lock);
       break;
-    } catch {
+    } catch (e) {
+      // ONLY EEXIST means "another process holds the lock" — the contention this loop exists to
+      // wait out. Any other errno (EACCES/EROFS/ENOSPC) is a REAL failure, not contention:
+      // `fs.statSync(lock)` right below would then throw ENOENT (the lock dir was never created),
+      // its own catch would `continue`, and the loop would retry the identical failing `mkdirSync`
+      // forever — an unbounded synchronous spin that skips the deadline check entirely (same shape
+      // as `buildClaimsStore.mjs`'s own fix, which this mirrors). Fail loud instead, naming the
+      // path and the errno. Does NOT change the "give up and proceed unlocked" behaviour below for
+      // genuine EEXIST contention past the deadline — that divergence from buildClaimsStore.mjs is
+      // deliberate and untouched (see this function's own header).
+      if (e?.code !== 'EEXIST') {
+        throw new Error(`Could not create the device-claims lock directory (${lock}): ${e?.code ?? ''} ${e?.message ?? e}`.trim(), { cause: e });
+      }
       let age;
       try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; /* vanished — retry */ }
       if (age > LOCK_STALE_MS) { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ } continue; }

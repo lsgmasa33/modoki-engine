@@ -9,7 +9,12 @@
  *
  *  NOT to be confused with `AudioSource.clips` (audio.clipBank — `[{key,ref}]`) or the
  *  `.spriteanim.json` / `.animset.json` clip SETS (separate assets); this bank lives inline
- *  on the keyframe `Animator` trait and its `clip` refs are `.anim.json` GUIDs. */
+ *  on the keyframe `Animator` trait and its `clip` refs are `.anim.json` GUIDs.
+ *
+ *  `parseAnimClipBankResult` (below) additionally reports WHETHER the input was malformed, for a
+ *  caller that wants to warn on it (#731); `parseAnimClipBank` stays the plain never-throws `[]`
+ *  contract every existing caller already relies on — same split as `loadVendorPlugins.mjs`'s
+ *  `loadEnginePluginModuleResult`/`loadEnginePluginModule`. */
 
 export interface AnimatorClip {
   /** Selector name used as the active pointer (idle/walk/jump). */
@@ -24,11 +29,22 @@ export interface AnimatorClip {
   fadeDuration?: number;
 }
 
-export function parseAnimClipBank(src: unknown): AnimatorClip[] {
-  if (typeof src !== 'string' || src === '') return [];
+export interface AnimClipBankResult {
+  entries: AnimatorClip[];
+  /** True when `src` was a non-empty string that could NOT be decoded into a valid clip-bank
+   *  array — corrupt/truncated JSON, or JSON of the wrong top-level shape. `false` for "no bank
+   *  authored" (absent/empty `src`) — that is not a failure, so a caller deciding whether to warn
+   *  must not conflate the two (#731, the sibling of #714's `loadEnginePluginModuleResult`). Does
+   *  NOT flag an otherwise-valid array containing a dropped entry (missing `name`/`clip`) — that
+   *  is normal authoring, not corruption. */
+  malformed: boolean;
+}
+
+export function parseAnimClipBankResult(src: unknown): AnimClipBankResult {
+  if (typeof src !== 'string' || src === '') return { entries: [], malformed: false };
   let raw: unknown;
-  try { raw = JSON.parse(src); } catch { return []; }
-  if (!Array.isArray(raw)) return [];
+  try { raw = JSON.parse(src); } catch { return { entries: [], malformed: true }; }
+  if (!Array.isArray(raw)) return { entries: [], malformed: true };
   const out: AnimatorClip[] = [];
   for (const e of raw) {
     if (!e || typeof e !== 'object') continue;
@@ -40,7 +56,15 @@ export function parseAnimClipBank(src: unknown): AnimatorClip[] {
     if (typeof fadeDuration === 'number') entry.fadeDuration = fadeDuration;
     out.push(entry);
   }
-  return out;
+  return { entries: out, malformed: false };
+}
+
+/** Thin wrapper over {@link parseAnimClipBankResult} — the plain `[]`-on-failure contract every
+ *  existing caller (the play loop, the resource collector, …) relies on and the header's
+ *  "never throws" promise names. A caller that must tell "no bank" apart from "malformed bank" —
+ *  today only the build tree-shaker, which decides whether to warn — uses the Result function. */
+export function parseAnimClipBank(src: unknown): AnimatorClip[] {
+  return parseAnimClipBankResult(src).entries;
 }
 
 /** Serialize a bank back to its JSON-string form (inverse of `parseAnimClipBank`).

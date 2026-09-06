@@ -13,7 +13,7 @@ import { makeDeviceEvalApi } from './deviceEvalApi';
 import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { setJournalEnabled } from '@modoki/engine/runtime';
+import { setJournalEnabled, getFrameLoopHealth } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
@@ -62,6 +62,29 @@ export const INPUT_MECHANISM = 'synthetic' as const;
  *  drift between the six string-returning handlers that call it. */
 function withMechanismSuffix(reply: string): string {
   return reply.startsWith('Error:') ? reply : `${reply} [input:${INPUT_MECHANISM}]`;
+}
+
+/** Refuse an input dispatch when the frame loop cannot actually deliver it (#682).
+ *
+ *  The "hold ~1-2 frames" `setTimeout`s below (and in `handlePressKey`/`handlePointer`) assume
+ *  per-frame `Input` sampling is running so the down/up edge gets seen — true only while the ECS
+ *  pipeline is registered as a frame callback and rAF is actually pumping it. On a dead chain the
+ *  wall-clock timer still fires (timers keep running — `declareUnrecoverable`'s own text), the
+ *  dispatch below still runs, and the reply still says `ok`, but zero frames pass and
+ *  `inputSystem` never samples anything: a false success, worse than a hang because the caller
+ *  acts on it.
+ *
+ *  `device_step`'s existing refusal (`agentBridge.ts`) GUESSES — "the frame loop may be stopped".
+ *  `getFrameLoopHealth()` can say it FOR CERTAIN: `.detail` already states how long, whether the
+ *  watchdog has given up (`unrecoverable`), and whether the GPU device was lost, so this reuses it
+ *  rather than re-deriving the same facts. Returns `null` (proceed) unless the loop is genuinely
+ *  `'stalled'` or `unrecoverable` — `'idle'`/`'hidden'` are left alone: a loop that never armed at
+ *  all (no viewport mounted yet) or is merely throttled by an occluded window is not this bug. */
+function frameLoopRefusal(op: string): string | null {
+  const h = getFrameLoopHealth();
+  if (h.status !== 'stalled' && !h.unrecoverable) return null;
+  return `Error: refusing ${op} — ${h.detail ?? `the frame loop has not ticked for ${h.msSinceLastFrame}ms`} `
+    + 'Dispatching this input now would report success while the game never receives it.';
 }
 
 // The bridge's OWN logging, deliberately kept OUT of `consoleRing` (avoids a feedback loop, and
@@ -470,6 +493,8 @@ function handleReleaseHeldPointer(): { released: string | null } {
 }
 
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('tap');
+  if (refusal) { _log(`[debug-bridge] TAP → ${refusal}`); return refusal; }
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
@@ -478,6 +503,8 @@ export async function handleTap(params: Record<string, unknown>): Promise<string
 }
 
 export async function handleDrag(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('drag');
+  if (refusal) { _log(`[debug-bridge] DRAG → ${refusal}`); return refusal; }
   const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY');
   if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return fromAim.error; }
   const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY');
@@ -831,8 +858,20 @@ function mkButtonedPointerEvent(type: string, x: number, y: number, button: numb
 // backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
 // module import cleanly (measured), so a direct call is the honest way to cover them.
 export async function handlePointer(params: Record<string, unknown>): Promise<string> {
-  const stillLive = leaseLiveness.capture();
   const action = params.action as string;
+  // `frameLoopRefusal` exists to stop an ACQUIRE from reporting success into a dead loop — it must
+  // not also block the RELEASE half of an already-held gesture. Refusing 'up' here strands the
+  // press down forever (down landed while healthy, the loop then stalled, up gets refused), which
+  // is exactly the state-leaking failure this guard's own error text warns against — just on the
+  // other end of the gesture. `deviceCdp.ts`'s `releaseHeldBeforeTrustedGesture` treats "a failure
+  // after one landed leaves a finger DOWN" as the hazard to avoid, not to cause (#682 close-out
+  // round 3, MEDIUM 3 — round 1's defect in a new hat: a guard meant for the acquire half applied
+  // to both).
+  if (action !== 'up') {
+    const refusal = frameLoopRefusal('pointer');
+    if (refusal) return refusal;
+  }
+  const stillLive = leaseLiveness.capture();
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
   }
@@ -980,6 +1019,9 @@ function readFocusedValue(el: HTMLElement): string | null {
  *  ` [input:synthetic]` suffix those use; a failure carries no field, matching the string handlers'
  *  rule that a refusal never claims a mechanism because nothing was dispatched. */
 export async function handleType(params: Record<string, unknown>): Promise<{ ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof INPUT_MECHANISM }> {
+  // Object-shaped twin of the string handlers' refusal above — see `frameLoopRefusal`.
+  const refusal = frameLoopRefusal('type-text');
+  if (refusal) return { ok: false, typed: 0, activeElement: null, error: refusal };
   const text = params.text;
   if (typeof text !== 'string') return { ok: false, typed: 0, activeElement: null, error: 'type-text needs a `text` string' };
 
@@ -1066,6 +1108,8 @@ function keyToCode(key: string): string {
  *  drive gameplay keys. Dispatched on the focused element (bubbles to `window`, where the menu +
  *  input sources listen). The hold lets per-frame input sampling see the down edge. */
 export async function handlePressKey(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('press-key');
+  if (refusal) return refusal;
   const key = params.key as string;
   if (!key) return 'Error: press-key needs a key';
   const mods = (params.modifiers as string[]) ?? [];
@@ -1084,6 +1128,8 @@ export async function handlePressKey(params: Record<string, unknown>): Promise<s
 /** Hover: move the pointer over the resolved element/point (pointerover/enter/move + mousemove) so
  *  :hover styles, tooltips, and hover-gated UI light up. */
 export async function handleHover(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('hover');
+  if (refusal) return refusal;
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) return aim.error;
   const el = document.elementFromPoint(aim.x, aim.y);
@@ -1098,6 +1144,8 @@ export async function handleHover(params: Record<string, unknown>): Promise<stri
 
 /** Scroll: dispatch a wheel event at the resolved point (defaults to viewport center). */
 export async function handleScroll(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('scroll');
+  if (refusal) return refusal;
   const hasAim = typeof params.selector === 'string' || (typeof params.x === 'number' && typeof params.y === 'number');
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const aim = await resolveAim(p, 'selector', 'x', 'y');

@@ -47,6 +47,18 @@ native plugins → `dist/`) **and** `engine/scripts/bootstrap-game-deps.mjs`, wh
 `dist/` is what makes `npm test` / the editor fail with `Failed to resolve import
 "capacitor-<x>"`. See the Two Clones section of `CLAUDE.md`.
 
+⚠️ **This makes a plain `npm install` a TRACKED-FILE mutator, not just a `dist/`/`node_modules`
+one.** `bootstrap-game-deps.mjs` calls `vendorEnginePlugins(gameDir, repoRoot, {canBuild: true})`
+for every game — and when an engine `capacitor-*` plugin's source differs from its
+already-committed tarball, that re-vendor writes a new `games/<id>/plugins/*.tgz` and rewrites the
+matching `games/<id>/package.json` dep spec, both git-tracked, across as many as 26 projects at
+once. Correctly gated (only a stale tarball triggers a re-pack), so a clean checkout with nothing
+to vendor sees no churn — but it means the rewrite can land in your working tree from an `npm
+install` you ran for an unrelated reason. This is exactly the CLAUDE.md `git add -A` scar (#18): a
+developer who installs deps and then stages broadly (`git add -A`/`git add .`) sweeps these
+re-vendored files into whatever commit they were about to make. Stage paths explicitly, and check
+`git diff --cached -- games/` before committing after any `npm install`.
+
 The chain also runs `engine/scripts/stamp-plugin-builds.mjs` immediately after `build:plugins`
 (#395). `build:plugins` builds each plugin's `dist/` directly and wrote no **build stamp**, so the
 next caller of `ensurePluginBuilt` (the editor on open, the vendorer, a test) read a perfectly
@@ -465,10 +477,12 @@ clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed on
 or connect it in the editor), and release the moment you are done — a claim is machine-wide and
 locks that phone out of every other clone and out of the owner's own hands.
 
-### One build at a time (#173)
+### One build at a time (#173, #650)
 
-**Three routes compile into the same `<project>/dist`, so they share ONE slot** — not one lock each.
-`/api/build`, `/api/ota/publish`, and `/api/add-native-target` all run the byte-identical
+**SIX entry points compile into the same `<project>/dist`, so they share ONE slot** — not one lock
+each. Three editor routes (`/api/build`, `/api/ota/publish`, `/api/add-native-target`) and three CLI
+scripts (`build-web.mjs`, `add-native-targets.mjs`, `ota-publish.mjs`), which
+[§ CLI recipes](#cli-recipes) tells you to run by hand. The three routes all run the byte-identical
 `node engine/scripts/build-web.mjs --target native` from the same cwd into the same `dist`
 (`vite-asset-scanner.ts` build steps · the publish route's step 1 · `addNativeTarget.ts`). Whichever
 starts second rewrites that dist while the first is still copying it, and the failure is quiet:
@@ -483,6 +497,36 @@ starts second rewrites that dist while the first is still copying it, and the fa
   two scaffolds for one platform also race the `isNativeTargetScaffolded` gate that is supposed to
   make the route a no-op. (That gate checks for the platform's real project file, not just the
   folder — a folder a killed scaffold left half-written is a *different* hazard, fixed in #581.)
+
+**Two layers, because one process cannot see the other (#650).** `acquireBuild`
+(`plugins/backend/buildLock.ts`) is a module-level flag: it closes build-vs-build *inside one
+backend process* — an agent firing `modoki_build` while a human's build runs — and is blind to
+everything else. A CLI script is a SEPARATE PROCESS, so the documented by-hand recipe raced the
+editor's publish through a path the flag provably could not observe. `acquireBuildSlot` now takes
+both: the in-process flag, plus a cross-process claim in `~/.modoki/build-claims.json`
+(`scripts/buildClaimsStore.mjs` — an O_EXCL `mkdir` lock, an atomic temp+rename write, and dual
+pid/TTL staleness, the shape `deviceClaimsStore.mjs` already uses for hardware). The CLI scripts
+take the claim and **refuse and exit** rather than waiting: a scripted build must not hang on an
+interactive editor, which is what the routes already do.
+
+⚠️ **The holder SPAWNS a child that wants the same claim, and that nearly shipped as a deadlock.**
+Every route's first pipeline step is `node engine/scripts/build-web.mjs` with
+`MODOKI_PROJECT=<projectRoot>` — the child then asks for a claim on the identical key and, without
+a re-entrancy rule, is refused by its own parent. The fix: a successful grant publishes its token on
+`MODOKI_BUILD_CLAIM_TOKEN`, which every spawn path already inherits via `{ ...process.env }`; a
+later request for the SAME resolved root whose env token matches the live claim's token **and comes
+from a different pid** gets a pass-through handle with a no-op `release()`, so a child exiting first
+cannot free its parent's claim. The different-pid half is load-bearing on its own — without it the
+ancestor re-acquiring on *itself* would pass through, silently defeating the one-claim rule.
+
+⚠️ **The test that was supposed to catch this is the reason it got as far as it did.**
+`tests/architecture/cliBuildClaims.test.ts` was pure source-text matching: it asserted that each
+script *calls* `acquireBuildClaim` — and "every entry point calls the claim" is precisely the
+property that produces the deadlock. It did not merely miss the defect, it confirmed the thing that
+caused it, and it was green throughout. A source grep cannot see composition, reachability, or what
+happens when two of the asserted call sites are parent and child. The coverage that matters here is
+the integration test in that same file which **actually spawns `build-web.mjs` under a held claim**;
+add one of those before trusting any future grep-shaped guard in this family.
 
 Refused, not queued: these run for minutes and nothing cancels one, so a queued SSE stream would sit
 silent and read as a wedged editor. The refusal is a `FAILED:` status naming what holds the slot
@@ -1253,7 +1297,7 @@ result:
 | `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
 | `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
 | `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
-| `verifyInstalledMatchesTarball` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
+| `verifyInstalledMatchesTarballResult` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
 
 Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
 tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
@@ -1419,13 +1463,13 @@ undoes nothing.
 in-place re-pack means no in-repo re-vendor can CAUSE the state, and `bootstrap-game-deps` never
 skipping a present `node_modules` (the #215 scar) means an install always runs — but note that a
 plain `npm install` on an already-poisoned tree does NOT heal it, so neither of those is a cure.
-The cure is the detector: `verifyInstalledMatchesTarball` compares tarball to installed and fails
+The cure is the detector: `verifyInstalledMatchesTarballResult` compares tarball to installed and fails
 both native build paths regardless of how the state arose. ⚠️ **One gap, and it is narrower than it
 looks**: `build-web.mjs` loads `vendorPlugins.ts` through esbuild at runtime and, when that load
 returns null, prints a loud warning and skips the check. A packaged editor is that case — it ships
 the `.ts` sources but prunes esbuild as a devDependency — so a bare `node engine/scripts/build-web.mjs`
 there would not check. The editor's own **Build menu is unaffected**: `/api/build` imports
-`verifyInstalledMatchesTarball` statically and fails before it ever spawns the CLI. What stays reachable otherwise is a mis-resolved `.tgz` binary merge conflict (tarball
+`verifyInstalledMatchesTarballResult` statically and fails before it ever spawns the CLI. What stays reachable otherwise is a mis-resolved `.tgz` binary merge conflict (tarball
 from one side, lockfile from the other) or hand-editing.
 
 ⚠️ **That gap is a DECISION, not an oversight — do not "fix" it without new evidence** (owner,

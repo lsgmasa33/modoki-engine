@@ -27,9 +27,16 @@ import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
+/** Every test root in the repo, not the two somebody listed (#830). The claim this guard makes is
+ *  universal — "**no test** may compute it inline" — and `games/<id>/tests/` and `demos/<id>/tests/`
+ *  are test roots the sibling guards (`commentStripperIsShared`, `testFilesAreCollected`) both
+ *  enumerate. No offender lives there today, so this widening is latent-by-measurement rather than
+ *  a fix; the point is that the scope now matches the sentence. */
 const TEST_DIRS = [
   path.join(REPO_ROOT, 'engine', 'tests'),
   path.join(REPO_ROOT, 'engine', 'packages', 'modoki', 'tests'),
+  path.join(REPO_ROOT, 'games'),
+  path.join(REPO_ROOT, 'demos'),
 ];
 
 /** The helper is the one legitimate place to compute this. This guard is excluded because it
