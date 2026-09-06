@@ -79,7 +79,6 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [pairing-mode.md](./pairing-mode.md) | Pairing mode — parking on `modoki_wait_for_edit` to be woken by the human's editor activity instead of polling `editor_journal`, what the wake event does/doesn't tell you, and the gotchas (unsaved-edit reload, guid-not-id) it inherits |
 | [connect-claude-code.md](./connect-claude-code.md) | Design + rationale for the shipped **AI → Connect Claude Code** flow — the dockable AI panel that one-click wires the user's own Claude Code to the running editor's `modoki` MCP **and** CDP (chrome-devtools) in the DMG/exe, plus the MCP tool-quality re-audit decisions (§15) |
 | [vscode-debugging.md](./vscode-debugging.md) | Setting VS Code breakpoints in the Electron editor's main (Node) and renderer (Chromium) processes |
-| [multi-ai-cli-support.md](./multi-ai-cli-support.md) | Cursor / Codex CLI / Antigravity CLI support alongside Claude Code — generated `AGENTS.md` + `.cursor/mcp.json` + `.codex/config.toml`, the sync guard, and why generation (not a symlink) |
 
 ## Native & Build
 

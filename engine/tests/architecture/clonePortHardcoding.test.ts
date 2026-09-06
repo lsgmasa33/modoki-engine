@@ -27,14 +27,14 @@ import { CLONE_BACKEND_PORTS, vitePortForBackend, cdpPortForBackend } from '../.
 
 const REPO = path.resolve(__dirname, '../../..');
 const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
-// The public engine snapshot ships neither the committed agent-CLI configs
-// (.mcp.json/.cursor/.codex) nor engine/scripts/** — both are private-repo-only.
+// The public engine snapshot ships neither the committed agent-CLI config
+// (.mcp.json) nor engine/scripts/** — both are private-repo-only.
 const skip = !hasPrivateTooling();
 
-/** Every committed file that configures an MCP server for an agent CLI. The root `.mcp.json` is the
- *  source; the other two are GENERATED from it by `npm run sync:agent-configs` — included here so a
- *  hand-edit (which the doc conventions forbid) cannot smuggle a literal port past this guard. */
-const MCP_CONFIGS = ['.mcp.json', '.cursor/mcp.json', '.codex/config.toml'];
+/** The single committed file that configures an MCP server for an agent CLI — `.mcp.json`, the one
+ *  hand-authored source (Cursor/Codex CLI support, and the generated configs mirroring it, were
+ *  dropped). */
+const MCP_CONFIGS = ['.mcp.json'];
 
 /** The per-clone lanes from root CLAUDE.md § Clones. A literal occurrence of any of these in a
  *  shared config is the bug — UNLESS it is the default of a `${VAR:-…}` expansion, which is the

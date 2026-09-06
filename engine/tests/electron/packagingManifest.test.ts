@@ -113,7 +113,7 @@ describe('electron-builder packaging manifest', () => {
     }
     // …and the excludes we DO want must actually match what they claim to.
     for (const [file, glob] of [
-      ['engine/tests/assets/agentConfigSync.test.ts', 'engine/tests/**'],
+      ['engine/tests/assets/publishExclusions.test.ts', 'engine/tests/**'],
       ['engine/packages/modoki/tests/runtime/clock.test.ts', 'engine/packages/*/tests/**'],
     ] as const) {
       expect(picomatch.isMatch(file, glob), `${glob} should match ${file}`).toBe(true);

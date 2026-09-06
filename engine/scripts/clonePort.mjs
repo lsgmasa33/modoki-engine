@@ -62,8 +62,7 @@ export function defaultRepoRoot() {
 //      `/var` are symlinks), where the URL is already resolved and argv[1] is not.
 // pathToFileURL fixes 1 and 2 but NOT 3, so it is not enough on its own. realpath both
 // sides and the comparison is about file identity, which is what "am I the entry point?"
-// actually means. (sync-agent-configs.mjs documents trap 1-2 and uses pathToFileURL; it
-// carries hole 3 in theory, but it is only ever run as an npm script from the repo root.)
+// actually means.
 const isEntryPoint = () => {
   if (!process.argv[1]) return false;
   try {

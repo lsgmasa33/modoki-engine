@@ -17,7 +17,7 @@
  *   tools/*.ts      the tool definitions, by group, side-effect-free
  *
  * Do not move tool definitions back in here. The path `engine/tools/modoki-mcp/src/index.ts` is
- * pinned by `.mcp.json`, `.cursor/mcp.json`, the Electron Connect-Claude writer, the esbuild
+ * pinned by `.mcp.json`, the Electron Connect-Claude writer, the esbuild
  * bundle step and the packaging manifest test — so the entry stays put while the surface stays
  * importable. See `registerAll.ts` for why that split is load-bearing.
  */

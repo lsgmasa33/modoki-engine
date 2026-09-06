@@ -685,7 +685,7 @@ Two mechanisms now close it, and they are deliberately different in reach:
 
 - **`engine/scripts/device.mjs`** — a standalone CLI (`npm run device:claim|release|list|run`) that
   takes the SAME machine-wide claim the editor does. It is the universal path: it works for a human
-  in a terminal, for Codex/Cursor/Antigravity, and inside scripts. Because a CLI process exits
+  in a terminal, for tooling that is not a Claude session, and inside scripts. Because a CLI process exits
   immediately, its claim cannot be pid-owned — it carries an **owner token** (`cli:<clone path>`) and
   is expired purely by a **90-minute TTL**, far shorter than the pid-claim's 12h backstop for the
   reason spelled out on `CLI_CLAIM_TTL_MS`: a pid-claim has a second, independent expiry and an

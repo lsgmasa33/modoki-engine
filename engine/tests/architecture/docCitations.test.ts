@@ -167,9 +167,10 @@ const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
 const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{
   cited: string; absorbedBy: string; absorbedByPaths: string[]; citedBy: string[];
 }> = [
+  { cited: 'docs/multi-ai-cli-support.md', absorbedBy: 'docs/todo.md § "Deferred decisions" — the #793 removal record: what the generator produced, why it went (7 deliberate commits against 542 of generated churn), the shakedown finding that Antigravity worked BEST of the three, and the symlink premise nobody re-tested', absorbedByPaths: ['docs/todo.md'], citedBy: ['docs/todo.md'] },
   { cited: 'docs/plans/court-store-plan.md', absorbedBy: 'games/court/ads.md — §§ 2-4 folded in (the catalog, the standing rules, the grant hook); the condensed § "A guard whose premise can lie" carries three of the ten close-out-catalogue instances, the rest preserved only in git history', absorbedByPaths: ['games/court/ads.md'], citedBy: ['games/court/accounts.md', 'games/court/ads.md', 'games/court/runtime/store.ts', 'games/court/runtime/storeUi.ts', 'games/court/runtime/systems.ts', 'games/court/tests/store.test.ts', 'games/court/tests/storeUi.test.ts'] },
-  { cited: 'docs/plans/court-prototype-plan.md', absorbedBy: 'games/court/{hints,levels,tutorial}.md — each says which phases it absorbed', absorbedByPaths: ['games/court/hints.md', 'games/court/levels.md', 'games/court/tutorial.md'], citedBy: ['games/court/AGENTS.md', 'games/court/CLAUDE.md', 'games/court/hints.md', 'games/court/levels.md', 'games/court/tutorial.md'] },
-  { cited: 'docs/plans/forest-camp-demo-plan.md', absorbedBy: 'demos/forest-camp/CLAUDE.md', absorbedByPaths: ['demos/forest-camp/CLAUDE.md'], citedBy: ['demos/forest-camp/AGENTS.md', 'demos/forest-camp/CLAUDE.md', 'docs/plans/public-demos-plan.md'] },
+  { cited: 'docs/plans/court-prototype-plan.md', absorbedBy: 'games/court/{hints,levels,tutorial}.md — each says which phases it absorbed', absorbedByPaths: ['games/court/hints.md', 'games/court/levels.md', 'games/court/tutorial.md'], citedBy: ['games/court/CLAUDE.md', 'games/court/hints.md', 'games/court/levels.md', 'games/court/tutorial.md'] },
+  { cited: 'docs/plans/forest-camp-demo-plan.md', absorbedBy: 'demos/forest-camp/CLAUDE.md', absorbedByPaths: ['demos/forest-camp/CLAUDE.md'], citedBy: ['demos/forest-camp/CLAUDE.md', 'docs/plans/public-demos-plan.md'] },
   { cited: 'docs/plans/engine-oss-public-repo.md', absorbedBy: 'docs/engine-oss-publishing.md (its own "Graduated from" line)', absorbedByPaths: ['docs/engine-oss-publishing.md'], citedBy: ['docs/engine-oss-publishing.md'] },
   { cited: 'docs/plans/gcp-lb-retirement-plan.md', absorbedBy: 'docs/site-hosting.md § "Why a Worker"', absorbedByPaths: ['docs/site-hosting.md'], citedBy: ['docs/site-hosting.md'] },
   { cited: 'docs/plans/scene-view-gizmo-plan.md', absorbedBy: 'docs/scene-view-gizmo.md (its own "Graduated from" line)', absorbedByPaths: ['docs/scene-view-gizmo.md'], citedBy: ['docs/scene-view-gizmo.md'] },
@@ -331,8 +332,8 @@ function scanDocPathCitations(historical: ReadonlySet<string>): Map<string, Set<
           // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
           // below, nothing about this case is ambiguous.
           //
-          // A NON-relative prefix keeps the fallback: `docs/multi-ai-cli-support.md` writes
-          // `site/docs/guide/ai-assistants.md` repo-anchored, which resolves under a root rather
+          // A NON-relative prefix keeps the fallback: `docs/api-reference.md` writes
+          // `site/.vitepress/config.ts` repo-anchored, which resolves under a root rather
           // than beside the citing file.
           if (/^\.\.?\//.test(full)) {
             if (ok) continue;
@@ -1060,6 +1061,13 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?
   },
 
   // --- Deleted ON PURPOSE, and the doc's subject IS the deletion.
+  {
+    cited: 'scripts/sync-agent-configs.mjs',
+    in: 'docs/todo.md',
+    reason: 'deleted with the multi-CLI support it generated (#793). The declined-decision record '
+      + 'names it to say what existed — a doc describing its own subject\'s deletion, which is '
+      + 'the case this list\'s own failure message calls out',
+  },
 
   // --- Not built yet. A plan naming its future file is the plan doing its job.
   { cited: 'editor/inspectorRegistry.ts', reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
@@ -1070,7 +1078,7 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?
 ];
 
 /** Every `.md` whose source-path citations must resolve: the engine docs, plus every `CLAUDE.md`
- *  and its generated `AGENTS.md` mirror (#195).
+ *  (#195).
  *
  *  `CLAUDE.md` earns the stricter treatment, not the looser one: it is loaded into an agent's
  *  context AUTOMATICALLY at session start, so a wrong path there is believed by default rather
@@ -1084,7 +1092,7 @@ function citingMarkdownFiles(): string[] {
     if (isNonCitingSource(r)) return false;
     if (r.startsWith('docs/')) return true;
     if (/^(?:games|demos)\/[^/]+\/docs\//.test(r)) return true;
-    return r === 'CLAUDE.md' || r.endsWith('/CLAUDE.md') || r === 'AGENTS.md' || r.endsWith('/AGENTS.md');
+    return r === 'CLAUDE.md' || r.endsWith('/CLAUDE.md');
   });
 }
 
@@ -1102,14 +1110,8 @@ function rootsFor(relFile: string): string[] {
   return [...SOURCE_ROOTS, ...projectRoots()];
 }
 
-/** AGENTS.md is a GENERATED mirror of the CLAUDE.md beside it (npm run sync:agent-configs), so it
- *  reproduces that file's sentences verbatim. Match a scoped exemption against the SOURCE file, or
- *  every `in:` entry would need a near-duplicate for its mirror — and the mirror is regenerated, so
- *  the two can never legitimately disagree. */
-const asSource = (f: string) => f.replace(/(^|\/)AGENTS\.md$/, '$1CLAUDE.md');
-
 const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITATION_EXEMPT.some(
-  (e) => e.cited === cited && (e.in === undefined || e.in === asSource(citingFile)),
+  (e) => e.cited === cited && (e.in === undefined || e.in === citingFile),
 );
 
 /** Rule 2's scan, factored out for the same reason as `scanDocPathCitations` above: the
@@ -1119,8 +1121,8 @@ const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITAT
  *  The two really can disagree, and not subtly: rule 2's regex anchors at a known top-level
  *  segment, so it keys `engine/tests/editor/cloudEditorEnv.test.ts` as
  *  `tests/editor/cloudEditorEnv.test.ts` — a plain substring search would look for the engine-
- *  prefixed string rule 2 never produces. (Scoping an exemption to one citing file, and the
- *  AGENTS.md mirroring below, are two more places to get it independently wrong.) Both methods
+ *  prefixed string rule 2 never produces. (Scoping an exemption to one citing file is one more
+ *  place to get it independently wrong.) Both methods
  *  happened to agree on the 10 inert entries this found; the extraction is here so agreement is
  *  structural rather than lucky, since a divergence would be silent in the worse direction —
  *  reporting an exemption inert while rule 2 is still using it, and inviting its deletion.
@@ -1338,7 +1340,7 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
         if (!sites) return true;
         if (e.in === undefined) return false;
         // A scoped entry is load-bearing only where IT is scoped, not wherever the path is named.
-        return ![...sites].some((s) => asSource(s.replace(/:\d+$/, '')) === e.in);
+        return ![...sites].some((s) => s.replace(/:\d+$/, '') === e.in);
       })
       .map((e) => `${e.cited}${e.in ? ` (scoped to ${e.in})` : ''} — nothing cites it; drop this exemption (${e.reason})`);
     expect(

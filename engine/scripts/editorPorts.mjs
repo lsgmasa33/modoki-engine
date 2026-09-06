@@ -37,10 +37,9 @@
  *     added for exactly this — `deviceToolSurface.test.ts` § S2.39). Wrong-clone is
  *     LOUD, not silent.
  *   - The obvious repair (`${MODOKI_BACKEND:-}`) rests on empty-default expansion
- *     behaviour Claude Code does not document, and `.mcp.json` is the committed
- *     SOURCE that generates `.cursor/mcp.json` + `.codex/config.toml` and is what
- *     `hasPrivateTooling()` keys on. Gitignoring it to fix one field would cost the
- *     shared server config and leave a fresh clone with no MCP at all.
+ *     behaviour Claude Code does not document, and `.mcp.json` is the committed shared
+ *     server config as well as what `hasPrivateTooling()` keys on. Gitignoring it to fix
+ *     one field would cost both, and leave a fresh clone with no MCP at all.
  *
  * KEYED ON THE CLONE DIRECTORY NAME, not the branch (owner, 2026-08-26). A clone's
  * directory is stable even while it temporarily has another branch checked out, and

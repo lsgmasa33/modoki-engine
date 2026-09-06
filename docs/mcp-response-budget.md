@@ -479,10 +479,20 @@ fetched, not swapped, so fetching one does not invalidate the cache.
 full surface (`modoki` 190,718 across 105 tools + `game-debug` 58,037 across 43). A session using
 ten tools pays roughly 9k, not 90k.
 
-**The premise still holds for Cursor and Codex CLI** — `npm run sync:agent-configs` hands them the
-byte-identical 3-server set (`.cursor/mcp.json`, `.codex/config.toml`), and neither is known to
-defer. **So the ledger's pin stays** — it guards the non-deferring clients, and this section is not
-a licence to let the surface grow.
+⚠️ **This argument lost its load-bearing half on 2026-09-06 (#793).** The pin was justified here by
+the *non-deferring* clients — Cursor and Codex CLI, which were handed the byte-identical 3-server set
+by a generator that no longer exists, and were not known to defer. Support for them was removed.
+
+**The pin stays, and NOT because everything defers now.** Claude Code is the only client whose
+deferral has been *measured*; it is not the only client. **Claude Desktop's Chat tab** talks to the
+same `modoki` MCP server — the public guide (`site/docs/guide/ai-assistants.md`) walks a user
+through wiring it into `claude_desktop_config.json` — and nobody has measured whether it defers. So
+the un-measured non-deferring client is not hypothetical, it is documented and shipped. On top of
+that, deferral is client-side behaviour nobody here controls or tests, so an un-pinned surface is
+one client release away from being paid in full again.
+
+⚠️ **If the pin is ever re-examined, measure Desktop Chat first** — re-examining it on "the only
+client defers" would be reasoning from a premise this section has never established.
 
 **Method + caveat:** measured with the same `StdioClientTransport` + `Client.listTools()` recipe as
 the section above; `chars/4` understates these payloads by 27-38% per that section's own finding, so

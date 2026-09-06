@@ -4,10 +4,10 @@
  *
  * `deviceClaimsStore.mjs` already arbitrates the hardware for the MCP surface
  * (`device_connect`) and for `claim-guard.mjs`'s Bash hook, but both of those
- * only reach a Claude Code session in THIS repo. Codex, Cursor, Antigravity, a
- * human's own terminal — none of them go through either path, so a claim taken
- * by one of them is invisible to the others and vice versa. This file is the
- * one surface every one of those can reach: `node engine/scripts/device.mjs …`
+ * only reach a Claude Code session in THIS repo. A human's own terminal, a
+ * script, any future non-Claude tooling — none of them go through either path,
+ * so a claim taken by one of them is invisible to the others and vice versa.
+ * This file is the one surface every one of those can reach: `node engine/scripts/device.mjs …`
  * (or the `npm run device:*` shortcuts) needs nothing but Node.
  *
  * ── The owner token ──
@@ -93,8 +93,8 @@ function currentBranch() {
  *  A bare `spawnSync('adb', …)` is a lint ERROR in this repo, and for a good reason: the packaged
  *  editor's adb is NOT on PATH, so a bare spawn ENOENTs there. The authority is
  *  `detectAdb()` in `engine/toolchain/index.ts` — which this file cannot import, being plain ESM
- *  that must run under bare `node` with no build step (that is the whole point of the CLI: Codex,
- *  a terminal, a script). So it mirrors that resolution order instead, most-specific first, and
+ *  that must run under bare `node` with no build step (that is the whole point of the CLI: a
+ *  terminal, a script). So it mirrors that resolution order instead, most-specific first, and
  *  falls back to PATH last.
  *
  *  The PATH fallback is correct rather than lazy HERE, and the toolchain agrees in code: with no

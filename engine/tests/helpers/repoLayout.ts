@@ -45,8 +45,8 @@ function findRepoRoot(): string {
 
 export const REPO_ROOT = findRepoRoot();
 
-/** True when this checkout has the private agent-CLI configs (`.mcp.json` and its
- *  generated siblings) — i.e. this is a developer clone, not the public engine snapshot. */
+/** True when this checkout has the private agent-CLI config (`.mcp.json`) — i.e. this is a
+ *  developer clone, not the public engine snapshot. */
 export function hasPrivateTooling(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, '.mcp.json'));
 }

@@ -21,8 +21,8 @@
  *
  * ── What this can and cannot reach ──
  * It intercepts the Bash tool of a Claude Code session in this repo, and nothing else. A human's own
- * terminal, the editor backend's own spawns, and other agent CLIs (Codex, Cursor, Antigravity — none
- * of which have a PreToolUse equivalent) all bypass it. `engine/scripts/device.mjs` is the universal
+ * terminal, the editor backend's own spawns, and any non-Claude tooling (nothing else here has a
+ * PreToolUse equivalent) all bypass it. `engine/scripts/device.mjs` is the universal
  * path for those; this hook is the one that closes the case #285 was filed about.
  *
  * It never reaches a Modoki USER: `.claude/` is excluded from the OSS snapshot

@@ -96,7 +96,7 @@ files:
   # full stale COPY of the suite, and while vite.config correctly excludes `**/release/**`,
   # any vitest run that passes an explicit path or a bare `-t` filter re-includes it and
   # runs build-time-stale tests against current source. That produced phantom failures
-  # (a stale agentConfigSync snapshot "failing", stale vendorPlugins copies) more than once.
+  # (a stale generated-config snapshot "failing", stale vendorPlugins copies) more than once.
   - "!engine/tests/**"
   - "!engine/packages/*/tests/**"
   # ⚠️ This exclude set is unverified against a real packaged Vite run — if a
