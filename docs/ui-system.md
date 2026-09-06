@@ -530,9 +530,10 @@ swallow — either way — is what OPTS a panel in. ⚠️ **Which panels are co
 roster**: it is whatever carries a binding or `swallowClicks` right now, and a grep for
 `swallowClicks` across the scenes answers it — an enumeration here went stale the same day #728
 landed. Court's dialog bodies were the known uncovered group and are covered as of 2026-09-05
-(#729); **wordweave's are not** — `HelpPanel` (#741) and `ResultPanel` (#753) each sit under a
-scrim that dismisses on click and carry neither a binding nor `swallowClicks`, while
-`DictionaryPanel` beside them does, so that game did not opt out wholesale. Do not read this
+(#729); wordweave's `HelpPanel` and `ResultPanel` were the last holdouts — each sat under a
+scrim that dismissed on click and carried neither a binding nor `swallowClicks`, while
+`DictionaryPanel` beside them already did — and both now author `swallowClicks: true` too
+(#741). Do not read this
 paragraph as a roster in either direction: it names where the question was last ASKED, and the grep
 is what answers it. Stamping
 the marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
@@ -780,9 +781,13 @@ parent (`UIAnchor.ts`):
   shipped rendering UNDER the iOS home indicator — measured on an iPhone Air, the slot spanned
   device y 829–912 against the indicator's own 878–912, while reading "safe-area aware" from the
   trait alone. The fix was to author `safeArea: false` on the slot and LIFT its box at runtime
-  (`patchAnchorPct`), not to trust the padding. Contrast `games/wordweave`'s `BottomButtonRow`,
-  also `bottom-stretch`: its two buttons are FLOW children (no `UIAnchor` of their own), so the
-  same padding arm lifts them correctly with no runtime code at all.
+  (`patchAnchorPct`), not to trust the padding. `games/wordweave`'s `BottomButtonRow` used to be the
+  worked CONTRAST here — `bottom-stretch` with its two buttons as FLOW children (no `UIAnchor` of
+  their own), so the same padding arm lifted them correctly with no runtime code at all. #666 renamed
+  it `GapButtonRow` and moved it into the split gap on a `top-stretch` anchor re-anchored every frame
+  by its own runtime code (`syncGapButtonRow`, `games/wordweave/runtime/systems.ts`), so it no longer
+  illustrates the no-runtime-code case — see that game's own `../games/wordweave/docs/feel.md` for
+  why it moved.
 
   ⚠️ **The anchor MODE is a proxy for "which edges this element reaches", and an authored
   or runtime-driven offset can falsify it.** An element anchored `top-stretch` but pushed
