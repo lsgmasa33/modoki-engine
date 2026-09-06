@@ -54,7 +54,7 @@ import {
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
-import { panelDrivesPreview, panelMayStopPreview } from './previewOwnership';
+import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 
 const COALESCE_MS = 500;
 const TRACK_LIST_MIN_W = 140;

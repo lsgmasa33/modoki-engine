@@ -14,6 +14,7 @@ import type { AnimationClipDef } from '../../runtime/animation/types';
 import { setTimeline } from '../../runtime/loaders/timelineCache';
 import type { TimelineDef } from '../../runtime/timeline/types';
 import { FREE_PRESET, type DevicePreset, type Orientation } from '../scene/devicePresets';
+import { panelMayStopPreview } from '../scene/previewOwnership';
 
 // Toast auto-dismiss state, module-scoped (F5): a newer toast clears the prior
 // timer so N rapid toasts don't leave N zombie timers, and the id is a monotonic
@@ -921,7 +922,12 @@ export const useEditorStore = create<EditorState>((set, get) => {
     isRecording: false,
     isPreviewPlaying: false, previewOwner: null,
   })),
-  closeAnimationEditor: () => set({ editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false, isPreviewPlaying: false, previewOwner: null }),
+  // Same ownership guard as `closeTimelineEditor` below — see its comment. `isRecording` is NOT
+  // gated: it is this panel's own flag, not shared with the Timeline.
+  closeAnimationEditor: () => set((s) => ({
+    editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false,
+    ...(panelMayStopPreview(s.previewOwner, 'animation') ? { isPreviewPlaying: false, previewOwner: null } : {}),
+  })),
   remapEditingAssetPath: (field, path, name) => set((s) => {
     const cur = s[field];
     if (!cur) return {}; // unbound → nothing to repoint
@@ -958,7 +964,15 @@ export const useEditorStore = create<EditorState>((set, get) => {
     playheadTime: 0,
     isPreviewPlaying: false, previewOwner: null,
   })),
-  closeTimelineEditor: () => set({ editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null, isPreviewPlaying: false, previewOwner: null }),
+  // ⚠️ Clear the shared preview flag ONLY if this panel owns it (or nobody does). `isPreviewPlaying`
+  // is read by BOTH preview panels, so an unconditional clear here stops a RUNNING Animation
+  // preview when an idle Timeline tab is merely closed — the same defect as #810, on the store
+  // action behind the panel rather than in the panel. The panels' unmount cleanups were guarded
+  // first and these two actions were missed; the #810 E2E is what caught it.
+  closeTimelineEditor: () => set((s) => ({
+    editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null,
+    ...(panelMayStopPreview(s.previewOwner, 'timeline') ? { isPreviewPlaying: false, previewOwner: null } : {}),
+  })),
   loadTimelineDoc: (doc) => {
     const { editingTimelineAsset } = get();
     if (editingTimelineAsset) setTimeline(editingTimelineAsset.path, doc);

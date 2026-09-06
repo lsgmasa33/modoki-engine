@@ -1,6 +1,6 @@
 /** Guard: each preview panel gates on ITS OWN id (#810 follow-up).
  *
- *  `previewOwnership.ts`'s `panelDrivesPreview`/`panelMayStopPreview` are unit-tested as pure
+ *  `scene/previewOwnership.ts`'s `panelDrivesPreview`/`panelMayStopPreview` are unit-tested as pure
  *  functions, and `previewDisplacementSharedFlag.test.ts` models the two panels' call sequences —
  *  but NOTHING reached the two `.tsx` call sites, and that gap was demonstrated, not theorised:
  *  an adversarial review swapped `TimelineEditor`'s `'timeline'` for `'animation'` — a plausible

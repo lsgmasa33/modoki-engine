@@ -28,7 +28,7 @@ import {
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
-import { panelDrivesPreview, panelMayStopPreview } from './previewOwnership';
+import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
 import {
   defaultTimeline, normalizeTimeline,
@@ -594,7 +594,16 @@ export default function TimelineEditor() {
   // drag-scrub holds no session, so clear them explicitly.
   useEffect(() => () => {
     clearPreviewControls();
-    if (hasTimelinePreviewSession()) {
+    // ⚠️ The preview SESSION is shared, not ours alone — `AnimationEditor` opens it through the
+    // same `beginTimelinePreviewSession()` for its own ▶. Ending it here regardless of who owns it
+    // RELOADS the scene (`endTimelinePreviewSession` -> `SceneManager.loadScene` -> a world swap),
+    // which tears the Animation panel's live preview down as a side effect of closing this idle
+    // tab — and then this panel's own `onWorldSwap` handler below sees that swap and clears the
+    // shared flag too. Guarding the flag alone was not enough; the session is the deeper half, and
+    // the #810 E2E is what surfaced it. When the Animation panel owns the preview it also owns the
+    // session, and its own unmount (`endAnimationPreview`) ends it.
+    const owns = panelMayStopPreview(useEditorStore.getState().previewOwner, 'timeline');
+    if (owns && hasTimelinePreviewSession()) {
       const path = useEditorStore.getState().editingTimelineAsset?.path;
       void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) });
     }
@@ -621,7 +630,10 @@ export default function TimelineEditor() {
   //     scene load, hot-reload, or the mutate that triggers one. Cleanup unsubscribes on unmount.
   useEffect(() => onWorldSwap(() => {
     const st = useEditorStore.getState();
-    if (st.isPreviewPlaying || hasTimelinePreviewSession()) {
+    // Same ownership guard as the unmount cleanup above, for the same reason: on a world swap
+    // caused by the OTHER panel's session, this must not stop that panel's preview or abandon its
+    // snapshot. `exitPreviewMode` already self-guards on owner.
+    if (panelMayStopPreview(st.previewOwner, 'timeline') && (st.isPreviewPlaying || hasTimelinePreviewSession())) {
       st.setPreviewPlaying(false);
       void endTimelinePreviewSession({ restore: false });
     }

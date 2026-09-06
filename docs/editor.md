@@ -1289,7 +1289,26 @@ Second, **a displaced panel must stop its own rAF, never call `setPreviewPlaying
 panel. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
 press**, so each would take the mode from the other — and the Timeline always lands second (its entry
 is behind an await), so it always won and always stopped the Animation panel's loop. Pressing ▶ in
-the Animation panel played nothing at all. A panel now drives the preview only when it owns it. Full mechanism, and why this site needed a displacement
+the Animation panel played nothing at all. A panel now drives the preview only when it owns it.
+
+⚠️ **There are TWO shared resources here, and checking ownership on one is not enough.** Besides the
+`isPreviewPlaying` flag there is the preview **session** — `AnimationEditor` opens it through the
+same `beginTimelinePreviewSession()` the Timeline uses. `TimelineEditor`'s unmount used to end that
+session whoever owned it, and **ending it reloads the scene**
+(`endTimelinePreviewSession` → `SceneManager.loadScene` → a world swap), which tore down the
+Animation panel's live preview as a side effect of closing an idle tab — and the Timeline's own
+`onWorldSwap` handler then saw that swap and cleared the flag too. Three passes fixed the flag
+before anyone noticed the session, because every one of them reasoned about the flag. The store's
+`closeTimelineEditor`/`closeAnimationEditor` are the same shape again: ownership decisions wearing a
+store action's clothes.
+
+**Test it by the OWNER, not by the playhead.** With a timeline doc loaded the Timeline's own loop
+advances `playheadTime` too, so "the playhead moved" passes under both the correct and the broken
+behaviour — the vacuum this change's first test fell into. `previewModeOwner()` on the editor test
+bridge exists for that: `playMode`'s `_modeOwner` is module state an E2E cannot reach through the
+store. The seam is covered by `tests/e2e/editor-preview-panel-ownership.spec.ts`, which is
+mutation-checked against the one-word change that reintroduces the bug and that all 3379 editor unit
+tests missed. Full mechanism, and why this site needed a displacement
 callback where its sibling `timelinePreview._saveHandler` needed a re-seating stack:
 [rendering.md](./rendering.md) § "One fix, two twin globals".
 

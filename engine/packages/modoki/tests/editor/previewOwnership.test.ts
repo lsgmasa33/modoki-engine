@@ -5,7 +5,7 @@
  *  the Timeline (entering behind an await) always won — killing the Animation panel's loop, which
  *  with no timeline doc open meant ▶ played nothing at all. */
 import { describe, it, expect } from 'vitest';
-import { panelDrivesPreview, panelMayStopPreview } from '../../src/editor/panels/previewOwnership';
+import { panelDrivesPreview, panelMayStopPreview } from '../../src/editor/scene/previewOwnership';
 
 describe('panelDrivesPreview', () => {
   it('does not drive when nothing is playing, whoever owns it', () => {

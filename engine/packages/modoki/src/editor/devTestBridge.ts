@@ -10,6 +10,7 @@ import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
 import { loadScene, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
+import { getModeOwner } from './scene/playMode';
 import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
 import { getCurrentWorld } from '../runtime/core/ecs/world';
 import { fireDirtyListeners } from '../runtime/core/ecs/entityUtils';
@@ -47,6 +48,17 @@ export interface EditorTestBridge {
    *  would animate every rig's baked clip out of Play mode and clobber the
    *  keyframe pose) — the E2E asserts it stays false during preview. */
   isSkeletalPreviewing(): boolean;
+  /** WHICH panel currently owns the editor scrub/preview run mode ('timeline' | 'animation'), or
+   *  null when stopped. This is `playMode.ts`'s `_modeOwner` — module state, so an E2E cannot
+   *  reach it through the store.
+   *
+   *  Exposed for the #810 seam: `isPreviewPlaying` is ONE store flag both preview panels read, so
+   *  a single ▶ ran both panels' effects and each took this single-valued mode from the other.
+   *  The Timeline always landed second (its entry sits behind an await), so it always won and
+   *  stopped the Animation panel's loop. The playhead advancing is NOT enough to catch that —
+   *  with a timeline doc open the Timeline's own loop advances it too — so the owner is the
+   *  discriminating read, and without it the E2E would pass under both correct and broken. */
+  previewModeOwner(): string | null;
   /** Pose a Director's timeline at absolute time `t` while STOPPED — the same
    *  scrub-preview path the Timeline panel drives (previewTimelineAt + repaint).
    *  Lets an E2E verify skeletal seek-scrub (Phase 5) deterministically: scrub,
@@ -115,6 +127,9 @@ export function installEditorTestBridge(): void {
     },
     isSkeletalPreviewing() {
       return isSkeletalPreviewing();
+    },
+    previewModeOwner() {
+      return getModeOwner();
     },
     scrubTimeline(directorId, def, t) {
       previewTimelineAt(getCurrentWorld(), directorId, normalizeTimeline(def as Partial<TimelineDef>), t);

@@ -11,7 +11,12 @@
  *  The fix is to record WHICH panel's ▶ started the preview (`editorStore.previewOwner`) and let
  *  only that panel drive it. This lives in its own module, not inline in the two `.tsx` panels,
  *  per `docs/editor.md` § Panels: a panel's DECISIONS belong in a plain `.ts` module beside it,
- *  which is where the unit test goes — inline, deleting the gate would fail nothing. */
+ *  which is where the unit test goes — inline, deleting the gate would fail nothing.
+ *
+ *  It sits in `scene/` rather than `panels/` because the STORE needs it too: `closeTimelineEditor`
+ *  and `closeAnimationEditor` clear the shared flag themselves, so they are ownership decisions
+ *  wearing a store action's clothes. That was missed on the first two sweeps — the panels were
+ *  guarded and the store actions behind them were not — and the #810 E2E is what caught it. */
 export type PreviewOwner = 'timeline' | 'animation';
 
 /** True when `me` should RUN its preview loop for the current store state.
