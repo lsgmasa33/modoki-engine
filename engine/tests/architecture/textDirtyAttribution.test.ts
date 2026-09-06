@@ -12,16 +12,17 @@
  *  callee cannot see) and `reapScoping.test.ts` (comment-safe scanning via the shared scanner). */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const renderingDir = path.resolve(repoRoot, 'packages/modoki/src/runtime/rendering');
 
-const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+/** Comments blanked at the READ (#812) — the callers used to each remember to strip, which
+ *  is one forgetful caller away from a guard that matches its own documentation. */
+const read = (rel: string) => readScannedSource(path.join(repoRoot, rel)).code;
 
 /** `rel` here is `repoFiles()`'s own output — git-relative, POSIX, unquoted — never
  *  round-tripped through `path.relative`/`sep` (that round-trip, via a local `toPosix()` call,
@@ -54,9 +55,11 @@ const attributedSites: [label: string, rel: string][] = [
 
 describe('getTextDirtyVersion stays attributed by font at both layout-hash sites (#696)', () => {
   it.each(attributedSites)('%s calls getTextDirtyVersion(t.font), not the no-arg form', (_label, rel) => {
-    const raw = read(rel);
-    const src = stripComments(raw);
-    assertScanIsSane(raw, src, rel);
+    // ⚠️ One strip, at the read. Stripping `read()`'s output AGAIN made the local variable named
+    // `raw` hold stripped text, so `assertScanIsSane(raw, src)` compared stripped against
+    // double-stripped — trivially equal, and no longer a check on the instrument at all.
+    // `readScannedSource` runs that assertion against the REAL file contents.
+    const src = read(rel);
 
     expect(src, `${rel}: expected a getTextDirtyVersion(t.font) call in the layout hash`)
       .toMatch(/getTextDirtyVersion\(\s*t\.font\s*\)/);
@@ -69,9 +72,7 @@ describe('getTextDirtyVersion stays attributed by font at both layout-hash sites
 
   it('no other file under runtime/rendering calls getTextDirtyVersion() with no argument', () => {
     for (const { file, rel } of renderingFiles().callers) {
-      const raw = fs.readFileSync(file, 'utf8');
-      const src = stripComments(raw);
-      assertScanIsSane(raw, src, rel);
+      const src = readScannedSource(file).code;
       expect(src, `${rel}: found a no-argument getTextDirtyVersion() call — pass the font GUID ` +
         '(#696) so an unrelated font\'s glyph generation does not force a rebuild here')
         .not.toMatch(/getTextDirtyVersion\(\s*\)/);

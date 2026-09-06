@@ -33,6 +33,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { stripSwiftComments } from '@modoki/engine/testing';
 import { hasNativeProjects } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
@@ -87,46 +88,15 @@ function compiledIntoAppTarget(name: string): boolean {
   }
 }
 
-/** Remove Swift comments while PRESERVING string literals.
+/* ⚠️ `stripSwiftComments` used to be defined HERE, and was the best stripper in the repo with no
+ *  way for anything else to reach it. It moved into `@modoki/engine/testing` in #812 — where the
+ *  three failed regex attempts it replaced are recorded — so every Swift-scanning guard gets it
+ *  instead of writing a fourth.
  *
- *  A scanner, not a regex, because three separate regex attempts here were each subtly wrong and
- *  each failure disarmed or falsely tripped the guard below:
- *    · a naive line-comment pattern ate the `//` in `https://…/Dep.git`, erasing the dependency
- *      NAME from a manifest that correctly declared it — a false failure that fires exactly when
- *      someone does the right thing;
- *    · guarding it with `[^:]` still lost `https://host//path` (doubled separator) and still
- *      treated `dependencies://x` as code;
- *    · stripping block comments first is blind to `//`, so a `/*` inside a LINE comment ate
- *      forward to the next `*​/` anywhere in the file — the same asymmetry that terminated a
- *      JSDoc in this very file.
- *  Tokenizing is the only thing that gets all of them, and it is 20 lines. Swift block comments
- *  nest, so the depth counter is real rather than defensive. */
-export function stripSwiftComments(src: string): string {
-  let out = '';
-  let i = 0;
-  let inString = false;
-  let inLine = false;
-  let blockDepth = 0;
-  while (i < src.length) {
-    const c = src[i];
-    const d = src[i + 1];
-    if (inLine) {
-      if (c === '\n') { inLine = false; out += c; }        // keep the newline: lines stay aligned
-      i += 1;
-    } else if (blockDepth > 0) {
-      if (c === '/' && d === '*') { blockDepth += 1; i += 2; }
-      else if (c === '*' && d === '/') { blockDepth -= 1; i += 2; }
-      else { if (c === '\n') out += c; i += 1; }
-    } else if (inString) {
-      if (c === '\\') { out += c + (d ?? ''); i += 2; }     // an escape cannot close the literal
-      else { if (c === '"') inString = false; out += c; i += 1; }
-    } else if (c === '"') { inString = true; out += c; i += 1; }
-    else if (c === '/' && d === '/') { inLine = true; i += 2; }
-    else if (c === '/' && d === '*') { blockDepth = 1; i += 2; }
-    else { out += c; i += 1; }
-  }
-  return out;
-}
+ *  ⚠️ A guard that READS A PATH goes through `readScannedSource`, the entry point
+ *  `commentStripperIsShared.test.ts` enforces. This file calls `stripSwiftComments` directly and
+ *  that is correct: `missingSpmDeps`/`isSpmDepDeclared` are handed manifest TEXT by their callers,
+ *  not a filename, so there is no read here to route. */
 
 /** Podspec dependencies that `Package.swift` does not declare — the reason a package must not
  *  claim `capacitor.ios` (cap sync would add an SPM package whose target cannot compile).

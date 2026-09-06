@@ -20,13 +20,14 @@
  *  gitignored precisely so they CAN hold a literal port. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
 import { CLONE_BACKEND_PORTS, vitePortForBackend, cdpPortForBackend } from '../../scripts/editorPorts.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.resolve(__dirname, '../../..');
-const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(REPO, rel)).code;
 // The public engine snapshot ships neither the committed agent-CLI config
 // (.mcp.json) nor engine/scripts/** — both are private-repo-only.
 const skip = !hasPrivateTooling();

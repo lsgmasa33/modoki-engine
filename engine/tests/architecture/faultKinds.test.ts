@@ -12,12 +12,12 @@
  *  is a real device and a crash console. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(repoRoot, rel)).code;
 
 const PLUGIN_TS = 'engine/packages/capacitor-game-debug/src/definitions.ts';
 const ENGINE_TS = 'engine/packages/modoki/src/runtime/core/faultProvider.ts';

@@ -39,16 +39,20 @@
  * mutation is covered elsewhere.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   assertEveryCodeTokenSurvives,
   assertScanIsSane,
   findDamagedCodeTokens,
+  readScannedSource,
   stripComments,
   stripCommentsAndStrings,
+  stripHashComments,
+  stripSwiftComments,
 } from './sourceScanner';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -260,6 +264,27 @@ describe('⚠️ the FORWARD guard: no file the engine guards scan is damaged by
       files: collectFiles(join(REPO_ROOT, 'engine/packages/modoki/src/editor'), /\.tsx?$/), minFiles: 20 },
     { label: 'engine/plugins',
       files: collectFiles(join(REPO_ROOT, 'engine/plugins'), /\.(ts|js|mjs)$/), minFiles: 3 },
+    // ⚠️ Added in #812's close-out: routing the READ pulled these two trees under the scanner for
+    // the FIRST time (`registerTraits.ts`, `setup.ts`, `main.tsx`, `debug/agentBridge.ts`, the MCP
+    // `contracts.ts`), and `assertScanIsSane` cannot vouch for them — its length/line parity is
+    // true by construction for `stripComments`, so a misread that deletes a declaration is silent.
+    // Only this token oracle can see that. Swept clean when added: 103 files, 0 damaged.
+    { label: 'engine/app (newly scanned via readScannedSource)',
+      files: collectFiles(join(REPO_ROOT, 'engine/app'), /\.tsx?$/), minFiles: 20 },
+    { label: 'engine/tools (newly scanned via readScannedSource)',
+      files: collectFiles(join(REPO_ROOT, 'engine/tools'), /\.ts$/), minFiles: 5 },
+    // ⚠️ The same standard, applied to what the gate's own widening newly routed: the two non-test
+    // HELPERS in engine/tests/architecture, and the two engine-root configs that `ssrLoaderDefines`
+    // and `buildTargetFloor` scan. The "test files" set is `.test.tsx?`-only, so none of these was
+    // reached — the identical omission this pair of rows was added to fix.
+    { label: 'architecture helpers + engine-root configs (newly scanned)',
+      files: [
+        join(REPO_ROOT, 'engine/tests/architecture/moduleGraph.ts'),
+        join(REPO_ROOT, 'engine/tests/architecture/rendererConstructionCensus.ts'),
+        join(REPO_ROOT, 'engine/vite.config.ts'),
+        join(REPO_ROOT, 'engine/project-config.ts'),
+      ].filter((f) => existsSync(f)),
+      minFiles: 4 },
     { label: 'test files (engine/tests + games/*/tests + demos/*/tests)',
       files: [
         ...collectFiles(join(REPO_ROOT, 'engine/tests'), /\.test\.tsx?$/),
@@ -315,5 +340,131 @@ describe('⚠️ the FORWARD guard: no file the engine guards scan is damaged by
     const stripped = stripComments(raw);
     expect(imports(stripped)).toBe(imports(raw));
     assertEveryCodeTokenSurvives(raw, stripped, 'Scene3D.tsx', { minTokens: 4_000 });
+  });
+});
+
+describe('the non-JS strippers hold the same length/line contract (#812)', () => {
+  it('Swift: nested block comments close at the right depth, and the strip is length-preserving', () => {
+    // ⚠️ The nesting is the whole reason Swift has its own tokenizer: a depth-blind stripper closes
+    // at the FIRST `*/` and leaves the outer comment's tail as apparent code.
+    const raw = 'let a = 1\n/* outer /* inner */ still comment */\nlet keep = 2\n';
+    const code = stripSwiftComments(raw);
+    expect(code.length, 'length parity is what puts it inside assertScanIsSane').toBe(raw.length);
+    expect(code.split('\n').length).toBe(raw.split('\n').length);
+    expect(code).toContain('let keep = 2');
+    expect(code, 'the outer comment\'s tail leaked out as code — the depth counter is not counting')
+      .not.toContain('still comment');
+  });
+
+  it('Swift: a `//` inside a string literal is not a comment', () => {
+    const raw = 'let u = "https://host//path"\nlet keep = 1\n';
+    const code = stripSwiftComments(raw);
+    expect(code).toContain('https://host//path');
+    expect(code).toContain('let keep = 1');
+  });
+
+  it('shell: `#` blanks a comment but not `${v#prefix}`, `a#b`, or the shebang', () => {
+    const raw = '#!/usr/bin/env bash\necho "${v#pre}" # trailing note\nid=a#b\n';
+    const code = stripHashComments(raw);
+    expect(code.length).toBe(raw.length);
+    expect(code, 'the shebang is load-bearing metadata a guard may assert on').toContain('#!/usr/bin/env bash');
+    expect(code, 'parameter expansion is code, not a comment').toContain('${v#pre}');
+    expect(code, 'a `#` with no preceding whitespace does not open a comment').toContain('id=a#b');
+    expect(code, 'the trailing comment survived — a comment can then satisfy a required match')
+      .not.toContain('trailing note');
+  });
+
+  it('shell/yaml: an apostrophe in prose does not eat the NEXT line\'s comment', () => {
+    // ⚠️ The measured review finding. Without a newline reset the `'` in `Don't` opens a string
+    // that runs to the next quote anywhere in the file, and every `#` comment in between survives
+    // unblanked — a required-pattern guard can then be satisfied by prose. `assertScanIsSane` is
+    // blind to it: length and line parity both still hold.
+    const raw = "name: Don't push\nfoo: bar # a real comment\n";
+    const code = stripHashComments(raw);
+    expect(code.length).toBe(raw.length);
+    expect(code, 'the following line\'s comment survived the strip').not.toContain('a real comment');
+    expect(code).toContain('foo: bar');
+  });
+
+  it('shell: a `#` inside quotes survives', () => {
+    const raw = 'msg="issue #812 is the one"\nkeep=1\n';
+    const code = stripHashComments(raw);
+    expect(code).toContain('issue #812 is the one');
+    expect(code).toContain('keep=1');
+  });
+});
+
+describe('readScannedSource is the one read, and REFUSES rather than falling back (#812)', () => {
+  let dir: string;
+  const write = (name: string, body: string): string => {
+    const p = join(dir, name);
+    writeFileSync(p, body, 'utf8');
+    return p;
+  };
+
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'scanned-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('strips by extension and hands back a code view aligned with raw', () => {
+    const p = write('guard.ts', 'const a = 1; // performance.now()\nconst b = 2;\n');
+    const { raw, code } = readScannedSource(p);
+    expect(code.length).toBe(raw.length);
+    expect(code, 'the offender was in a COMMENT — a forbidden-pattern guard must not see it')
+      .not.toContain('performance.now()');
+    expect(code).toContain('const b = 2;');
+  });
+
+  it('picks the SWIFT stripper for .swift, not the JS one', () => {
+    // The discriminator: JS has no nested block comments, so the JS scanner would close early and
+    // leak `MediaPipeTasksGenAI` — the exact false-declaration case #812 cites.
+    const p = write('Package.swift', '/* a /* b */ .package(name: "MediaPipeTasksGenAI") */\nlet x = 1\n');
+    const { code } = readScannedSource(p);
+    expect(code).not.toContain('MediaPipeTasksGenAI');
+    expect(code).toContain('let x = 1');
+  });
+
+  it('.pbxproj stays UNREGISTERED — the invariant is a test, not a comment', () => {
+    // ⚠️ This exists because the claim "re-registering pbxproj fails loudly" was FALSE when first
+    // written. `comments: 'include'` returns before the extension lookup and `pbxprojObjectIds`
+    // reads `.raw`, so registration is inert for the only caller — re-adding the row left all 754
+    // architecture tests green. The invariant was held by prose, one plausible edit from restoring
+    // a guard that inspected 1 of 43 object ids.
+    const p = write('project.pbxproj', '\t\t504EC2FB1FED79650016851F = {\n');
+    expect(() => readScannedSource(p), 'a pbxproj annotation is generated NAMING that '
+      + "pbxprojObjectIds' regex matches as syntax — blanking it cut its ids from 43 to 1")
+      .toThrow(/no comment stripper/);
+  });
+
+  it('refuses an extension it has no stripper for, instead of returning raw text', () => {
+    const p = write('notes.md', 'a doc that mentions performance.now()\n');
+    expect(() => readScannedSource(p), 'falling back to raw IS the bug — it must refuse')
+      .toThrow(/no comment stripper/);
+  });
+
+  it("refuses comments:'include' with no reason", () => {
+    const p = write('guard.ts', 'const a = 1;\n');
+    expect(() => readScannedSource(p, { comments: 'include' })).toThrow(/needs a reason/);
+  });
+
+  it("comments:'include' with a reason returns raw, for the guards that scan prose ON PURPOSE", () => {
+    // ⚠️ `docCitations` and `editorStoreActionsReachable` are the real callers. Stripping there
+    // DEFEATS them — a citation in a docblock is exactly what the first exists to catch.
+    const p = write('guard.ts', 'const a = 1; // docs/rendering.md\n');
+    const { raw, code } = readScannedSource(p, { comments: 'include', reason: 'cites live in docblocks' });
+    expect(code).toBe(raw);
+    expect(code).toContain('docs/rendering.md');
+  });
+
+  it('a sentinel that does not survive the strip fails the read', () => {
+    const p = write('guard.ts', 'const a = 1; // only-in-a-comment\n');
+    expect(() => readScannedSource(p, { sentinels: ['only-in-a-comment'] }))
+      .toThrow(/sentinel/);
+  });
+
+  it('an explicit `language` overrides a suffix that lies', () => {
+    const p = write('hook', '#!/usr/bin/env bash\nrun # note\n');
+    const { code } = readScannedSource(p, { language: 'shell' });
+    expect(code).toContain('run');
+    expect(code).not.toContain('note');
   });
 });

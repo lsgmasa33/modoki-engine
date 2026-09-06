@@ -33,12 +33,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.resolve(__dirname, '../../..');
-const producerSrc = fs.readFileSync(path.join(REPO, 'engine/plugins/vite-asset-scanner.ts'), 'utf8');
-const consumerSrc = fs.readFileSync(path.join(REPO, 'engine/app/debug/agentBridge.ts'), 'utf8');
+const producerSrc = readScannedSource(path.join(REPO, 'engine/plugins/vite-asset-scanner.ts')).code;
+const consumerSrc = readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code;
 
 /** Members of a `type X = 'a' | 'b'` declaration. */
 function unionMembers(src: string, typeName: string): string[] {

@@ -17,8 +17,8 @@
  *  the `userData` assignment must come first) needs an allowlist entry stating why. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
@@ -73,26 +73,18 @@ function runtimeFiles(): Array<{ abs: string; rel: string }> {
     });
 }
 
-/** Strip line comments and block-comment bodies so a doc paragraph ABOUT `base.clone()` — of
- *  which this change added several — is not read as a clone site. */
-function codeLines(src: string): Array<{ n: number; text: string }> {
-  const out: Array<{ n: number; text: string }> = [];
-  let inBlock = false;
-  src.split('\n').forEach((raw, i) => {
-    let line = raw;
-    if (inBlock) {
-      const end = line.indexOf('*/');
-      if (end === -1) return;
-      line = line.slice(end + 2);
-      inBlock = false;
-    }
-    const block = line.indexOf('/*');
-    if (block !== -1) { inBlock = line.indexOf('*/', block) === -1; line = line.slice(0, block); }
-    const slash = line.indexOf('//');
-    if (slash !== -1) line = line.slice(0, slash);
-    if (line.trim()) out.push({ n: i + 1, text: line });
-  });
-  return out;
+/**
+ * Non-blank lines of a file, with 1-based numbers, read through the shared scanner (#812).
+ *
+ * The private stripper this replaces was line-oriented and tracked no string state, so a `//`
+ * inside a URL truncated the rest of the line — lowering what a forbidden-pattern guard could see,
+ * which reads as a PASS.
+ */
+function codeLines(file: string): Array<{ n: number; text: string }> {
+  return readScannedSource(file).code
+    .split('\n')
+    .map((text, i) => ({ n: i + 1, text }))
+    .filter(({ text }) => text.trim());
 }
 
 /** The one file allowed to contain a raw material `.clone()`: the helper itself. */
@@ -109,7 +101,7 @@ describe('material clones carry the derived-base stamp', () => {
     const raw: string[] = [];
     for (const { abs: file, rel } of runtimeFiles()) {
       if (rel === HELPER_FILE) continue;
-      for (const { n, text } of codeLines(readFileSync(file, 'utf8'))) {
+      for (const { n, text } of codeLines(file)) {
         if (!CLONE.test(text)) continue;
         if (EXEMPT.some((e) => e.file === rel && text.includes(e.contains))) continue;
         raw.push(`${rel}:${n} — ${text.trim()}`);
@@ -133,7 +125,7 @@ describe('material clones carry the derived-base stamp', () => {
     const sites: string[] = [];
     let helperStampsItsOwnClone = false;
     for (const { abs: file, rel } of runtimeFiles()) {
-      for (const { text } of codeLines(readFileSync(file, 'utf8'))) {
+      for (const { text } of codeLines(file)) {
         if (rel === HELPER_FILE) {
           // The helper is where the ONE raw clone lives, and it must still stamp on that line.
           if (CLONE.test(text) && text.includes('markDerived')) helperStampsItsOwnClone = true;

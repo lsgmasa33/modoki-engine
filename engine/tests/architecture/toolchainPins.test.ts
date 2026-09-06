@@ -35,6 +35,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { hasOssOverlay } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
@@ -181,7 +182,7 @@ describe('workflow node-version tracks the provisioned Node', () => {
       if (!fs.existsSync(abs)) continue;
       for (const name of fs.readdirSync(abs)) {
         if (!/\.ya?ml$/.test(name)) continue;
-        const src = fs.readFileSync(path.join(abs, name), 'utf8');
+        const src = readScannedSource(path.join(abs, name)).code;
         for (const m of src.matchAll(/^\s*node-version:\s*['"]?([0-9.]+)['"]?/gm)) {
           out.push({ file: `${dir}/${name}`, version: m[1] });
         }
@@ -193,7 +194,7 @@ describe('workflow node-version tracks the provisioned Node', () => {
   it('every workflow (private AND the oss/ overlay) pins the PINNED_NODE major', () => {
     // Read the pin from source rather than hard-coding 24 — a hard-coded copy is the same drift
     // this guard exists to catch, one level up.
-    const src = fs.readFileSync(path.join(repoRoot, 'engine/toolchain/nodeProvision.ts'), 'utf8');
+    const src = readScannedSource(path.join(repoRoot, 'engine/toolchain/nodeProvision.ts')).code;
     const pinned = src.match(/version:\s*'v(\d+)\./);
     expect(pinned, 'could not read PINNED_NODE.version from nodeProvision.ts').not.toBeNull();
     const major = pinned![1];
@@ -217,7 +218,10 @@ describe('workflow node-version tracks the provisioned Node', () => {
       if (!fs.existsSync(abs)) continue;
       for (const name of fs.readdirSync(abs)) {
         if (!/\.ya?ml$/.test(name)) continue;
-        if (fs.readFileSync(path.join(abs, name), 'utf8').includes('node-version:')) {
+        // ⚠️ Stripped: this is the NON-VACUITY check for the pin comparison above, and a bare
+        // `.includes` is satisfied by `# node-version: 20` in a comment — a workflow that had
+        // stopped pinning Node would still look covered (#812).
+        if (readScannedSource(path.join(abs, name)).code.includes('node-version:')) {
           filesWithNodeVersion.push(`${dir}/${name}`);
         }
       }

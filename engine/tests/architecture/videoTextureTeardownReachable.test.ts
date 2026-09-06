@@ -18,13 +18,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
-const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(repoRoot, rel)).code;
 
 // Each region is the smallest slice of the file containing one onWorldSwap/teardown site.
 const sites: [label: string, rel: string, regionStart: string, regionEnd: string][] = [

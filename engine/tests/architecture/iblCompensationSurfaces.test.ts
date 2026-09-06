@@ -24,8 +24,8 @@
  *  `previewScene`), which never sync an environment — so they are correct by having no
  *  compensation at all, not by reconciling one. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const srcRoots = [
@@ -46,7 +46,7 @@ describe('IBL-off compensation — surfaces that sync an environment must reconc
     const offenders: string[] = [];
     let callers = 0;
     for (const file of sourceFiles()) {
-      const src = fs.readFileSync(file, 'utf8');
+      const src = readScannedSource(file).code;
       if (!/\bsyncEnvironment\s*\(/.test(src)) continue;
       callers++;
       if (!/\breconcileToneExposure\s*\(/.test(src)) offenders.push(path.relative(process.cwd(), file));

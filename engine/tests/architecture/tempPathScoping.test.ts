@@ -25,6 +25,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
@@ -52,20 +53,24 @@ function tempDirBasenames(src: string): string[] {
   return out;
 }
 
-/** Drop whole-line comments: these scripts discuss `/tmp` paths in prose constantly (they
- *  document this very hazard), and a doc mention is not a write. */
-function codeLines(src: string): { line: string; n: number }[] {
-  return src
-    .split('\n')
-    .map((line, i) => ({ line, n: i + 1 }))
-    .filter(({ line }) => !/^\s*#/.test(line));
+/**
+ * Numbered lines of ALREADY-STRIPPED shell source. These scripts discuss `/tmp` paths in prose
+ * constantly (they document this very hazard), and a doc mention is not a write.
+ *
+ * The private version this replaces dropped only WHOLE-LINE `#` comments, so a trailing
+ * `cmd  # writes to /tmp/x` was still read as a write. Callers hand in
+ * `readScannedSource(file).code`, which blanks both and is line-preserving, so `n` still addresses
+ * the real file (#812).
+ */
+function codeLines(code: string): { line: string; n: number }[] {
+  return code.split('\n').map((line, i) => ({ line, n: i + 1 }));
 }
 
 describe('temp paths in engine/scripts are clone-scoped', () => {
   it('every literal /tmp path carries a per-clone discriminator', () => {
     const offenders: string[] = [];
     for (const file of shellScripts()) {
-      for (const { line, n } of codeLines(fs.readFileSync(file, 'utf8'))) {
+      for (const { line, n } of codeLines(readScannedSource(file).code)) {
         // `mktemp`/`mkdtemp` mint a unique name themselves — the `${TMPDIR:-/tmp}` prefix in
         // those calls is a portability idiom, not a shared name.
         if (/mk(d?)temp/.test(line)) continue;
@@ -96,7 +101,7 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     // shared name here while their PORTS and profiles were already per clone.
     const offenders: string[] = [];
     for (const file of shellScripts()) {
-      for (const name of tempDirBasenames(fs.readFileSync(file, 'utf8'))) {
+      for (const name of tempDirBasenames(readScannedSource(file).code)) {
         if (!name.includes('$')) offenders.push(`${path.basename(file)}: ${name}`);
       }
     }
@@ -112,8 +117,8 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     // the script finds a DIFFERENT, older app (or none) and reports on it. Its own header says
     // a naive default once did exactly that and "reported it green". Renaming one side while
     // per-cloning it is precisely how that recurs, so pin them to each other.
-    const smoke = fs.readFileSync(path.join(scriptsDir, 'smoke-packaged.sh'), 'utf8');
-    const repro = fs.readFileSync(path.join(scriptsDir, 'repro-cold-boot.sh'), 'utf8');
+    const smoke = readScannedSource(path.join(scriptsDir, 'smoke-packaged.sh')).code;
+    const repro = readScannedSource(path.join(scriptsDir, 'repro-cold-boot.sh')).code;
     const outOf = (src: string) => /^OUT=.*$/m.exec(codeLines(src).map((l) => l.line).join('\n'))?.[0] ?? '';
     // Compare the BASENAME expression, normalised for the two spellings of "this clone"
     // ($CLONE vs an inline $(basename "$REPO")) — the paths must resolve to one directory.
@@ -124,7 +129,7 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
   });
 
   it('launch-editor.sh EXPORTS the per-clone Vite log, not just computes it', () => {
-    const src = fs.readFileSync(path.join(scriptsDir, 'launch-editor.sh'), 'utf8');
+    const src = readScannedSource(path.join(scriptsDir, 'launch-editor.sh')).code;
     const code = codeLines(src).map((l) => l.line).join('\n');
     // The regression was a computed-but-unexported variable, so asserting the assignment
     // exists proves nothing — the export is the whole point.
@@ -139,7 +144,7 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     const setters = ['launch-editor.sh', 'test-packaged.sh'];
     const offenders: string[] = [];
     for (const name of setters) {
-      const s = fs.readFileSync(path.join(scriptsDir, name), 'utf8');
+      const s = readScannedSource(path.join(scriptsDir, name)).code;
       for (const { line, n } of codeLines(s)) {
         if (line.includes('MODOKI_VITE_LOG') && /\/tmp\//.test(line)) offenders.push(`${name}:${n}: ${line.trim()}`);
       }

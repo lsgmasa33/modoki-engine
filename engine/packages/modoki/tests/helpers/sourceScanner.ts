@@ -36,6 +36,8 @@
  * strip byte-identically under most of the mutations (measured, #411 close-out).
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { expect } from 'vitest';
 import ts from 'typescript';
 
@@ -409,4 +411,215 @@ export function assertEveryCodeTokenSurvives(
     .toBeGreaterThan(opts.minTokens ?? 10);
   expect(damaged, `${label}: the stripper ate CODE, not comments — a count taken over this is `
     + `meaningless, and it lowers silently.\n${damaged.join('\n')}`).toEqual([]);
+}
+
+/**
+ * ⚠️ **Swift block comments NEST, so the depth counter is real rather than defensive.**
+ *
+ * Lifted here from `capacitorPlatformDeclarations.test.ts` (#812), which reached this shape the
+ * hard way — the header there records the three regex attempts it replaced, each of which lost a
+ * different construct (`https://host//path` under an `[^:]` guard, a `/*` inside a line comment
+ * eating forward to the next terminator anywhere in the file). It was already the best stripper in
+ * the repo; what it lacked was a way for anything else to reach it.
+ *
+ * ⚠️ **Changed in one way while moving: comment characters are BLANKED, not dropped.** The
+ * original preserved lines but not length, which put it outside `assertScanIsSane`'s contract —
+ * the one instrument check every other stripper here answers to. Blanking makes it compose with
+ * the rest of this module; `missingSpmDeps`, its only caller, matches with `includes` and cannot
+ * tell the difference.
+ */
+export function stripSwiftComments(src: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  let inLine = false;
+  let blockDepth = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (inLine) {
+      if (c === '\n') { inLine = false; out += c; } else { out += ' '; }
+      i += 1;
+    } else if (blockDepth > 0) {
+      if (c === '/' && d === '*') { blockDepth += 1; out += '  '; i += 2; }
+      else if (c === '*' && d === '/') { blockDepth -= 1; out += '  '; i += 2; }
+      else { out += c === '\n' ? c : ' '; i += 1; }
+    } else if (inString) {
+      if (c === '\\') { out += c + (d ?? ''); i += 2; }     // an escape cannot close the literal
+      else { if (c === '"') inString = false; out += c; i += 1; }
+    } else if (c === '"') { inString = true; out += c; i += 1; }
+    else if (c === '/' && d === '/') { inLine = true; out += '  '; i += 2; }
+    else if (c === '/' && d === '*') { blockDepth = 1; out += '  '; i += 2; }
+    else { out += c; i += 1; }
+  }
+  return out;
+}
+
+/**
+ * Shell/`#`-comment source with comment CONTENT blanked. Length- and line-preserving, like the rest.
+ *
+ * ⚠️ **`#` opens a comment only at line start or after WHITESPACE**, which is the shell's own rule
+ * and the conservative direction: it leaves `${var#prefix}` and `a#b` alone rather than blanking
+ * real code. Single and double quotes are tracked so a `#` inside a string survives.
+ *
+ * ⚠️ **The `#!` shebang is KEPT, although the shell does treat it as a comment.** It is
+ * load-bearing metadata that a guard may reasonably assert on ("every script declares
+ * `env bash`"), and keeping it errs toward leaving more text rather than less.
+ *
+ * ⚠️ **Known limit — a HEREDOC body is treated as ordinary code**, so a `#`-comment-looking line
+ * inside one is blanked. That direction LOWERS what a scan sees, which for a forbidden-pattern
+ * guard is the silent-pass direction this whole module exists to close. It is left this way
+ * because tracking heredoc delimiters properly needs a real shell parser; a guard scanning a
+ * heredoc-heavy script should pass `sentinels` to `readScannedSource` so the blanking cannot go
+ * unnoticed.
+ */
+export function stripHashComments(src: string): string {
+  let out = '';
+  let i = 0;
+  let quote: '"' | "'" | null = null;
+  let inComment = false;
+  while (i < src.length) {
+    const c = src[i];
+    if (inComment) {
+      if (c === '\n') { inComment = false; out += c; } else { out += ' '; }
+      i += 1;
+      continue;
+    }
+    if (quote) {
+      // ⚠️ **A quote does not survive a newline — a deliberate TRADE, not parity with
+      // `stripComments`.** There the reset is sound: a JS string literal cannot span a newline
+      // unescaped. Here it is not — a POSIX single-quoted string and a YAML quoted scalar both
+      // legally span lines — so this buys the common case and pays for the rare one.
+      //
+      // What it buys: without it, `name: Don't push` opens a string that closes on the next quote
+      // ANYWHERE in the file, leaving every `#` comment in between unblanked. That is the
+      // silent-green direction for a forbidden-pattern guard, and `assertScanIsSane` is blind to it
+      // because length and line parity both still hold.
+      // What it costs: a `#` INSIDE a genuinely multi-line quoted string is now blanked. Measured
+      // across all 35 tracked .sh/.yml files, exactly one such case exists today —
+      // `scripts/publish-engine-oss.sh:351`, inside a multi-line `node -e '…'` — and no guard
+      // scans that file. All 13 `engine/scripts/**.sh` strip byte-identically old vs new.
+      // Getting both right needs a real shell/YAML parser, which this is not.
+      if (c === '\n') { quote = null; out += c; i += 1; continue; }
+      // Backslash escapes are honoured inside "…" but are literal inside '…' (POSIX).
+      if (quote === '"' && c === '\\') { out += c + (src[i + 1] ?? ''); i += 2; continue; }
+      if (c === quote) quote = null;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; out += c; i += 1; continue; }
+    if (c === '#' && !(i === 0 && src[1] === '!')) {
+      const prev = i === 0 ? '\n' : src[i - 1];
+      if (prev === '\n' || prev === ' ' || prev === '\t') { inComment = true; out += ' '; i += 1; continue; }
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** The comment syntaxes `readScannedSource` knows how to blank. */
+export type ScanLanguage = 'js' | 'braces' | 'swift' | 'shell' | 'jsonc' | 'yaml';
+
+/** Extension → language. Absent means `readScannedSource` REFUSES rather than guessing — see there. */
+const LANGUAGE_BY_EXT: ReadonlyMap<string, ScanLanguage> = new Map<string, ScanLanguage>([
+  ...(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'] as const)
+    .map((e) => [e, 'js'] as const),
+  // C-family comment syntax with no regex literals, so a bare `/` is always division.
+  ...(['.java', '.kt', '.kts', '.gradle', '.m', '.mm', '.h', '.c', '.cc', '.cpp',
+    '.wgsl', '.glsl', '.css', '.scss'] as const).map((e) => [e, 'braces'] as const),
+  ...(['.swift'] as const).map((e) => [e, 'swift'] as const),
+  ...(['.sh', '.bash', '.zsh'] as const).map((e) => [e, 'shell'] as const),
+  // YAML comments are `#`, same rule as shell — a workflow guard is defeatable by one exactly as
+  // a script guard is, so this is not a formality.
+  ...(['.yml', '.yaml'] as const).map((e) => [e, 'yaml'] as const),
+  // Strict JSON has no comments, so the strip is a no-op there and JSONC is handled for free.
+  ...(['.json', '.jsonc'] as const).map((e) => [e, 'jsonc'] as const),
+]);
+
+export interface ReadScannedOptions {
+  /**
+   * `'strip'` (default) blanks comment content before the guard matches.
+   *
+   * `'include'` is the DECLARED opt-out for a guard that scans comments **on purpose** —
+   * `docCitations` (a citation living in a docblock is exactly what it exists to catch) and
+   * `editorStoreActionsReachable` (any textual reference counts). It returns `code === raw`, and
+   * it requires `reason`, so the exemption is a sentence someone wrote rather than the silent
+   * default it used to be.
+   */
+  comments?: 'strip' | 'include';
+  /** Why this read scans comments. Required with `comments: 'include'`; ignored otherwise. */
+  reason?: string;
+  /** Override the extension mapping — for an extensionless script, or a file whose suffix lies. */
+  language?: ScanLanguage;
+  /** Strings that must survive the strip, forwarded to `assertScanIsSane`. */
+  sentinels?: readonly string[];
+}
+
+export interface ScannedSource {
+  /** The file exactly as on disk. For line numbers, and for a guard that must quote prose. */
+  raw: string;
+  /** What the guard MATCHES against: same length and same line count as `raw`, comments blanked. */
+  code: string;
+  /** The path as handed in, so a failure message can name the file. */
+  path: string;
+}
+
+/**
+ * ⚠️ **The one way a source-scanning guard reads a file (#812).** Read here, match on `.code`.
+ *
+ * `#419` gave this repo one comment scanner and twelve guards adopted it; sixteen more went on
+ * matching `fs.readFileSync(…, 'utf8')` output directly, and that is a fail-OPEN defect in both
+ * directions at once. A **forbidden**-pattern guard goes green because a comment hid the offender;
+ * a **required**-pattern guard goes green because a comment SATISFIED the match, so the real call
+ * site can be deleted and nothing notices. Measured instances of each: a `/*`-in-a-line-comment
+ * hid 82 lines of `Scene3D.tsx` including 22 imports from the determinism guard, and
+ * `stopDevServer.mjs`'s own explanatory comment satisfies `devStopEditorCarveOut`'s
+ * `--configLoader runner` assertion today.
+ *
+ * The point of routing the READ rather than fixing sixteen matches is that remembering to strip is
+ * exactly what nobody does. `commentStripperIsShared.test.ts` enforces this entry point, so the
+ * seventeenth guard cannot quietly skip it.
+ *
+ * ⚠️ **It REFUSES an extension it has no stripper for**, rather than falling back to raw text.
+ * Falling back is precisely the defect; a guard scanning Markdown or a storyboard must say so with
+ * `comments: 'include'` and a reason.
+ *
+ * ⚠️ **`.pbxproj` is deliberately NOT registered, and the reason generalises.** It was, briefly,
+ * routed to `braces` — an Xcode project file is C-family and carries block-comment spans
+ * naming each file (the `AppDelegate.swift` annotation Xcode writes beside every id),
+ * annotations denser than anything else the guards scan. But those spans are **generated NAMING
+ * that is part of the file's syntax**, not commentary hiding code, and `pbxprojObjectIds` matches
+ * them as such — its DEFINITION regex has an OPTIONAL group for the annotation, spelled with
+ * escaped delimiters. Blanking the annotation broke the adjacency that
+ * regex needs and cut the ids it inspected from **43 to 1**, under a `> 0` floor that could not
+ * tell the difference. The lesson is not about pbxproj: **before registering a language, read the
+ * consumer's pattern — a "comment" that the guard's own regex MATCHES is data, not noise.**
+ */
+export function readScannedSource(absPath: string, opts: ReadScannedOptions = {}): ScannedSource {
+  const raw = fs.readFileSync(absPath, 'utf8');
+  const label = path.basename(absPath);
+
+  if (opts.comments === 'include') {
+    if (!opts.reason?.trim()) {
+      throw new Error(`${label}: comments:'include' needs a reason — it turns off the strip, and an `
+        + 'undeclared exemption is the fail-open default this exists to remove');
+    }
+    return { raw, code: raw, path: absPath };
+  }
+
+  const ext = path.extname(absPath).toLowerCase();
+  const language = opts.language ?? LANGUAGE_BY_EXT.get(ext);
+  if (!language) {
+    throw new Error(`${label}: no comment stripper for \`${ext || '(no extension)'}\` — pass `
+      + '`language`, or declare `comments: \'include\'` with a reason if this guard means to scan '
+      + 'prose. Guessing here is the fail-open bug (#812).');
+  }
+
+  const code = language === 'swift' ? stripSwiftComments(raw)
+    : (language === 'shell' || language === 'yaml') ? stripHashComments(raw)
+      : stripComments(raw, { regexLiterals: language === 'js' });
+  assertScanIsSane(raw, code, label, opts.sentinels);
+  return { raw, code, path: absPath };
 }

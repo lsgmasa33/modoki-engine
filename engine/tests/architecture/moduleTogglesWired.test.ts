@@ -29,7 +29,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
@@ -119,7 +119,7 @@ describe('build.modules toggles are wired in both directions', () => {
 
   it('the Engine Modules panel offers exactly the keys MODULE_KEYS resolves', () => {
     const panelPath = 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx';
-    const src = fs.readFileSync(path.join(REPO_ROOT, panelPath), 'utf8');
+    const src = readScannedSource(path.join(REPO_ROOT, panelPath)).code;
     const start = src.indexOf('const MODULES');
     expect(start, `${panelPath} no longer declares a MODULES array — this guard needs updating`).toBeGreaterThan(-1);
     const block = src.slice(start, src.indexOf('\n];', start));

@@ -21,6 +21,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -50,7 +51,7 @@ function tsFilesUnder(projectRel: string): string[] {
 function gameIdOf(projectDir: string): string {
   const gameTs = path.join(projectDir, 'game.ts');
   if (fs.existsSync(gameTs)) {
-    const m = /^\s*id:\s*'([^']+)'/m.exec(fs.readFileSync(gameTs, 'utf-8'));
+    const m = /^\s*id:\s*'([^']+)'/m.exec(readScannedSource(gameTs).code);
     if (m) return m[1];
   }
   return path.basename(projectDir);
@@ -73,7 +74,7 @@ for (const root of PROJECT_ROOT_DIRS) {
     const projectDir = path.join(rootAbs, entry.name);
     const gameId = gameIdOf(projectDir);
     for (const file of tsFilesUnder(`${root}/${entry.name}`)) {
-      const src = fs.readFileSync(file, 'utf-8');
+      const src = readScannedSource(file).code;
       if (!src.includes('registerAgentTool')) continue;
       mentioningFiles += 1;
       for (const m of src.matchAll(CALL_RE)) {

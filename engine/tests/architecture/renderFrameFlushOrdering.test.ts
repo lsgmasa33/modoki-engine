@@ -16,14 +16,14 @@
  *  instead — cheap, and it fails with a message that names the consequence rather than sending a
  *  future reader to git archaeology. */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SCENE2D_PATH = path.resolve(
   __dirname,
   '../../packages/modoki/src/runtime/rendering/Scene2D.tsx',
 );
-const src = readFileSync(SCENE2D_PATH, 'utf8');
+const src = readScannedSource(SCENE2D_PATH).code;
 
 // Scope to renderFrame()'s body: from its declaration to the next top-level method
 // (`private flushPendingMaskDestroy` and friends are earlier in the file, so anchor on the

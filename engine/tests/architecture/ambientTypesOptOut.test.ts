@@ -25,6 +25,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
@@ -58,29 +59,11 @@ function tsconfigs(): string[] {
  *
  *  Parse failure THROWS rather than returning a default: an unreadable config is a broken
  *  guard, and it must say so instead of quietly becoming a finding. */
-function stripJsonComments(src: string): string {
-  let out = '';
-  let inStr = false;
-  let esc = false;
-  for (let i = 0; i < src.length; i++) {
-    const c = src[i];
-    if (inStr) {
-      out += c;
-      if (esc) esc = false;
-      else if (c === '\\') esc = true;
-      else if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') { inStr = true; out += c; continue; }
-    if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; out += '\n'; continue; }
-    if (c === '/' && src[i + 1] === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++; i++; continue; }
-    out += c;
-  }
-  return out;
-}
-
 function readJsonc(file: string): Record<string, unknown> {
-  const raw = stripJsonComments(fs.readFileSync(file, 'utf8')).replace(/,(\s*[}\]])/g, '$1');
+  // JSONC comments blanked by the shared scanner (#812) rather than a private stripper — its
+  // `.json` route keeps strings intact, so a `//` inside a path value survives. Trailing commas
+  // are still JSONC-only and handled here.
+  const raw = readScannedSource(file).code.replace(/,(\s*[}\]])/g, '$1');
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch (e) {

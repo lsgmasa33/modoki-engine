@@ -22,10 +22,10 @@
  *  worker-clone launches landed on 5179, one (modoki-qa, 2026-08-25) with a live hub editor. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
-import { stripComments as stripJsComments } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
   HUB_BACKEND_PORT,
@@ -36,7 +36,17 @@ import {
 } from '../../scripts/editorPorts.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
-const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
+/**
+ * A documentation file, read as PROSE (#812).
+ *
+ * Every read in this guard is a `.md` doc — it compares the port TABLES humans read against the
+ * authored table in code, which it imports directly rather than scanning. So there is no code
+ * scan here to strip, and Markdown carries no comment syntax a scan could be blinded by.
+ */
+const readDoc = (rel: string) => readScannedSource(path.join(REPO, rel), {
+  comments: 'include',
+  reason: 'the assertions are about the port TABLES written in this doc — prose is the subject',
+}).raw;
 // engine/scripts/** and the committed agent-CLI configs are private-repo-only; the public
 // engine snapshot ships neither, so there is nothing to assert there.
 const skip = !hasPrivateTooling();
@@ -117,7 +127,7 @@ describe.skipIf(skip)('the docs still say what the table says', () => {
     ['docs/clones-and-ports.md', '§ RULE 2'],
   ] as const) {
     it(`${doc} ${section} lists the same clone → backend port pairs`, () => {
-      const documented = portsFromMarkdownTable(read(doc));
+      const documented = portsFromMarkdownTable(readDoc(doc));
       expect(
         Object.keys(documented).length,
         `${doc} — parsed no \`~/Projects/<clone>\` table rows at all. Either the table moved or its `
@@ -141,7 +151,7 @@ describe.skipIf(skip)('the docs still say what the table says', () => {
   }
 
   it('docs/clones-and-ports.md § RULE 2 also agrees on the derived Vite and CDP columns', () => {
-    const src = read('docs/clones-and-ports.md');
+    const src = readDoc('docs/clones-and-ports.md');
     let checked = 0;
     for (const line of src.split('\n')) {
       const dir = /~\/Projects\/([A-Za-z0-9._-]+)/.exec(line)?.[1];
@@ -194,29 +204,12 @@ describe.skipIf(skip)('no shared script re-introduces a hardcoded hub-port defau
   //  missed the regression written in the same style as the fix.
   const DEFAULTED_PORT = /(?::-|=|:)\s*["']?(?:http:\/\/(?:127\.0\.0\.1|localhost):)?(517[3-9]|518[0-3]|922[2-6])\b/;
 
-  /**
-   * Dual language: `#` for shell, the shared scanner (`@modoki/engine/testing`, #419) for JS.
-   *
-   * ⚠️ **The JS half used to be a line filter dropping any line starting with `//`, `*` or `/*`,
-   * and that is a silent-DELETION bug of exactly the #419 class** (found sweeping the siblings).
-   * A wrapped multiplication — `const derived = base\n  * factor;` — starts with `*` and was
-   * dropped as if it were a JSDoc continuation, taking real code out of the guard's view; and a
-   * block comment whose continuation lines do NOT start with `*` survived it entirely. The
-   * scanner decides by STATE rather than by how a line happens to begin, which is the only thing
-   * that can tell those two apart.
-   *
-   * The shell half stays a line filter: bash has no block comments, so there is no phantom-region
-   * ambiguity to exploit, and the scanner does not speak `#`.
-   */
-  function stripComments(src: string, rel: string): string {
-    if (rel.endsWith('.mjs')) return stripJsComments(src);
-    return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
-  }
-
   for (const rel of SHARED) {
     it(`${rel} derives its backend port instead of defaulting to one`, () => {
       if (!existsSync(path.join(REPO, rel))) return;
-      const code = stripComments(read(rel), rel);
+      // Dual language (`.sh` vs `.mjs` vs `.json`) — the shared scanner (#419/#812) picks the
+      // right stripper by extension, so no hand-rolled per-language branch is needed here.
+      const code = readScannedSource(path.join(REPO, rel)).code;
       const hit = DEFAULTED_PORT.exec(code);
       expect(
         hit?.[0] ?? null,

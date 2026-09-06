@@ -35,7 +35,14 @@ import { describe, expect, it } from 'vitest';
 // `stripCommentsAndStrings` additionally blanks string/template CONTENT (parser-driven) — used
 // below to compute brace/bracket DEPTH safely, so a stray `(`/`{`/`[` inside a tooltip string
 // cannot desync a balanced-span scan (#723 review finding H).
-import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens } from '@modoki/engine/testing';
+import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens, readScannedSource } from '@modoki/engine/testing';
+
+/** `qa/README.md` is read as PROSE — the format spec's own tables and sentences are what these
+ *  assertions are about, and Markdown has no comment syntax for a scan to be blinded by. */
+const README_AS_PROSE = {
+  comments: 'include',
+  reason: 'the assertions are about the spec TEXT — the prose is the subject, not noise',
+} as const;
 
 /**
  * `node:path` yields `\` on Windows, but every path in this file's vocabulary — the `area`
@@ -1424,7 +1431,7 @@ describe('qa case guard helpers', () => {
       // covers this family at all — only `ids` does. Read from the REAL file, not a hand-typed
       // fixture, so a renamed/removed settings key goes red instead of the assertion testing
       // itself.
-      const setupSrc = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const setupSrc = readScannedSource(join(REPO_ROOT, 'engine/app/editor/setup.ts')).code;
       const { ids, patterns } = knownUiIds([setupSrc, 'const uiId = `projectSettings.${field.key}`;']);
       expect(ids.has('projectSettings.rendering.three.qualityTier')).toBe(true);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
@@ -1438,10 +1445,9 @@ describe('qa case guard helpers', () => {
       // it passed whether the derivation worked or not, and it defended a shape blanket that let
       // `particle.bursts.delete` through. Reading the actual panel is what gives it power: if the
       // Section/label markup changes shape, this goes red.
-      const panel = readFileSync(
+      const panel = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/ParticleEditor.tsx'),
-        'utf8',
-      );
+      ).code;
       const derived = particleFieldIds(panel);
       expect(derived.length).toBeGreaterThan(40); // ~60 labelled fields; a broken scan returns []
       expect(derived).toContain('particle.general.max-particles');
@@ -1535,7 +1541,7 @@ describe('qa case guard helpers', () => {
    */
   describe('#723 derived families reject a typo of a real cited value', () => {
     it('inspector.field — from the REAL trait registry', () => {
-      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const src = readScannedSource(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts')).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('inspector.field.Transform.x')).toBe(true);
@@ -1561,7 +1567,7 @@ describe('qa case guard helpers', () => {
      * 4-line comment; `Renderable3DPrimitive.material` sits behind a 2-line comment.
      */
     it('inspector.field derives EVERY field of a comment-heavy trait, not just the ones after its last comment', () => {
-      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const src = readScannedSource(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts')).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       // The two ids the brief names explicitly.
@@ -1596,7 +1602,7 @@ describe('qa case guard helpers', () => {
     });
 
     it('inspector.section / inspector.addComponent.item — from the REAL trait registry', () => {
-      const src = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
+      const src = readScannedSource(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts')).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('inspector.section.Director.header')).toBe(true);
@@ -1631,10 +1637,9 @@ describe('qa case guard helpers', () => {
      * to an import, so this is that pin for the copy in THIS file.
      */
     it("traitSubSectionIds' inline subSectionSlug copy matches widgets.tsx (pin, not an import)", () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/assetViews/widgets.tsx'),
-        'utf8',
-      );
+      ).code;
       expect(src).toContain("return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');");
     });
 
@@ -1715,7 +1720,7 @@ describe('qa case guard helpers', () => {
     });
 
     it('projectSettings.* — from the REAL setup.ts field declarations', () => {
-      const src = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const src = readScannedSource(join(REPO_ROOT, 'engine/app/editor/setup.ts')).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('projectSettings.app.appName')).toBe(true);
@@ -1738,7 +1743,7 @@ describe('qa case guard helpers', () => {
         // shape as a real ContextMenuItem — this is the false positive the deriver's docblock
         // names, reproduced here rather than only asserted about.
         'engine/app/debug/hmrStaleness.ts',
-      ].map((f) => readFileSync(join(REPO_ROOT, f), 'utf8'));
+      ].map((f) => readScannedSource(join(REPO_ROOT, f)).code);
       const { ids, patterns } = knownUiIds(files);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('contextmenu.item.Delete')).toBe(true);
@@ -1759,8 +1764,8 @@ describe('qa case guard helpers', () => {
      * hand-typed fixture, so a future change to either can only make this MORE honest, not less.
      */
     it('#723 review close-out: impossible ids rejected, real cited ids still accepted', () => {
-      const traitsSrc = readFileSync(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts'), 'utf8');
-      const setupSrc = readFileSync(join(REPO_ROOT, 'engine/app/editor/setup.ts'), 'utf8');
+      const traitsSrc = readScannedSource(join(REPO_ROOT, 'engine/app/ecs/registerTraits.ts')).code;
+      const setupSrc = readScannedSource(join(REPO_ROOT, 'engine/app/editor/setup.ts')).code;
       const { ids, patterns } = knownUiIds([traitsSrc, setupSrc]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
 
@@ -1923,7 +1928,7 @@ describeCases('QA case references', () => {
     ? repoFiles({ floor: 0, includeUntracked: true }).map((f) => f.rel)
     : [];
 
-  const readIfPresent = (p: string) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
+  const readIfPresent = (p: string) => (existsSync(p) ? readScannedSource(p).code : '');
   const modokiTools = new Set(
     readIfPresent(join(REPO_ROOT, 'engine/tools/modoki-mcp/src/contracts.ts')).match(
       /modoki_[a-z0-9_]+/g,
@@ -1934,7 +1939,7 @@ describeCases('QA case references', () => {
     existsSync(deviceToolsDir)
       ? walk(deviceToolsDir)
           .filter((f) => f.endsWith('.ts'))
-          .flatMap((f) => readFileSync(f, 'utf8').match(/device_[a-z0-9_]+/g) ?? [])
+          .flatMap((f) => readScannedSource(f).code.match(/device_[a-z0-9_]+/g) ?? [])
       : [],
   );
   const npmScripts = new Set(
@@ -2364,7 +2369,7 @@ describeCases('QA case references', () => {
     // quoted the docstring as its worked example, and a case brief copied the README.
     const docs = [
       ...cases.map((c) => ({ rel: c.rel, body: c.body })),
-      { rel: 'qa/README.md', body: readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8') },
+      { rel: 'qa/README.md', body: readScannedSource(join(REPO_ROOT, 'qa', 'README.md'), README_AS_PROSE).raw },
     ];
     corpusScanCache = { known, docs };
     return corpusScanCache;
@@ -2563,7 +2568,7 @@ describeCases('QA case references', () => {
    * directory actually uses `QA-DIALOG-` sends the next author to the wrong one.
    */
   it('every case area has a README row, with the id prefix that area actually uses', () => {
-    const readme = readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8');
+    const readme = readScannedSource(join(REPO_ROOT, 'qa', 'README.md'), README_AS_PROSE).raw;
     const rows = new Map(
       [...readme.matchAll(/^\|\s*`([a-z][\w-]*)`\s*\|\s*`(QA-[A-Z]+-)`\s*\|/gm)].map((m) => [
         m[1],
@@ -2610,7 +2615,7 @@ describeCases('QA case references', () => {
   // closes the two halves that ARE local, so at least a case can never name a target the spec
   // does not document, nor the spec promise one no case may use.
   it('the target enum in this guard matches the one qa/README.md documents', () => {
-    const readme = readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8');
+    const readme = readScannedSource(join(REPO_ROOT, 'qa', 'README.md'), README_AS_PROSE).raw;
     const sentence = /^\*\*`targets`\*\* —([\s\S]*?)\./m.exec(readme)?.[1] ?? '';
     const documented = [...sentence.matchAll(/`([a-z][\w-]*)`/g)].map((m) => m[1]);
     // A reformat that stops the parser matching must fail loudly, not vacuously pass.

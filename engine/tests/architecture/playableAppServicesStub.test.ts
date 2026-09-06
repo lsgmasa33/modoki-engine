@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -37,7 +37,7 @@ const STUB = path.join(repoRoot, 'engine/plugins/playable-appservices-stub.ts');
 
 /** Names the stub actually exports. */
 function stubExports(): Set<string> {
-  const src = readFileSync(STUB, 'utf8');
+  const src = readScannedSource(STUB).code;
   const names = new Set<string>();
   for (const m of src.matchAll(/^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)) names.add(m[1]);
   for (const m of src.matchAll(/^export\s+(?:const|let|class)\s+([A-Za-z_$][\w$]*)/gm)) names.add(m[1]);
@@ -86,7 +86,7 @@ function requiredNames(files: readonly string[]): { required: Map<string, string
   };
 
   for (const rel of files) {
-    const src = readFileSync(path.join(repoRoot, rel), 'utf8');
+    const src = readScannedSource(path.join(repoRoot, rel)).code;
     for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'@[^/']+\/app-services'/g)) {
       for (const raw of m[1].split(',')) {
         const trimmed = raw.trim().replace(/^type\s+/, '');
@@ -111,7 +111,7 @@ function requiredNames(files: readonly string[]): { required: Map<string, string
  * many lines and several members return object literals of their own (`PLAYABLE_NO_AUTH`).
  */
 function stubNamespaceMembers(): Map<string, Set<string>> {
-  const src = readFileSync(STUB, 'utf8');
+  const src = readScannedSource(STUB).code;
   const out = new Map<string, Set<string>>();
   for (const m of src.matchAll(/^export const ([A-Za-z_$][\w$]*)\s*=\s*\{/gm)) {
     const name = m[1];
@@ -158,7 +158,7 @@ function requiredNamespaceMembers(
   for (const rel of files) {
     const fileAliases = aliases.get(rel);
     if (!fileAliases) continue;
-    const src = readFileSync(path.join(repoRoot, rel), 'utf8');
+    const src = readScannedSource(path.join(repoRoot, rel)).code;
     for (const [localName, originalName] of fileAliases) {
       if (!namespaces.has(originalName)) continue; // not one of the stub's namespace objects
       const re = new RegExp(`\\b${localName}\\.([A-Za-z_$][\\w$]*)\\s*\\(`, 'g');

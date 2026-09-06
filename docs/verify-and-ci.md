@@ -342,6 +342,20 @@ spawn and a hand-rolled recursive `readdir` walker. It lives in `engine/scripts/
 `engine/tests/helpers/` because the plain-`.mjs` build scripts must import it too — the same `.ts`
 barrier that forced `pathPosix.mjs` to exist (see [windows.md](windows.md) § Paths).
 
+⚠️ **A source-scanning guard needs BOTH shared halves, and they answer different questions.**
+`repoFiles()` decides *which files* are in the corpus; `readScannedSource()` (next section) decides
+*how each one is read*. Landed independently by two clones — #799/#771/#805 and #812 — and
+`corpusProducerIsShared.test.ts` is right to call itself `commentStripperIsShared.test.ts`'s
+structural twin one mechanism over. A guard using only the first enumerates the right files and can
+still be satisfied by a comment in one of them; a guard using only the second reads each file
+correctly and can still be blind to half the corpus. The shape to copy:
+
+```ts
+for (const { abs, rel } of repoFiles({ under: SRC_DIR, match: /\.tsx?$/, floor: 400 })) {
+  const { code } = readScannedSource(abs);   // enumerate with one, read with the other
+}
+```
+
 ```js
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 // `rel` is git's own repo-relative POSIX path; `abs` is joined FROM it.
@@ -394,11 +408,65 @@ and how the first sweep for #419 still missed sixteen more.
 path; from `engine/tests/**` and from a game's tests use the package subpath — a game may not
 reach outside its own folder by relative path (`assets/gamePortability.test.ts`).
 
+⚠️ **Do not read the file yourself either — `readScannedSource` is the entry point (#812).** One
+scanner was never the whole rule: sixteen guards imported nothing and matched
+`fs.readFileSync(…, 'utf8')` output directly, and enforcing the rule turned up twenty-one more —
+the class was 37 files, not the 16 the report enumerated. Remembering to strip is exactly what nobody does, so the READ is what got routed.
+
+```ts
+import { readScannedSource } from '@modoki/engine/testing';
+const { raw, code } = readScannedSource(absPath);   // strips by EXTENSION, runs assertScanIsSane
+expect(code).toMatch(/…/);                          // match on `code`; `raw` only to scan prose
+```
+
+It picks a stripper by extension — js · braces (C-family, no regex literals, and where `.pbxproj`
+lands: Xcode writes `/* Name */` annotations denser than anything else the guards scan) · swift ·
+shell · yaml (`#`, the same rule — a workflow guard is defeatable by a comment exactly as a script
+guard is) · jsonc — and **REFUSES an extension it has no stripper for** rather than falling back to
+raw text, because falling back is the defect. A guard scanning Markdown or a storyboard declares
+`{ comments: 'include', reason }`, which makes the exemption a sentence somebody wrote instead of a
+silent default.
+
+⚠️ **Before registering a language, read the CONSUMER's pattern — a "comment" a guard MATCHES is
+data, not noise.** `.pbxproj` was briefly routed to the C-family stripper because Xcode annotations
+are the densest comments in the repo. They are, and `pbxprojObjectIds`' regex matches them *as
+syntax* (`^\t\t<id>(optional annotation) = {`), so blanking them cut the object ids that guard
+inspects from **43 to 1** while it stayed green under a `> 0` floor. `.pbxproj` is now deliberately
+unregistered so the reader refuses it and the caller has to decide. The general lesson is the one
+in `sourceScanner.ts`'s docblock; the general defence is a non-vacuity floor that can tell 43 from
+1, which `> 0` cannot.
+
+⚠️ **Stripping is not universally right, and that is why the opt-out exists.** `docCitations` scans
+comments on purpose (a citation living in a docblock is exactly what it exists to catch), and
+`editorStoreActionsReachable` states that any textual reference counts — strip either and you DEFEAT
+it. `fontSourceShipped` is the mixed case that shows the shape: eight of its assertions are about
+code, and one asserts that a RATIONALE is documented, where the comment IS the subject. The reader
+hands back both views from one read, so it keeps `code` for the eight and `raw` for the one, named
+`SRC` and `SRC_WITH_PROSE` so reaching for prose stays a deliberate act rather than the default.
+
+**Both halves are enforced by `commentStripperIsShared.test.ts`** — no hand-rolled stripper
+anywhere, and no raw read of repo source inside `engine/tests/architecture/**`. That directory is
+the scope on purpose: of 1,234 test files, 113 still carry a raw utf8 read, but almost all read back
+a fixture the test itself just wrote, where there is nothing to strip — inside the architecture
+directory it is 55 of 59. A read elsewhere is a deliberate false negative rather than a 55-entry
+allowlist, which would be the same hole one level up. The 27 that are real guards are tracked in
+#816.
+
+⚠️ **Both directions of this defect are fail-OPEN, and the second one is the easy one to miss.** A
+**forbidden**-pattern guard goes green because a comment HID the offender. A **required**-pattern
+guard goes green because a comment SATISFIED the match — so the real call site can be deleted and
+nothing fails. Measured example of the second: `devStopEditorCarveOut` asserts `stopDevServer.mjs`
+tests for `--configLoader runner`, and that file's own explanatory comment matched the regex on its
+own.
+
 ```ts
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
-const stripped = stripComments(raw);          // or { strings: 'blank' } / { regexLiterals: false }
+const stripped = stripComments(raw);          // or { regexLiterals: false } for non-JS source
 assertScanIsSane(raw, stripped, 'file.ts');   // BEFORE any count is trusted
 ```
+
+The lower-level `stripComments` stays exported for source you already hold as a string — a sliced
+function body, shader text, a value that never came off disk.
 
 **Why this is a correctness rule and not a tidiness one (#419).** Twenty-eight guards each carried
 a private stripper, and every one was built the same broken way: strip block comments with a lazy

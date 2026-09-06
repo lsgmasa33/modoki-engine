@@ -24,9 +24,9 @@
  *  duplicate DEFINITION is a damaged project, whoever wrote it.
  */
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { globSync } from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -44,6 +44,18 @@ const repoRoot = path.resolve(__dirname, '..', '..', '..');
  * that collides.
  */
 const DEFINITION = /^\t\t([0-9A-Fa-f]{24})(?: \/\* .* \*\/)? = \{/gm;
+
+/**
+ * ⚠️ **Read AS WRITTEN — a pbxproj's `/* … *\/` spans are Xcode-generated NAMING, and `DEFINITION`
+ * matches them.** Blanking them cost this guard 42 of the 43 ids it inspects per project (measured
+ * on `demos/video-demo`), because the optional annotation group could no longer match and ` = {`
+ * stopped being adjacent to the id. The `> 0` floor passed on the single un-annotated root object,
+ * so the file stayed green while checking almost nothing (#812 close-out).
+ */
+const PBXPROJ_AS_WRITTEN = {
+  comments: 'include',
+  reason: 'the `/* Name */ ` spans are generated naming that DEFINITION matches — syntax, not prose',
+} as const;
 
 function definedIds(source: string): string[] {
   return [...source.matchAll(DEFINITION)].map((m) => m[1]);
@@ -63,8 +75,21 @@ describe.skipIf(!hasInternalGames())('committed pbxproj object ids', () => {
   });
 
   it.each(files)('%s defines every object id exactly once', (rel) => {
-    const ids = definedIds(readFileSync(path.join(repoRoot, rel), 'utf8'));
-    expect(ids.length).toBeGreaterThan(0);
+    const ids = definedIds(readScannedSource(path.join(repoRoot, rel), PBXPROJ_AS_WRITTEN).raw);
+    // ⚠️ A floor of ONE is not a floor. `> 0` was satisfied by the single un-annotated root object
+    // while a stripped read hid the other 42, so the guard inspected 2% of the file and reported
+    // green. Measured across all 21 committed pbxprojs the real range is 41-48, so a fresh
+    // `cap add ios` project clears this comfortably.
+    //
+    // ⚠️ It can no longer be a STRIP regression that trips this — the read above is `.raw`, so
+    // `raw === code` by construction. What it now catches is `DEFINITION` or Xcode's annotation
+    // format drifting out from under the guard.
+    expect(
+      ids.length,
+      `${rel}: only ${ids.length} object ids matched, against 41-48 in every committed project — `
+      + 'DEFINITION has stopped seeing this file (an annotation-format change, or a read that no '
+      + 'longer returns the file as written), so the duplicate check below is vacuous',
+    ).toBeGreaterThan(10);
 
     const seen = new Set<string>();
     const duplicates = [...new Set(ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false))))];

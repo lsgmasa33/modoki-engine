@@ -18,10 +18,11 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.resolve(__dirname, '../../..');
 const LOADERS_DIR = path.join(REPO, 'engine/packages/modoki/src/runtime/loaders');
-const consumerSrc = fs.readFileSync(path.join(REPO, 'engine/app/debug/agentBridge.ts'), 'utf8');
+const consumerSrc = readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code;
 
 /** Every `export function invalidate<Something>(` across the loader modules, with the file that
  *  defines it (for a failure message that doesn't force a repo-wide grep). */
@@ -29,7 +30,7 @@ function findInvalidators(): Array<{ name: string; file: string }> {
   const out: Array<{ name: string; file: string }> = [];
   for (const entry of fs.readdirSync(LOADERS_DIR, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-    const src = fs.readFileSync(path.join(LOADERS_DIR, entry.name), 'utf8');
+    const src = readScannedSource(path.join(LOADERS_DIR, entry.name)).code;
     for (const m of src.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(/g)) {
       out.push({ name: m[1], file: entry.name });
     }

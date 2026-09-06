@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const viewsDir = path.resolve(__dirname, '../../packages/modoki/src/editor/panels/assetViews');
 
@@ -48,7 +49,7 @@ interface Site { file: string; line: number; expr: string; spliced: boolean }
 function optionSites(): Site[] {
   const out: Site[] = [];
   for (const f of fs.readdirSync(viewsDir).filter((n) => n.endsWith('.tsx'))) {
-    const lines = fs.readFileSync(path.join(viewsDir, f), 'utf8').split('\n');
+    const lines = readScannedSource(path.join(viewsDir, f)).code.split('\n');
     lines.forEach((l, i) => {
       if (!/=>\s*<option/.test(l)) return;
       // The list and the .map() are often split across lines by the line length, so read a

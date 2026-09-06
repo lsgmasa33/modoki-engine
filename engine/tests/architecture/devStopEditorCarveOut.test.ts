@@ -13,11 +13,17 @@
  *  install must not have a bundled config written into its tree — not for this one), the
  *  carve-out silently stops matching and the bug returns with no test failing. Hence this. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.resolve(__dirname, '../../..');
-const read = (rel: string) => fs.readFileSync(path.join(REPO, rel), 'utf8');
+/** ⚠️ **Comments blanked (#812).** Every assertion here is a REQUIRED-pattern match, and this file
+ *  scans two heavily-commented sources that explain the very flag it looks for — so raw text lets
+ *  PROSE satisfy the assertion. Measured: `stopDevServer.mjs:71`'s comment ("`--configLoader
+ *  runner` is the discriminator") matches the regex below on its own, so deleting the real
+ *  `isEditorOwned` at `:74` left that assertion green. */
+const read = (rel: string) => readScannedSource(path.join(REPO, rel)).code;
 
 describe('dev:stop leaves the editor-owned Vite alone (#129)', () => {
   it('the editor still spawns Vite with the flag stopDevServer uses to identify it', () => {

@@ -40,6 +40,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { REPO_ROOT, hasNativeProjects } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -73,7 +74,7 @@ describe('iOS SceneDelegate builds the plugin-registering bridge VC (#368)', () 
       // literal to a module const would make it skip every second offending file. Any-occurrence
       // is all this needs.
       /rootViewController\s*=\s*CAPBridgeViewController\s*\(/.test(
-        fs.readFileSync(path.join(REPO_ROOT, f), 'utf8'),
+        readScannedSource(path.join(REPO_ROOT, f)).code,
       ),
     );
     expect(

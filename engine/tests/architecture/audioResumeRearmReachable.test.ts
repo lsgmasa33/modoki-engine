@@ -15,13 +15,14 @@
  *  that imports the module cannot see whether production calls it. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments } from '@modoki/engine/testing';
+import { stripComments, readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+/** Comments blanked at the READ (#812) — the callers used to each remember to strip, which
+ *  is one forgetful caller away from a guard that matches its own documentation. */
+const read = (rel: string) => readScannedSource(path.join(repoRoot, rel)).code;
 
 describe('useAudioResumeRearm is reached from production code (#489)', () => {
   it('App.tsx imports useAudioResumeRearm from its own module', () => {

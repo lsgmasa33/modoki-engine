@@ -27,10 +27,19 @@
  * `.claude/skills/`. Skip when absent rather than going red on `ci/main`.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { describe, expect, it } from 'vitest';
 import { REPO_ROOT, hasSkills } from '../helpers/repoLayout';
+
+/** A Markdown doc, read as PROSE — the doc TEXT is the subject of these assertions, and
+ *  Markdown carries no comment syntax a scan could be blinded by (#812). */
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the doc text IS the subject, so there is nothing to see past',
+} as const;
+
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
@@ -64,7 +73,7 @@ describe.skipIf(!HAS_SKILLS)('skill references', () => {
     const dangling: string[] = [];
     for (const file of skillFiles()) {
       const rel = toPosix(file.slice(REPO_ROOT.length + 1));
-      for (const tok of new Set(codeSpans(readFileSync(file, 'utf8')).filter(isRepoPath))) {
+      for (const tok of new Set(codeSpans(readScannedSource(file, DOC_AS_PROSE).raw).filter(isRepoPath))) {
         if (!existsSync(join(REPO_ROOT, tok))) dangling.push(`${rel} cites missing path: ${tok}`);
       }
     }
@@ -80,11 +89,11 @@ describe.skipIf(!HAS_SKILLS)('skill references', () => {
     const dangling: string[] = [];
     for (const file of skillFiles()) {
       const rel = toPosix(file.slice(REPO_ROOT.length + 1));
-      const text = readFileSync(file, 'utf8');
+      const text = readScannedSource(file, DOC_AS_PROSE).raw;
       for (const m of text.matchAll(/`([^`\n]+\.md)`\s*§\s*"([^"\n]+)"/g)) {
         const [, path, heading] = m;
         if (!isRepoPath(path) || !existsSync(join(REPO_ROOT, path))) continue; // covered above
-        const headings = [...readFileSync(join(REPO_ROOT, path), 'utf8').matchAll(/^#{1,6}\s+(.*)$/gm)].map(
+        const headings = [...readScannedSource(join(REPO_ROOT, path), DOC_AS_PROSE).raw.matchAll(/^#{1,6}\s+(.*)$/gm)].map(
           (h) => h[1].replace(/`/g, '').trim(),
         );
         if (!headings.some((h) => h.includes(heading.replace(/`/g, '').trim()))) {

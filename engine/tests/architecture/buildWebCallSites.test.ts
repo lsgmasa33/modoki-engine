@@ -22,9 +22,9 @@
  *  single-quoted — is named in ALLOWLIST below with its reason; if a new false positive shows up
  *  here, add it there rather than loosening the detector. */
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -82,7 +82,7 @@ function scan(): Invocation[] {
   const found: Invocation[] = [];
   for (const file of files) {
     const rel = relEngine(file);
-    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    const lines = readScannedSource(file).code.split('\n');
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (!line.includes('build-web.mjs')) continue;
@@ -149,7 +149,7 @@ describe('every build-web.mjs invocation passes --target (regression guard)', ()
  *  runner alive, and it needs the flag for read-only installs. So the two spawn sites legitimately
  *  DIFFER, which is why this asserts each one separately rather than assuming symmetry. */
 describe('vite build must not use the runner config loader', () => {
-  const read = (p: string) => fs.readFileSync(path.join(__dirname, '../..', p), 'utf8');
+  const read = (p: string) => readScannedSource(path.join(__dirname, '../..', p)).code;
 
   it('build-web.mjs runs `vite build` WITHOUT --configLoader runner', () => {
     const src = read('scripts/build-web.mjs');

@@ -23,7 +23,15 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+
+/** A Markdown doc, read as PROSE — the doc TEXT is the subject of these assertions, and
+ *  Markdown carries no comment syntax a scan could be blinded by (#812). */
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the doc text IS the subject, so there is nothing to see past',
+} as const;
 
 const REPO = path.resolve(__dirname, '../../..');
 const DOCS = path.join(REPO, 'docs');
@@ -118,7 +126,7 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
   it('no tracked markdown tells you to hand-roll a toolchain probe in a command block', () => {
     const offences: string[] = [];
     for (const file of allMarkdown()) {
-      const md = fs.readFileSync(path.join(REPO, file), 'utf8');
+      const md = readScannedSource(path.join(REPO, file), DOC_AS_PROSE).raw;
       for (const block of commandBlocks(md)) {
         for (const line of block.split('\n')) {
           for (const { re, why } of BANNED) {
@@ -164,7 +172,7 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
     // one above — a doc that reads authoritative and does not work.
     const script = path.resolve(__dirname, '../../scripts/print-toolchain-env.mjs');
     expect(fs.existsSync(script)).toBe(true);
-    const src = fs.readFileSync(script, 'utf8');
+    const src = readScannedSource(script).code;
     // It must DELEGATE. If this file ever grows its own candidate list it becomes the third probe.
     expect(src).toContain("'engine', 'toolchain', 'index.ts'");
     expect(src).toMatch(/detect\(['"]java['"]\)/);
@@ -174,7 +182,7 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
   it('every recipe doc that mentions the script spells it the same way', () => {
     const invocation = 'node engine/scripts/print-toolchain-env.mjs';
     for (const file of RECIPE_DOCS) {
-      const md = fs.readFileSync(path.join(DOCS, file), 'utf8');
+      const md = readScannedSource(path.join(DOCS, file), DOC_AS_PROSE).raw;
       if (!md.includes('print-toolchain-env')) continue;
       expect(md, `${file} names the script but not the runnable form`).toContain(invocation);
     }
