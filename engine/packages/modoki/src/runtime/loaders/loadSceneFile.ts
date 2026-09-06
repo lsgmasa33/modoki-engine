@@ -1096,6 +1096,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Text2D.font': 'font',
   'UIElement.imageSrc': 'texture',
   'UIElement.fontFamily': 'font-family',   // a font asset consumed by the DOM (#231)
+  'UISettings.fontFamily': 'font-family',  // scene-wide DOM default for every UI root (#803)
   'PrefabInstance.source': 'prefab',
   'Environment.hdrPath': 'environment',
   'ParticleEmitter.effect': 'particle',

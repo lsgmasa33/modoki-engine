@@ -96,6 +96,9 @@ function makeWorld(getClip: () => string, buttons: { guid: string; clipValue: st
         }
       },
     }),
+    // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+    // rebuild via `world.queryFirst`, unconditionally.
+    queryFirst: () => undefined,
   } as never;
 }
 

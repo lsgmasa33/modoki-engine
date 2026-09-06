@@ -989,6 +989,56 @@ describe('asset-tree-shaker', () => {
     expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
   });
 
+  /** #803 — the scene-wide default. `UISettings.fontFamily` is the ONLY font ref in Court's scene
+   *  now that its per-root `UIElement.fontFamily` was removed, so if the keep-walk cannot see this
+   *  field the face is shaken out of the production build and every UI string falls back to
+   *  system-ui ON DEVICE ONLY — the #53 class of "a ref the build cannot see", which no editor
+   *  session can reveal.
+   *
+   *  Deliberately authored with NO `resources[]` entry and NO `UIElement.fontFamily` anywhere:
+   *  `SceneManager` acquires from the saved `resources` array as well as the entity walk, so a
+   *  stale saved entry would mask a broken walk at runtime while the next editor save silently
+   *  dropped the font. This asserts the ENTITY walk alone is sufficient. */
+  it('resolves a UISettings.fontFamily GUID — the scene-wide default — to its file AND variants', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000004';
+    fx.writeVirtual('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeVirtual('/modoki/assets/fonts/Varela/VarelaRound-Bold.ttf', 'fake');
+    fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');
+
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UISettings: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf');
+    // The variant half: authored via the dedicated 'font-family' kind, not the registry's generic
+    // 'asset' push, which would keep only the one file the GUID names. A `fontWeight: 700` on any
+    // root would otherwise get a browser-synthesized fake bold in production.
+    expect(result.kept, 'sibling variant of the same family').toContain('/modoki/assets/fonts/Varela/VarelaRound-Bold.ttf');
+    expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Regular.ttf');
+    // A DOM consumer — what makes `shipSource:'auto'` ship the source `.ttf` at all.
+    expect(result.domFontFiles).toContain('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf');
+    expect(result.warnings.filter((w) => /unresolved GUID|no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** Same one-ref-one-warning rule as `UIElement.fontFamily` above: `UISettings.fontFamily` is in
+   *  BOTH `REF_FIELDS_BY_TRAIT` and the dedicated 'font-family' handler, so it must be listed in
+   *  `DEDICATED_REF_FIELDS` or a single stale ref reports as two broken fonts. */
+  it('reports an unresolved UISettings.fontFamily GUID exactly once', () => {
+    const MISSING = '99999999-9999-4999-8999-999999999998';
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UISettings: { fontFamily: MISSING } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
+  });
+
   it('drops all fonts when no scene sets fontFamily', () => {
     fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
     fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');

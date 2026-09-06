@@ -190,6 +190,9 @@ describe('uiTreeStore', () => {
             }
           },
         }),
+        // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+        // rebuild via `world.queryFirst`, unconditionally.
+        queryFirst: () => undefined,
       } as any;
     }
 
@@ -270,6 +273,9 @@ describe('uiTreeStore', () => {
             cb([uiEl], { id: () => 1, has: () => true, get: () => ({ parentId: 0, sortOrder: 0 }), generation: () => 0 });
           },
         }),
+        // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+        // rebuild via `world.queryFirst`, unconditionally.
+        queryFirst: () => undefined,
       } as any;
     }
 
@@ -350,6 +356,9 @@ describe('uiTreeStore', () => {
             }
           },
         }),
+        // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+        // rebuild via `world.queryFirst`, unconditionally.
+        queryFirst: () => undefined,
       } as any;
     }
 
@@ -457,6 +466,9 @@ describe('uiTreeStore', () => {
             cb([uiEl], entity);
           },
         }),
+        // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+        // rebuild via `world.queryFirst`, unconditionally.
+        queryFirst: () => undefined,
       } as any;
     }
 
@@ -531,6 +543,9 @@ describe('uiTreeStore', () => {
             cb([uiEl], entity);
           },
         }),
+        // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+        // rebuild via `world.queryFirst`, unconditionally.
+        queryFirst: () => undefined,
       } as any;
     }
 

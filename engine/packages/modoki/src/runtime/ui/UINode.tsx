@@ -594,9 +594,26 @@ interface UINodeProps {
    *  (so nested Canvas2D canvases still mount/position) while the UI layer is
    *  toggled off. Canvas content is unaffected (gated separately by renderCanvas2D). */
   uiVisualsHidden?: boolean;
+  /** The font this node would inherit through the CSS cascade (#803) — i.e. the NEAREST ancestor's
+   *  authored `UIElement.fontFamily`, falling back to the scene-wide `UISettings` default that
+   *  `UIRenderer` sets on the shared container. Each level passes `node.fontFamily || inherited`
+   *  down, so it tracks the cascade rather than jumping straight to the scene default.
+   *
+   *  A plain `div` never needs it explicitly — the real CSS cascade already gives it exactly this
+   *  value — but an `<input>`/`<range>` does NOT inherit `font-family`: the UA stylesheet gives
+   *  form controls their own default, and an explicit declared value beats inheritance. So a form
+   *  control with no authored font would render in the UA font while its `div` siblings render in
+   *  the inherited one, and this prop is how it gets the same answer they do.
+   *
+   *  ⚠️ It must be the INHERITED value, not the scene default: a modal root authoring its own
+   *  `fontFamily` makes those two differ, and handing the input the scene default would render it
+   *  in a different typeface from the labels beside it. `''` when nothing up the chain authored a
+   *  font, which is what keeps the repo's two existing `<input>`s (`games/chess`,
+   *  `games/llm-test`, neither authoring one) on the UA font exactly as before. */
+  inheritedFontFamily?: string;
 }
 
-function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisualsHidden }: UINodeProps) {
+function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisualsHidden, inheritedFontFamily }: UINodeProps) {
   // Focus ring (controller/keyboard navigation, Part B). Runtime only — the editor's
   // click-to-select mode (onSelectEntity set) is authoring, not gameplay nav. The
   // selector subscribes THIS node to the focus store, so only the entering/leaving
@@ -776,6 +793,19 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // field is on every UIElement and the Inspector shows it everywhere, so honouring it only on
   // leaves was an authoring surface that lied.
   if (node.fontFamily) style.fontFamily = node.fontFamily;
+  // A form control (`input`/`range`) does NOT inherit `font-family` from this style cascade —
+  // the browser's UA stylesheet gives it its own explicit default, which beats plain
+  // inheritance — so with no authored `UIElement.fontFamily` it would miss the scene-wide
+  // `UISettings` default every `div` sibling gets for free through `UIRenderer`'s container
+  // (#803, one element type over from the container fix). Gated to input/range ONLY: a `div`
+  // already inherits correctly and must be left alone, and using `'inherit'` unconditionally
+  // here was rejected — `games/chess` and `games/llm-test` author the repo's only two
+  // `<input>`s and neither authors a scene font, so an unconditional `inherit` would visibly
+  // change both from the platform's form font to `body`'s `system-ui` for a change neither
+  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps them byte-identical.
+  else if (inheritedFontFamily && (node.elementType === 'input' || node.elementType === 'range')) {
+    style.fontFamily = inheritedFontFamily;
+  }
 
   // ── Text styling (only when text content exists) ──
   // Built here, applied to a wrapper around the text near the end of render — see the maxLines
@@ -1646,7 +1676,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
-          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
         ))}
       </div>
     );
@@ -1707,7 +1737,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       {videoLayer}
       {textContent}
       {node.children.map(child => (
-        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
       ))}
     </div>
   );

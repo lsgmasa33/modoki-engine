@@ -79,6 +79,10 @@ function makeWorld(getSpecs: () => Spec[]) {
         }
       },
     }),
+    // No `UISettings` singleton by default (#803) — the projection now reads it every rebuild
+    // via `world.queryFirst`, so every pre-existing test in this file needs SOME implementation
+    // here or it throws. `makeWorldWithSettings` below overrides this with a real fake singleton.
+    queryFirst: () => undefined,
   } as never;
 }
 
@@ -432,5 +436,76 @@ describe('uiTreeStore touch', () => {
     specs[0].touch = { ...base };     // a FRESH object with identical values
     markUIDirty(); uiTreeProjection(world);
     expect(useUITreeStore.getState().tree[0]).toBe(before);
+  });
+});
+
+/** `rootFontFamily` — the SCENE-WIDE default DOM font (#803). Every UI ROOT entity mounts as a
+ *  SIBLING inside one shared container div (`UIRenderer`), so a font authored on one root's own
+ *  `UIElement.fontFamily` never reaches another root's descendants — Court authors it on 1 of
+ *  its 10 roots and the other 9 (every modal) fall back to the browser default, silently. The
+ *  fix is a `UISettings.fontFamily`/`systemFont` pair resolved ONCE per rebuild and stored on
+ *  `rootFontFamily`, which `UIRenderer` applies to the shared container so CSS inheritance
+ *  carries it to every root.
+ *
+ *  Resolved through the SAME `resolveUIFontFamily` helper a per-node `fontFamily` uses, so the
+ *  precedence contract (asset wins over systemFont) is identical at both levels — asserted here
+ *  through a real projection, not a spy, for the same reason as the per-node fontFamily tests
+ *  above: a spy passes whether or not the result reaches the store. */
+describe('uiTreeStore rootFontFamily — the scene-wide default (#803)', () => {
+  const FONT_GUID = '30000000-0000-4000-8000-000000000001';
+
+  /** Extends `makeWorld` with a fake `UISettings` singleton read via `queryFirst` — the same
+   *  seam `bindings.ts`'s `readLockWindow` uses for the OTHER `UISettings` fields. The trait
+   *  identity object passed to `queryFirst` is ignored: this fixture has only one singleton to
+   *  serve, so it doesn't need to distinguish which trait was asked for. */
+  function makeWorldWithSettings(getSpecs: () => Spec[], settings?: { fontFamily?: string; systemFont?: string }) {
+    const base = makeWorld(getSpecs) as { query: unknown };
+    return {
+      ...base,
+      queryFirst: () => (settings ? { get: () => settings } : undefined),
+    } as never;
+  }
+
+  async function loadWithFontProvider() {
+    const mod = await load();
+    const { domFontProvider } = await import('../../src/runtime/core/domFontProvider');
+    domFontProvider.provide({ familyForGuid: (g) => (g === FONT_GUID ? 'Varela Round' : undefined) });
+    return mod;
+  }
+
+  it('resolves a UISettings.fontFamily GUID to the CSS family on the store', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0 }];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorldWithSettings(() => specs, { fontFamily: FONT_GUID }));
+    expect(useUITreeStore.getState().rootFontFamily).toBe('"Varela Round"');
+  });
+
+  it('falls back to systemFont, and the asset wins when both are authored', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0 }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorldWithSettings(() => specs, { fontFamily: '', systemFont: 'system-ui' }));
+    expect(useUITreeStore.getState().rootFontFamily).toBe('system-ui');
+
+    markUIDirty();
+    uiTreeProjection(makeWorldWithSettings(() => specs, { fontFamily: FONT_GUID, systemFont: 'system-ui' }));
+    expect(useUITreeStore.getState().rootFontFamily).toBe('"Varela Round"');
+  });
+
+  it('is empty when no UISettings entity exists', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0 }];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorldWithSettings(() => specs, undefined));
+    expect(useUITreeStore.getState().rootFontFamily).toBe('');
+  });
+
+  it('is empty when a UISettings entity exists but both font fields are empty', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0 }];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorldWithSettings(() => specs, { fontFamily: '', systemFont: '' }));
+    expect(useUITreeStore.getState().rootFontFamily).toBe('');
   });
 });

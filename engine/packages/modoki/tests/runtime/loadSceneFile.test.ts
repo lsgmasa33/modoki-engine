@@ -1251,6 +1251,21 @@ describe('collectResourceRefsFromEntities', () => {
     expect(refs).toEqual([]);
   });
 
+  /** #803 — `UISettings.fontFamily` is the scene-wide DEFAULT DOM font (every UI root is a
+   *  SIBLING of every other, so a font authored only on one `UIElement` never reaches another
+   *  root's descendants). This is the REACHABILITY test: a scene whose ONLY font reference is
+   *  `UISettings.fontFamily` — no entity authors `UIElement.fontFamily` at all — must still
+   *  surface a `{type:'font-family', path:<guid>}` ref, or the asset is dropped from the
+   *  production build and the whole feature renders identically to the bug it fixes (#53,
+   *  "assets the build cannot see"). Mirrors the `UIElement.fontFamily` case just above. */
+  it('collects UISettings.fontFamily even when no UIElement authors one', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UISettings: { fontFamily: FONT_GUID } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
+  });
+
   it('collects ModelSource glbPath with postprocessor', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const refs = collectResourceRefsFromEntities([

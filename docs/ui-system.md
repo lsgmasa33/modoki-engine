@@ -2444,6 +2444,89 @@ UI font ref is followed by the same walk as every other ref (and its family's ot
 with it). What remains is a family named from a place no static scan can read — a stylesheet or a
 runtime code string — which is what `shipSource: 'always'` exists for.
 
+#### Registration is not application: where a scene's UI font is APPLIED (#803)
+
+The two subsections above answer "is the face loaded" — REGISTRATION. This one answers a different
+question they cannot: "does anything on screen ask for it" — APPLICATION. A face can be fully
+registered, correctly mapped, and still render nothing anywhere, because nothing on a node's
+ancestor chain names it.
+
+**`UIRenderer` mounts every UI-layer ROOT entity** (`EntityAttributes.layer === 'ui'`,
+`parentId === ''`) **as a SIBLING inside one shared container div** (`runtime/ui/UIRenderer.tsx`).
+CSS `font-family` inheritance follows the DOM tree, and that tree stops at each root's own
+subtree — a root does not inherit anything from a sibling root, only from the shared container
+above all of them (and, failing that, from `body`).
+
+That mechanism produced a concrete bug in `games/court`: exactly 1 of its 10 UI roots (`Intro`)
+authored a `UIElement.fontFamily`; the other nine (`PurchaseNoticeCard`, `CoinShortfallCard`,
+`BonusModal`, `RulesModal`, `AccountModal`, `AccountDeleteModal`, `ConflictModal`, `BusyOverlay`,
+`StoreModal`) authored none, so each fell through to `body { font-family: system-ui, -apple-system,
+sans-serif }`, set by `engine/app/App.css` — and that inheritance chain ships in the production build,
+not just the editor. `games/wordweave`, by contrast, happened to be correct: it has only 4 UI roots
+and authored the font on all of them by hand. That is not evidence the per-root shape was fine — it
+is diligence standing in for a missing mechanism, and diligence does not scale past a handful of
+roots authored by different people at different times, which is exactly what Court's ten became.
+
+**Why #253/#276 could not have caught this.** Both are about whether a `FontFace` exists in
+`document.fonts` and stays current under re-import — REGISTRATION. This bug's face was loaded,
+current, and correctly resolved from its GUID; the failure was that no CSS declaration on the
+affected nodes' ancestor chain ever referenced that family, which `document.fonts` has no way to
+observe. The only probe that sees it is `getComputedStyle(node).fontFamily` on the actual node in
+question (art.md's rule, unchanged by this fix) — not the registry, and not "is `Intro` correct",
+since `Intro` being correct proved nothing about the other nine roots.
+
+**The fix is a scene-wide default, not a tenth per-root author.** `UISettings` (the existing
+resource-trait singleton, alongside `HapticSettings`/`AudioSettings`) gained `fontFamily` +
+`systemFont` fields, resolved in the UI projection and set on the ONE shared container div —
+so every UI root inherits it unless a root's own `UIElement.fontFamily`/`systemFont` overrides it
+by ordinary CSS cascade. One authored value now backs every root a scene has, present or future,
+instead of a per-root field that a new modal can simply forget to set.
+
+⚠️ **The load-bearing wiring most likely to silently regress — and it is TWO tables in two files,
+which is why the first attempt at this fix wired only one and was dead code.**
+`collectResourceRefsFromEntities` consults `loadSceneFile.ts`'s `SCALAR_RESOURCE_TYPE_BY_FIELD`
+(field → resource TYPE) *only for fields already listed per trait* in `sceneValidation.ts`'s
+`REF_FIELDS_BY_TRAIT` (trait → its ref FIELDS). So both need
+`UISettings.fontFamily`: the type map alone never gets reached, and the field registry alone leaves
+the ref untyped. Miss either and the GUID authored only on `UISettings`
+is never collected as a scene resource, never reaches `loadFontFamilyForRef`, and is never
+FontFace-registered — the field renders as fully authored data in the Inspector while doing
+nothing, the exact "unwired field is a lie with a tooltip" failure CLAUDE.md warns about, and it
+renders IDENTICALLY to the original #803 bug (system-ui everywhere except wherever a root still
+authors its own font).
+
+⚠️ **A second way the same failure can hide**: `SceneManager` acquires a scene's resources from
+BOTH its saved `resources` array (written by the last save) AND a fresh
+`collectResourceRefsFromEntities` pass over the current entities. If the collector's wiring above
+broke, a scene whose `resources` array still carries a stale `{type:'font-family', path:'<guid>'}`
+entry from before the break would keep working at runtime — masking the break entirely — right up
+until the next editor save regenerates `resources` from the (broken) collector and silently drops
+the entry, and with it the font, from every root that depended on the scene-wide default.
+
+⚠️ **The production BUILD is a third, separate wiring — do not assume the two above cover it.**
+`plugins/asset-tree-shaker.ts` walks `REF_FIELDS_BY_TRAIT` too, but it deliberately SKIPS both font
+fields there (`DEDICATED_REF_FIELDS`) and reaches them through its own `'font-family'` handler,
+because the registry's generic `'asset'` push keeps only the ONE file a GUID names — dropping the
+family's other VARIANTS, so an authored `fontWeight: 700` ships as a browser-synthesized fake bold.
+`UISettings.fontFamily` therefore has to be added in BOTH places in that file: the skip set and the
+handler. Measured, not assumed: deleting the `REF_FIELDS_BY_TRAIT` entry leaves all 65 tree-shaker
+tests green while the runtime collector's test reds — the two halves fail independently, so a green
+build gate says nothing about the runtime seam and vice versa.
+
+⚠️ **The saved-`resources[]` masking applies to the BUILD too — but it behaves the OPPOSITE way
+round there, and getting that backwards is easy.** `processSceneOrPrefab` pushes
+`type:'font-family'` from the saved array as well as walking entities, so a scene carrying the entry
+— Court's does — keeps shipping the font with the shaker wiring removed. Unlike the collector case
+above, **that mask never lifts**: a save regenerates the same entry *from* the collector, which is
+wired. So for any scene the editor has saved, a shaker-only break is masked indefinitely, and
+"it still works after a save" says nothing.
+
+What the shaker's own wiring therefore buys is narrower than "Court's font ships": it is the
+independent second guard, the one still standing when the COLLECTOR is what broke and there is no
+`resources[]` entry to fall back on — plus variant-keeping.
+`tests/plugins/assetTreeShaker.test.ts` pins it against a scene whose ONLY font ref is
+`UISettings.fontFamily` and which authors NO `resources[]` entry, which is that shape.
+
 ### MSDF world-text atlases (`Text2D`/`Text3D`)
 
 World-space text renders from a signed-distance-field atlas, not a `FontFace`.

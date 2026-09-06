@@ -7,7 +7,7 @@ import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
-import { markUIDirty } from './uiTreeStore';
+import { markUIDirty, useUITreeStore } from './uiTreeStore';
 import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
@@ -29,6 +29,11 @@ interface UIRendererProps {
 
 export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, uiVisualsHidden }: UIRendererProps) {
   const tree = useUIEntities();
+  // Scene-wide default DOM font (#803) — resolved once in the projection (uiTreeStore), not
+  // here, so it's the same value every UI root inherits by CSS cascade, applied below to the
+  // one container all roots share. '' when unset, so the container carries no fontFamily at
+  // all and App.css's body rule (or any ambient default) still wins.
+  const rootFontFamily = useUITreeStore(s => s.rootFontFamily);
   const [vpVars, setVpVars] = useState<Record<string, string>>({});
   const roRef = useRef<ResizeObserver | null>(null);
   /** The queued `update()` frame, so the callback ref's cleanup can CANCEL it rather than let it
@@ -162,11 +167,25 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
       {...{ [UI_ROOT_ATTR]: onSelectEntity ? 'editor' : 'runtime' }}
       style={{
         position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden',
+        // Every UI root mounted below is a SIBLING inside this one div (there is no single
+        // "top" element UI roots nest under), so this is the ONE place a scene-wide font
+        // reaches all of them — by ordinary CSS inheritance. A per-element
+        // UIElement.fontFamily still wins over this for that element by cascade (#803).
+        // Omitted entirely (not `fontFamily: ''`) when unset, so an empty string can't
+        // override an ambient default (e.g. App.css's body rule) with nothing.
+        ...(rootFontFamily ? { fontFamily: rootFontFamily } : {}),
         ...vpVars as any,
       }}
     >
+      {/* The scene-wide default IS what a root inherits — there is no ancestor above it but this
+          container. Deliberately NOT `node.fontFamily || rootFontFamily` like the recursion sites
+          (#803): there the expression runs on the PARENT and is handed to the child, so it means
+          "the font my child inherits"; here it would run on the node receiving it and hand a root
+          its OWN font as its inherited one. Identical today — the only consumer reads the prop in
+          an `else` after `if (node.fontFamily)` — and wrong the moment a second consumer reads it
+          above that branch. */}
       {tree.map(node => (
-        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
       ))}
     </div>
   );

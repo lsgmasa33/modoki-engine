@@ -31,4 +31,30 @@ export const UISettings = trait({
    * async handler must never brick the UI permanently.
    */
   inputLockMaxMs: UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
+  /**
+   * The scene-wide DEFAULT DOM font for every UI root (#803). A `UIElement` mounted as a UI
+   * ROOT entity is a SIBLING of every other root inside one shared container div, not a
+   * descendant of some single "top" element — so a font authored on `UIElement.fontFamily`
+   * only ever reaches ITS OWN root's descendants, and a scene with several roots (Court has
+   * ten: HUD + one per modal) needs the same typeface authored nine more times or it silently
+   * falls back to the browser default on every root that didn't get it. This field is read
+   * once for the whole scene and applied to the ONE container every UI root lives inside, so
+   * CSS inheritance carries it to all of them.
+   *
+   * A font-ASSET GUID, resolved through the manifest exactly like every other ref (so the
+   * validator, `diagnose` and the build's tree-shaker can see it) — same contract as
+   * `UIElement.fontFamily`. Empty ⇒ no scene-wide default is applied.
+   */
+  fontFamily: '',
+  /**
+   * A plain CSS family name (system-ui, Helvetica, or a stack) — for a typeface no asset can
+   * express. Used only when `fontFamily` above is empty or unresolvable. Same role as
+   * `UIElement.systemFont`, one level up the cascade.
+   *
+   * Precedence matches `UIElement`'s, exactly: the asset GUID wins over `systemFont` when both
+   * are set, and either one only ever supplies the DEFAULT — a per-element
+   * `UIElement.fontFamily`/`systemFont` still overrides it by ordinary CSS cascade (the
+   * descendant's own `font-family` wins over the inherited container value).
+   */
+  systemFont: '',
 });

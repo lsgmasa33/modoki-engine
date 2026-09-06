@@ -167,6 +167,75 @@ describe('UINode fontFamily is emitted on containers, not only on text nodes', (
   });
 });
 
+/** `inheritedFontFamily` — a form control (`input`/`range`) does NOT inherit `font-family` from
+ *  its DOM ancestors (#803): the browser's UA stylesheet gives it its own explicit default, which
+ *  beats plain CSS inheritance. So the font every `div` picks up through the cascade would
+ *  otherwise miss form controls entirely — the same class of bug as #803, one element type over.
+ *
+ *  The prop carries the font this node WOULD inherit: each level passes
+ *  `node.fontFamily || inherited` down, so it is the nearest declaring ancestor's value, falling
+ *  back to the scene-wide `UISettings` default `UIRenderer` puts on the shared container. It is
+ *  deliberately NOT the scene default itself — see the nested case below. A `div` never needs it
+ *  (the real cascade already gives it the same answer), so only input/range read it. */
+describe('UINode inheritedFontFamily — the inherited font reaches form controls too (#803)', () => {
+  it('an <input> with no authored fontFamily falls back to inheritedFontFamily', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
+  });
+
+  it('an authored fontFamily still wins over inheritedFontFamily on an <input>', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: 'Geologica' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Geologica');
+    expect(container.querySelector('input')!.style.fontFamily).not.toContain('Varela Round');
+  });
+
+  it('a RANGE with no authored fontFamily falls back to inheritedFontFamily too', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'range', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
+  });
+
+  /** The chess/llm-test case: neither game authors a scene font, so `inheritedFontFamily` is `''`
+   *  and this MUST leave `fontFamily` absent, not fall back to `inherit` — an unconditional
+   *  `inherit` was rejected specifically because it would visibly change these two games'
+   *  inputs from the platform's form font to `body`'s `system-ui` for no reason either asked
+   *  for. Asserted as ABSENT (empty string on a CSSStyleDeclaration), not merely falsy. */
+  it('an empty inheritedFontFamily leaves fontFamily unset on an <input> — no accidental "inherit"', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: '' })} storeState={{}} inheritedFontFamily="" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toBe('');
+  });
+
+  /** The prop must track the CASCADE, not jump to the scene default. A modal ROOT authoring its
+   *  own `fontFamily` is the case that separates them: every `div` inside that modal renders in
+   *  the modal's font, so an `<input>` handed the SCENE default instead would be the only element
+   *  in the dialog in a different typeface. Caught in review before it could ship — the first
+   *  version passed the raw store value straight down. */
+  it('a nested <input> gets its ANCESTOR\u2019s font, not the scene-wide default', () => {
+    const input = makeNode({ entityId: 2, guid: 'g2', elementType: 'input', fontFamily: '' });
+    const modalRoot = makeNode({ fontFamily: 'Geologica', children: [input] });
+    const { container } = render(
+      <UINode node={modalRoot} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    const el = container.querySelector('input')!;
+    expect(el.style.fontFamily).toContain('Geologica');
+    expect(el.style.fontFamily).not.toContain('Varela Round');
+  });
+
+  it('a div (not a form control) ignores inheritedFontFamily — it already inherits via CSS', () => {
+    const { container } = render(
+      <UINode node={makeNode({ text: 'hi', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toBe('');
+  });
+});
+
 // ── Box visuals ──
 describe('UINode box rendering', () => {
   it('renders nothing when not visible', () => {

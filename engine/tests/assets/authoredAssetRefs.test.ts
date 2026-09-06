@@ -219,11 +219,15 @@ const provenPairs = new Set(
  *  work". Keep it short: a wrongly-listed pair silences the guard for that field repo-wide.
  *
  *  `UIElement.fontFamily` (#231): CSS `font-family` INHERITS, so a UI tree gets its typeface
- *  from one authored ancestor and every descendant is legitimately blank — 120 of the 121
- *  committed instances are, and the one that is not is Court's `Intro` root. Blank also has a
- *  documented fallback chain of its own (`systemFont`, then the browser default —
- *  `runtime/ui/fontFamilyRef.ts`). It became a "proven" pair the moment that root was migrated
- *  from a family NAME to a GUID; nothing about the blanks changed. */
+ *  from one authored ancestor and every descendant is legitimately blank — of the 16 committed
+ *  instances, 12 are blank and the 4 that are not are `games/wordweave`'s UI roots (`HUD Root`,
+ *  `HelpModal`, `DictionaryModal`, `ResultModal`), all pointing at the same font guid. (Court used
+ *  to be the one non-blank instance, on its `Intro` root; #803 moved Court's font onto
+ *  `UISettings.fontFamily` instead — a different trait — so Court now contributes zero instances
+ *  of this field, all blank.) Blank also has a documented fallback chain of its own (`systemFont`,
+ *  then the browser default — `runtime/ui/fontFamilyRef.ts`). It became a "proven" pair the
+ *  moment a root was first migrated from a family NAME to a GUID; nothing about the blanks
+ *  changed. */
 const OPTIONAL_BLANK_PAIRS = new Set(['UIElement.fontFamily']);
 
 /** Every instance of a proven asset-ref pair whose value is a blank string. */

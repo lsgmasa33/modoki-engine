@@ -33,6 +33,25 @@ export const REF_FIELDS_BY_TRAIT: Record<string, string[]> = {
   // font reference. A plain CSS family name lives in the separate `systemFont` field, which
   // is NOT a ref and is deliberately absent from this registry.
   UIElement: ['imageSrc', 'fontFamily'],
+  // The scene-wide DOM font default (#803). It must be here and not only in
+  // `SCALAR_RESOURCE_TYPE_BY_FIELD`: that table is consulted only for fields this registry
+  // already lists per trait, so an entry there alone is dead code and the ref is collected by
+  // nothing. What this entry buys, specifically — measured by deleting it and watching which
+  // suites red, not assumed:
+  //   - `collectResourceRefsFromEntities` emits the `{type:'font-family'}` scene resource, which
+  //     is what FontFace-registers the face at scene load. Without it a scene whose ONLY font ref
+  //     is `UISettings.fontFamily` (Court's, once its per-root author was removed) still renders
+  //     today ONLY because `SceneManager` also acquires from the scene's saved `resources` array —
+  //     and the next editor save regenerates that array without the entry, so the font dies later,
+  //     silently, in a commit that touches nothing to do with fonts.
+  //   - the validator's GUID check, and `editor/scene/serialize.ts`'s save-time guard.
+  // ⚠️ NOT the build keep-walk: `plugins/asset-tree-shaker.ts` reaches this field through its own
+  // dedicated `'font-family'` handler (and skips it here via `DEDICATED_REF_FIELDS`), because the
+  // generic `'asset'` push would keep only the one file the GUID names and drop the family's other
+  // VARIANTS. Deleting this entry leaves all 65 tree-shaker tests green — so do not read this line
+  // as the thing protecting the production build; that lives in the shaker.
+  // `systemFont` is a CSS family name, not a ref, and stays out.
+  UISettings: ['fontFamily'],
   ModelSource: ['glbPath'],
   SkinnedModel: ['model'],
   SkeletalAnimator: ['animSet'],

@@ -73,6 +73,9 @@ function makeWorld(specs: Spec[]) {
         }
       },
     }),
+    // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+    // rebuild via `world.queryFirst`, unconditionally.
+    queryFirst: () => undefined,
   } as never;
 }
 

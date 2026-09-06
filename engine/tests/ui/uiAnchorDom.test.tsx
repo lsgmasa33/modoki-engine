@@ -54,6 +54,10 @@ const ANCHOR_DEFAULTS = {
 
 function makeWorld(ui: Record<string, unknown>, anchor: Record<string, unknown> | null) {
   return {
+    // No `UISettings` entity: `uiTreeProjection` reads the scene-wide default font through
+    // `queryFirst` (#803), so this fake must answer it. `undefined` = no default authored,
+    // which is what these fixtures assert against.
+    queryFirst: () => undefined,
     query: () => ({
       updateEach: (cb: (data: unknown[], entity: unknown) => void) => {
         const data = new Map<unknown, unknown>();

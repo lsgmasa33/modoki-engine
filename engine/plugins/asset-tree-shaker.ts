@@ -413,6 +413,7 @@ function buildGuidIndex(roots: AssetRoot[], origin = new Map<string, GuidOrigin>
  *  pushing the same value a second time. */
 const DEDICATED_REF_FIELDS = new Set([
   'UIElement.fontFamily',   // pushed as 'font-family' — also keeps the family's other variants
+  'UISettings.fontFamily',  // the scene-wide default (#803) — same GUID, so it must shake the SAME
 ]);
 
 function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, referencedBy: RefSource): void {
@@ -499,11 +500,34 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
 
   // ── Refs that are NOT a scalar guid field, so they can't live in the registry ──
 
-  // UIElement.fontFamily is a CSS family NAME, not an asset guid — resolved to
-  // physical font files at the end of the walk via the dedicated 'font-family' kind.
-  const ui = traits['UIElement'] as Record<string, unknown> | undefined;
-  if (ui && typeof ui === 'object') {
-    pushRef(state, 'font-family', ui.fontFamily, { ...referencedBy, trait: 'UIElement' }, 'fontFamily');
+  // A DOM font ref is a font-ASSET GUID (#231), but it cannot go through the generic registry
+  // loop above: that pushes the `'asset'` kind, which keeps only the ONE file the GUID names.
+  // The dedicated `'font-family'` kind resolves it to the family and keeps every VARIANT, so an
+  // authored `fontWeight: 700` gets the real Bold file instead of a browser-synthesized fake.
+  //
+  // Two fields carry one, and they must shake IDENTICALLY (#803): `UIElement.fontFamily` is the
+  // per-element override, `UISettings.fontFamily` the scene-wide default every UI root inherits.
+  // A scene can author only the latter — Court does — so a scene-wide font is reachable by no
+  // other trait field, and without this the walk cannot see it at all.
+  //
+  // ⚠️ That does NOT mean deleting `UISettings` here breaks Court's build today — and the reason
+  // is worth stating, because the obvious test of this line comes back green and the obvious
+  // explanation for that is wrong. `processSceneOrPrefab` also pushes `type:'font-family'` from
+  // the scene's SAVED `resources[]` array, and Court's carries the entry. That mask does NOT lift
+  // on the next save: `collectResourceRefsFromEntities` reads `UISettings.fontFamily` too (its own
+  // wiring in `sceneValidation.ts` + `loadSceneFile.ts`), so a save REGENERATES the same entry.
+  // For any scene the editor has saved, a shaker-only break is masked indefinitely.
+  //
+  // So what this line actually buys is narrower than "Court's font ships": it is the second,
+  // independent guard — the one that still holds when the COLLECTOR wiring is what broke, leaving
+  // no `resources[]` entry to fall back on — plus the variant-keeping behaviour above, which the
+  // `resources[]` path gets right only because it pushes the same `'font-family'` kind.
+  // `tests/plugins/assetTreeShaker.test.ts` pins it against a scene with no `resources[]` entry,
+  // which is that shape.
+  for (const traitName of ['UIElement', 'UISettings'] as const) {
+    const t = traits[traitName] as Record<string, unknown> | undefined;
+    if (!t || typeof t !== 'object') continue;
+    pushRef(state, 'font-family', t.fontFamily, { ...referencedBy, trait: traitName }, 'fontFamily');
   }
 
   // AnimationLibrary (P6) → shared cross-model clips: an ARRAY of .animset.json

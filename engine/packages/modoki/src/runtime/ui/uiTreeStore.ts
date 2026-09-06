@@ -17,6 +17,7 @@ import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
+import { UISettings } from '../traits/UISettings';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
@@ -145,10 +146,17 @@ export interface UINodeData {
 
 interface UITreeState {
   tree: UINodeData[];
+  /** The scene-wide default DOM `font-family` (#803), resolved from the `UISettings` singleton
+   *  through the SAME precedence helper a per-node `fontFamily` uses (`resolveUIFontFamily`).
+   *  Applied to the ONE container every UI root lives inside — see `UIRenderer` — so it reaches
+   *  every root by ordinary CSS inheritance instead of needing to be re-authored on each root's
+   *  own `UIElement`. `''` when no `UISettings` entity exists, or both its font fields are empty. */
+  rootFontFamily: string;
 }
 
 export const useUITreeStore = create<UITreeState>(() => ({
   tree: [],
+  rootFontFamily: '',
 }));
 
 // ── Dirty flag (core/uiDirty.ts owns the state — see the import above) ──
@@ -181,7 +189,7 @@ function ensureInitialized() {
     resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     _warnedLengthUnitMismatches.clear();
-    useUITreeStore.setState({ tree: [] });
+    useUITreeStore.setState({ tree: [], rootFontFamily: '' });
   });
   _initialized = true;
 }
@@ -669,5 +677,11 @@ export function uiTreeProjection(world: World) {
   const tree = buildTree(world);
   if (tree === null) return;
   clearUIDirty();
-  useUITreeStore.setState({ tree });
+  // Scene-wide default font (#803) — read fresh each rebuild, same as `readLockWindow` reads
+  // `UISettings` fresh in bindings.ts: caching it would go stale across a world swap, and this
+  // only runs when the tree is already dirty, so it costs one extra `queryFirst` per rebuild,
+  // not per frame.
+  const settings = world.queryFirst(UISettings)?.get(UISettings);
+  const rootFontFamily = resolveUIFontFamily(settings?.fontFamily, settings?.systemFont, 'UISettings');
+  useUITreeStore.setState({ tree, rootFontFamily });
 }

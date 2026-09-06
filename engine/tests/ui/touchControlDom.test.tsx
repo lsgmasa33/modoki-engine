@@ -45,6 +45,10 @@ const TOUCH_DEFAULTS = { action: 'moveLeft', showOn: 'touch', pressedOpacity: 0.
 
 function makeWorld(touch: Record<string, unknown> | null, ui?: Record<string, unknown>) {
   return {
+    // No `UISettings` entity: `uiTreeProjection` reads the scene-wide default font through
+    // `queryFirst` (#803), so this fake must answer it. `undefined` = no default authored,
+    // which is what these fixtures assert against.
+    queryFirst: () => undefined,
     query: () => ({
       updateEach: (cb: (data: unknown[], entity: unknown) => void) => {
         const data = new Map<unknown, unknown>();

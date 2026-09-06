@@ -52,6 +52,9 @@ function makeWorld() {
         cb([data.get(UIEL)], entity);
       },
     }),
+    // No `UISettings` singleton in this fixture (#803) — the projection reads it every
+    // rebuild via `world.queryFirst`, unconditionally.
+    queryFirst: () => undefined,
   } as never;
 }
 
