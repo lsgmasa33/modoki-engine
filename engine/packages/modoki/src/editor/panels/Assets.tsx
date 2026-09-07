@@ -187,8 +187,15 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // abort is an import failure, and `setImportError` is the dismissible modal for one.
     // (A blanket `finally { setImportStatus(false) }` would be wrong — it resets `failed`,
     // wiping the very error modal the catch sets.)
+    // ⚠️ NAME NO CAUSE HERE. `importModel` aborts for three different reasons now — a write that
+    // did not land (#311), a refusal to overwrite a too-new/corrupt existing asset doc (#784), and
+    // a failed `.meta.json` READ (#880, which would otherwise mint a fresh GUID over the model's
+    // own) — and only the abort itself is visible from this side; the reason travels in
+    // `importModel`'s own toast and console line. This modal hard-coded "a generated file could
+    // not be written", which `importModel` had already fixed in its toast for exactly this reason
+    // and which would now send a user to check disk permissions for a dev-server blip.
     if (!rootId) {
-      setImportError(`Import of "${assetName}" was aborted — a generated file could not be written (see console).`);
+      setImportError(`Import of "${assetName}" was aborted — nothing was written. See the notification and console for the reason.`);
       return;
     }
 

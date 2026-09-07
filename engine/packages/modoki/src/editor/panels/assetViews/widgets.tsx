@@ -13,6 +13,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import {
   useBufferedValue, parseNumber, clampRange, Tooltip, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER,
 } from '../fields';
+import { metaCameFromFailedRead } from '../../scene/metaReadFallback';
 
 /** Single source of truth for the per-type color default (F11). White, not 0/black,
  *  so a newly-bound color `set`-value / un-set material color isn't a surprise
@@ -67,6 +68,27 @@ export interface MetaWriteResult {
  *  old behaviour and the right default for the eight explicit-action writers: they build their
  *  document from a fresh read moments earlier and the human asked for the write. */
 export async function writeMetaConditional(path: string, meta: unknown, ifMatch?: string): Promise<MetaWriteResult> {
+  // ⚠️ THE ONE PLACE A `.meta.json` WRITE IS REFUSED FOR PROVENANCE (#880). This is the single
+  // POST implementation, so guarding here covers every writer — the pending-registry flush, the
+  // explicit-action `writeMetaWholesale` callers, and the two modal editors that call
+  // `writeMetaOrWarn` directly. The review that added it found the tag consumed in three other
+  // places and NOT here, which is how `SpriteEditor`/`NineSliceEditor` came to be protected only
+  // by a hand-rolled `metaLoadedRef` each: a third modal editor copying their shape and omitting
+  // that line would have replaced a sidecar with an id-less document, silently.
+  //
+  // The write is WHOLESALE (`writeMetaSidecar` replaces the file), so a document built on a failed
+  // read costs the asset its GUID and dangles every scene/prefab reference to it. `parkMetaEdit`
+  // refuses the same document EARLIER — at edit time rather than save time — which is a better
+  // moment, not a duplicate of this.
+  if (metaCameFromFailedRead(meta)) {
+    console.error(
+      `[Inspector] refusing to write ${path} — this document was built on a FAILED .meta.json `
+      + 'read, so it has no GUID and the write would REPLACE the file: the scanner would mint a '
+      + 'fresh GUID and every scene/prefab reference to this asset would dangle. Reselect or '
+      + 'reopen the asset to re-read it, then retry.',
+    );
+    return { ok: false, conflict: false, error: 'the document was built on a failed .meta.json read' };
+  }
   try {
     const res = await backendFetch('/api/write-meta', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

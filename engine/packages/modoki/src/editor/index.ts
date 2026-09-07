@@ -102,7 +102,7 @@ export {
   parkMetaEdit, peekPendingMeta, isMetaDirty, hasPendingMeta, getPendingMetaPaths,
   clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
   subscribePendingMeta, getPendingMetaVersion, type MetaFlushResult,
-  readMetaPreferringPark, metaWrittenToDisk, type PreferredMetaRead,
+  readMetaPreferringPark, metaWrittenToDisk, metaReadFallback, type PreferredMetaRead,
 } from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';

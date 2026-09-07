@@ -77,6 +77,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
 import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
+import { metaReadFallback, metaCameFromFailedRead } from './metaReadFallback';
 
 /** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
@@ -98,23 +99,11 @@ const pending = new Map<string, unknown>();
  *  `contentHash.ts`'s docblock warns about. */
 const baselines = new Map<string, string>();
 
-/** Paths whose last `/api/read-meta` FAILED, so this editor does not know what the sidecar holds.
- *
- *  ⚠️ This exists to make one specific destruction unrepresentable. `/api/write-meta` replaces the
- *  sidecar WHOLESALE — it does not merge with disk — and a panel whose load failed is showing its
- *  own defaults with no `id` in hand. Park a field change from that state and Cmd+S writes an
- *  id-less document; the scanner's heal pass then MINTS A FRESH GUID, and every scene/prefab
- *  reference to that asset dangles. A transient 500 on a GET destroys the asset's identity.
- *
- *  `makeTexture2D.ts:24` spells this out and returns early, and `NineSlice`/`SpriteEditor` now
- *  refuse to save — but those are the three RAREST surfaces. The common one is an ordinary field
- *  change in any of the eight asset views, which needs no modal at all, and guarding it in each of
- *  them would be eight copies of one rule that the ninth view will not have. So the refusal lives
- *  HERE, where every read and every park already pass through.
- *
- *  Cleared by a later successful read of the same path: a dev-server blip is transient, and once
- *  we have genuinely read the file there is nothing left to protect against. */
-const readFailed = new Set<string>();
+/** The read-failed tag, its producer and its predicate live in their own leaf module so the
+ *  WRITE ENDPOINT can import them without a cycle — see `metaReadFallback.ts` for the whole
+ *  mechanism and why it is keyed on the document rather than the path (#880). Re-exported here
+ *  because this is the module every caller already imports. */
+export { metaReadFallback, metaCameFromFailedRead } from './metaReadFallback';
 
 /** The baseline for `path`, or `undefined` when this editor has never read it. `undefined` means
  *  UNCONDITIONAL: `ifMatchRefusal` treats an absent `ifMatch` as "proceed", which is the correct
@@ -124,7 +113,8 @@ export function peekMetaBaseline(path: string | undefined): string | undefined {
   return path ? baselines.get(path) : undefined;
 }
 
-/** Test-only: forget every recorded baseline (and every recorded failed read).
+/** Test-only: forget every recorded baseline. (There is no failed-read state left to clear —
+ *  #880 moved that onto the DOCUMENT, where it needs no registry entry and no reset.)
  *
  *  ⚠️ **"Test-only" is the CORRECT state, not an oversight — do not wire this to a project
  *  switch** (#871 half ②, refuted). That half was filed on the reading that a baseline keyed by an
@@ -143,7 +133,7 @@ export function peekMetaBaseline(path: string | undefined): string | undefined {
  *  what it must call, and `pending` matters more than `baselines` (a parked edit surviving into
  *  another project is worse than a stale hash, which only costs one spurious 409 that then drops
  *  the baseline anyway). */
-export function clearMetaBaselines(): void { baselines.clear(); readFailed.clear(); }
+export function clearMetaBaselines(): void { baselines.clear(); }
 
 /** Forget the baseline for `path` — this editor no longer knows what the sidecar holds.
  *
@@ -164,12 +154,12 @@ export function clearMetaBaselines(): void { baselines.clear(); readFailed.clear
  *  is looking at any more — #874's spurious 409. */
 function forgetMetaBaseline(path: string): void { baselines.delete(path); }
 
-/** Record what a `/api/read-meta` response tells us about `path`: the CAS baseline on success
- *  (#845 phase 2, #871), and the READ-FAILED flag on anything else (#845 second review).
+/** Record the CAS baseline a successful `/api/read-meta` response establishes for `path`
+ *  (#845 phase 2, #871). A non-ok response records nothing — see the note at the top of the body.
  *
  *  Call this for EVERY raw GET of that route — `readMetaPreferringPark` does it for the one
  *  blessed path, and a file that is a declared exemption in `metaReadPreferringPark.test.ts`
- *  owes it too.
+ *  owes it too, along with `metaReadFallback()` for its `{}`.
  *
  *  ⚠️ **AN EXEMPTION FROM THE READ HELPER IS NOT AN EXEMPTION FROM WHAT THE RESPONSE TEACHES.**
  *  That is the whole of #871: `VideoAssetView` is exempted for a true and still-correct reason —
@@ -180,13 +170,14 @@ function forgetMetaBaseline(path: string): void { baselines.delete(path); }
  *  passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed* —
  *  the precondition was inert for that entire asset type while looking present.
  *
- *  ⚠️ **The same trap fired a SECOND time, and the merge is what caught it.** `dfe8ce441` added
- *  the `readFailed` half to the block this function had already extracted, so an exempted reader
- *  would have recorded the baseline and NOT the read-failure — leaving the video panel free to
- *  park a document built on the `{}` fallback, with no `id`, which is the GUID destruction
- *  `readFailed` exists to make unrepresentable. Both halves live here for that reason, and the
- *  function is named for the response rather than for the baseline so the next addition lands
- *  inside it too.
+ *  ⚠️ **The same trap fired a SECOND time, and the merge is what caught it.** `dfe8ce441` added a
+ *  read-failed flag to the block this function had already extracted, so an exempted reader would
+ *  have recorded the baseline and NOT the read-failure — leaving the video panel free to park a
+ *  document built on the `{}` fallback, with no `id`, and destroy the asset's GUID. #880 moved
+ *  that half OUT again, onto the fallback document itself, which is what finally makes the
+ *  exemption survivable: an exempted reader now owes `metaReadFallback()` — a value it cannot
+ *  half-adopt — instead of a second bookkeeping call it can forget. The rule generalises: what an
+ *  exemption must not be allowed to skip is better carried by the DATA than by a call.
  *
  *  Three hazards on the baseline half, which is why this is shared and not four lines per site:
  *
@@ -205,40 +196,16 @@ export function noteMetaReadResult(
   path: string,
   res: { ok?: boolean; headers?: { get?: (name: string) => string | null | undefined } | null } | null | undefined,
 ): void {
-  // ⚠️ THE READ-FAILED FLAG IS ARMED UNCONDITIONALLY — a live park does NOT excuse it.
+  // ⚠️ A FAILED READ RECORDS NOTHING HERE, and that is the #880 fix, not an omission.
   //
-  // We do NOT know what this sidecar holds. Remember that, so a field change cannot park a
-  // document built on the `{}` fallback — see `readFailed`.
-  //
-  // This was gated on the live-park check below for one release and that reopened the GUID
-  // destruction `readFailed` exists to prevent. The argument for gating it — "a park exists, so
-  // nothing is about to be built on the `{}` fallback" — is true of the parking component and
-  // FALSE of any other component reading the same path, because `readMetaPreferringPark` returns
-  // `meta: {}` on a failed read and every asset view merges onto `{...(meta ?? {})}`. Two
-  // components DO read one path concurrently on mount (`Inspector`'s postprocessor row and
-  // `ModelAssetView`, both on the model's path): park a good doc from one, let the OTHER's GET
-  // 500, and the flag is skipped — then that panel's next field change parks a doc with no `id`,
-  // and Cmd+S writes an id-less sidecar. The scanner's heal pass mints a fresh GUID and every
-  // scene/prefab reference to that asset dangles.
-  //
-  // ⚠️ **THIS CLOSES ONE INTERLEAVING OF THAT SCENARIO, NOT THE CLASS — see #880.** `readFailed`
-  // is keyed by PATH and the hazard is keyed by COMPONENT, so the `delete` below still fires for
-  // a reader that is NOT the one holding `{}`. Reverse the two responses above — the 500 lands
-  // first, the 200 second — and the id-less park is accepted exactly as before. That half is
-  // pre-existing (every revision of this function clears on ok) and its fix needs identity this
-  // API does not carry, which is why it is filed rather than patched here.
-  //
-  // ⚠️ And arming while a park is live is a WEDGE, accepted deliberately: `readMetaPreferringPark`
-  // returns early on a park and never reaches the network, so nothing clears the flag until the
-  // park is flushed AND the asset re-read. Recovery is Cmd+S then reselect — two steps, and the
-  // refusal message says so. The trade is a refused edit against a silently orphaned asset, so it
-  // goes this way; #880 carries the shape that would remove the wedge instead of trading for it.
-  if (!res?.ok) {
-    readFailed.add(path);
-    return;
-  }
-  // A successful read means this editor knows the file again, park or no park.
-  readFailed.delete(path);
+  // This function armed a path-keyed `readFailed` flag for three revisions, and every one of them
+  // was wrong in the same way: the hazard is *"is the document about to be written the `{}`
+  // fallback?"*, which belongs to one COMPONENT, and a flag keyed by path answers for whichever
+  // component asked last. The guard now travels ON the fallback document (`metaReadFallback`),
+  // so a failed read needs no registry entry — and this function is back to the one job its name
+  // claims. Given it shipped a defect on two of three attempts at the second job, that narrowing
+  // is the point.
+  if (!res?.ok) return;
   // ⚠️ ONLY THE BASELINE is skipped while a park is live — see this function's docblock. The
   // parked document was built from older bytes, so a baseline taken from what disk holds NOW is a
   // claim that document cannot support.
@@ -278,16 +245,18 @@ export function getPendingMetaVersion(): number { return _version; }
  *  the stamp, so deep-cloning would cost more and buy nothing. */
 export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): void {
   // ⚠️ REFUSE rather than park a document this editor cannot have built correctly. See
-  // `readFailed`: the write is wholesale, so a park made while the panel is showing defaults from
-  // a failed read costs the asset its GUID and dangles every reference to it. Refusing loses one
-  // field edit; parking loses the asset.
-  if (readFailed.has(path)) {
+  // `FROM_FAILED_READ`: the write is wholesale, so a park made while the panel is showing defaults
+  // from a failed read costs the asset its GUID and dangles every reference to it. Refusing loses
+  // one field edit; parking loses the asset.
+  //
+  // The refusal reads the DOCUMENT, so it answers for the component that built it and for no
+  // other. The panel next to this one, whose read succeeded, keeps editing (#880).
+  if (metaCameFromFailedRead(meta)) {
     console.error(
-      `[pendingMeta] refusing to park an import-settings edit for ${path} — its .meta.json was `
-      + 'never read successfully, so saving this would replace the file with a document missing '
-      + 'its GUID. RECOVERY: if this asset has other unsaved import-settings edits, press Cmd+S '
-      + 'first — while any edit is parked for this path the panel reads the park instead of the '
-      + 'file, so no read can clear this. Then reselect the asset to re-read it (#880).',
+      `[pendingMeta] refusing to park an import-settings edit for ${path} — this panel's .meta.json `
+      + 'read failed, so it is showing defaults with no GUID in hand, and saving would replace the '
+      + 'file with a document missing it. RECOVERY: reselect the asset to re-read it. Other panels '
+      + 'showing this asset are unaffected.',
     );
     return;
   }
@@ -317,8 +286,13 @@ export function peekPendingMeta(path: string | undefined): unknown | undefined {
 
 /** What `readMetaPreferringPark` hands back. */
 export interface PreferredMetaRead {
-  /** The doc to use — the parked edit when one exists, else what `/api/read-meta` returned (`{}`
-   *  on a non-ok response, matching every existing call site's `r.ok ? r.json() : {}`). */
+  /** The doc to use — the parked edit when one exists, else what `/api/read-meta` returned.
+   *
+   *  ⚠️ On a non-ok response this is `metaReadFallback()`, NOT a bare `{}`. It is empty to every
+   *  string-key consumer, so a call site spreading it behaves exactly as it did when this was
+   *  literally `{}` — but it carries the tag that makes a park or a wholesale write built on it
+   *  REFUSABLE (#880). A caller substituting its own `{}` (for a THROWN read, say — this function
+   *  does not swallow those) hands its panel an untagged document and opts out of that guard. */
   meta: Record<string, unknown>;
   /** The EXACT value `pending` held for `path` at the moment of this read — the same object
    *  reference as `meta` when a park existed, `undefined` when none did. A caller about to write
@@ -332,7 +306,7 @@ export interface PreferredMetaRead {
    *  `/api/write-meta` → `writeMetaSidecar` replaces the sidecar; it does not merge with disk. So
    *  spreading a fallback `{}` writes a sidecar with no `id`, and the scanner's heal pass then
    *  MINTS A NEW GUID for the asset — silently orphaning every scene/prefab reference to it. A
-   *  transient 500 on a read would destroy the asset's identity. `makeTexture2D.ts:24` spells this
+   *  transient 500 on a read would destroy the asset's identity. `makeTexture2D`'s "A FAILED READ MUST ABORT" comment spells this
    *  out at length and returns early; it is the precedent, and this flag is what lets the other
    *  wholesale writers follow it instead of each re-deriving the argument.
    *
@@ -372,7 +346,10 @@ export async function readMetaPreferringPark(
   // in-memory doc → the flush is ACCEPTED and overwrites the external change, where without the
   // agent's read it was correctly refused. An observer must not disarm the guard it observes.
   if (!opts?.passive) noteMetaReadResult(path, r);
-  const meta = r.ok ? await r.json() : {};
+  // ⚠️ The fallback is `metaReadFallback()`, never a bare `{}` — every panel spreads what it gets
+  // here into its next park, and that tag is what makes the spread refusable. See
+  // `FROM_FAILED_READ`.
+  const meta = r.ok ? await r.json() : metaReadFallback();
   return { meta, pendingRef: undefined, ok: r.ok };
 }
 
@@ -402,6 +379,12 @@ export async function readMetaPreferringPark(
  *  if a caller appears that writes and then sits. Leaving the OLD hash remains the one actively
  *  wrong option of the three. */
 export async function writeMetaWholesale(path: string, meta: unknown): Promise<boolean> {
+  // ⚠️ NO TAG CHECK HERE — it moved to `writeMetaConditional`, the single POST implementation
+  // (#880 close-out review, finding 1). A copy here would be a second guard on one endpoint, and
+  // that duplication is precisely what left the FOURTH door open: the tag was consumed in three
+  // places while `writeMetaOrWarn` — which `SpriteEditor.save` and `NineSliceEditor.save` call
+  // directly — consumed it nowhere, and those two were safe only by hand-rolling their own
+  // `metaLoadedRef`. Guarding the endpoint covers all of them at once.
   const wrote = await writeMetaOrWarn(path, meta);
   if (wrote) forgetMetaBaseline(path);
   return wrote;

@@ -23,7 +23,7 @@ import {
 } from './videoAssetLogic';
 import { withCurrentValue } from './importSettingOptions';
 import {
-  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult,
+  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult, metaReadFallback,
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -107,7 +107,11 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
   // from disk and `meta` still prefers the park.
   const loadMeta = useCallback((signal?: AbortSignal) => {
     return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
-      .then((r) => { noteMetaReadResult(path, r); return r.ok ? r.json() : {}; })
+      // ⚠️ `metaReadFallback()`, not a bare `{}` (#880). The exemption above is from the READ
+      // HELPER, never from what a failed read means: an untagged `{}` here would let this panel
+      // park an id-less document and mint the asset a fresh GUID. Same shape as the baseline trap
+      // one line down, which is why both now live in values this file cannot half-adopt.
+      .then((r) => { noteMetaReadResult(path, r); return r.ok ? r.json() : metaReadFallback(); })
       .then((m: Record<string, unknown>) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
   }, [path, applyMeta]);

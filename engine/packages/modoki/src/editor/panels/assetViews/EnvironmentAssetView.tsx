@@ -117,7 +117,21 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         const updatedMeta = { ...(meta ?? {}), environment: settings, environmentCache: { hash, bytes: jpeg.length } };
         setMeta(updatedMeta);
         // #874: the write AND the forget-on-success, in one call — see writeMetaWholesale.
-        await writeMetaWholesale(path, updatedMeta);
+        //
+        // ⚠️ The result is CHECKED (#880 close-out review). Discarding it made a refused write —
+        // which is now a real outcome, since `writeMetaWholesale` refuses a document built on a
+        // failed read — look like a completed Apply: the status cleared, the asset list refreshed,
+        // and `~ultrahdr.jpg` sat on disk with nothing in the sidecar pointing at it, explained
+        // only by a `console.error`. `makeTexture2D` returns `false` to its caller and the two
+        // modal editors keep their dialog open; this was the one of the four that swallowed it.
+        if (!await writeMetaWholesale(path, updatedMeta)) {
+          // Re-read before giving up, or the panel keeps holding the fallback document and every
+          // later Apply is refused too: `loadMeta` otherwise only re-runs on a path/epoch change,
+          // and the early return below skips both. This lets the panel recover on its own instead
+          // of requiring the reselect the console message names.
+          await loadMeta();
+          return;
+        }
       } else {
         // Node-side downscale (dependency-free) via the reimport handler.
         setImportStatus(true, `Downscaling ${name}...`);

@@ -63,10 +63,10 @@
  * `projectRoots.mjs`: most consumers are bash scripts and plain Node, which cannot
  * import TypeScript. Bash reaches it through the CLI at the bottom.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { clonePort } from './clonePort.mjs';
+import { canonicalPath, pathCaseKey, samePath } from './pathIdentity.mjs';
 
 /**
  * Clone directory basename → pinned editor backend port.
@@ -91,6 +91,23 @@ export const CLONE_BACKEND_PORTS = Object.freeze({
 /** The hub's port. Named so call sites can say what they mean instead of `5179`. */
 export const HUB_BACKEND_PORT = CLONE_BACKEND_PORTS['modoki'];
 
+/** The same table keyed by `pathCaseKey`, for the case-insensitive fallback in
+ *  `backendPortForClone` (#881). DERIVED from the table above rather than hand-written, so a clone
+ *  added to one is in the other by construction — a second hand-kept list is how #798's five
+ *  `toPosix` copies happened. */
+const CLONE_BACKEND_PORTS_BY_CASE_KEY = new Map(
+  Object.entries(CLONE_BACKEND_PORTS).map(([name, port]) => [pathCaseKey(name), port]),
+);
+// ⚠️ Two table names folding to one key would silently drop a clone from this fallback — a `Map`
+// keeps the last write and says nothing. That check lives in `editorPorts.test.ts`, NOT here as a
+// module-load `throw`, which is what #881 first wrote and review rejected for three reasons:
+// it fires only on case-INSENSITIVE platforms (so the public Linux CI leg stays green on the
+// very edit that breaks every Mac clone); it would kill `modoki-mcp`, which imports this module,
+// rather than degrade one clone; and every shell caller wraps this file in `|| true`, so a throw
+// degrades ALL of them to auto ports with a stack trace where the guarded bug degrades exactly
+// one. It also contradicts this file's own CLI contract below — "always exits 0 … a non-zero exit
+// inside a command substitution would kill the launch rather than degrade it".
+
 /**
  * The pinned backend port for the clone at `repoRoot`, or `null` when the
  * directory is not one of the known clones (→ the caller should use auto ports).
@@ -99,8 +116,22 @@ export const HUB_BACKEND_PORT = CLONE_BACKEND_PORTS['modoki'];
  * @returns {number | null}
  */
 export function backendPortForClone(repoRoot) {
-  const name = path.basename(path.resolve(repoRoot));
-  return CLONE_BACKEND_PORTS[name] ?? null;
+  // #881: `path.resolve` + a case-SENSITIVE object lookup was two misses in one line. `resolve`
+  // normalises separators and `..` but neither drive-letter case, a `subst` mapping nor a symlink,
+  // so `E:/Projects/MODOKI` — or a clone reached through a junction — produced a `name` that is not
+  // a key here, returned `null`, and dropped the clone onto AUTO ports. That is #349's failure
+  // wearing a different cause: the editor comes up on a port no sibling expects, and every
+  // `MODOKI_BACKEND` aimed at this clone drives someone else's.
+  //
+  // `canonicalPath` fixes the spelling where the directory EXISTS (`.native` expands `subst`,
+  // junctions and drive case). `pathCaseKey` carries the rest: `.native` throws on a path that is
+  // gone and the fallback is bare `resolve`, which folds nothing — and this function is called with
+  // a not-yet-created root by the scaffolder path. Both halves are needed; neither is redundant.
+  const name = path.basename(canonicalPath(repoRoot));
+  const exact = CLONE_BACKEND_PORTS[name];
+  if (exact !== undefined) return exact;
+  const folded = CLONE_BACKEND_PORTS_BY_CASE_KEY.get(pathCaseKey(name));
+  return folded ?? null;
 }
 
 /**
@@ -188,15 +219,12 @@ export function backendUrlForClone(repoRoot) {
 // it printed no port AND no warning, and `resave-*.sh` then died claiming
 // "'modoki-qa' is not a known clone directory" about a name that IS in the table.
 // Silence was the worst part — every other unknown-clone path at least says why.
-const realOrRaw = (p) => {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p); // deleted/inaccessible: fall back rather than throw at import time
-  }
-};
+// #881: this was a hand-rolled `canonicalPath` — resolve, realpath, fall back on throw — built on
+// the JS `fs.realpathSync` walk, which resolves symlinks but NOT `subst` or drive-letter case. The
+// `===` folded nothing either. `samePath` is both halves, and it is the same question: "do these
+// two spellings name one FILE?"
 const invokedDirectly =
-  process.argv[1] && realOrRaw(process.argv[1]) === realOrRaw(fileURLToPath(import.meta.url));
+  !!process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url));
 
 if (invokedDirectly) {
   const repoRoot = process.argv[3] ?? fileURLToPath(new URL('../..', import.meta.url));
@@ -211,7 +239,10 @@ if (invokedDirectly) {
     process.stdout.write(String(unpinnedCdpPort(repoRoot)));
   } else if (port === null) {
     process.stderr.write(
-      `[editor-ports] '${path.basename(path.resolve(repoRoot))}' is not a known clone directory — ` +
+      // The CANONICAL name, i.e. the one both lookups actually missed. Printing
+      // `basename(resolve(...))` here would name a different string than the one that failed,
+      // which is the confusion #881 was about in the first place.
+      `[editor-ports] '${path.basename(canonicalPath(repoRoot))}' is not a known clone directory — ` +
         `using AUTO ports. Set MODOKI_BACKEND_PORT explicitly to pin one ` +
         `(known: ${Object.keys(CLONE_BACKEND_PORTS).join(', ')}; see docs/clones-and-ports.md).\n`,
     );

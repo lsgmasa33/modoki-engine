@@ -19,7 +19,7 @@ import { useEditorStore } from '../store/editorStore';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { sha256Hex } from '../utils/contentHash';
 import { classifyExistingAssetFetchFailure, classifyExistingAssetJson } from './modelImportPersist';
-import { readMetaPreferringPark, metaWrittenToDisk } from './pendingMeta';
+import { readMetaPreferringPark, metaWrittenToDisk, metaCameFromFailedRead } from './pendingMeta';
 
 /** Thrown by `writeAssetFileOrAbort` to unwind a model import whose write did not land (#311).
  *  Caught only at `importModel`'s boundary, which converts it to the falsy return every caller
@@ -184,11 +184,48 @@ async function resolveMaterialGuid(path: string): Promise<string> {
  *  would silently roll back an Inspector edit still only PARKED for this same path (postprocessor,
  *  a texture setting), and the park would go on to overwrite this write's own fresh id/generated
  *  list wholesale at the next Cmd+S. `pendingRef` rides along so each write can drop the park it
- *  already incorporated via `metaWrittenToDisk` — see each call site. */
+ *  already incorporated via `metaWrittenToDisk` — see each call site.
+ *
+ *  ⚠️ **A FAILED READ ABORTS THE IMPORT — it must never fall back to `{}` (#880 close-out).**
+ *  This is the THIRD door onto `/api/write-meta`: the three call sites below POST it directly,
+ *  through neither `parkMetaEdit` nor `writeMetaWholesale`, so `pendingMeta`'s own two guards
+ *  cannot see them. And the hazard here is not the id-less write those guards refuse — this read
+ *  exists to PRESERVE the guid (`existingMeta.id ?? newGuid()` at every call site), so a failed
+ *  read does not write a document with no `id`, it writes one with a **DIFFERENT** id. Every
+ *  scene/prefab ref to the model dangles, and the scanner's heal pass never even flags it, because
+ *  the sidecar it finds looks complete. That is strictly worse than the case the panels guard.
+ *
+ *  Aborting rather than continuing is this file's existing policy for exactly this failure on the
+ *  documents it reads through `readAssetJsonOrAbort` — *"A fresh GUID was NOT minted and the file
+ *  was NOT overwritten"*. The GLB's own sidecar, which is the one document that actually OWNS the
+ *  model's identity, was the one read excluded from it. Both failure shapes abort: a non-ok GET
+ *  (which `readMetaPreferringPark` reports by tagging its fallback) and a thrown one (which it
+ *  deliberately does not swallow).
+ *
+ *  ⚠️ An absent sidecar is NOT a failed read and must still return `{}` — a first import has no
+ *  sidecar to preserve a guid from, and `/api/read-meta` answers 200 with `{}` for one (only a
+ *  missing ASSET 404s). Aborting on that would make importing any new model impossible. */
 async function readMeta(path: string): Promise<{ meta: Record<string, unknown>; pendingRef: unknown }> {
+  let read: { meta: Record<string, unknown>; pendingRef: unknown };
   try {
-    return await readMetaPreferringPark(path);
-  } catch { return { meta: {}, pendingRef: undefined }; }
+    read = await readMetaPreferringPark(path);
+  } catch (e) {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — could not read ${path}: ${e instanceof Error ? e.message : String(e)}. `
+      + 'A fresh GUID was NOT minted and the file was NOT overwritten. Retry once the editor '
+      + 'backend is reachable.',
+    );
+  }
+  if (metaCameFromFailedRead(read.meta)) {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — ${path} could not be read, so this import cannot know the `
+      + "asset's existing GUID and would mint a fresh one over it, dangling every scene/prefab "
+      + 'reference to it. A fresh GUID was NOT minted and the file was NOT overwritten.',
+    );
+  }
+  return read;
 }
 
 // ── Material hashing for dedup ──

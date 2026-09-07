@@ -13,7 +13,7 @@ import { getModelPostprocessorIds } from '../../../runtime/loaders/modelPostproc
 import { inputStyle, MIXED_PLACEHOLDER } from '../fields';
 import { reimportBtnStyle } from './widgets';
 import { reimportPaths } from './reimport';
-import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
+import { parkMetaEdit, readMetaPreferringPark, metaReadFallback } from '../../scene/pendingMeta';
 import type { SelectedAsset } from '../../store/editorStore';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -43,7 +43,12 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       try {
         const { meta: m } = await readMetaPreferringPark(p);
         return [p, (m.postprocessor as string) ?? 'none', m] as const;
-      } catch { return [p, 'none', {} as Record<string, unknown>] as const; }
+      // ⚠️ `metaReadFallback()`, not a bare `{}` (#880 close-out review). Identical to
+      // `TextureBatchView`'s catch and worse in consequence: `applyPostprocessor` parks EVERY
+      // selected path per click, and a model's sidecar carries `generated`/`rig` as well as the
+      // guid. `readMetaPreferringPark` does not swallow a thrown read, so this is where a network
+      // error becomes this view's document; an untagged `{}` here parks N id-less documents.
+      } catch { return [p, 'none', metaReadFallback()] as const; }
     }));
     setPostprocessors(Object.fromEntries(entries.map(([p, v]) => [p, v])));
     setMetas(Object.fromEntries(entries.map(([p, , m]) => [p, m])));

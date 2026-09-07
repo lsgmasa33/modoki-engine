@@ -133,13 +133,36 @@ load-bearing and commented as such).
   ⚠️ **This does NOT mean such a comparison is unfixable**, which an earlier version of this
   section claimed. The residue belongs to the COMPARATOR, not the canonicaliser: case-fold at the
   comparison and two spellings of a missing path match again. Measured on `win`.
-- **Use `samePath` / `canonicalPath` from `engine/scripts/pathIdentity.mjs`** — the one
-  implementation (#869), reachable from electron TS, `engine/plugins/**` TS and the bare-node
-  `.mjs` CLIs alike. Before it existed the repo had hand-rolled this **eight** times in four
-  mutually inconsistent recipes. `engine/tests/architecture/pathIdentityIsShared.test.ts` now
-  bans a new `path.resolve(x) === y`; it found the eighth site itself, which a hand-written census
-  grep had missed because the call was `path.resolve(path.join(...))` and nested parens defeated
-  the pattern.
+- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
+  `engine/scripts/pathIdentity.mjs`** — the one implementation (#869, #881), reachable from
+  electron TS, `engine/plugins/**` TS and the bare-node `.mjs` CLIs alike. Before it existed the
+  repo had hand-rolled this **eight** times in four mutually inconsistent recipes.
+  `engine/tests/architecture/pathIdentityIsShared.test.ts` bans a new `path.resolve(x) === y`; it
+  found the eighth site itself, which a hand-written census grep had missed because the call was
+  `path.resolve(path.join(...))` and nested parens defeated the pattern.
+
+  | export | answers |
+  |---|---|
+  | `canonicalPath(p)` | the canonical SPELLING — `resolve` + `.native`, falling back to `resolve` |
+  | `samePath(a, b)` | same directory or file? |
+  | `pathCaseKey(s)` | the platform's comparison KEY for a canonical path or one segment — for a **lookup** rather than a comparison |
+  | `isUnderOrSame(parent, child)` | same path, or inside it? |
+
+  ⚠️ **The guard also bans a bare `fs.realpathSync(...)` in those roots (#881).** The census that
+  decided it found **nine** calls in **six** files still using the JS walk. (Seven is the count of
+  files the fix TOUCHED — it also edits `editorBackendRouter.ts`, which had no realpath.) `.native` is NOT
+  banned — the regex requires the paren to follow immediately, so `realpathSync.native(x)` does not
+  match — and that asymmetry is pinned in the guard's own table, because a version banning both
+  would make deleting `canonicalPath`'s realpath the cheapest way to go green.
+
+  ⚠️ **`.native` MASKS the case-fold on a path that exists, which makes a test for the fold easy to
+  write and impossible to fail.** A flipped spelling of an existing directory is resolved back to
+  its on-disk name by `.native` alone, so the fold contributes nothing there. The fold's only
+  load-bearing case is a path that is **gone or not yet created** — `.native` throws, the fallback
+  is bare `resolve`, and folding is all that is left. Two tests were written the wrong way here and
+  both stayed green with the mechanism deleted (#881 mutation checks M2 and M3); the fix is to
+  assert on a NON-EXISTENT path, and on a **symlinked** one where the link's own basename is not a
+  match in any casing.
 
   Two things that are deliberately NOT that shape and must stay as they are:
   - **`isUnderRepo` (`electron/projects.ts`) is correct** — `path.relative` **is case-insensitive
@@ -147,6 +170,11 @@ load-bearing and commented as such).
     `relative('E:\Projects\modoki', 'e:/Projects/MODOKI/games/sling')` is `'games\sling'`. This
     asymmetry is exactly why #869's two guards were wrong and this one was not: they used `===`
     on two absolute paths, which folds nothing.
+  - **`context-cost-guard.mjs`'s dedup key and `projectPaths.ts`'s `realDir` were migrated
+    anyway** (#881) even though neither compares two clone roots: any bare walk in these roots is
+    now a guard failure, and both are strictly better on `.native`. `realDir` keeps its deliberate
+    shape — it canonicalises the CONTAINING directory only, so a symlink inside the project is not
+    followed out to its target.
   - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` HASH the
     path into a PERSISTED identity** — a userData profile dir and a per-project auth token.
     Re-normalising them relocates every existing user's profile (prefs silently reset) and 403s
@@ -156,7 +184,29 @@ load-bearing and commented as such).
     `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles. That is a real defect needing a migration
     decision, not a sweep.
 - ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
-  baseline quietly encodes a second claim nobody meant to assert. The two forms also disagree on an
+  baseline quietly encodes a second claim nobody meant to assert.
+
+  **The discriminator, derived while sweeping for siblings of this in #881 — the hazard is narrower
+  than "the test used the wrong realpath".** It bites only when the seed is used to BUILD AN
+  EXPECTED VALUE. When the seed is merely an INPUT that the subject canonicalises on both sides,
+  the mismatch is normalised away before any comparison and the test is safe. Worked both ways:
+  - **Divergent** — `projectPaths.test.ts` seeded `tmp` with the JS walk and built every expected
+    relative path from it, while `realDir` returned `.native` output. Short-vs-long would have
+    reddened `ci/main`'s windows leg and nothing a Mac runs. Fixed in #881.
+  - **NOT divergent** — `deviceClaimBuildGuard.test.ts`'s two `#865` cases (*"matches when the
+    stored side is the real path and the own side is reached through a link"* and *"re-claims a CLI
+    owner-claim when the requester spells the same clone differently"*) also seed with the JS walk, but
+    hand both spellings to `sameClone`, which `.native`s each side before comparing. Checked
+    explicitly rather than swept in; a fix there would have been churn.
+
+  ⚠️ **That is the same FILE as the #878 failure below, and a different case in it.** #878 was its
+  drive-CASE baseline, which built an expected value from the seed and died on short-vs-long; the
+  two cases named above feed the seed in as an input and are safe. Same file, opposite verdicts,
+  and the discriminator above is what tells them apart — which is exactly why the rule is not
+  "grep the file for the wrong realpath".
+
+  So the check is *"does an assertion compare subject output against something built from the
+  seed?"* — not *"which realpath did the seed use?"* The two forms also disagree on an
   **8.3 short path** (row 3 above), so `deviceClaimBuildGuard.test.ts` — seeding a drive-CASE
   baseline with the JS walk against a `.native` subject — died on short-vs-long, which is not the
   property it exists to pin (#878, fixed in `1307b2c1f`).

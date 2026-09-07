@@ -78,6 +78,18 @@ interface Exemption {
   /** `'seeds'` — this file still records the CAS baseline itself, via `noteMetaReadResult`
    *  (asserted below). `'none'` — it establishes no baseline, and `costs` says why that is safe. */
   baseline: 'seeds' | 'none';
+  /** What this file's own FAILED read yields (#880) — the second thing the helper does that an
+   *  exemption silently drops.
+   *
+   *  ⚠️ **The same trap as `baseline`, one release later.** `readMetaPreferringPark` returns
+   *  `metaReadFallback()` on a non-ok GET: a `{}` tagged so a park or wholesale write built on it
+   *  is REFUSED, because the write replaces the sidecar and an id-less document costs the asset
+   *  its GUID. A raw reader writing a bare `{}` hands its panel an UNTAGGED fallback, and the
+   *  guard is inert for every asset only that file reads — exactly the shape #871 had.
+   *
+   *  `'tags'` — calls `metaReadFallback()` (asserted below). `'aborts'` — has no fallback at all
+   *  because a failed read returns early, which is the stronger position and needs no tag. */
+  fallback: 'tags' | 'aborts';
   /** Required when `baseline` is `'none'`: what the bypass COSTS and why that is acceptable here.
    *  This is the field #871 did not exist to make anyone write. */
   costs?: string;
@@ -89,6 +101,7 @@ interface Exemption {
 const EXEMPT: Record<string, Exemption> = {
   'panels/assetViews/VideoAssetView.tsx': {
     baseline: 'seeds',
+    fallback: 'tags',
     reason:
     'keeps a THIRD piece of state (`applied`) that must reflect DISK, never a still-parked edit — '
     + 'preferring the park there would compare a pending edit against itself and hide the '
@@ -103,6 +116,7 @@ const EXEMPT: Record<string, Exemption> = {
   },
   'panels/makeTexture2D.ts': {
     baseline: 'none',
+    fallback: 'aborts',
     costs:
     'establishes no baseline, and does not need one: it flushes this path, reads, and writes '
     + 'UNCONDITIONALLY in one synchronous body, and `writeMetaConditional`\'s own docblock names an '
@@ -144,6 +158,16 @@ function hasRawReadMetaFetch(code: string): boolean {
  *  can: an import names the symbol bare, a call follows it with a paren. */
 function callsReadResultRecorder(code: string): boolean {
   return /\bnoteMetaReadResult\s*\(/.test(code);
+}
+
+/** `true` if `code` (already comment-stripped) CALLS `metaReadFallback` (#880).
+ *
+ *  Same paren rule, and for the same reason `callsReadResultRecorder` documents above: an import
+ *  names the symbol bare and would make the `'tags'` rule vacuous with the call deleted. Written
+ *  this way from the start BECAUSE that lesson is already on the record one function up — the
+ *  cheapest kind of scar to reuse. */
+function callsMetaReadFallback(code: string): boolean {
+  return /\bmetaReadFallback\s*\(/.test(code);
 }
 
 describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
@@ -226,6 +250,46 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
     ).toEqual([]);
   });
 
+  /** #880 — the `baseline` rule's twin, for the other thing an exemption drops silently.
+   *
+   *  A raw reader's bare `{}` is an UNTAGGED fallback, so `parkMetaEdit` and `writeMetaWholesale`
+   *  cannot tell it from a document the panel genuinely read — and the GUID-destruction guard is
+   *  inert for every asset only that file reads. That is the #871 shape exactly, which is why the
+   *  cost is declared and checked rather than narrated.
+   *
+   *  ⚠️ Both directions, same as `baseline`. A `'tags'` entry that stopped tagging is the
+   *  regression; an `'aborts'` entry that quietly started tagging means its early return is gone
+   *  and the declaration has gone stale — and a stale declaration is what let #871 through. */
+  it("a 'tags' exemption really does tag its fallback, and an 'aborts' one has none to tag", () => {
+    const wrong: string[] = [];
+    for (const [rel, ex] of Object.entries(EXEMPT)) {
+      const tags = callsMetaReadFallback(read(rel));
+      if (ex.fallback === 'tags' && !tags) {
+        wrong.push(`${rel}: declared 'tags' but never calls metaReadFallback — its failed read `
+          + 'hands the panel an untagged {}, so the #880 refusal is INERT for every asset only '
+          + 'this file reads, and an id-less write costs those assets their GUID.');
+      }
+      if (ex.fallback === 'aborts' && tags) {
+        wrong.push(`${rel}: declared 'aborts' but DOES call metaReadFallback — if this file now `
+          + "has a fallback instead of an early return, change the entry to 'tags'; if it has "
+          + 'both, the early return is the one that should stay.');
+      }
+    }
+    expect(wrong, wrong.join('\n')).toEqual([]);
+  });
+
+  /** The positive control for the `'aborts'` half, which is otherwise a claim about ABSENCE — and
+   *  absence is what a vacuous guard also looks like. `makeTexture2D` declares that it needs no
+   *  tag because a failed read returns early; pin that the early return is really there, so
+   *  deleting it turns the declaration red instead of leaving it quietly false. */
+  it("the 'aborts' exemption really does return early on a failed read", () => {
+    // Deliberately shape-based, not text-based: an `if` whose condition negates some response's
+    // `.ok` and whose body reaches `return false`. That survives renaming the variable or adding
+    // another disjunct (it currently reads `!metaRes || !metaRes.ok`), and still goes red if the
+    // early return itself is deleted — which is the only thing this is asserting.
+    expect(read('panels/makeTexture2D.ts')).toMatch(/if\s*\([^)]*!\s*\w+\.ok[^)]*\)\s*\{[\s\S]{0,400}?return\s+false/);
+  });
+
   /** The detector's own positive control. If `noteMetaReadResult` is ever renamed, the substring
    *  test above silently stops matching and BOTH checks go vacuously green — the `'seeds'` half
    *  reads as "nobody seeds" and the `'none'` half as "nobody wrongly seeds". Pin the name against
@@ -233,6 +297,22 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
   it('the baseline seeder this rule names actually exists', () => {
     const helper = read(HELPER_FILE);
     expect(helper).toContain('export function noteMetaReadResult');
+  });
+
+  /** Same control for the #880 half — a rename would make `callsMetaReadFallback` match nothing
+   *  and both directions of the `fallback` rule go vacuously green.
+   *
+   *  ⚠️ The DEFINITION lives in its own leaf module, not in the read helper: `pendingMeta.ts`
+   *  imports the write endpoint (`assetViews/widgets.tsx`), so the endpoint could not import the
+   *  predicate back without a cycle. Assert the definition where it is and the USE where it
+   *  matters — checking only `pendingMeta.ts` would pass on the re-export while the helper had
+   *  stopped tagging. */
+  it('the tagged fallback this rule names actually exists, and the helper uses it', () => {
+    const FALLBACK_FILE = 'scene/metaReadFallback.ts';
+    expect(read(FALLBACK_FILE)).toContain('export function metaReadFallback');
+    // ...and the blessed reader really is the reference case the exemptions are measured against:
+    // if the helper itself stopped tagging, every 'tags' exemption would be guarding a hole.
+    expect(callsMetaReadFallback(read(HELPER_FILE))).toBe(true);
   });
 
   /** \u26a0\ufe0f The detector must see a CALL, not a mention — and this is not hypothetical
@@ -248,6 +328,14 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
     expect(callsReadResultRecorder("import { parkMetaEdit, noteMetaReadResult } from '../x';")).toBe(false);
     expect(callsReadResultRecorder('import {\n  noteMetaReadResult,\n} from "../x";')).toBe(false);
     expect(callsReadResultRecorder('const f = noteMetaReadResult;')).toBe(false);
+  });
+
+  it('the fallback detector matches a CALL and not an import mention', () => {
+    expect(callsMetaReadFallback('return r.ok ? r.json() : metaReadFallback();')).toBe(true);
+    expect(callsMetaReadFallback('  metaReadFallback ();')).toBe(true);
+    expect(callsMetaReadFallback("import { parkMetaEdit, metaReadFallback } from '../x';")).toBe(false);
+    expect(callsMetaReadFallback('import {\n  metaReadFallback,\n} from "../x";')).toBe(false);
+    expect(callsMetaReadFallback('const f = metaReadFallback;')).toBe(false);
   });
 
   it('every exemption is a real file this scan actually enumerates', () => {

@@ -224,6 +224,8 @@ import { resolveModules } from '../detect-modules';
 // vite-asset-scanner import) into this host-agnostic router.
 import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
 import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
+// The ONE 'same directory / inside it?' comparison (#869, #881) — see engine/scripts/pathIdentity.mjs.
+import { isUnderOrSame } from '../../scripts/pathIdentity.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -2449,10 +2451,15 @@ async function describeUnresolvedAgainstLiveWorld(
       // and starve other projects). Filter by resolved-abs-under-projectRoot rather
       // than a hardcoded prefix, so flat (`/assets`) and multi-game
       // (`/games/<id>/assets`) roots both pass and only the engine root is dropped.
-      const rootWithSep = ctx.projectRoot.endsWith(path.sep) ? ctx.projectRoot : ctx.projectRoot + path.sep;
+      // #881: was `abs === ctx.projectRoot || abs.startsWith(rootWithSep)`, which folds nothing —
+      // the third live instance the #869 guard's review found and the one it deferred here. A
+      // string `startsWith` also matches a SIBLING whose name merely begins with the root's
+      // (`…/modoki-ai3-old` under `…/modoki-ai3`), so it could offer an engine-owned or
+      // another-project asset for deletion. `isUnderOrSame` canonicalises and folds both sides and
+      // compares by `path.relative`, which cannot cross a directory boundary that way.
       const inProject = (o: { path: string }): boolean => {
         const abs = ctx.resolveAssetPath(o.path);
-        return !!abs && (abs === ctx.projectRoot || abs.startsWith(rootWithSep));
+        return !!abs && isUnderOrSame(ctx.projectRoot, abs);
       };
       // Largest first — the reclaimable-space wins are what the user scans for.
       const orphans = result.orphanDetails.filter(inProject).sort((a, b) => b.bytes - a.bytes);

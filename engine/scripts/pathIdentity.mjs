@@ -108,14 +108,105 @@ export function canonicalPath(p) {
  *  realpath: `.native` fixes drive-letter case only for a path that EXISTS, and throws otherwise.
  *  A persisted path naming a directory that is gone — a stale recents entry, a stale device claim —
  *  falls back to bare `resolve`, which does no folding at all. That fallback is precisely where
- *  #865's fix still had a hole, and this fold is what closes it.
+ *  #865's fix still had a hole, and this fold closes the CASE half of it.
+ *
+ *  ⚠️ **It does NOT close the SYMLINK half, and an earlier version of this paragraph implied it
+ *  did.** `resolve` resolves no links either, so two spellings of a path that does not exist —
+ *  one reached through a symlinked ancestor — still compare UNEQUAL here. Measured on darwin:
+ *  `samePath('<base>/link/gone', '<base>/real/gone')` is `false` with `link -> real`.
+ *  `isUnderOrSame` fixes this for itself with `canonicalWithMissingTail` below; `samePath` does
+ *  not, because it has eight production call sites whose polarity differs and #865's suite pins
+ *  the current fallback. Tracked separately rather than changed inside #881's finishing pass.
  *
  *  ⚠️ Both sides are canonicalised. If one side is UNTRUSTED (read off disk, out of an env var)
  *  and must be qualified before it is believed, gate it separately and gate it FIRST —
  *  `deviceClaimsStore`'s `isFullyQualified` is the worked example. This answers sameness, not
  *  trust: handed `"."` it will happily resolve against the cwd. */
 export function samePath(a, b) {
-  const A = canonicalPath(a);
-  const B = canonicalPath(b);
-  return CASE_INSENSITIVE ? A.toLowerCase() === B.toLowerCase() : A === B;
+  return pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b));
+}
+
+/** The COMPARISON KEY for an already-canonical path (or a single path segment) on this platform:
+ *  case-folded where the filesystem is, identity where it is not.
+ *
+ *  Exported (#881) because the fold is not only needed by `samePath`. `backendPortForClone` looks a
+ *  clone directory NAME up in a table — a lookup, not a comparison — and was case-SENSITIVE, so
+ *  `E:/Projects/MODOKI` found no pinned port and fell to auto ports (the #349 class). A second
+ *  `platform === 'win32' || 'darwin'` test written at that call site would have been the ninth
+ *  hand-rolled recipe this module exists to end, so the rule lives here once and the lookup asks
+ *  for it.
+ *
+ *  ⚠️ **Not a canonicaliser.** It folds case and nothing else — no resolve, no realpath. Feed it
+ *  `canonicalPath()` output, or a single path segment taken from one. Handed a raw `../x` it
+ *  returns a lower-cased `../x`, which compares equal to nothing useful. */
+export function pathCaseKey(s) {
+  return CASE_INSENSITIVE ? s.toLowerCase() : s;
+}
+
+/** The canonical spelling of `p`, resolving symlinks in the longest ANCESTOR that exists and
+ *  re-appending the part that does not.
+ *
+ *  ⚠️ **Why this is not `canonicalPath`, and why `canonicalPath` must not become this.** A
+ *  containment check compares two paths against each other, so both must be expressed in the same
+ *  space — and `canonicalPath` falls back to bare `path.resolve` for a path that does not exist,
+ *  which resolves no symlinks at all. On macOS that is not an edge case: `os.tmpdir()` is
+ *  `/var/…`, a symlink to `/private/var/…`. So an EXISTING parent canonicalises to `/private/var`
+ *  while a not-yet-created child under it falls back to `/var`, the two share no prefix, and the
+ *  child is reported OUTSIDE a directory it is plainly inside. Found by the regression test for
+ *  the `..bak` fix, which failed on its second assertion for this entirely separate reason.
+ *
+ *  `canonicalPath` keeps its #869 contract — a single path in, the best available spelling out,
+ *  with an existing test pinning the resolve fallback — because its callers hand the result to
+ *  humans and to persisted records. This one exists only for the comparison below. */
+function canonicalWithMissingTail(p) {
+  const resolved = path.resolve(p);
+  let head = resolved;
+  const tail = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync.native(head);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      // Every throw is treated as "not there" and steps up — including EACCES/EPERM/ELOOP, not
+      // only ENOENT. Applied to BOTH operands symmetrically that is harmless: they step up to the
+      // same accessible ancestor and the comparison is unchanged. The one wrong-answer shape needs
+      // an INACCESSIBLE component that is itself a symlink pointing outside the parent, which
+      // would read as inside. Unreproducible without root here, so: stated, not fixed.
+    }
+    const parent = path.dirname(head);
+    if (parent === head) return resolved; // reached the root having found nothing that exists
+    tail.unshift(path.basename(head));
+    head = parent;
+  }
+}
+
+/** Is `child` the same path as `parent`, or inside it? (#881)
+ *
+ *  The third recipe in this space, and the one `===`-plus-`startsWith` gets wrong. Both operands
+ *  are canonicalised (so a `subst`ed or symlinked spelling matches) and then FOLDED BEFORE
+ *  `path.relative`, which is what makes this correct on both case-insensitive platforms:
+ *
+ *  ⚠️ **`path.relative` folds case on win32 but NOT on darwin** — it is `node:path`'s posix
+ *  implementation there, so `relative('/A/b', '/a/b/c')` is `'../../a/b/c'` and a raw containment
+ *  check reports a path as OUTSIDE a root it is plainly inside. Folding both sides first is what
+ *  closes that; it is not redundant with the win32 behaviour, it is the darwin half of it.
+ *
+ *  `electron/projects.ts`'s `isUnderRepo` is deliberately NOT migrated onto this (docs/windows.md
+ *  § Paths): it answers STRICT containment — `rel !== ''`, so the root itself is not "under" itself
+ *  — and it is correct as it stands. This one includes equality because its caller needs it: the
+ *  `/api/unused-assets` filter must keep an asset that IS the project root's own path. Two
+ *  questions, two functions; do not collapse them. */
+export function isUnderOrSame(parent, child) {
+  const P = pathCaseKey(canonicalWithMissingTail(parent));
+  const C = pathCaseKey(canonicalWithMissingTail(child));
+  if (P === C) return true; // `path.relative(P, P)` is '', which the escape test below would reject
+  const rel = path.relative(P, C);
+  // ⚠️ **`rel.startsWith('..')` is WRONG and this function shipped it once.** It also rejects a
+  // child whose NAME begins with two dots — `path.relative('/proj', '/proj/..bak')` is `'..bak'`,
+  // which is inside the project and has a perfectly good relative form. Only the `..` SEGMENT
+  // means escaped. `projectPaths.ts:47` already carried this spelling with the same comment, and
+  // `projectPaths.test.ts` has a case named for it; the SSOT was written with the version that
+  // test exists to forbid, and review caught it.
+  const escapes = rel === '..' || rel.startsWith(`..${path.sep}`);
+  return rel !== '' && !escapes && !path.isAbsolute(rel);
 }

@@ -46,9 +46,9 @@
  * misses those is worse than the ~40 ms it saves, because the gap is invisible.
  */
 
-import fs, { readFileSync } from 'node:fs';
-import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { listClaims, sameClone } from './deviceClaimsStore.mjs';
+import { canonicalPath } from './pathIdentity.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 
 /** Cheap pre-filter: does this command even mention a tool that can touch a phone? Deliberately
@@ -90,12 +90,16 @@ function readStdin() {
  *  clone look like a stranger and refuse its own device. */
 function thisClone(payload) {
   const raw = process.env.CLAUDE_PROJECT_DIR || payload?.cwd || process.cwd();
-  // realpath, not merely resolve: `device.mjs` records the claim under the REAL path (it resolves
-  // the repo root through `fs.realpathSync`), so on a symlinked checkout — or with
-  // CLAUDE_PROJECT_DIR pointed at a non-canonical path — a `path.resolve` here would produce a
-  // different string for the same directory and this clone would be refused its OWN device. Falls
-  // back to `resolve` when the path does not exist, since a refusal must never depend on a stat.
-  try { return fs.realpathSync(path.resolve(raw)); } catch { return path.resolve(raw); }
+  // realpath, not merely resolve: `device.mjs` records the claim under the REAL path, so on a
+  // symlinked checkout — or with CLAUDE_PROJECT_DIR pointed at a non-canonical path — a
+  // `path.resolve` here would produce a different string for the same directory and this clone
+  // would be refused its OWN device. Falls back to `resolve` when the path does not exist, since a
+  // refusal must never depend on a stat.
+  //
+  // #881: this was `canonicalPath`'s body, hand-rolled on the JS `fs.realpathSync` walk — which
+  // resolves symlinks (the case the comment above was written for) but neither `subst` nor
+  // drive-letter case. The shared one uses `.native` and gets all three.
+  return canonicalPath(raw);
 }
 
 function heldByThisClone(claim, clone) {

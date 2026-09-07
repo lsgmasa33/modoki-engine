@@ -72,6 +72,13 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
     writtenMeta = { path: body.path, meta: body.meta };
     return { ok: true };
   }
+  // ⚠️ A MISSING SIDECAR IS A 200 WITH `{}` — the route (`editorBackendRouter.ts`'s
+  // `/api/read-meta`) 404s only when the ASSET FILE is absent; an asset with no sidecar gets
+  // `readMetaSidecar`'s `{}` at 200. Answering non-ok here says "the read FAILED", which since
+  // #880 aborts the import rather than minting a guid over an id this editor could not read.
+  if (url.startsWith('/api/read-meta')) {
+    return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
+  }
   return { ok: false };
 });
 vi.stubGlobal('fetch', mockFetch);

@@ -184,6 +184,15 @@ source of truth every launch path reads — this table is checked against it by
 | `~/Projects/modoki-ai3` (work-ai3) | 5182 | 5176 | 9225 | `engine/scripts/launch-editor.sh games/3d-test` |
 | `~/Projects/modoki-qa` (work-qa) | 5183 | 5177 | 9226 | `engine/scripts/launch-editor.sh games/3d-test` |
 
+⚠️ **A KNOWN clone reached by a second spelling used to land here too, which is a bug and not the
+deliberate part** (#881). `backendPortForClone` took `path.basename(path.resolve(root))` and looked
+it up case-SENSITIVELY, so `E:/Projects/MODOKI`, a `subst`ed drive, or a clone reached through a
+symlink or junction found no key, returned `null`, and fell into the auto-port path below —
+producing #349's symptom from a different cause, and producing it **silently**, since a clone
+legitimately absent from the table looks identical from here. It now canonicalises with
+`canonicalPath` and falls back to a `pathCaseKey` lookup; both halves are needed, because `.native`
+cannot normalise a directory that does not exist yet. See docs/windows.md § Paths.
+
 ⚠️ **A clone directory not in that table gets AUTO ports, not a pinned one** — deliberately. Any
 hardcoded fallback is correct on exactly one clone and silently wrong on the rest, which was the
 #349 bug: `launch-editor.sh` defaulted to **5179, the hub's port**, so a bare launch from a worker

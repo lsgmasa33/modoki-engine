@@ -234,40 +234,99 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   write at the next Cmd+S.
 
 - **Every reader of `/api/read-meta` owes recording what the response TAUGHT it — including a
-  reader exempt from `readMetaPreferringPark`** (#871). `noteMetaReadResult` is the one place that
-  does it, and it records two things: the CAS baseline (the SERVER's hash) on success, and the
-  READ-FAILED flag on anything else — the flag that stops a panel parking a document built on the
-  `{}` fallback, which would write an id-less sidecar and let the scanner mint a fresh GUID.
-  ⚠️ **The two halves are recorded on DIFFERENT conditions, and collapsing them reopens the GUID
-  destruction.** The read-failed flag is armed on *every* non-ok response; the baseline is skipped
-  while a park is live (the parked doc came from older bytes, so a hash taken from disk now is a
-  claim it cannot support), and a `passive` read — the agent surface — records neither. Gating the
-  FLAG on the live park too shipped for one release and reopened the hole: the helper checks the
-  park before its `await` and records after, so a park landing in between hides the failure from a
-  DIFFERENT component whose own read failed and which is now showing the `{}` fallback.
+  reader exempt from `readMetaPreferringPark`** (#871). `noteMetaReadResult` is that one place, and
+  since #880 it records exactly one thing: the CAS baseline (the SERVER's hash) on success. It is
+  skipped while a park is live — the parked doc came from older bytes, so a hash taken from disk now
+  is a claim it cannot support — and a `passive` read, the agent surface, records nothing at all.
 
-  ⚠️ **That closes ONE interleaving, not the class — #880.** The flag is keyed by PATH and the
-  hazard is keyed by COMPONENT, so a successful read still clears it for a reader that is not the
-  one holding `{}`: reverse the order of those two responses and the id-less park is accepted
-  exactly as before. The same root makes the armed state a WEDGE — `readMetaPreferringPark` returns
-  early on a park and never reaches the network, so nothing clears the flag until the park is
-  flushed AND the asset re-read (the refusal message says so). Both faces need identity the API
-  does not carry, which is why #880 is filed rather than patched.
+- **The read-failed guard is keyed on the DOCUMENT, not on the path** (#880). A failed GET makes
+  `readMetaPreferringPark` return `metaReadFallback()`: an empty document tagged with a
+  module-private symbol. `parkMetaEdit` and `writeMetaWholesale` refuse anything carrying that tag,
+  because `/api/write-meta` replaces the sidecar wholesale and a document with no `id` makes the
+  scanner's heal pass mint a fresh GUID, dangling every scene/prefab reference to the asset.
 
-  ⚠️ **Both halves live in one function for the same reason, and the second one is why it is named
-  for the response rather than for the baseline.** The `readFailed` half was added to that block
-  independently, after it had been extracted; taking only the baseline half would have left the
-  exempted video reader recording a baseline and not the failure — the same trap one field down,
-  on the one asset type with no other reader. ⚠️ `VideoAssetView` is a *declared* exemption from the read helper, for a
+  ⚠️ **It was a `Set` of failed PATHS for three revisions, and that keying is what kept failing.**
+  The question the guard asks — *is the document about to be written the `{}` fallback?* — belongs
+  to one COMPONENT, and two components do read one path on mount (`Inspector`'s postprocessor row
+  and `ModelAssetView`, both on the model's path). So a path-keyed flag was wrong in both
+  directions at once: either component's successful read CLEARED it for the other, in either
+  response order, and while a park was live nothing could clear it at all — `readMetaPreferringPark`
+  returns early on a park and never reaches the network — so the path WEDGED, and the panel it
+  refused was the one whose read had SUCCEEDED. Tagging the document answers per component by
+  construction and leaves no armed state to clear: a component recovers when its own next read
+  succeeds.
+
+  ⚠️ **The tag rides the spread every park site already makes — and that propagation is true by
+  INSPECTION, not by enforcement.** Spread and `Object.assign` copy own enumerable SYMBOL keys, so
+  `{...meta, texture: next}` carries it through any number of hops with no call site aware it
+  exists; `JSON.stringify` ignores symbol keys, so it cannot reach the sidecar; `Object.keys`
+  cannot see it; and it cannot collide with a schema field. Every one of the 18 park sites spreads
+  its loaded document at the TOP level today, which is what makes the tag arrive.
+  ⚠️ **`metaMergeNotClobber.test.ts` narrows the space a new site can occupy but does NOT close
+  it, and an earlier draft of this section claimed it did.** Its rule (`clobberingMetaPayloads`)
+  accepts a payload containing `...` ANYWHERE — a nested `{ texture: { ...cur, ...patch } }` passes
+  with a fresh top-level object — and accepts any payload carrying a literal `id:` with no spread
+  at all. So `parkMetaEdit(p, { id: meta.id, texture: { ...settings, ...patch } })` would be a
+  plausible 19th site that satisfies the merge rule, carries no tag, and on a failed read posts
+  `id: undefined` (dropped by `JSON.stringify`) — this exact destruction with the guard silent.
+  Nothing is broken today; the residual is real and unguarded.
+
+  ⚠️ **There are FOUR doors onto `/api/write-meta`, and the path-keyed flag watched one.** It was consulted on
+  the park, so it could not see `writeMetaWholesale` — and `EnvironmentAssetView.apply()`'s UltraHDR
+  branch builds `{...(meta ?? {}), environment, environmentCache}` and writes it without parking,
+  with its `loadMeta` dropping the read's `ok` and its Apply button disabled only while `importing`,
+  never on a failed load. A 500 on the GET, a switch to UltraHDR, one click, and an id-less document
+  reached the route. `makeTexture2D` is the precedent that returns early on `!res.ok`, and
+  `NineSlice`/`SpriteEditor` refuse in their save handlers; the refusal in `writeMetaWholesale` makes
+  that structural for everything routed through it instead of a habit three of four surfaces had.
+
+  ⚠️ **Do not confuse this with the sidecar PARK GATE (#872/#882) — different axis, same
+  function.** The park gate is a NODE-side check on agent-reachable routes, asking *"would this
+  write clobber an edit parked in the renderer?"*, and `writeMetaConditional` passes
+  `rendererWrite: true` to opt out of it (a renderer write is never blind to a registry it owns).
+  The refusal described here is RENDERER-side and asks a different question — *"was this document
+  built from a real read?"* — and it runs BEFORE the POST, so a tagged document never reaches the
+  route at all, flagged or not. Both live at the same function because that function is the one
+  renderer POST definition; neither subsumes the other.
+
+  ⚠️ **The guard now sits at the ENDPOINT, which is what covers doors two and four at once.**
+  `writeMetaConditional` (`panels/assetViews/widgets.tsx`) is the only `/api/write-meta` POST
+  implementation in the package, and it refuses a tagged document there — so the pending-registry
+  flush, the explicit-action `writeMetaWholesale` callers, and the two modal editors that call
+  `writeMetaOrWarn` **directly** (`SpriteEditor.save`, `NineSliceEditor.save`) are all covered by
+  one check. That fourth door was open through the first round of this fix: the tag was consumed
+  in three separate places while one endpoint existed, and the place not consuming it was the one
+  reached directly. Those two editors were safe only because each hand-rolls its own
+  `metaLoadedRef`; a third modal editor copying their shape and omitting that line would have
+  replaced a sidecar with an id-less document, silently. ⚠️ `parkMetaEdit`'s own refusal is **not**
+  a duplicate of the endpoint's — it fires at EDIT time rather than save time, so the human is told
+  while looking at the control instead of N edits later at Cmd+S.
+
+  ⚠️ **The remaining door is `scene/modelImport.ts`, and it is guarded from the OUTSIDE.** It POSTs
+  `/api/write-meta` directly at three sites, through neither `parkMetaEdit` nor
+  `writeMetaWholesale` — and its hazard is a different shape: it reads the sidecar precisely to
+  PRESERVE the model's guid (`existingMeta.id ?? newGuid()`), so a failed read does not write a
+  document with no `id`, it writes one with a **DIFFERENT** id. Every ref dangles and the scanner's
+  heal pass never flags it, because the sidecar it finds looks complete — strictly worse than the
+  case the panels guard. That file consumes the tag itself (`metaCameFromFailedRead`) and throws
+  `ImportWriteAborted`, joining the abort policy it already applied to every OTHER document it
+  reads and had excluded only the one that owns the identity. It POSTs with a raw `backendFetch`,
+  so the endpoint guard cannot see it — and refusing its write would not be enough anyway: the
+  import must ABORT, or it proceeds to spawn entities against a model whose guid it just failed to
+  preserve.
+
+  ⚠️ `VideoAssetView` is a *declared* exemption from the read helper, for a
   reason that is true and stays true — it keeps a third state (`applied`) that must reflect DISK, so
   it cannot use a helper that skips the network whenever a park exists. That reason vouches for
   **which document the panel displays** and for nothing else, and it was read as vouching for the
   file generally: its raw fetch dropped the header, so `baselines` had no entry for any `.mp4`, the
   flush passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed*
   — the #845 precondition was **inert for that whole asset type** while looking present. The
-  exemption map now carries a declared `baseline: 'seeds' | 'none'` and
-  `metaReadPreferringPark.test.ts` checks it both ways, because a prose reason cannot carry that
-  distinction.
+  exemption map now carries a declared `baseline: 'seeds' | 'none'` and a `fallback:
+  'tags' | 'aborts'`, both checked both ways by `metaReadPreferringPark.test.ts`, because a prose
+  reason cannot carry those distinctions. The generalisation the second field carries: **what an
+  exemption must not be allowed to skip is better carried by the DATA than by a call** — an exempted
+  reader can forget a bookkeeping call, but it cannot half-adopt `metaReadFallback()`.
 - **A wholesale editor write FORGETS the baseline it invalidated** (#874). Make-2D, a 9-slice or
   Sprite Save, a model import and the collision-mesh write all replace the sidecar while a panel is
   mounted on the same path. Leaving the old hash made the human's very next Cmd+S 409 under

@@ -57,7 +57,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
    *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
    *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
-   *  `false` and only an ok read sets it. `makeTexture2D.ts:24` is the precedent this follows. */
+   *  `false` and only an ok read sets it. `makeTexture2D`'s "A FAILED READ MUST ABORT" comment is the precedent this follows. */
   const metaLoadedRef = useRef(false);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
 

@@ -48,6 +48,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
 let vfsFiles: Map<string, string>;
 let vfsMeta: Map<string, any>;
 let deletedPaths: string[];
+/** Asset paths whose `/api/read-meta` GET should FAIL (a 500) rather than answer — the dev-server
+ *  blip a test cannot otherwise reach. Distinct from "no sidecar", which is a 200 with `{}`. */
+let metaReadFails: Set<string>;
 
 function url(u: string | URL): string {
   return typeof u === 'string' ? u : u.toString();
@@ -70,10 +73,23 @@ const mockFetch = vi.fn(async (u: string | URL, opts?: any) => {
     const q = target.slice(target.indexOf('?') + 1);
     const params = new URLSearchParams(q);
     const path = params.get('path') ?? '';
+    // ⚠️ **A MISSING SIDECAR IS A 200 WITH `{}`, NOT A 404** — this fake used to answer 404 for
+    // both, and that is not what the route does. `editorBackendRouter.ts`'s `/api/read-meta` 404s
+    // only when the ASSET FILE is absent; when the asset exists and merely has no sidecar it
+    // returns `readMetaSidecar`'s `{}` at 200. The divergence was invisible while a non-ok read
+    // collapsed to `{}` anyway — both paths produced the same empty document. It stopped being
+    // invisible in #880, where a non-ok read produces a TAGGED document that aborts the import,
+    // so a fake that 404s every first import would have made this suite assert that importing a
+    // new model is impossible. Fixed here rather than worked around: a fake modelling behaviour
+    // the real dependency does not have makes every test written against it a claim about
+    // nothing.
+    // ⚠️ Scope: this fake models 200-with-a-body, 200-with-`{}` and (via `metaReadFails`) a 500.
+    // It does NOT reproduce the route's 404 (asset gone), 403 (outside root) or 400 (no path).
+    // Nothing is untested because of that — all of them are non-ok, so they reach the same tagged
+    // fallback the 500 does — but do not read this fake as saying `/api/read-meta` never 404s.
+    if (metaReadFails.has(path)) return { ok: false, status: 500, async json() { return {}; } };
     const meta = vfsMeta.get(path);
-    return meta
-      ? { ok: true, status: 200, async json() { return meta; } }
-      : { ok: false, status: 404, async json() { return {}; } };
+    return { ok: true, status: 200, async json() { return meta ?? {}; } };
   }
   if (target === '/api/delete-asset') {
     const body = JSON.parse(opts.body);
@@ -131,6 +147,7 @@ beforeEach(() => {
   vfsFiles = new Map();
   vfsMeta = new Map();
   deletedPaths = [];
+  metaReadFails = new Set();
   mockTemplates = new Map();
   mockPostprocessor = {};
   entityIndex.clear();
@@ -288,6 +305,59 @@ describe('format-version REFUSAL on re-import (#784 phase C2b, items 3+4)', () =
 
     expect(result).toBe(0); // aborted, not a fresh entity tree
     expect(vfsFiles.get(meshFile)).toBe(corrupt); // bytes untouched — no fresh guid was minted over them
+  });
+
+  /** #880 close-out review, finding 2 — THE THIRD DOOR, and the sharpest shape of this defect.
+   *
+   *  `pendingMeta`'s two refusals (`parkMetaEdit`, `writeMetaWholesale`) cover the PANELS. This
+   *  file POSTs `/api/write-meta` directly at three sites and routes through neither — and its
+   *  hazard is not the id-less write those guards refuse. This read exists precisely to PRESERVE
+   *  the guid (`existingGlbMeta.id ?? newGuid()`), so a failed read does not write a document with
+   *  no `id`: it writes one with a **DIFFERENT** id. Every scene/prefab ref to the model dangles,
+   *  and the scanner's heal pass never even flags it, because the sidecar it finds looks complete.
+   *
+   *  The tag was already on that document and nothing read it — this file's own dominant defect
+   *  class, a producer whose consumer was never wired. `readMeta` now consumes it and joins the
+   *  `ImportWriteAborted` policy this file already applied to every OTHER document it reads. */
+  it('a FAILED sidecar read aborts the re-import — it does not mint a fresh guid over the old one', async () => {
+    const { importModel } = await getModule();
+
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const guidBefore = vfsMeta.get(GLB)?.id as string;
+    expect(guidBefore, 'positive control: the first import established a guid').toBeTruthy();
+    const metaBefore = JSON.stringify(vfsMeta.get(GLB));
+
+    // The dev server blips on THIS path's sidecar read. Everything else still answers.
+    metaReadFails.add(GLB);
+    clearManifest();
+    mockTemplates = new Map();
+    addTemplate('wall', mat('brick'));
+    const result = await importModel(GLB, 'level');
+
+    expect(result, 'the falsy return every caller checks').toBe(0);
+    expect(
+      JSON.stringify(vfsMeta.get(GLB)),
+      'the sidecar is UNTOUCHED — a re-import that cannot read the guid must not replace it',
+    ).toBe(metaBefore);
+    expect(vfsMeta.get(GLB)?.id, 'and the guid is the SAME one, not a fresh mint').toBe(guidBefore);
+  });
+
+  /** ⚠️ THE ACCEPT SIDE, and the one that decides whether the abort above is usable at all: a
+   *  first import has NO sidecar to preserve a guid from, and the route answers that with a 200
+   *  and `{}` (only a missing ASSET 404s — see the fake's own note). If the abort fired on that,
+   *  importing any new model would be impossible, and every "does it refuse?" test above would
+   *  still pass. */
+  it('...but an ABSENT sidecar is not a failed read — a first import still mints and writes', async () => {
+    const { importModel } = await getModule();
+
+    addTemplate('wall', mat('brick'));
+    expect(vfsMeta.has(GLB), 'precondition: nothing has written this sidecar yet').toBe(false);
+
+    const result = await importModel(GLB, 'level');
+
+    expect(result, 'a first import must still succeed').not.toBe(0);
+    expect(vfsMeta.get(GLB)?.id, 'and it minted a guid into the sidecar').toBeTruthy();
   });
 
   it('a too-new .mat.json is NOT overwritten either — same REFUSE, on the material path', async () => {

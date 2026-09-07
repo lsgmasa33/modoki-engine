@@ -63,12 +63,36 @@ export function defaultRepoRoot() {
 // pathToFileURL fixes 1 and 2 but NOT 3, so it is not enough on its own. realpath both
 // sides and the comparison is about file identity, which is what "am I the entry point?"
 // actually means.
+// ⚠️ **This file must import NOTHING but `node:` builtins, so it cannot reach the shared
+// `pathIdentity.mjs`.** `clonePortCli.test.ts` COPIES it, alone, into a directory whose name
+// contains a space — that copy is the whole apparatus proving the CLI still works from such a
+// path, and an import of a sibling module makes the copy unrunnable. (Measured: it did. #881's
+// first attempt migrated this to `samePath` and reddened that test with ERR_MODULE_NOT_FOUND.)
+//
+// So this is the ONE place a local canonicalisation is correct rather than copy #9 of the recipe.
+// #881: the walk here was `fs.realpathSync`, which fixes reason 3 above but not a `subst`ed or
+// case-flipped drive; `.native` fixes all three and is deliberately NOT banned by
+// `pathIdentityIsShared.test.ts`. No case-fold is needed to go with it, unlike `samePath`: both
+// operands name a file that EXISTS by construction — this module is running and `argv[1]` is what
+// started it — so `.native` normalises the case itself and the fallback below is unreachable for
+// any path that could make this true.
+const canonicalHere = (p) => {
+  try {
+    return fs.realpathSync.native(path.resolve(p));
+  } catch {
+    return path.resolve(p); // not a real file (e.g. `node --eval`) — the spellings then differ anyway
+  }
+};
 const isEntryPoint = () => {
   if (!process.argv[1]) return false;
   try {
-    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1]);
+    return canonicalHere(fileURLToPath(import.meta.url)) === canonicalHere(process.argv[1]);
   } catch {
-    return false; // argv[1] not a real file (e.g. `node --eval`) — not our entry point
+    // `fileURLToPath` throws on a non-`file:` `import.meta.url` (a bundler shim, a custom loader).
+    // It sat inside the old try/catch and must stay guarded: this runs at module load, so an
+    // unguarded throw here stops `editorPorts.mjs`, `playwright.config.ts` and
+    // `migrate-legacy-scenes.mjs` importing the module at all, rather than declining CLI mode.
+    return false;
   }
 };
 if (isEntryPoint()) {

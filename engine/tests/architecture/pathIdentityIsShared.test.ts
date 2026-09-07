@@ -17,8 +17,10 @@
  *  question (module identity, not directory identity) and a `samePath` there would be a category
  *  error. Exempting by shape rather than by an allowlist of paths is deliberate: a hand-maintained
  *  list goes stale on the first file somebody adds, invisibly, and the point of this guard is to
- *  make the EIGHTH copy loud. (The idiom is separately fragile on Windows — `clonePort.mjs:69` is
- *  the one site that realpaths both sides — but that is a different defect and not this guard's.)
+ *  make the EIGHTH copy loud. (The idiom is separately fragile on Windows: `clonePort.mjs`'s
+ *  `isEntryPoint` canonicalises both sides, and since #881 so does `editorPorts.mjs`'s
+ *  `invokedDirectly` — so it is no longer "the one site". Cited by SYMBOL because the line
+ *  citation that stood here rotted inside a single change. A different defect, not this guard's.)
  *
  *  **NOT banned: the case-folding hand-rolls** in `userDataDir.cloneId`, `userDataDir.multiProfileKey`
  *  and `instanceToken.rootKey`. They do not match this shape, and that is correct: those HASH the
@@ -36,7 +38,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -94,6 +96,27 @@ const BANNED = /(?:^|[^.\w])(?:path\.)?resolve\s*\([^;]*\)\s*[!=]==|[!=]==\s*(?:
 /** The "was this module run directly?" idiom — a different question, exempt by shape. */
 const ENTRYPOINT_IDIOM = /import\.meta\.url|process\.argv\[1\]/;
 
+/** A bare `fs.realpathSync(...)` — the JS lstat-walk — anywhere in these roots (#881).
+ *
+ *  #869's docblock left this as an open question for #881; the answer is yes, and the census that
+ *  decided it found **nine** calls in **six** files (`projectPaths.ts`, `claim-guard.mjs`,
+ *  `clonePort.mjs` ×2, `context-cost-guard.mjs`, `device.mjs` ×3, `editorPorts.mjs`). The walk resolves symlinks and junctions
+ *  but neither a `subst` mapping nor drive-letter case, so it is never the right canonicaliser on
+ *  Windows — measured in docs/windows.md § Paths, where `realpathSync('e:\Projects\modoki')`
+ *  comes back unchanged and `.native` returns `E:\Projects\modoki`.
+ *
+ *  ⚠️ **`.native` is NOT banned, only the bare walk.** `\brealpathSync\s*\(` requires the paren
+ *  to follow immediately, so `fs.realpathSync.native(x)` does not match — a `.` sits where the
+ *  `(` would have to be. That is deliberate rather than incidental: `.native` throws on a path
+ *  that does not exist, which is occasionally exactly what a caller wants, and `canonicalPath`
+ *  is built out of it. The regex-table below pins both directions so a later "simplification"
+ *  cannot quietly widen this to the shape that would ban the SSOT's own body.
+ *
+ *  The word boundary also lets `import { realpathSync } from 'node:fs'` through at the IMPORT
+ *  (no paren follows) while still catching the call — the same destructured-import escape the
+ *  `resolve` regex above had to be widened for. */
+const BANNED_REALPATH = /\brealpathSync\s*\(/;
+
 const files = ROOTS.flatMap(sourceFiles);
 
 describe('same-directory comparisons go through pathIdentity (#869)', () => {
@@ -150,5 +173,71 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
       + 'Use `samePath` from engine/scripts/pathIdentity.mjs instead:\n'
       + offenders.join('\n'),
     ).toHaveLength(0);
+  });
+
+  /** The realpath regex's own falsifiability. The negative rows are the load-bearing ones here:
+   *  a version of this that also matched `.native` would ban `canonicalPath`'s own body, and the
+   *  cheapest way to make THAT green is to delete the SSOT's realpath — the exact "a guard can
+   *  push the fix the wrong way" hazard. */
+  it.each([
+    ['bare member call', 'return fs.realpathSync(p);', true],
+    ['bare, wrapped in resolve', 'try { return fs.realpathSync(path.resolve(raw)); } catch {}', true],
+    ['destructured call', 'const real = realpathSync(dir);', true],
+    ['space before paren', 'return fs.realpathSync (p);', true],
+    // …and what it must NOT claim.
+    ['.native — the SSOT\'s own body', 'return fs.realpathSync.native(resolved);', false],
+    ['.native, destructured', 'const r = realpathSync.native(resolved);', false],
+    ['the destructured IMPORT itself', "import fs, { realpathSync } from 'node:fs';", false],
+    // ⚠️ NOT a blessing — `fs.promises.realpath` is the SAME JS walk and has its own `.native`.
+    // It is an ACCEPTED GAP: no caller uses it today, and widening the regex to cover a second
+    // spelling with zero live instances is how a guard grows false positives it later gets
+    // silenced for. If one appears, widen this rather than reading the row as permission.
+    ['the async twin — an accepted gap, not an endorsement', 'await fs.promises.realpath(p);', false],
+  ])('realpath regex: %s', (_label, line, shouldMatch) => {
+    expect(BANNED_REALPATH.test(line)).toBe(shouldMatch);
+  });
+
+  it('no file canonicalises with the bare fs.realpathSync walk (#881)', () => {
+    const offenders: string[] = [];
+    for (const rel of files) {
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
+      src.split('\n').forEach((line, i) => {
+        if (BANNED_REALPATH.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
+      });
+    }
+    expect(
+      offenders,
+      '`fs.realpathSync` is the JS lstat-walk: it resolves symlinks and junctions but NOT a\n'
+      + '`subst` mapping or drive-letter case, so it is not a canonicaliser on Windows (#881).\n'
+      + 'Use `canonicalPath` from engine/scripts/pathIdentity.mjs — it is `.native` with a\n'
+      + '`path.resolve` fallback for a path that does not exist:\n'
+      + offenders.join('\n'),
+    ).toHaveLength(0);
+  });
+
+  /** Non-vacuity for BOTH scans, and the half that is easy to forget: a guard collecting offenders
+   *  and asserting the list is empty goes GREEN when its matching silently breaks (docs/windows.md
+   *  § Paths — "the loud failure is the lucky one"). `files.length > 0` above proves we read
+   *  something; this proves the two regexes still FIND the shapes in a real repo file when they
+   *  are present, rather than having been narrowed into never matching anything. */
+  it('both scans still detect their shape in real source (non-vacuity)', () => {
+    // ⚠️ Through `readScannedSource`, not `fs.readFileSync` — `commentStripperIsShared` (#812)
+    // bans a raw read of repo source that is then pattern-matched, and this assertion is exactly
+    // that shape. The first draft used `fs.readFileSync` and reddened that guard, correctly.
+    //
+    // ⚠️ An earlier version of this comment "measured" that the SSOT's prose could not satisfy
+    // the pattern, and the measurement was FALSE TWICE OVER: it counted `.native` (5) and reported
+    // it as `realpathSync.native` (3), and the very next commit in the same change added a second
+    // parenthesised occurrence, invalidating the "only once" half. That is the defect this whole
+    // change is about, committed in prose — twice, in a commit whose message claimed the opposite.
+    // The rule needs no count: read code as code, because prose that satisfies a pattern is always
+    // one edit away and nothing announces that edit.
+    const ssot = readScannedSource(path.join(repoRoot, 'engine/scripts/pathIdentity.mjs')).code;
+    // The SSOT's body is the one place `.native` legitimately appears — it must be found by a
+    // `realpathSync` search and NOT by the ban.
+    expect(ssot).toMatch(/realpathSync\.native\(/);
+    expect(BANNED_REALPATH.test('fs.realpathSync.native(resolved)')).toBe(false);
+    expect(BANNED_REALPATH.test('fs.realpathSync(resolved)')).toBe(true);
+    expect(BANNED.test('if (path.resolve(a) === b) return;')).toBe(true);
   });
 });

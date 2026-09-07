@@ -40,6 +40,7 @@ import {
   sameClone,
 } from './deviceClaimsStore.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
+import { canonicalPath } from './pathIdentity.mjs';
 
 // ── Repo root + owner token ─────────────────────────────────────────────────
 
@@ -48,20 +49,24 @@ import { parseDeviceCommand } from './deviceCommandTargets.mjs';
  *  machine with no `git` on PATH (unlikely, but claiming hardware must not
  *  hard-depend on a binary this script does not otherwise need). */
 function findRepoRoot() {
+  // #881: all three canonicalisations were the JS `fs.realpathSync` walk wrapped in a try/catch —
+  // symlinks yes, `subst` and drive-letter case no. `canonicalPath` is `.native` with the same
+  // resolve-on-failure fallback, so the try/catch scaffolding goes with it. This matters here more
+  // than most: the value becomes `OWNER = cli:<root>`, the identity every claim and release in this
+  // invocation is recorded under, and `claim-guard.mjs` compares its own root against it — two
+  // spellings of one clone and a clone is refused its OWN device.
   const viaGit = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
   if (viaGit.status === 0 && viaGit.stdout && viaGit.stdout.trim()) {
-    try { return fs.realpathSync(viaGit.stdout.trim()); } catch { /* fall through */ }
+    return canonicalPath(viaGit.stdout.trim());
   }
   let dir = process.cwd();
   for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) {
-      try { return fs.realpathSync(dir); } catch { break; }
-    }
+    if (fs.existsSync(path.join(dir, '.git'))) return canonicalPath(dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  try { return fs.realpathSync(process.cwd()); } catch { return process.cwd(); }
+  return canonicalPath(process.cwd());
 }
 
 const repoRoot = findRepoRoot();

@@ -10,3 +10,14 @@ export declare function canonicalPath(p: string): string;
  *  case-insensitively on win32/darwin. Answers sameness, not trust — gate an untrusted side
  *  first (`deviceClaimsStore.isFullyQualified` is the worked example). */
 export declare function samePath(a: string, b: string): boolean;
+
+/** The comparison KEY for an already-canonical path (or a single segment) on this platform:
+ *  case-folded on win32/darwin, identity elsewhere. Exported for lookups rather than
+ *  comparisons (`backendPortForClone`, #881). Folds case and nothing else — feed it
+ *  `canonicalPath()` output, not a raw relative path. */
+export declare function pathCaseKey(s: string): string;
+
+/** Is `child` the same path as `parent`, or inside it? (#881) Canonicalises and folds BOTH sides
+ *  before `path.relative`, which folds case on win32 but NOT on darwin. Includes equality —
+ *  `electron/projects.ts`'s `isUnderRepo` answers STRICT containment and stays separate. */
+export declare function isUnderOrSame(parent: string, child: string): boolean;

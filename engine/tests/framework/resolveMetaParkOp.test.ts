@@ -20,6 +20,7 @@ import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
   parkMetaEdit, peekPendingMeta, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths,
   noteMetaReadResult, peekMetaBaseline,
+  metaReadFallback,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
 
 registerEditorAgentOps();
@@ -58,7 +59,7 @@ describe('resolve-meta-park — the probe', () => {
     await expect(resolve({ paths: TEX })).rejects.toThrow(/requires \{ paths/);
   });
 
-  it('RECORDS NOTHING — the probe cannot seed a baseline or clear the read-failed flag', async () => {
+  it('RECORDS NOTHING — the probe cannot seed a baseline, nor make a failed-read document parkable', async () => {
     // The defect this pins is the one `read-asset-meta`'s own review caught and fixed with
     // `passive`: an agent-side read that seeds the CAS baseline makes a stale parked edit ACCEPTED
     // where it was correctly refused. A gate has more power to do that than a read, not less.
@@ -68,8 +69,12 @@ describe('resolve-meta-park — the probe', () => {
     await resolve({ paths: [TEX] });
 
     expect(peekMetaBaseline(TEX)).toBeUndefined();
-    // …and the read-failed flag is still armed, so the id-less park it guards is still refused.
-    parkMetaEdit(TEX, { texture: { maxSize: 256 } });
+    // ⚠️ The second half USED to read "and the read-failed flag is still armed". #880 replaced that
+    // path-keyed flag with a tag on the fallback DOCUMENT, so there is no per-path state a probe
+    // could clear even in principle — which is a stronger guarantee, not a lost one. The property
+    // worth keeping is the observable one: a document built on a failed read is still refused after
+    // the probe ran. Driven the way a panel does it, by spreading what the failed read handed back.
+    parkMetaEdit(TEX, { ...metaReadFallback(), texture: { maxSize: 256 } });
     expect(peekPendingMeta(TEX)).toBeUndefined();
   });
 });
@@ -103,19 +108,24 @@ describe('resolve-meta-park — the discard', () => {
     expect(await resolve({ paths: [MODEL], discard: true })).toMatchObject({ parked: [], discarded: [] });
   });
 
-  it('leaves readFailed ARMED after a discard — clearing it would reopen the id-less park', async () => {
-    // #880's second face, reachable by one more route now. It is NOT papered over: an armed path
-    // stays refused after an agent discard, because a component may still be holding the `{}`
-    // fallback, and a wholesale write of that document has no `id` — the scanner's heal pass then
-    // mints a fresh GUID and every scene ref to the asset dangles.
+  it('an agent discard does not make a failed-read document parkable', async () => {
+    // Written as "leaves readFailed ARMED after a discard" when the guard was a path-keyed flag.
+    // #880 moved it onto the fallback DOCUMENT, so the discard cannot reach it by construction —
+    // but the test still earns its place as the regression guard for anyone wiring provenance into
+    // the discard path. The hazard is unchanged: a component may still be holding the `{}` fallback,
+    // and a wholesale write of that document has no `id`, so the scanner's heal pass mints a fresh
+    // GUID and every scene ref to the asset dangles.
     parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
-    noteMetaReadResult(TEX, { ok: false, headers: { get: () => null } } as unknown as Response);
 
     await resolve({ paths: [TEX], discard: true });
 
     expect(peekPendingMeta(TEX)).toBeUndefined();
-    parkMetaEdit(TEX, { texture: { maxSize: 512 } });
+    parkMetaEdit(TEX, { ...metaReadFallback(), texture: { maxSize: 512 } });
     expect(peekPendingMeta(TEX), 'an id-less park must still be refused after an agent discard').toBeUndefined();
+    // ⚠️ The ACCEPT side, or a mutant refusing every post-discard park passes: a document from a
+    // GOOD read still parks after the discard.
+    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 128 } });
+    expect(peekPendingMeta(TEX)).toEqual({ id: 'tex-guid', texture: { maxSize: 128 } });
   });
 });
 

@@ -18,7 +18,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { canonicalPath, samePath } from '../../scripts/pathIdentity.mjs';
+import { canonicalPath, samePath, pathCaseKey, isUnderOrSame } from '../../scripts/pathIdentity.mjs';
 
 const onWin = process.platform === 'win32';
 const CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin';
@@ -139,6 +139,187 @@ describe('canonicalPath', () => {
       expect(canonicalPath(canonicalPath(d))).toBe(canonicalPath(d));
     } finally {
       fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('pathCaseKey (#881)', () => {
+  it('folds exactly where the platform does, and nowhere else', () => {
+    expect(pathCaseKey('Modoki-AI3')).toBe(CASE_INSENSITIVE ? 'modoki-ai3' : 'Modoki-AI3');
+    expect(pathCaseKey('modoki-ai3')).toBe('modoki-ai3');
+  });
+
+  it('is the rule samePath applies, on a path no realpath can rescue', () => {
+    // ⚠️ An earlier version of this asserted
+    //     samePath(d, flipped) === (pathCaseKey(canonicalPath(d)) === pathCaseKey(canonicalPath(flipped)))
+    // which is `samePath`'s own definition — X === X, green under every mutation including
+    // replacing pathCaseKey with the identity function. Review caught it. It also used EXISTING
+    // directories, where `.native` folds the case by itself and the comparison is between two
+    // identical strings whatever the fold does.
+    //
+    // Both operands must therefore NOT EXIST, and the assertion must be against the platform
+    // rule rather than against a re-spelling of the subject.
+    const a = path.join(os.tmpdir(), 'modoki-pck-nonexistent', 'Clone');
+    const b = path.join(os.tmpdir(), 'modoki-pck-nonexistent', 'CLONE');
+    expect(fs.existsSync(a)).toBe(false);
+    expect(samePath(a, b)).toBe(CASE_INSENSITIVE);
+    expect(samePath(a, a)).toBe(true); // control: identical spellings hold on every platform
+  });
+
+  it('folds case and NOTHING else — it is not a canonicaliser', () => {
+    // Pinned because the name invites misuse: it must not resolve, and must not touch separators.
+    expect(pathCaseKey('../x/./y')).toBe(CASE_INSENSITIVE ? '../x/./y' : '../x/./y');
+    expect(pathCaseKey('A/../B')).toBe(CASE_INSENSITIVE ? 'a/../b' : 'A/../B');
+  });
+});
+
+describe('isUnderOrSame (#881)', () => {
+  it('a root is under ITSELF — the half `isUnderRepo` deliberately answers false', () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      expect(isUnderOrSame(d, d)).toBe(true);
+      expect(isUnderOrSame(d, d + path.sep)).toBe(true);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a real descendant and refuses a real ancestor', () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      const child = path.join(parent, 'assets', 'deep');
+      fs.mkdirSync(child, { recursive: true });
+      expect(isUnderOrSame(parent, child)).toBe(true);
+      expect(isUnderOrSame(child, parent)).toBe(false);
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a name-PREFIX sibling — the defect the `startsWith` form had', () => {
+    // `…/modoki-ai3-old`.startsWith(`…/modoki-ai3`) is TRUE, which is how the /api/unused-assets
+    // filter could offer a neighbouring project's assets for deletion. This is the assertion that
+    // fails if anyone reduces this back to a prefix test.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      const root = path.join(base, 'modoki-ai3');
+      const sibling = path.join(base, 'modoki-ai3-old');
+      fs.mkdirSync(root);
+      fs.mkdirSync(sibling);
+      expect(isUnderOrSame(root, sibling)).toBe(false);
+      expect(isUnderOrSame(root, path.join(sibling, 'assets', 'x.png'))).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('folds case where the platform does — the darwin half `path.relative` does NOT do', () => {
+    // ⚠️ The reason both sides are folded BEFORE path.relative. On win32 relative() folds by
+    // itself; on darwin it is node:path's POSIX implementation and folds nothing, so a raw
+    // containment check reports a path as outside a root it is plainly inside.
+    //
+    // ⚠️⚠️ The paths must NOT EXIST, and that is the whole point of this case. An earlier version
+    // of this test made the directories first and **stayed green when the fold was deleted**:
+    // `.native` resolves a flipped spelling of an EXISTING directory back to its on-disk name, so
+    // it silently supplies what the fold was there to supply. The fold's only load-bearing job is
+    // the path that is gone or not yet created — where `.native` throws and the fallback is bare
+    // `path.resolve`, which folds nothing. Caught by mutation-checking, not by review.
+    const root = path.join(os.tmpdir(), 'modoki-uos-nonexistent', 'Project');
+    const child = path.join(os.tmpdir(), 'modoki-uos-nonexistent', 'PROJECT', 'assets');
+    expect(fs.existsSync(root)).toBe(false);
+    expect(isUnderOrSame(root, child)).toBe(CASE_INSENSITIVE);
+    // The same pair spelled identically must hold on EVERY platform, or the assertion above is
+    // measuring the platform gate rather than the fold.
+    expect(isUnderOrSame(root, path.join(os.tmpdir(), 'modoki-uos-nonexistent', 'Project', 'assets'))).toBe(true);
+  });
+
+  it('accepts a flipped spelling of an EXISTING directory (does NOT isolate .native — see below)', () => {
+    // ⚠️ **This case cannot fail, and its old title claimed it pinned `.native`.** On a
+    // case-insensitive volume the FOLD alone carries it; on a case-sensitive one both arms are
+    // false. Review measured it green under `canonicalPath → path.resolve`. It is kept as an
+    // end-to-end acceptance case, not as cover for the realpath — that is the symlink test below,
+    // which is the only one on this platform that discriminates the two.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      fs.mkdirSync(path.join(base, 'Project', 'assets'), { recursive: true });
+      expect(isUnderOrSame(path.join(base, 'PROJECT'), path.join(base, 'Project', 'assets')))
+        .toBe(CASE_INSENSITIVE);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a child whose NAME begins with two dots', () => {
+    // ⚠️ Regression: this function shipped `rel.startsWith('..')`, which reads `..bak` — a
+    // perfectly ordinary directory INSIDE the root — as an escape. `projectPaths.ts:47` already
+    // carried the correct spelling with this same comment and its suite has a case named for it;
+    // the SSOT was written with the version that test exists to forbid. Only the `..` SEGMENT
+    // means escaped.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      fs.mkdirSync(path.join(base, '..bak'), { recursive: true });
+      expect(isUnderOrSame(base, path.join(base, '..bak'))).toBe(true);
+      // ⚠️ `old.png` does NOT exist, deliberately. This assertion failed when first written, for
+      // a reason entirely separate from the `..` fix: `canonicalPath` falls back to bare
+      // `path.resolve` for a missing path, resolving no symlinks — and `os.tmpdir()` on macOS is
+      // `/var` → `/private/var`. So the existing parent canonicalised one way and the missing
+      // child the other, and containment reported OUTSIDE. `isUnderOrSame` now resolves the
+      // longest existing ANCESTOR and re-appends the missing tail.
+      expect(fs.existsSync(path.join(base, '..bak', 'old.png'))).toBe(false);
+      expect(isUnderOrSame(base, path.join(base, '..bak', 'old.png'))).toBe(true);
+      // …and the real escape is still an escape, or the fix has gone too far the other way.
+      expect(isUnderOrSame(path.join(base, 'sub'), base)).toBe(false);
+      expect(isUnderOrSame(base, path.join(path.dirname(base), 'elsewhere'))).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('a MISSING child under a symlinked ancestor is still inside', (ctx) => {
+    // The general form of the trap above, isolated. Both operands must be expressed in the same
+    // space or containment is meaningless; a missing child must not fall back to an unresolved
+    // spelling while its existing parent gets resolved.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      const real = path.join(base, 'real');
+      fs.mkdirSync(real, { recursive: true });
+      const link = path.join(base, 'link');
+      try {
+        fs.symlinkSync(real, link, 'dir');
+      } catch {
+        ctx.skip('cannot create a directory symlink here (needs a privilege this machine lacks)');
+        return;
+      }
+      const missing = path.join(link, 'not-created-yet', 'x.png');
+      expect(fs.existsSync(missing)).toBe(false);
+      expect(isUnderOrSame(real, missing)).toBe(true);
+      expect(isUnderOrSame(link, missing)).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('follows a symlink, so one directory reached two ways is still inside', (ctx) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    try {
+      const real = path.join(base, 'real');
+      fs.mkdirSync(path.join(real, 'assets'), { recursive: true });
+      const link = path.join(base, 'link');
+      try {
+        fs.symlinkSync(real, link, 'dir');
+      } catch {
+        // ⚠️ SKIP, never a silent `return`. This is the ONLY case here that discriminates
+        // `.native` from `path.resolve`, and unelevated Windows cannot create a link — so a bare
+        // `return` would report a clean green run over the one assertion that matters, on the
+        // very platform this whole change exists for. Per CLAUDE.md: a leg this machine cannot
+        // run reports SKIP, not a pass.
+        ctx.skip('cannot create a directory symlink here (needs a privilege this machine lacks)');
+        return;
+      }
+      expect(isUnderOrSame(real, path.join(link, 'assets'))).toBe(true);
+      expect(isUnderOrSame(link, path.join(real, 'assets'))).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
     }
   });
 });

@@ -31,7 +31,7 @@ import {
   clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
   readMetaPreferringPark, metaWrittenToDisk, peekMetaBaseline, clearMetaBaselines,
   writeMetaWholesale,
-  noteMetaReadResult,
+  noteMetaReadResult, metaReadFallback,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
 
 const TEX = '/assets/textures/rock.png.meta.json';
@@ -241,13 +241,20 @@ describe('readMetaPreferringPark', () => {
     expect(pendingRef).toBeUndefined();
   });
 
-  it('a non-ok GET resolves to {}, matching every existing call site\'s r.ok ? r.json() : {}', async () => {
+  /** The body of a non-ok reply is never read — the fallback stands in for it. Since #880 that
+   *  fallback is `metaReadFallback()` rather than a bare `{}`: string-key-identical (so every
+   *  call site still merges onto an empty document), but tagged, so a park or wholesale write
+   *  built on it is refused. Both halves are asserted — the second is the one a `toEqual({})`
+   *  would silently stop pinning if the tag were dropped. */
+  it('a non-ok GET resolves to the TAGGED empty fallback, not a bare {}', async () => {
     vi.stubGlobal('fetch', vi.fn(async () =>
       ({ ok: false, status: 404, json: async () => ({ should: 'not be read' }) } as unknown as Response)));
 
     const { meta } = await readMetaPreferringPark(TEX);
 
-    expect(meta).toEqual({});
+    expect(meta).toEqual(metaReadFallback());
+    expect(meta, 'the tag is the guard — a bare {} would park an id-less document').not.toEqual({});
+    expect(Object.keys(meta), 'and it is still empty to every string-key consumer').toEqual([]);
   });
 });
 
@@ -537,14 +544,20 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
    *  modal editors refuse to save; the eight ASSET VIEWS need no modal at all, which makes an
    *  ordinary field change the common route to it. Guarding in the registry covers all of them,
    *  and the ninth view somebody adds tomorrow. */
+  /** ⚠️ The park payload SPREADS the read, because that is what the panel does and what
+   *  `metaMergeNotClobber.test.ts` requires of every one of the 18 park sites — a bare literal
+   *  here would be testing a shape the guard forbids anyway. Since #880 that spread is also what
+   *  carries the refusal: the fallback is tagged, the tag rides the spread, and the tagged
+   *  document is what `parkMetaEdit` refuses. */
   it('refuses to park after a FAILED read — an id-less wholesale write costs the asset its GUID', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: false, status: 500, headers: { get: () => null }, text: async () => '', json: async () => ({}),
     } as unknown as Response)));
     const { meta } = await readMetaPreferringPark(TEX);
-    expect(meta, 'the fallback the panel would spread').toEqual({});
+    expect(meta, 'the fallback the panel would spread').toEqual(metaReadFallback());
+    expect(meta, 'and it is NOT a bare {} — the tag is the whole guard (#880)').not.toEqual({});
 
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });   // the panel's field change
+    parkMetaEdit(TEX, { ...meta, texture: { format: 'webp' } });   // the panel's field change
 
     expect(hasPendingMeta(), 'parking this is how the GUID gets destroyed').toBe(false);
   });
@@ -553,13 +566,13 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: false, status: 500, headers: { get: () => null }, text: async () => '', json: async () => ({}),
     } as unknown as Response)));
-    await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    const failed = await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { ...failed.meta, texture: { format: 'webp' } });
     expect(hasPendingMeta()).toBe(false);
 
     stubWithHeader('AFTER-RECOVERY');
-    await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    const ok = await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { ...ok.meta, texture: { format: 'webp' } });
 
     expect(hasPendingMeta(), 'the refusal must not be permanent').toBe(true);
   });
@@ -696,13 +709,19 @@ describe('an exempted raw reader still records the baseline (#871)', () => {
    *  left the exempted video reader recording a baseline and NOT the failure — #871's exact trap
    *  a second time, one field down, on the one asset type with no other reader.
    *
-   *  This is the accept-side pair: a failure must ARM the guard, and a later success must DISARM
-   *  it (a dev-server blip is transient; once we have genuinely read the file there is nothing
-   *  left to protect against). Asserted through `parkMetaEdit`'s observable behaviour rather than
-   *  by reaching into `readFailed`, so it survives that set being reshaped. */
-  it('a failed raw read ARMS the park refusal, and a later success DISARMS it', () => {
+   *  This is the accept-side pair: a document built on the failed read must be REFUSED, and one
+   *  built on a successful read must still park (a dev-server blip is transient).
+   *
+   *  ⚠️ **#880 moved WHERE that is carried, and the exempted reader is the reason it matters.**
+   *  It used to be a path-keyed flag this helper armed; it is now a tag on the fallback DOCUMENT,
+   *  which is why the video panel's `metaReadFallback()` — not a bare `{}` — is the thing under
+   *  test here. Same trap as the baseline, one field along: an exemption from the read HELPER is
+   *  not an exemption from what a failed read MEANS, and the guard is inert for `.mp4` (the one
+   *  type with no other reader) the moment this file hands back an untagged `{}`.
+   *  `metaReadPreferringPark.test.ts`'s `fallback: 'tags'` rule is the source-level half of this. */
+  it('a document built on the raw reader\'s FALLBACK is refused; one built on a real read parks', () => {
     noteMetaReadResult(VID, res(false, null));
-    parkMetaEdit(VID, { video: { crf: 23 } });
+    parkMetaEdit(VID, { ...metaReadFallback(), video: { crf: 23 } });
     expect(
       isMetaDirty(VID),
       'a park built on the {} fallback would write an id-less sidecar and orphan the asset',
@@ -825,86 +844,235 @@ describe('only a read that feeds a panel may move the baseline', () => {
   });
 });
 
-/** `readFailed` — the guard against an id-less wholesale write (#845 second review, #871).
+/** The guard against an id-less wholesale write, keyed on the DOCUMENT (#845, #871, #880).
  *
- *  Split out of the baseline describe: this is about the FLAG, not about `baselines`. Both halves
- *  of the recording rule are pinned here, because reverting either one alone left every test in
- *  this file green.
- */
-describe('the read-failed refusal (#845/#871)', () => {
-  /** ⚠️ THE ASYNC WINDOW — the seam a direct `noteMetaReadResult` call cannot reach.
-   *
-   *  `readMetaPreferringPark` checks the park BEFORE its `await` and records the result AFTER, so a
-   *  park landing in between is invisible to the check that started the read. Gating the
-   *  read-failed flag on "is a park live?" therefore skips it for a component whose OWN read
-   *  failed — and that component is showing `meta: {}`, because the helper returns the `{}`
-   *  fallback on `!ok` and every asset view merges onto `{...(meta ?? {})}`.
-   *
-   *  Reachable in production: `Inspector`'s postprocessor row and `ModelAssetView` both read the
-   *  model's path on mount. Park a good doc from one, let the other's GET 500, and the next field
-   *  change in that panel parks a doc with NO `id`, supersedes the good park, and Cmd+S writes an
-   *  id-less sidecar — the scanner mints a fresh GUID and every reference to the asset dangles.
-   *
-   *  So the flag is armed unconditionally and only the BASELINE is skipped while a park is live. */
-  it('a read that FAILS while another component parks still arms the refusal', async () => {
-    // The OTHER component's park — it lands while this read is in flight, which is the whole seam.
-    const parkDuringFlight = () => parkMetaEdit(TEX, { id: 'GUID-1', postprocessor: 'none' });
-    vi.stubGlobal('fetch', vi.fn(async () => {
-      parkDuringFlight();
+ *  Split out of the baseline describe: this is about the read-failed refusal, not about
+ *  `baselines`. Every half is pinned separately, because reverting any one of them alone left
+ *  every other test in this file green.
+ *
+ *  ⚠️ **#880 rewrote what the guard is keyed on, and these tests are the reason it had to be.**
+ *  It was a `Set<string>` of paths whose last read failed, and a path cannot answer the question
+ *  the guard asks — *"is the document about to be written the `{}` fallback?"* belongs to one
+ *  COMPONENT. Two components do read one path on mount (`Inspector`'s postprocessor row and
+ *  `ModelAssetView`, both on the model's path), and the path-keyed version failed in both
+ *  directions at once: either one's ok read CLEARED the flag the other still needed, and while a
+ *  park was live nothing could clear it at all. So the fallback document is tagged instead, the
+ *  tag rides the spread every park site already makes, and the tagged document is what is
+ *  refused.
+ *
+ *  ⚠️ Every park payload below SPREADS its own read, because that is what all 18 park sites do —
+ *  and that spread is what carries the tag. ⚠️ It is what they DO, not what anything enforces:
+ *  `metaMergeNotClobber.test.ts`'s rule accepts a `...` anywhere (a nested one passes with a fresh
+ *  top-level object) and accepts a literal `id:` with no spread at all, so it narrows the space a
+ *  19th site can occupy without closing it. The residual is stated on `FROM_FAILED_READ`. */
+describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', () => {
+  /** What `/api/read-meta` answers next. Mutated per test rather than re-stubbed, because the
+   *  scenario that matters is TWO reads of one path with different outcomes. */
+  let readReply: { ok: boolean; body: unknown; sha: string | null };
+  /** Every `/api/write-meta` POST body — `[]` is how a test proves a refusal never left. */
+  let writes: Array<{ path: string; meta: unknown }>;
+
+  beforeEach(() => {
+    readReply = { ok: true, body: {}, sha: null };
+    writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+      if (String(url).includes('/api/read-meta')) {
+        return {
+          ok: readReply.ok, status: readReply.ok ? 200 : 500,
+          headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-sha256' ? readReply.sha : null) },
+          text: async () => '', json: async () => readReply.body,
+        } as unknown as Response;
+      }
+      writes.push(JSON.parse(init?.body ?? '{}'));
       return {
-        ok: false, status: 500, headers: { get: () => null },
-        text: async () => '', json: async () => ({}),
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => '', json: async () => ({ ok: true, sha256: 'AFTER' }),
       } as unknown as Response;
     }));
+  });
 
-    const r = await readMetaPreferringPark(TEX);
-    expect(r.ok, 'the read really did fail').toBe(false);
-    expect(r.meta, 'and handed back the {} fallback this panel will merge onto').toEqual({});
+  const failRead = () => { readReply = { ok: false, body: {}, sha: null }; };
+  const okRead = () => { readReply = { ok: true, body: { id: 'GUID-1' }, sha: 'DISK-V1' }; };
 
-    // That panel's next field change, built on the fallback — no `id`.
-    parkMetaEdit(TEX, { model: { lodCount: 2 } });
+  /** Two components, one path, the 500 FIRST. This is the interleaving the path-keyed flag did
+   *  close — it armed on A's failure, and B's success then cleared it, so A's next field change
+   *  parked a document with no `id`. */
+  it("A's failed read still refuses A, after B reads the same path successfully", async () => {
+    failRead();
+    const a = await readMetaPreferringPark(TEX);          // component A: 500 -> the {} fallback
+    expect(a.meta, 'the fallback, tagged').toEqual(metaReadFallback());
+
+    okRead();
+    const b = await readMetaPreferringPark(TEX);          // component B: 200 -> the real document
+    expect(b.meta, 'positive control: B really did read the file').toEqual({ id: 'GUID-1' });
+
+    parkMetaEdit(TEX, { ...a.meta, model: { lodCount: 2 } });   // A's next field change
 
     expect(
       peekPendingMeta(TEX),
-      'an id-less park superseded the good one — Cmd+S would orphan every ref to this asset',
-    ).toEqual({ id: 'GUID-1', postprocessor: 'none' });
-    // ⚠️ The line above alone also passes under a mutant that refuses EVERY park, so pin that the
-    // refusal is selective: a park made after a SUCCESSFUL read of the same path still lands.
-    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V1' } });
-    parkMetaEdit(TEX, { id: 'GUID-1', model: { lodCount: 3 } });
-    expect(peekPendingMeta(TEX), 'the refusal must be selective, not blanket')
+      "B's successful read must not vouch for the document A is holding",
+    ).toBeUndefined();
+  });
+
+  /** The SAME scenario with the responses reversed — the half still open after #871, and the one
+   *  that makes this a keying bug rather than an ordering bug. The path-keyed flag accepted this
+   *  order exactly as it accepted the other; it was never about order. */
+  it("...and in the reverse order — B reads successfully first, then A's read fails", async () => {
+    okRead();
+    const b = await readMetaPreferringPark(TEX);          // component B: 200, first
+
+    failRead();
+    const a = await readMetaPreferringPark(TEX);          // component A: 500, second
+
+    parkMetaEdit(TEX, { ...a.meta, model: { lodCount: 2 } });
+    expect(peekPendingMeta(TEX), 'the order was never what made this safe').toBeUndefined();
+
+    parkMetaEdit(TEX, { ...b.meta, model: { lodCount: 3 } });
+    expect(peekPendingMeta(TEX), "and B's own document is untouched by A's failure")
       .toEqual({ id: 'GUID-1', model: { lodCount: 3 } });
   });
 
-
-  /** ⚠️ THE OTHER HALF, and it was pinned by nothing. `noteMetaReadResult` makes two changes on an
-   *  ok response — clear the flag, and (only when no park is live) seed the baseline. Moving the
-   *  CLEAR below the park early-return reverts exactly half the fix and left all 45 tests green;
-   *  the mutation reported for that commit only exercised the ARM half.
+  /** ⚠️ THE ACCEPT SIDE, and the face of #880 that made the old guard actively harmful: the panel
+   *  it punished was the one whose read had SUCCEEDED.
    *
-   *  Clearing while a park is live is what makes the flag recoverable at all for the exempted raw
-   *  reader, which is the one caller that still reaches the network with a park held. */
-  it('a successful read clears the flag EVEN WHILE a park is live', () => {
-    // Reach the state this fix newly made possible: a park held AND the flag armed. It needs the
-    // park FIRST — once the flag is armed nothing can park, so parking after it cannot get here.
-    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V1' } });
-    parkMetaEdit(TEX, { id: 'g', v: 1 });
-    expect(peekPendingMeta(TEX), 'positive control: the park landed').toEqual({ id: 'g', v: 1 });
+   *  Under the path-keyed flag A's failure armed the PATH — and `readMetaPreferringPark` returns
+   *  early on a park and never reaches the network, so nothing could clear it. B's next
+   *  postprocessor change was then refused with `Inspector.tsx:1487` having already moved the
+   *  dropdown and advanced `metaRef.current`: the control moved, no dirty badge appeared, and the
+   *  edit was dropped with only a `console.error`. Recovery was Cmd+S, then reselect.
+   *
+   *  There is no armed path state left to wedge, so B simply keeps working — TWICE, which is the
+   *  part one park cannot show: the second edit is the one the wedge ate, because by then a park
+   *  is live for the path and no read can reach the network to clear anything. */
+  it("the component whose read SUCCEEDED keeps parking while another's read has failed", async () => {
+    okRead();
+    const b = await readMetaPreferringPark(TEX);
 
-    // Another component's read now fails. Armed, with that park still live.
-    noteMetaReadResult(TEX, { ok: false, headers: { get: () => null } });
-    parkMetaEdit(TEX, { id: 'g', v: 2 });
-    expect(peekPendingMeta(TEX), 'armed — the next park is refused').toEqual({ id: 'g', v: 1 });
+    failRead();
+    const a = await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { ...a.meta, model: { lodCount: 2 } });
+    expect(peekPendingMeta(TEX), 'positive control: A is still refused').toBeUndefined();
 
-    // The exempted raw reader is the one caller that still reaches the network with a park held,
-    // so its success is the only thing that can un-wedge this path.
-    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V2' } });
+    parkMetaEdit(TEX, { ...b.meta, postprocessor: 'outline' });
+    expect(peekPendingMeta(TEX)).toEqual({ id: 'GUID-1', postprocessor: 'outline' });
 
-    parkMetaEdit(TEX, { id: 'g', v: 3 });
-    expect(peekPendingMeta(TEX), 'a successful read must clear the flag even with a park live')
-      .toEqual({ id: 'g', v: 3 });
+    parkMetaEdit(TEX, { ...b.meta, postprocessor: 'none' });
+    expect(peekPendingMeta(TEX), 'a live park must not wedge the path')
+      .toEqual({ id: 'GUID-1', postprocessor: 'none' });
+  });
+
+  /** The legitimate empty case, which is NOT a failed read: an asset whose sidecar does not exist
+   *  yet answers 200 with `{}` (only a missing ASSET 404s). Its first park carries no `id` and
+   *  must land — there is no GUID for a heal pass to orphan.
+   *
+   *  ⚠️ Without this, a mutant refusing every id-less document passes everything above. */
+  it('a first-ever park on an asset with no sidecar yet still lands', async () => {
+    readReply = { ok: true, body: {}, sha: null };
+    const { meta, ok } = await readMetaPreferringPark(TEX);
+    expect(ok, 'a missing SIDECAR is a 200 — only a missing asset 404s').toBe(true);
+
+    parkMetaEdit(TEX, { ...meta, texture: { maxSize: 512 } });
+
+    expect(peekPendingMeta(TEX)).toEqual({ texture: { maxSize: 512 } });
+  });
+
+  /** THE SECOND DOOR (#880). `writeMetaWholesale` reaches disk without parking anything, so the
+   *  park refusal above never saw it — and `EnvironmentAssetView.apply()`'s UltraHDR branch builds
+   *  `{...(meta ?? {}), environment, environmentCache}` and writes it, with `loadMeta` dropping the
+   *  read's `ok` and Apply disabled only while `importing`, never on a failed load. A 500, a switch
+   *  to UltraHDR, one click, and an id-less document went to `/api/write-meta`.
+   *
+   *  The path-keyed flag could not have covered this at all: it was only ever consulted on a park. */
+  it('a wholesale write built on a failed read is refused, and never reaches the route', async () => {
+    failRead();
+    const { meta } = await readMetaPreferringPark(TEX);
+
+    const wrote = await writeMetaWholesale(TEX, { ...meta, environment: { format: 'ultrahdr' } });
+
+    expect(wrote, 'this write would have minted the asset a fresh GUID').toBe(false);
+    expect(
+      writes,
+      'refused BEFORE the POST — a write that reaches the route has already replaced the file',
+    ).toEqual([]);
+  });
+
+  /** The accept side of that door, and the half a "does it refuse?" test cannot reach. */
+  it('...and a wholesale write built on a SUCCESSFUL read still goes through', async () => {
+    okRead();
+    const { meta } = await readMetaPreferringPark(TEX);
+
+    const wrote = await writeMetaWholesale(TEX, { ...meta, environment: { format: 'ultrahdr' } });
+
+    expect(wrote).toBe(true);
+    expect(writes.at(-1)?.meta).toEqual({ id: 'GUID-1', environment: { format: 'ultrahdr' } });
+  });
+
+  /** THE FOURTH DOOR (#880 close-out review, finding 1) — and the one that was still open after
+   *  the first three were guarded.
+   *
+   *  `writeMetaConditional` (`assetViews/widgets.tsx`) is the ONLY `/api/write-meta` POST
+   *  implementation in the package, and `SpriteEditor.save` / `NineSliceEditor.save` reach it
+   *  directly through `writeMetaOrWarn`, passing through neither `parkMetaEdit` nor
+   *  `writeMetaWholesale`. They are safe today only because each hand-rolls its own
+   *  `metaLoadedRef` boolean — so a third modal editor copying their shape and omitting that one
+   *  line would have replaced a sidecar with an id-less document, with every guard silent.
+   *
+   *  ⚠️ The tag was being consumed in three places while ONE endpoint existed. That is what this
+   *  test pins: the refusal is at the endpoint now, so it holds for a caller that knows nothing
+   *  about the pending registry. */
+  it('the direct write path (writeMetaOrWarn) refuses a document built on a failed read', async () => {
+    const { writeMetaOrWarn } = await import('../../packages/modoki/src/editor/panels/assetViews/widgets');
+    failRead();
+    const { meta } = await readMetaPreferringPark(TEX);
+
+    const wrote = await writeMetaOrWarn(TEX, { ...meta, border: { top: 4 } });
+
+    expect(wrote, 'a modal editor saving on a failed read must not replace the sidecar').toBe(false);
+    expect(writes, 'and the POST must not have been issued').toEqual([]);
+  });
+
+  /** The accept side of the fourth door — without it, a mutant refusing EVERY write passes above. */
+  it('...and lets an ordinary document through', async () => {
+    const { writeMetaOrWarn } = await import('../../packages/modoki/src/editor/panels/assetViews/widgets');
+    okRead();
+    const { meta } = await readMetaPreferringPark(TEX);
+
+    const wrote = await writeMetaOrWarn(TEX, { ...meta, border: { top: 4 } });
+
+    expect(wrote).toBe(true);
+    expect(writes.at(-1)?.meta).toEqual({ id: 'GUID-1', border: { top: 4 } });
+  });
+
+  /** ⚠️ The property the whole design rests on, and the one a reader cannot check by looking: the
+   *  tag survives the spreads a panel makes, however many. Every test above exercises ONE spread;
+   *  `ModelAssetView` and its siblings re-spread their own state on each keystroke, so a tag that
+   *  survived only the first hop would fail open on the second edit and nowhere else. */
+  it('the tag survives repeated spreads — a panel re-merging its own state stays refused', () => {
+    const first = { ...metaReadFallback(), model: { lodCount: 2 } };
+    const second = { ...first, texture: { maxSize: 512 } };
+    const third = { ...second, model: { lodCount: 3 } };
+
+    parkMetaEdit(TEX, third);
+
+    expect(peekPendingMeta(TEX), "three spreads deep, still the fallback's document").toBeUndefined();
+  });
+
+  /** ⚠️ The tag must never leave the renderer, and `/api/write-meta` takes `JSON.stringify`'d
+   *  bodies, which drop symbol keys.
+   *
+   *  ⚠️ **Scope, stated honestly: this pins the SYMBOL, not the serializer.** It builds its own
+   *  object and never goes through `writeMetaWholesale` or `flushPendingMeta`, so the only mutant
+   *  it catches is `FROM_FAILED_READ` ceasing to be a symbol (a string key would land in the
+   *  sidecar). It cannot detect a swapped serializer — and it cannot be widened to, because a
+   *  tagged document is REFUSED at both doors and so can never reach a real write to observe. An
+   *  earlier version of this docblock claimed the wider guarantee. */
+  it('the tag cannot reach the wire — JSON does not carry it', () => {
+    const doc = { ...metaReadFallback(), texture: { maxSize: 512 } };
+    expect(JSON.parse(JSON.stringify(doc))).toEqual({ texture: { maxSize: 512 } });
+    expect(Object.keys(metaReadFallback()), 'and no string-keyed consumer can see it').toEqual([]);
   });
 });
+
 
 describe('a wholesale editor write does not leave a stale baseline (#874)', () => {
   /** A stub that behaves like `ifMatchRefusal`: 409 when a PRESENT `ifMatch` misses, and every

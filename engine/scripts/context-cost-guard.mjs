@@ -33,6 +33,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { canonicalPath } from './pathIdentity.mjs';
 
 /** Below this, Read's own truncation (or the file simply being small) means the call is cheap enough
  *  not to warn about. Matches the ~50k-token outlier measured in the 2026-08-30 audit scaled down to
@@ -158,12 +159,10 @@ function handleRead() {
 
   // Normalize the key so `foo.md`, `./foo.md` and an absolute path to the same file share one
   // budget instead of each getting their own 2-warning allowance.
-  let normalizedPath = p;
-  try {
-    normalizedPath = fs.realpathSync(p);
-  } catch {
-    // Fall back to the raw path — the cap just becomes spelling-sensitive again, never a crash.
-  }
+  // #881: was the JS `fs.realpathSync` walk, falling back to the RAW path on throw. `canonicalPath`
+  // uses `.native` and falls back to `path.resolve`, so `./foo.md` and `foo.md` still share one
+  // budget for a file that has since been deleted — the old fallback gave those two keys.
+  const normalizedPath = canonicalPath(p);
   if (!bumpAndCheck(sid, `read-large:${normalizedPath}`)) return quiet();
 
   const kb = Math.round(headBytes / 1024);

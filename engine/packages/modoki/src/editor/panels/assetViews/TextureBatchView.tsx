@@ -9,7 +9,7 @@ import { resolveTextureSettings, resolveTextureType, deriveSettingsForType, type
 import { reimportBtnStyle } from './widgets';
 import { mergeRecords } from '../assetMerge';
 import { reimportPaths } from './reimport';
-import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
+import { parkMetaEdit, readMetaPreferringPark, metaReadFallback } from '../../scene/pendingMeta';
 import { TextureSettingsControls, type TextureSettingKey } from './TextureAssetView';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -39,7 +39,14 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
       try {
         const { meta } = await readMetaPreferringPark(p);
         return [p, meta] as const;
-      } catch { return [p, {}] as const; }
+      // ⚠️ `metaReadFallback()`, not a bare `{}` (#880 close-out sweep).
+      // `readMetaPreferringPark` deliberately does not swallow a THROWN read, so this catch is
+      // where a network error becomes this view's document for `p` — and an untagged `{}` here
+      // parks with no `id`, which makes the scanner mint the texture a fresh GUID and dangles
+      // every reference to it. The non-ok branch is already tagged by the helper; this is the
+      // only other way an empty document enters this map. (#890 carries the other half of the
+      // class: the single-asset views keep `useState(null)` and have the same hole.)
+      } catch { return [p, metaReadFallback()] as const; }
     }));
     setMetas(Object.fromEntries(entries));
     setLoaded(true);
