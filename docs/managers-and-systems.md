@@ -403,8 +403,16 @@ registerReadSource('canGoBack',          () => navigationManager.canGoBack);
 This is why we avoid copying Manager-derived values into a store via a per-frame
 projection (option A) — it would re-introduce the exact poller smell we're
 removing. The read-source registry keeps "values reach UI without a tick" and
-generalizes: a Back button binds `disabled={!canGoBack}`; a HUD binds
-`Time: {timeSinceGameStart}`; a score manager registers `{score}`.
+generalizes: a HUD binds `Time: {timeSinceGameStart}`; a score manager registers
+`{score}`; a Back button binds its VISIBILITY to `canGoBack`.
+
+⚠️ That last one was written here as `disabled={!canGoBack}` for a long time, and no
+such binding exists. A read source reaches a UI element through
+`UIBinding.visibleBinding` / `textBinding` only (`runtime/ui/bindingResolver.ts`); the
+one `disabled` field in the UI traits — `UIToggle.disabled` — is written by a `set`
+binding, never read from the read-source registry. So the shipped shape is *hide*, not
+*disable*. Kept as an aspiration if someone wants to build it; do not cite it as
+existing.
 
 ## Engine-global Managers
 
@@ -428,6 +436,93 @@ it) and exposes `loadScene` / `back` / `canGoBack` / `replace`. It backs onto
 
 `scene-selector` stops re-implementing `navigateBack` — it uses the engine
 built-in.
+
+**History is recorded at the WORLD SWAP, not in the navigation's own continuation
+(#808).** `loadScene`/`back` only CLAIM their target path; `NavigationManager.onSwap`
+records the transition if and when that swap commits, using one rule for both
+directions — arriving at the entry we would `back()` into pops it (that is both the
+back and the A→B→A oscillation collapse); anything else pushes the scene we left.
+The pop is checked FIRST and unconditionally, maintaining the invariant *the current
+scene is never the top of the back-stack*: a same-scene swap (A→A) is exactly when
+that invariant is already broken, because something outside this manager — Play-stop
+restore, prefab undo, an agent `load_scene` — landed us on the entry at the top, and
+guarding on "we did not move" before the pop left it unconsumed forever.
+
+A claim is per CALL, not per path. `replace()` claims too, but as SUPPRESSING — it
+consumes its own swap and records nothing, so its "navigate without history" contract
+holds even against a concurrent `loadScene` for the same scene. Every direct
+`sceneManager.loadScene` (boot, hot-reload) claims nothing, which is what keeps "only
+this manager's methods record history" true **for every case production can reach** —
+strictly, an external swap onto a path that happens to have a live claim would consume
+it, but a real direct load aborts the pending navigation first and clears that claim.
+
+⚠️ **Two concurrent navigations to one scene with opposite intent are genuinely
+ambiguous** — `onWorldSwap` does not say which call caused the swap — so the rule is a
+tie-break, not an answer: the most recently STARTED claim wins, i.e. what the player
+last asked for. Preferring the suppressing claim reads as safer and is not; a
+`replace()` that was itself superseded, whose cleanup has not yet run, would disarm the
+`loadScene` that actually committed and leave Back dead.
+
+⚠️ **Five shapes preceded this one, and each looked obviously right.** ① the original
+mutated `history` BEFORE its `await`, so a rejected load left the stack off by one;
+② a snapshot restored in a `catch` — discards the work of whichever navigation
+superseded this one; ③ that restore gated on a supersession epoch — answers *am I still
+the latest?*, not *is my mutation still on the stack?*, and they diverge whenever the
+superseding call mutates nothing; ④ deferring the write past the await — two
+navigations that BOTH succeed interleave, because a load superseded by a newer LOAD
+after its swap is no longer cancelled and RESOLVES, so its stale continuation runs after
+the winner's (not absolute: a mid-flight `unloadAll()` still throws post-swap, #542);
+⑤ swap-driven but with a `Set<path>` claim — see the next paragraph.
+
+⚠️ **Supersession cuts both ways, and knowing only half of it cost a fifth round.** A
+load superseded BEFORE its swap does *reject*, with `AbortError` — normal operation,
+as `ui/bindings.ts` says in its own comment — so the LOSER settles first. That is why
+a claim is per call: a `Set<path>` collapses two navigations to one scene into a single
+entry, and the loser's cleanup then released it before the winner's swap arrived, so
+the winner recorded nothing.
+
+**The shared mechanism:** each repair had the navigation's own continuation decide what
+to write by INSPECTING the stack after its `await` — and the stack is exactly what a
+concurrent navigation may have changed by then. Every guard was a proxy for *did my
+navigation actually win*, and each proxy failed on a different interleaving. The swap
+is the authoritative, serialized answer, so no proxy is needed.
+
+⚠️ **Testing this needs a real swap.** A mock that only resolves
+`sceneManager.loadScene` exercises none of the above — that is precisely why four
+repairs shipped or were proposed green. `tests/runtime/navigationManager.test.ts`
+drives `setCurrentWorld`, and can put the swap and the promise resolution at DIFFERENT
+points, which is the post-swap-tail window the interleavings live in.
+
+Measured against the 32-test suite, every prior shape fails and no two fail the same
+way — which is the property that makes it a regression test rather than a description
+of the current code:
+
+| shape | failures |
+|---|---|
+| ① mutate before the await | 9 |
+| ② snapshot + restore | 6 |
+| ③ restore gated on an epoch | 6 |
+| ④ defer past the await | 2 |
+| ⑤ swap-driven, `Set<path>` claims | 4 |
+| ⑥ swap-driven, per-call claims (current) | **0** |
+
+⚠️ **What the suite still cannot see: production never drives this.** No scene in
+`games/**` or `demos/**` binds `engine.navigateBack` or the `canGoBack` read source,
+and `replace()` has no callers at all — so `back()`, the pop and the oscillation
+collapse have never run against a real Back button. That absence, not the mocking, is
+the structural reason six shapes of this fix could each ship green. **That gap is now partly closed**:
+`tests/runtime/navigationBackButton.integration.test.ts` authors a Back button into a
+real scene, loads it through the real `SceneManager` (fetch stubbed, nothing else), and
+presses it through `applyBindings` — so the whole chain from click to history pop to the
+button's own visibility runs. ⚠️ It binds `visibleBinding`, not `disabled`, for the
+reason given further up: the disabled form does not exist.
+
+⚠️ **It is not a substitute for the unit suite, measured:** that file fails on pre-#808
+(1 of 2) and PASSES on the deferral shape that shipped and was wrong. It closes the
+*chain* gap; the interleaving gap is closed by `navigationManager.test.ts`, which can
+separate a swap from its promise resolution. What is still missing is an AUTHORED scene
+in a real game — no `games/**` or `demos/**` scene binds these — so the editor-authoring
+side of this remains unexercised.
 
 ### Time (System + Manager)
 
