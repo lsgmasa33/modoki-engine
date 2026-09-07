@@ -816,6 +816,22 @@ describe('only a read that feeds a panel may move the baseline', () => {
     expect(r.failed).toHaveLength(1);
   });
 
+  /** The ACCEPT side of the same rule: a NON-passive read by the panel still seeds normally, or
+   *  the fix above would have disarmed #871 in the other direction. */
+  it('a normal (non-passive) read still records the baseline', async () => {
+    stubDisk();
+    await readMetaPreferringPark(TEX);
+    expect(peekMetaBaseline(TEX)).toBe('V1');
+  });
+});
+
+/** `readFailed` — the guard against an id-less wholesale write (#845 second review, #871).
+ *
+ *  Split out of the baseline describe: this is about the FLAG, not about `baselines`. Both halves
+ *  of the recording rule are pinned here, because reverting either one alone left every test in
+ *  this file green.
+ */
+describe('the read-failed refusal (#845/#871)', () => {
   /** ⚠️ THE ASYNC WINDOW — the seam a direct `noteMetaReadResult` call cannot reach.
    *
    *  `readMetaPreferringPark` checks the park BEFORE its `await` and records the result AFTER, so a
@@ -852,14 +868,41 @@ describe('only a read that feeds a panel may move the baseline', () => {
       peekPendingMeta(TEX),
       'an id-less park superseded the good one — Cmd+S would orphan every ref to this asset',
     ).toEqual({ id: 'GUID-1', postprocessor: 'none' });
+    // ⚠️ The line above alone also passes under a mutant that refuses EVERY park, so pin that the
+    // refusal is selective: a park made after a SUCCESSFUL read of the same path still lands.
+    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V1' } });
+    parkMetaEdit(TEX, { id: 'GUID-1', model: { lodCount: 3 } });
+    expect(peekPendingMeta(TEX), 'the refusal must be selective, not blanket')
+      .toEqual({ id: 'GUID-1', model: { lodCount: 3 } });
   });
 
-  /** The ACCEPT side of the same rule: a NON-passive read by the panel still seeds normally, or
-   *  the fix above would have disarmed #871 in the other direction. */
-  it('a normal (non-passive) read still records the baseline', async () => {
-    stubDisk();
-    await readMetaPreferringPark(TEX);
-    expect(peekMetaBaseline(TEX)).toBe('V1');
+
+  /** ⚠️ THE OTHER HALF, and it was pinned by nothing. `noteMetaReadResult` makes two changes on an
+   *  ok response — clear the flag, and (only when no park is live) seed the baseline. Moving the
+   *  CLEAR below the park early-return reverts exactly half the fix and left all 45 tests green;
+   *  the mutation reported for that commit only exercised the ARM half.
+   *
+   *  Clearing while a park is live is what makes the flag recoverable at all for the exempted raw
+   *  reader, which is the one caller that still reaches the network with a park held. */
+  it('a successful read clears the flag EVEN WHILE a park is live', () => {
+    // Reach the state this fix newly made possible: a park held AND the flag armed. It needs the
+    // park FIRST — once the flag is armed nothing can park, so parking after it cannot get here.
+    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V1' } });
+    parkMetaEdit(TEX, { id: 'g', v: 1 });
+    expect(peekPendingMeta(TEX), 'positive control: the park landed').toEqual({ id: 'g', v: 1 });
+
+    // Another component's read now fails. Armed, with that park still live.
+    noteMetaReadResult(TEX, { ok: false, headers: { get: () => null } });
+    parkMetaEdit(TEX, { id: 'g', v: 2 });
+    expect(peekPendingMeta(TEX), 'armed — the next park is refused').toEqual({ id: 'g', v: 1 });
+
+    // The exempted raw reader is the one caller that still reaches the network with a park held,
+    // so its success is the only thing that can un-wedge this path.
+    noteMetaReadResult(TEX, { ok: true, headers: { get: () => 'V2' } });
+
+    parkMetaEdit(TEX, { id: 'g', v: 3 });
+    expect(peekPendingMeta(TEX), 'a successful read must clear the flag even with a park live')
+      .toEqual({ id: 'g', v: 3 });
   });
 });
 

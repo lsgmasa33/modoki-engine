@@ -205,21 +205,6 @@ export function noteMetaReadResult(
   path: string,
   res: { ok?: boolean; headers?: { get?: (name: string) => string | null | undefined } | null } | null | undefined,
 ): void {
-  // ⚠️ A LIVE PARK MEANS THIS RESPONSE DESCRIBES NOBODY'S DOCUMENT — record nothing (#871 review).
-  //
-  // `readMetaPreferringPark` gets this for free: it early-returns on a park and never reaches the
-  // network, so it cannot re-seed while one is live. An exempted reader DOES reach the network
-  // (that is what the exemption is FOR — `VideoAssetView` must see disk to keep `applied`
-  // honest), so without this check it re-seeds on every remount. Measured failure: panel reads
-  // V1 → human parks an edit built on V1 → something external rewrites the sidecar → panel
-  // remounts and re-reads → baseline advances to EXTERNAL → Cmd+S sends `ifMatch: EXTERNAL`, a
-  // claim the parked document cannot support, and the external change is CLOBBERED instead of
-  // 409'd. The baseline must describe the bytes the DISPLAYED document came from; while a park is
-  // live, that is the park, and disk is a stranger.
-  //
-  // The read-failed flag is skipped for the same reason: a park exists, so nothing is about to be
-  // built on the `{}` fallback, and arming the refusal here would block a park that already has
-  // its `id`.
   // ⚠️ THE READ-FAILED FLAG IS ARMED UNCONDITIONALLY — a live park does NOT excuse it.
   //
   // We do NOT know what this sidecar holds. Remember that, so a field change cannot park a
@@ -233,12 +218,21 @@ export function noteMetaReadResult(
   // components DO read one path concurrently on mount (`Inspector`'s postprocessor row and
   // `ModelAssetView`, both on the model's path): park a good doc from one, let the OTHER's GET
   // 500, and the flag is skipped — then that panel's next field change parks a doc with no `id`,
-  // supersedes the good park, and Cmd+S writes an id-less sidecar. The scanner's heal pass mints a
-  // fresh GUID and every scene/prefab reference to that asset dangles.
+  // and Cmd+S writes an id-less sidecar. The scanner's heal pass mints a fresh GUID and every
+  // scene/prefab reference to that asset dangles.
   //
-  // Arming it costs a live park almost nothing: `parkMetaEdit` consults the flag only on the NEXT
-  // park, and any successful read of the path clears it again. A refusal the human sees and can
-  // recover from is the correct trade against a silent write that orphans the asset.
+  // ⚠️ **THIS CLOSES ONE INTERLEAVING OF THAT SCENARIO, NOT THE CLASS — see #880.** `readFailed`
+  // is keyed by PATH and the hazard is keyed by COMPONENT, so the `delete` below still fires for
+  // a reader that is NOT the one holding `{}`. Reverse the two responses above — the 500 lands
+  // first, the 200 second — and the id-less park is accepted exactly as before. That half is
+  // pre-existing (every revision of this function clears on ok) and its fix needs identity this
+  // API does not carry, which is why it is filed rather than patched here.
+  //
+  // ⚠️ And arming while a park is live is a WEDGE, accepted deliberately: `readMetaPreferringPark`
+  // returns early on a park and never reaches the network, so nothing clears the flag until the
+  // park is flushed AND the asset re-read. Recovery is Cmd+S then reselect — two steps, and the
+  // refusal message says so. The trade is a refused edit against a silently orphaned asset, so it
+  // goes this way; #880 carries the shape that would remove the wedge instead of trading for it.
   if (!res?.ok) {
     readFailed.add(path);
     return;
@@ -291,7 +285,9 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
     console.error(
       `[pendingMeta] refusing to park an import-settings edit for ${path} — its .meta.json was `
       + 'never read successfully, so saving this would replace the file with a document missing '
-      + 'its GUID. Reselect the asset once the dev server responds.',
+      + 'its GUID. RECOVERY: if this asset has other unsaved import-settings edits, press Cmd+S '
+      + 'first — while any edit is parked for this path the panel reads the park instead of the '
+      + 'file, so no read can clear this. Then reselect the asset to re-read it (#880).',
     );
     return;
   }

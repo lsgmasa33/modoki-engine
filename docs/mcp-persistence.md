@@ -246,6 +246,14 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   park before its `await` and records after, so a park landing in between hides the failure from a
   DIFFERENT component whose own read failed and which is now showing the `{}` fallback.
 
+  ⚠️ **That closes ONE interleaving, not the class — #880.** The flag is keyed by PATH and the
+  hazard is keyed by COMPONENT, so a successful read still clears it for a reader that is not the
+  one holding `{}`: reverse the order of those two responses and the id-less park is accepted
+  exactly as before. The same root makes the armed state a WEDGE — `readMetaPreferringPark` returns
+  early on a park and never reaches the network, so nothing clears the flag until the park is
+  flushed AND the asset re-read (the refusal message says so). Both faces need identity the API
+  does not carry, which is why #880 is filed rather than patched.
+
   ⚠️ **Both halves live in one function for the same reason, and the second one is why it is named
   for the response rather than for the baseline.** The `readFailed` half was added to that block
   independently, after it had been extracted; taking only the baseline half would have left the
