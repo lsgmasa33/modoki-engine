@@ -162,13 +162,13 @@ const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/liveness
 
 /** Every `.ts`/`.tsx` production source file under `SCAN_DIRS`, via the shared corpus producer
  *  (#799/#771/#805 Phase 4). Floored well under the 851 measured today. */
-function listSourceFiles(roots: readonly string[] = SCAN_DIRS): string[] {
+function listSourceFiles(roots: readonly string[] = SCAN_DIRS): Array<{ rel: string; abs: string }> {
   return repoFiles({
     under: roots.map((rel) => path.join(REPO, rel)),
     match: (rel: string) => /\.tsx?$/.test(rel) && !path.posix.basename(rel).includes('.test.'),
     exclude: ['node_modules', 'dist'],
     floor: 0,   // callers assert their own non-vacuity; SCAN_DIRS measured >600 when written
-  }).map(({ abs }) => abs);
+  });
 }
 
 /** Zero-initialised numeric counters: module/closure `let x = 0;` and class field `private x = 0;`.
@@ -210,17 +210,15 @@ interface Scanned { file: string; counters: string[]; offenders: string[] }
 
 function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
   const results: Scanned[] = [];
-  for (const file of listSourceFiles(roots)) {
-    const src = stripComments(fs.readFileSync(file, 'utf8'));
+  for (const { rel, abs } of listSourceFiles(roots)) {
+    const src = stripComments(fs.readFileSync(abs, 'utf8'));
     const counters = [...src.matchAll(DECL)].map((m) => m[1]);
-    const offenders = file === HELPER
+    const offenders = abs === HELPER
       ? []
       : [...new Set(counters)].filter((n) => livenessPair(src, n));
-    // Normalise to forward slashes HERE, the single point every row is produced — `path.relative`
-    // yields backslashes on Windows, but KNOWN_OUTSIDE_SCAN_DIRS below is a forward-slash ledger.
-    // Every assertion in this file reads `r.file`, so one normalisation point keeps them consistent.
-    const relFile = path.relative(REPO, file).split(path.sep).join('/');
-    results.push({ file: relFile, counters, offenders });
+    // `rel` is git's own repo-relative POSIX string (`repoCorpus.mjs`) — no separator to
+    // normalise, and no way for a later edit to reintroduce one.
+    results.push({ file: rel, counters, offenders });
   }
   return results;
 }

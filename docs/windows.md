@@ -174,17 +174,32 @@ load-bearing and commented as such).
     `engine/scripts/pathPosix.mjs` (`toPosix`) is now the shared one for **new** code; the existing
     ~66 sites were deliberately left as-is — they're churn with no defect behind them, not a
     backlog to migrate.
-  - **The instance list stops here, and the reason is worth stating: the class is now UNREACHABLE
-    for anything that enumerates a corpus** (#799/#771/#805). Guards did not get better at
-    normalising — they stopped producing paths that need it. `engine/scripts/repoCorpus.mjs` returns
-    **git's own repo-relative POSIX `rel`**, so a consumer comparing against `'a/b.ts'` never touches
-    `node:path` and there is no backslash to forget. ~70 producers were migrated onto it and
+  - **The corpus producer made this class RARE, not unreachable — this bullet claimed the latter
+    for a month, and instance 9 disproved it** (#799/#771/#805; corrected under #847). Guards did
+    not get better at normalising — they stopped producing paths that need it.
+    `engine/scripts/repoCorpus.mjs` returns **git's own repo-relative POSIX `rel`**, so a consumer
+    that KEEPS that `rel` and compares against `'a/b.ts'` never touches `node:path` and has no
+    backslash to forget. ⚠️ Keeping it is the consumer's CHOICE, which is the whole of limit 1
+    below. ~70 producers were migrated onto it and
     `corpusProducerIsShared.test.ts` enforces it; the shape is documented in
     [verify-and-ci.md](verify-and-ci.md) § "Corpus production". Instances **3, 5 and 7** above
     (`materialCloneStamp`, `chromeTagging`, `textDirtyAttribution`) each carried a hand-rolled
     normaliser, and all three are now dead code that `noUnusedLocals` deleted — `materialCloneStamp`
     is the one that mattered most, since its `split(sep)` was the one genuinely broken spelling.
-    ⚠️ Three limits, so this is not read as more than it is:
+    ⚠️ Four limits, so this is not read as more than it is:
+    - ⚠️ **Instance 9 (`livenessTokenIsShared`, #847) landed INSIDE this supposedly-covered
+      region** — not in the #814 gap below, where this bullet predicted the next one. The
+      producer's guarantee is **opt-out**: `repoFiles` returns `{ rel, abs }`, and a consumer
+      writing `.map(({ abs }) => abs)` throws the safe `rel` away, after which any
+      `path.relative(REPO, abs)` reconstructs the backslash the producer had removed. That is
+      what #847's guard did, and `corpusProducerIsShared.test.ts` cannot see it — the producer
+      IS shared; the consumer discarded its output. Measured 2026-09-07: **30 call sites across
+      28 files** in `engine/tests/**` spell that `.map`, and a sweep found every other one
+      benign — they
+      normalise before comparing, or never compare at all. So the exposed population is one, not
+      thirty; but it is not zero, and nothing structural keeps it there.
+      **The fix is to thread `{ rel, abs }` through and compare on `rel`**, as
+      `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
     - **Instance 4 is the exception.** `consoleRingOptionsWiring`'s `relPosix` SURVIVES and is live.
       Its two offender lists — the actual defect — now take `rel` from git, but the helper still
       serves individually-named fixed files and a BFS trail, which are not corpus enumeration. It

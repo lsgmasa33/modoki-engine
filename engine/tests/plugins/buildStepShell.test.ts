@@ -173,37 +173,19 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
  * to `NUL` changed nothing, because stderr stays piped either way and the wait was never about
  * ping's writes at all.
  *
- * ⚠️ REAL BOX ONLY — this suite is gated off CI, and the gate is evidence-based, not a dodge.
- * On the GitHub `windows-latest` runner the CONTROL fails: it FINDS a child of cmd.exe, then
- * finds it gone after `close` + 500ms ("expected [] to deeply equal [ 1292 ]", then [ 840 ]).
- * Something there reaps the tool when its parent dies, and the runner disagrees with the
- * hand-measured 4/4 above on identical code.
- *
- * What that costs is not just a red build: if the tool dies on CI regardless of the kill, the
- * TREATMENT case passes for the wrong reason — it was asserting "no survivors" against a child
- * that was already dead. So on that runner this suite was proving nothing about `taskkill /T`
- * while looking green. Gating it is what stops it vouching for coverage it does not have.
- *
- * DISPROVED (ci/main 31287701127): "ping writes to a pipe node owns, `proc.kill()` breaks the
- * pipe, ping dies on the next write." Redirecting the tool's output to `NUL` removes that
- * dependency entirely and the control failed identically. Not the mechanism.
- *
- * STILL OPEN, for whoever picks this up ON A WINDOWS BOX (#182) — all three need a debugger on
- * the runner, none can be settled from a Mac:
- *   1. libuv puts spawned children in a Job Object; something about the runner's job config may
- *      reap the tree when cmd.exe exits.
- *   2. `childrenOf` may be capturing a TRANSIENT child (conhost.exe, a nested cmd.exe) rather
- *      than PING.EXE — a pid that was always going to exit on its own. Filtering by image name
- *      would settle this one, and is the cheapest of the three to try.
- *   3. The runner's session/console teardown differs from an interactive box.
- *
- * ⚠️ This gate was LOST once already: merge `fda2dfbcc` (bringing `origin/win`'s `d3d36893c`,
- * forked before this gate existed, into this commit) took the win side of the conflict and
- * silently dropped both the `&& !process.env.CI` clause and this paragraph. Restored here under
- * #847 — `git log -S` on the clause doesn't surface that loss because the pickaxe skips merge
- * commits by default.
+ * This suite RUNS on CI: it passed on `windows-latest` 117 times between 2026-08-10 and
+ * 2026-08-31. A `&& !process.env.CI` gate was added at `dc66059e5` on the theory that the runner
+ * reaps the tool before the assertions can see it — but that theory is contradicted by those 117
+ * greens, since a reaping runner would have failed the CONTROL every time. The real cause was
+ * #184 above: the first CONTROL awaited `close`, which cannot fire until the orphan is dead, so
+ * it was unsatisfiable by construction. `origin/win`'s repaired version (awaiting `exit` instead)
+ * came in via merge `fda2dfbcc` and is what actually made the gate unnecessary. The gate was
+ * briefly and mistakenly re-added under #847 on a belief that the merge had silently reverted it,
+ * and removed again here once the run history above was checked. The one genuine residual is a
+ * ~4% flake at child discovery (2 of 49 failure runs since 2026-08-10, both
+ * `kids.length === 0` at the first CONTROL) — see the poll deadline below.
  */
-describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
+describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
   // A SIMPLE command on purpose — see the header. `ping -n 30` is the measured shape: it runs
   // long enough to observe and needs no shell builtins.
   const SIMPLE = 'ping -n 30 127.0.0.1'
@@ -245,7 +227,11 @@ describe.runIf(process.platform === 'win32' && !process.env.CI)('buildStepShell 
 
   const spawnAndFindTool = async (): Promise<{ proc: ReturnType<typeof spawnBuildCommand>; kids: number[] }> => {
     const proc = spawnBuildCommand(SIMPLE, { cwd: process.cwd(), env: process.env })
-    const kids = await poll(() => childrenOf(proc.pid!), (k) => k.length > 0, 5000)
+    // Each `childrenOf` call is a PowerShell CIM query costing ~1-3s (docs/windows.md), so a 5s
+    // deadline allowed only 2-3 samples — the observed cause of the ~4% child-discovery flake
+    // above. The tool runs `ping -n 30`, so 15s is still well inside its window. NOT verified on
+    // Windows from this machine.
+    const kids = await poll(() => childrenOf(proc.pid!), (k) => k.length > 0, 15000)
     spawned.push(...kids)
     return { proc, kids }
   }

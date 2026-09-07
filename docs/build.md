@@ -580,6 +580,14 @@ compound steps did. Measured: aborting a real build killed a 5-process, 4-level 
 uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0
 for all 7 processes across 11 samples of a full build).
 
+`buildStepShell.test.ts` carries a Windows suite that pins that path, and it runs on CI. It was
+gated OFF CI for about a month on the theory that the runner reaps the tool before the assertions
+can see it — but the run history refutes that: the suite passed on `windows-latest` 117 times
+between 2026-08-10 and 2026-08-31, which a reaping runner could not produce. The real cause was the
+suite's CONTROL awaiting the wrong event (`close` instead of `exit`), fixed on the `win` branch and
+merged in. The gate is gone now, and the suite's only residual is a small flake at child discovery,
+addressed by a longer poll deadline in the test itself.
+
 ⚠️ **One residual hole, and one that was closed by measuring it (#185):**
 
 - **A SIGKILL'd backend** executes no hook and orphans whatever was mid-step. A process that is
