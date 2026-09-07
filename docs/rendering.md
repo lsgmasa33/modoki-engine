@@ -3248,6 +3248,14 @@ is the mechanism that avoids it — cancel this run's rAF and block its reschedu
 whoever owns the mode. Its tick checks `stopped` *before* rescheduling, because a bare
 `cancelAnimationFrame` loses the race against a tick already queued.
 
+**Which sites still lack the guard, and why that is safe — not lucky.** `SceneView`'s three
+viewport registrations (`_pickBillboardInUI`, `editorCamera`, `ecsObjectsRegistry`) still release
+with a bare clear, and #811 closed as **not-reachable** rather than being fixed: the editor's panel
+model makes the required ordering impossible, and the naive guard would itself break the camera's
+projection-toggle re-seat. The four invariants that hold it up, what would flip the class live in
+one move, and the three further slots of this shape are in
+[editor.md](./editor.md) § "Panel registrations in module-level slots".
+
 **The guard, and the trap it was written around.**
 `engine/tests/architecture/rendererLossHandling.test.ts` pairs every renderer/`Application`
 construction site with an attach call into the shared module — sibling to `glContextRelease.test.ts`

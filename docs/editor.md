@@ -1336,6 +1336,113 @@ is refused outright (returns without doing anything) rather than starting a conc
 two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
 `'playing'` with no snapshot left to revert.
 
+## Panel registrations in module-level slots — why the unguarded ones are safe (#811)
+
+Several editor panels publish per-instance state into a module-level single slot and clear it on
+effect cleanup. The class — *take path overwrites unconditionally, release path nulls without
+re-seating a survivor* — and its two failure shapes are in
+[rendering.md](./rendering.md) § "One fix, two twin globals" (#802, #810). This section records the
+**editor-specific** half: which slots still lack the identity guard, and the invariants that make
+that safe today rather than lucky.
+
+`SceneView` registers three slots inside its one big viewport `useEffect`, and that effect's cleanup
+releases all three with a bare clear:
+
+| Slot | Declared in | Released by |
+|---|---|---|
+| `_pickBillboardInUI` | `editor/panels/SceneView.tsx`, module scope | direct assignment to `null` |
+| `editorCamera` | `editor/scene/sceneViewBus.ts` | `setEditorViewportCamera(null)` |
+| `ecsObjectsRegistry` | `editor/scene/sceneViewBus.ts` | `setEcsObjectsRegistry(null)` |
+
+Their siblings in the same file — `setFocusEntityHandler` and `setViewportController` — DO return an
+identity-guarded unregister (`if (slot === handler) slot = null`). That asymmetry is real and was
+filed as #811.
+
+**#811 was closed as not-reachable**, because the harm needs an ordering nothing can produce: the
+OLD instance's cleanup running *after* a NEW instance has already registered. Four paths were
+checked, and all four are shut:
+
+- **Two SceneViews at once — impossible.** `dockPanel()` (`editor/panelDock.ts`) scans for an
+  existing tab whose `getComponent()` matches the requested id and takes its focus branch —
+  returning `'focused'` — instead of adding a second. `EditorApp`'s `PANELS` table maps `scene` to
+  `SceneView` exactly once, and the Window menu / `showPanel` / the openByDefault auto-dock all go
+  through `dockPanel`. Pinned by `tests/editor/panelDock.test.ts`,
+  `it('focuses (never duplicates) when the tab already exists')`.
+
+  ⚠️ **`dockPanel` is NOT the only add path, and a reader hardening it would be covering four
+  fifths of nothing.** Five asset-editor panels — particle-editor, spriteanim-editor, skin-editor,
+  animation-editor and timeline-editor — are docked by a direct `Actions.addNode` in `EditorApp`,
+  each behind its **own hand-copied** "find an existing tab, else add" check rather than
+  `dockPanel`'s. Six implementations of one rule. None of them can add a `scene` tab, so the
+  conclusion above holds — but it holds because of `PANELS` and those six separate checks, not
+  because one function owns the invariant.
+- **A dock move does not remount.** FlexLayout renders each tab through a portal keyed
+  `child.getId() + (child.isEnableWindowReMount() ? child.getWindowId() : '')`. Dragging a tab to
+  another tabset changes its position in the model, not its id — so the key is stable and React
+  keeps the component mounted. Hidden tabs stay mounted (CSS-hidden); they are not torn down.
+- **StrictMode is on unconditionally** — `engine/app/main.tsx` wraps `<App/>` in `<StrictMode>` with
+  no DEV gate — but its double-invoke is create → destroy → create on ONE instance. It never places
+  a cleanup after a newer registration.
+- **The async `setup()` cannot be overtaken.** The effect body is fire-and-forget (`void
+  setup().catch(...)`) and the unmount cleanup sets `outerDisposed = true`, so a superseded run must
+  bail. Each of `setup()`'s four awaits — the WebGPU renderer build, the retry backoff,
+  `acquireRenderer`, and `setActiveRenderer` — is followed by an `outerDisposed` re-check; the one
+  after `setActiveRenderer` is deliberate and carries its own comment (#254). After that last guard
+  there is **no further await before the three registrations**, so a run past it assigns all three
+  synchronously in one task.
+
+⚠️ **What would flip this class live, all at once.** The safety is a property of the editor's panel
+model, not of these call sites, so it is not local and it is not obvious:
+- **Enabling popout / floating windows.** `enableWindowReMount` appears nowhere in the editor today;
+  the moment it does, the portal key above gains `getWindowId()` and moving a panel between OS
+  windows becomes a genuine remount. A guard test forbidding the flag was considered and rejected —
+  it would block a legitimate feature instead of making it safe. This note is the precondition
+  instead: **whoever enables popout owns guarding these slots first.**
+- **A second `scene` tab**, or any panel id that also renders `SceneView`.
+- **A throw partway through `setup()` — the one that IS live (#858).** The four arguments above are
+  all about ordering *between* instances. They say nothing about a *single* instance failing
+  mid-bring-up: `cleanup` is assigned last, so a throw after the first registration leaves
+  `teardownViewport()`'s `fn?.()` releasing nothing and every slot registered so far dangling. An
+  identity guard would not help — a release-side guard is inert when release never runs. Tracked
+  separately because the fix is `try/finally`, not a guard.
+- **Making the context-loss `rebuild` non-awaiting, or relaxing its coalescing.** `outerDisposed` is
+  per-EFFECT, not per-`setup()`-RUN: a rebuild does not set it, so a superseded run has nothing to
+  bail on. That is harmless today only because `rendererRecovery.ts` serialises rebuilds (`inFlight`)
+  and its `rebuild` *awaits* `setup()` — so the safety the bullet above credits to SceneView's own
+  guards is in fact owned by a different file. Whoever changes either owes a per-run epoch here
+  first.
+
+⚠️ **The obvious fix is wrong for `editorCamera`, and this is the trap worth carrying forward.**
+It is registered TWICE — once when the orbit camera is built, and again from the viewport
+controller's `toggleProjection`, with a *different* camera object each time (`activeEditorCam` swaps
+perspective↔orthographic). So copying the sibling's value-identity guard would make the cleanup
+refuse to clear after any toggle, leaving the slot dangling to a disposed camera for the rest of the
+session — reintroducing exactly the defect the guard was added to prevent. A guard here has to key
+on the **registrant** (the effect run / renderer lease), not on the value. `_pickBillboardInUI` and
+`ecsObjectsRegistry` are each set once per run, so value-identity *would* work for them — which is
+how a fix ends up carrying two shapes of one guard. Use owner-identity for all three, or none.
+
+**Three more slots share the shape** and are unreachable for the same reasons, so they are recorded
+here rather than as their own tickets — they would want one guard shape between them, not three:
+`editor/animation/recording.ts`'s `hook` (`setRecordHook`, cleared by `AnimationEditor`'s effect
+cleanup — that panel is a singleton too, but via its **own** duplicate check in `EditorApp`'s
+auto-dock effect, not via `dockPanel`; see the ⚠️ above);
+`runtime/input/inputSources.ts`'s `inputGate` (`setInputGate`, cleared in an `EditorApp` effect keyed
+on `hmrEpoch`, whose re-runs React orders cleanup-then-effect); and `runtime/core/uiDirty.ts`'s
+`_singleEditorCb` (`setEditorDirtyCallback`), which has no live caller at all — worth guarding
+*before* it acquires one, since its take path drops a differing previous registrant silently.
+
+For contrast, the guarded shapes already in the tree: `offscreenCapture.ts`'s
+`unregisterSceneRenderer` (`if (current === fn)`, documented as protecting against React's
+mount-before-unmount ordering), `editorJournal.ts`'s `closeActorLease` (compares the lease id), and
+`materialBroker.ts`'s `registerRenderSurface` (a `Set` keyed on the object handle, safe by
+construction).
+
+⚠️ Cite these by SYMBOL, not by line (#686 / `docCitations.test.ts`). This section's first draft used
+line numbers and the gate rejected all 37 of them — correctly, and pointedly: **#811's own body cited
+a cleanup range that had already rotted by four lines** between filing and being picked up, which is
+the whole argument for the rule.
+
 ## Selection restore across world swaps
 
 koota entity ids are scoped to their owning world, so a `SceneManager` world swap (scene
