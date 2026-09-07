@@ -29,9 +29,9 @@
     "vitest": "^4.1.0"
   },
   "dependencies": {
-    "@dimforge/rapier2d-compat": "^0.19.3",
-    "@dimforge/rapier3d-compat": "^0.19.3",
-    "@noble/curves": "^2.2.0",
+    "@dimforge/rapier2d-compat": "^0.20.0",
+    "@dimforge/rapier3d-compat": "^0.20.0",
+    "@noble/curves": "^2.4.0",
     "@zappar/msdf-generator": "^1.2.4",
     "maxrects-packer": "^2.7.3",
     "poly-decomp-es": "^0.4.2"
