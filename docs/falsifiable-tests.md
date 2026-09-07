@@ -46,9 +46,20 @@ verified the same way — see **The bar** below.
 
 ### The bar: mutation, not inspection
 
-**A test in this family is not finished until it has been mutation-checked.** Delete the mechanism
-in the production source, re-run the test, confirm it goes **red**, restore, confirm **green**.
-Red in both states proves nothing; green in both states is the defect itself.
+**EVERY new test is mutation-checked, and the result gets REPORTED** — not only the tests in this
+family. Delete the mechanism in the production source, re-run the test, confirm it goes **red** and
+that nothing unrelated does, restore, confirm **green**. Red in both states proves nothing; green in
+both states is the defect itself. Then say in the commit or the close-out what you broke and what
+went red: an unreported mutation check is indistinguishable from one that never ran.
+
+⚠️ **Unconditional on purpose — the tests that LOOK obvious are the ones that ship unfalsifiable**
+(owner, 2026-09-07). The #823/#825 close-out found three mechanisms whose tests stayed green when the
+mechanism was deleted (reverting the detail-selection block left 1614 tests green) — and every test
+that had been *explicitly* required to carry a mutation check survived review. The bar was already
+written here and was applied unevenly; **that unevenness IS the defect**, so there is no
+"is this one risky enough" question to answer first. Writing a test yourself feels like verification
+and is not — this survives the 2026-09-07 inline-implementation ruling
+([model-routing.md](model-routing.md)) rather than being fixed by it.
 
 ⚠️ **Restore with an ABSOLUTE path.** A `cd` earlier in a command chain silently redirects the
 restore and leaves the source broken while the test reports what you wanted to see.

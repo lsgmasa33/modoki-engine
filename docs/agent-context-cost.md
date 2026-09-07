@@ -12,9 +12,11 @@ growth by roughly an order of magnitude over MCP tool traffic (`modoki_*`, `devi
 surface is summary-first and token-budgeted by design (see `docs/mcp-response-budget.md`), while
 `Read` and `Bash` have no such budget of their own. One observed session spent roughly 50k tokens
 on a single unbounded `Read` of a large doc file. CLAUDE.md already names the fix as a **mechanical
-trigger** — a second read-only search in a row routes to `Explore`, an edit after the plan is
-decided routes to `sonnet-implementer` — but that guidance only fires if the agent remembers to
-apply it, under pressure, on this specific call. A hook runs unconditionally on the actual tool
+trigger** — a second read-only search in a row routes to `Explore` — but that guidance only fires if
+the agent remembers to apply it, under pressure, on this specific call. (At the time of this audit a
+second trigger routed a decided edit to `sonnet-implementer`; that one was **repealed on 2026-09-07**
+when implementation delegation ended — see [model-routing.md](model-routing.md) — which puts those
+edits' reads back in-session and makes bounding `Read`/`Bash` matter more, not less.) A hook runs unconditionally on the actual tool
 input every time, so it backstops the guidance rather than replacing it.
 
 ## Why this hook, when a pre-commit hook was declined for a similar discipline problem
