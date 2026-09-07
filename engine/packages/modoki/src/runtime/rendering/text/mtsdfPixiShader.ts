@@ -305,10 +305,14 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
     uGlowStrength: { value: style.glowStrength ?? 0, type: 'f32' },
     uShadowSoftness: { value: style.shadowSoftness ?? 0, type: 'f32' },
     uDistanceRange: { value: distanceRange, type: 'f32' },
-    // Used ONLY where fwidth is unavailable (see the shader body). Design-space, because the
-    // canvas scale is not known here — so on a downscaled canvas this over-estimates the range,
-    // which errs toward a crisper edge rather than a blurry one. Anything is an improvement on
-    // the alternative, which is a shader that does not compile and text that does not exist.
+    // Used ONLY where fwidth is unavailable (see the shader body). `fontSize` here is whatever
+    // the caller passes — this factory has no notion of "authored" vs "effective" size. Since
+    // #752, Scene2D's Text2D pass passes `t.fontSize * effScale`, the on-screen size after BOTH
+    // the entity's world Transform scale and the host Canvas2D's own uniform scale (see the
+    // effScale derivation in Scene2D.tsx's per-frame text-transform block), so this now tracks
+    // the rendered size rather than the design-space value alone. A caller that only has the
+    // authored size (or none of this machinery, e.g. a test) still gets a sane fallback: passing
+    // the raw fontSize is equivalent to effScale = 1.
     // ⚠️ This expression MUST stay identical to the one in `updateMtsdfPixiMetrics` below
     // (#690) — that function refreshes this same uniform on a REUSED shader without going
     // through this factory, and a drift between the two would silently change edge sharpness.

@@ -153,6 +153,39 @@ edit could silently overwrite a newer on-disk write at the next Cmd+S, with noth
 See [editor.md](./editor.md) § "The asset Inspector — six rules that have each failed
 repeatedly", rule 6, for the two-mechanism picture this is one half of.
 
+### Wiring a kind into the table is only HALF the job — the invalidator must USE the path
+
+`ASSET_CACHE_INVALIDATORS` (`engine/app/debug/agentBridge.ts`) maps each `SceneChangedKind` to a
+`(urlPath: string) => void`. The signature hands every invalidator the path of the ONE file that
+changed. **An invalidator that ignores it and clears its whole cache is wired and still wrong**:
+the reload fires, the edit takes, and every unrelated entity pays for it.
+
+That was `invalidateShader` for the length of #842's window (#852). One `.shader.json` write — an
+agent's `write_asset`, an Inspector edit, a `git pull` touching one file — called
+`clearSpriteMaterialCache()`, so every compiled 2D material program in the scene was dropped and
+every material entity drew its fallback sprite for a frame while its Mesh + Shader slot was
+re-minted. Nothing errored, the edit *did* take, and the only symptom was a flash on entities that
+had nothing to do with the file.
+
+The seven other entries were already per-key on the shared pattern —
+`createTeardownToken<K>()` (`runtime/core/liveness.ts`), `capture(key)` before the await,
+`invalidateKey(key)` in the evictor — and #852 converted the eighth. Two rules fall out, and
+`engine/tests/architecture/invalidatorGranularity.test.ts` now guards the first:
+
+- **Evict per-key, never wholesale.** A wholesale `clear*Cache()` belongs to teardown (world swap,
+  renderer stop), not to "one file changed". Where the cache's key is not the path — the 2D program
+  map is keyed by GUID — resolve it (`isGuid(p) ? p : getGuidForPath(p)`, the precedent is
+  `agentEditorOps.ts`'s read-asset-def shader arm) rather than giving up and clearing everything.
+- **An unresolved key means UNKNOWN, not absent — fail safe.** A per-key evictor that no-ops on a
+  path it cannot resolve (a brand-new asset the manifest has not indexed) leaves the edited asset's
+  own stale entry live, which is the author's edit silently not taking — #523's symptom, and worse
+  than the over-eviction being fixed. Fall back to the wholesale clear.
+- **Fire the waiters you evict.** A superseded in-flight load deliberately fires no `onReady`, so
+  dropping a key's waiter set without invoking it strands any renderer still live across the
+  invalidation (a sibling viewport; the editor's GameView + SceneView) on its fallback until some
+  unrelated dirty. `clearSpriteMaterialCache` snapshots-then-fires for this reason; a per-key
+  evictor owes the same, for its one key.
+
 ⚠️ **`AtlasAssetView` needed one thing the registry did not have, and it is worth knowing before
 the next surface parks.** Nothing tells that panel its file changed underneath — `atlas` is not a
 `SceneChangedKind`, so `dropParkedWriteFor` never fires for it — so it carries a compare-and-swap

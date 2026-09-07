@@ -121,10 +121,33 @@ units per em for `Text3D`.
 ⚠️ **`font`, `text`, `fontSize`, `align`, `maxWidth`, `lineSpacing` and `letterSpacing` are all part
 of Scene2D's `layoutHash` — the text-slot REBUILD KEY.** Writing any one of them per frame with a
 changing value tears down and rebuilds that entity's page meshes, geometry and GL buffers every
-frame (#677). To animate a size, animate `Transform` scale instead, never `Text2D.fontSize`. Caveat:
-on the WebGL1-without-derivatives path (iPhone 8, no `fwidth`), a `Transform` scale does not refresh
-`uScreenPxRange`, so the antialiasing term stays pinned at the authored `fontSize` instead of
-tracking the rendered size (#752). #677 is the scar; #749 tracks this residual on the engine side.
+frame (#677). To animate a size, animate `Transform` scale instead, never `Text2D.fontSize`. #752
+fixed the residual this workaround used to leave open: on the WebGL1-without-derivatives path
+(iPhone 8, no `fwidth`), `uScreenPxRange` now refreshes every frame from the entity's WORLD
+transform scale (inherited through parents) times the host Canvas2D's own uniform scale, instead of
+staying pinned at the authored `fontSize`. That closes it for BOTH ways a Transform scale reaches
+text: an animated scale (wordweave's flight animation) and a static one inherited from a scaled
+ancestor (wordweave's crossword glyphs, pinch-zoomed 1x→3x via their host container while spawned
+at a fixed `fontSize`). #677 is the scar that produced the workaround; #752 is the fix that made it
+exact for shading too, not just geometry.
+
+⚠️ **Two things to know before trusting that fix, both of which cut against it.**
+
+**It is verified by arithmetic, not by eye.** `uScreenPxRange` is read ONLY on the
+no-derivatives branch, so on every Mac, simulator and modern device the `fwidth` branch runs and
+this uniform is *dead*. The tests assert the uniform's VALUE; nothing here can render the branch
+that consumes it, and a screenshot proves nothing. The visual outcome remains unobserved — it needs
+an iPhone 8 or another no-derivatives WebGL1 device.
+
+**On a DOWNSCALED canvas the term is now LOWER than it was, which is softer, and that direction was
+previously deliberate.** The old code used the design-space `fontSize`, and its comment justified
+that as erring "toward a crisper edge rather than a blurry one" on a canvas rendering smaller than
+its reference. Tracking the effective size removes that margin: where `canvasScale < 1` the uniform
+now drops proportionally. This is *correct* — `spr` is meant to be actual screen pixels per
+distance-field unit — but it is a real change in appearance on exactly the device class that reads
+it, in the direction the previous author avoided on purpose. If small text looks softer on the
+iPhone 8 after #752, this is why, and the fix is to raise the font's baked `pxRange` (§2), not to
+restore the over-estimate.
 
 The full rebuild that `layoutHash`/`hash` gate is not the only path a text edit can take, on
 either backend. Both `Scene2D` and `Scene3D` split that rebuild key into two: a **build key**

@@ -3699,12 +3699,16 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
           // clearing `wasColored` would strand an animated colour with nothing left to restore it
           // (`Scene2D.tsx:2219-2228` documents the identical reasoning for the 2D twin).
           //
-          // ⚠️ There is no 3D counterpart to 2D's "NOT optional" `updateMtsdfPixiMetrics` refresh
-          // here: `makeMtsdfMaterial` takes no `fontSize` (mtsdfShader.ts:76-84) — 3D derives
-          // `screenPxRange` in-shader from `uTexSize` (mtsdfShader.ts:136), and `updateMtsdfStyle`
-          // already runs every frame outside this branch. If #752 introduces a fontSize- or
-          // scale-derived CPU uniform on this material, THIS fast path must start refreshing it
-          // too, or resized text will render with stale antialiasing.
+          // #752 landed 2D-ONLY, and rightly so: `makeMtsdfMaterial` takes no `fontSize`
+          // (mtsdfShader.ts:76-84) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
+          // (mtsdfShader.ts:138-140), the same per-fragment derivative Scene2D's Pixi shader uses
+          // whenever it's available (mtsdfPixiShader.ts's `#else` arm is the no-derivatives
+          // FALLBACK #752 actually fixed). So 3D is structurally immune to the bug #752 fixed —
+          // there is no CPU-computed screenPxRange here to go stale — and `updateMtsdfStyle`
+          // already runs every frame outside this branch regardless. Still no CPU uniform for
+          // this fast path to refresh; if a FUTURE change ever adds a fontSize- or scale-derived
+          // CPU uniform to this material, THIS fast path must start refreshing it too, or resized
+          // text will render with stale antialiasing.
           fastPathApplied = true;
         }
       }

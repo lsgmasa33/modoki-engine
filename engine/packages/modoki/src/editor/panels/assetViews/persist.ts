@@ -127,11 +127,13 @@ export const invalidateMaterialFile = (path: string) => invalidateMaterial(path)
 // does not move a pixel until then. A no-op is the honest wiring; inventing an invalidation here
 // would drop a cache entry nothing had rebuilt and make the panel look like it had done something.
 export const invalidateAtlasFile = (_path: string) => { /* nothing live derives from this doc */ };
-// A `.shader.json` edit (param default/range/label): drop the compiled 2D-material
-// programs so the next material-pass frame recompiles + re-reads the new defaults. (The
-// cache is keyed by GUID, so clearing all is the simplest correct invalidation; they
-// recompile lazily.) An already-mounted material Mesh caches its bound uniforms, so a
-// default change fully reflects on the next scene load / material rebuild.
+// A `.shader.json` edit (param default/range/label): drop THIS shader's compiled 2D-material
+// program so the next material-pass frame recompiles + re-reads the new defaults. The cache is
+// keyed by GUID and every entity using the edited shader shares that guid, so evicting the one
+// key already re-resolves all of them while leaving every OTHER shader's program alone (#852 —
+// this used to clear the whole map, flashing unrelated entities for a frame). An already-mounted
+// material Mesh caches its bound uniforms, so a default change fully reflects on the next scene
+// load / material rebuild.
 //
 // Delegates to `spriteMaterialCache.invalidateShader` (#842) rather than spelling the two calls
 // out here — this panel and the live-reload watcher (agentBridge.ts's ASSET_CACHE_INVALIDATORS)

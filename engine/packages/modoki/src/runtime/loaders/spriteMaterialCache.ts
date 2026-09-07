@@ -21,23 +21,26 @@ import type { PixiShaderProgram } from '../rendering/pixiShaderBuilder';
 import { buildPixiShaderProgram, invalidatePixiShaderProgram } from '../rendering/pixiShaderBuilder';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { createTeardownToken } from '../core/liveness';
+import { isGuid } from '../core/assetRefRules';
+import { getGuidForPath } from './assetManifest';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
 const waiters = new Map<string, Set<() => void>>();    // guid → onReady wakes awaiting the in-flight compile
 const failed = new Set<string>();                      // guid → compile returned null (don't retry every frame)
-// Teardown liveness, invalidated wholesale by `clearSpriteMaterialCache` — an in-flight compile
-// captures it before starting and bails on resolve/reject if it no longer matches, so a compile
-// superseded by a clear (world swap, or the editor's `invalidateShaderFile` on a `.shader.json`
-// save) can't write a stale program back in, or worse, delete the map entries a NEW compile for
-// the same guid installed after the clear.
-// No per-key epoch here (unlike spriteAnimCache/particleCache) — `clearSpriteMaterialCache` is
-// still the ONLY clear this module has. That premise held while the sole caller was the Shader
-// Inspector; #842 wired `invalidateShader` to the file watcher too, which hands a per-PATH signal
-// (one `.shader.json` changed) that this wholesale clear discards, dropping every compiled 2D
-// material program in the scene for an edit to one of them. A per-key epoch is therefore no
-// longer "unused machinery" — it's a deliberate deferral, filed separately from #842.
-const liveness = createTeardownToken();
+// Teardown liveness, KEYED BY GUID (#852) — same shape as spriteAnimCache/particleCache/etc. An
+// in-flight compile captures it BY GUID before starting and bails on resolve/reject if either the
+// whole-module generation OR that guid's own generation has moved, so a compile superseded by a
+// wholesale clear (world swap, `Scene2D.stop()`) OR by a per-key `invalidateShader` for THIS guid
+// (a `.shader.json` save for exactly this material) can't write a stale program back in, or worse,
+// delete the map entries a NEW compile for the same guid installed after the invalidation.
+// Per-key matters because #842 wired `invalidateShader` to the live-reload watcher too, which
+// hands a per-PATH signal (one `.shader.json` changed) — routing that through the wholesale
+// `clearSpriteMaterialCache()` dropped every OTHER compiled 2D material program in the scene for
+// an edit to just one of them, flashing every material entity's fallback sprite for a frame
+// (#852). Keying liveness by guid is what lets `invalidateShader` evict ONLY the edited guid's
+// entry without superseding any other guid's in-flight compile.
+const liveness = createTeardownToken<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: `resolveRef` never warns for a validly-shaped
 // guid simply absent from the manifest — the comment below claiming "resolveRef already warned"
 // was wrong. Separate from `failed` above: this one forgets a guid once it resolves (so a LATER
@@ -79,7 +82,7 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
   const set = new Set<() => void>();
   if (onReady) set.add(onReady);
   waiters.set(guid, set);
-  const stillLive = liveness.capture();
+  const stillLive = liveness.capture(guid);
   const p = buildPixiShaderProgram(path)
     .then((program) => {
       // Superseded by a clear mid-compile — a NEW compile for this guid may already own
@@ -122,17 +125,58 @@ export function clearSpriteMaterialCache(): void {
   for (const cb of pending) cb();
 }
 
-/** The ONE definition of "a `.shader.json` changed" (#842). The 2D program map above is keyed
- *  by GUID and never re-fetches on its own, so the wholesale `clearSpriteMaterialCache()` is the
- *  load-bearing half — every entity re-`ensure`s and recompiles against the edited source.
- *  `invalidatePixiShaderProgram(manifestPath)` is the optimisation on top (its own docblock says
- *  so): it evicts just the one path from `pixiShaderBuilder`'s module-level program cache instead
- *  of the whole thing, so a re-`ensure` doesn't recompile every OTHER shader in the scene too.
- *  Both the Inspector panel (`assetViews/persist.ts`) and the live-reload watcher
- *  (`agentBridge.ts`'s `ASSET_CACHE_INVALIDATORS`) must drive this one function, not spell the
- *  two calls out themselves — that duplication is exactly how `material`/`shader` went unwired
- *  from the watcher path while still working from the Inspector (#842). */
+/** The ONE definition of "a `.shader.json` changed" (#842, made per-key by #852). Both the
+ *  Inspector panel (`assetViews/persist.ts`) and the live-reload watcher (`agentBridge.ts`'s
+ *  `ASSET_CACHE_INVALIDATORS`) must drive this one function, not spell the eviction out
+ *  themselves — that duplication is exactly how `material`/`shader` went unwired from the
+ *  watcher path while still working from the Inspector (#842).
+ *
+ *  `manifestPath` is a PATH — what the watcher and the Inspector both hand over — but the 2D
+ *  program map above is keyed by GUID, so it has to be resolved before anything can be evicted.
+ *  A resolved guid gets ONLY its own entry dropped: #852's fix for a wholesale
+ *  `clearSpriteMaterialCache()` here dropping every OTHER compiled 2D material program in the
+ *  scene for an edit to just one of them, flashing every entity's fallback sprite for a frame.
+ *  An UNRESOLVED path — a brand-new `.shader.json` the manifest hasn't indexed yet — is
+ *  "unknown", not "absent": a per-key evictor that silently no-ops on it would leave the edited
+ *  shader's OWN stale program in place, which is worse than the flash this fixes and is exactly
+ *  #523's symptom (an edit that silently doesn't take). So an unresolved path falls back to the
+ *  wholesale `clearSpriteMaterialCache()` instead of a no-op.
+ *  ⚠️ KNOWN NARROW GAP, and it is the price of going per-key: this resolves the path to whatever
+ *  guid the manifest holds NOW. If a live `.shader.json`'s `id` is re-keyed (a hand edit, a
+ *  delete-and-recreate, or a copy — copying an asset re-keys its GUID), `pathToGuid` re-points to
+ *  the NEW guid, so this evicts an entry that was never there and the OLD guid's program stays
+ *  cached while scene entities still name it in `Renderable2D.material`. They keep drawing the
+ *  pre-edit program indefinitely. The wholesale clear used to mask this by dropping everything,
+ *  which turned it into a visible fall-to-fallback-sprite instead of silent staleness. Judged
+ *  PLAUSIBLE rather than demonstrated — no UI gesture that re-keys a LIVE shader's id was found
+ *  — and fixing it needs the manifest to surface the outgoing guid, which it does not today.
+ *  Note the unresolved-path fallback below does NOT cover this: a re-key resolves to a different
+ *  guid, it does not fail to resolve.
+ *  `invalidatePixiShaderProgram(manifestPath)` runs unconditionally either way — it's the
+ *  optimisation on top (its own docblock says so): it evicts just the one path from
+ *  `pixiShaderBuilder`'s module-level program cache instead of the whole thing, so a re-`ensure`
+ *  doesn't recompile every OTHER shader's SOURCE too. */
 export function invalidateShader(manifestPath: string): void {
-  clearSpriteMaterialCache();
+  const guid = isGuid(manifestPath) ? manifestPath : getGuidForPath(manifestPath);
+  if (guid) {
+    // Snapshot this guid's waiters BEFORE evicting, fire them AFTER — the per-key mirror of
+    // `clearSpriteMaterialCache`'s wake, and load-bearing for the same reason (#523). A
+    // superseded compile's resolve/reject deliberately fires no `onReady`, so a renderer still
+    // live across this invalidation (a sibling viewport, or the editor's GameView + SceneView)
+    // would otherwise lose the only signal that makes it re-`ensure`, and its entities would sit
+    // on the fallback sprite until some unrelated dirty. Dropping the set without firing it is
+    // the flash this issue fixes, made PERMANENT for the one shader actually edited.
+    const pending = [...(waiters.get(guid) ?? [])];
+    liveness.invalidateKey(guid);
+    programs.delete(guid);
+    failed.delete(guid);
+    loading.delete(guid);
+    waiters.delete(guid);
+    for (const cb of pending) cb();
+  } else {
+    // Unresolved guid — fail SAFE, not silent. See the docblock above: "unknown" must not be
+    // treated as "absent", or an edit to a not-yet-indexed shader would silently not take.
+    clearSpriteMaterialCache();
+  }
   invalidatePixiShaderProgram(manifestPath);
 }

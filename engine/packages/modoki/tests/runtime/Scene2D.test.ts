@@ -2597,7 +2597,7 @@ describe('Text2D shader reclaim (#690/#696)', () => {
   // ─────────────────────────────────────────────────────────────────────────
   describe('layout-only fast path reuses geometry in place (#749)', () => {
     it('a fontSize-only change keeps the SAME geometry object, writes NEW positions, and updates uScreenPxRange', async () => {
-      const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+      const { traits, world, scene2d, fontLoader, renderer, pool } = await setupText();
       fontLoader.__setProvider(makeFontProvider());
       const canvas = spawnCanvas(world, traits);
       const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
@@ -2608,6 +2608,14 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       const geo1 = mesh1.geometry;
       const shader1 = slot1.textShaders[0];
       const positionsBefore = geo1.positions.slice(); // copy — geo1.positions is mutated in place below
+
+      // #752: uScreenPxRange is now ALSO scaled by the host canvas's own uniform scale, not
+      // fontSize alone — so give the canvas a real size matching its 1080x1920 reference
+      // (`spawnCanvas`'s default `scaleMode: 'fitH'`). Left at the pool's default 1x1 slot
+      // canvas, `canvasScale` would be ~1/1920, making the expected value below about the
+      // CANVAS SIZE this test never sets out to cover, not the fontSize edit it does.
+      const poolSlot = pool.getSlot(canvas.id())!;
+      poolSlot.canvas.width = 1080; poolSlot.canvas.height = 1920;
 
       text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 64 }); // layout-only: buildKey unchanged
       scene2d.renderFrame();

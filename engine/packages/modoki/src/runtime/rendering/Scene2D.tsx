@@ -599,6 +599,11 @@ interface TextSnap {
    *  frame of a fade. It still has to be COMPARED here — the block early-returns when
    *  nothing changed, so a parent fading over a static label would otherwise never paint. */
   groupAlpha: number;
+  /** The host canvas's own uniform `scale` (#752), feeding `uScreenPxRange`'s effScale. Tracked
+   *  SEPARATELY from `compX`/`compY`: a uniform window resize moves `scaleX`/`scaleY` together
+   *  while `compX`/`compY` stay 1 (they cancel out), so without this field a canvas-only resize
+   *  would leave `changed` false and the uniform stuck at the pre-resize size. */
+  canvasScale: number;
 }
 
 /** Per-entity snapshot for the 2D-material (Mesh) pass — the inputs that determine the
@@ -764,7 +769,9 @@ export class Scene2DRenderer {
   private readonly warnedMaskIds = new Set<string>();
   private readonly canvasOfEntity = new Map<number, number>();   // entityId → canvas2D entityId (cached)
   private readonly canvasEntityIds = new Set<number>();          // all Canvas2D entity IDs this frame
-  private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
+  // canvasEntityId → shape compensation + the canvas's own uniform `scale` (#752 — the latter
+  // feeds the Text2D pass's scale-aware `uScreenPxRange` refresh; see the effScale comment there).
+  private readonly canvasCompensate = new Map<number, { x: number; y: number; scale: number }>();
   // Reused out-param so the path-caching walk allocates nothing per call.
   private readonly ancestorPath: number[] = [];
   // Visible Renderable2D entities skipped for want of a Canvas2D ancestor: id → consecutive
@@ -780,7 +787,7 @@ export class Scene2DRenderer {
 
   // ── 2D particle emitters ──
   private particleState2D: ParticleSync2DState | null = null;
-  private readonly _oneComp = { x: 1, y: 1 };
+  private readonly _oneComp = { x: 1, y: 1, scale: 1 };
   private readonly particleCtx: ParticleSync2DCtx;
 
   // ── Collider debug overlay (editor-only) ──
@@ -1482,11 +1489,13 @@ export class Scene2DRenderer {
         // pre-init (screen isn't available yet, and at that point they're equal).
         const actualW = slot.app.renderer?.screen?.width || slot.canvas.width;
         const actualH = slot.app.renderer?.screen?.height || slot.canvas.height;
-        const { scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
+        const { scale, scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
           computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
-        this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY });
+        // `scale` (min(scaleX, scaleY)) rides along with the shape compensation (#752) — it's
+        // the canvas's own uniform on-screen factor, needed by the Text2D pass's effScale.
+        this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY, scale });
 
         const prev = this.lastCanvasScale.get(canvasEntityId);
         if (forceAll || !prev || prev.sx !== scaleX || prev.sy !== scaleY ||
@@ -1611,7 +1620,7 @@ export class Scene2DRenderer {
 
         // Compute this frame's render inputs.
         const px = rend.pivotX, py = rend.pivotY;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
         // Effective alpha = the entity's own opacity × its GroupAlpha ancestry (#211). The
@@ -1887,7 +1896,7 @@ export class Scene2DRenderer {
         const mesh = slot.obj as Mesh;
         { const wp = this.containerFor(canvasSlot, id); if (mesh.parent !== wp) { mesh.removeFromParent(); wp.addChild(mesh); } }
 
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
         const fx = rend.flipX ? -1 : 1, fy = rend.flipY ? -1 : 1;
@@ -2035,7 +2044,7 @@ export class Scene2DRenderer {
 
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const deform = buf.version;
         const alpha = ss.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
 
@@ -2210,9 +2219,13 @@ export class Scene2DRenderer {
                   mesh.geometry.positions.set(positions);
                   mesh.geometry.getBuffer('aPosition').update();
                 }
-                // NOT optional: `uScreenPxRange` is derived from fontSize (mtsdfPixiShader.ts:502),
-                // so skipping this renders a resized string with the wrong antialiasing width, and
-                // it also re-stashes `_mtsdfAtlas` for the later shadow-offset clamp.
+                // #752: this call is now only PROVISIONAL — raw fontSize, ignoring Transform/canvas
+                // scale — because the scale-aware refresh has moved to the transform block below
+                // (it needs `wt`/`comp`, not yet in scope here), and that block always runs this
+                // same frame (a rebuild always leaves `snap.layoutHash !== layoutHash`, so its
+                // `changed` gate trips). NOT deleted, still not optional: `uScreenPxRange` must
+                // never be left at a stale PRE-rebuild atlas's value even for one frame, and this
+                // call is also what re-stashes `_mtsdfAtlas` for the later shadow-offset clamp.
                 for (const shader of slot.textShaders ?? []) updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
                 slot.meshFrameKey = layoutHash;
                 slot.textW = layout.width; slot.textH = layout.height;
@@ -2272,6 +2285,10 @@ export class Scene2DRenderer {
                   let shader = reusable.get(page);
                   if (shader && canReuseMtsdfPixiShader(shader, ptex, atlas)) {
                     reusable.delete(page);
+                    // Provisional (#752) — same reasoning as the fast-path call above: raw
+                    // fontSize only, corrected by the scale-aware refresh in the transform block
+                    // below on this same frame. Kept because reclaiming a shader must still
+                    // re-stash `_mtsdfAtlas` for the later shadow-offset clamp.
                     updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
                   } else {
                     shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
@@ -2374,7 +2391,7 @@ export class Scene2DRenderer {
         const container = slot.obj as Container;
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
 
         const groupAlpha = this.groupAlphaOf.get(id) ?? 1; // #211 — t.opacity is already in the shader
         const snap = this.lastTextRender.get(id);
@@ -2382,7 +2399,8 @@ export class Scene2DRenderer {
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
           snap.anchorX !== t.anchorX || snap.anchorY !== t.anchorY || snap.paint !== paint ||
-          snap.compX !== comp.x || snap.compY !== comp.y || snap.groupAlpha !== groupAlpha ||
+          snap.compX !== comp.x || snap.compY !== comp.y || snap.canvasScale !== comp.scale ||
+          snap.groupAlpha !== groupAlpha ||
           snap.layoutHash !== layoutHash || snap.styleHash !== styleHash;
         if (!changed) return;
 
@@ -2392,6 +2410,28 @@ export class Scene2DRenderer {
         { const wp = this.containerFor(canvasSlot, id); if (container.parent !== wp) { container.removeFromParent(); wp.addChild(container); } }
 
         if (!snap || snap.styleHash !== styleHash) { const style = textStyle2D(t); for (const s of slot.textShaders ?? []) updateMtsdfPixiStyle(s, style); }
+
+        // #752: the fontSize-derived `uScreenPxRange` AA uniform used to be set only from the
+        // AUTHORED fontSize (mtsdfPixiShader.ts), blind to both the entity's Transform scale and
+        // the host canvas's own scale — dead everywhere `fwidth` is available, but the ONLY value
+        // used on the no-derivatives fallback (WebGL1 without OES_standard_derivatives, e.g. the
+        // iPhone 8). This is the one place per frame that has both inputs in scope, so the refresh
+        // lives here rather than in the geometry-rebuild branch above (which only ever sees the
+        // raw trait). Kept OUT of `layoutHash` deliberately — folding Transform scale into the
+        // rebuild key would resurrect #677's per-frame geometry teardown.
+        //
+        // Derivation of `effScale`: the canvas root container is scaled by (scaleX, scaleY)
+        // (~:1487 above) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
+        // `comp.x = comp.scale / scaleX` (canvas2DScaler.ts's `compensateX`), the per-axis product
+        // is `comp.scale * wt.sx` — `comp.x`/`comp.y` and `scaleX`/`scaleY` cancel EXACTLY, so the
+        // on-screen factor is the canvas's own uniform scale times the entity's WORLD scale. `comp`
+        // itself must NOT appear in this expression — including it would double-count the same
+        // cancellation. `Math.abs` because a flipped (negative) scale must not produce a negative
+        // range; `Math.max` of the two axes because an over-estimated range errs toward a crisper
+        // edge and an under-estimated one toward blurry (mtsdfPixiShader.ts's chosen direction for
+        // this file) — the deliberate rule for non-uniformly-scaled text.
+        const effScale = comp.scale * Math.max(Math.abs(wt.sx), Math.abs(wt.sy));
+        for (const s of slot.textShaders ?? []) updateMtsdfPixiMetrics(s, atlas, t.fontSize * effScale);
 
         // Anchor via pivot: (anchorX·w, anchorY·h) in local space aligns to position.
         container.pivot.set(t.anchorX * (slot.textW ?? 0), t.anchorY * (slot.textH ?? 0));
@@ -2404,11 +2444,12 @@ export class Scene2DRenderer {
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
           snap.anchorX = t.anchorX; snap.anchorY = t.anchorY; snap.paint = paint; snap.compX = comp.x; snap.compY = comp.y;
+          snap.canvasScale = comp.scale;
           snap.layoutHash = layoutHash; snap.styleHash = styleHash; snap.groupAlpha = groupAlpha;
         } else {
           this.lastTextRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y,
+            anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y, canvasScale: comp.scale,
             layoutHash, styleHash, groupAlpha,
           });
         }

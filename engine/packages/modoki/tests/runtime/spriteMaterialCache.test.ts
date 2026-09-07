@@ -6,6 +6,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 let build: ReturnType<typeof vi.fn<(p: string) => unknown>>;
+// #852: invalidateShader's unconditional `invalidatePixiShaderProgram(manifestPath)` call needs a
+// stub here too — the mock below used to omit it entirely, which was invisible while nothing in
+// this file called invalidateShader. It's a bare spy (not exercised for content), same shape as
+// `build` above: declared here so the factory (hoisted, evaluated once per module-graph reset)
+// closes over a binding that has a real vi.fn() by the time it's actually called.
+let invalidateProgram: ReturnType<typeof vi.fn<(p?: string) => void>>;
 const paths = new Map<string, string>();
 
 vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => {
@@ -18,6 +24,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => {
 });
 vi.mock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
   buildPixiShaderProgram: (p: string) => build(p),
+  invalidatePixiShaderProgram: (p?: string) => invalidateProgram(p),
 }));
 
 let cache: typeof import('../../src/runtime/loaders/spriteMaterialCache');
@@ -26,6 +33,7 @@ beforeEach(async () => {
   vi.resetModules();
   paths.clear();
   build = vi.fn<(p: string) => unknown>();
+  invalidateProgram = vi.fn<(p?: string) => void>();
   cache = await import('../../src/runtime/loaders/spriteMaterialCache');
 });
 afterEach(() => { vi.restoreAllMocks(); });
@@ -283,5 +291,159 @@ describe('ensureSpriteMaterial', () => {
     expect(cache.getSpriteMaterialProgram('g1')).toBeUndefined();
     expect(onReady).toHaveBeenCalledTimes(1);
     expect(onReady2).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #852: `invalidateShader` used to be a thin wrapper around the wholesale `clearSpriteMaterialCache`
+// (#842's fix for the watcher path never reaching this cache at all) — correct but far too coarse:
+// ONE `.shader.json` edit dropped EVERY compiled 2D material program in the scene, flashing every
+// material entity's fallback sprite for a frame and re-minting its Mesh+Shader slot. These tests
+// drive it per-key: only the edited guid's own program is disturbed.
+describe('invalidateShader (#852 per-key)', () => {
+  const GUID_A = '11111111-1111-4111-8111-111111111111';
+  const GUID_B = '22222222-2222-4222-8222-222222222222';
+  const PATH_A = 'matA.shader.json';
+  const PATH_B = 'matB.shader.json';
+
+  it('evicts only the edited guid — a sibling material never flashes (the reported symptom)', async () => {
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    paths.set(GUID_B, PATH_B);
+    // registerAsset seeds the REAL assetManifest pathToGuid index — invalidateShader resolves
+    // its path argument through THIS, not through the `paths` map above (that one only backs the
+    // mocked `resolveRef`, i.e. guid→path, the opposite direction).
+    registerAsset(GUID_A, PATH_A, 'shader');
+    registerAsset(GUID_B, PATH_B, 'shader');
+
+    const programA = { params: [], id: 'A' } as any;
+    const programB = { params: [], id: 'B' } as any;
+    build.mockImplementation((p: string) => Promise.resolve(p === PATH_A ? programA : programB));
+
+    cache.ensureSpriteMaterial(GUID_A);
+    cache.ensureSpriteMaterial(GUID_B);
+    await flush();
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(programA);
+    expect(cache.getSpriteMaterialProgram(GUID_B)).toBe(programB);
+
+    cache.invalidateShader(PATH_A);
+
+    // B must still be there SYNCHRONOUSLY — it never falls back to the default sprite.
+    expect(cache.ensureSpriteMaterial(GUID_B)).toBe(programB);
+    // A is gone and recompiles from scratch.
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBeUndefined();
+    expect(cache.ensureSpriteMaterial(GUID_A)).toBeUndefined(); // kicks a fresh compile
+    await flush();
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(programA);
+    expect(build).toHaveBeenCalledTimes(3); // A, B, A again
+    expect(invalidateProgram).toHaveBeenCalledWith(PATH_A); // the pixiShaderBuilder optimisation still runs
+  });
+
+  it('resolves a WATCHER-shaped path (a leading-slash asset URL, not a bare relative path invented by a test)', async () => {
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    // Shape produced by absToAssetUrl (engine/plugins/vite-asset-scanner.ts) — what
+    // ASSET_CACHE_INVALIDATORS.shader is actually called with by the file watcher.
+    const WATCHER_PATH = '/games/fixture/assets/materials/toon.shader.json';
+    paths.set(GUID_A, WATCHER_PATH);
+    registerAsset(GUID_A, WATCHER_PATH, 'shader');
+    const program = { params: [] } as any;
+    build.mockResolvedValue(program);
+
+    cache.ensureSpriteMaterial(GUID_A);
+    await flush();
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(program);
+
+    cache.invalidateShader(WATCHER_PATH);
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBeUndefined();
+  });
+
+  it('an unresolvable path (not yet in the manifest) falls back to a wholesale clear, not a silent no-op', async () => {
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    paths.set(GUID_B, PATH_B);
+    registerAsset(GUID_A, PATH_A, 'shader');
+    // GUID_B's path is deliberately left UNREGISTERED — it stands in for a brand-new
+    // `.shader.json` the manifest scan hasn't indexed yet.
+    const programA = { params: [], id: 'A' } as any;
+    const programB = { params: [], id: 'B' } as any;
+    build.mockImplementation((p: string) => Promise.resolve(p === PATH_A ? programA : programB));
+
+    cache.ensureSpriteMaterial(GUID_A);
+    cache.ensureSpriteMaterial(GUID_B);
+    await flush();
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(programA);
+    expect(cache.getSpriteMaterialProgram(GUID_B)).toBe(programB);
+
+    cache.invalidateShader('brand-new-not-yet-in-manifest.shader.json');
+
+    // Unresolved must fail SAFE (wholesale), not silently no-op — a no-op would leave the
+    // just-edited shader's own stale program in place, which is #523's symptom all over again.
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBeUndefined();
+    expect(cache.getSpriteMaterialProgram(GUID_B)).toBeUndefined();
+  });
+
+  it('invalidating one guid does not supersede a DIFFERENT guid\'s in-flight compile — and still supersedes its OWN', async () => {
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    paths.set(GUID_B, PATH_B);
+    registerAsset(GUID_A, PATH_A, 'shader');
+    registerAsset(GUID_B, PATH_B, 'shader');
+
+    const aInFlight = deferred<unknown>(); // will resolve AFTER invalidateShader(A) supersedes it
+    const bInFlight = deferred<unknown>(); // must be unaffected by invalidating A
+    build.mockImplementation((p: string) => (p === PATH_A ? aInFlight.promise : bInFlight.promise));
+
+    expect(cache.ensureSpriteMaterial(GUID_A)).toBeUndefined(); // A's compile in flight
+    expect(cache.ensureSpriteMaterial(GUID_B)).toBeUndefined(); // B's compile in flight, concurrently
+
+    cache.invalidateShader(PATH_A); // supersedes ONLY A's in-flight compile
+
+    const staleProgramA = { params: [], id: 'stale-A' } as any;
+    const freshProgramB = { params: [], id: 'fresh-B' } as any;
+    aInFlight.resolve(staleProgramA);
+    bInFlight.resolve(freshProgramB);
+    await flush();
+
+    // A's now-superseded compile must not re-seat a stale program once it resolves.
+    expect(cache.getSpriteMaterialProgram(GUID_A)).toBeUndefined();
+    // B was never invalidated — its own compile lands normally, unaffected by A's invalidation.
+    expect(cache.getSpriteMaterialProgram(GUID_B)).toBe(freshProgramB);
+  });
+
+  it('wakes the invalidated guid\'s waiters, and does NOT wake an unrelated guid\'s', async () => {
+    // The per-key mirror of `clearSpriteMaterialCache wakes waiters whose compile it superseded`.
+    // A superseded compile fires no `onReady`, so evicting the set without firing it leaves a
+    // still-live renderer with no signal to re-`ensure` — its entities stay on the fallback
+    // sprite until an unrelated dirty. That is this issue's flash, made permanent for the one
+    // shader actually edited.
+    // ⚠️ `registerAsset` is NOT optional here, and omitting it does not fail loudly — it makes
+    // `getGuidForPath` return undefined, so `invalidateShader` takes its unresolved-path FALLBACK
+    // and this test silently asserts against the wholesale clear, i.e. the exact behaviour #852
+    // removed. It passed anyway in a whole-file run because `assetManifest`'s module-level
+    // `pathToGuid` is NOT reset by `vi.resetModules()` and still held the earlier tests'
+    // registrations; run alone, it failed. Every test in this block needs its own.
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    paths.set(GUID_B, PATH_B);
+    registerAsset(GUID_A, PATH_A, 'shader');
+    registerAsset(GUID_B, PATH_B, 'shader');
+    const { promise: pA } = deferred<unknown>();
+    const { promise: pB } = deferred<unknown>();
+    const onReadyA = vi.fn();
+    const onReadyA2 = vi.fn();
+    const onReadyB = vi.fn();
+
+    build.mockReturnValueOnce(pA);
+    expect(cache.ensureSpriteMaterial(GUID_A, onReadyA)).toBeUndefined();
+    expect(cache.ensureSpriteMaterial(GUID_A, onReadyA2)).toBeUndefined(); // dedups onto the same compile
+    build.mockReturnValueOnce(pB);
+    expect(cache.ensureSpriteMaterial(GUID_B, onReadyB)).toBeUndefined();
+
+    cache.invalidateShader(PATH_A);
+
+    // EVERY waiter on A wakes — not just the first (two live viewports each register their own).
+    expect(onReadyA).toHaveBeenCalledTimes(1);
+    expect(onReadyA2).toHaveBeenCalledTimes(1);
+    // B's compile is untouched and still in flight, so its waiter must NOT have been woken.
+    expect(onReadyB).not.toHaveBeenCalled();
   });
 });

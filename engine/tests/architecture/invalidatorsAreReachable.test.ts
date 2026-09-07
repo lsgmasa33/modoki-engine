@@ -89,8 +89,9 @@ const ALLOWLIST: Record<string, string> = {
   invalidateRiggedModel: 'editor/scene/modelImport.ts (rigged-model re-import step)',
   // `invalidatePixiShaderProgram` is never called directly from ASSET_CACHE_INVALIDATORS — it's
   // called FROM `spriteMaterialCache.ts`'s `invalidateShader`, which IS wired (as `shader:`) below
-  // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it as its second
-  // step, after the wholesale `clearSpriteMaterialCache()`.
+  // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it unconditionally,
+  // alongside a per-key eviction of the one guid the path resolves to (#852 — it used to be a
+  // wholesale `clearSpriteMaterialCache()`, which now runs only on the unresolved-path fallback).
   invalidatePixiShaderProgram: 'runtime/loaders/spriteMaterialCache.ts\'s invalidateShader (itself wired into ASSET_CACHE_INVALIDATORS as `shader:`)',
 };
 

@@ -1674,6 +1674,13 @@ entire release window.
 ⚠️ Still uncovered by either mechanism: `.meta.json` sidecars are invisible to `detectType`
 (`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845.
 
+⚠️ **And being watched is not the same as being invalidated WELL.** Adding a kind to
+`LiveReloadKind` makes the broadcast fire; what the matching `ASSET_CACHE_INVALIDATORS` entry then
+does with the path it is handed is a separate question, and `invalidateShader` answered it by
+throwing the path away and clearing every compiled 2D material program (#852). Rule and the two
+traps that come with it (an unresolved key is UNKNOWN, not absent; fire the waiters you evict):
+[mcp-persistence.md](./mcp-persistence.md) § "Wiring a kind into the table is only HALF the job".
+
 Why it stayed invisible: `AtlasAssetView`'s own header notes the page preview "refreshes after a
 Re-pack via the watcher's manifest broadcast" — and it does. **Derived** data (the `.meta.json`
 pages/frames block, surfaced through the manifest) refreshed correctly, while the **authored**
