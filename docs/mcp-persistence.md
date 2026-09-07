@@ -373,6 +373,20 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     exists to prevent — so an agent `discardUnsaved` can still leave a path wedged for the panel.
     That is #880's second face, reachable by one more route, and it is not papered over.
 
+  - ⚠️ **The gate cannot see the EDITOR'S OWN save, and no flag makes it — `flushPendingMeta`
+    takes the batch out and `pending.clear()`s it BEFORE issuing any request**. By the time
+    `/api/write-meta` asks `resolve-meta-park`, the registry is empty for every path in that flush,
+    so the probe honestly answers `clear` and the write proceeds. The clear-first ordering is
+    correct for its own reason (a `flushPendingMetaFor` landing mid-flush must not see a document
+    this flush is about to overwrite), and `rendererWrite:true` is not what is doing the work here
+    — the gate would pass even without it. **So the gate covers the AGENT reaching past a human's
+    parked edit; it does not and cannot cover a poisoned document the human saves themselves**
+    (verified against #890/#891's repro, `work-qa` 2026-09-07). Read together with the first bullet
+    above, the two say the same thing from both ends: this is a route-shaped guard on a
+    process-shaped rule, and the human's own save is outside it by construction. Whatever fixes
+    `family/unscoped-panel-state` has to stop the document being POISONED — refusing the write
+    downstream is a place the check cannot reach.
+
   ⚠️ **It refuses rather than flushing**, which is the one place the agent surface deliberately
   differs from the UI. `assetViews/reimport.ts` flushes the park before re-importing, because the
   human clicked Re-import in the panel where they made the edit and that click IS consent to
