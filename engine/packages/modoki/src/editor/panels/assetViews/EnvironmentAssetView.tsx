@@ -23,6 +23,7 @@ import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
 import {
   parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
+  metaCameFromFailedRead,
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -94,6 +95,29 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   }, [meta, path]);
 
   const apply = useCallback(async () => {
+    // ⚠️ REFUSE BEFORE THE EXPENSIVE WORK, not after the write (#880 close-out review 3).
+    //
+    // The first version of this guard checked `writeMetaWholesale`'s return, which is the LAST
+    // step: by then `encodeUltraHDR` had run the WebGL gainmap encode and `/api/write-file` had
+    // committed a multi-MB `~ultrahdr.jpg` into the asset tree — so a refusal left that variant
+    // orphaned on disk with nothing in the sidecar pointing at it, and the re-read that followed
+    // snapped the format dropdown back to `hdr`, discarding the user's choice with no toast.
+    // It traded a visible sticky refusal for silent loss, which is worse.
+    //
+    // The answer is decidable here, before anything is spent: if this panel's document came from
+    // a failed read it has no `id`, and a wholesale write of it would cost the asset its GUID.
+    if (metaCameFromFailedRead(meta)) {
+      console.error(
+        `[Inspector] not converting ${path} — its .meta.json was never read successfully, so `
+        + 'writing the result would replace the file with a document missing its GUID. Reselect '
+        + 'the asset to re-read it, then retry.',
+      );
+      useEditorStore.getState().showToast(
+        `Cannot convert ${name} — its import settings could not be read. Reselect the asset and try again.`,
+        'warn',
+      );
+      return;
+    }
     setImporting(true);
     try {
       // #845: both branches below are about to read (the reimport route, off disk) or write (the
@@ -124,14 +148,12 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         // and `~ultrahdr.jpg` sat on disk with nothing in the sidecar pointing at it, explained
         // only by a `console.error`. `makeTexture2D` returns `false` to its caller and the two
         // modal editors keep their dialog open; this was the one of the four that swallowed it.
-        if (!await writeMetaWholesale(path, updatedMeta)) {
-          // Re-read before giving up, or the panel keeps holding the fallback document and every
-          // later Apply is refused too: `loadMeta` otherwise only re-runs on a path/epoch change,
-          // and the early return below skips both. This lets the panel recover on its own instead
-          // of requiring the reselect the console message names.
-          await loadMeta();
-          return;
-        }
+        // ⚠️ A failed write returns WITHOUT re-reading. The provenance case is refused at the top
+        // of this function now, so the only way to reach this branch is a genuine write failure
+        // (a dev-server blip) — and re-reading there would reseed `settings` from disk and throw
+        // away the user's dropdown choice for a reason that has nothing to do with it. Same rule
+        // the two modal editors follow by keeping their dialog open.
+        if (!await writeMetaWholesale(path, updatedMeta)) return;
       } else {
         // Node-side downscale (dependency-free) via the reimport handler.
         setImportStatus(true, `Downscaling ${name}...`);

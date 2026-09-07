@@ -2709,13 +2709,14 @@ export function registerEditorAgentOps(): void {
    *  proceed. Node is single-threaded and so is the renderer, so answering both in one op closes
    *  it as far as this seam can.
    *
-   *  ⚠️ **`readFailed` is deliberately left ARMED by a discard**, because `discardPendingMeta`
-   *  leaves it armed. Clearing it here would let a component still holding the `{}` fallback park
-   *  an id-less document, which the scanner's heal pass answers by minting a fresh GUID and
-   *  orphaning every reference to the asset — the exact destruction that flag exists to prevent.
-   *  A path whose flag is armed can therefore still be wedged for the panel after an agent
-   *  discard; that is #880's second face, reachable by one more route, and it is not papered over
-   *  here. */
+   *  ⚠️ **A discard cannot make a failed-read document parkable, and since #880 that is
+   *  STRUCTURAL rather than a decision this op makes.** It used to be one: the guard was a
+   *  path-keyed `readFailed` flag, `discardPendingMeta` deliberately left it armed, and the
+   *  accepted cost was that an agent discard could leave a path WEDGED for the panel. That flag
+   *  is gone. The guard is a tag on the fallback DOCUMENT now (`scene/metaReadFallback.ts`), so
+   *  this op has nothing to clear even in principle: a component still holding the `{}` fallback
+   *  is still refused, and a component whose OWN read succeeded is no longer punished for it.
+   *  #880's second face was removed rather than traded away. */
   registerAgentOp('resolve-meta-park', (params) => {
     const { paths, discard } = (params ?? {}) as { paths?: unknown; discard?: unknown };
     if (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== 'string' || !p)) {

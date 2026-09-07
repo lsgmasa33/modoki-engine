@@ -68,10 +68,12 @@ export interface MetaWriteResult {
  *  old behaviour and the right default for the eight explicit-action writers: they build their
  *  document from a fresh read moments earlier and the human asked for the write. */
 export async function writeMetaConditional(path: string, meta: unknown, ifMatch?: string): Promise<MetaWriteResult> {
-  // ⚠️ THE ONE PLACE A `.meta.json` WRITE IS REFUSED FOR PROVENANCE (#880). This is the single
-  // POST implementation, so guarding here covers every writer — the pending-registry flush, the
+  // ⚠️ WHERE A PANEL'S `.meta.json` WRITE IS REFUSED FOR PROVENANCE (#880). Every panel POST goes
+  // through this one helper, so guarding here covers all of them — the pending-registry flush, the
   // explicit-action `writeMetaWholesale` callers, and the two modal editors that call
-  // `writeMetaOrWarn` directly. The review that added it found the tag consumed in three other
+  // `writeMetaOrWarn` directly. ⚠️ It does NOT cover `scene/modelImport.ts`, which posts the route
+  // raw and consumes the tag itself (aborting the import, because refusing its write would leave
+  // it spawning entities against a model whose guid it just failed to preserve). The review that added it found the tag consumed in three other
   // places and NOT here, which is how `SpriteEditor`/`NineSliceEditor` came to be protected only
   // by a hand-rolled `metaLoadedRef` each: a third modal editor copying their shape and omitting
   // that line would have replaced a sidecar with an id-less document, silently.

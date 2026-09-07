@@ -277,8 +277,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   with its `loadMeta` dropping the read's `ok` and its Apply button disabled only while `importing`,
   never on a failed load. A 500 on the GET, a switch to UltraHDR, one click, and an id-less document
   reached the route. `makeTexture2D` is the precedent that returns early on `!res.ok`, and
-  `NineSlice`/`SpriteEditor` refuse in their save handlers; the refusal in `writeMetaWholesale` makes
-  that structural for everything routed through it instead of a habit three of four surfaces had.
+  `NineSlice`/`SpriteEditor` refuse in their save handlers; the refusal now lives at
+  `writeMetaConditional` — the endpoint note below — which makes it structural for everything
+  routed through it instead of a habit three of four surfaces had.
 
   ⚠️ **Do not confuse this with the sidecar PARK GATE (#872/#882) — different axis, same
   function.** The park gate is a NODE-side check on agent-reachable routes, asking *"would this
@@ -290,8 +291,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   renderer POST definition; neither subsumes the other.
 
   ⚠️ **The guard now sits at the ENDPOINT, which is what covers doors two and four at once.**
-  `writeMetaConditional` (`panels/assetViews/widgets.tsx`) is the only `/api/write-meta` POST
-  implementation in the package, and it refuses a tagged document there — so the pending-registry
+  Every PANEL `/api/write-meta` POST goes through one shared helper,
+  `writeMetaConditional` (`panels/assetViews/widgets.tsx`), and it refuses a tagged document there
+  — so the pending-registry
   flush, the explicit-action `writeMetaWholesale` callers, and the two modal editors that call
   `writeMetaOrWarn` **directly** (`SpriteEditor.save`, `NineSliceEditor.save`) are all covered by
   one check. That fourth door was open through the first round of this fix: the tag was consumed
@@ -427,10 +429,11 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     read half carries as `passive`. An observer must not disarm the guard it observes, and a WRITE
     gate has more power to get that wrong than a read, not less.
   - **Probe and discard are ONE op**, so a park cannot land between the check and the write.
-  - **A discard deliberately leaves `readFailed` ARMED.** Clearing it would let a component still
-    holding the `{}` fallback park an id-less document, which is the GUID destruction that flag
-    exists to prevent — so an agent `discardUnsaved` can still leave a path wedged for the panel.
-    That is #880's second face, reachable by one more route, and it is not papered over.
+  - **A discard cannot make a failed-read document parkable** — and since #880 that is structural,
+    not a choice this op makes. It used to be one: the guard was a path-keyed `readFailed` flag
+    that a discard deliberately left armed, at the cost of leaving the path WEDGED for the panel.
+    The guard is now a tag on the fallback DOCUMENT, so there is no per-path state a discard could
+    clear, and no wedge to accept — that second face was removed rather than traded away.
 
   - ⚠️ **The gate cannot see the EDITOR'S OWN save, and no flag makes it — `flushPendingMeta`
     takes the batch out and `pending.clear()`s it BEFORE issuing any request**. By the time

@@ -6,11 +6,16 @@
  *  asserted HERE is the behaviour that only exists inside the renderer:
  *
  *  - it reports a park **without recording anything** — the `passive` lesson `read-asset-meta`
- *    already carries. A write gate that seeds a CAS baseline or clears the read-failed flag as a
- *    side effect of looking would corrupt the state it was consulted about;
- *  - a discard drops the park **and its baseline**, and deliberately leaves `readFailed` ARMED,
- *    because clearing it would let a component still holding the `{}` fallback park an id-less
- *    document — the GUID destruction that flag exists to prevent (#880's second face);
+ *    already carries. A write gate that seeds a CAS baseline as a side effect of looking would
+ *    corrupt the state it was consulted about;
+ *  - a discard drops the park **and its baseline**, and still lets a document from a GOOD read
+ *    park afterwards (the accept side — a gate that refused everything post-discard would pass a
+ *    refusal-only test);
+ *  ⚠️ This file used to also pin "a discard leaves `readFailed` ARMED". #880 replaced that
+ *  path-keyed flag with a tag on the fallback DOCUMENT, which this op shares no state with, so
+ *  that property is now structural and untestable FROM HERE — asserting it in this suite would
+ *  be a test that cannot fail, pointing at the wrong subsystem. `editor/pendingMeta.test.ts`
+ *  owns it;
  *  - probe and discard are ONE call, so nothing can park in between.
  */
 
@@ -19,8 +24,7 @@ import { runAgentOp } from '../../app/debug/agentBridge';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
   parkMetaEdit, peekPendingMeta, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths,
-  noteMetaReadResult, peekMetaBaseline,
-  metaReadFallback,
+  peekMetaBaseline,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
 
 registerEditorAgentOps();
@@ -33,9 +37,11 @@ const discardAssetEdits = (params: unknown) => runAgentOp('discard-asset-edits',
 const TEX = '/assets/textures/rock.png';
 const MODEL = '/assets/models/hero.glb';
 
-// BOTH resets. `clearPendingMeta` empties `pending` only; the read-failed flag lives with the
-// baselines and is cleared by `clearMetaBaselines`. Leaving it armed across cases makes a later
-// `parkMetaEdit` silently refuse, which reads as the op having discarded something it did not.
+// BOTH resets, and `clearMetaBaselines` is NOT optional despite the read-failed flag it used to
+// also clear being gone (#880). `clearPendingMeta` empties `pending` only, so without the second
+// call a baseline seeded by an earlier case leaks into the next one — and the "RECORDS NOTHING"
+// case below asserts on `peekMetaBaseline` being undefined, so it would fail for a reason that
+// has nothing to do with the probe.
 const reset = () => { clearPendingMeta(); clearMetaBaselines(); };
 beforeEach(reset);
 afterEach(reset);
@@ -63,19 +69,20 @@ describe('resolve-meta-park — the probe', () => {
     // The defect this pins is the one `read-asset-meta`'s own review caught and fixed with
     // `passive`: an agent-side read that seeds the CAS baseline makes a stale parked edit ACCEPTED
     // where it was correctly refused. A gate has more power to do that than a read, not less.
-    noteMetaReadResult(TEX, { ok: false, headers: { get: () => null } } as unknown as Response);
-    expect(peekMetaBaseline(TEX)).toBeUndefined();
+    // (No `noteMetaReadResult(ok:false)` setup any more — it used to ARM the read-failed flag, and
+    // since #880 a non-ok response records nothing at all, so the call was arming nothing while
+    // reading like a precondition. `reset()` already leaves the baseline unset.)
+    expect(peekMetaBaseline(TEX), 'precondition: no baseline for this path').toBeUndefined();
 
     await resolve({ paths: [TEX] });
 
     expect(peekMetaBaseline(TEX)).toBeUndefined();
-    // ⚠️ The second half USED to read "and the read-failed flag is still armed". #880 replaced that
-    // path-keyed flag with a tag on the fallback DOCUMENT, so there is no per-path state a probe
-    // could clear even in principle — which is a stronger guarantee, not a lost one. The property
-    // worth keeping is the observable one: a document built on a failed read is still refused after
-    // the probe ran. Driven the way a panel does it, by spreading what the failed read handed back.
-    parkMetaEdit(TEX, { ...metaReadFallback(), texture: { maxSize: 256 } });
-    expect(peekPendingMeta(TEX)).toBeUndefined();
+    // ⚠️ NO tag assertion here, deliberately. The second half used to read "and the read-failed
+    // flag is still armed"; #880 moved that guard onto the fallback DOCUMENT, which this op shares
+    // no state with. Asserting it here would be green with the `await resolve()` above DELETED —
+    // a test that cannot fail for anything its own subject does, and one that reddens in the
+    // agent-op suite when `parkMetaEdit` breaks, pointing a reader at the wrong subsystem.
+    // `editor/pendingMeta.test.ts` owns the refusal.
   });
 });
 
@@ -120,10 +127,10 @@ describe('resolve-meta-park — the discard', () => {
     await resolve({ paths: [TEX], discard: true });
 
     expect(peekPendingMeta(TEX)).toBeUndefined();
-    parkMetaEdit(TEX, { ...metaReadFallback(), texture: { maxSize: 512 } });
-    expect(peekPendingMeta(TEX), 'an id-less park must still be refused after an agent discard').toBeUndefined();
-    // ⚠️ The ACCEPT side, or a mutant refusing every post-discard park passes: a document from a
-    // GOOD read still parks after the discard.
+    // ⚠️ The ACCEPT side, which is the half this op can actually get wrong: a document from a GOOD
+    // read still parks after the discard. (The refusal half is NOT asserted here — see the note in
+    // "RECORDS NOTHING" above and the file header: since #880 it cannot fail for anything
+    // `resolve-meta-park` does.)
     parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 128 } });
     expect(peekPendingMeta(TEX)).toEqual({ id: 'tex-guid', texture: { maxSize: 128 } });
   });

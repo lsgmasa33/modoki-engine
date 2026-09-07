@@ -3,11 +3,17 @@
  *
  *  ## Why this is its own module and not part of `pendingMeta.ts`
  *
- *  Because the endpoint it protects does not live there. `/api/write-meta` has exactly ONE POST
- *  implementation in the package — `writeMetaConditional` (`panels/assetViews/widgets.tsx`) —
- *  and `pendingMeta.ts` IMPORTS that, so `widgets.tsx` cannot import back without a cycle
+ *  Because the endpoint it protects does not live there. The panels' `/api/write-meta` POSTs all
+ *  go through ONE shared helper — `writeMetaConditional` (`panels/assetViews/widgets.tsx`) — and
+ *  `pendingMeta.ts` IMPORTS that, so `widgets.tsx` cannot import back without a cycle
  *  (`architecture/noNewCycles.test.ts` would fail it, correctly). A leaf both can depend on is
- *  what lets the guard sit at the endpoint instead of being re-implemented at each caller.
+ *  what lets the guard sit at that helper instead of being re-implemented at each caller.
+ *
+ *  ⚠️ **"One shared helper" is NOT "the only POST".** `scene/modelImport.ts` posts the route
+ *  directly with a raw `backendFetch`, three times, and does not pass through the helper at all —
+ *  it consumes this predicate itself and ABORTS the import (see `metaCameFromFailedRead` below for
+ *  why refusing its write would not be enough). Read the guard at the helper as covering the
+ *  panels, not as closing the endpoint.
  *
  *  ⚠️ **That re-implementation is exactly what went wrong, twice, and is why this exists.** The
  *  #880 close-out review found the tag consumed in three separate places while there was one POST
@@ -55,8 +61,27 @@
  *   - `Object.keys`/`for...in` cannot see it, so no consumer of a meta document can trip over it.
  *     (vitest's `toEqual` DOES compare symbol keys — deliberate: it makes the tag assertable, and
  *     it is why the fallback assertions in `pendingMeta.test.ts` name it.)
- *   - A symbol cannot collide with a sidecar field, now or after any schema change. */
-const FROM_FAILED_READ = Symbol('pendingMeta.fromFailedRead');
+ *   - A symbol cannot collide with a sidecar field, now or after any schema change — a sidecar is
+ *     JSON, and `JSON.parse` cannot produce a symbol-keyed property at all, so no file on disk
+ *     (corrupt, hand-edited or hostile) can forge the tag and make an asset permanently
+ *     unsaveable.
+ *
+ *  ⚠️ **`Symbol.for`, not `Symbol` — the identity has to survive a second module instance.**
+ *  An unregistered symbol is unique per module EVALUATION, so the guard would have been correct
+ *  only because every importer happens to use a relative specifier that resolves to one id. That
+ *  is an invariant held by nothing, invisible to every test, and it fails OPEN: the day someone
+ *  writes `import { metaCameFromFailedRead } from '@modoki/engine'` and gets a second instance,
+ *  the producer's symbol and the consumer's predicate stop matching and every tagged document is
+ *  silently accepted — with the suites still green, because each loads one instance. The global
+ *  registry is per-realm, so `Symbol.for` makes two instances resolve to the SAME symbol and the
+ *  failure stops being representable rather than merely being absent today.
+ *
+ *  The key is namespaced (`modoki.`) for the one property registration costs: a registered symbol
+ *  CAN collide, on its string key, with any other code calling `Symbol.for` with the same string.
+ *  Everything else above survives unchanged — measured, not assumed: spread and `Object.assign`
+ *  still copy it, `JSON.stringify` still drops it, `Object.keys` still cannot see it, and vitest's
+ *  `toEqual` still compares it. */
+const FROM_FAILED_READ = Symbol.for('modoki.pendingMeta.fromFailedRead');
 
 /** The document a FAILED `/api/read-meta` yields — `{}`, tagged so a park or a write built on it
  *  is refused.
