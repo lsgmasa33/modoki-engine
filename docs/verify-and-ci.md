@@ -29,6 +29,67 @@ that is how the ~110s figure above went stale.
 Warm is the honest figure to quote: `typecheck`/`lint` cache into the gitignored
 `node_modules/.tmp` (65f5f840), so a COLD clone pays ~55s more on those two.
 
+### The two lanes share ONE working tree — a test must not leave a linted file in it
+
+⚠️ **A test that writes a linted-extension file (`.ts/.tsx/.js/.mjs/.cjs`) into a non-ignored
+directory can take the gate red from the other lane, with zero failing tests.** The lanes are
+concurrent over one checkout, so the app lane's writes land under lane 2's `lint` while it is
+enumerating. **ESLint is the reader that DIES** — it treats a stat-then-read mismatch as **fatal,
+not skippable** (`ENOENT … readAndVerifyFile`, exit 2), and it is the only reader that fails the
+gate from the OTHER lane.
+
+⚠️ **It is not the only exposed reader, and a fix aimed only at it is not a fix.** Two guards in
+the APP lane also enumerate by extension and then read, so they race the writer *within* one lane,
+across `fileParallelism` workers:
+
+- `buildWebCallSites.test.ts` — `repoFiles({ under: engine/, match: /\.(ts|mjs|sh)$/ })` at MODULE
+  scope, read through `readScannedSource`, which does **not** catch. An ENOENT there throws during
+  vitest COLLECTION. `repoCorpus.test.ts` names this file as the hazard its own probe was moved to
+  avoid.
+- `noNulBytesInSource.test.ts` — its `SOURCE_EXT` includes `.cjs` and it walks the whole repo. It
+  survives only because its read sits in a `try { … } catch { continue }`.
+
+`tsc` is a third reader, but a narrower one than it looks: no tsconfig sets `allowJs`, so a
+transient `.cjs` is invisible to it, and a transient **`.ts`** is picked up only inside the three
+root programs' `include` sets: `engine/app`, `engine/electron`, `engine/tests`, `games`, `demos`
+(plus `engine/vite.config.ts` by name). A stray `.ts` under `engine/scripts/` or `engine/plugins/` is in no
+program at all, which is exactly the directory `buildWebCallSites` scans and where this repo has
+already been bitten. Do not reach for `tsc` as a safety net there.
+
+**Two failures, not one, and a fix for either alone leaves the other:**
+
+| | trigger | symptom |
+|---|---|---|
+| mid-flight | the other lane is globbing while the file exists | `[FAIL] <lane>` with **no failing test underneath** — indistinguishable at a glance from a real failure, and the documented "re-run quiet before believing a red" reflex costs a full gate cycle |
+| stranded | a SIGINT / crash / failed pack skips the cleanup | the artifact is **linted** on every later run, red until someone deletes it by hand |
+
+**The rule: any transient artifact written into the tree is declared in BOTH `.gitignore` and the
+`ignores` list in `engine/eslint.config.js`, as the same glob.** Those are two lists that must
+agree, and #879 was exactly them disagreeing — `.gitignore` knew about `engine/vite.config.cjs`
+and not the test probe beside it; ESLint's list knew about neither. That is the **fourth** time
+this list has cost a red gate (`ads/` — 33,482 errors from one interrupted playable build;
+`subgame-dist/` — 1,657; `.claude/worktrees/` — 36, in code not even on the branch), which is why
+the entries there each carry the lesson in prose — and why the seam itself is filed as **#885**
+rather than left as a fifth comment asking the next author to remember. Gitignoring is also what
+keeps an artifact out of every `repoFiles()` corpus — see
+[Corpus production](#corpus-production-the-one-enumerator-these-guards-share), which enumerates
+with `git ls-files --others --exclude-standard`.
+
+**Prefer not writing into the tree at all.** Almost every test here uses `mkdtemp`; the handful
+that cannot each say why in place. `packagedViteConfig.test.ts` genuinely cannot — the bundle
+collapses the plugin graph into one file whose modules locate themselves via `__dirname`, so it
+must load from inside `engine/`. `repoCorpus.test.ts` shows the other way out when the location is
+forced: put the probe where **no reader's filter reaches it** (repo root, `.tmp`), which is where
+its own comment says it moved after living under `engine/scripts/`. ⚠️ That comment describes the
+hazard **prospectively** — *"a flake seam this test creates for its neighbours"* — so treat it as a
+reasoned relocation, not as a recorded flake; no such failure was observed.
+
+`engine/tests/architecture/ignoreListsAgree.test.ts` pins the two `vite.config*.cjs`
+producers by asking the real resolvers (`ESLint#isPathIgnored`, `git check-ignore`) and by deriving
+the filenames from the producers' own source, so renaming one goes red instead of silently
+reopening the hole. ⚠️ **It pins those two, not the class** — a new test writing some other linted
+extension into a linted directory reopens this with the guard green. That is what this rule is for.
+
 ### The Windows clone
 
 The Windows clone was **~10 min** at the old shape (2026-08-04): 608s, of which the app-tests

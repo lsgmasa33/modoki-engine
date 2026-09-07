@@ -121,6 +121,7 @@ load-bearing and commented as such).
   |---|---|---|
   | `Y:\` (a `subst` of another dir) | `Y:\` — unresolved | the real target |
   | `e:\Projects\modoki` | `e:\Projects\modoki` | `E:\Projects\modoki` |
+  | `C:\Users\RUNNER~1\…` (an 8.3 SHORT path) | left short | expanded to the long form |
 
   So a comparison that canonicalises with the JS walk still fails on a `subst`ed checkout or a
   lower-cased drive letter. `path.resolve` repairs neither. ⚠️ **`.native` only normalises a
@@ -129,6 +130,11 @@ load-bearing and commented as such).
   spelling-sensitive. `deviceClaimsStore.mjs`'s `canonicalClonePath` is the worked example;
   **#869** is the open instance of getting this wrong (two `engine/electron/main.ts` guards
   compare a `__dirname` root against a project root with neither realpath nor case folding).
+- ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
+  baseline quietly encodes a second claim nobody meant to assert. The two forms also disagree on an
+  **8.3 short path** (row 3 above), so `deviceClaimBuildGuard.test.ts` — seeding a drive-CASE
+  baseline with the JS walk against a `.native` subject — died on short-vs-long, which is not the
+  property it exists to pin (#878, fixed in `1307b2c1f`).
 - **A drive letter is a colon, and a colon means "remote host" to some tools.** GNU tar reads
   `C:\path\x.zip` as `host:path` and dies with `Cannot connect to C:`. Every drive letter, not
   just non-`C`.
@@ -563,6 +569,13 @@ Split the failure into one of two classes before doing anything:
   diagnosable remotely. Shipping mechanism-guesses for CI to adjudicate burns rounds and lands
   wrong fixes; CI is a pass/fail **oracle, never a diagnosis**. Report the evidence, name the
   competing theories, and let a real Windows box measure it.
+
+Then ask **which Windows**. The hosted runner and a real dev box differ in ways that decide tests:
+the runner's `%TEMP%` arrives **8.3-shortened** (`C:\Users\RUNNER~1\…`), because the account name
+`runneradmin` exceeds 8 characters, while a box whose account name fits (`C:\Users\dev\…`) is
+already the long form. A canonicalisation test can therefore be red on `ci/main` and green on the `win` clone
+forever. ⚠️ **"Green on the win clone" is not evidence about CI, and the reverse holds too** — #878
+was invisible on real Windows hardware and reproduced on every runner.
 
 A worked example of the second class: an orphaned child inherits `cmd.exe`'s stdio pipes, so a
 `close` event cannot fire until the orphan dies — making an assertion unsatisfiable *by
