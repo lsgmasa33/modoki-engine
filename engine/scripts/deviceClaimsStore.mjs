@@ -84,6 +84,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// The ONE 'same directory?' comparison (#869).
+import { canonicalPath, samePath } from './pathIdentity.mjs';
 
 /** Where the claims live: beside `editor-launches.log`, machine-wide by design (see the header).
  *
@@ -525,17 +527,18 @@ export function isFullyQualified(p) {
  *  build path compared a bare `process.cwd()`. Falls back to `resolve` when the path does not
  *  exist, because a refusal must never depend on a stat. */
 export function canonicalClonePath(p) {
-  const resolved = path.resolve(p);
-  // `.native`, NOT the JS lstat-walk. Measured on win32 (#865 close-out review):
-  //   subst Y: <dir>  ->  realpathSync('Y:\') === 'Y:\'   (NOT resolved)
-  //                       realpathSync.native('Y:\') === 'D:\'
-  //   'e:\Projects\modoki' -> realpathSync keeps the lower-case drive;
-  //                             realpathSync.native returns 'E:\Projects\modoki'
-  // So the JS walk resolves junctions and symlinks but neither `subst` mappings nor
-  // drive-letter CASE, and both of those are ordinary ways one directory acquires two
-  // spellings on Windows. An earlier version of this used the JS walk and its comment
-  // claimed to cover `subst`; it did not.
-  try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+  // ⚠️ Now a thin alias for the SHARED canonicaliser (#869) — same behaviour, one implementation.
+  // The residue #865 left was never HERE: it was in `sameClone`, which compared these with `===`,
+  // so the drive-letter hole survived for a path that does not EXIST (`.native` throws there and
+  // this falls back to bare `resolve`). A stale `~/.modoki/device-claims.json` entry is precisely
+  // a non-existent path — the case this family is most often asked about. `samePath` case-folds
+  // at the COMPARISON, which is what closes it; this still returns the on-disk spelling, because
+  // callers put it in refusal messages a human reads.
+  //
+  // Retained as a named export rather than deleted: it is the vocabulary the claim family reads
+  // in ("a clone path in the ONE spelling"), and `sameClone` below is asymmetric in a way a bare
+  // `samePath` is not.
+  return canonicalPath(p);
 }
 
 /** Does STORED name the same clone as OWN? The one comparison behind every claim check. (#865)
@@ -552,10 +555,13 @@ export function canonicalClonePath(p) {
  *  clone's own builds until it is deleted by hand — self-evident, and one `rm` away — whereas the
  *  fail-open direction silently drives a phone a sibling clone is holding.
  *
- *  ⚠️ Drive-letter CASE is still not normalised (`e:\x` !== `E:\x`) — see `docs/windows.md`. */
+ *  ⚠️ That caveat used to read "Drive-letter CASE is still not normalised (`e:\x` !== `E:\x`)".
+ *  It is retired (#869): the comparison now case-folds, including for a path that does not
+ *  exist — which was the half #865 left open, because `.native` throws there and the fallback
+ *  was a bare `resolve`. A stale claim entry is exactly a non-existent path. */
 export function sameClone(stored, own) {
   if (!isFullyQualified(stored)) return false;
-  return canonicalClonePath(stored) === canonicalClonePath(own);
+  return samePath(stored, own);
 }
 
 /** The refusal text. Names the clone, the branch, when, and the pid — every one of which is a

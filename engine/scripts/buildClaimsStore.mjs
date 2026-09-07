@@ -111,6 +111,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { claimsDir, isFullyQualified } from './deviceClaimsStore.mjs';
+// The ONE 'same directory?' comparison (#869).
+import { samePath } from './pathIdentity.mjs';
 
 function claimsFile() {
   return path.join(claimsDir(), 'build-claims.json');
@@ -218,8 +220,9 @@ function readClaimsResult() {
  *  silently found NO conflict and the claim was GRANTED twice (#847 caught this in tests, where
  *  three assertions went red and two more passed vacuously).
  *
- *  ⚠️ Drive-letter CASE is not normalised by `path.resolve` (`e:\x` !== `E:\x`), so this closes the
- *  separator and trailing-slash spellings, not that one.
+ *  ✅ **Drive-letter case is closed too, as of #869** — this now compares through the shared
+ *  `samePath`, which realpaths where it can and case-folds where the platform is case-insensitive.
+ *  (This caveat appeared TWICE in this docblock; both copies are retired.)
  *
  *  ⚠️ **The gate is FULLY-QUALIFIED, not `path.isAbsolute` — that was this function's first version
  *  and it was wrong on the case most likely to occur.** `path.resolve` is only safe to apply to a
@@ -247,10 +250,12 @@ function readClaimsResult() {
  *  `repoCorpus.mjs`'s header) or a trailing separator. A bare `/proj/x` is NOT one, and a test that
  *  seeds one must `path.resolve` it as the seeds in `buildClaimsStore.test.ts` already do.
  *
- *  ⚠️ Drive-letter CASE is still not normalised by `path.resolve` (`e:\x` !== `E:\x`), so this
- *  closes the separator and trailing-slash spellings, not that one. */
+ *  The comparison itself is `samePath` (#869) — the ONE "same directory?" predicate. The
+ *  qualification gate stays HERE and stays first: `samePath` answers sameness, not trust, and it
+ *  would happily `path.resolve` an unqualified stored value onto this cwd's drive, which is the
+ *  exact failure the gate above exists to stop. Order matters. */
 function sameProjectRoot(claim, root) {
-  return isFullyQualified(claim.projectRoot) && path.resolve(claim.projectRoot) === root;
+  return isFullyQualified(claim.projectRoot) && samePath(claim.projectRoot, root);
 }
 
 /** The refusal message for `acquireBuildClaim`'s UNKNOWN branch — names the file and the human's

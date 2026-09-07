@@ -170,6 +170,43 @@ with their enum and validate against it. That is parity with the transport, not 
 is the `modoki_prefab` class, which 400'd on every call for months with a green suite. Both halves
 are worth having; conflating them is what went wrong.
 
+### The wrong-ALTITUDE shape: asserting the command you built, never the effect it has (#875)
+
+The shapes above pick the wrong input or the wrong subject. This one picks the wrong **altitude**:
+the assertion is about a value the code *constructs*, when the thing that can be wrong is what the
+operating system then *does* with it.
+
+`trashCommand.test.ts` covered the editor's "move to Recycle Bin". It built the argv and asserted:
+
+```ts
+expect(args.join(' ')).toContain('foreach ($p in $args)');
+expect(args.slice(-2)).toEqual(['C:/x/m.glb', 'C:/x/n.png']);
+```
+
+Both assertions were true, and both pinned a **broken** invocation as correct: `powershell
+-Command "<script>" p1 p2` does not bind `$args` (see [windows.md](windows.md)), so the loop ran
+zero times and nothing was recycled on Windows for months. `assetFsOps.integration.test.ts`
+covered the same function with an injected `exec` and `platform: 'darwin'`, so the win32 branch
+was executed by nothing at all.
+
+**Why the mutation bar does not catch this one by itself.** Delete the mechanism and the test DOES
+go red — it notices the string changed. It just cannot notice that the string never worked. The
+test and the defect are at different altitudes, so mutation only proves the test is wired to the
+code, not that the code is wired to the OS.
+
+The discriminator to add is **one test that performs the real effect and observes it**:
+
+- Run the actual API against a real fixture, and assert on the **filesystem afterwards**, not on
+  the command. `trashCommandLive.test.ts` recycles real files and checks they are gone.
+- Assert what must be **ABSENT**, not only what is present. "no path appears in argv" is the
+  invariant; "the script contains `SendToRecycleBin`" is a spelling.
+- Pin a **bystander**. The sharpest case here is not "the file was deleted" but "the file next to
+  it was NOT" — the old defect split `…\a file.json` and aimed at `…\a`.
+- ⚠️ **Check that your platform can even express the failure.** The UTF-8 guard in that fix is
+  inert on a dev box already at code page 65001; a mutation check there reports it as dead code.
+  The test has to *manufacture* the hostile condition (force CP437) or it is measuring your
+  machine's luck. A green mutation check on an environment-dependent guard is not evidence.
+
 ### The guard, and what it deliberately does not cover
 
 `worldSwapTeardownFalsifiable.test.ts` is **producer-side** — one test per teardown, not one per

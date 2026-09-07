@@ -26,6 +26,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { productName, killPackaged } from './packagedAppPaths.mjs';
+// The ONE 'same directory?' comparison (#869).
+import { samePath } from './pathIdentity.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..', '..');
@@ -98,12 +100,39 @@ function targets() {
     for (const dir of [process.env.MODOKI_TOOLCHAIN_DIR, path.join(support, SHARED_DIR, 'toolchain')]) {
       if (!dir) continue;
       const resolved = path.resolve(dir);
+      const dflt = path.join(support, SHARED_DIR, 'toolchain');
+      // (#869) The LABEL comparison goes through `samePath`, because `path.resolve` does not fold
+      // drive-letter case and `MODOKI_TOOLCHAIN_DIR=e:\…` pointing at the default dir was
+      // therefore labelled as an override.
+      //
+      // ⚠️ The dedupe KEY is deliberately NOT canonical, and an earlier draft of this fix made it
+      // so — which SKIPPED a multi-gigabyte directory instead of deleting it (close-out review).
+      // If `MODOKI_TOOLCHAIN_DIR` is a junction to the default location (an ordinary Windows move
+      // when C: is small), the canonical key of the link IS the target: iteration 1 keys on the
+      // target and pushes the LINK, iteration 2 then matches that key and skips the real
+      // directory. And `fs.rmSync(<junction>, {recursive:true})` removes only the link —
+      // measured: the target's contents survive. So the wipe reported success with the whole
+      // provision intact, which is exactly the outcome the "wipe BOTH" note above exists to
+      // prevent. Keying on the raw resolved path lists both, and listing one directory twice is
+      // a harmless no-op (`force: true`) where skipping it is a silent failure. ⚠️ Under
+      // `--dry-run` nothing is removed, so a case-variant override does print the same directory
+      // twice — cosmetic, but it is the printed evidence someone reads.
+      //
+      // ⚠️ **A junctioned toolchain dir is still NOT fully wiped, and that is out of scope here.**
+      // `fs.rmSync(<junction>, {recursive:true})` removes only the link — measured, the target's
+      // contents survive. This block rescues the case where the override is a junction TO the
+      // default (the default is listed separately and deleted directly), but not the case where
+      // the listed path is a junction whose target is listed nowhere — e.g. the default location
+      // itself junctioned onto a bigger drive, with MODOKI_TOOLCHAIN_DIR unset. Then `--toolchain`
+      // prints "removed N path(s)" with the provision intact, which is the silent success the
+      // header above exists to prevent. Tracked in #883; fixing it means resolving and wiping a
+      // link TARGET, which is not a decision to take inside a finishing pass.
       if (seen.has(resolved)) continue;         // the override may equal the default
       seen.add(resolved);
       list.push({
         p: resolved,
         reason: 'provisioned JDK/Android SDK/toktx/msdf-atlas-gen — MULTI-GB RE-DOWNLOAD'
-          + (resolved !== path.resolve(path.join(support, SHARED_DIR, 'toolchain')) ? ' [MODOKI_TOOLCHAIN_DIR]' : ''),
+          + (!samePath(resolved, dflt) ? ' [MODOKI_TOOLCHAIN_DIR]' : ''),
       });
     }
   }

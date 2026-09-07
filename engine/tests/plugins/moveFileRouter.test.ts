@@ -61,8 +61,13 @@ function makeCtx(): BackendContext {
 }
 const move = (from: string, to: string) =>
   handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/move-file', query: new URLSearchParams(), body: { from, to } });
+/** One marked path as an asset-root-ish suffix, so assertions read independently of the tmpdir.
+ *  ⚠️ The ONLY place this file may turn a native `abs` into something comparable (#876). A
+ *  second, POSIX-only spelling (`abs.endsWith('/b.json')`) was hand-rolled below this and made
+ *  main red on windows-latest: `abs` ends `\b.json` there, so the find returned undefined. */
+const relOf = (abs: string) => abs.slice(tmp.length).replace(/\\/g, '/');
 /** Marked paths as asset-root-ish suffixes, so assertions read independently of the tmpdir. */
-const markedRel = () => rec.marked.map((m) => m.abs.slice(tmp.length).replace(/\\/g, '/'));
+const markedRel = () => rec.marked.map((m) => relOf(m.abs));
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mvrouter-'));
@@ -176,7 +181,7 @@ describe('/api/move-file carries the repair (#867)', () => {
     // folder children above are marked with a null hash instead.
     fs.writeFileSync(path.join(tmp, 'a.json'), 'the bytes');
     await move('/a.json', '/b.json');
-    const dest = rec.marked.find((m) => m.abs.endsWith('/b.json'));
+    const dest = rec.marked.find((m) => relOf(m.abs) === '/b.json');
     expect(dest?.hash).toMatch(/^[0-9a-f]{40}$/);
   });
 });

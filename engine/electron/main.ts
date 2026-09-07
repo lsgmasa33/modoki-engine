@@ -102,7 +102,7 @@ import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
 import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer } from './devServer';
 import { showSplash, setSplashStatus, closeSplash } from './splash';
-import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentProjects, migrateLegacyRecents, setRecentsScope, chooseInitialProject, projectFolderKind, installAppMenu, type RendererMenuSpec } from './projects';
+import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentProjects, migrateLegacyRecents, setRecentsScope, chooseInitialProject, projectFolderKind, installAppMenu, isEditorsOwnTree, type RendererMenuSpec } from './projects';
 import { scaffoldProject } from './newProject';
 import { resolveCdpConfig, readCdpEnabled, writeCdpEnabled, probeCdp, newCdpNonce, buildRendererUrl, readCdpPortMemo, writeCdpPortMemo, cdpMemoVerdict, type CdpProbe } from './cdp';
 import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from './backendPort';
@@ -111,6 +111,8 @@ import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
 import { composeDepsInstallError, hasStaleWorkspaceLink } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
+// The ONE 'same directory?' comparison (#869).
+import { samePath } from '../scripts/pathIdentity.mjs';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
 import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
@@ -273,7 +275,7 @@ async function installProjectDeps(cwd: string, opts: { preferCi: boolean }): Pro
  *  dep-install logic is refactored; and it ALWAYS logs (a "nothing to do" line
  *  included) so heal-on-open is observable. */
 function healProjectOnOpen(projectRoot: string): void {
-  if (path.resolve(projectRoot) === REPO_ROOT) return; // the editor's own tree, not a game
+  if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree, not a game (#869)
   try {
     const { notes } = healNativeConfig(projectRoot);
     if (notes.length) for (const n of notes) console.log(`[modoki-electron] heal: ${n}`);
@@ -284,7 +286,7 @@ function healProjectOnOpen(projectRoot: string): void {
 }
 
 async function ensureProjectDeps(projectRoot: string): Promise<void> {
-  if (path.resolve(projectRoot) === REPO_ROOT) return; // the editor's own tree
+  if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree (#869)
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return; // not an npm project
 
@@ -1118,9 +1120,12 @@ function rebuildMenu(): void {
     },
     onOpenProject: async () => {
       const chosen = await pickProjectFolder(mainWindow);
-      if (chosen && chosen !== state.root) await setProject(chosen);
+      if (chosen && !samePath(chosen, state.root)) await setProject(chosen);
     },
-    onOpenRecent: (root) => { if (root !== state.root) void setProject(root); },
+    // (#869) samePath, not `!==`: a recents entry is one of the two untrusted spelling
+    // sources, so a differently-cased entry re-opened the project ALREADY open — a full
+    // setProject, discarding whatever unsaved scene state that costs.
+    onOpenRecent: (root) => { if (!samePath(root, state.root)) void setProject(root); },
     rendererMenus: rendererMenuSpec,
     // Relay an OS-menu click to the renderer, which dispatches the editor action.
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),

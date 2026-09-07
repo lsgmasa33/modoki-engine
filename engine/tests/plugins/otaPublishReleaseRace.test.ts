@@ -18,6 +18,22 @@ import { mergeProjectConfig, pruneProjectConfig, DEFAULT_PROJECT_CONFIG, type Ra
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/** The module set `ota-publish.mjs` imports at RUNTIME, copied into each test's subset repo.
+ *
+ *  ⚠️ ONE list, because it was five identical copies and it went stale the first time somebody
+ *  added a dependency: #869 gave the claim stores a new import (`pathIdentity.mjs`), nothing
+ *  copied it, and all 34 tests here failed with a bare `status: 1` — the child's
+ *  ERR_MODULE_NOT_FOUND went to a stderr no assertion read. `runNode` now surfaces that
+ *  specific failure loudly; this list is why it should not recur. If you add an import to any
+ *  module below, add it HERE. */
+const CLAIM_STORE_SCRIPTS = ['buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs'];
+
+function copyClaimStoreScripts(repoRoot: string): void {
+  for (const name of CLAIM_STORE_SCRIPTS) {
+    fs.cpSync(path.join(engineRoot, 'scripts', name), path.join(repoRoot, 'engine', 'scripts', name));
+  }
+}
+
 const FAKE_GCLOUD_SRC = `#!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
@@ -144,7 +160,15 @@ function runNode(cwd: string, env: NodeJS.ProcessEnv, args: string[]): { status:
   // output (which goes to stderr) from a run that exits 0, so stderr must be captured on
   // BOTH the success and failure path — spawnSync always returns both.
   const result = spawnSync('node', args, { cwd, env, encoding: 'utf8' });
-  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  const stderr = result.stderr ?? '';
+  // A module the subset repo forgot to copy is NEVER an intended outcome here — it surfaces as a
+  // bare `status: 1` with the real cause in a stderr no assertion reads (#869 lost 34 tests to
+  // exactly that). Fail with the cause instead of letting each caller assert 0 === 1.
+  if (/ERR_MODULE_NOT_FOUND|Cannot find module/.test(stderr)) {
+    throw new Error('subset repo is missing a module ota-publish.mjs imports — add it to '
+      + `CLAIM_STORE_SCRIPTS above:\n${stderr.split('\n').slice(0, 5).join('\n')}`);
+  }
+  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr };
 }
 
 describe('ota-publish.mjs release.json optimistic concurrency', () => {
@@ -162,8 +186,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
     // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
     // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
-    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
-    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
+    copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-'));
@@ -448,8 +471,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
     // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
     // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
-    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
-    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
+    copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-mandatory-'));
@@ -577,8 +599,7 @@ describe('ota-publish.mjs version-collision guard', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
     // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
     // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
-    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
-    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
+    copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-collision-'));
@@ -707,8 +728,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
     // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
     // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
-    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
-    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
+    copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-guards-'));
@@ -908,8 +928,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
     // #650: ota-publish.mjs now imports the cross-process build claim store — a real Node import,
     // so this copied-subset repo must carry it (and its own dependency, deviceClaimsStore.mjs) too.
-    fs.cpSync(path.join(engineRoot, 'scripts', 'buildClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs'));
-    fs.cpSync(path.join(engineRoot, 'scripts', 'deviceClaimsStore.mjs'), path.join(repoRoot, 'engine', 'scripts', 'deviceClaimsStore.mjs'));
+    copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
     binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-validation-'));

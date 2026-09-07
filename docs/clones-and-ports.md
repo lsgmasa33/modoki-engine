@@ -290,6 +290,17 @@ every other clone at yours.**
   a detail: see `docs/windows.md` § Paths, the JS walk resolves neither `subst` nor drive-letter
   case. `claim-guard.mjs` had documented that reasoning and done the
   realpath; the two it pointed at had not, which is the drift that got #865 filed.
+  ⚠️ **#865 left a residue, closed by #869: `sameClone` kept comparing with `===`.** The
+  canonicaliser was right and the COMPARATOR was not — `.native` throws for a path that does not
+  exist, so the fallback was bare `path.resolve`, which folds no case at all. **A stale claim
+  entry naming a deleted directory is precisely that case**, and it is the case this predicate is
+  most often asked about. It now compares through `samePath`
+  (`engine/scripts/pathIdentity.mjs`), the ONE "same directory?" implementation — which the repo
+  had hand-rolled **eight** times in four inconsistent recipes.
+  ⚠️ That residue had **no test**: a mutation check reverting the comparison stayed green,
+  because every existing case used a path that EXISTS, where `.native` already repairs the drive
+  letter. Pinned now. The lesson generalises — when a fix has a "…except when the path is
+  missing" clause, the test set almost certainly only covers paths that exist.
   Detail: [debug-tools-mcp.md](./debug-tools-mcp.md) § "Several phones attached".
 - **Several phones of the SAME platform? Say which one.** Every adb call on the device surface is
   now `-s <serial>`-targeted, resolved ONCE when the lease opens and reused by the CDP tunnel and

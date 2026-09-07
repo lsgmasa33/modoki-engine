@@ -2220,12 +2220,31 @@ async function describeUnresolvedAgainstLiveWorld(
       // reaches the folder and none of its contents.
       // Canonical urls, for the same reason /api/move-file uses them: the renderer compares
       // exactly and these strings came straight off the wire.
-      const deleted = resolved.map((abs) => {
+      // The abs path rides along so the list can be filtered by what ACTUALLY went to the trash
+      // (below) — the stat itself must still happen HERE, before the delete, while the paths
+      // exist. Dropped again immediately after.
+      const candidates = resolved.map((abs) => {
         let isDir = false;
         try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
-        return { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) };
-      }).filter((m): m is { from: string; to: null; prefix?: boolean } => m.from !== null);
-      if (resolved.length > 0) moveToTrash(resolved);
+        return { abs, move: { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) } };
+      }).filter((c): c is { abs: string; move: { from: string; to: null; prefix?: boolean } } => c.move.from !== null);
+      // ⚠️ A per-path OS refusal is a PARTIAL success, and it must not abort the reconciliation
+      // for the paths that DID go (#875 close-out review). On win32 the recycler processes each
+      // path independently, so a locked file / denied ACL / >260-char path fails alone while the
+      // rest of the batch is already in the Recycle Bin. An earlier draft let that throw: the
+      // route 500'd, `rebuildManifest` and `applyMovesInRenderer` never ran, and the caller read
+      // "nothing was deleted" about N-1 files that were gone — with no undo, and a bound editor
+      // still parked on them (the #186 resurrection the unbind below exists to prevent).
+      // That is the same 500 the `manifestRebuilt` comment below forbids, for the same reason.
+      const trashFailed = resolved.length > 0 ? moveToTrash(resolved).failed : [];
+      const wentToTrash = trashFailed.length === 0
+        ? resolved
+        : resolved.filter((abs) => !trashFailed.includes(abs));
+      // Repair the renderer for the paths that GENUINELY went. Unbinding an editor from a file
+      // that is still on disk would be the wrong direction: the binding is still live and valid.
+      const deleted = trashFailed.length === 0
+        ? candidates.map((c) => c.move)
+        : candidates.filter((c) => !trashFailed.includes(c.abs)).map((c) => c.move);
       // Rebuild the asset manifest INLINE, like the other asset routes that mint or
       // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
       // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
@@ -2247,7 +2266,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // wait for the debounce — rather than a 500 that would read as
       // "nothing was deleted" and invite a retry against files already gone.
       let manifestRebuilt = false;
-      if (resolved.length > 0) {
+      if (wentToTrash.length > 0) {
         try { ctx.rebuildManifest(); manifestRebuilt = true; } catch { manifestRebuilt = false; }
       }
       // ⚠️ A DELETE bypassed the repair exactly as a move did (#867's mechanism, found by its
@@ -2262,7 +2281,9 @@ async function describeUnresolvedAgainstLiveWorld(
         ? await applyMovesInRenderer(ctx, deleted)
         : { kind: 'absent' };
       return json({
-        ok: true, trashed: resolved.length, missing, manifestRebuilt,
+        ok: true, trashed: wentToTrash.length, missing, manifestRebuilt,
+        // Named, not merely counted — the caller has to know WHICH ones are still there.
+        ...(trashFailed.length ? { failed: trashFailed.map((abs) => ctx.absToAssetUrl(abs) ?? abs) } : {}),
         ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
         ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
       });

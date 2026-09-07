@@ -15,6 +15,8 @@ import { app, dialog, Menu, type BrowserWindow } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+// The ONE 'same directory?' comparison (#869) — see engine/scripts/pathIdentity.mjs.
+import { samePath } from '../scripts/pathIdentity.mjs';
 
 const MAX_RECENTS = 10;
 // All recents live under a FIXED "modoki-app" dir (via the app-support root), NOT
@@ -141,10 +143,41 @@ export function addRecentProject(root: string): void {
   } catch { /* best-effort */ }
 }
 
-/** True if project path `p` lives inside `repoRoot`. */
+/** True if project path `p` lives inside `repoRoot`.
+ *
+ *  ⚠️ Looks like #869's defect and is NOT one. `path.relative` is **case-insensitive on win32**
+ *  (measured: `relative('E:\\Projects\\modoki', 'e:/Projects/MODOKI/games/sling')` === `'games\\sling'`),
+ *  so a differently-cased drive or clone name still resolves correctly here. That asymmetry is
+ *  the whole reason #869's two guards were wrong and this one is right: they used `===` on two
+ *  absolute paths, which does no folding at all. Left as-is deliberately — it is subst/symlink
+ *  blind, but no reported defect turns on that and `samePath` would change which recents entry
+ *  the two-clone guard picks. */
 export function isUnderRepo(repoRoot: string, p: string): boolean {
   const rel = path.relative(repoRoot, p);
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/** Is `projectRoot` the editor's OWN checkout rather than a game to open? (#869)
+ *
+ *  Two `main.ts` actions must not run against the editor's own tree — `healNativeConfig`
+ *  (rewrites native config) and `ensureProjectDeps` (runs `npm install`). Both guarded with
+ *  `path.resolve(projectRoot) === REPO_ROOT`, which normalises separators and a trailing slash
+ *  but NOT drive-letter case, `subst`, or symlinks — so `MODOKI_PROJECT=e:/Projects/modoki`
+ *  missed the guard and the editor ran an `npm install` into its own repo. It FAILS OPEN: the
+ *  comparison misses, the early return does not happen, the action proceeds.
+ *
+ *  ⚠️ The guard is load-bearing, not defensive dead code: `chooseInitialProject` is handed
+ *  `repoRoot` as a candidate, so `state.root` genuinely can be the repo root.
+ *
+ *  Over-matching here is SAFE (we decline to heal a tree that should not have been opened as a
+ *  project) and under-matching is the bug, which is why this reads `samePath` rather than
+ *  hand-rolling a comparison with its own polarity.
+ *
+ *  Named and exported rather than inlined at the two call sites because `main.ts` imports
+ *  `electron` at module scope and cannot be loaded under vitest — the decision has to live in a
+ *  plain module to be testable at all (the `projectDeps.ts` pattern). */
+export function isEditorsOwnTree(projectRoot: string, repoRoot: string): boolean {
+  return samePath(projectRoot, repoRoot);
 }
 
 /** Pure policy for which project the editor auto-opens on launch — split out of
@@ -277,7 +310,7 @@ export function installAppMenu(opts: {
     {
       label: 'Open Recent',
       submenu: recents.length
-        ? recents.map((p) => ({ label: p === opts.currentRoot ? `✓ ${p}` : p, click: () => opts.onOpenRecent(p) }))
+        ? recents.map((p) => ({ label: samePath(p, opts.currentRoot ?? p) && opts.currentRoot ? `✓ ${p}` : p, click: () => opts.onOpenRecent(p) }))
         : [{ label: '(none)', enabled: false }],
     },
   ];

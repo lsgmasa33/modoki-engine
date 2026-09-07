@@ -16,6 +16,7 @@ import {
   claimsDir, listClaims, claimDevice, foreignClaimFor, adbDeviceId, adbSerialOf, wifiDeviceId, ownAdbClaim,
   isFullyQualified,
   canonicalClonePath,
+  sameClone,
 } from '../../scripts/deviceClaimsStore.mjs';
 import type { DeviceClaim } from '../../scripts/deviceClaimsStore.d.mts';
 
@@ -393,6 +394,47 @@ describe('#865 canonicalClonePath normalisation', () => {
   it('falls back to resolve for a path that does not exist, rather than throwing', () => {
     const missing = path.join(os.tmpdir(), 'modoki-does-not-exist-abcdef', 'x');
     expect(canonicalClonePath(missing)).toBe(path.resolve(missing));
+  });
+
+  /** ⚠️ #869: the half #865 left OPEN, and it had no test — a mutation check reverting
+   *  `sameClone` to `===` on two `canonicalClonePath` results stayed green, because every case
+   *  above uses a path that EXISTS, where `.native` already repairs the drive letter.
+   *
+   *  The residue lives in the fallback. `.native` THROWS for a missing path, so
+   *  `canonicalClonePath` returns bare `path.resolve` output, which does no case folding at all —
+   *  and a stale `~/.modoki/device-claims.json` entry naming a directory that has since been
+   *  deleted is exactly a missing path. `sameClone` now folds at the COMPARISON, which is what
+   *  covers it. Reverting that comparison turns this red. */
+  it.runIf(process.platform === 'win32')(
+    'sameClone matches two spellings of a MISSING path — #865 closed the existing half only', () => {
+      const missing = path.join(os.tmpdir(), 'modoki-869-missing-clone', 'nested');
+      const drive = missing.slice(0, 1);
+      const flipped = (drive === drive.toLowerCase() ? drive.toUpperCase() : drive.toLowerCase()) + missing.slice(1);
+
+      expect(fs.existsSync(missing), 'premise: genuinely absent').toBe(false);
+      expect(flipped, 'premise: a different spelling').not.toBe(missing);
+      expect(canonicalClonePath(flipped), 'premise: canonicalising CANNOT repair a missing path')
+        .not.toBe(canonicalClonePath(missing));
+
+      // …and yet they name the same clone, so the comparison must say so.
+      expect(sameClone(flipped, missing)).toBe(true);
+    });
+
+  /** The same residue, asserted on a platform the HUB can fail on.
+   *
+   *  ⚠️ The test above flips a DRIVE LETTER, so it is win32-only — and #869's other
+   *  discriminating cases are too. That leaves the Mac hub unable to fail if someone reverts
+   *  `sameClone` to `===` (close-out review). The fold is live on darwin as well, so flipping a
+   *  path SEGMENT instead exercises the same mechanism there. Asserted in both directions:
+   *  on linux these are genuinely different directories and must NOT match. */
+  it('folds a case-flipped SEGMENT exactly on the case-insensitive platforms', () => {
+    const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin';
+    const base = path.join(os.tmpdir(), 'modoki-869-Missing-Segment', 'nested');
+    const flipped = path.join(os.tmpdir(), 'modoki-869-missing-segment', 'nested');
+
+    expect(fs.existsSync(base), 'premise: genuinely absent').toBe(false);
+    expect(flipped, 'premise: a different spelling').not.toBe(base);
+    expect(sameClone(flipped, base)).toBe(caseInsensitive);
   });
 });
 

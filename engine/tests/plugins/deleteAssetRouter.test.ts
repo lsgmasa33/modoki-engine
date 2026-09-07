@@ -16,9 +16,18 @@ import os from 'os';
 // the positive case below could not be written at all, and the rebuild would only
 // ever be asserted in its did-not-happen form.
 const trashed: string[][] = [];
+// Paths this stub should REFUSE, so the partial-failure branch is reachable (#875). The real
+// moveToTrash reports a per-path OS refusal in its return value rather than throwing — a stub
+// that returns nothing models a function that cannot exist, and an earlier version of this one
+// did exactly that, which is how a route change slipped past it.
+let refuse: string[] = [];
 vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
-  moveToTrash: (paths: string | string[]) => { trashed.push(Array.isArray(paths) ? paths : [paths]); },
+  moveToTrash: (paths: string | string[]) => {
+    const list = Array.isArray(paths) ? paths : [paths];
+    trashed.push(list);
+    return { failed: list.filter((p) => refuse.some((r) => p.endsWith(r))) };
+  },
 }));
 
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
@@ -146,6 +155,34 @@ describe('/api/delete-asset rebuilds the asset manifest inline', () => {
     // Nothing left the disk, so there is nothing for the manifest to catch up ON.
     // Reporting `manifestRebuilt:true` here would be a claim about work that never
     // happened — the shape §0 ranks worst.
+    expect(rebuilds).toBe(0);
+    expect(r.body.manifestRebuilt).toBe(false);
+  });
+
+  /** A per-path OS refusal is a PARTIAL success (#875 close-out review). An earlier draft made
+   *  moveToTrash THROW on one, which aborted reconciliation for the paths that DID go: the route
+   *  500'd, the manifest was not rebuilt, the renderer was never told, and the caller read
+   *  "nothing was deleted" about files already in the Recycle Bin. Same shape the rebuild case
+   *  above forbids, and worse, because it also loses the renderer repair and the undo. */
+  it('reconciles what WENT and names what did not, rather than failing the batch', async () => {
+    const { ctx, url, dir } = withRealFile();
+    refuse = [path.basename(url)];
+    let rebuilds = 0;
+    const r = (await del({ paths: [url] }, ctx(() => { rebuilds++; return {}; }))) as
+      { status?: number; body: { ok: boolean; trashed: number; failed?: string[]; manifestRebuilt: boolean } };
+    refuse = [];
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    expect(r.status, 'a refusal on ONE path must not 500 the batch').toBeUndefined();
+    expect(r.body.ok).toBe(true);
+    // Nothing actually went, so nothing is claimed to have gone…
+    expect(r.body.trashed).toBe(0);
+    // …and the survivor is NAMED, not merely counted. Asserted by identity rather than exact
+    // spelling: this ctx stubs `absToAssetUrl: () => null` on purpose, so the route falls back
+    // to the absolute path — a fallback the ctx's own comment already declines to pin.
+    expect(r.body.failed).toHaveLength(1);
+    expect(r.body.failed?.[0]).toContain(path.basename(url));
+    // No rebuild either: the manifest has nothing to catch up on.
     expect(rebuilds).toBe(0);
     expect(r.body.manifestRebuilt).toBe(false);
   });

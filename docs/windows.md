@@ -124,12 +124,37 @@ load-bearing and commented as such).
   | `C:\Users\RUNNER~1\…` (an 8.3 SHORT path) | left short | expanded to the long form |
 
   So a comparison that canonicalises with the JS walk still fails on a `subst`ed checkout or a
-  lower-cased drive letter. `path.resolve` repairs neither. ⚠️ **`.native` only normalises a
-  path that EXISTS** — for a missing path both forms throw and callers fall back to `resolve`,
-  which restores the case problem, so a comparison over paths that may not exist is still
-  spelling-sensitive. `deviceClaimsStore.mjs`'s `canonicalClonePath` is the worked example;
-  **#869** is the open instance of getting this wrong (two `engine/electron/main.ts` guards
-  compare a `__dirname` root against a project root with neither realpath nor case folding).
+  lower-cased drive letter. `path.resolve` repairs neither.
+- ⚠️ **`.native` only normalises a path that EXISTS**, and throws otherwise. That is why the
+  canonicaliser alone is not enough, and it is where #865's fix still had a hole: callers fall
+  back to `path.resolve`, which folds nothing, and **a persisted path naming a directory that is
+  gone — a stale recents entry, a stale device claim — is exactly that case.**
+
+  ⚠️ **This does NOT mean such a comparison is unfixable**, which an earlier version of this
+  section claimed. The residue belongs to the COMPARATOR, not the canonicaliser: case-fold at the
+  comparison and two spellings of a missing path match again. Measured on `win`.
+- **Use `samePath` / `canonicalPath` from `engine/scripts/pathIdentity.mjs`** — the one
+  implementation (#869), reachable from electron TS, `engine/plugins/**` TS and the bare-node
+  `.mjs` CLIs alike. Before it existed the repo had hand-rolled this **eight** times in four
+  mutually inconsistent recipes. `engine/tests/architecture/pathIdentityIsShared.test.ts` now
+  bans a new `path.resolve(x) === y`; it found the eighth site itself, which a hand-written census
+  grep had missed because the call was `path.resolve(path.join(...))` and nested parens defeated
+  the pattern.
+
+  Two things that are deliberately NOT that shape and must stay as they are:
+  - **`isUnderRepo` (`electron/projects.ts`) is correct** — `path.relative` **is case-insensitive
+    on win32**, so a containment check already folds. Measured:
+    `relative('E:\Projects\modoki', 'e:/Projects/MODOKI/games/sling')` is `'games\sling'`. This
+    asymmetry is exactly why #869's two guards were wrong and this one was not: they used `===`
+    on two absolute paths, which folds nothing.
+  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` HASH the
+    path into a PERSISTED identity** — a userData profile dir and a per-project auth token.
+    Re-normalising them relocates every existing user's profile (prefs silently reset) and 403s
+    them against their own editor. Their omission of realpath is arguably right for a stable
+    identity: a `subst` mapping can vanish and take the identity with it. ⚠️ `multiProfileKey`
+    has already drifted from the other two — it lost the trailing-slash trim, so
+    `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles. That is a real defect needing a migration
+    decision, not a sweep.
 - ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
   baseline quietly encodes a second claim nobody meant to assert. The two forms also disagree on an
   **8.3 short path** (row 3 above), so `deviceClaimBuildGuard.test.ts` — seeding a drive-CASE
@@ -330,6 +355,69 @@ degrades to system npm, so a dev machine boots fine and `smoke:packaged` reporte
 its own log said `Node provisioning failed`. When testing an extractor, do not build the fixture
 with the same tool — GNU tar's `-a -cf x.zip` writes a *tar* named `.zip` that extracts happily
 and proves nothing. Assert the `PK` magic bytes instead.
+
+### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
+
+It **appends them to the command line as more source**. `$args` is empty, and the trailing items
+are re-parsed by the PowerShell parser. This is not a quoting bug you can escape your way out of;
+it is the wrong channel. Measured on `win` (#875):
+
+| invocation | `$args` |
+|---|---|
+| `-Command <script> p1 p2` | **empty** — and `p1 p2` are executed as statements |
+| `-Command "& { <script> }" p1 p2` | binds — but see below |
+
+`moveToTrash` shipped the first form for months. Three consequences, in the order they bite:
+
+1. **`foreach ($p in $args)` iterated zero times**, so the editor's "move to Recycle Bin" recycled
+   *nothing* on Windows, ever.
+2. **A path with a space splits.** `…\a file.json` became `…\a` + `file.json`, so the `& { }`
+   "fix" would have deleted `…\a` — a path the user never selected. **Binding `$args` is not the
+   fix**; it converts a no-op into a wrong-target delete.
+3. **A FILENAME can execute.** A legal NTFS name containing `; <statement>` ran that statement
+   (verified with an inert payload, exit 0, no error). The name need not be typed by anyone — it
+   can arrive in a downloaded asset pack or a cloned project.
+
+**The rule: data never travels on a PowerShell command line.** Put it on **stdin** (or an env
+var) and read it inside the script. `osascript -e … p1 p2` genuinely does bind argv (`on run
+argv`), which is why the macOS branch was correct and the comment claiming both were safe was
+half wrong — do not generalise from the mac side.
+
+Two traps in the replacement, both of which cost a measurement here:
+
+- ⚠️ **A .NET exception inside a PowerShell loop is NON-terminating: the script keeps going and
+  still EXITS 0.** So `execFileSync` does not throw and the caller reports success for work that
+  did not happen. This bit twice in one change — the fixed `moveToTrash` recycled the good paths,
+  wrote nothing for the bad one, and `/api/delete-asset` returned `{ok:true}`, unbound the asset
+  in the renderer and rebuilt the manifest for a file still on disk. Measured: one bad path among
+  two good ones exited 0.
+
+  **Count failures and `exit` non-zero.** ⚠️ Do *not* reach for `$ErrorActionPreference = 'Stop'`
+  instead — it reports the failure but abandons every remaining path, converting one bad file
+  into a half-applied batch. `try`/`catch` per item keeps the batch going *and* reports:
+
+  ```powershell
+  $failed = 0
+  foreach ($p in $paths) { try { … } catch { $failed++; [Console]::Error.WriteLine("FAILED $p") } }
+  if ($failed -gt 0) { exit $failed }
+  ```
+
+  The general form of the trap: **the loud failure is the lucky one.** The broken version of this
+  code failed loudly *by accident* (the path ran as a command and exited 1); fixing the real bug
+  removed the accident and left a silent one behind. When a fix removes an incidental error path,
+  check what was relying on it.
+- ⚠️ **`[Console]::In` decodes through the console's CODE PAGE.** On a dev box already at 65001
+  everything works and the guard looks like dead code; on a default en-US (437) or ja-JP (932)
+  console the UTF-8 bytes are mangled, the path matches nothing, and the file **silently
+  survives** — exit 0, nothing thrown. Set `[Console]::InputEncoding` to UTF-8 *before* the read.
+  A mutation check on a 65001 machine will tell you the line is unnecessary; it is lying to you,
+  and the only way to see it is to force a legacy code page (`GetEncoding(437)`) in the test.
+- **`[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile` throws `Could not find file` on a
+  directory.** Folders need `DeleteDirectory`. Branch on `Test-Path -PathType Container`.
+
+⚠️ **This was a singleton, not a class** — a sweep found the repo's four other PowerShell call
+sites (`packagedAppPaths.mjs`, `stopDevServer.mjs`, `toolchain/index.ts`, `buildStepShell.test.ts`)
+all interpolate their values into the script string and pass no trailing args. Do not "fix" them.
 
 ## Packaged-app bugs found on real Windows hardware
 
