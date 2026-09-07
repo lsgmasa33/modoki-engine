@@ -186,6 +186,59 @@ Two rules fall out, both learned the expensive way:
 ⚠️ **`livenessTokenIsShared.test.ts` does not see this shape**, because nothing is compared against a
 counter. Do not read a green guard as "there is no lifetime question here".
 
+### The precondition the claim shape hides: the consumer must be an event that ACTUALLY fires
+
+The shape above is *register a claim, let an authoritative event consume it*. Its unstated
+precondition is that the event **arrives**. #789 and #839 are the two ways that fails, and both
+were shipped, green, for months — because a mechanism that cannot fire breaks nothing a test asserts.
+
+- **#789 — the work is reachable only from a path a swap never takes.** `space-console`'s three
+  systems and `3d-test`'s stats readback keep per-frame state in module-scope maps keyed by koota
+  entity id. `resetShipShakeSystem` / `resetCameraDistanceSystem` / `resetEngineFlameSystem` all
+  existed and all did the right thing — and their only non-test caller was `unregisterGameSystems`,
+  which a world swap does not call. koota recycles entity ids, so the new world's ship read the old
+  world's offset as its own: `baseX = tf.x - prev.dx` recovers a base pose that is off by the
+  previous world's displacement, and the next frame recomputes the base from the already-displaced
+  transform, so the bias is **permanent**, not a one-frame blip.
+- **#839 — the claim is consumed by a FOREIGN event.** The Hierarchy recorded "this swap needs a
+  collapse restore" on `onWorldSwap` and left the consuming to `onStructureDirtyCoalesced`.
+  Structure-dirty fires on `registerEntity`; `loadSceneFile` registers the incoming scene's entities
+  into the **staging** world *before* the swap, and `SceneManager` marks nothing dirty after
+  `setCurrentWorld`. So for a scene loaded after boot no settled refresh ever followed the swap: the
+  collapse set was never restored **and** — because the same claim gated the save — never persisted,
+  for the rest of that scene. Measured, not reasoned: reverting the fix turns
+  `editor-hierarchy-collapse.spec.ts` red on both halves.
+
+**The rule.** Before trusting a claim/teardown, trace the edge from `setCurrentWorld` to the work.
+If no edge exists, the mechanism cannot fire, and the code reads correct at every line.
+
+Two corollaries, each the cheaper half of the fix:
+
+- **Own the trigger you depend on.** If the work must happen after a swap, schedule it from the swap
+  handler — do not hand it to an event that merely *usually* follows. A foreign event is a
+  backstop, never the primary path.
+- **Key a swap-scoped claim by IDENTITY, never by an unkeyed boolean.** #839's `restoreNeededRef`
+  was a `Set`-of-one degenerated to a flag: two swaps collapse into one claim, and nothing
+  distinguishes *"restored"* from *"never had anything to restore"*. Re-keyed on the scene path the
+  set was restored FOR, an unconsumed claim costs one skipped save instead of a permanently shut
+  gate — the gate answers from the current path rather than waiting to be cleared. This is the same
+  correction as "key the claim per CALL" above, one level down: a boolean is what a `Set<path>`
+  degrades to when there is only ever one key.
+
+  ⚠️ **Pick the identity the ids actually belong to.** #839's first fix keyed the claim on the
+  scene PATH, which looks equivalent and is not: `saveScene()` re-points the path with no swap and
+  no structural change, so a plain **File → Save As** read as "needs restore" and the next
+  structural change collapsed the whole tree and persisted that over the arrangement the user had
+  just saved. The set is owned by the WORLD whose entity ids it holds; the path is only where it
+  gets written. A world identity also needs no clearing on the swap — a new world simply is not
+  the old one — which a flag nulled on every swap EVENT gets wrong the moment `stepSimulation`
+  swaps the world out and back.
+
+⚠️ **A docblock is not an edge.** `cameraDistanceSystem`'s said "world-swap teardown goes through
+`resetCameraDistanceSystem` which clears everything" while no world-swap path to it existed. That is
+worse than no comment: it stops the next reader looking. When you assert a wiring in prose, name the
+file and the registration, so the claim is checkable.
+
 ### Scope: module and instance, not components
 
 The helper and its guard cover module-scoped and instance-scoped state. An editor panel that runs the

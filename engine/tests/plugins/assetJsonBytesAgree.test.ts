@@ -123,9 +123,21 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
       .filter((l) => l.includes('writeJsonAtomic(') && !l.includes('function writeJsonAtomic('));
     expect(calls.length, 'the writeJsonAtomic call scan found nothing — it has broken')
       .toBeGreaterThanOrEqual(5);
-    const untyped = calls.filter((c) => !/assetJsonBytes\(|sceneJsonBytes\(/.test(c));
-    expect(untyped, 'a writeJsonAtomic call passes neither assetJsonBytes nor sceneJsonBytes, so '
-      + 'nothing states which serialisation it owns. That is how the scene writer silently '
+    // A call may name its producer INLINE (`writeJsonAtomic(abs, assetJsonBytes(out))`) or through
+    // a local the same file assigns from one (`const outBytes = assetJsonBytes(out)` — which
+    // /api/asset-write needs, because it also hashes those exact bytes into the reply and must not
+    // serialise them twice). Both DECLARE which serialisation the call owns, which is the claim;
+    // a bare identifier that traces to neither producer does not, and still fails.
+    const declaredFrom = (id: string) =>
+      new RegExp(`(?:const|let)\\s+${id}\\s*(?::[^=]+)?=\\s*(?:assetJsonBytes|sceneJsonBytes)\\(`).test(src);
+    const untyped = calls.filter((c) => {
+      if (/assetJsonBytes\(|sceneJsonBytes\(/.test(c)) return false;
+      const arg = /writeJsonAtomic\([^,]+,\s*([A-Za-z_$][\w$]*)\s*\)/.exec(c);
+      return !(arg && declaredFrom(arg[1]));
+    });
+    expect(untyped, 'a writeJsonAtomic call passes neither assetJsonBytes nor sceneJsonBytes — not '
+      + 'inline, and not through a local this file assigns from one — so nothing states which '
+      + 'serialisation it owns. That is how the scene writer silently '
       + 'inherited the asset trailing newline.\n\n' + untyped.join('\n')).toEqual([]);
     // And the scene caller specifically must be on the client-matching one.
     expect(calls.some((c) => /sceneJsonBytes\(scene\)/.test(c)),

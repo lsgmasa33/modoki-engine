@@ -181,6 +181,7 @@ import {
 import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
 import { PARTICLE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/particles/types';
 import { MATERIAL_FORMAT_VERSION } from '../../packages/modoki/src/runtime/traits/Renderable3D';
+import { ATLAS_FORMAT_VERSION } from '../../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 // Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
 // itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
@@ -200,6 +201,11 @@ import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/renderin
 const ASSET_WRITE_FORMAT_VERSION: Partial<Record<AssetSchemaType, number>> = {
   material: MATERIAL_FORMAT_VERSION,
   particle: PARTICLE_FORMAT_VERSION,
+  // #831: `.atlas.json` came onto this route when AtlasAssetView stopped autosaving. It carries a
+  // stamped `version`, and the PANEL already refuses a too-new one client-side
+  // (`classifyAtlasLoad`) — so without this row the refusal lived only in the UI and an agent's
+  // `modoki_write_asset` could overwrite a document this build cannot read.
+  atlas: ATLAS_FORMAT_VERSION,
 };
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
@@ -378,6 +384,34 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
  *  which strips a leading BOM as part of decoding (#490 review finding 2). */
 function stripUtf8Bom(buf: Buffer): Buffer {
   return (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) ? buf.subarray(3) : buf;
+}
+
+/** The `ifMatch` precondition, shared by `/api/write-file` and `/api/asset-write` (#469, #831).
+ *
+ *  Returns null when the caller may proceed, or the 409 body when it may not. `expected` is a
+ *  sha256 of the file's bytes as the CLIENT last read them; a caller that omits it gets an
+ *  unconditional write, exactly as before.
+ *
+ *  ⚠️ **ATOMICITY IS THE ENTIRE POINT, and it is a property of the CALL SITE, not of this
+ *  function.** The read + hash + compare here are synchronous, and Node is single-threaded, so
+ *  nothing can interleave between this returning `null` and the caller's write — PROVIDED the
+ *  caller does not `await` in between. An `await` inserted between this call and the write
+ *  reopens exactly the race the precondition exists to close, and neither the type checker nor a
+ *  unit test can see it. This closes SAME-PROCESS races (every editor panel); a genuinely
+ *  external writer (another process, `git checkout`) can still land between the hash and the
+ *  write at the OS level — a much narrower window than before, and not what #469 is about.
+ *
+ *  A leading UTF-8 BOM is stripped before hashing so this agrees with the CLIENT side (#490
+ *  review finding 2): the browser's `Response.text()` strips a leading BOM as part of decoding,
+ *  so a BOM'd file — a Windows-authored `.atlas.json`, say — would otherwise hash differently
+ *  here than the panel's own baseline FOREVER, 409ing on every write with no way to succeed. */
+function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: false; conflict: true; reason: string } | null {
+  if (expected === undefined) return null;
+  let currentBytes: Buffer | null;
+  try { currentBytes = fs.readFileSync(absPath); } catch { currentBytes = null; }
+  const currentHash = currentBytes === null ? null : crypto.createHash('sha256').update(stripUtf8Bom(currentBytes)).digest('hex');
+  if (currentHash === null || currentHash !== expected) return { ok: false, conflict: true, reason: 'if-match' };
+  return null;
 }
 
 /** The EXACT bytes a JSON document write puts on disk — the single definition of that, because
@@ -1821,7 +1855,13 @@ async function describeUnresolvedAgainstLiveWorld(
       // below only ever exists for the scene actually loaded live — this route can target ANY
       // scene FILE on disk, loaded or not), and unsavedChanges (only load-bearing on the
       // FILE-DIRECT fallback below; see its own comment for why).
-      type EditorStateProbe = { playState?: string; unsavedChanges?: boolean; scenePath?: string };
+      // `unsavedCauses` (#844) — additive on `get_editor_state`/`editor-state`, so an OLDER or
+      // otherwise-mismatched renderer simply omits it; the refusal below falls back to the old
+      // generic wording rather than crashing on a missing field.
+      type EditorStateProbe = {
+        playState?: string; unsavedChanges?: boolean; scenePath?: string;
+        unsavedCauses?: { sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[] };
+      };
       let st: EditorStateProbe | null = null;
       let probeFailed = false;
       // 8s, not 2s (independent review, 2026-07-30). `requestBrowser` REJECTS on timeout, and this
@@ -1938,18 +1978,31 @@ async function describeUnresolvedAgainstLiveWorld(
         }
       }
       // ── File-direct fallback (headless curl, no renderer, wrong scene loaded, or setBaseScene) ──
-      // Refuse when the editor has UNSAVED live work — entities created via create_entity /
-      // duplicate_entity / prefab that are not in the scene file yet. This route edits the FILE, and
-      // the resulting disk hot-reload rebuilds the live world FROM that file, silently DESTROYING
-      // those unsaved entities while the tool reported ok:true, changed:N. Save first, then the reload
-      // is lossless. Mirrors the load_scene / new_scene guardUnsaved sibling. (F3) Moot when we just
+      // Refuse when the editor has UNSAVED work of ANY kind — since #831 a Material slider drag
+      // parks a dirty asset the same as create_entity/duplicate_entity/prefab park a live-world
+      // edit, and this route edits the FILE either way: the resulting disk hot-reload rebuilds the
+      // live world FROM that file, silently DESTROYING whichever kind of unsaved work is pending
+      // while the tool reported ok:true, changed:N. Save first, then the reload is lossless.
+      // Mirrors the load_scene / new_scene `guardUnsaved` sibling (agentEditorOps.ts) — same
+      // cause-naming shape, built from the same `unsavedChangeCauses()`. (F3) Moot when we just
       // went live above (that branch returned already) — this only guards the true file-direct case.
       if (st?.unsavedChanges === true) {
-        return json({
-          ok: false,
-          error: `the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`,
-          unsavedChanges: true,
-        }, 409);
+        // #844: name the ACTUAL cause(s) instead of a fixed string that always blamed
+        // create_entity/duplicate_entity/prefab — a dirty asset (e.g. a Material slider drag) sent
+        // an agent hunting entities it never created. Two differences from `guardUnsaved`: the
+        // consequence here is the FILE hot-reload destroying live work, not a world swap; and this
+        // route has no `discardUnsaved`/`force` escape hatch, so the only remedy is `modoki_save_all`.
+        const c = st.unsavedCauses;
+        const causes: string[] = [];
+        if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
+        if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
+        if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+        const error = causes.length
+          ? `the editor has UNSAVED work — ${causes.join(' AND ')}. This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`
+          // No `unsavedCauses` on the probe (an older/mismatched renderer) — fall back to the
+          // old generic wording rather than naming a cause list that doesn't exist.
+          : 'the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.';
+        return json({ ok: false, error, unsavedChanges: true }, 409);
       }
       const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
@@ -2574,13 +2627,31 @@ async function describeUnresolvedAgainstLiveWorld(
   // an existing file's `id` when the new data omits one.
   if (urlPath === '/api/asset-write' && method === 'POST') {
     try {
-      const { path: assetPath, type, data } = (body ?? {}) as {
-        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean;
+      const { path: assetPath, type, data, ifMatch } = (body ?? {}) as {
+        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean; ifMatch?: string;
       };
       if (!assetPath || !type) return json({ error: 'asset-write requires { path, type, data }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return json({ error: 'path outside allowed directories' }, 403);
+      // Optional compare-and-swap precondition (#831), the same one `/api/write-file` carries and
+      // through the same helper. `AtlasAssetView` is the caller that needs it: it serializes the
+      // WHOLE document, nothing notifies it of a same-path content change, and since #831 its
+      // write is PARKED — so the window between the read it serializes onto and the write is now
+      // as long as the human takes to press Cmd+S, rather than one keystroke. Absent `ifMatch` ⇒
+      // unconditional write, so every other caller (agent ops, the four parking panels) is
+      // unaffected.
+      //
+      // ⚠️ Everything from here to `writeJsonAtomic` below is SYNCHRONOUS, which is what makes the
+      // check-then-write atomic — see `ifMatchRefusal`. Do not introduce an `await` into this span.
+      const casRefusal = ifMatchRefusal(abs, ifMatch);
+      if (casRefusal) {
+        return json({
+          ...casRefusal,
+          error: `REFUSED: ${assetPath} changed on disk since it was read. Nothing was written.`,
+          hint: 'Re-read the file and re-apply the edit onto the current content.',
+        }, 409);
+      }
       const { errors, warnings } = validateAssetData(type, data);
       if (errors.length) return json({ ok: false, errors, warnings }, 400);
       // ── asset-write is a FULL REPLACE, so a thin `data` is a DESTRUCTIVE write. ──
@@ -2604,12 +2675,23 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       // ── Refuse to overwrite a document this build cannot read (docs/format-versioning.md
       // § 2b: "a writer that ... can overwrite an existing document must refuse a too-new
-      // one"). Only the asset types that carry a real format constant are checked — `type`
-      // is narrowed to `AssetSchemaType`, which does not include `mesh`/`atlas` (those are
-      // written elsewhere, never through this route), so the map below only ever matches
-      // `material`/`particle` today; any OTHER type keeps today's behaviour rather than
-      // inventing a constant that does not exist.
-      const prevText = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : null;
+      // one"). Only the asset types that carry a real format constant are checked; a type
+      // with no stamped `version` field (`.anim.json`, `.spriteanim.json`, `.timeline.json`,
+      // `.rig2d.json`, `.shader.json`, `.animset.json` — § 3) keeps today's behaviour rather
+      // than being mapped to an invented constant. ⚠️ This comment used to say `AssetSchemaType`
+      // "does not include `mesh`/`atlas` (those are written elsewhere, never through this
+      // route)". `atlas` came onto this route in #831 and is now in the map above; `mesh` is
+      // still not an `AssetSchemaType` at all.
+      // ⚠️ BOM-stripped, and it is load-bearing three times over. A `.json` with a leading UTF-8
+      // BOM — a Windows-authored file, or one round-tripped through an editor that adds one — is
+      // NOT parsable by `JSON.parse`, so reading it raw made this route: (1) classify it
+      // `unreadable` and REFUSE every write to it forever, (2) leave `prevDoc` null so the
+      // dropped-field guard silently passed anything, and (3) skip id preservation, so a document
+      // whose `id` the caller omitted got a brand-new GUID minted by the watcher's heal and every
+      // reference to it dangled (the C7 class). Measured 2026-09-07 while adding the `ifMatch`
+      // test above: a BOM'd atlas 400'd with "could not be classified (unparsable)". The bytes
+      // written back never carry a BOM (`assetJsonBytes`), so this also heals the file in place.
+      const prevText = fs.existsSync(abs) ? stripUtf8Bom(fs.readFileSync(abs)).toString('utf-8') : null;
       if (prevText !== null) {
         const formatVersion = ASSET_WRITE_FORMAT_VERSION[type];
         if (formatVersion !== undefined) {
@@ -2676,8 +2758,14 @@ async function describeUnresolvedAgainstLiveWorld(
         const bytes = assetJsonBytes(out);
         ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
       }
-      writeJsonAtomic(abs, assetJsonBytes(out));
-      return json({ ok: true, saved: true, warnings, path: assetPath });
+      const outBytes = assetJsonBytes(out);
+      writeJsonAtomic(abs, outBytes);
+      // The sha256 of what now sits on disk, so a compare-and-swap caller can advance its own
+      // baseline without re-fetching. It CANNOT compute this itself: the bytes are the server's
+      // (`normalizeAssetData` + the id-preservation branch + `assetJsonBytes`' trailing newline),
+      // and a client that reconstructs them is a second copy of that serialisation waiting to
+      // drift — after which every subsequent write 409s against a baseline that was never right.
+      return json({ ok: true, saved: true, warnings, path: assetPath, sha256: crypto.createHash('sha256').update(outBytes).digest('hex') });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2740,32 +2828,12 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       if (!absPath) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
       // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
-      // compare-and-swap caller (AtlasAssetView's #439 CAS guard was the motivating one) gets
-      // the compare and the write as ONE atomic operation instead of doing its own
-      // read-then-write with a gap a second write can land in between. Absent `ifMatch` ⇒
-      // unconditional write, exactly as before — every existing caller is unaffected.
-      //
-      // ⚠️ ATOMICITY IS THE ENTIRE POINT: this precondition read + hash + compare happens with
-      // the SYNCHRONOUS fs API and NO `await` between the compare and the write below. Node is
-      // single-threaded, so a synchronous span cannot be interleaved by another in-flight
-      // request — an `await` anywhere in this span (e.g. a refactor to `fs.promises.readFile`)
-      // would reopen exactly the race this endpoint exists to close. This closes SAME-PROCESS
-      // races (every editor panel); a genuinely external writer (another process, `git
-      // checkout`) can still land between the hash check and the write at the OS level — a much
-      // narrower window than before, and not what #469 is about.
-      if (ifMatch !== undefined) {
-        let currentBytes: Buffer | null;
-        try { currentBytes = fs.readFileSync(absPath); } catch { currentBytes = null; }
-        // A leading UTF-8 BOM is stripped before hashing so this agrees with the CLIENT side
-        // (#490 review finding 2): the browser's `Response.text()` (what `AtlasAssetView` reads
-        // `loadedText` from) strips a leading BOM as part of decoding, so a BOM'd file — a
-        // Windows-authored `.atlas.json`, say — would otherwise hash differently here than the
-        // panel's own baseline FOREVER, 409ing on every write with no way to ever succeed.
-        const currentHash = currentBytes === null ? null : crypto.createHash('sha256').update(stripUtf8Bom(currentBytes)).digest('hex');
-        if (currentHash === null || currentHash !== ifMatch) {
-          return json({ ok: false, conflict: true, reason: 'if-match' }, 409);
-        }
-      }
+      // compare-and-swap caller gets the compare and the write as ONE atomic operation instead
+      // of doing its own read-then-write with a gap a second write can land in between. Absent
+      // `ifMatch` ⇒ unconditional write, exactly as before. See `ifMatchRefusal` for why NOTHING
+      // may `await` between here and the write below.
+      const refusal = ifMatchRefusal(absPath, ifMatch);
+      if (refusal) return json(refusal, 409);
       // Materialize the exact bytes once so the self-write guard can fingerprint
       // them (the F9 late-rename fallback) and we write the identical buffer.
       const bytes = encoding === 'base64'

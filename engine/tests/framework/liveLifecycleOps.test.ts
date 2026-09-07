@@ -440,6 +440,12 @@ describe('read-asset-def (runtime twin, #166 P7)', () => {
       { ok?: boolean; error?: string; options?: string[] };
     expect(unknown.ok).toBe(false);
     expect(unknown.options).toContain('particle');
+    // The 7 kinds that are actually dispatched below (#842b) — material is deliberately excluded,
+    // it gets its own refusal rather than being an "unsupported type" option.
+    expect(unknown.options).toEqual(
+      expect.arrayContaining(['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset']),
+    );
+    expect(unknown.options).not.toContain('material');
   });
 
   it('an asset NOTHING has loaded is said so, never returned as an empty def', async () => {
@@ -450,6 +456,35 @@ describe('read-asset-def (runtime twin, #166 P7)', () => {
       { ok?: boolean; error?: string };
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not in the live particle cache/i);
+  });
+
+  it('a shader miss ERRORS through the shader cache too (#842b — device surface parity)', async () => {
+    // Proves the device dispatch actually has a `shader` arm, not just the suffix inference and
+    // the advertised `options` — a miss must route to "not in the live cache", not "unsupported
+    // type", which is exactly the bug this whole fix closes.
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/glow.shader.json' }) as
+      { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/not in the live shader cache/i);
+  });
+
+  it('reads a LIVE animset back on the device surface too (#842b)', async () => {
+    const { setAnimSet, clearAnimSetCache } = await import('@modoki/engine/runtime');
+    setAnimSet('/assets/fx/hero.animset.json', { source: 'guid-of-glb', clips: [{ name: 'walk', speed: 2 }] });
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/hero.animset.json' }) as
+      { ok?: boolean; type?: string; def?: { clips: { speed?: number }[] } };
+    expect(r.ok).not.toBe(false);
+    expect(r.type).toBe('animset');
+    expect(r.def?.clips[0].speed).toBe(2);
+    clearAnimSetCache();
+  });
+
+  it('material refuses explicitly on the device surface too, and never as "unsupported type"', async () => {
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/glow.mat.json' }) as
+      { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/only the compiled THREE\.Material is retained/);
+    expect(r.error).not.toMatch(/unsupported type/);
   });
 
   it('infers the kind from every suffix the project uses', async () => {

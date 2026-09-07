@@ -6,8 +6,10 @@
  *  independently. These tests pin that contract. */
 
 import { describe, it, expect } from 'vitest';
+import { createWorld } from 'koota';
 import { mark2DDirty, get2DDirtyVersion, consume2DDirty, ensureCanvas2DListeners } from '../../src/editor/store/canvas2DDirty';
 import { fireDirtyListeners } from '../../src/runtime/core/ecs/entityUtils';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 describe('canvas2DDirty version counter', () => {
   it('bumps the version on every mark2DDirty', () => {
@@ -69,5 +71,25 @@ describe('ensureCanvas2DListeners', () => {
     fireDirtyListeners();
     // Exactly one bump, not two — proves only a single listener is attached.
     expect(get2DDirtyVersion()).toBe(before + 1);
+  });
+});
+
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  // Every test above drives mark2DDirty()/fireDirtyListeners() directly — none of them exercises
+  // the `onWorldSwap(mark2DDirty)` registration inside ensureCanvas2DListeners(), which is what
+  // actually keeps the SceneView 2D overlay redrawing after a real scene swap. Deleting that
+  // registration left the whole suite (this file AND editorStore.test.ts, which pulls this module
+  // in transitively) green — the gap this test closes: it drives a REAL `setCurrentWorld` swap,
+  // the same mechanism `materialInstanceClones.test.ts`'s own world-swap-wiring test uses, and
+  // asserts the dirty EFFECT, not merely that a listener got registered.
+  it('a real world swap marks the 2D canvas dirty', () => {
+    ensureCanvas2DListeners();
+    consume2DDirty(); // clear any pending dirty flag left by earlier tests/module init
+    const before = get2DDirtyVersion();
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    expect(get2DDirtyVersion()).toBeGreaterThan(before);
+    expect(consume2DDirty()).toBe(true);
   });
 });

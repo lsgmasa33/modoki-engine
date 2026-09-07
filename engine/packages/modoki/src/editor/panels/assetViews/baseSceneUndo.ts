@@ -8,8 +8,12 @@
  *  instead of being the one with no test.
  *
  *  `write` is injected rather than imported: it is the component's own state-setting
- *  writer (`mutateScene` + `setBaseScene`), and keeping it a parameter is what makes this
- *  callable — and testable — with no React instance in sight. */
+ *  writer, and keeping it a parameter is what makes this callable — and testable — with no React
+ *  instance in sight.
+ *
+ *  ⚠️ Since #831 `write` does NOT reach disk. The panel applies the ref live (the open scene) or
+ *  parks it (any other scene) and Cmd+S is the write, so `fileDirect` is now a parameter rather
+ *  than a hardcoded `true` — see its own note below. */
 
 import type { UndoAction } from '../../undo/undoManager';
 import { reportUndoFailure } from '../../undo/undoFailure';
@@ -21,11 +25,23 @@ export function makeBaseSceneUndo(params: {
   old: string;
   /** The value this commit set (redo re-applies it). */
   next: string;
-  /** Writes the value and returns whether it landed. Already console.errors the
-   *  underlying /api/scene-mutate failure itself. */
+  /** Applies the value and returns whether it landed. Already console.errors any underlying
+   *  failure itself. */
   write: (v: string) => Promise<boolean>;
+  /** Whether this action's effect is ALREADY on disk, and so must not contribute an edit-version
+   *  bump (see `UndoAction._isFileDirect`).
+   *
+   *  TRUE for a scene the editor has not loaded: the edit is parked in `pendingBaseScene`, which
+   *  `hasUnsavedChanges()` counts on its own — bumping as well would mark the ACTIVE scene dirty
+   *  over an edit that has nothing to do with it, and self-block the flush's own scene-mutate via
+   *  the "unsaved live changes" guard that route carries.
+   *
+   *  FALSE for the OPEN scene: there the ref is applied to `setCurrentBaseScene`, live editor
+   *  state that only a scene save persists — so the bump is exactly right, and without it Cmd+S
+   *  would have nothing telling it the scene changed. */
+  fileDirect: boolean;
 }): UndoAction {
-  const { path, old, next, write } = params;
+  const { path, old, next, write, fileDirect } = params;
   const label = next ? 'Set base scene' : 'Clear base scene';
   return {
     label,
@@ -39,11 +55,6 @@ export function makeBaseSceneUndo(params: {
     redo: async () => {
       if (!await write(next)) reportUndoFailure({ direction: 'Redo', label, detail: `"${path}" was not updated` });
     },
-    // scene-mutate writes straight to the FILE — this edit (and its undo/redo) is
-    // ALREADY persisted, unlike a normal trait/entity edit that's genuinely pending
-    // a Cmd+S. Without this, pushAction/undo/redo's unconditional edit-version bump
-    // would falsely mark the ACTIVE scene dirty and self-block a FOLLOW-UP
-    // scene-mutate call via the "unsaved live changes" guard that route carries.
-    _isFileDirect: true,
+    _isFileDirect: fileDirect,
   };
 }

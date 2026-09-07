@@ -2,33 +2,50 @@
  *  persistence, Phase 8). One field today: the scene's `baseScene` ref, edited
  *  via `AssetRefField` (`accept: ['scene']`) exactly like any other asset ref.
  *
- *  Writes go through `POST /api/scene-mutate` with the `setBaseScene` op
- *  (Phase 7), NOT the generic `persistAssetEdit` whole-file-overwrite other
- *  asset views use. A scene file is not a plain static asset like a material —
- *  it is also what the live editor world serializes INTO on save, and
- *  scene-mutate already carries the guards that matter here: it refuses to
- *  write while Playing/Paused (a mid-Play edit would be discarded on Stop) and
- *  while the editor holds unsaved live-world changes for THIS scene (a raw
- *  whole-file write would silently destroy them). Reusing it also means this
- *  view and an agent's `modoki_mutate_scene` calls can never race each other
- *  with two different serializations of the same field.
+ *  ⚠️ **This edit is MANUAL-SAVE as of #831, and it takes one of two routes.** It used to POST
+ *  `/api/scene-mutate` the moment the field changed — no save action, while `get_editor_state`
+ *  reported `persistenceMode:'manual'` — which is the same defect the four `persistAssetEdit`
+ *  views had, reached down a different route. #831's own body cleared this view on the grounds
+ *  that avoiding `persistAssetEdit` was deliberate; that was about the MECHANISM and said nothing
+ *  about WHEN the bytes land.
+ *
+ *  It still does not use `persistAssetEdit`, and that part IS deliberate: a scene file is not a
+ *  plain static asset like a material — it is also what the live editor world serializes INTO on
+ *  save, so a whole-file overwrite would silently destroy unsaved live-world changes.
+ *  `/api/scene-mutate` edits the one field and carries the guards that matter (it refuses while
+ *  Playing/Paused, and while the editor holds unsaved live work its write would hot-reload away),
+ *  and reusing it means this view and an agent's `modoki_mutate_scene` can never race with two
+ *  different serializations of the same field.
+ *
+ *  **The OPEN scene does not go through that route at all.** `serializeScene` emits `baseScene`
+ *  from `setCurrentBaseScene`'s module state, so for the active scene the ref is applied THERE and
+ *  Cmd+S writes it with everything else. That is also a bug fix: `_currentBaseScene` was only ever
+ *  set at LOAD, so setting a base on the open scene put the ref in the file and the next Cmd+S
+ *  serialised the stale module value straight back over it.
+ *
+ *  **Any other scene** — one the editor has not loaded — parks in `pendingBaseScene` and is
+ *  flushed by `saveAll`, LAST. See that module's header for why the ordering is load-bearing.
  *
  *  Cycle detection is a NEW check (nothing else validates it at ref-set time):
  *  resolve the candidate base's own chain and refuse if this scene's guid
  *  already appears in it. The load-time chain resolver (Phase 4) is the
  *  backstop for a hand-edit or agent write that skips this UI.
  *
- *  The pushAction below sets `_isFileDirect: true` (undoManager.ts) — this edit
- *  is already persisted via scene-mutate, unlike a normal trait/entity edit
- *  that's genuinely pending a Cmd+S. Without it, the undo stack's unconditional
- *  edit-version bump would falsely mark the active scene dirty and self-block
- *  a follow-up scene-mutate call via the same "unsaved live changes" guard
- *  this view's own write goes through (found live while testing this view:
- *  clear-then-restore in one session tripped exactly this). */
+ *  The pushAction below passes `fileDirect` rather than the hardcoded `true` it used to
+ *  (undoManager.ts). For a NON-open scene it stays true: the edit is parked, `hasUnsavedChanges()`
+ *  counts it on its own, and a bump as well would mark the ACTIVE scene dirty over an edit that
+ *  has nothing to do with it — and self-block the flush's own scene-mutate via the "unsaved live
+ *  changes" guard that route carries (found live while testing this view: clear-then-restore in
+ *  one session tripped exactly this). For the OPEN scene it is false, because there the bump is
+ *  the only thing telling Cmd+S the scene changed. */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
+import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from 'react';
 import { pushAction } from '../../undo/undoManager';
+import { getCurrentScenePath, setCurrentBaseScene } from '../../scene/serialize';
+import {
+  applyBaseSceneEdit, peekBaseSceneEdit, isBaseSceneDirty,
+  subscribePendingBaseScenes, getPendingBaseScenesVersion,
+} from '../../scene/pendingBaseScene';
 import { makeBaseSceneUndo } from './baseSceneUndo';
 import { AssetRefField, assetDisplayName } from '../AssetRefField';
 import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
@@ -51,28 +68,10 @@ const fetchSceneMetaForEditor: FetchSceneMeta = async (locator) => {
   }
 };
 
-// Exported for unit testing without mounting the component.
-export async function mutateScene(path: string, baseScene: string | null): Promise<{ ok: boolean; errors: string[] }> {
-  // Resolve `{ok:false}` on a THROWN request too, matching every sibling backend wrapper
-  // in assetOps (each is `try { … return res.ok } catch { return false }`). Without this
-  // the fetch rejection escaped `write()` and, through it, this view's undo/redo closures —
-  // and a throw from an undo closure is the one failure mode #308 rules out: `undo()` pops
-  // the action BEFORE awaiting it, so the rejection skips `redoStack.push` and the `!undo`
-  // event and loses the action from BOTH stacks. An HTTP error already resolved false; only
-  // a network-level failure could throw, which is exactly when the editor is least able to
-  // afford losing an undo entry.
-  let res: Response;
-  try {
-    res = await backendFetch('/api/scene-mutate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, ops: [{ op: 'setBaseScene', baseScene }] }),
-    });
-  } catch (e) {
-    return { ok: false, errors: [e instanceof Error ? e.message : String(e)] };
-  }
-  const body = await res.json().catch(() => ({ ok: false, errors: [`HTTP ${res.status}`] }));
-  return { ok: res.ok && body.ok !== false, errors: body.errors ?? (res.ok ? [] : [body.error ?? `HTTP ${res.status}`]) };
-}
+/** ⚠️ `mutateScene` used to live here and now lives in `scene/pendingBaseScene.ts`, beside the
+ *  flush that calls it — a `.tsx` is not importable from `scene/`, and the flush needs it. It is
+ *  re-exported so the tests and tools that reach for it by this name keep working. */
+export { mutateScene } from '../../scene/pendingBaseScene';
 
 /** Pure (no React) cycle check: would pointing `myGuid`'s scene at `candidateGuid`
  *  as its base create a cycle? `fetchSceneMeta` accepts EITHER a guid or a path as
@@ -104,6 +103,12 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
   const baseSceneRef = useRef(baseScene);
   baseSceneRef.current = baseScene;
 
+
+  // Re-render when the pending-edit registry moves, so the unsaved marker below is honest after a
+  // Cmd+S or an agent discard — neither of which passes through this component.
+  useSyncExternalStore(subscribePendingBaseScenes, getPendingBaseScenesVersion, getPendingBaseScenesVersion);
+  const pendingHere = isBaseSceneDirty(path);
+
   useEffect(() => {
     const ac = new AbortController();
     setLoaded(false);
@@ -115,16 +120,48 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
         const data = json as { id?: string; baseScene?: string } | null;
         if (!data) return;
         setMyGuid(data.id && isGuid(data.id) ? data.id : null);
-        setBaseScene(data.baseScene ?? '');
+        // ⚠️ ASK THE REGISTRY BEFORE THE FILE, for the same reason every parking asset view does
+        // (`pendingAssetDoc`): between the edit and Cmd+S the file still holds the PRE-edit ref,
+        // so re-opening this panel on it would show the old value over a newer pending one.
+        // `undefined` means nothing is parked; `null` means a parked CLEAR, which must show as
+        // empty rather than falling through to the file's value.
+        const parked = peekBaseSceneEdit(path);
+        setBaseScene(parked !== undefined ? (parked ?? '') : (data.baseScene ?? ''));
         setLoaded(true);
       })
       .catch((e) => { if (e.name !== 'AbortError') setLoaded(true); });
     return () => ac.abort();
   }, [path]);
 
+  // Apply the ref. Since #831 this NEVER reaches disk — see the header for the two routes and why
+  // they differ. Returns whether it landed, because the undo/redo closures report on that.
+  /** Which route the LAST `write` actually took. `fileDirect` is derived from this rather than
+   *  from the render-time `isOpenScene`, and the difference is not cosmetic: `write` re-reads
+   *  `getCurrentScenePath()` at APPLY time on purpose (see below), so the two disagree whenever
+   *  the scene changed since this render. Taking `fileDirect` from the stale one is how an edit
+   *  goes invisible — the live route deletes the park AND `_isFileDirect: true` suppresses the
+   *  edit-version bump, so nothing anywhere reports it as unsaved: no badge, `hasUnsavedChanges()`
+   *  false, Cmd+S writes nothing. One source, read once, used for both. */
+  const lastRoute = useRef<'live' | 'parked'>('parked');
+
   const write = useCallback(async (v: string) => {
-    const { ok, errors } = await mutateScene(path, v || null);
-    if (!ok) { console.error(`[SceneAssetView] setBaseScene failed for ${path}:`, errors); return false; }
+    // The routing (open scene → live editor state; anything else → parked) lives in
+    // `applyBaseSceneEdit` so it is covered without mounting this panel. `getCurrentScenePath()`
+    // is read HERE, at apply time, and NOWHERE ELSE in this component — a render-time copy of the
+    // same comparison is stale for a scene swap, and for an undo replayed seconds later, and
+    // having two of them is how the route and the `fileDirect` flag came to disagree.
+    //
+    // ⚠️ Raw string equality, and `/api/scene-mutate` learned the hard way that this comparison
+    // can silently fail: the renderer can report a `/@fs/<abs>` path while a panel holds
+    // `/assets/…`, which made that route's live path unreachable for months until it normalised
+    // both sides through `toAssetRef` (editorBackendRouter.ts). It holds HERE because boot
+    // canonicalises `_currentScenePath` (createEditor.tsx), and that was OBSERVED rather than
+    // assumed — verified 2026-09-07 in the running editor on `games/skin-test`: selecting the open
+    // `main.scene.json` and setting a base reported NO `pendingBaseScenes`, i.e. the live branch
+    // was taken. Where canonicalisation cannot run (no projectRoot, an unregistered path) this
+    // degrades to the parked route rather than failing loudly. If that is ever seen, normalise
+    // both sides; do not "fix" it by comparing suffixes.
+    lastRoute.current = applyBaseSceneEdit(path, v, getCurrentScenePath(), setCurrentBaseScene);
     setBaseScene(v);
     return true;
   }, [path]);
@@ -134,7 +171,7 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
     if (!await write(next)) return;
     // Builder in baseSceneUndo.ts (#308) — a framework-free factory so the undo/redo
     // closures are unit-testable without mounting this panel.
-    pushAction(makeBaseSceneUndo({ path, old, next, write }));
+    pushAction(makeBaseSceneUndo({ path, old, next, write, fileDirect: lastRoute.current === 'parked' }));
   }, [write, path]);
 
   const handleChange = useCallback(async (v: string) => {
@@ -162,6 +199,15 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
       />
       {warning && (
         <div style={{ color: '#e74c3c', fontSize: '10px', marginTop: 2, marginBottom: 4 }}>{warning}</div>
+      )}
+      {/* Manual save has to be LEGIBLE or it reads as "my edit did nothing" — the same reason the
+          five asset editors carry an `Unsaved ● ⌘S` badge. Only shown for a scene the editor has
+          not loaded: for the OPEN scene the ref is live editor state and the editor's ordinary
+          unsaved indicator already covers it. */}
+      {pendingHere && (
+        <div data-ui-id="assetView.scene.unsaved" style={{ color: '#e0a06c', fontSize: '10px', marginTop: 2, marginBottom: 4 }}>
+          Unsaved ● ⌘S
+        </div>
       )}
     </>
   );

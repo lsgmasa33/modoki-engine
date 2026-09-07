@@ -29,6 +29,7 @@ import {
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  getPendingBaseScenePaths,
   getLastSceneLoadFailureMessage,
   isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
@@ -60,10 +61,11 @@ import {
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
+  getAnimSet, getSpriteMaterialProgram, isGuid,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl,
+  sceneManager, assetUrl, type AssetSchemaType,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -245,10 +247,24 @@ function readEditorState() {
     // mutate_scene, build) is looking at a DIFFERENT world while this is true. (C7)
     // Also true while a dirty asset (below) is pending — see hasUnsavedChanges()'s own comment.
     unsavedChanges: hasUnsavedChanges(),
-    // Pending 'manual'-mode particle/anim/timeline writes (mcp-persistence.md
+    // Pending 'manual'-mode writes to any ASSET_SCHEMA_TYPES doc (mcp-persistence.md
     // Phase 3) — omitted when empty (nothing pending has nothing to show). A dirty asset an
     // agent can't SEE is the same silent-loss trap `unsavedChanges` already exists to close.
     ...(getDirtyAssetPaths().length ? { dirtyAssetPaths: getDirtyAssetPaths() } : {}),
+    // #844 — ADDITIVE, alongside `unsavedChanges`/`dirtyAssetPaths` above, never replacing them:
+    // `modoki_persistence`'s tool text points agents at `dirtyAssetPaths` for wire compatibility,
+    // and `guardUnsaved` (load-scene/new-scene, below) already has its own cause-naming logic. This
+    // is the SAME `unsavedChangeCauses()` surfaced for the two OTHER refusal sites that used to
+    // blame a fixed "create_entity / duplicate_entity / prefab" string regardless of the real
+    // cause (editorBackendRouter.ts's `/api/scene-mutate` guard, and modoki_build's
+    // `unsavedChangesWarning`) — both read `get_editor_state` and had no cause to name until now.
+    // Omitted when clean, matching `dirtyAssetPaths`'s omit-when-empty convention above.
+    ...(hasUnsavedChanges() ? { unsavedCauses: unsavedChangeCauses() } : {}),
+    // Pending `baseScene` refs set in the Scene inspector on a scene the editor has NOT loaded
+    // (#831) — omitted when empty, same rule. Reported separately from `dirtyAssetPaths` because
+    // they are a different KIND of pending write (a single-field scene mutation, not a document)
+    // and `discard_asset_edits` does not reach them.
+    ...(getPendingBaseScenePaths().length ? { pendingBaseScenes: getPendingBaseScenePaths() } : {}),
     playState: getPlayState(),
     runMode: getRunMode(),   // 'stopped' | 'scrub' | 'preview' | 'playing' (preview-mode-refactor)
     advancing: isAdvancing(), // false = a frozen frame (Play paused, or a paused preview)
@@ -500,7 +516,7 @@ function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: stri
  *     then block the file-direct routes over an edit that no longer exists. */
 function pushAssetUndo<T>(
   label: string, before: T | null | undefined, after: T, apply: (def: T) => void,
-  path: string, type: 'particle' | 'animation' | 'timeline',
+  path: string, type: AssetSchemaType,
 ): void {
   // No prior def means this is the FIRST write to that asset — there is no state to revert TO, so
   // an entry would be a lie about what undo can do. The write itself still stands.
@@ -1514,13 +1530,17 @@ export function registerEditorAgentOps(): void {
     // fixed string blamed only the first: an agent whose pending work was a dirty
     // particle/anim/timeline doc was sent looking for live entities it had never created. Both
     // clear with save_all; the difference is what `discardUnsaved:true` would discard.
-    const { sceneDirty, dirtyAssetPaths, dirtyScenes } = unsavedChangeCauses();
+    const { sceneDirty, dirtyAssetPaths, dirtyScenes, pendingBaseScenes } = unsavedChangeCauses();
     const causes: string[] = [];
     if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
     if (dirtyAssetPaths.length) causes.push(`${dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${dirtyAssetPaths.join(', ')}`);
     // Third cause: a non-primary loaded scene still dirty (a base whose write failed in a
     // partial save_all). Without it a refusal driven by this alone would name no cause.
     if (dirtyScenes.length) causes.push(`${dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+    // Fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene the editor has
+    // not loaded. It is neither a live-world edit nor an asset document, so before this row a
+    // refusal driven by it alone named no cause at all — S3.11's failure, one population later.
+    if (pendingBaseScenes.length) causes.push(`${pendingBaseScenes.length} pending base-scene ref(s) awaiting a save: ${pendingBaseScenes.join(', ')}`);
     throw new Error(
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
       `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
@@ -1622,13 +1642,17 @@ export function registerEditorAgentOps(): void {
     // succeeded: a dirty BASE scene that could not be serialized or written was previously just a
     // `console.error` + `continue`, and this returned `{ok:true}`. The edit then lived only in
     // memory, and a later build — which reads FILES — shipped without it, with nothing saying why.
-    // Two independent partial-failure channels, and the op reported ok:true through BOTH:
-    // other loaded SCENES (`r.failed`) and parked ASSET writes (`r.assets.failed`, e.g. a
-    // particle/anim def whose disk write was rejected — it stays pending and hasUnsavedChanges()
-    // stays true, but the agent was told the save succeeded).
+    // THREE independent partial-failure channels, and the op reported ok:true through all of
+    // them at one time or another: other loaded SCENES (`r.failed`), parked ASSET writes
+    // (`r.assets.failed`, e.g. a particle/anim def whose disk write was rejected — it stays
+    // pending and hasUnsavedChanges() stays true, but the agent was told the save succeeded), and
+    // — since #831 — pending base-scene refs (`r.baseScenes.failed`), which `/api/scene-mutate`
+    // can refuse on its own run-mode or unsaved-work guard and which are then RE-PARKED. The
+    // third was added with the field and not with the check, which is how the second one got here.
     const sceneFails = (r.failed ?? []).map((f) => `scene ${f.path} (${f.reason})`);
     const assetFails = (r.assets?.failed ?? []).map((f) => `asset ${f.path} (${f.error})`);
-    const allFails = [...sceneFails, ...assetFails];
+    const baseSceneFails = (r.baseScenes?.failed ?? []).map((f) => `base-scene ref on ${f.path} (${f.error})`);
+    const allFails = [...sceneFails, ...assetFails, ...baseSceneFails];
     if (allFails.length) {
       throw new Error(
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
@@ -1645,6 +1669,9 @@ export function registerEditorAgentOps(): void {
         // `saved:false` was the answer when the edit was parked, and this is where that promise
         // is kept.
         ...(r.assets?.saved.length ? { savedAssets: r.assets.saved } : {}),
+        // Same promise for the base-scene refs: `setBaseScene` through the Inspector answers
+        // "parked, not written", and this is where that is squared.
+        ...(r.baseScenes?.saved.length ? { savedBaseScenes: r.baseScenes.saved } : {}),
       };
     }
     if (r.reason === 'needs-path') {
@@ -2478,7 +2505,18 @@ export function registerEditorAgentOps(): void {
     if (!kind) {
       throw new Error(
         `read-asset-def: cannot tell what kind of asset '${path}' is — pass ` +
-        "type: 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d'.",
+        "type: 'particle' | 'animation' | 'spriteanim' | 'timeline' | 'rig2d' | 'shader' | 'animset'.",
+      );
+    }
+    if (kind === 'material') {
+      // material is NOT genuinely peekable — `materialCache` (meshTemplateCache.ts) holds only the
+      // BUILT `THREE.Material` once `fetchMaterial` parses the `.mat.json`; the raw JSON itself is
+      // never retained anywhere live (the panel's `invalidateMaterialFile` only invalidates the
+      // compiled material for a lazy recompile; it does not re-seed a JSON doc the way
+      // `invalidateAnimSetFile` does for animset). Refuse explicitly, matching the device surface's
+      // wording, rather than falling through to the generic "not in the live cache" refusal below.
+      throw new Error(
+        "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
       );
     }
     // PEEK, don't load. This op reports what is in the LIVE cache — it has no business fetching.
@@ -2501,10 +2539,27 @@ export function registerEditorAgentOps(): void {
       // keeps the "is it in the live cache at all?" answer identical for a rig seeded by an
       // older path that never recorded a source.
       : kind === 'rig2d' ? (getRig2DSource(path) ?? getRig2D(path, peek))
+      // shader (#842b) — `getSpriteMaterialProgram` is a bare `Map.get`, no fetch side effect on a
+      // miss, so it's exactly as peekable as the `{load:false}` getters above despite the different
+      // signature. It's keyed by GUID (whatever `Renderable.material` carried when the program
+      // compiled), not by path, so a path-shaped `path` (the common case — `inferAssetDefType`
+      // only recognizes the `.shader.json` suffix, never a bare guid) has to be turned into a guid
+      // first via the manifest's reverse lookup. `.manifest` is the authored `.shader.json` doc
+      // itself (`PixiShaderProgram.manifest: ShaderManifest`) — the compiled GL/GPU program
+      // alongside it is not part of the answer.
+      : kind === 'shader' ? (() => {
+          const guid = isGuid(path) ? path : getGuidForPath(path);
+          const program = guid ? getSpriteMaterialProgram(guid) : undefined;
+          return program ? program.manifest : null;
+        })()
+      // animset (#842b) — `getAnimSet` now takes the same `{load:false}` peek option as its
+      // siblings above, so a miss reports null without fetching or sticky-poisoning `failed`.
+      : kind === 'animset' ? getAnimSet(path, peek)
       : undefined;
     if (def === undefined) {
       throw new Error(
-        `read-asset-def: unsupported type '${kind}' (particle | animation | timeline | spriteanim | rig2d).`,
+        `read-asset-def: unsupported type '${kind}' (particle | animation | spriteanim | ` +
+        'timeline | rig2d | shader | animset).',
       );
     }
     if (def === null) {
@@ -2536,7 +2591,7 @@ export function registerEditorAgentOps(): void {
  *
  *  Always returns false (nothing reached disk) for the op's `saved` field. */
 async function persistOrMarkDirty(
-  path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown,
+  path: string, type: AssetSchemaType, data: unknown,
 ): Promise<boolean> {
   markAssetDirty(path, type, data);
   return false;

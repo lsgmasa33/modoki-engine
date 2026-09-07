@@ -17,6 +17,11 @@ import { PrefabInstance } from '../../src/runtime/traits/PrefabInstance';
 
 let testWorld: ReturnType<typeof createWorld>;
 const idIndex = new Map<number, any>();
+// Captured `onWorldSwap` registrations, rather than dropped with a bare no-op, so a test can
+// invoke the REAL production listener(s) and prove they are actually wired (#838). Every listener
+// registered at module load by anything this file imports lands here — entriesSystem.ts's own
+// viewStates-clearing callback among them.
+const worldSwapListeners: Array<() => void> = [];
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
@@ -25,7 +30,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   // Mirrors the real one: destroys exactly ONE entity and does NOT cascade — which is precisely
   // what `releaseViewPool` has to compensate for by walking the subtree itself.
   destroyEntity: (e: any) => { idIndex.delete(e.id()); e.destroy(); },
-  onWorldSwap: () => {},
+  onWorldSwap: (fn: () => void) => { worldSwapListeners.push(fn); return () => {}; },
   findEntityById: (id: number) => idIndex.get(id),
   findEntityByGuid: (guid: string) => {
     let found: any;
@@ -1125,5 +1130,37 @@ describe('entriesSystem — focus on recycle', () => {
     sys.entriesSystem(testWorld);
 
     expect(focus.focusedGuid()).toBe('');
+  });
+});
+
+// #838: this suite mocks `core/ecs/world` wholesale — `onWorldSwap` is only a re-export of
+// `worldRegistry`'s, so the mock severs the real listener Set and a `setCurrentWorld` here would
+// fire nothing. CAPTURE-AND-INVOKE instead: the mock above hands back whatever the module
+// (entriesSystem.ts, imported via `setup()`) registers at module load.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap resets the per-view uncached-tick counter (viewStates)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // entryHeight: 0 -> the ZERO-PLAN entrance (see the #363 tests above): tickUncachedPrefab
+    // still runs every tick even though the plan is empty, so no pooled entities are needed here.
+    const { sys, src } = await setup({ entryHeight: 0, entryHeightUnit: 'px' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider({
+      isCached: () => false,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      spawnInstance: () => 0,
+    });
+
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);   // under the 120-tick warn threshold
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+
+    expect(worldSwapListeners.length, 'onWorldSwap must have been called at module load').toBeGreaterThan(0);
+    for (const l of worldSwapListeners) l();   // the REAL world-swap path — must reset viewStates
+
+    // If the counter were NOT reset, these 100 more ticks would total 200 and cross the 120-tick
+    // threshold partway through — warning falsely about a prefab that has only been uncached for
+    // 100 ticks since the swap.
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+    warn.mockRestore();
   });
 });

@@ -654,3 +654,79 @@ describe('uiTreeProjection — lazy init latch ordering', () => {
     expect(onWorldSwap).toHaveBeenCalledTimes(2);
   });
 });
+
+// #838: every test above mocks `core/ecs/world` with a bare `onWorldSwap: vi.fn()`, which drops
+// the registered handler on the floor — `setCurrentWorld` cannot be used here, so this
+// CAPTURE-AND-INVOKE instead: the mock hands back whatever `ensureInitialized()` registers, and
+// this drives that exact callback the real world registry would call on a scene swap.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap resets the store AND re-arms the length-unit warn-once cache', async () => {
+    vi.resetModules();
+    let listener: (() => void) | null = null;
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
+      getCurrentWorld: vi.fn(),
+      onWorldSwap: (fn: () => void) => { listener = fn; return () => {}; },
+    }));
+    const rUI = { name: 'RenderableUI' } as any;
+    const ui = { name: 'UIElement' } as any;
+    const attr = { name: 'EntityAttributes' } as any;
+    vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
+      getAllTraits: () => [
+        { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
+        { name: 'UIElement', trait: ui, category: 'component', fields: {} },
+        { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
+      ],
+    }));
+    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await import('../../src/runtime/ui/uiTreeStore');
+
+    // width: '%' + a small unauthored-unit minWidth trips `findLengthUnitSuspects` (#529/#549) —
+    // see lengthUnitWarning.ts. One real DEV-only warn-once cache to observe the swap's clear on.
+    const uiEl = {
+      width: 50, widthUnit: '%', height: 40, heightUnit: 'px', minWidth: 5, minWidthUnit: 'px',
+      flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'stretch',
+      gap: 0, flexGrow: 0, flexShrink: 0,
+      paddingTop: 0, paddingLeft: 0, paddingRight: 0, paddingBottom: 0,
+      overflow: 'visible', isVisible: true,
+      text: '', fontSize: 16, textColor: 0xffffff,
+    };
+    const world = {
+      query: () => ({
+        updateEach: (cb: (data: unknown[], entity: unknown) => void) => {
+          cb([uiEl], { id: () => 1, has: () => true, get: () => ({ parentId: 0, sortOrder: 0 }), generation: () => 0 });
+        },
+      }),
+      queryFirst: () => undefined,
+    } as any;
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      uiTreeProjection(world); // registers the listener via ensureInitialized() + builds once
+      expect(listener, 'onWorldSwap must have been called at module load').not.toBeNull();
+      expect(warn, 'the length-unit suspect warns once').toHaveBeenCalledTimes(1);
+
+      // Rebuild without a swap: the warn-once guard must stay silent — the precondition the swap
+      // is being tested against.
+      markUIDirty();
+      uiTreeProjection(world);
+      expect(warn, 'precondition: warn-once dedups without a swap').toHaveBeenCalledTimes(1);
+
+      // Seed a non-empty store so the reset half of the callback is observable too.
+      useUITreeStore.setState({ tree: [{ dummy: true } as any], rootFontFamily: 'Foo' });
+
+      listener!(); // the REAL world-swap path — must reset the store and clear the warn-once cache
+
+      expect(useUITreeStore.getState().tree).toEqual([]);
+      expect(useUITreeStore.getState().rootFontFamily).toBe('');
+
+      // The SAME suspect, on the SAME entity+generation: only a cleared `_warnedLengthUnitMismatches`
+      // lets this warn again.
+      markUIDirty();
+      uiTreeProjection(world);
+      expect(warn, 'the swap re-armed the warn-once cache').toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

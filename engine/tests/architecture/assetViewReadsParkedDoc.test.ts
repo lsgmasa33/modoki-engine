@@ -48,11 +48,14 @@ describe('every parking asset view reads the parked doc before the file (#831)',
   it('finds the parking views by their marker, not by a list', () => {
     const views = parkingViews().map((v) => path.basename(v.rel)).sort();
     // Non-vacuity with a NAMED expectation: an empty scan would make the real assertion below pass
-    // having examined nothing. Four measured 2026-09-07 — Atlas and Scene are deliberately absent
-    // (Atlas writes through its own compare-and-swap queue, Scene through /api/scene-mutate), which
-    // is the correction this issue's own body needed.
+    // having examined nothing. FIVE measured 2026-09-07. Atlas joined the day it stopped writing
+    // through its own compare-and-swap queue — and it joined this list by itself, because the
+    // population is derived from the marker rather than written down here, which is the whole
+    // point. `SceneAssetView` is still absent: it mutates one FIELD through /api/scene-mutate
+    // rather than writing a document, so `persistAssetEdit` is not its route.
     expect(views).toEqual([
-      'AnimSetAssetView.tsx', 'MaterialAssetView.tsx', 'MaterialBatchView.tsx', 'ShaderAssetView.tsx',
+      'AnimSetAssetView.tsx', 'AtlasAssetView.tsx', 'MaterialAssetView.tsx',
+      'MaterialBatchView.tsx', 'ShaderAssetView.tsx',
     ]);
   });
 
@@ -72,6 +75,80 @@ describe('every parking asset view reads the parked doc before the file (#831)',
       'nothing is pending.',
       '',
       ...missing,
+    ].join('\n')).toEqual([]);
+  });
+});
+
+/** Every asset view whose props destructure a PLURAL `paths` (a multi-path/batch view) AND that
+ *  parks edits through `persistAssetEdit` in the first place. That second filter matters:
+ *  `TextureBatchView` also takes a `paths` prop but writes its `.meta.json` directly
+ *  (`writeMetaOrWarn`), never going through `persistAssetEdit`/either refresher hook at all — a
+ *  different persistence mechanism entirely, outside what this guard (and #843) is about. */
+function multiPathViews(): Array<{ rel: string; code: string }> {
+  const parking = new Set(parkingViews().map((v) => v.rel));
+  const out: Array<{ rel: string; code: string }> = [];
+  for (const { abs, rel } of repoFiles({ under: VIEWS, match: /\.tsx?$/, floor: 3 })) {
+    if (rel.includes('.test.')) continue;
+    if (rel.endsWith('/persist.ts')) continue;
+    if (!parking.has(rel)) continue;
+    const code = readScannedSource(abs).code;
+    if (/\{\s*paths\s*\}\s*:/.test(code) || /paths:\s*string\[\]/.test(code)) out.push({ rel, code });
+  }
+  return out;
+}
+
+/** ⚠️ **A multi-path asset view must register a live refresher for EVERY path it shows, not one
+ *  of them (#843).** `MaterialBatchView` used to register `useAssetViewRefresher(paths[0] ?? '',
+ *  () => loadAll())` — a single subscription that re-loaded the WHOLE panel. That raced
+ *  `persistAssetEdit`'s parking loop over the batch: the loop's synchronous setter call for the
+ *  registered path fired `loadAll` mid-loop, which re-fetched every OTHER path in the batch before
+ *  its own `persistAssetEdit` call had parked it — so those still-unparked paths read
+ *  `pendingAssetDoc` as null, fell through to `fetch`, and re-seeded the panel (and the live cache)
+ *  from the PRE-edit disk document, silently dropping the edit the human had just made and seen
+ *  applied. The fix is `useAssetViewRefreshers(paths, ...)` — one registration per path, each a
+ *  pure per-path merge, so a parked-but-not-yet-refreshed sibling is never re-read.
+ *
+ *  ⚠️ **What this proves and what it doesn't.** This is a source scan (panels are never mounted in
+ *  jsdom — `docs/editor.md` § Panels), so it can only see WHICH hook a view calls, not that the
+ *  call is wired correctly at runtime. `engine/tests/editor/materialBatchParkedEdits.test.ts` pins
+ *  the HOOK's own per-path merge behaviour directly. Neither test alone covers #843: this one pins
+ *  which hook the PANEL calls; that one pins what the hook DOES once called — reverting the panel's
+ *  wiring to the single-path hook leaves the hook test green, and a hook regression leaves this
+ *  scan green, so both are needed. */
+describe('every multi-path asset view refreshes every path it shows (#843)', () => {
+  it('finds the multi-path views by their `paths` prop, not by a list', () => {
+    const views = multiPathViews().map((v) => path.basename(v.rel)).sort();
+    // Non-vacuity with a NAMED expectation, same reasoning as the parking-views check above: an
+    // empty scan would make the real assertions below pass having examined nothing.
+    expect(views).toEqual(['MaterialBatchView.tsx']);
+  });
+
+  it('each one calls the plural refresher, not the singular one', () => {
+    const missingPlural = multiPathViews()
+      .filter((v) => !/\buseAssetViewRefreshers\s*\(/.test(v.code))
+      .map((v) => v.rel);
+    const usesSingular = multiPathViews()
+      .filter((v) => /\buseAssetViewRefresher\s*\(/.test(v.code))
+      .map((v) => v.rel);
+
+    expect(missingPlural, [
+      'These multi-path asset views never call `useAssetViewRefreshers` (the per-path plural hook),',
+      'so nothing keeps every path in the batch in sync with a live edit.',
+      '',
+      ...missingPlural,
+    ].join('\n')).toEqual([]);
+
+    expect(usesSingular, [
+      'A multi-path asset view calls `useAssetViewRefresher` (the SINGULAR hook) — registering a',
+      'refresher for only ONE of its N paths. Concretely this was `useAssetViewRefresher(paths[0]',
+      "?? '', () => loadAll())`: registering for one path means persistAssetEdit's synchronous",
+      "setter call fires while its own parking loop over the OTHER paths is still running, so those",
+      'not-yet-parked paths read `pendingAssetDoc` as null, fall through to `fetch`, and re-seed the',
+      'panel from the PRE-edit disk document — silently dropping the edit the human just made and',
+      'saw applied (#843). Use `useAssetViewRefreshers(paths, (p, updated) => ...)` instead — one',
+      'registration per path, each a pure per-path merge.',
+      '',
+      ...usesSingular,
     ].join('\n')).toEqual([]);
   });
 });

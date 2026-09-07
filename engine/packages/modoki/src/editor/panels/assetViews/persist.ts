@@ -10,15 +10,13 @@
  *  whichever instance is currently showing that asset (or none — the file+cache
  *  still update and a later re-select re-reads from disk via the load effect). */
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { markAssetDirty } from '../../scene/dirtyAssets';
 import type { AssetSchemaType } from '../../../runtime/assets/assetSchemas';
 import { invalidateMaterial } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateAnimSet, setAnimSet, type AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
-import { clearSpriteMaterialCache } from '../../../runtime/loaders/spriteMaterialCache';
-import { invalidatePixiShaderProgram } from '../../../runtime/rendering/pixiShaderBuilder';
+import { invalidateShader } from '../../../runtime/loaders/spriteMaterialCache';
 import { fireDirtyListeners } from '../../../runtime/core/ecs/entityUtils';
-import { useEditorStore } from '../../store/editorStore';
 
 export const clampNum = (v: number, min?: number, max?: number) => {
   let r = v;
@@ -29,29 +27,16 @@ export const clampNum = (v: number, min?: number, max?: number) => {
 
 const _assetViewSetters = new Map<string, (data: any) => void>();
 
-/** A write that did not land must SAY SO. The Inspector's asset edits were the last place in the
- *  editor where a rejected write was silent (the #308 sweep later found one more, AtlasAssetView,
- *  which now reports through this same function): the response was never inspected and a rejection was
- *  never caught, while the cache invalidation and the panel refresh ran regardless — so a failed
- *  write left the editor confidently showing a value the file does not have, and the only trace
- *  was an unhandled promise rejection nobody reads. Same class as the save toasts that were fixed
- *  for scenes and prefabs (C7): never report a save that did not happen.
+/** ⚠️ `reportWriteFailed` used to live here and is GONE (#831). It was the console+toast for a
+ *  rejected Inspector write, and after #831 no Inspector code writes: everything parks, and the
+ *  only writer is `flushDirtyAssets`. Its report is not lost — it moved to where the failure now
+ *  happens, twice over: `toastForSave` (scene/saveCommand.ts) names every path whose write failed
+ *  and is still unsaved, in a WARN toast; and `getAssetFlushError` (scene/dirtyAssets.ts) carries
+ *  the reason per path so the panel showing that asset can say so itself.
  *
- *  It reports rather than REVERTS, deliberately. The edited value is still live and still correct
- *  as an intention; snapping the Inspector back to the old value would destroy the human's work to
- *  resolve a failure that is usually transient (permissions, a full disk, the backend restarting),
- *  and the next edit to the same asset rewrites the whole file — so editing again IS the retry.
- *  Same reasoning as `discardDirtyAssets`'s scope note: dropping the write is not dropping the edit. */
-export function reportWriteFailed(path: string, detail: string): void {
-  console.error(
-    `[Inspector] FAILED to write ${path} — ${detail}. The editor is showing the edited value, but ` +
-    'the file on disk still holds the previous one. Edit the asset again to retry the write.',
-  );
-  useEditorStore.getState().showToast(
-    `Save FAILED for ${path.split('/').pop() ?? path} — the file on disk is unchanged (see console)`,
-    'warn',
-  );
-}
+ *  Its old reasoning still holds and is why the flush LEAVES a failed entry parked: report, do not
+ *  REVERT. The edited value is still correct as an intention, and snapping the Inspector back would
+ *  destroy the human's work to resolve a failure that is usually transient. */
 
 /** Park an asset-file edit and refresh the live panel for `path` if mounted.
  *
@@ -76,14 +61,19 @@ export function reportWriteFailed(path: string, detail: string): void {
  *  ⚠️ The cache + panel still update OPTIMISTICALLY and SYNCHRONOUSLY here, before anything is
  *  written — unchanged, and still what makes the viewport reflect an Inspector edit immediately.
  *  What changed is only WHEN the bytes land. There is no longer a write that can fail at this
- *  point, so nothing is reported here; a failed FLUSH is `flushDirtyAssets`' to report. */
+ *  point, so nothing is reported here; a failed FLUSH is `flushDirtyAssets`' to report.
+ *
+ *  `ifMatch` is an OPTIONAL compare-and-swap baseline — the sha256 of the file's bytes as this
+ *  panel last read them — which the flush turns into a write precondition. Only `AtlasAssetView`
+ *  passes one; see `DirtyAsset.ifMatch` for why that view needs it and the others do not. */
 export function persistAssetEdit(
   path: string, type: AssetSchemaType, updated: unknown, invalidate: (path: string, updated: any) => void,
+  ifMatch?: string,
 ): void {
-  markAssetDirty(path, type, updated, 'panel');
+  markAssetDirty(path, type, updated, 'panel', ifMatch);
   invalidate(path, updated);
   _assetViewSetters.get(path)?.(updated); // refresh the mounted panel, if any
-  // Wake the 3D viewport's idle dirty-gate. An asset edit alone leaves a STATIC scene idle — the
+  // Wake every subscribed viewport's idle dirty-gate (2D and 3D). An asset edit alone leaves a STATIC scene idle — the
   // invalidated material never gets re-resolved until some OTHER event (Play, camera move,
   // selection) re-arms the gate. Firing the shared dirty signal (the same one gizmo/trait writes
   // use) draws for the grace window, long enough for the async material re-fetch to land and
@@ -99,20 +89,54 @@ export function useAssetViewRefresher(path: string, setData: (data: any) => void
   }, [path, setData]);
 }
 
+/** Register a live refresher for EACH of several paths at once (#843's batch views).
+ *
+ *  A batch view can't just call `useAssetViewRefresher` in a loop over `paths` — that calls a hook
+ *  a variable number of times, which is an illegal hook call (React tracks hooks by call ORDER, not
+ *  identity). So the whole map has to be one effect, registering one `_assetViewSetters` entry per
+ *  path, with each entry's cleanup identity-guarded exactly like `useAssetViewRefresher`'s single
+ *  one — `if (_assetViewSetters.get(p) === fn) delete` — so a stale registration is never dropped
+ *  out from under a newer one.
+ *
+ *  Two things that would otherwise re-register on every render and defeat the identity guard above:
+ *   - `paths` (Inspector.tsx builds it as `assets.map((a) => a.path)` on every render, so a NEW
+ *     array is a certainty even when its contents haven't changed) — key the effect on the joined
+ *     path string instead of the array itself.
+ *   - `setDataFor`, when the caller doesn't memoize it — read it through a ref so a changing
+ *     callback identity doesn't retrigger the effect either. */
+export function useAssetViewRefreshers(paths: string[], setDataFor: (path: string, data: any) => void) {
+  const setDataForRef = useRef(setDataFor);
+  setDataForRef.current = setDataFor;
+  const key = paths.join(' ');
+  useEffect(() => {
+    const fns = paths.map((p) => {
+      const fn = (data: any) => setDataForRef.current(p, data);
+      _assetViewSetters.set(p, fn);
+      return [p, fn] as const;
+    });
+    return () => { for (const [p, fn] of fns) { if (_assetViewSetters.get(p) === fn) _assetViewSetters.delete(p); } };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on `key`, the joined path string, deliberately: `paths` is a fresh array every render (Inspector.tsx rebuilds it via .map), so depending on the array itself would re-register every render and defeat the identity-guarded cleanup above.
+  }, [key]);
+}
+
 export const invalidateMaterialFile = (path: string) => invalidateMaterial(path);
+// An `.atlas.json` edit invalidates NOTHING live, and that is a measured fact rather than a gap:
+// this document is the AUTHORED half (which sprites, how they pack), while everything the
+// renderer reads — pages, frame map, hash — is DERIVED, lives in the `.meta.json` sidecar, and
+// only changes when a re-pack runs (`/api/reimport`, the panel's Pack button). Changing `padding`
+// does not move a pixel until then. A no-op is the honest wiring; inventing an invalidation here
+// would drop a cache entry nothing had rebuilt and make the panel look like it had done something.
+export const invalidateAtlasFile = (_path: string) => { /* nothing live derives from this doc */ };
 // A `.shader.json` edit (param default/range/label): drop the compiled 2D-material
 // programs so the next material-pass frame recompiles + re-reads the new defaults. (The
 // cache is keyed by GUID, so clearing all is the simplest correct invalidation; they
 // recompile lazily.) An already-mounted material Mesh caches its bound uniforms, so a
 // default change fully reflects on the next scene load / material rebuild.
 //
-// This is the ONE call site where a shader's SOURCE has genuinely changed (a param default,
-// range, etc. was edited and written to disk — see ShaderAssetView), so it's also the one call
-// site allowed to evict `pixiShaderBuilder`'s module-level program cache (#716) — everywhere
-// else (world swap, viewport teardown) that cache MUST survive `clearSpriteMaterialCache()`,
-// which is the whole point of the fix. `persistAssetEdit` calls `invalidate(path, updated)`, so
-// `path` is right here — evict just that path rather than the whole program cache.
-export const invalidateShaderFile = (path: string) => { clearSpriteMaterialCache(); invalidatePixiShaderProgram(path); };
+// Delegates to `spriteMaterialCache.invalidateShader` (#842) rather than spelling the two calls
+// out here — this panel and the live-reload watcher (agentBridge.ts's ASSET_CACHE_INVALIDATORS)
+// must drive the SAME definition of "a `.shader.json` changed", not two copies that can drift.
+export const invalidateShaderFile = (path: string) => invalidateShader(path);
 // Live-update the running scene: drop the stale entry, seed the new one so the
 // next driveAnimator frame resolves the edited params (path === cache key).
 export const invalidateAnimSetFile = (path: string, updated: unknown) => { invalidateAnimSet(path); setAnimSet(path, updated as { source?: string; clips?: AnimSetClipDef[] }); };

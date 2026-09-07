@@ -478,7 +478,7 @@ export function detectType(relPath: string, ext: string): string | null {
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
  *  world; 'animation', 'timeline' and 'particle' only invalidate their asset cache (reloading
  *  the scene would be wrong — and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset';
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -527,6 +527,13 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // other while agreeing on the wrong set. `invalidatorsAreReachable.test.ts` is the guard that
   // closes that blind spot, by asking the question from the invalidator's end instead.
   if (type === 'animset') return 'animset';
+  // `.material.json` / `.shader.json` — agent-writable (`/api/asset-write` covers all 8
+  // ASSET_SCHEMA_TYPES) and parkable in the Inspector, but absent from this function until #842:
+  // an external write fell through to `return null` — no broadcast, so `dropParkedWriteFor` never
+  // ran (a stale parked material edit could clobber a newer on-disk write at Cmd+S) and no cache
+  // invalidation ever fired for an agent shader write.
+  if (type === 'material') return 'material';
+  if (type === 'shader') return 'shader';
   if (type === 'scene') return 'scene';
   return null;
 }

@@ -1347,6 +1347,44 @@ for entities lacking a guid, matches by name + ancestor path. Anything unresolve
 cleared. This is the same GUID-keyed mechanism that lets a Stop-revert preserve the user's
 selection.
 
+### Hierarchy collapse restore — the swap must SCHEDULE its own restore (#839)
+
+Expand/collapse is per-user view state, so it lives in `localStorage` keyed by scene path and by
+`EntityAttributes.guid` (a runtime id does not survive the swap). The load/save pair and both
+decisions live in `editor/panels/hierarchyCollapse.ts`; `Hierarchy.tsx` keeps only the wiring.
+
+- **The panel restores from a SETTLED refresh, never from inside the `onWorldSwap` handler** —
+  `getCurrentScenePath()` is still the pre-swap value at that instant, because `loadScene` writes
+  it in its own tail after `sceneManager.loadScene` resolves (`scene/serialize.ts`). A restore run
+  synchronously on the swap would key the new world's tree to the OLD scene's saved set. For the
+  same reason the restore waits while **`aSceneSwapIsHappening()`** (`editor/scene/playMode.ts`)
+  is true. ⚠️ Ask that, never "do the two scene paths agree" — every writer of the editor path
+  other than `loadScene`'s tail leaves it diverged from `sceneManager` **indefinitely** (Save As,
+  Assets → Create Scene, the boot restore), and so does a load that throws after the swap, so a
+  path comparison is not "not settled yet" but "never settled" — it would shut the restore and the
+  save gate for the rest of the session, which is #839 itself by another route.
+- **⚠️ But the swap handler must SCHEDULE that settled refresh itself.** It used to leave the job
+  to `onStructureDirtyCoalesced`, which fires on `registerEntity` — and `loadSceneFile` registers
+  the incoming scene's entities into the **staging** world *before* the swap, while `SceneManager`
+  marks nothing structure-dirty after `setCurrentWorld`. So for any scene loaded after boot, no
+  settled refresh ever followed the swap: collapse was neither restored nor saved for the rest of
+  that scene, and the first entity the user created finally ran the restore and overwrote whatever
+  they had collapsed. Structure-dirty is the late-spawn **backstop**, not the primary path.
+
+⚠️ **The set is owned by a WORLD, not by a scene path.** The save gate and the restore trigger both
+compare `getCurrentWorld()` against the world the set was restored for. Keying them on the *path*
+looks equivalent and is not: `saveScene()` changes the path with **no swap and no structural
+change** (`serialize.ts` — both the Save-As and known-path branches), so a path-keyed claim reads
+"needs restore" after a plain **Save As** and the next structural change collapses the whole tree
+and persists that over the user's arrangement. A world identity says the true thing — the ids are
+still valid, only the file name moved — so the arrangement carries across and is saved under the
+new path.
+
+`hierarchyCollapse.test.ts` pins the decisions; `e2e/editor-hierarchy-collapse.spec.ts` pins the
+wiring, including the Save-As case (reverting the panel turns it red). The mechanism class is
+written up in [async-lifetime.md](./async-lifetime.md).
+
+
 ## Asset editors
 
 Several assets get a dedicated editor. They share one architecture: **the live def is the
@@ -1560,33 +1598,81 @@ is "not a GPU cache the renderer keys by path"; `audioBufferCache` is keyed by p
 premise was simply false and the test was defending the bug.
 
 **6. A panel that writes the WHOLE document must prove it still has the whole document.**
-`AtlasAssetView` serializes and writes the entire `.atlas.json` on every control interaction,
-from a copy it read when the panel opened. Nothing tells it the file changed underneath —
-`assetsVersion` is keyed on paths, not content (see § "A panel that reads `getAllAssets()` must
-subscribe to `assetsVersion`" above) — so a `.atlas.json` altered on disk while the panel is
-open (a `git checkout` under a live editor, which CLAUDE.md names as a real hazard) was silently
-reverted by the next padding nudge, with nothing erroring (#439). The write is now a
-**compare-and-swap**: `persistAtlasDocIfUnchanged` (`assetViews/atlasPersist.ts`) hashes what the
-panel loaded and hands that as a precondition to `POST /api/write-file`'s optional `ifMatch` field
-(a sha256 hex of the expected current content). The server compares against the file's actual
-current hash and only then writes — synchronously, with no `await` between the compare and the
-write — so there is no gap left for a second write to land in. A mismatch (or the file not
-existing) 409s with no write, surfaced as a "changed on disk" banner and a re-read of the truth.
-`ifMatch` is optional and absent means an unconditional write, unchanged for every other caller
-(#439's original fix did the compare client-side — read, compare, then write as two separate
-calls — which closed the `git checkout` race but left a narrower one open between two rapid edits;
-#469 moved the compare-and-write into that one atomic server-side operation). The server CAS alone
-still lets the panel ISSUE two overlapping writes and self-inflict a false conflict on the second
-(fast typing, a held stepper); `createAtlasWriteQueue` (`atlasPersist.ts`) fixes that by keeping
-only one write from this panel in flight at a time, collapsing to the latest — without it, fast
-input produces exactly the "changed on disk" false positive the CAS was meant to prevent.
+`AtlasAssetView` builds the entire `.atlas.json` from a copy it read when the panel opened.
+Nothing tells it the file changed underneath — `assetsVersion` is keyed on paths, not content
+(see § "A panel that reads `getAllAssets()` must subscribe to `assetsVersion`" above), and
+`atlas` is not a `SceneChangedKind`, so the watcher's `dropParkedWriteFor` never fires for it
+either. A `.atlas.json` altered on disk while the panel is open (a `git checkout` under a live
+editor, which CLAUDE.md names as a real hazard) was silently reverted by the next padding nudge,
+with nothing erroring (#439).
 
-Why this panel and not its siblings: the parked-write panels (`ParticleEditor`,
-`SpriteAnimEditor`, `AnimationEditor`, `TimelineEditor`, `SkinEditor`) go through
-`useParkedAssetDoc` and write on Save All (see [mcp-persistence.md](./mcp-persistence.md)
-§ "5. The dirty-asset registry — the ONE path from an asset edit to disk"); `AtlasAssetView`
-reads and writes the file directly instead, and that asymmetry is what makes it the one panel
-exposed to this hazard.
+The guarantee is a **compare-and-swap**, and it now travels with the parked write. The panel
+hashes what it loaded into `baselineHash`, parks it alongside the document as
+`DirtyAsset.ifMatch`, and `flushDirtyAssets` sends it as `POST /api/asset-write`'s optional
+`ifMatch` precondition (a sha256 hex of the expected current content). The server compares
+against the file's actual current hash and only then writes — synchronously, with no `await`
+between the compare and the write (`ifMatchRefusal`, shared with `/api/write-file`), so there is
+no gap for a second write to land in. A mismatch, or the file not existing, 409s with no write.
+`ifMatch` is optional and absent means an unconditional write, unchanged for every other caller.
+
+⚠️ **#831 made this window LONGER, not shorter, which is why the CAS survived the change.** The
+panel used to write on every control interaction, so the read-to-write gap was one keystroke; it
+now parks and Cmd+S is the write, so the gap is however long the human takes to save. What did
+NOT survive is `createAtlasWriteQueue`: it existed (#469 review finding 1) to stop this panel's
+own overlapping writes self-inflicting a 409 on each other, and parking is synchronous and
+last-write-wins in a `Map`, so there are no concurrent writes left to serialize. That claim is
+asserted rather than argued — `tests/editor/atlasParksNotWrites.test.ts` drives N rapid edits and
+pins ONE pending write, the LAST document, the ORIGINAL baseline, and zero network calls.
+
+**A conflict is now a fork the human resolves, not a discard.** The old flow dropped the losing
+edit and reloaded from disk, which was proportionate when the edit was one control change; after
+#831 a conflict lands on a set of unsaved edits, so discarding them silently would be the larger
+data loss. `flushDirtyAssets` leaves the entry parked and records why (`getAssetFlushError`), and
+the banner offers both exits explicitly — **Discard & reload** (`discardDirtyAssets`) or
+**Overwrite on save** (`clearAssetIfMatch`, which drops the precondition). The CAS exists to
+prevent a SILENT overwrite; a deliberate one is the human's call.
+
+History, so the shape is not re-derived: #439's original fix did the compare client-side — read,
+compare, then write as two separate calls — which closed the `git checkout` race but left a
+narrower one open between two rapid edits; #469 moved the compare-and-write into one atomic
+server-side operation on `/api/write-file`; #831 moved the whole write onto the registry, so the
+precondition moved to `/api/asset-write` with it and the client-side queue went away.
+
+⚠️ **Why this panel and not its siblings — and the answer is narrower than it first looks.** An
+earlier version of this section said the other views were covered because "their types are all
+`SceneChangedKind`s, so an external change drops their parked write through
+`dropParkedWriteFor`". **That is false for two of them.** `material` and `shader` are absent from
+`LiveReloadKind`/`SceneChangedKind` (`vite-asset-scanner.ts`, `agentBridge.ts`) and
+`classifySceneChange` has no case for either, so `MaterialAssetView`, `ShaderAssetView` and
+`MaterialBatchView` park whole documents with **no** baseline and **no** watcher drop — #439's
+defect on three more views. That is **#842**, whose fix is to derive the watcher classification
+from `ASSET_SCHEMA_TYPES` rather than to give each view its own baseline. So the honest scoping is:
+the atlas carries a compare-and-swap because it needs one INDEPENDENTLY of #842, not because it is
+the only view at risk. See [mcp-persistence.md](./mcp-persistence.md) § "5. The dirty-asset
+registry — the ONE path from an asset edit to disk".
+
+**But parking is not itself the protection — that was always a second mechanism, and #842 showed
+it can be silently absent.** A parked write is only dropped as stale by `dropParkedWriteFor`
+(`engine/app/debug/agentBridge.ts`), which fires ONLY off a `modoki:scene-changed` broadcast,
+which fires ONLY when the changed file's type has a `LiveReloadKind`
+(`classifySceneChange`, `engine/plugins/vite-asset-scanner.ts`). `material` and `shader` had no
+`LiveReloadKind` at all until #842, so `MaterialAssetView`/`MaterialBatchView`/`ShaderAssetView`
+parked their edits with **no staleness protection whatsoever** in that window — an external
+change to the same `.mat.json`/`.shader.json` (an agent's `write_asset`, a `git checkout`)
+would never be noticed, and the stale parked edit would win at the next Cmd+S.
+
+So there are now **two independent mechanisms guarding the same hazard**, and a reader should not
+conflate them: `AtlasAssetView` alone parks WITH the compare-and-swap `ifMatch` precondition
+(#439/#469, above; #831 added the park) — its protection is checked server-side at write time.
+Every OTHER Inspector asset surface — the five panels and the four views — parks WITHOUT one and
+relies on watcher-driven park-drop instead, which is checked at edit time but depends entirely on
+the kind being watched. **The rule to take away: absent a compare-and-swap, parking a write
+protects it only if the file's kind carries a `LiveReloadKind` — adding a type to the parkable set
+with neither silently removes the guarantee**, exactly as it did here for two full types across an
+entire release window.
+
+⚠️ Still uncovered by either mechanism: `.meta.json` sidecars are invisible to `detectType`
+(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845.
 
 Why it stayed invisible: `AtlasAssetView`'s own header notes the page preview "refreshes after a
 Re-pack via the watcher's manifest broadcast" — and it does. **Derived** data (the `.meta.json`
@@ -1594,6 +1680,16 @@ pages/frames block, surfaced through the manifest) refreshed correctly, while th
 source document did not. A panel that visibly updates is the worst place to hide a stale read.
 (#439's sibling #430, on the failed-READ half of the same panel, has no separate write-up here —
 it shipped with code + tests + one QA case only.)
+
+⚠️ **A BOM defeated three of `/api/asset-write`'s guards at once** (found 2026-09-07 while moving
+the atlas write onto that route). `prevText` was read as `readFileSync(abs, 'utf-8')`, BOM
+included, and `JSON.parse` rejects that — so the format-version classifier called the file corrupt
+and **refused every write to it forever** (`400 could not be classified (unparsable)`), `prevDoc`
+fell to `null` so the dropped-field guard passed anything, and id preservation was skipped, which
+lets the scanner's heal mint a fresh GUID and dangle every reference to the old one. Type-agnostic
+and pre-existing: a Windows-authored `.mat.json` hits it identically, which is CLAUDE.md's
+recurring Windows class surfacing on a Mac-only gate. Fixed by reading through `stripUtf8Bom`, the
+same helper the `ifMatch` hash already used to agree with the browser's `Response.text()`.
 
 ### Animation Editor
 
@@ -2246,8 +2342,9 @@ OS trash; the partial case was not reported at all. `makeDeleteUndo` now restore
 
 ⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,
 `deleteAssetFile`, `moveFileTo`, `createFolderApi` and `duplicateAssetFile`
-**never throw** — they catch and resolve `false`. (`SceneAssetView`'s `mutateScene` was the one
-exception: it resolved `{ok:false}` for an HTTP error but let a network-level rejection escape,
+**never throw** — they catch and resolve `false`. (`mutateScene` — then in `SceneAssetView`, since
+#831 in `scene/pendingBaseScene.ts` — was the one exception: it resolved `{ok:false}` for an HTTP
+error but let a network-level rejection escape,
 straight out of an undo closure and into the both-stacks-lost path below. It now catches too.) So ignoring the return value is silent *by
 construction*, and `undoManager` pops the entry and reports success either way: Cmd+Z reads as
 working while nothing happened. The forward path of the same function usually checks the return;
@@ -2413,7 +2510,7 @@ a future change picks, these do not change:
 distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
 loss, worth interrupting for whatever caused it.
 
-⚠️ **This was LATENT when fixed** — #308 closed the last live route (`SceneAssetView`'s
+⚠️ **This was LATENT when fixed** — #308 closed the last live route (the base-scene field's
 `mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
 on the stack" is the obvious-looking design the next change will reach for, and it did not work

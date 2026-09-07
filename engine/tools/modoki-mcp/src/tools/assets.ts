@@ -1,4 +1,4 @@
-/** Asset schema introspection + validated authoring (particle/anim/timeline) + gesture capture.
+/** Asset schema introspection + validated authoring (all ASSET_SCHEMA_TYPES types) + gesture capture.
  *
  *  Registered by `registerAllTools` (`../registerAll.ts`). Side-effect-free on import:
  *  nothing here runs until the register function is called, which is what lets a test
@@ -21,9 +21,25 @@ import type { ToolContext } from '../context.js';
  *  ENFORCES (a zod enum rejects before any request is made), so drift here is not a bad error
  *  message — it is a tool that refuses a type the backend serves. `engine/tests/tools/
  *  assetTypeParity.test.ts` compares the two lists and fails the build when they disagree. */
-const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'] as const;
+const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset', 'atlas'] as const;
+
+/** The same list as PROSE, for the tool descriptions below. Derived, never transcribed: both
+ *  descriptions spelled the set out by hand and both were already stale — each stopped at
+ *  `rig2d`, so `shader` and `animset` were served by the backend, accepted by the zod enum above,
+ *  and invisible to the only text an agent reads before choosing a type. A prose copy of a list
+ *  is a copy, and the parity test cannot see it. */
+const ASSET_TYPES_PROSE = ASSET_TYPES.join(' / ');
 
 export { ASSET_TYPES as ASSET_TYPES_FOR_TESTS };
+
+/** The `type` values `modoki_read_asset_def` accepts — the 8 of the 9 `ASSET_TYPES` above that
+ *  the backend's `read-asset-def` op actually serves; `material` is deliberately absent (that op
+ *  refuses it — a material's live cache holds only the compiled THREE.Material, not the authored
+ *  JSON). Exported so `assetTypeParity.test.ts` pins this enum against the op directly instead of
+ *  letting it drift again like #842/#843. */
+const READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset', 'atlas'] as const;
+
+export { READ_ASSET_DEF_TYPES as READ_ASSET_DEF_TYPES_FOR_TESTS };
 
 export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   /** The two facts every asset-def WRITE owes its caller, in ONE wording (§2).
@@ -52,7 +68,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_asset_schema',
     'Get the field schema (types, defaults, ranges, enums) + a valid example for an asset type ' +
-      '(material / particle / animation / spriteanim / timeline / rig2d), so you can author the JSON ' +
+      `(${ASSET_TYPES_PROSE}), so you can author the JSON ` +
       'correctly. Read this BEFORE ' +
       'modoki_write_asset. Texture/effect refs must be GUIDs (use modoki_list_assets).',
     { type: z.enum(ASSET_TYPES)
@@ -61,7 +77,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_create_asset',
-    'Scaffold a new asset (material/particle/animation/spriteanim/timeline/rig2d) with sensible defaults + a fresh GUID at ' +
+    `Scaffold a new asset (${ASSET_TYPES_PROSE}) with sensible defaults + a fresh GUID at ` +
       'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit.',
@@ -246,8 +262,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── read_asset_def — the READ half of the asset-editor tools ──
   tool(
     'modoki_read_asset_def',
-    'Read an asset DEFINITION back: a .particle.json, .anim.json, .timeline.json, .spriteanim.json ' +
-      'or .rig2d.json, from the LIVE cache (not the file). The companion to modoki_particle_set / ' +
+    'Read an asset DEFINITION back: a .particle.json, .anim.json, .timeline.json, .spriteanim.json, ' +
+      '.rig2d.json, .shader.json, .animset.json or .atlas.json, from the LIVE cache (not the file). NOT ' +
+      '.mat.json — a material\'s live cache holds only the compiled THREE.Material, the authored ' +
+      'JSON is discarded once built, so read that file directly instead. The companion to ' +
+      'modoki_particle_set / ' +
       'modoki_anim_set_clip / modoki_timeline_set, which all take a FULL definition — this is how ' +
       'you GET one to modify, and how you VERIFY an edit by DATA instead of judging it from a ' +
       'rendered frame. ' +
@@ -257,8 +276,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'flushes). Errors if nothing in the open scene has loaded the asset yet.',
     {
       path: z.string().describe('Asset-root URL, e.g. /assets/particles/spark.particle.json'),
-      type: z.enum(['particle', 'animation', 'timeline', 'spriteanim', 'rig2d']).optional()
-        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d suffix.'),
+      // #842b widened the OP to 7 types; this enum stayed at the original 5, so `type:'shader'`
+      // was rejected by zod before it could reach the op — the same "a contract keyed to the old
+      // asset-type set" defect, one layer up. `material` is deliberately absent: the op refuses it.
+      type: z.enum(READ_ASSET_DEF_TYPES).optional()
+        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d/.shader/.animset/.atlas suffix.'),
     },
     async ({ path, type }) => {
       const q = new URLSearchParams({ path });

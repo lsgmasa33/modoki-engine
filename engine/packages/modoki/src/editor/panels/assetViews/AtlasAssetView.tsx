@@ -7,12 +7,18 @@
  *  the live manifest (`getAssetEntry(guid).atlas`) for the page preview + stats — it
  *  refreshes after a Re-pack via the watcher's manifest broadcast. */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from 'react';
 import {
-  createAtlasWriteQueue, classifyAtlasLoad, canPersistAtlasDoc, buildNextAtlasDoc,
+  classifyAtlasLoad, canPersistAtlasDoc, buildNextAtlasDoc, normalizeAtlasBody,
   DEFAULT_ATLAS_DOC, type AtlasSourceDoc, type AtlasLoadState,
 } from './atlasPersist';
-import { writeAssetFileIfMatch } from '../assetOps';
+import { persistAssetEdit, invalidateAtlasFile, useAssetViewRefresher } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
+import {
+  subscribeDirtyAssets, getDirtyAssetsVersion, getAssetFlushError, getLastFlushedAssetHash,
+  peekDirtyAsset, clearAssetIfMatch, discardDirtyAssets, forgetFlushedAssetHash,
+} from '../../scene/dirtyAssets';
+import { sha256Hex } from '../../utils/contentHash';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { getAssetEntry, getGuidForPath, type AtlasCacheBlock } from '../../../runtime/loaders/assetManifest';
@@ -38,34 +44,56 @@ const DEFAULT_DOC = DEFAULT_ATLAS_DOC;
  *
  *  `raw` is the document as parsed from disk. Spreading it FIRST both preserves the unknown keys
  *  and keeps their original position (object spread takes each key's first-seen order), so an
- *  edit produces a minimal diff instead of a reshuffled file. The trailing newline is restored
- *  for the same reason — its loss was the other half of that diff. */
-export function serializeAtlasDoc(raw: Record<string, unknown>, next: AtlasSourceDoc): string {
+ *  edit produces a minimal diff instead of a reshuffled file.
+ *
+ *  ⚠️ Returns the OBJECT to park, not bytes (#831). It used to return
+ *  `JSON.stringify(merged, null, 2) + '\n'` and POST that string; the bytes are now the server's
+ *  to produce, through `assetJsonBytes` — the ONE definition of them, which two self-write
+ *  fingerprints also hash. A client that re-serialises here would be a second copy of that
+ *  format, and the trailing newline this used to restore by hand is exactly what drifted last
+ *  time. `maxPages: undefined` (how the Max-pages field says "unset") is deleted rather than left
+ *  in place, so the key genuinely leaves the document instead of relying on `JSON.stringify`
+ *  dropping it — `/api/asset-write`'s dropped-field guard reads `Object.keys`, not the JSON. */
+export function buildAtlasDocToPark(raw: Record<string, unknown>, next: AtlasSourceDoc): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...raw, ...next };
-  // `maxPages: undefined` is how the Max-pages field says "unset"; JSON.stringify drops an
-  // undefined value, but only if the key is genuinely absent from the object it walks.
   for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
-  return `${JSON.stringify(merged, null, 2)}\n`;
+  return merged;
 }
 
 export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const [doc, setDoc] = useState<AtlasSourceDoc>(DEFAULT_DOC);
-  /** The document exactly as parsed from disk, so a write can carry forward every field this
-   *  view does not render. See {@link serializeAtlasDoc}. */
+  /** `doc`, readable synchronously. `update()` builds the document it PARKS from this rather than
+   *  from the render-time `doc`, so two edits landing before React re-renders compose instead of
+   *  the second silently discarding the first. The optimistic `setDoc` beside it already used the
+   *  functional form for exactly this reason; the parked document has to agree with it, and since
+   *  #831 that document is also what the panel is re-seeded FROM (see the refresher below), so a
+   *  stale read here would be visible on screen and not only on disk. */
+  const docRef = useRef(doc);
+  docRef.current = doc;
+  /** The document exactly as parsed from disk (or as parked), so an edit can carry forward every
+   *  field this view does not render. See {@link buildAtlasDocToPark}. */
   const rawDoc = useRef<Record<string, unknown>>({});
   /** The path `rawDoc`/`doc` were actually loaded FROM, set only alongside a successful load and
    *  reset to `null` at the top of every (re)load. `update()` compares this against the current
    *  `path` prop rather than trusting `loadState` alone — see `canPersistAtlasDoc`'s header for
    *  why state alone cannot close the A→B selection-change window (review findings 1 + 3). */
   const loadedPath = useRef<string | null>(null);
-  /** The exact file text this panel last READ from disk for `path`. The write path compares the
-   *  file's CURRENT text against this immediately before writing (#439): the panel serializes the
-   *  whole document, so writing on top of a document that changed underneath — a `git checkout`
-   *  under a live editor, CLAUDE.md's documented hazard — silently reverts whatever changed.
-   *  Nothing notifies this panel of a same-path content change (`assetsVersion` is keyed on the
-   *  asset PATH SET, see assetSetSignature.ts), so the check must happen at write time, not via a
-   *  subscription. */
-  const loadedText = useRef<string | null>(null);
+  /** The sha256 of the file's bytes as this panel last agreed with them — parked alongside every
+   *  edit as `DirtyAsset.ifMatch`, and applied by the flush as a write precondition (#439).
+   *
+   *  The panel serializes the WHOLE document, so writing on top of a document that changed
+   *  underneath — a `git checkout` under a live editor, CLAUDE.md's documented hazard — silently
+   *  reverts whatever changed. Nothing notifies this panel of a same-path content change:
+   *  `assetsVersion` is keyed on the asset PATH SET (assetSetSignature.ts), and `atlas` is not a
+   *  `SceneChangedKind`, so `dropParkedWriteFor` never fires for it either. The check therefore
+   *  has to sit on the WRITE.
+   *
+   *  Seeded at load from the fetched text, re-seeded after a save from `getLastFlushedAssetHash`
+   *  (the server's hash of what it actually wrote — this panel cannot compute those bytes), and
+   *  adopted from the parked entry when the panel opens onto an already-parked edit. `null` means
+   *  no baseline: the park then carries no precondition, which is the same unconditional write
+   *  every other asset view does. */
+  const baselineHash = useRef<string | null>(null);
   /** 'loading' until the fetch below settles, 'failed' on a bad response/network error, 'ok'
    *  once `doc`/`rawDoc` hold a real (or genuinely empty) atlas. Every control that writes is
    *  gated on this — see `update()` and the `disabled=` props below (#430): editing on top of a
@@ -86,36 +114,40 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   // `assetsVersion`/`blockVersion` are read so the preview recomputes after a re-pack
   // re-registers the atlas entry; reference them to satisfy the deps lint without effect.
   void assetsVersion; void blockVersion;
-  const [diskConflict, setDiskConflict] = useState(false);
+  // Re-render whenever the dirty-asset registry moves, so the save outcome for THIS path is
+  // visible here. Since #831 the write happens at Cmd+S, in `flushDirtyAssets` — the panel is not
+  // the caller any more and cannot see the response, so a compare-and-swap conflict would
+  // otherwise be invisible exactly where the human is looking.
+  useSyncExternalStore(subscribeDirtyAssets, getDirtyAssetsVersion, getDirtyAssetsVersion);
+  const flushError = getAssetFlushError(path);
+  // The saved baseline moved on when the file did: adopt what the flush actually wrote, so the
+  // NEXT edit parks a precondition the server can still match. Without this every save after the
+  // first would 409 against the text this panel loaded, with no way out.
+  //
+  // ⚠️ This used to be gated on nothing being parked, and that gate was itself a bug. An edit made
+  // WHILE a flush is in flight re-parks — so the gate held the panel's ref at the pre-flush hash,
+  // and the very next keystroke parked that stale value again (an explicitly-passed `ifMatch` wins
+  // over the entry's), undoing the flush's own advance of that entry. The gate is gone because the
+  // record is now cleared wherever it stops describing the file — a discard, a panel write, and
+  // this panel's own re-read below — so anything still recorded here IS what disk holds.
+  const flushedHash = getLastFlushedAssetHash(path);
+  if (flushedHash && loadedPath.current === path) baselineHash.current = flushedHash;
 
-  // Single-flight, latest-wins write queue for THIS panel instance (#469 review finding 1). One
-  // `update()` per keystroke would otherwise issue one server `ifMatch` write per keystroke —
-  // fine on its own, but a second write firing before the first's response lands carries the
-  // SAME pre-write baseline as the first, and the atomic server route correctly 409s it as a
-  // (self-inflicted) conflict; the panel can't tell that apart from a real disk change and
-  // discards the edit. Created once per mount via a lazy initializer (not per-`update` call) so
-  // every write from this panel funnels through the SAME queue. See `createAtlasWriteQueue`'s own
-  // header for why this is correct combined WITH the server-side CAS, not a substitute for it.
-  // Kept fresh every render (not just at the queue's one-time creation below) so a job already
-  // chained onto the queue reads the panel's CURRENT path, not whatever path was in scope when
-  // the queue was constructed — see `createAtlasWriteQueue`'s `getCurrentPath` header (review
-  // finding 2).
-  const currentPathRef = useRef(path);
-  currentPathRef.current = path;
-  const writeQueueRef = useRef<ReturnType<typeof createAtlasWriteQueue> | null>(null);
-  if (writeQueueRef.current === null) {
-    writeQueueRef.current = createAtlasWriteQueue(writeAssetFileIfMatch, {
-      getLoadedText: () => loadedText.current,
-      getCurrentPath: () => currentPathRef.current,
-      onWritten: (content) => { loadedText.current = content; },
-      onConflict: () => { setDiskConflict(true); setReloadNonce((n) => n + 1); },
-    });
-  }
-  const writeQueue = writeQueueRef.current;
+  // An agent's `modoki_write_asset {type:'atlas'}` parks a doc this panel must show — the same
+  // contract every other asset view has through `persistAssetEdit`'s refresher. Without it the
+  // panel keeps rendering the pre-agent document AND, on the next control interaction, parks that
+  // stale document straight over the agent's.
+  useAssetViewRefresher(path, useCallback((updated: Record<string, unknown>) => {
+    rawDoc.current = updated;
+    const normalized = normalizeAtlasBody(updated);
+    docRef.current = normalized;
+    setDoc(normalized);
+  }, []));
 
   // Load the authored `.atlas.json` (served as a normal project asset file). Fetches as text
-  // (rather than `.json()`) so the exact bytes can be kept in `loadedText` — the write path's
-  // compare-and-swap baseline (#439) — even though this effect itself only needs the parsed doc.
+  // (rather than `.json()`) so the exact bytes can be hashed into `baselineHash` — the write
+  // path's compare-and-swap baseline (#439) — even though this effect itself only needs the
+  // parsed doc.
   useEffect(() => {
     const ac = new AbortController();
     // Drop the previous atlas's document before loading this one — the ref is passthrough data
@@ -125,10 +157,26 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     // let you edit + overwrite the new file with) the previous atlas's content.
     rawDoc.current = {};
     loadedPath.current = null;
-    loadedText.current = null;
+    baselineHash.current = null;
     setDoc(DEFAULT_DOC);
     setLoadState('loading');
     setRefusalMessage('');
+    // ⚠️ ASK THE REGISTRY BEFORE THE FILE. Since #831 an edit here is PARKED, so between the edit
+    // and Cmd+S the file on disk still holds the PRE-edit document — fetching it would re-seed
+    // this panel with the older doc while the newer one is still queued to be written, which is
+    // the QA-CTX-0008 / EhE6JQkHRYttDGeGmtPK shape `pendingAssetDoc` exists to prevent. The
+    // baseline comes from the parked entry too: it is the hash of what disk held when this edit
+    // was first parked, and re-hashing the current file would silently re-arm the CAS against
+    // content nobody has looked at.
+    const parked = pendingAssetDoc(path, 'atlas') as Record<string, unknown> | null;
+    if (parked) {
+      rawDoc.current = parked;
+      loadedPath.current = path;
+      baselineHash.current = peekDirtyAsset(path)?.ifMatch ?? null;
+      setDoc(normalizeAtlasBody(parked));
+      setLoadState('ok');
+      return () => ac.abort();
+    }
     let fetchedText: string | null = null;
     backendFetch(path, { signal: ac.signal })
       .then((r) => (r.ok ? r.text().then((text) => {
@@ -141,23 +189,38 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
         if (ac.signal.aborted || (err as { name?: string })?.name === 'AbortError') return null;
         return classifyAtlasLoad({ kind: 'networkError' });
       })
-      .then((result) => {
+      .then(async (result) => {
         if (result === null) return; // aborted — a newer load wins
         if (result.loadState === 'failed') { setLoadState('failed'); return; }
         if (result.loadState === 'refused') { setLoadState('refused'); setRefusalMessage(result.message); return; }
+        // Hash BEFORE publishing the load, so `loadedPath`/`loadState` never say "editable" while
+        // `baselineHash` is still null — `update()` would then park with no precondition and the
+        // compare-and-swap would be silently off for exactly one edit. `sha256Hex` can reject
+        // outright (`crypto.subtle` is undefined in a non-secure context), which must NOT read as
+        // "no baseline needed": refuse the load instead, the same way a too-new version does.
+        let hash: string;
+        try {
+          hash = await sha256Hex(fetchedText ?? '');
+        } catch (e) {
+          console.error('[AtlasAssetView] could not hash the loaded atlas — editing disabled so a write cannot land unguarded:', e);
+          setLoadState('refused');
+          setRefusalMessage('this build cannot compute a content hash here (crypto.subtle is unavailable), so an edit could not be protected against a change on disk');
+          return;
+        }
+        if (ac.signal.aborted) return; // a newer load won while we were hashing
         rawDoc.current = result.raw;
         loadedPath.current = path;
-        loadedText.current = fetchedText;
+        baselineHash.current = hash;
+        // This read IS the truth about the file, so whatever an earlier flush recorded for this
+        // path is obsolete — and the re-seed above would otherwise put it straight back. Reachable
+        // with nothing parked and no discard in sight: save the atlas, `git checkout` the file,
+        // press Retry. See `forgetFlushedAssetHash`.
+        forgetFlushedAssetHash(path);
         setDoc(result.doc);
         setLoadState('ok');
-        setDiskConflict(false);
       });
     return () => ac.abort();
   }, [path, reloadNonce]);
-
-  // A path change means the user picked a different asset — any lingering "changed on disk"
-  // banner belongs to the PREVIOUS atlas and must not carry over (#439).
-  useEffect(() => { setDiskConflict(false); }, [path]);
 
   // Persist a change to the `.atlas.json` (discrete controls — no debounce). Empty
   // member slots are kept while editing; the packer ignores blanks.
@@ -178,30 +241,27 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       // panel updates optimistically; the write follows once, right after this call.
       return next;
     });
-    const next = buildNextAtlasDoc(doc, patch);
-    // Report a write that did not land, instead of discarding the boolean (#308 sweep).
-    // The panel updates optimistically either way — same order as persistAssetEdit, which
-    // every SIBLING asset view uses; without the failure path that optimism is a LIE: the
-    // atlas shows the edited member list while the .atlas.json on disk still holds the old
-    // one, and nothing anywhere says so. Not an undo/redo site (this view pushes no undo
-    // entry), so it reports through the write-failure reporter rather than reportUndoFailure.
-    // The write+report itself lives in atlasPersist.ts (#308 close-out) so it's unit-testable
-    // without mounting this component.
-    const content = serializeAtlasDoc(rawDoc.current, next);
-    // Compare-and-swap (#439), made ATOMIC server-side (#469) and SERIALIZED client-side (#469
-    // #469 review finding 1): write only if the file on disk still hashes to what this panel last
-    // read, checked and written as ONE operation in the route handler, and never more than one
-    // write from THIS panel in flight at once. The panel writes the WHOLE document on every
-    // control interaction, so writing on top of a document that changed underneath — a `git
-    // checkout` under a live editor, or a second edit racing this one — would silently revert
-    // whatever changed. `writeQueue` reads `loadedText.current` itself at the moment each queued
-    // write actually issues (not here), so a write chained behind an earlier one picks up that
-    // earlier write's own new baseline rather than a stale one. On a GENUINE conflict, the queue's
-    // `onConflict` callback bumps `reloadNonce` to re-read the truth from disk and show the user
-    // why the panel just changed under them; a write superseded by a newer one before it starts
-    // collapses into the newer one silently — see `createAtlasWriteQueue`'s header.
-    writeQueue.enqueue(path, content);
-  }, [path, loadState, doc, writeQueue]);
+    const next = buildNextAtlasDoc(docRef.current, patch);
+    // PARK, don't write (#831). This used to POST the whole document on every control
+    // interaction — a keystroke in Padding, an add or remove of a member — so a committed
+    // `.atlas.json` was rewritten behind the human's back while `get_editor_state` reported
+    // `persistenceMode: 'manual'`. Now it queues in the dirty-asset registry with every other
+    // asset edit and Cmd+S is the write.
+    //
+    // `baselineHash` rides along as the compare-and-swap precondition (#439). The panel parks the
+    // WHOLE document, so a save landing on top of a file that changed underneath — a `git
+    // checkout` under a live editor — would silently revert whatever changed; `/api/asset-write`
+    // refuses that write instead. Note this is not a weaker guard than the old per-keystroke one:
+    // the baseline is the same, but it is now checked against a file that has had longer to move.
+    //
+    // `buildAtlasDocToPark` re-merges from `rawDoc` every time, which is what keeps the unknown
+    // keys this view does not render (`texture`, chiefly — QA-ASSET-0013) alive across every edit.
+    // ⚠️ `rawDoc` IS advanced by this call, through the refresher above — `persistAssetEdit` calls
+    // the setter registered for this path, which is this panel's own. Harmless (the merged doc is
+    // a superset of what it replaces), and said out loud because an earlier draft of this comment
+    // claimed the opposite and would have sent the next reader hunting a bug that is not there.
+    persistAssetEdit(path, 'atlas', buildAtlasDocToPark(rawDoc.current, next), invalidateAtlasFile, baselineHash.current ?? undefined);
+  }, [path, loadState]);
 
   const setMember = (i: number, v: string) => update({ members: doc.members.map((m, j) => (j === i ? v : m)) });
   const addMember = () => update({ members: [...doc.members, ''] });
@@ -259,11 +319,22 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
 
   return (
     <>
-      {(loadState !== 'ok' || diskConflict) && (
+      {(loadState !== 'ok' || flushError) && (
         <div data-ui-id="assetView.atlas.loadBanner" style={{ color: '#e0a06c', fontSize: '10px', lineHeight: 1.4, marginBottom: 8, padding: '3px 5px', background: '#3a2e1e', border: '1px solid #5a452a', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ flex: 1 }}>
-            {diskConflict
-              ? `⚠ ${fileLabel} changed on disk — your edit was not applied. Reloaded from disk.`
+            {/* ⚠️ The wording changed with #831 and the change is the point. This used to read
+                "your edit was not applied. Reloaded from disk." — true then, because the write
+                fired per keystroke and the panel reloaded itself. Now the edits are PARKED and
+                still here: nothing was discarded, and nothing will be until the human says so. A
+                banner that says "reloaded" over unsaved work in memory is the lie that gets it
+                thrown away. */}
+            {flushError
+              ? (flushError.conflict
+                ? `⚠ ${fileLabel} changed on disk since you opened it, so Save did NOT write it. Your edits are still here and still unsaved — pick one below.`
+                // No "try saving again": a 409 from the format-version or drop-key guard refuses
+                // the SAME bytes every time, so that advice is a loop. The server's own message
+                // carries the remedy; repeat it and stop.
+                : `⚠ Save FAILED for ${fileLabel} — ${flushError.error} Your edits are still here and still unsaved.`)
               : loadState === 'loading'
                 ? `Loading ${fileLabel}…`
                 : loadState === 'refused'
@@ -274,11 +345,33 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
                   ? `⚠ Cannot open ${fileLabel} — ${refusalMessage}. Editing is disabled; update to a build that supports it, or re-save this atlas from the build that wrote it.`
                   : `⚠ Could not load ${fileLabel} — editing disabled so it is not overwritten.`}
           </span>
-          {/* Kept mounted (not `failed`-only) so a load that HANGS — rather than failing outright,
-              e.g. the dev server accepting the socket mid-restart with no timeout set on the
-              fetch — is still escapable. Retry itself lands on 'loading', which used to unmount
-              this banner and its own button, making a second retry unreachable. */}
-          <button data-ui-id="assetView.atlas.retry" data-ui-kind="button" data-ui-label="Retry" onClick={() => setReloadNonce((n) => n + 1)} style={{ ...reimportBtnStyle, width: 'auto', padding: '2px 8px' }}>Retry</button>
+          {/* A conflict is the one state with no way out of its own accord: every save will 409
+              against the same baseline until either the parked edits go or the precondition does.
+              Both exits are the HUMAN's to choose — the compare-and-swap exists to stop a SILENT
+              overwrite, not to stop a deliberate one — so both are offered, and neither happens
+              on the panel's own judgement. */}
+          {flushError?.conflict ? (
+            <>
+              <button
+                data-ui-id="assetView.atlas.discardAndReload" data-ui-kind="button" data-ui-label="Discard and reload"
+                title="Throw away your unsaved atlas edits and re-read the file as it now is on disk"
+                onClick={() => { discardDirtyAssets([path]); setReloadNonce((n) => n + 1); }}
+                style={{ ...reimportBtnStyle, width: 'auto', padding: '2px 8px' }}
+              >Discard &amp; reload</button>
+              <button
+                data-ui-id="assetView.atlas.overwrite" data-ui-kind="button" data-ui-label="Overwrite on save"
+                title="Keep your edits and let the next Save overwrite whatever changed on disk"
+                onClick={() => clearAssetIfMatch(path)}
+                style={{ ...reimportBtnStyle, width: 'auto', padding: '2px 8px' }}
+              >Overwrite on save</button>
+            </>
+          ) : (
+            /* Kept mounted (not `failed`-only) so a load that HANGS — rather than failing outright,
+               e.g. the dev server accepting the socket mid-restart with no timeout set on the
+               fetch — is still escapable. Retry itself lands on 'loading', which used to unmount
+               this banner and its own button, making a second retry unreachable. */
+            <button data-ui-id="assetView.atlas.retry" data-ui-kind="button" data-ui-label="Retry" onClick={() => setReloadNonce((n) => n + 1)} style={{ ...reimportBtnStyle, width: 'auto', padding: '2px 8px' }}>Retry</button>
+          )}
         </div>
       )}
       <div style={sectionStyle}>Members ({doc.members.length})</div>

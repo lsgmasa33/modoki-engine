@@ -105,8 +105,9 @@ export function MaterialAssetView({ path }: { path: string }) {
       // editing a material marked the scene dirty, which is a different and wrong claim.
       // ⚠️ It no longer stops the file-direct agent routes REFUSING, though: `hasUnsavedChanges()`
       // folds in `hasDirtyAssets()`, so a parked material edit blocks `mutate_scene`/`modoki_build`
-      // whatever this flag says. Correct in itself (the edit IS unsaved) — but the refusal names
-      // the wrong cause, which is filed separately.
+      // whatever this flag says. Correct in itself (the edit IS unsaved) — and the refusal now
+      // names the real cause too (#844): `unsavedChangeCauses()` reports `dirtyAssetPaths`
+      // separately from `sceneDirty`, so a parked material edit is no longer blamed on the wrong one.
       // ⚠️ The flag is still right; its old REASON is not. It used to read "persistAssetEdit
       // already wrote it to disk", which stopped being true in #831 — the edit is now PARKED in
       // the dirty-asset registry, not written. So this edit is genuinely pending, just not against

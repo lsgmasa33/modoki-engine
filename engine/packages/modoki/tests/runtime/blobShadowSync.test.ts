@@ -41,7 +41,15 @@ vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
   worldTransforms: new Map(),
   deactivatedEntities: new Set(),
 }));
-vi.mock('../../src/runtime/core/ecs/world', () => ({ onWorldSwap: vi.fn() }));
+// onWorldSwap is called at module load to register the quad-geometry teardown — capture the
+// registered listener (rather than dropping it with a bare no-op) so a test can invoke it and
+// prove the registration actually frees the cache it names (#838). `vi.hoisted` because the
+// factory below runs during the (hoisted) import of blobShadowSync.ts itself, before a plain
+// top-level `let` would be initialized.
+const blobSwap = vi.hoisted(() => ({ listener: null as (() => void) | null }));
+vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: (fn: () => void) => { blobSwap.listener = fn; return () => {}; },
+}));
 
 const raycast3DMock = vi.fn();
 vi.mock('../../src/runtime/core/raycast3DRegistry', () => ({
@@ -287,6 +295,37 @@ describe('disposeBlobShadowSyncState', () => {
       expect(scene.children).not.toContain(rec.mesh);
       expect(rec.mat.dispose).toHaveBeenCalled();
     }
+  });
+});
+
+// #838: this suite mocks `core/ecs/world` wholesale — `onWorldSwap` is only a re-export of
+// `worldRegistry`'s, so the mock severs the real listener Set and a `setCurrentWorld` here would
+// fire nothing. CAPTURE-AND-INVOKE instead: the mock above hands back whatever
+// `blobShadowSync.ts` registers at module load, so this drives the exact callback the real world
+// registry would call on a scene swap.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap disposes and clears the shared quad geometry (_quadGeo)', () => {
+    expect(blobSwap.listener, 'onWorldSwap must have been called at module load').not.toBeNull();
+
+    raycast3DMock.mockReturnValue({ x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0, distance: 0 });
+    const world = createWorld();
+    const scene = new THREE.Scene();
+    const state = createBlobShadowSyncState();
+    const e1 = world.spawn(Transform(), BlobShadow({}));
+    syncBlobShadows(world, scene, state);
+    const geo1 = state.recs.get(e1.id())!.mesh.geometry;
+    const disposeSpy = vi.spyOn(geo1, 'dispose');
+
+    blobSwap.listener!(); // the REAL world-swap path — must free the module-level cache
+
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+
+    // A second, independent entity: if the cache had not been cleared, blobGeometry() would hand
+    // back the same (already-disposed) geometry instead of rebuilding.
+    const e2 = world.spawn(Transform(), BlobShadow({}));
+    syncBlobShadows(world, scene, state);
+    const geo2 = state.recs.get(e2.id())!.mesh.geometry;
+    expect(geo2).not.toBe(geo1);
   });
 });
 

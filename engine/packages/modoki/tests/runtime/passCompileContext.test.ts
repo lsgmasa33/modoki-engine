@@ -113,6 +113,43 @@ describe('pinPassCallDepth', () => {
     await expect(pinPassCallDepth(null, {}, 1, run)).resolves.toBe('done');
     expect(run).toHaveBeenCalledTimes(2);
   });
+
+  // ⚠️ Every OTHER test in this file (including 'survives two overlapping compiles' above, whose
+  // whole point is two IN-FLIGHT compiles) uses exactly ONE `makeRenderer()` — so `activePins` /
+  // `originalGet` collapsing from a per-renderer WeakMap to shared module state would pass every
+  // one of them. Two SEPARATE renderers, each with its OWN `_renderContexts`, is the only way to
+  // tell "keyed by renderer" apart from "one shared stack everyone pushes onto".
+  it('two renderers do not share pin stacks — B\'s wrapper install must not disturb A\'s active pin', async () => {
+    const rA = makeRenderer();
+    const rB = makeRenderer();
+    const targetA = { name: 'rt-A' };
+    const targetB = { name: 'rt-B' };
+
+    let releaseA!: () => void;
+    const compileA = pinPassCallDepth(rA, targetA, 1, () => new Promise<void>((res) => { releaseA = res; }));
+
+    // While A's compile is still in flight (its wrapper installed on rA's OWN _renderContexts),
+    // run a whole separate compile on rB, pinned to a different target/depth.
+    await pinPassCallDepth(rB, targetB, 2, async () => {
+      rB._renderContexts.get(targetB, null);
+      // A shared stack would have B's install see A's pin still on top (or vice versa) — reading
+      // A's lookup here, from INSIDE B's compile, on A's own renderer, must still resolve through
+      // A's own wrapper to A's own pin.
+      rA._renderContexts.get(targetA, null);
+    });
+
+    expect(rB.calls.at(-1), 'B\'s own pinned lookup').toEqual({ rt: targetB, mrt: null, depth: 2 });
+    expect(rA.calls.at(-1), 'A\'s pin must still resolve through A\'s OWN wrapper').toEqual({ rt: targetA, mrt: null, depth: 1 });
+
+    // B's compile settled and was the only pin on ITS OWN stack — B's wrapper must be fully
+    // uninstalled. A's compile is still in flight, so A's wrapper must NOT have been touched.
+    expect(rB._renderContexts.get, 'B fully uninstalled').toBe(rB.original);
+    expect(rA._renderContexts.get, 'A must still be pinned — its own compile has not settled').not.toBe(rA.original);
+
+    releaseA();
+    await compileA;
+    expect(rA._renderContexts.get, 'A uninstalls once its own (only) pin is gone').toBe(rA.original);
+  });
 });
 
 describe('observePassCallDepth', () => {

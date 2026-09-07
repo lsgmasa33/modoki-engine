@@ -21,18 +21,24 @@ import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 
 const REPO = path.resolve(__dirname, '../../..');
-const LOADERS_DIR = path.join(REPO, 'engine/packages/modoki/src/runtime/loaders');
+const RUNTIME_SRC = path.join(REPO, 'engine/packages/modoki/src/runtime');
+// Scanned dirs (#842): `runtime/loaders/` plus `runtime/rendering/`, which is where
+// `invalidatePixiShaderProgram` lives — the shader-cache invalidator `spriteMaterialCache.ts`'s
+// `invalidateShader` calls, so it must be visible to this guard too, not just the loaders.
+const SCAN_DIRS = [path.join(RUNTIME_SRC, 'loaders'), path.join(RUNTIME_SRC, 'rendering')];
 const consumerSrc = readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code;
 
-/** Every `export function invalidate<Something>(` across the loader modules, with the file that
- *  defines it (for a failure message that doesn't force a repo-wide grep). */
+/** Every `export function invalidate<Something>(` across the scanned runtime dirs, with the file
+ *  that defines it (for a failure message that doesn't force a repo-wide grep). */
 function findInvalidators(): Array<{ name: string; file: string }> {
   const out: Array<{ name: string; file: string }> = [];
-  for (const entry of fs.readdirSync(LOADERS_DIR, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-    const src = readScannedSource(path.join(LOADERS_DIR, entry.name)).code;
-    for (const m of src.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(/g)) {
-      out.push({ name: m[1], file: entry.name });
+  for (const dir of SCAN_DIRS) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
+      const src = readScannedSource(path.join(dir, entry.name)).code;
+      for (const m of src.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(/g)) {
+        out.push({ name: m[1], file: entry.name });
+      }
     }
   }
   return out;
@@ -71,17 +77,21 @@ const ALLOWLIST: Record<string, string> = {
   // re-import or Font-Inspector mode flip changes the manifest hash — not via the scene-change path.
   invalidateFont: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontAtlasLoader.ts',
   invalidateFontFace: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontLoader.ts',
-  // Materials/prefabs/rigged models are edited through their own Inspector asset-view panels
+  // Prefabs/rigged models are edited through their own Inspector asset-view panels
   // (editor/panels/assetViews/persist.ts wraps the invalidator per asset kind) or the prefab
   // apply/instantiate flow — not the live-reload watcher.
   //
-  // ⚠️ `invalidateAnimSet` is deliberately NOT here: it has an Inspector caller too, but that
-  // serves only edits made INSIDE the editor. It is wired into ASSET_CACHE_INVALIDATORS as well,
-  // so an external write (an agent tool, or a plain file Write) invalidates it. An Inspector
-  // caller is not on its own enough to allowlist a kind whose files are also written from outside.
-  invalidateMaterial: 'editor/scene/modelImport.ts + meshTemplateCache.ts\'s own retired-texture sweep, and assetViews/persist.ts\'s invalidateMaterialFile called from MaterialAssetView.tsx / MaterialBatchView.tsx',
+  // ⚠️ `invalidateMaterial` used to be here, on the same (wrong) premise as the old `invalidateAnimSet`
+  // comment below: it has an Inspector caller, but that only serves edits made INSIDE the editor.
+  // #842 wired it into ASSET_CACHE_INVALIDATORS (agentBridge.ts) too, so it is no longer allowlisted
+  // — it must show as WIRED now, and an entry here for it again would silently un-fix #842.
   invalidatePrefab: 'editor/scene/prefab.ts (prefab apply/instantiate flow)',
   invalidateRiggedModel: 'editor/scene/modelImport.ts (rigged-model re-import step)',
+  // `invalidatePixiShaderProgram` is never called directly from ASSET_CACHE_INVALIDATORS — it's
+  // called FROM `spriteMaterialCache.ts`'s `invalidateShader`, which IS wired (as `shader:`) below
+  // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it as its second
+  // step, after the wholesale `clearSpriteMaterialCache()`.
+  invalidatePixiShaderProgram: 'runtime/loaders/spriteMaterialCache.ts\'s invalidateShader (itself wired into ASSET_CACHE_INVALIDATORS as `shader:`)',
 };
 
 describe('every invalidator is reachable from production (#74)', () => {

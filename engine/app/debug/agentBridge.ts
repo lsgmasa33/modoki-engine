@@ -76,6 +76,9 @@ import {
   invalidateSpriteAnim,
   invalidateRig2D,
   invalidateAnimSet,
+  invalidateMaterial,
+  invalidateShader,
+  fireDirtyListeners,
   findEntityByGuid,
   getCachedPrefab,
   getAllAssets,
@@ -91,6 +94,10 @@ import {
   getTimeline,
   getSpriteAnim,
   getRig2D,
+  getAnimSet,
+  getSpriteMaterialProgram,
+  isGuid,
+  getGuidForPath,
   startInputWatch,
   stopInputWatch,
   clearInputPresses,
@@ -1900,13 +1907,21 @@ registerAgentOp('set-timescale', (params) => {
 // See docs/mcp-tool-conventions.md §9.
 /** Guess an asset-def kind from its filename. The suffixes are the project's own convention
  *  (docs/doc-conventions.md), not a heuristic. Exported so the EDITOR op reuses it instead of
- *  keeping a second copy (#166 P7 — the duplication class §9 warns about). */
-export function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
+ *  keeping a second copy (#166 P7 — the duplication class §9 warns about).
+ *
+ *  #842b widened this to all 8 `ASSET_SCHEMA_TYPES` — `/api/asset-write` already accepted
+ *  material/shader/animset, but this function (and `read-asset-def`, which infers its `type`
+ *  from it when the caller doesn't pass one) only recognized 5, so an agent could WRITE a
+ *  material/shader/animset and never read it back to verify. */
+export function inferAssetDefType(path: string): 'material' | 'particle' | 'animation' | 'spriteanim' | 'timeline' | 'rig2d' | 'shader' | 'animset' | null {
+  if (path.endsWith('.mat.json')) return 'material';
   if (path.endsWith('.particle.json')) return 'particle';
   if (path.endsWith('.anim.json')) return 'animation';
   if (path.endsWith('.timeline.json')) return 'timeline';
   if (path.endsWith('.spriteanim.json')) return 'spriteanim';
   if (path.endsWith('.rig2d.json')) return 'rig2d';
+  if (path.endsWith('.shader.json')) return 'shader';
+  if (path.endsWith('.animset.json')) return 'animset';
   return null;
 }
 
@@ -1925,12 +1940,23 @@ registerAgentOp('read-asset-def', (params) => {
     return {
       ok: false,
       error: `cannot tell what kind of asset '${path}' is — pass type explicitly.`,
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'],
+      options: ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'],
     };
   }
   // PEEK, don't load. The plain getters treat a miss as "not loaded YET" and kick off a background
   // fetch, so asking about an absent asset would queue a load that can only fail and log into the
   // console — for a question this op then refuses anyway.
+  if (kind === 'material') {
+    // material is NOT genuinely peekable, on this surface either — `materialCache`
+    // (meshTemplateCache.ts) holds only the BUILT `THREE.Material` once `fetchMaterial` parses the
+    // `.mat.json`; the raw JSON is never retained live. Refuse explicitly rather than falling into
+    // the generic "unsupported type" branch below, and say why + what to do instead.
+    return {
+      ok: false,
+      error: "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
+      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+    };
+  }
   const peek = { load: false } as const;
   const def =
     kind === 'particle' ? getParticleEffect(path, peek)
@@ -1938,9 +1964,27 @@ registerAgentOp('read-asset-def', (params) => {
     : kind === 'timeline' ? getTimeline(path, peek)
     : kind === 'spriteanim' ? getSpriteAnim(path, peek)
     : kind === 'rig2d' ? getRig2D(path, peek)
+    // shader — `getSpriteMaterialProgram` is a bare `Map.get`, no fetch side effect on a miss, so
+    // it's exactly as peekable as the `{load:false}` getters above despite the different signature.
+    // It's keyed by GUID (whatever `Renderable.material` carried when the program compiled), not by
+    // path, so a path-shaped `path` has to be turned into a guid first via the manifest's reverse
+    // lookup. `.manifest` is the authored `.shader.json` doc itself — the compiled GL/GPU program
+    // alongside it is not part of the answer.
+    : kind === 'shader' ? (() => {
+        const guid = isGuid(path) ? path : getGuidForPath(path);
+        const program = guid ? getSpriteMaterialProgram(guid) : undefined;
+        return program ? program.manifest : null;
+      })()
+    // animset — `getAnimSet` now takes the same `{load:false}` peek option as its siblings above,
+    // so a miss reports null without fetching or sticky-poisoning `failed`.
+    : kind === 'animset' ? getAnimSet(path, peek)
     : undefined;
   if (def === undefined) {
-    return { ok: false, error: `unsupported type '${kind}'.`, options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'] };
+    return {
+      ok: false,
+      error: `unsupported type '${kind}'.`,
+      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+    };
   }
   if (def === null) {
     // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no live
@@ -2151,7 +2195,7 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
 
 /**
  * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
@@ -2181,6 +2225,12 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
   // `liveReloadKinds.test.ts` stayed green through it: `animset` was missing from BOTH unions, so
   // the cross-check agreed with itself. `invalidatorsAreReachable.test.ts` asks from the other end.
   animset: invalidateAnimSet,
+  // Seventh and eighth (#842): `material`/`shader` were agent-writable (`/api/asset-write` covers
+  // all 8 ASSET_SCHEMA_TYPES) and Inspector-parkable, but absent from LiveReloadKind entirely, so
+  // `classifySceneChange` fell through to `null` for both — no broadcast, ever, so an external
+  // write never invalidated the cache and a stale parked edit was never dropped at the next save.
+  material: invalidateMaterial,
+  shader: invalidateShader,
 };
 
 /** The file on disk for `urlPath` just changed, so its cached def is being dropped — any
@@ -2221,6 +2271,12 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
     await dropParkedWriteFor(msg.urlPath);
+    // The invalidation above is otherwise invisible while the sim is stopped: Scene2D's idle
+    // dirty-gate skips the whole frame unless something wakes it, so the viewport would keep
+    // showing pre-edit pixels forever. Firing the shared dirty signal wakes EVERY subscribed
+    // surface (Scene2D.tsx, Scene3D.tsx, SceneView.tsx, editor/store/canvas2DDirty.ts,
+    // runtime/ui/uiTreeStore.ts) for all eight kinds in the table above, not just material/shader.
+    fireDirtyListeners();
     return;
   }
   const current = sceneManager.getCurrent()?.path;

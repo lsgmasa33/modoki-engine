@@ -307,6 +307,56 @@ Covers external writes (MCP `write_asset`, a plain file edit); the editor's own 
 already seeded the cache directly via `setTimeline`. Same defect, and same fix, as the animation
 clip cache.
 
+### The live-reload broadcast contract, in general (not just timeline)
+
+The mechanism above — `classifySceneChange` classifies a changed file, the dev-server broadcasts a
+`modoki:scene-changed` message, and the renderer looks the kind up in a table to decide what to
+invalidate — is shared by every watched asset-def kind (`animation`, `timeline`, `particle`,
+`spriteanim`, `rig2d`, `animset`, `material`, `shader`), not just timelines. This is the fullest
+write-up of it because timeline was the instance that first got it fully documented; the contract
+itself has no other single home, so record it here and link to it rather than re-explaining it
+per-kind.
+
+**Producer and consumer are two separate unions, kept in sync BY HAND, and they cannot share a
+type.** The producer is `LiveReloadKind` + `classifySceneChange` in
+`engine/plugins/vite-asset-scanner.ts`; the consumer is `SceneChangedKind` +
+`ASSET_CACHE_INVALIDATORS` in `engine/app/debug/agentBridge.ts`. They can't import a shared type
+because the plugin is a Node module (it runs inside Vite) and the app's tsconfig carries no Node
+types — so the consumer redeclares the union with a "keep the two in sync" comment instead.
+`engine/tests/architecture/liveReloadKinds.test.ts` is the guard that stands in for the compiler
+here, and it asks **three independent questions**, not one:
+
+1. Do the producer and consumer unions have identical members, and does `classifySceneChange`
+   only ever return a member of that union?
+2. Does every member of the union have either an explicit `type === '<kind>'` branch in
+   `classifySceneChange` (so it can actually be produced) and either a scene-reload kind or an
+   `ASSET_CACHE_INVALIDATORS` entry (so it is actually handled)?
+3. **(added in #842)** Does every agent-writable/parkable `AssetSchemaType` appear in
+   `LiveReloadKind` **at all**?
+
+That third question exists because the first two both start from `PRODUCER`/`CONSUMER` and only
+ever compare the two sides to each other — **they can agree with each other on a set that is
+narrower than what the rest of the system actually reads and writes, and neither notices.** That
+is exactly how #831 grew the agent-writable/parkable set from 5 `AssetSchemaType`s to 8
+(`material`/`shader` joining the Inspector's parking surfaces) while every check in this file
+stayed green: `material` and `shader` were absent from `LiveReloadKind` itself, not just from a
+branch inside it, so the producer and consumer had nothing to disagree about. `material` did get
+partial coverage from a different guard (`invalidatorsAreReachable.test.ts`, because
+`invalidateMaterial` already had a real Inspector caller) the way `animset` did before it — but
+that guard checks reachability of an invalidator function, not whether the broadcast that would
+call it ever fires, so it could not catch this class either. Only question 3 can.
+
+**An invalidation with no redraw is invisible.** Before this session's close-out, `handleSceneChanged`
+invalidated the relevant cache and returned without waking any render gate. With Play stopped,
+`Scene2D`'s idle dirty-gate (`Scene2D.tsx`, the `if (!isSimRunning() && !this._externalDirty && …)
+return;` check) skips the ECS scan and the render entirely unless something else wakes it — so the
+viewport kept showing pre-edit pixels indefinitely, which is the exact symptom the invalidator
+table exists to prevent, just one step further down the pipeline. `handleSceneChanged` now calls
+the shared `fireDirtyListeners()` after invalidating, which wakes every subscribed surface
+(`Scene2D.tsx`, `Scene3D.tsx`, `SceneView.tsx`, `editor/store/canvas2DDirty.ts`,
+`runtime/ui/uiTreeStore.ts`). This had been true — and silent — for all eight kinds in the table,
+not only the two (`material`/`shader`) added alongside it.
+
 ## Editor panel
 
 A dockable, retargeting **Timeline panel** (`editor/panels/TimelineEditor.tsx`, mirroring the

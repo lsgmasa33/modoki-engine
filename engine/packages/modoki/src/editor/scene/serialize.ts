@@ -30,6 +30,7 @@ import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
 import { createSupersessionToken } from '../../runtime/core/liveness';
 
 // ── Types ───────────────────────────────────────────────
@@ -788,8 +789,8 @@ export function markSceneSaved(atEditVersion?: number): void {
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from
  *  the world, the file, and the undo stack, with nothing anywhere saying why.
- *  Also true while a 'manual'-mode particle/anim/timeline edit is pending a save
- *  (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
+ *  Also true while a 'manual'-mode edit to any `ASSET_SCHEMA_TYPES` doc (assetSchemas.ts) is
+ *  pending a save (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
  *  not scene-edit-version work, so `getEditVersion()` alone can't see them.
  *
  *  THIRD cause, and the reason it can't be dropped: a still-dirty NON-PRIMARY loaded
@@ -801,7 +802,8 @@ export function markSceneSaved(atEditVersion?: number): void {
  *  this flag before writing a `.ts` that force-reloads the editor) would then discard the
  *  human's work believing there was none. */
 export function hasUnsavedChanges(): boolean {
-  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0;
+  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0
+    || hasPendingBaseScenes();
 }
 
 /** WHICH kind of unsaved work exists — the three independent causes above, told apart.
@@ -817,11 +819,17 @@ export function hasUnsavedChanges(): boolean {
  *  whose edits are still only in memory — typically a base whose write failed in a
  *  partial `saveAll`. It must be reported, or a refusal triggered by it alone would name
  *  no cause at all. */
-export function unsavedChangeCauses(): { sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[] } {
+export function unsavedChangeCauses(): {
+  sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[]; pendingBaseScenes: string[];
+} {
   return {
     sceneDirty: getEditVersion() !== _savedAtEditVersion,
     dirtyAssetPaths: getDirtyAssetPaths(),
     dirtyScenes: [...dirtySceneGuidsSnapshot()],
+    // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is
+    // NOT the open one. It is neither a live-world edit nor an asset document, so without its own
+    // row a refusal triggered by it alone would name no cause at all — the S3.11 failure again.
+    pendingBaseScenes: getPendingBaseScenePaths(),
   };
 }
 
@@ -845,7 +853,14 @@ export interface SaveResult {
    *
    *  Their dirty flags stay SET, so a later save retries them. */
   failed?: { path: string; guid: string; reason: string }[];
-  /** Parked asset docs (particle/anim/timeline/spriteanim/rig2d) flushed by this save, if any.
+  /** Pending `baseScene` refs (Scene inspector, #831) written by this save, if any.
+   *
+   *  Reported separately from `assets` because it is a different KIND of pending write — a
+   *  single-field mutation of a scene FILE, not a document — and separately from `extraSaved`
+   *  because those are live scenes the editor serialized, while these are files it never loaded.
+   *  A failure here re-parks, so the edit is still pending and a later save retries it. */
+  baseScenes?: { saved: string[]; failed: Array<{ path: string; error: string }> };
+  /** Parked asset docs (any `ASSET_SCHEMA_TYPES` type — assetSchemas.ts) flushed by this save, if any.
    *
    *  Present on a FAILED result too, and that is the point: the asset flush no longer depends on
    *  the scene write, so "the scene was refused but your 3 asset edits are on disk" is a real
@@ -1231,7 +1246,22 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   const withAssets = <T extends SaveResult>(r: T): T =>
     (assets.saved.length || assets.failed.length ? { ...r, assets } : r);
   const primaryResult = await saveScene(opts);
-  if (!primaryResult.saved) return withAssets(primaryResult);
+  // LAST, and deliberately so — `/api/scene-mutate` refuses while `hasUnsavedChanges()` is true,
+  // and these entries are themselves part of that report. Run before the scene write and every
+  // mutation 409s against the very save trying to persist it. See `pendingBaseScene.ts`'s header;
+  // the take-first half of the same problem lives there.
+  // ⚠️ Declared AFTER `saveScene` on purpose — the textual order is what
+  // `tests/architecture/baseSceneEditIsManual.test.ts` reads, and it is the only place the
+  // "flush LAST" requirement is written down where a refactor will trip over it.
+  const withBaseScenes = async (): Promise<{ baseScenes?: SaveResult['baseScenes'] }> => {
+    const r = await flushPendingBaseScenes();
+    return r.saved.length || r.failed.length ? { baseScenes: r } : {};
+  };
+  // A refused primary does NOT skip this, for the same reason the asset flush runs unconditionally
+  // (#259): a `baseScene` ref on a scene the editor never loaded has nothing to do with the live
+  // world the refusal is about. It may still fail on its own merits — scene-mutate carries its own
+  // Play refusal — and then it stays parked.
+  if (!primaryResult.saved) return withAssets({ ...primaryResult, ...(await withBaseScenes()) });
   // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
   // those values were just written to disk. Reported AFTER the save succeeds so a refused save
   // (playing/previewing) doesn't warn about a file nothing wrote.
@@ -1275,5 +1305,6 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),
     ...(failed.length ? { failed } : {}),
+    ...(await withBaseScenes()),
   });
 }

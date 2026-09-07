@@ -114,50 +114,10 @@ entry pending rather than silently dropping it. `hasUnsavedChanges()` and `get_e
 trap the original `unsavedChanges` field exists to close for live scene edits.
 
 **The five asset PANELS park here too, as of #259.** The Particle, Animation, Timeline, Skin and
-SpriteAnim editors used to POST their document to disk on a 400 ms trailing debounce.
-
-⚠️ **This paragraph used to end "— there is no longer a second contract", and that was false for as
-long as it stood (#831).** #259 fixed the five panels it named and left the Inspector's asset VIEWS
-— Material, MaterialBatch, Shader and AnimSet — POSTing `/api/write-file` on every keystroke through
-`persistAssetEdit`, while `get_editor_state` reported `persistenceMode:'manual'` and
-`unsavedChanges:false`. The second contract was still there; only its owner had changed. The lesson
-is the one #830's family is about: **a fix scoped to the instances someone listed reads afterwards
-as a fix to the class**, and the sentence claiming completeness is what stops anyone re-checking.
-The four views park through the same registry as of #831 (`markAssetDirty(path, type, data,
-'panel')`), which is what finally makes the claim true — so it is now stated as a measurement, not
-a flourish: **nine surfaces park, and `grep -rn "persistAssetEdit(" ` names four of them.**
-
-### The bytes a save writes
-
-**`assetJsonBytes` (`engine/plugins/backend/editorBackendRouter.ts`) is the one definition of what
-an asset JSON write puts on disk** — `JSON.stringify(doc, null, 2)` **plus a trailing newline**.
-`writeJsonAtomic` and both self-write FINGERPRINT sites read it, and
-`tests/plugins/assetJsonBytesAgree.test.ts` asserts they cannot drift.
-
-⚠️ **The fingerprint is why this is one function and not three call sites.** `markEditorWrite(abs,
-sha1(bytes))` is how the file watcher skips the editor's own save; a hash that does not match what
-actually landed **fails OPEN** — the change event returns ~150 ms later, is read as an EXTERNAL
-edit, and `dropParkedWriteFor` discards whatever the human had parked. Getting the newline right at
-two of three sites would have been worse than leaving the bug.
-
-Two sibling writers share it (both fixed in #831 after the live check caught them): the asset
-scanner's guid **heal**, which rewrites any doc written without an `id` ~150 ms later, and
-`asset-fs-ops.ts`'s asset **copy**. `scripts/migrate-assets.mjs` carries the same byte as a literal
-(it is `.mjs` and cannot import the `.ts`), with a comment saying so — its old comment justified
-*omitting* the newline by matching the editor, and would have produced exactly the churn it was
-written to prevent once the editor changed.
-
-⚠️ **This covers the SERVER seam only.** Scenes, prefabs, and the panels' create paths serialise
-**client-side** and POST the finished string, so `assetJsonBytes` is not in their path and they
-still drop the newline — 17 sites, tracked as **#835**. `AtlasAssetView` is the one client-side
-writer that already appends it.
-
-⚠️ Two views deliberately do NOT park and are not exceptions to fix: `AtlasAssetView` writes through
-its own compare-and-swap queue (`/api/write-file-if-match`, with conflict detection the registry has
-no equivalent for) and `SceneAssetView` mutates one field via `/api/scene-mutate`. The issue that
-found this listed six views; there are four. That was a second way for one file to be written, and each half was right
-locally: the agent op answered `saved:false` while the panel had already put bytes on disk. What it
-cost, all three measured rather than argued:
+SpriteAnim editors used to POST their document to disk on a 400 ms trailing debounce. That was a
+second way for one file to be written, and each half was right locally: the agent op answered
+`saved:false` while the panel had already put bytes on disk. What it cost, all three measured
+rather than argued:
 
 - **The two collided.** `particle_set` parked v1, a panel write put v2 on disk, `dirtyAssetPaths`
   still listed the path, and `save_all` rewrote the file back to v1 — the human's panel edits gone.
@@ -167,8 +127,63 @@ cost, all three measured rather than argued:
 - **There was no undo for it**: a debounced write lands with no undo entry, so a mis-drag on a
   curve was permanent the moment the timer fired.
 
-Now every panel edit is a `markAssetDirty(path, type, doc, 'panel')` and **Cmd+S is the write**. Two
-consequences worth knowing:
+⚠️ **That claim used to end "— there is no longer a second contract", and it was false for as long
+as it stood (#831).** #259 fixed the five panels it named and left the Inspector's asset VIEWS
+— Material, MaterialBatch, Shader and AnimSet — POSTing `/api/write-file` on every keystroke through
+`persistAssetEdit`, while `get_editor_state` reported `persistenceMode:'manual'` and
+`unsavedChanges:false`. The second contract was still there; only its owner had changed. The lesson
+is the one #830's family is about: **a fix scoped to the instances someone listed reads afterwards
+as a fix to the class**, and the sentence claiming completeness is what stops anyone re-checking.
+Those four views park through the same registry as of #831 (`markAssetDirty(path, type, data,
+'panel')`), and `AtlasAssetView` — the fifth, which reached disk through its own compare-and-swap
+queue rather than `persistAssetEdit` — joined them in the same issue. So the claim is now stated as
+a measurement rather than a flourish: **ten surfaces park, and `grep -rn "persistAssetEdit(" `
+names five of them.**
+
+### A parked doc's staleness guarantee depends on the kind being watched
+
+A parked write is dropped as stale the moment its file changes on disk — `dropParkedWriteFor`
+(`engine/app/debug/agentBridge.ts`), triggered off the `modoki:scene-changed` broadcast. That
+broadcast fires only for a file whose kind has a `LiveReloadKind`
+(`classifySceneChange`, `engine/plugins/vite-asset-scanner.ts`); a kind with none never broadcasts,
+so a park for it is never dropped no matter what happens to the file underneath. `material` and
+`shader` had no `LiveReloadKind` between #831 (when their Inspector views started parking) and
+#842 (when the two kinds were added) — so for that whole window a stale parked material/shader
+edit could silently overwrite a newer on-disk write at the next Cmd+S, with nothing to catch it.
+See [editor.md](./editor.md) § "The asset Inspector — six rules that have each failed
+repeatedly", rule 6, for the two-mechanism picture this is one half of.
+
+⚠️ **`AtlasAssetView` needed one thing the registry did not have, and it is worth knowing before
+the next surface parks.** Nothing tells that panel its file changed underneath — `atlas` is not a
+`SceneChangedKind`, so `dropParkedWriteFor` never fires for it — so it carries a compare-and-swap
+baseline on the entry (`DirtyAsset.ifMatch`), which the flush sends as `/api/asset-write`'s write
+precondition. Parking made that window LONGER, not shorter: the read-to-write gap used to be one
+keystroke and is now however long the human takes to press Cmd+S. Mechanism and the conflict UX:
+[editor.md](./editor.md) § 6.
+
+⚠️ **`SceneAssetView` is manual too, and it is the one surface that does NOT park here.** It sets
+one field (`baseScene`) on a `.scene.json`, which is a single-field MUTATION rather than a document
+write — this registry is not its shape, because a scene file is also what the live world serializes
+INTO on save and a whole-file overwrite would destroy unsaved live-world changes. It has its own
+one-field registry, `editor/scene/pendingBaseScene.ts`, flushed by the same `saveAll`. Two things
+about it are worth knowing before touching either:
+
+- **The OPEN scene does not go through that registry at all.** `serializeScene` emits `baseScene`
+  from `setCurrentBaseScene`'s module state, so for the active scene the panel applies the ref
+  THERE and the ordinary scene save writes it. That is also a bug fix: `_currentBaseScene` was only
+  ever set at LOAD, so setting a base on the open scene put the ref in the file and the next Cmd+S
+  serialised the stale module value straight back over it.
+- **Its flush runs LAST in `saveAll`, and takes its entries before issuing anything.**
+  `/api/scene-mutate` refuses while `hasUnsavedChanges()` is true, and these entries are part of
+  that report — so a flush that ran first, or that left them parked while calling, would 409
+  against the very save trying to persist it. Both halves are asserted
+  (`tests/architecture/baseSceneEditIsManual.test.ts`, `tests/editor/pendingBaseScene.test.ts`).
+
+It is the FOURTH cause `unsavedChangeCauses()` names, for the S3.11 reason: a refusal driven by it
+alone used to name no cause at all.
+
+Now every panel edit is a `markAssetDirty(path, type, doc, 'panel')` and **Cmd+S is the write**.
+Three consequences worth knowing:
 
 - **Parking is synchronous** (`editor/panels/useParkedAssetDoc.ts`). The debounce was not merely
   unnecessary once the write became a `Map.set` — it was actively harmful: the old hook cancelled
@@ -281,6 +296,32 @@ injects `_persistenceMode` into the params of exactly these five ops before forw
 `write_asset`/`create_asset` are deliberately unaffected by the mode: they're explicit "write
 this file" tools, not live-state edits.
 
+### The bytes a save writes
+
+**`assetJsonBytes` (`engine/plugins/backend/editorBackendRouter.ts`) is the one definition of what
+an asset JSON write puts on disk** — `JSON.stringify(doc, null, 2)` **plus a trailing newline**.
+`writeJsonAtomic` and both self-write FINGERPRINT sites read it, and
+`tests/plugins/assetJsonBytesAgree.test.ts` asserts they cannot drift.
+
+⚠️ **The fingerprint is why this is one function and not three call sites.** `markEditorWrite(abs,
+sha1(bytes))` is how the file watcher skips the editor's own save; a hash that does not match what
+actually landed **fails OPEN** — the change event returns ~150 ms later, is read as an EXTERNAL
+edit, and `dropParkedWriteFor` discards whatever the human had parked. Getting the newline right at
+two of three sites would have been worse than leaving the bug.
+
+Two sibling writers share it (both fixed in #831 after the live check caught them): the asset
+scanner's guid **heal**, which rewrites any doc written without an `id` ~150 ms later, and
+`asset-fs-ops.ts`'s asset **copy**. `scripts/migrate-assets.mjs` carries the same byte as a literal
+(it is `.mjs` and cannot import the `.ts`), with a comment saying so — its old comment justified
+*omitting* the newline by matching the editor, and would have produced exactly the churn it was
+written to prevent once the editor changed.
+
+⚠️ **This covers the SERVER seam only.** Scenes, prefabs, and the panels' create paths serialise
+**client-side** and POST the finished string, so `assetJsonBytes` is not in their path and they
+still drop the newline — 17 sites, tracked as **#835**. (`AtlasAssetView` used to be the one
+client-side writer that appended it; since #831 it parks an OBJECT and the bytes are
+`assetJsonBytes`' like every other asset doc, so it is no longer on that seam at all.)
+
 ### Abandoning a parked write — `discard_asset_edits`
 
 The registry originally had exactly ONE exit, `saveAll`, so an exploratory asset edit could not be
@@ -309,6 +350,32 @@ refusal used to blame only the first, naming `create_entity`/`duplicate_entity`/
 only unsaved work was a parked particle edit went looking for live entities it had never created. The
 message is now built from `unsavedChangeCauses()` and lists `getDirtyAssetPaths()` when non-empty, so
 `discardUnsaved:true` tells you what it would discard. Both causes still clear with one `save_all`.
+
+**The same collapsed-boolean defect existed on two more refusal surfaces, fixed in #844.**
+`/api/scene-mutate`'s file-direct fallback 409 (`editorBackendRouter.ts`) and the MCP-side
+`unsavedChangesWarning()` (`modoki-mcp/src/context.ts`, serving `modoki_build`,
+`modoki_add_native_target`, `modoki_ota_publish`) both used to build their refusal from the same
+flat `unsavedChanges` boolean the `guardUnsaved` fix above replaced — so both still blamed
+`create_entity`/`duplicate_entity`/`prefab` even when the actual cause was a dirty asset (a
+Material slider drag parks one the same way, since #831). Both now read the same
+`unsavedCauses`/`unsavedChangeCauses()` shape and name the dirty asset paths.
+
+**The durable lesson, which is the point of this section and not the instance list: a refusal
+message derived from a collapsed boolean names whatever cause existed when the message was
+written, and then stays green forever afterwards** — nothing tests a refusal's *reason*, only
+whether it fires. `engine/tests/tools/unsavedGate.test.ts` is the cheap tell that makes #844's fix
+actually verifiable: it asserts the message NAMES the dirty asset path AND does **not** contain
+`create_entity`. The negative half is what makes the test bite — a naive positive-only assertion
+would have passed against the old fixed string too, since the old string happened to still be
+present as a fallback.
+
+**Still open, same family, needing a different shape of fix (#850):** `hmrStaleness.ts`'s
+unsaved-work banner/warning messages are all built from `DirtyProbe`'s single collapsed boolean
+(`initHmrStaleness`, `engine/app/debug/hmrStaleness.ts`) rather than from `unsavedChangeCauses()`,
+so they carry the same generic wording regardless of which kind of unsaved work triggered them.
+Because that seam is a boolean-returning callback rather than a call site that can simply be
+swapped for a richer one, fixing it means widening the `DirtyProbe` seam itself, not just
+changing what a caller passes.
 
 ## 6. Prior fix this generalizes
 

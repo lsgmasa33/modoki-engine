@@ -1,0 +1,333 @@
+{
+  "id": "e2ec0000-0000-4000-8000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Ambient Light",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "EntityAttributes": {
+          "name": "Ambient Light",
+          "guid": "e2ec0000-0000-4000-8000-000000000001",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 0,
+          "layer": ""
+        },
+        "Light": {
+          "lightType": "ambient",
+          "color": 16777215,
+          "intensity": 1,
+          "targetX": 0,
+          "targetY": 0,
+          "targetZ": 0,
+          "distance": 0,
+          "angle": 0.5,
+          "penumbra": 0,
+          "castShadow": false
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Group1",
+      "traits": {
+        "Transform": {
+          "x": -4,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cube",
+          "color": 3447003,
+          "size": 1.5,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group1",
+          "guid": "e2ec0000-0000-4000-8000-000000000002",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": 0,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Group1A",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group1A",
+          "guid": "e2ec0000-0000-4000-8000-000000000003",
+          "isActive": true,
+          "sortOrder": 2,
+          "parentId": 2,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Group1B",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": -1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group1B",
+          "guid": "e2ec0000-0000-4000-8000-000000000004",
+          "isActive": true,
+          "sortOrder": 3,
+          "parentId": 2,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "Group2",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cube",
+          "color": 3447003,
+          "size": 1.5,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group2",
+          "guid": "e2ec0000-0000-4000-8000-000000000005",
+          "isActive": true,
+          "sortOrder": 4,
+          "parentId": 0,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "Group2A",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group2A",
+          "guid": "e2ec0000-0000-4000-8000-000000000006",
+          "isActive": true,
+          "sortOrder": 5,
+          "parentId": 5,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "name": "Group2B",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": -1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group2B",
+          "guid": "e2ec0000-0000-4000-8000-000000000007",
+          "isActive": true,
+          "sortOrder": 6,
+          "parentId": 5,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "name": "Group3",
+      "traits": {
+        "Transform": {
+          "x": 4,
+          "y": 0,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "cube",
+          "color": 3447003,
+          "size": 1.5,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group3",
+          "guid": "e2ec0000-0000-4000-8000-000000000008",
+          "isActive": true,
+          "sortOrder": 7,
+          "parentId": 0,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "name": "Group3A",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": 1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group3A",
+          "guid": "e2ec0000-0000-4000-8000-000000000009",
+          "isActive": true,
+          "sortOrder": 8,
+          "parentId": 8,
+          "layer": "3d"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "name": "Group3B",
+      "traits": {
+        "Transform": {
+          "x": 0,
+          "y": -1.5,
+          "z": 0,
+          "rx": 0,
+          "ry": 0,
+          "rz": 0,
+          "sx": 1,
+          "sy": 1,
+          "sz": 1
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 16746632,
+          "size": 0.8,
+          "material": "",
+          "isVisible": true
+        },
+        "EntityAttributes": {
+          "name": "Group3B",
+          "guid": "e2ec0000-0000-4000-8000-000000000010",
+          "isActive": true,
+          "sortOrder": 9,
+          "parentId": 8,
+          "layer": "3d"
+        }
+      }
+    }
+  ]
+}

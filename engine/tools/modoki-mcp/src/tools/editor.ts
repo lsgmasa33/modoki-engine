@@ -56,8 +56,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'MANUAL-ONLY, so there is no mode to set — this is a READ. Returns `mode:"manual"` plus ' +
       '`unsavedChanges` (null if no editor is connected).\n\n' +
       'THE CONTRACT: modoki_mutate_scene / modoki_set_transform apply as ONE undoable step to the ' +
-      'RUNNING world and do NOT touch the scene file; the particle/anim/timeline ops park their ' +
-      'write in a dirty-asset registry (see modoki_get_editor_state `dirtyAssetPaths`). Both reach ' +
+      'RUNNING world and do NOT touch the scene file; the asset-editing ops (any ASSET_SCHEMA_TYPES ' +
+      'type) park their write in a dirty-asset registry (see modoki_get_editor_state ' +
+      '`dirtyAssetPaths`). Both reach ' +
       'disk only via modoki_save_all. The live-world entity/prefab tools (create/duplicate/delete/' +
       'reparent) were always live-only. modoki_write_asset/modoki_create_asset are explicit ' +
       '"write this file" tools and always write.\n\n' +
@@ -267,8 +268,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_discard_asset_edits',
     'ABANDON parked asset writes — the counterpart to modoki_save_all for the dirty-asset registry '
-      + '(the pending particle/anim/timeline defs listed as `dirtyAssetPaths` by '
-      + 'modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
+      + '(the pending asset defs — any ASSET_SCHEMA_TYPES type, not just particle/anim/timeline — '
+      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
       + 'exploratory modoki_particle_set / anim_set_clip / timeline_set could not be backed out.\n\n'
       + 'DO NOT "undo" one by re-applying the old def — that is not equivalent and the difference '
       + 'bites: it re-parks a write (so the doc is still dirty and the next save_all commits it), and '

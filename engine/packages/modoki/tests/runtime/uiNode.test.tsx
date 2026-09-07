@@ -65,6 +65,7 @@ import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo } from '../../src/runtime/ui/pressOrigin';
 import { isPaintOpaque } from '../../src/editor/panels/uiPreviewPick';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 afterEach(() => {
   cleanup();
@@ -2272,6 +2273,45 @@ describe('warn-once fallback key survives entity id recycling (#759)', () => {
 
       renderNode(nodeForEntity(b, { toggle: toggle({ value: false }) }));
       expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// #838: this file never mocks `core/ecs/world` (the koota worlds above are real, tracked and
+// destroyed), so a REAL `setCurrentWorld` swap reaches the four `onWorldSwap(...)` registrations
+// at the top of UINode.tsx directly — no capture needed. The #759 suite just above proves each
+// warn-once Set's WITHIN-world recycling key; this proves the ACROSS-world clear those comments
+// say the recycling key does not subsume.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap clears all four warn-once caches, so each warning can fire again', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const deadToggle = makeNode({ guid: 'w838-toggle', toggle: toggle({ value: false }) });
+      const inertScroll = makeNode({ guid: 'w838-scroll', overflow: 'visible', scroll: scrollTrait() });
+      const droppedText = makeNode({ guid: 'w838-text', elementType: 'input', text: 'hi' });
+      const droppedTextStyleNode = makeNode({ guid: 'w838-style', elementType: 'input', text: '', textAlign: 'center' });
+
+      const renderAll = () => {
+        renderNode(deadToggle); cleanup();
+        renderNode(inertScroll); cleanup();
+        renderNode(droppedText); cleanup();
+        renderNode(droppedTextStyleNode); cleanup();
+      };
+
+      renderAll();
+      expect(warn).toHaveBeenCalledTimes(4);
+
+      // Precondition: without a swap, warn-once dedups every one of the four on a re-render.
+      renderAll();
+      expect(warn, 'precondition: warn-once dedups without a swap').toHaveBeenCalledTimes(4);
+
+      setCurrentWorld(createWorld()); // the REAL swap path — must fire all four production listeners
+
+      renderAll();
+      expect(warn, 'each warn-once cache was cleared by the swap, so the SAME guid warns again')
+        .toHaveBeenCalledTimes(8);
     } finally {
       warn.mockRestore();
     }

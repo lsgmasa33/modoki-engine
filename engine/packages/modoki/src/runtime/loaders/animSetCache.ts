@@ -85,13 +85,19 @@ function normalizeAnimSet(json: Partial<AnimSetDef> | undefined): AnimSetDef {
 
 /** Resolve an animset ref to its parsed definition, or null if not yet loaded.
  *  Kicks off a lazy fetch on first miss (retried each frame by the caller). */
-export function getAnimSet(ref: string): AnimSetDef | null {
+export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef | null {
   if (!ref) return null;
   const path = animSetCacheKey(ref);
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
   if (failed.has(path)) return null;
+  // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
+  // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
+  // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
+  // fetch that could only fail and permanently `failed.add`-poison the path (no watcher heals it on
+  // device) — for a question the caller had already decided to answer with a refusal.
+  if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
     const p = fetch(assetUrl(path))

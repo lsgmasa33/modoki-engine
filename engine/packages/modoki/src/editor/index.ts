@@ -83,8 +83,15 @@ export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
   subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
+  getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, forgetFlushedAssetHash,
   type AssetWriteOrigin,
 } from './scene/dirtyAssets';
+export {
+  markBaseSceneEdit, applyBaseSceneEdit, peekBaseSceneEdit, isBaseSceneDirty, hasPendingBaseScenes,
+  getPendingBaseScenePaths, clearPendingBaseScenes, discardPendingBaseScenes,
+  flushPendingBaseScenes, subscribePendingBaseScenes, getPendingBaseScenesVersion,
+  mutateScene, type BaseSceneFlushResult,
+} from './scene/pendingBaseScene';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';

@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { persistAssetEdit, reportWriteFailed } from '../../packages/modoki/src/editor/panels/assetViews/persist';
+import { persistAssetEdit } from '../../packages/modoki/src/editor/panels/assetViews/persist';
 import { clearDirtyAssets, peekDirtyAsset, isAssetDirty, hasDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { useEditorStore } from '@modoki/engine/editor';
 
@@ -93,15 +93,3 @@ describe('persistAssetEdit parks the edit instead of writing it (#831)', () => {
   });
 });
 
-describe('reportWriteFailed still reports — atlasPersist writes directly and depends on it', () => {
-  // `persistAssetEdit` no longer writes, so it can no longer fail; `atlasPersist.ts` DOES write
-  // (a compare-and-swap queue against /api/write-file-if-match) and reports through this function.
-  // Keeping its cover here rather than deleting it with the write path it used to serve.
-  it('names the file and the reason, in the console AND a toast', () => {
-    reportWriteFailed(PATH, 'HTTP 403');
-    expect(err).toHaveBeenCalled();
-    expect(String(err.mock.calls[0]?.[0])).toContain(PATH);
-    expect(String(err.mock.calls[0]?.[0])).toContain('HTTP 403');
-    expect(toast()?.message).toContain('rock.mat.json');
-  });
-});

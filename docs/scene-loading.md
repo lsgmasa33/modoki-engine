@@ -897,11 +897,19 @@ Two consumers:
 ### Editor authoring surface
 
 - **Set the ref** — `editor/panels/assetViews/SceneAssetView.tsx`: select a scene in
-  Assets, set its base via an `AssetRefField` with an inline cycle warning. It writes
-  through `POST /api/scene-mutate`'s `setBaseScene` op (see "Scene-file mutation ops"
-  below), **not** the generic whole-file asset-write path — a scene file is also what
-  the live world serializes into, so a blind write from React state could race a
-  Play/Stop snapshot or an agent's concurrent mutate.
+  Assets, set its base via an `AssetRefField` with an inline cycle warning. ⚠️ **The edit is
+  MANUAL-SAVE as of #831** — it used to write the moment the field changed, which is the autosave
+  defect that issue is about, wearing a different route. Where it goes depends on whether this is
+  the scene the editor has OPEN:
+  - **the open scene** → `setCurrentBaseScene`, the module state `serializeScene` already emits
+    from, and Cmd+S writes it with the rest of the scene. (Before #831 that state was only ever set
+    at LOAD, so a base set here was overwritten by the stale value on the next save.)
+  - **any other scene** → parked in `editor/scene/pendingBaseScene.ts` and flushed by `saveAll`
+    through `POST /api/scene-mutate`'s `setBaseScene` op (see "Scene-file mutation ops" below),
+    **not** the generic whole-file asset-write path — a scene file is also what the live world
+    serializes into, so a blind write from React state could race a Play/Stop snapshot or an
+    agent's concurrent mutate. The flush runs LAST in `saveAll`, because that route refuses while
+    the editor reports unsaved work and these entries are part of that report.
 - **Hierarchy scene groups** — `editor/panels/Hierarchy.tsx` (grouping helper in
   `hierarchyFolders.ts`): base scenes render as collapsed-by-default "🔗 Base" header
   rows above the primary content, with a dirty dot when that base has unsaved edits. A
@@ -1630,8 +1638,9 @@ stability on disk" above) — they never round-trip to disk as-is.
 - **`removeEntity`** — deletes the entity plus its whole subtree (children found
   by `parentId`, GUID or legacy numeric).
 - **`setBaseScene`** — sets or clears a scene's top-level `baseScene` ref (see
-  [Base scenes](#base-scenes-nestable-cross-scene-persistence)); what
-  `SceneAssetView`'s Inspector field writes through.
+  [Base scenes](#base-scenes-nestable-cross-scene-persistence)); what `saveAll`'s
+  `flushPendingBaseScenes` writes through for a scene the editor has not loaded. Since #831 the
+  Inspector field does not call it directly — it parks, and the flush is the caller.
 
 `errors` are **hard** (entity not found, malformed op) — those ops are skipped;
 the caller decides whether to still write (the `/api/scene-mutate` endpoint only

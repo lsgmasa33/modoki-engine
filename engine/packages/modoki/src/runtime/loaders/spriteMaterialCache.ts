@@ -18,7 +18,7 @@
  *  Scene2D falls back to the default texture/tint path — a brief pop-in, like sprites). */
 
 import type { PixiShaderProgram } from '../rendering/pixiShaderBuilder';
-import { buildPixiShaderProgram } from '../rendering/pixiShaderBuilder';
+import { buildPixiShaderProgram, invalidatePixiShaderProgram } from '../rendering/pixiShaderBuilder';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { createTeardownToken } from '../core/liveness';
 
@@ -31,9 +31,12 @@ const failed = new Set<string>();                      // guid → compile retur
 // superseded by a clear (world swap, or the editor's `invalidateShaderFile` on a `.shader.json`
 // save) can't write a stale program back in, or worse, delete the map entries a NEW compile for
 // the same guid installed after the clear.
-// No per-key epoch here (unlike spriteAnimCache/particleCache): `clearSpriteMaterialCache` is
-// always a full wholesale clear, never a per-key invalidation, so a single module-wide token is
-// the complete answer — a per-key epoch would be unused machinery.
+// No per-key epoch here (unlike spriteAnimCache/particleCache) — `clearSpriteMaterialCache` is
+// still the ONLY clear this module has. That premise held while the sole caller was the Shader
+// Inspector; #842 wired `invalidateShader` to the file watcher too, which hands a per-PATH signal
+// (one `.shader.json` changed) that this wholesale clear discards, dropping every compiled 2D
+// material program in the scene for an edit to one of them. A per-key epoch is therefore no
+// longer "unused machinery" — it's a deliberate deferral, filed separately from #842.
 const liveness = createTeardownToken();
 // Parity fix, close-out sweep of QA-ANIM-0018: `resolveRef` never warns for a validly-shaped
 // guid simply absent from the manifest — the comment below claiming "resolveRef already warned"
@@ -117,4 +120,19 @@ export function clearSpriteMaterialCache(): void {
   waiters.clear();
   failed.clear();
   for (const cb of pending) cb();
+}
+
+/** The ONE definition of "a `.shader.json` changed" (#842). The 2D program map above is keyed
+ *  by GUID and never re-fetches on its own, so the wholesale `clearSpriteMaterialCache()` is the
+ *  load-bearing half — every entity re-`ensure`s and recompiles against the edited source.
+ *  `invalidatePixiShaderProgram(manifestPath)` is the optimisation on top (its own docblock says
+ *  so): it evicts just the one path from `pixiShaderBuilder`'s module-level program cache instead
+ *  of the whole thing, so a re-`ensure` doesn't recompile every OTHER shader in the scene too.
+ *  Both the Inspector panel (`assetViews/persist.ts`) and the live-reload watcher
+ *  (`agentBridge.ts`'s `ASSET_CACHE_INVALIDATORS`) must drive this one function, not spell the
+ *  two calls out themselves — that duplication is exactly how `material`/`shader` went unwired
+ *  from the watcher path while still working from the Inspector (#842). */
+export function invalidateShader(manifestPath: string): void {
+  clearSpriteMaterialCache();
+  invalidatePixiShaderProgram(manifestPath);
 }

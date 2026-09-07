@@ -5,10 +5,12 @@
  *  headlessly in uiFocusSystem.test.ts. */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { createWorld } from 'koota';
 import {
   pickInDirection, pushScope, popScope, activeScope, setFocus, focusedGuid, resetFocus,
-  requestActivate, retargetFocusedGuid, useFocusStore,
+  requestActivate, retargetFocusedGuid, useFocusStore, ensureFocusWorldSwapHook,
 } from '../../src/runtime/ui/focusManager';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import type { ScreenRect } from '../../src/runtime/core/screenBounds';
 
 const rect = (x: number, y: number): ScreenRect => ({ x, y, w: 10, h: 10 });
@@ -162,5 +164,28 @@ describe('ensureFocusWorldSwapHook — lazy init latch ordering', () => {
 
     vi.doUnmock('../../src/runtime/core/ecs/world');
     vi.resetModules();
+  });
+});
+
+// #838: this file never mocks `core/ecs/world` (the one test above that does uses its OWN
+// isolated module instance via vi.resetModules()/vi.doMock(), so it does not affect the
+// statically-imported `focusManager`/`core/ecs/world` bindings the rest of this file — including
+// this test — uses). So a REAL `setCurrentWorld` swap reaches the real production listener
+// registered by `ensureFocusWorldSwapHook` directly — no capture needed. The latch-ordering test
+// above only proves registration SUCCEEDS; it never drives the registered callback, which is the
+// gap this test closes.
+describe('the PRODUCTION world-swap wiring (#838) — not just latch ordering', () => {
+  it('a real world swap resets focus via the ensureFocusWorldSwapHook registration', () => {
+    ensureFocusWorldSwapHook();
+    setFocus('slot-3');
+    requestActivate('slot-3');
+    expect(focusedGuid()).toBe('slot-3');
+    expect(useFocusStore.getState().pendingActivateGuid).toBe('slot-3');
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    expect(focusedGuid()).toBe('');
+    expect(useFocusStore.getState().pendingActivateGuid).toBe('');
+    expect(useFocusStore.getState().scopeStack).toEqual(['']);
   });
 });

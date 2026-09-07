@@ -44,9 +44,15 @@ vi.mock('three/tsl', () => {
 vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
   worldTransforms: new Map(),
 }));
-// onWorldSwap is called at module load to register the geometry-cache teardown —
-// make it a no-op so importing the module doesn't pull the real world graph.
-vi.mock('../../src/runtime/core/ecs/world', () => ({ onWorldSwap: vi.fn() }));
+// onWorldSwap is called at module load to register the geometry-cache teardown — capture the
+// registered listener (rather than dropping it with a bare no-op) so a test can invoke it and
+// prove the registration is actually wired to the cache it is meant to free (#838). `vi.hoisted`
+// because the mock factory below runs during the (hoisted) import of flameMeshSync.ts itself,
+// before a plain top-level `let` would be initialized.
+const flameSwap = vi.hoisted(() => ({ listener: null as (() => void) | null }));
+vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: (fn: () => void) => { flameSwap.listener = fn; return () => {}; },
+}));
 
 import { createWorld } from 'koota';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -174,5 +180,32 @@ describe('disposeFlameMeshSyncState', () => {
       expect(rec.outerMat.dispose).toHaveBeenCalled();
       expect(rec.innerMat.dispose).toHaveBeenCalled();
     }
+  });
+});
+
+// #838: this suite mocks `core/ecs/world` wholesale (see the banner above `onWorldSwap` is
+// only a re-export of `worldRegistry`'s, so the mock severs the real listener Set and a
+// `setCurrentWorld` here would fire nothing). CAPTURE-AND-INVOKE instead: the mock above hands
+// back whatever `flameMeshSync.ts` registers at module load, so this drives the exact callback
+// the real world registry would call on a scene swap.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap disposes and clears the shared lathe-geometry cache (_coneGeos)', () => {
+    expect(flameSwap.listener, 'onWorldSwap must have been called at module load').not.toBeNull();
+
+    const e1 = world.spawn(Transform(), FlameMesh({ radialSegments: 16 }));
+    syncFlameMeshes(world, scene, state);
+    const geo1 = state.recs.get(e1.id())!.outerMesh.geometry;
+    const disposeSpy = vi.spyOn(geo1, 'dispose');
+
+    flameSwap.listener!(); // the REAL world-swap path — must free the module-level cache
+
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+
+    // A second, independent entity at the SAME segment count: if the cache had not been cleared,
+    // flameGeometry(16) would hand back the same (already-disposed) geometry instead of rebuilding.
+    const e2 = world.spawn(Transform(), FlameMesh({ radialSegments: 16 }));
+    syncFlameMeshes(world, scene, state);
+    const geo2 = state.recs.get(e2.id())!.outerMesh.geometry;
+    expect(geo2).not.toBe(geo1);
   });
 });

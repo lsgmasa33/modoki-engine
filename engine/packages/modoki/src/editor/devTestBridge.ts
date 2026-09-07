@@ -8,7 +8,7 @@ import { useEditorStore } from './store/editorStore';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
-import { loadScene, type SceneLoadOutcome } from './scene/serialize';
+import { loadScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
 import { getModeOwner } from './scene/playMode';
 import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
@@ -33,6 +33,12 @@ export interface EditorTestBridge {
    *  the project-namespaced `modoki-last-scene:<project>` localStorage key, so fixture loading is
    *  independent of which project the dev server happens to open. */
   loadScene(scenePath: string): Promise<SceneLoadOutcome>;
+  /** Re-point the editor's tracked scene path with NO world swap and NO structural change —
+   *  what `saveScene()` does on a Save As (`scene/serialize.ts`, both branches). Exposed
+   *  because that seam is otherwise only reachable through a native file dialog, and it is
+   *  where #839's first fix regressed: a path-keyed collapse claim read "needs restore" here
+   *  and wiped the arrangement the user had just saved. */
+  renameCurrentScenePath(scenePath: string): void;
   /** Name of the currently selected entity, or null if none. */
   selectedEntityName(): string | null;
   /** Read a single trait field off an entity (for asserting edits landed). */
@@ -162,6 +168,9 @@ export function installEditorTestBridge(): void {
     },
     flushCoalescedEdits() {
       flushCoalescedEdits();
+    },
+    renameCurrentScenePath(scenePath) {
+      setCurrentScenePath(scenePath);
     },
     getPointerState() {
       const input = getInput(getCurrentWorld());

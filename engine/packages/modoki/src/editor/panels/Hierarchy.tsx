@@ -1,7 +1,7 @@
 /** Hierarchy — shows ECS entities as a tree with parent-child relationships */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { onWorldSwap } from '../../runtime/core/ecs/world';
+import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
@@ -14,6 +14,7 @@ import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { aSceneSwapIsHappening } from '../scene/playMode';
 import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
@@ -25,6 +26,7 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
+import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, collapsedIdsToGuids, needsCollapseRestore, shouldPersistCollapse, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
 import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
@@ -68,28 +70,8 @@ function saveEmptyFolders(scenePath: string, set: Set<string>) {
 }
 
 // ── Entity collapse persistence (editor-local, per scene, keyed by GUID) ──
-// Expand/collapse is per-user VIEW state, so it lives in localStorage — NOT the scene
-// file (would churn + isn't scene data). Keyed by EntityAttributes.guid so it survives
-// the runtime-id reassignment on every scene reload / Play→Stop. Per scene path, mirroring
-// the empty-folders map above. A saved (even empty) array = "this scene has been seen"
-// (all-expanded is remembered); a MISSING entry = never seen → collapse-all default.
-const ENTITY_COLLAPSE_LS_KEY = 'editor:hierarchy:entityCollapsed:v1';
-function loadCollapseMap(): Record<string, string[]> {
-  try { const raw = localStorage.getItem(ENTITY_COLLAPSE_LS_KEY); const o = raw ? JSON.parse(raw) : {}; return o && typeof o === 'object' ? o : {}; } catch { return {}; }
-}
-function loadCollapsedGuids(scenePath: string): string[] | null {
-  if (!scenePath) return null;
-  const arr = loadCollapseMap()[scenePath];
-  return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : null;
-}
-function saveCollapsedGuids(scenePath: string, guids: string[]) {
-  if (!scenePath) return;
-  try {
-    const map = loadCollapseMap();
-    map[scenePath] = guids;
-    localStorage.setItem(ENTITY_COLLAPSE_LS_KEY, JSON.stringify(map));
-  } catch { /* ignore */ }
-}
+// Lives in ./hierarchyCollapse.ts — the load/save pair plus the restore and
+// may-we-save decisions, so those carry unit tests instead of riding in this .tsx.
 
 /** Empty collapsed-set reused while a search/type filter is active so every kept
  *  node renders expanded (matches can sit arbitrarily deep). Stable identity so the
@@ -703,29 +685,22 @@ export default function Hierarchy() {
 
   // Refresh entity tree on structural changes (create/delete/reparent)
   const prevVersionRef = useRef(-1);
-  // True until the Hierarchy collapse state has been restored for the CURRENT world.
-  // Set on mount + every world swap; cleared by a SETTLED refresh (see below). Also gates
-  // the persistence effect so a transient pre-restore set can't clobber the saved state.
-  const restoreNeededRef = useRef(true);
+  // #839: the WORLD the current `collapsed` set was restored for — an identity, not an unkeyed
+  // "restore needed" boolean (which nothing was guaranteed to clear) and not the scene path
+  // (which File → Save As changes with no swap). See hierarchyCollapse.ts for both scars.
+  const collapseOwnerRef = useRef<CollapseOwner>(null);
+  // Set by the effect below so the persistence effect can ask for a settled refresh too.
+  const requestSettledRefreshRef = useRef<() => void>(() => {});
   useEffect(() => {
     // Restore per-scene collapse (by guid), or apply the collapse-all default for a
     // never-seen scene. MUST run from a SETTLED refresh: getCurrentScenePath() is correct
     // on the next-RAF coalesced refresh but STALE inside the synchronous onWorldSwap
     // handler (the editor sets the scene path AFTER the swap fires).
     const restoreCollapse = (flat: EntityInfo[]) => {
-      restoreNeededRef.current = false;
-      if (flat.length <= 5) { setCollapsed(new Set()); setCollapseEpoch((n) => n + 1); return; }
-      const parents = flat.filter((e) => flat.some((c) => c.parentId === e.id));
-      const saved = loadCollapsedGuids(getCurrentScenePath() || '');
-      if (saved) {
-        // Seen before → restore exactly (map saved guids → current ids). An entity with
-        // no guid, or not in the saved set, renders expanded.
-        const wanted = new Set(saved);
-        setCollapsed(new Set(parents.filter((e) => e.guid && wanted.has(e.guid)).map((e) => e.id)));
-      } else {
-        // Never-seen scene → collapse all parents (the tidy default).
-        setCollapsed(new Set(parents.map((e) => e.id)));
-      }
+      // Record WHICH WORLD this set now belongs to — that is what re-opens the save gate.
+      const path = getCurrentScenePath() || '';
+      collapseOwnerRef.current = { world: getCurrentWorld(), path };
+      setCollapsed(computeRestoredCollapse(flat, loadCollapsedGuids(path)));
       // Lands AFTER the selection's own reveal (restored by guid on load); bump the epoch
       // so the reveal effect re-opens the selected row's ancestors.
       setCollapseEpoch((n) => n + 1);
@@ -740,31 +715,98 @@ export default function Hierarchy() {
         setTree(buildEntityTree(flat));
       }
       // Collapse restore is scene-path-dependent → only on a settled refresh, once per world.
-      if (settled && restoreNeededRef.current) {
+      // ⚠️ The swap check belongs HERE, not in the swap's scheduled flush, because
+      // `onStructureDirtyCoalesced` is a second, unscheduled door into this same branch: a manager
+      // that spawns entities during the post-swap tail (managerRegistry's init contract allows it)
+      // would otherwise restore against the outgoing scene's path and latch the owner, leaving the
+      // scheduled flush a no-op. Skipping is always safe — the owner stays unclaimed, so whichever
+      // refresh arrives once the swap lands does the restore.
+      if (settled && !aSceneSwapIsHappening()
+          && needsCollapseRestore(collapseOwnerRef.current, getCurrentWorld(), getCurrentScenePath() || '')) {
         const flat = getAllEntities();
         if (flat.length > 0) restoreCollapse(flat);
       }
     };
+    // #839: a settled refresh THIS effect owns, so the restore is never left waiting on an
+    // event that may not come. Guarded so a burst of callers collapses to one frame.
+    let settledRaf = 0;
+    const hasRAF = typeof requestAnimationFrame !== 'undefined';
+    // `sceneManager` knows the incoming scene BEFORE setCurrentWorld (it sets primaryId first);
+    // the EDITOR's path is written later, in loadScene's own tail. While they disagree the swap
+    // has landed but the path has not, and restoring then would key the new world's tree to the
+    // OLD scene's saved set — then persist an empty set over that scene's entry.
+    // ⚠️ Ask "is a swap still in progress", NOT "do the two scene paths agree". The path
+    // comparison looks equivalent and is a trap: EVERY writer of the editor path other than
+    // `loadScene`'s tail leaves it diverged from `sceneManager` INDEFINITELY (Save As, Create
+    // Scene, the boot restore, the dev bridge), and so does a load that throws after the swap —
+    // so a path-based predicate is not "not settled yet", it is "never settled", and it would
+    // shut the restore AND the save gate for the rest of the session. That is #839 itself,
+    // returning by another route. `aSceneSwapIsHappening()` is bounded by the load's own
+    // `finally`, so it always clears.
+    const PATH_SETTLE_FRAMES = 5;
+    const scheduleSettledRefresh = (settleRetries = 0) => {
+      if (settledRaf) return;
+      const flush = () => {
+        settledRaf = 0;
+        refresh(true);
+        if (settleRetries <= 0) return;
+        // A swap still running does NOT consume the budget — it ends on its own `finally`, and a
+        // slow scene load must not exhaust the retries before the restore can key to a real path.
+        // The budget only bounds the case where nothing is in flight and the restore still has
+        // not happened, so the chain can never spin forever.
+        if (aSceneSwapIsHappening()) scheduleSettledRefresh(settleRetries);
+        else if (needsCollapseRestore(collapseOwnerRef.current, getCurrentWorld(), getCurrentScenePath() || '')) {
+          scheduleSettledRefresh(settleRetries - 1);
+        }
+      };
+      settledRaf = hasRAF ? requestAnimationFrame(flush) : (setTimeout(flush, 0) as unknown as number);
+    };
+    requestSettledRefreshRef.current = () => scheduleSettledRefresh();
+
     refresh(true); // initial build + restore (the editor boots with a scene already loaded)
     const unsub = onStructureDirtyCoalesced(() => refresh(true));
     const unsubSwap = onWorldSwap(() => {
-      prevVersionRef.current = -1;     // invalidate so the coalesced refresh isn't deduped
-      restoreNeededRef.current = true; // re-restore (remap ids) once the swap settles
-      refresh(false);                  // rebuild the tree now; path may be stale → skip restore
+      prevVersionRef.current = -1;      // invalidate so the coalesced refresh isn't deduped
+      // No claim to set: collapseOwnerRef holds the OLD world, and a new world simply is not it,
+      // so needsCollapseRestore is already true. (Nulling here would also demand a spurious
+      // restore after stepSimulation swaps the world out and back again.)
+      refresh(false);                   // rebuild the tree now; path may be stale → skip restore
+      // ⚠️ Do NOT wait for onStructureDirtyCoalesced to deliver the restore. Structure-dirty
+      // fires on registerEntity, and loadSceneFile registers the incoming scene's entities
+      // into the STAGING world BEFORE this swap (loadSceneFile's spawnEntity calls, which take the staging world) — SceneManager marks
+      // nothing dirty after setCurrentWorld — so for an ordinary scene load no settled
+      // refresh ever arrives. One frame from here getCurrentScenePath() is settled
+      // (loadScene writes it in its own tail, scene/serialize.ts:1080) and the restore runs.
+      scheduleSettledRefresh(PATH_SETTLE_FRAMES);
     });
-    return () => { unsub(); unsubSwap(); };
-  }, []);
+    return () => {
+      unsub();
+      unsubSwap();
+      requestSettledRefreshRef.current = () => {};
+      if (settledRaf) { if (hasRAF) cancelAnimationFrame(settledRaf); else clearTimeout(settledRaf); settledRaf = 0; }
+    };
+    // `hmrEpoch` (0 in production) re-runs this on a hot update — Fast Refresh re-renders the
+    // panel but never re-runs a `[]`-deps effect, so without it a hot edit to this file or to
+    // hierarchyCollapse.ts leaves the OLD swap handler and the OLD scheduler subscribed while
+    // `collapseOwnerRef` (a ref) survives — i.e. anyone verifying this fix in a running editor
+    // would be measuring pre-edit code. Re-running is safe: the cleanup unsubscribes and cancels
+    // the frame, and the fresh `refresh(true)` no-ops once the owner is already the live world.
+    // Same reasoning as the keymap effect below. See input/hmrEpoch.ts.
+  }, [hmrEpoch]);
 
-  // Persist collapse per scene (by guid). Gated on restoreNeededRef so a transient
-  // pre-restore collapsed set (stale ids from before a swap) can't overwrite the save.
+  // Persist collapse per scene (by guid). Gated on the OWNER so a transient pre-restore set
+  // (stale ids from before a swap) can't overwrite the save.
   useEffect(() => {
-    if (restoreNeededRef.current) return;
     const path = getCurrentScenePath() || '';
-    if (!path) return;
-    const idToGuid = new Map(getAllEntities().map((e) => [e.id, e.guid || '']));
-    const guids: string[] = [];
-    for (const id of collapsed) { const g = idToGuid.get(id); if (g) guids.push(g); }
-    saveCollapsedGuids(path, guids);
+    if (!shouldPersistCollapse(collapseOwnerRef.current, getCurrentWorld(), path)) {
+      // #839: a closed gate must not be a terminal state. Two ways it shuts — the set holds a
+      // DEAD world's ids (junk; the restore below replaces it), or there is no scene path to
+      // write to at all (`newScene()`, prefab-edit). Only the first is repairable, and only the
+      // first asks: request the settled refresh so a missed one cannot shut the gate for good.
+      if (path) requestSettledRefreshRef.current();
+      return;
+    }
+    saveCollapsedGuids(path, collapsedIdsToGuids(getAllEntities(), collapsed));
   }, [collapsed]);
 
   const handleToggle = useCallback((id: number, recursive = false) => {

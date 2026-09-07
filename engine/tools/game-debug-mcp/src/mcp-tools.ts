@@ -172,6 +172,13 @@ type DeviceStatusReply = {
  *  the real interface without re-parsing this file's type declaration. */
 export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial'] as const;
 
+/** The `type` values `device_read_asset_def` accepts — the 8 of the 9 `ASSET_SCHEMA_TYPES` that
+ *  `read-asset-def` (agentBridge.ts) actually serves; `material` is deliberately absent (that op
+ *  refuses it — a material's live cache holds only the compiled THREE.Material). Exported so
+ *  `assetTypeParity.test.ts` pins this enum against the op instead of letting it drift again like
+ *  #842/#843 (five types kept here after the op widened to seven). */
+export const DEVICE_READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset', 'atlas'] as const;
+
 // ── GET /api/device/list (#149) ───────────────────────────────────────────
 // A local mirror of the route's reply shape (`editorBackendRouter.ts`'s `/api/device/list` handler,
 // `DeviceClaim` from `deviceConnection.ts` § deviceClaims.ts) — same reason as `DeviceStatusReply`
@@ -1784,7 +1791,9 @@ export function registerTools(server: McpServer) {
 
   tool('device_read_asset_def',
     'Read an asset definition AS THE RUNNING BUILD RESOLVED IT (#166 P7) — a particle/animation/' +
-      'timeline/spriteanim/rig2d def straight out of the live cache on the phone. This is not a ' +
+      'timeline/spriteanim/rig2d/shader/animset/atlas def straight out of the live cache on the phone. ' +
+      'NOT .mat.json — a material\'s live cache holds only the compiled THREE.Material, the ' +
+      'authored JSON is discarded once built, so read that file directly instead. This is not a ' +
       'file read: it answers "what did THIS build actually load", which is the observe-don\'t-infer ' +
       'rule applied to assets, and it is the only way to tell a shipped/OTA build apart from the ' +
       'source on your disk. PEEKS ONLY — it never triggers a fetch, so asking about an absent asset ' +
@@ -1792,7 +1801,7 @@ export function registerTools(server: McpServer) {
       'empty def.',
     {
       path: z.string().describe('Asset path, e.g. /games/x/assets/fx/spark.particle.json'),
-      type: z.enum(['particle', 'animation', 'timeline', 'spriteanim', 'rig2d']).optional()
+      type: z.enum(DEVICE_READ_ASSET_DEF_TYPES).optional()
         .describe('Override the kind. Inferred from the filename suffix when omitted.'),
     },
     async ({ path, type }) => writeCall('device_read_asset_def', 'read-asset-def',

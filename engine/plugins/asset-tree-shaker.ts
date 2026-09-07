@@ -1206,6 +1206,10 @@ export function computeKeptAssets(
     // reading real fixtures that they're pure ASCII grids (floor/ramp/zones layers, a spawn-chart
     // `rows` array) with no embedded asset refs — they ARE leaves today. If a future level format
     // ever embeds a guid, its walk branch goes here.
+    // Also deliberately includes 'animation' — WALKABLE_TYPES (above) omits it on purpose:
+    // AnimationClipDef holds only number/color/boolean/enum keys, no GUID-bearing field, so a
+    // `.anim.json` IS a leaf. Verified, not overlooked — if a future clip format adds a ref
+    // (e.g. an embedded material/texture), its walk branch goes here.
   }
 
   // Resolve font families → actual files.

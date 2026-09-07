@@ -96,7 +96,7 @@ export default class PanelErrorBoundary extends Component<Props, State> {
           {remountFailed && this.state.confirming && (
             <>
               <p style={{ fontSize: 10, color: '#c9a227', marginBottom: 10, maxWidth: 320, lineHeight: 1.5 }}>
-                Reload the editor? Unsaved scene edits are discarded.
+                Reload the editor? Unsaved scene and pending asset edits are discarded.
               </p>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => this.setState({ confirming: false })} style={secondaryBtn} data-ui-id="panel-error.cancel-reload">Cancel</button>

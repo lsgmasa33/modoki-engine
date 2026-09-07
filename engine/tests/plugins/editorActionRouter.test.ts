@@ -442,6 +442,29 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
   });
 
+  it('names the ACTUAL cause when the unsaved work is a dirty ASSET, not a fixed create_entity string (#844)', async () => {
+    // Since #831 a Material slider drag parks a dirty asset the same way create_entity parks a
+    // live-world edit — the fixed refusal string used to blame create_entity/duplicate_entity/
+    // prefab regardless, sending an agent hunting entities it never created.
+    const scenePath = tempScene();
+    const before = fs.readFileSync(scenePath, 'utf-8');
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async () => ({
+        playState: 'stopped',
+        unsavedChanges: true,
+        unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/x.mat.json'], dirtyScenes: [] },
+      })),
+    });
+    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
+    expect(r.status).toBe(409);
+    expect(r.body.unsavedChanges).toBe(true);
+    expect(r.body.error).toMatch(/\/assets\/x\.mat\.json/);
+    // The negative half is what makes this bite: the OLD fixed string must be gone, not just a
+    // new sentence added alongside it.
+    expect(r.body.error).not.toMatch(/create_entity/);
+    expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
+  });
+
   it('applies the mutate when the editor is stopped', async () => {
     const scenePath = tempScene();
     const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });

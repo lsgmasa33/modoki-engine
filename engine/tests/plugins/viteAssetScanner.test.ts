@@ -173,8 +173,28 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
     expect(detectType('/games/x/assets/config/settings.json', '.json')).toBeNull();
     expect(classifySceneChange('/games/x/assets/config/settings.json')).toBeNull();
   });
-  it('does NOT broadcast typed sibling assets with no runtime cache (.mat/.mesh)', () => {
-    expect(classifySceneChange('/games/x/assets/materials/metal.mat.json')).toBeNull();
+  // ⚠️ THIS TEST WAS DEFENDING THE BUG (#842). It asserted `.mat.json` classifies as null on the
+  // stated grounds that materials have "no runtime cache". That premise was false when it was
+  // written — `invalidateMaterial` (meshTemplateCache.ts) has existed throughout, and materials
+  // are exactly as cached as the kinds below. The consequence was the whole of #842's member 1: no
+  // broadcast for a `.mat.json` meant `dropParkedWriteFor` could never fire for one, so once #831
+  // made the Material Inspector PARK its edits, a stale parked doc silently overwrote a newer file
+  // at the next Cmd+S. A green test asserting the defect is intended is what stopped anyone
+  // re-checking. Same shape as `reimportNotify.test.ts` asserting the old model|texture filter on
+  // the false premise that an audio clip is "not a GPU cache the renderer keys by path"
+  // (docs/editor.md § "The asset Inspector", rule 5) — twice now, so the lesson is the pattern, not
+  // the instance: a test whose NAME states a reason is only as good as the reason.
+  it("broadcasts a .mat.json as 'material' — it IS cached (#842)", () => {
+    expect(classifySceneChange('/games/x/assets/materials/metal.mat.json')).toBe('material');
+  });
+  it("broadcasts a .shader.json as 'shader' — spriteMaterialCache holds it by GUID (#842)", () => {
+    expect(classifySceneChange('/games/x/assets/shaders/holo.shader.json')).toBe('shader');
+  });
+  // `.mesh.json` genuinely does not broadcast, but note the REASON is not "no cache" either —
+  // `meshAssetCache` exists. It is that no mesh doc is agent-writable or parkable
+  // (`mesh` is not in ASSET_SCHEMA_TYPES), so nothing can park a stale one or edit it live. If a
+  // mesh ever becomes writable, this line is the one that has to move with it.
+  it('does NOT broadcast a .mesh.json — not writable, so nothing can go stale live', () => {
     expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBeNull();
   });
   // Cache-invalidation kinds: NOT a scene reload (that would discard unsaved work) — the

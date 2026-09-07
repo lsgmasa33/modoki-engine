@@ -6,8 +6,15 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as THREE from 'three';
 
 // The module registers its world-swap teardown at import time (mirroring flameMeshSync's lathe
-// cache); stub the hook so importing it here does not pull in the real world graph.
-vi.mock('../../src/runtime/core/ecs/world', () => ({ onWorldSwap: vi.fn() }));
+// cache). Capture the registered listener (rather than dropping it with a bare no-op) so a test
+// can invoke it and prove the REGISTRATION reaches `clearAllInstancedBatches` — the function
+// itself is already covered directly below (#838). `vi.hoisted` because the factory runs during
+// the (hoisted) import of instancedBatching.ts itself, before a plain top-level `let` would be
+// initialized.
+const batchingSwap = vi.hoisted(() => ({ listener: null as (() => void) | null }));
+vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: (fn: () => void) => { batchingSwap.listener = fn; return () => {}; },
+}));
 
 import {
   applyInstancedBatching, clearInstancedBatches, clearAllInstancedBatches, getBatchStats, MIN_INSTANCES,
@@ -266,5 +273,27 @@ describe('reporting', () => {
     expect(s.skipped.lod).toBeUndefined();
     expect(s.skipped['below-threshold']).toBe(1);
     expect(s.considered).toBe(2);
+  });
+});
+
+// #838: this suite mocks `core/ecs/world` wholesale — `onWorldSwap` is only a re-export of
+// `worldRegistry`'s, so the mock severs the real listener Set and a `setCurrentWorld` here would
+// fire nothing. CAPTURE-AND-INVOKE instead: the mock above hands back whatever
+// `instancedBatching.ts` registers at module load. `clearAllInstancedBatches` ITSELF is already
+// covered directly (see 'clearAllInstancedBatches drops batches from EVERY scene' above) — this
+// test's only job is to prove the REGISTRATION reaches it, not to re-test the function body.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap reaches clearAllInstancedBatches', () => {
+    expect(batchingSwap.listener, 'onWorldSwap must have been called at module load').not.toBeNull();
+
+    const ms = meshes(MIN_INSTANCES, geo, mat);
+    ms.forEach((m) => scene.add(m));
+    applyInstancedBatching(scene, ms);
+    expect(scene.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(true);
+
+    batchingSwap.listener!(); // the REAL world-swap path — must reach clearAllInstancedBatches
+
+    expect(scene.children.some((c) => (c as THREE.InstancedMesh).isInstancedMesh)).toBe(false);
+    expect(ms.every((m) => m.visible)).toBe(true);
   });
 });

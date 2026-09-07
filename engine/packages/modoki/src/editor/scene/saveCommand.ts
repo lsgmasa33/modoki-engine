@@ -15,6 +15,7 @@
 
 import { saveAll, unsavedChangeCauses, type SaveResult } from './serialize';
 import { flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { flushPendingBaseScenes } from './pendingBaseScene';
 import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
@@ -26,6 +27,14 @@ import { getModeOwner } from './playMode';
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
   assets: FlushResult;
+  /** Pending `baseScene` refs written by this save (#831), if any were.
+   *
+   *  A SEPARATE field rather than folded into `assets`, because they fail for different reasons
+   *  and a caller acting on the failure needs to know which: an asset write is retried by saving
+   *  again, while a refused `setBaseScene` means the route's own unsaved-work or run-mode guard
+   *  turned it down. `toastForSave` still names both in one sentence — the human wants ONE answer
+   *  to "did my work save", not a taxonomy. */
+  baseScenes?: { saved: string[]; failed: Array<{ path: string; error: string }> };
   /** Which half the scene-shaped save targeted. `'assets'` = only parked asset docs were written:
    *  a preview envelope was open and the scene had nothing to write, so interrupting the preview
    *  would have bought churn and a flicker for no content. */
@@ -158,11 +167,24 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     const refused = !canEdit();
     const mode = { runMode: getRunMode(), owner: getModeOwner() };
     const prefabSaved = await savePrefabEdit();
-    return { assets, target: 'prefab', prefabSaved, ...(refused ? { prefabRefused: true, mode } : {}) };
+    // …and the pending base-scene refs, for the same #259 reason this branch already flushes
+    // parked asset docs: a `baseScene` set on a scene the editor never loaded has nothing to do
+    // with which world is open, and Cmd+S doing nothing for it is "the human pressed save and
+    // their edit did not save". AFTER `savePrefabEdit`, not before: `/api/scene-mutate` refuses
+    // while the editor reports unsaved work, and the prefab world's own edits are exactly that —
+    // running it first would refuse every ref against the save that is trying to persist it. Same
+    // ordering rule as `saveAll`'s, for the same reason.
+    const baseScenes = await flushPendingBaseScenes();
+    return {
+      assets, target: 'prefab', prefabSaved,
+      ...(baseScenes.saved.length || baseScenes.failed.length ? { baseScenes } : {}),
+      ...(refused ? { prefabRefused: true, mode } : {}),
+    };
   }
   const scene = await saveAll({ allowDialog: true });
   return {
     assets: scene.assets ?? { saved: [], failed: [] },
+    ...(scene.baseScenes ? { baseScenes: scene.baseScenes } : {}),
     target: 'scene',
     scene,
     // Sampled here, not in the toast: by the time a message renders the user may already have
@@ -181,13 +203,21 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
 
   // A failed asset write is reported first and always: it is pending work that stayed pending,
   // and the file it belongs to is named so the human knows which edit is still only in memory.
-  const failSuffix = assetFails.length
+  const baseFails = o.baseScenes?.failed ?? [];
+  const failSuffix = (assetFails.length
     ? ` — ${assetFails.length} asset write(s) FAILED and are still unsaved: ${assetFails.map((f) => f.path).join(', ')}`
-    : '';
+    : '')
+    // Same rule for a refused base-scene ref (#831): it is pending work that stayed pending, and
+    // nothing else would have told the human. Its own clause rather than a shared count, because
+    // "asset write" is the wrong noun for a one-field scene mutation and a human chasing the wrong
+    // noun looks in the wrong panel.
+    + (baseFails.length
+      ? ` — ${baseFails.length} base-scene ref(s) FAILED and are still unsaved: ${baseFails.map((f) => f.path).join(', ')}`
+      : '');
   // A failed write is a WARNING in every branch, including the ones whose own outcome is benign.
   // A cancelled Save-As over a failed asset write was reporting 'info', so the sentence said FAILED
   // in a colour that says "nothing to see" — and colour is what gets read.
-  const worst = (k: 'success' | 'warn' | 'info') => (assetFails.length ? 'warn' : k);
+  const worst = (k: 'success' | 'warn' | 'info') => (assetFails.length || baseFails.length ? 'warn' : k);
 
   if (o.target === 'assets') {
     // No scene half to report. Silence about it is the point: while authoring a clip the scene is

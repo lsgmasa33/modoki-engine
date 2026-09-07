@@ -128,6 +128,50 @@ describe('getFontTexturePixi — concurrent renderers', () => {
   });
 });
 
+/** #828 — every test above uses a DIFFERENT `provider.id` per case and never resets the
+ *  module-level `cache`, so the key's `${provider.id}` discriminant has never actually been
+ *  asserted: a regression that dropped it from the key would still pass every test above
+ *  (each one only ever looks up the id it just built). This is the one that would catch it —
+ *  two providers, constructed in the SAME test, sharing the atlas-image cache map. */
+describe('per-provider discriminant — two providers, same page (#828)', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+
+  it('two providers with different ids get DISTINCT textures for the SAME page', async () => {
+    const a = provider('font-two-a');
+    const b = provider('font-two-b');
+
+    // The shared module-level `resolveLoad`/`rejectLoad` (used by every OTHER test in this file)
+    // only ever track the LATEST in-flight load, which can't drive two genuinely concurrent
+    // loads — so capture each call's own resolver instead.
+    let resolveA!: (t: unknown) => void;
+    let resolveB!: (t: unknown) => void;
+    loadPixiTexture.mockImplementationOnce(() => {
+      loadCalls++;
+      return new Promise((res) => { resolveA = res as typeof resolveA; });
+    });
+    loadPixiTexture.mockImplementationOnce(() => {
+      loadCalls++;
+      return new Promise((res) => { resolveB = res as typeof resolveB; });
+    });
+
+    expect(getFontTexturePixi(a, 0), 'nothing to draw yet for A').toBeNull();
+    expect(getFontTexturePixi(b, 0), 'nothing to draw yet for B').toBeNull();
+    // A shared `${...}:image` key (dropping provider.id) would route B's request onto A's
+    // already-in-flight load via `addWaiter` instead of starting a second one.
+    expect(loadCalls, 'a shared key would have joined B onto A\'s in-flight load').toBe(2);
+
+    const texA = fakeTexture();
+    const texB = fakeTexture();
+    resolveA(texA);
+    await vi.waitFor(() => expect(getFontTexturePixi(a, 0)).not.toBeNull());
+    resolveB(texB);
+    await vi.waitFor(() => expect(getFontTexturePixi(b, 0)).not.toBeNull());
+
+    expect(getFontTexturePixi(a, 0), 'a shared cache would hand B\'s texture back for A').toBe(texA);
+    expect(getFontTexturePixi(b, 0), 'a shared cache would hand A\'s texture back for B').toBe(texB);
+  });
+});
+
 /** Page 0's IMAGE texture must survive glyph generation.
  *
  *  A baked-seeded dynamic font bumps `atlasVersion` on every generated batch while serving page 0

@@ -112,7 +112,13 @@ function currentSceneKey(): string | null {
  *  `sceneManager.getNext()` is non-null exactly while a load is pre-swap (it is relinquished AT
  *  the swap), which is the window that matters here: past the swap the world is already the new
  *  one, so a snapshot taken then is of the right world. See docs/async-lifetime.md. */
-function aSceneSwapIsHappening(): boolean {
+/** Is a world swap in progress right now — through the `loadScene` wrapper OR straight through
+ *  SceneManager? BOTH halves are needed: `prefabEdit.openPrefabForEditing` and `applyPrefabUndo`
+ *  call `sceneManager.loadScene` directly and move neither the epoch nor the in-flight count
+ *  (see the SCOPE note on `isSceneLoadInFlight`). Exported for the Hierarchy's collapse restore,
+ *  which must not key a restore to the editor's scene path until the winning load's tail has
+ *  written it. */
+export function aSceneSwapIsHappening(): boolean {
   return isSceneLoadInFlight() || sceneManager.getNext() !== null;
 }
 

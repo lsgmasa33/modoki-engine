@@ -199,6 +199,11 @@ export {
   ANIMSET_DEFAULTS,
   type AnimSetDef, type AnimSetClipDef, type ResolvedAnimParams,
 } from './loaders/animSetCache';
+// The 2D-material (.shader.json) invalidator (#842) — agentBridge.ts's ASSET_CACHE_INVALIDATORS
+// reaches it through this barrel the same way it reaches invalidateAnimSet above.
+// `getSpriteMaterialProgram` (#842b) is a pure map read — no fetch side effect on a miss — so
+// `read-asset-def`'s shader arm can peek it exactly like the other types' `{load:false}` getters.
+export { invalidateShader, getSpriteMaterialProgram } from './loaders/spriteMaterialCache';
 export {
   getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip,
   setSpriteAnim, invalidateSpriteAnim, clearSpriteAnimCache, normalizeSpriteAnim,
@@ -863,7 +868,7 @@ export {
   requestActivate, resetFocus, consumePendingActivation, pickInDirection,
   type NavDir,
 } from './ui/focusManager';
-export { addDirtyListener } from './core/ecs/entityUtils';
+export { addDirtyListener, fireDirtyListeners } from './core/ecs/entityUtils';
 // Default game store (ECS→React bridge). Exported so a game imports it via
 // `@modoki/engine/runtime` instead of a repo-relative path into the app shell —
 // the latter breaks when the game is opened standalone (copied out of the repo).
