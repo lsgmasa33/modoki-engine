@@ -23,12 +23,12 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve, extname, basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { extname, basename } from 'node:path';
 import { repoFiles } from './repoCorpus.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(__dirname, '../..'); // repo root (engine/scripts → ../..)
+// No ROOT constant here on purpose (#849): every path this script reports now comes from
+// `repoFiles()`'s own repo-relative `rel`. A second, independently derived repo root is exactly
+// what makes a report print a truncated path when the two spellings disagree.
 const WRITE = process.argv.includes('--write');
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -62,7 +62,7 @@ function gameAssetFiles(match) {
     match: (rel) => RUNTIME_ASSETS_RE.test(rel) && match(rel),
     exclude: ['ios', 'android'],
     floor: 0,
-  }).map(({ abs }) => abs);
+  });
 }
 
 const TEX_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -77,11 +77,15 @@ async function main() {
   // 1. Index every texture: guid → { metaPath, srcPath, format, type }.
   const texByGuid = new Map();
   const metas = gameAssetFiles((rel) => rel.endsWith('.meta.json') && TEX_EXT.has(extname(rel.slice(0, -'.meta.json'.length)).toLowerCase()));
-  for (const metaPath of metas) {
+  for (const { rel: metaRel, abs: metaPath } of metas) {
     const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
     if (!isGuid(meta.id)) continue;
     texByGuid.set(meta.id, {
       metaPath, srcPath: metaPath.slice(0, -'.meta.json'.length),
+      // git's own repo-relative POSIX string, carried for the report (#849). Deriving it from
+      // `abs` needs a second, independently derived repo root, and slicing by that root's length
+      // prints a truncated path whenever the two disagree — the defect this range exists to remove.
+      srcRel: metaRel.slice(0, -'.meta.json'.length),
       format: meta?.texture?.format, type: resolveTextureType(meta), meta,
       used2D: false, used3D: resolveTextureType(meta) === '3d' || String(meta?.texture?.format || '').startsWith('ktx2'),
     });
@@ -89,7 +93,7 @@ async function main() {
 
   // 2. Mark textures used in 3D (any material slot referencing the texture GUID).
   const mats = gameAssetFiles((rel) => rel.endsWith('.mat.json'));
-  for (const matPath of mats) {
+  for (const { abs: matPath } of mats) {
     const raw = await readFile(matPath, 'utf-8');
     for (const guid of texByGuid.keys()) if (raw.includes(guid)) texByGuid.get(guid).used3D = true;
   }
@@ -129,7 +133,7 @@ async function main() {
       (extname(rel) === '.json' && /(^|\/)scenes\//.test(rel));
   });
 
-  for (const file of contentFiles) {
+  for (const { rel, abs: file } of contentFiles) {
     const json = JSON.parse(await readFile(file, 'utf-8'));
     const changes = [];
     if (file.endsWith('.rig2d.json') && Array.isArray(json.parts)) {
@@ -139,15 +143,15 @@ async function main() {
     } else {
       walkContent(json, basename(file), changes);
     }
-    if (changes.length) edits.push({ file, json, changes });
+    if (changes.length) edits.push({ file, rel, json, changes });
   }
 
   // 4. Report.
   console.log(`\n=== 2D sprite-ref migration (${WRITE ? 'WRITE' : 'DRY-RUN'}) ===`);
   console.log(`textures indexed: ${texByGuid.size} · content files scanned: ${contentFiles.length}`);
   let total = 0;
-  for (const { file, changes } of edits) {
-    console.log(`\n${file.replace(ROOT + '/', '')}  (${changes.length})`);
+  for (const { rel, changes } of edits) {
+    console.log(`\n${rel}  (${changes.length})`);
     for (const c of changes) { console.log(`  ${c.at}: ${c.from} → ${c.to}`); total++; }
   }
   console.log(`\nrewrites planned: ${total}`);
@@ -156,7 +160,7 @@ async function main() {
     console.log(`\n⚠️  AMBIGUOUS textures (referenced in 2D AND 3D — NOT migrated; decide the type manually):`);
     for (const g of ambiguous) {
       const t = texByGuid.get(g);
-      console.log(`  ${g}  ${t?.srcPath.replace(ROOT + '/', '')}  [format=${t?.format}]`);
+      console.log(`  ${g}  ${t?.srcRel}  [format=${t?.format}]`);
     }
   } else {
     console.log(`\nno ambiguous textures.`);

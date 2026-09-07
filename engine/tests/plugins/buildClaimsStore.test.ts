@@ -201,6 +201,102 @@ describe('acquireBuildClaim — refuse side', () => {
     expect(r.ok).toBe(false);
   });
 
+  /** #849. The store resolves the STORED root as well as the argument, so a claim written with an
+   *  equivalent-but-differently-spelled root still matches its owner.
+   *
+   *  ⚠️ **"Equivalent" means a different spelling of THE SAME fully-qualified root** — forward
+   *  slashes and a trailing separator here. It does NOT mean a bare `/proj/x`: on Windows that is
+   *  not a spelling of a local path at all, and the close-out review (F1) showed that resolving it
+   *  is actively harmful, because `path.resolve` re-roots it onto the cwd's drive and can collide
+   *  with a real local project. The test immediately below pins that.
+   *
+   *  Forward-slash drive paths are the reachable case, not a hypothetical: `git rev-parse
+   *  --show-toplevel` returns exactly that spelling on this machine, as `repoCorpus.mjs`'s own
+   *  header records, so a root that reached the claims file by way of git is spelled this way. */
+  it('a claim stored with an equivalent SPELLING of the same root still matches its owner (#849)', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const native = process.cwd();
+    const spelled = `${native.split(path.sep).join('/')}/`;   // forward slashes + trailing separator
+    expect(spelled, 'premise: the two spellings differ as strings').not.toBe(native);
+    expect(path.resolve(spelled), 'premise: but resolve to the same root').toBe(native);
+
+    const live: BuildClaim = { projectRoot: spelled, pid: 424242, at: 500, label: 'in-flight build', kind: 'editor', token: 'tok' };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live] }));
+
+    const r = acquireBuildClaim(native, 'new build', { now: 600, alive: (pid) => pid === 424242 || pid === process.pid });
+    expect(r.ok, 'the stored spelling did not match the resolved argument, so a SECOND build claim '
+      + 'was granted on a project that is already being built').toBe(false);
+    expect(readBuildClaim(native, { now: 600, alive: () => true })?.label).toBe('in-flight build');
+  });
+
+  /** #849 close-out review (F1). The stored root must be FULLY QUALIFIED before it is resolved —
+   *  `path.isAbsolute` is not enough, and this is the case that actually bites.
+   *
+   *  On win32 `path.isAbsolute('/Projects/modoki/games/court')` is TRUE, and `path.resolve` then
+   *  re-roots it onto the cwd's drive. A POSIX clone sharing `~/.modoki` (a network home, or
+   *  `MODOKI_HOME`) writes exactly that spelling, and this clone would resolve it to
+   *  `E:\Projects\modoki\games\court` — its OWN root — and refuse a legitimate build for the full
+   *  60-minute TTL, naming a pid that is not on this machine.
+   *
+   *  Built from `process.cwd()` so it is a real false-positive on whatever drive the suite runs on,
+   *  not a hardcoded `E:`. Skipped off win32, where the premise does not exist. */
+  it.skipIf(process.platform !== 'win32')(
+    'a FOREIGN drive-less POSIX root is not resolved onto this drive (#849 review)', () => {
+      fs.mkdirSync(home, { recursive: true });
+      const mine = process.cwd();                       // e.g. E:\Projects\modoki
+      // Strip the ROOT (`E:\`), not a fixed two characters: on a checkout opened through a UNC
+      // path the root is `\\server\share\` and `slice(2)` would yield `server/share/...`, failing
+      // the premise assertion below for a reason unrelated to the rule under test.
+      const root = path.parse(mine).root;
+      const foreign = `/${mine.slice(root.length).split(path.sep).join('/')}`;  // as a POSIX clone stored it
+      expect(path.isAbsolute(foreign), 'premise: isAbsolute admits this on win32').toBe(true);
+      expect(path.resolve(foreign), 'premise: resolve re-roots it onto our drive').toBe(mine);
+
+      const live: BuildClaim = { projectRoot: foreign, pid: 424242, at: 500, label: 'linux build', kind: 'cli', token: 'tok' };
+      fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live] }));
+
+      const r = acquireBuildClaim(mine, 'local build', { now: 600, alive: () => true });
+      expect(r.ok, "a foreign platform's claim was re-rooted onto this drive and blocked a local build")
+        .toBe(true);
+    });
+
+  /** The UNC arm of the qualification gate requires `//server/share`, not merely two leading
+   *  separators — and THAT is where its correctness lives (#849 close-out re-review).
+   *
+   *  `//a` is not a UNC path: win32 `path.resolve` treats it as drive-relative and roots it on the
+   *  cwd's DRIVE (`E:\a` here, `C:\a` from another drive). A gate of `[\\/]{2}` admits it, so the
+   *  stored value resolves onto our drive and can collide with a real local root — the exact F1
+   *  defect, one shape narrower. Without this test, "simplifying" the regex back to `[\\/]{2}`
+   *  stays green.
+   *
+   *  Real UNC (`//server/share/x`) is unaffected: it resolves to itself from any cwd. */
+  it.skipIf(process.platform !== 'win32')(
+    'a `//a`-shaped stored root is not treated as UNC and rooted on our drive (#849 re-review)', () => {
+      fs.mkdirSync(home, { recursive: true });
+      const rooted = path.resolve('//a');               // -> E:\a (the cwd's drive)
+      expect(rooted, 'premise: //a is drive-relative, not UNC').toBe(path.join(path.parse(process.cwd()).root, 'a'));
+
+      const live: BuildClaim = { projectRoot: '//a', pid: 424242, at: 500, label: 'corrupt', kind: 'cli', token: 'tok' };
+      fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live] }));
+
+      const r = acquireBuildClaim(rooted, 'local build', { now: 600, alive: () => true });
+      expect(r.ok, "a '//a' stored root was admitted as UNC, resolved onto our drive, and blocked a "
+        + 'build nothing actually holds').toBe(true);
+    });
+
+  /** The other half of the same rule: a stored root that is not fully qualified is CORRUPT, and must
+   *  match nothing rather than being resolved against this process's cwd — where `'.'` would match
+   *  whichever project is being built from its own directory and manufacture a conflict. */
+  it('a NON-ABSOLUTE stored root matches nothing rather than resolving against cwd (#849)', () => {
+    fs.mkdirSync(home, { recursive: true });
+    const corrupt: BuildClaim = { projectRoot: '.', pid: 424242, at: 500, label: 'corrupt', kind: 'editor', token: 'tok' };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [corrupt] }));
+
+    const r = acquireBuildClaim(process.cwd(), 'new build', { now: 600, alive: () => true });
+    expect(r.ok, 'a corrupt relative stored root was resolved against cwd and blocked a build that '
+      + 'nothing actually holds').toBe(true);
+  });
+
   it('a live claim PAST BUILD_CLAIM_TTL_MS is stale and overtaken', () => {
     fs.mkdirSync(home, { recursive: true });
     const old: BuildClaim = { projectRoot: path.resolve('/proj/l'), pid: 424242, at: 1_000, label: 'ancient build', kind: 'editor', token: 'tok' };

@@ -198,18 +198,72 @@ load-bearing and commented as such).
       found 30 across 28 files, but `engine/packages/modoki/tests/**` is not out of scope — it
       runs as the second half of `verify`, per `package.json`'s `verify` script — and
       `engine/scripts/**` adds a few more), and a sweep found every other one benign — they
-      normalise before comparing, or never compare at all. So the exposed population is one, not
-      thirty-nine; but it is not zero, and nothing structural keeps it there.
+      normalise before comparing, or never compare at all. ~~So the exposed population is one, not
+      thirty-nine.~~
       **The fix is to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
+      - ⚠️ **"Exposed population is one" was wrong, and the reason is worth more than the number
+        (#849, measured on the `win` clone 2026-09-07).** That census counted only the shape it had
+        just been burned by — `path.relative()` output compared against a forward-slash literal.
+        The other half of the class never involves a separator at all: **`abs` compared against a
+        separately-derived ABSOLUTE path** (`path.join(REPO_ROOT, …)` from `fileURLToPath`, a
+        `path.resolve`d TypeScript `fileNames` entry, `__filename`). Re-swept for both shapes, the
+        exposed population is **nine files**, not one — including a `urlFor` body copied into four
+        asset suites whose `startsWith` is case-SENSITIVE while `repoCorpus.mjs`'s own
+        `toUnderPrefix` compares the same directory to the git root case-INSENSITIVELY.
+        - ⚠️ **And the DENOMINATOR above ("39 call sites across 36 files") is also one spelling.**
+          It counts `.map(({ abs }) => abs)` only; `.map((f) => f.abs)` adds **4 sites across 4
+          files**, for a true population of **43 sites across 40 files** (re-derived at
+          `ac546c720`, both `git grep -cE` queries). Caught by the close-out review of the very
+          commit that added the correction above — i.e. the paragraph retracting a
+          one-spelling census published a new one. The lesson generalises past this class: **a
+          count over source is a claim about the QUERY, and the query belongs next to the
+          number.** The four extra files — `migrate-anchor-zindex.mjs`, `docCitations.test.ts`,
+          `projectDocs.test.ts`, `anchorZIndexMigrated.test.ts` — were swept and are all benign
+          (a `.filter` on `rel` before the map, the safe `split(path.sep).join('/')` spelling,
+          `path.basename` only, and a report-only string respectively).
+      - ✅ **And the prescription above is WORKING — measured, after I first claimed the opposite.**
+        Mutation-checking all nine (force the comparison to match nothing, i.e. reproduce a
+        derivation split) gives **seven LOUD, two OPEN** — not the seven-open I asserted before
+        measuring. The seven are loud for exactly the reason this section already gives: they pin
+        non-vacuity. `codeAssetRefs` is the clearest case — its main assertion DOES go vacuous, and
+        its reverse pin ("every PENDING_MIGRATION guid still fires") catches it anyway. The two that
+        failed open, `mcpErrorCodes` and `editorStoreActionsReachable`, were exactly the two with no
+        such pin; both now have one. **The lesson is not a new rule but the cost of asserting a
+        blast radius from code-reading**: "fails open" is a claim about behaviour, and behaviour has
+        to be run.
+      - ⚠️ **`path.resolve` is not the escape hatch it looks like.** It normalises separators and
+        trailing slashes but **not drive-letter case** — measured, `path.resolve('e:\\x') !==
+        path.resolve('E:\\x')`. Comparing on `rel` sidesteps the whole question because no absolute
+        path is in play; re-resolving an absolute one does not.
     - **Instance 4 is the exception.** `consoleRingOptionsWiring`'s `relPosix` SURVIVES and is live.
       Its two offender lists — the actual defect — now take `rel` from git, but the helper still
       serves individually-named fixed files and a BFS trail, which are not corpus enumeration. It
       is correct (the safe spelling, applied to `node:path` output), just not deleted.
     - The ~66 inline sites elsewhere are untouched **by design** — the ruling two bullets up.
-    - The guard covers only `engine/tests/**` + `engine/scripts/**`; **15** producers outside it,
-      including `determinismGuard` and `scripts/scan-publish-safety.mjs`, are tracked as **#814**.
-      A ninth instance is still possible *there*.
+    - ~~The guard covers only `engine/tests/**` + `engine/scripts/**`~~ — **CLOSED by #814
+      (2026-09-06).** `corpusProducerIsShared` now enumerates the WHOLE REPO, with a per-root
+      non-vacuity pin for each of `engine/tests/`, `engine/scripts/`, `engine/packages/modoki/tests/`,
+      `engine/plugins/`, `engine/electron/`, `games/`, `site/` and `scripts/`, so a narrowing
+      enumeration goes red instead of quiet. The widening reportedly found **18** producers
+      outside the old scope (that figure is `corpusProducerIsShared.test.ts`'s own docblock, a
+      point-in-time #814 count — carried here, not re-derived),
+      not the 15 the issue estimated, and disproved one of its two headline examples:
+      `scripts/scan-publish-safety.mjs` is **not** a rival corpus definition — it runs downstream of
+      its own `git ls-files` manifest. ⚠️ **This bullet predicted the next instance would land in
+      that gap. It did not** — instance 9 landed inside the region the bullet above called covered,
+      and this one sent the #849 reader looking in a gap that no longer exists.
+
+- **A path-valued field on a PERSISTED record is normalised by the module that owns the record, on
+  READ as well as on write — never by each caller** (#849). `deviceClaimsStore.mjs` does this
+  (`foreignClaimFor`, `ownAdbClaim`: `path.resolve(held.clone) === clone`); `buildClaimsStore.mjs`
+  did not, and compared its stored `projectRoot` raw against a resolved argument, so an equivalent
+  root spelled differently found no conflict and the build claim was granted twice. #847 patched
+  that at the four test seed sites and left a comment asking the next author to remember
+  `path.resolve` — which is the "fix that can be un-fixed" shape; the store now resolves both sides
+  and there is nothing to remember. The two stores are otherwise deliberate twins, and
+  `buildClaimsStore.mjs`'s header enumerates its three intended divergences — this was not one of
+  them, which is exactly why it went unnoticed.
 
 ## Never shell out to a platform binary whose shape you assumed
 

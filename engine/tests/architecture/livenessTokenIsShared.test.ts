@@ -157,8 +157,14 @@ const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
 const expectedOutsideRows = (): string[] =>
   expectedLedgerRows(KNOWN_OUTSIDE_SCAN_DIRS, UNSCANNED_ROOTS);
 
-/** The helper itself implements the token, so its own counters are the one legitimate instance. */
-const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/liveness.ts');
+/** The helper itself implements the token, so its own counters are the one legitimate instance.
+ *
+ *  ONE literal, two uses (#849 close-out review): `HELPER_REL` is the comparison key — matched
+ *  against `repoFiles()`'s own repo-relative POSIX `rel`, which is the point of #849 — and
+ *  `HELPER` is the absolute form, used ONLY to read the file off disk. Spelling the path twice
+ *  (a `rel` literal here and a `path.join` there) meant a rename had two places to miss. */
+const HELPER_REL = 'engine/packages/modoki/src/runtime/core/liveness.ts';
+const HELPER = path.join(REPO, HELPER_REL);
 
 /** Every `.ts`/`.tsx` production source file under `SCAN_DIRS`, via the shared corpus producer
  *  (#799/#771/#805 Phase 4). Floored well under the 851 measured today. */
@@ -213,7 +219,7 @@ function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
   for (const { rel, abs } of listSourceFiles(roots)) {
     const src = stripComments(fs.readFileSync(abs, 'utf8'));
     const counters = [...src.matchAll(DECL)].map((m) => m[1]);
-    const offenders = abs === HELPER
+    const offenders = rel === HELPER_REL
       ? []
       : [...new Set(counters)].filter((n) => livenessPair(src, n));
     // `rel` is git's own repo-relative POSIX string (`repoCorpus.mjs`) — no separator to

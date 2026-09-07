@@ -55,8 +55,8 @@ const SCAN_DIRS = ['tools/modoki-mcp/src', 'tools/shared', 'app', 'plugins', 'pa
 
 /** Every `.ts`/`.tsx` across all of `SCAN_DIRS`, via the shared corpus producer
  *  (#799/#771/#805 Phase 4). Floored well under the 169 measured before #830 widened SCAN_DIRS (more now). */
-function allSourceFiles(dirs: string[]): string[] {
-  return repoFiles({ under: dirs, match: /\.(ts|tsx)$/, floor: 100 }).map(({ abs }) => abs);
+function allSourceFiles(dirs: string[]): Array<{ rel: string; abs: string }> {
+  return repoFiles({ under: dirs, match: /\.(ts|tsx)$/, floor: 100 });
 }
 
 /** The DECLARATION — not the whole file — is excluded from the reachability scan. Matching
@@ -65,8 +65,9 @@ function allSourceFiles(dirs: string[]): string[] {
  *  exact defect this guard exists to catch. But `mcpResult.ts` is also a legitimate PRODUCER —
  *  `encode()` stamps `code:'TOO_LARGE'` into the over-cap envelope — so excluding the file
  *  wholesale would make that real emission invisible and demand a fake one elsewhere. Cut the
- *  declaration block out and scan what is left. */
-const MCP_RESULT_PATH = path.join(REPO_ROOT, 'engine/tools/shared/mcpResult.ts');
+ *  declaration block out and scan what is left. Matched on `rel` (#849) — git's own repo-relative
+ *  POSIX string — not on an independently `path.join`-built absolute. */
+const MCP_RESULT_REL = 'engine/tools/shared/mcpResult.ts';
 
 function withoutDeclaration(src: string): string {
   const start = src.indexOf('export const ERROR_CODES');
@@ -115,9 +116,21 @@ describe('the §5 error-code set (docs/mcp-tool-conventions.md) stays closed and
     // as string literal values (`code: 'AMBIGUOUS'`), and matching bare identifiers would also
     // match the code's own name inside an unrelated comment or variable name.
     const files = allSourceFiles(SCAN_DIRS);
-    const sources = files.map((f) => {
-      const src = readScannedSource(f).code;
-      return f === MCP_RESULT_PATH ? withoutDeclaration(src) : src;
+    // NON-VACUITY (#849). The declaration exemption must actually FIRE. If `MCP_RESULT_REL` stops
+    // matching — the file moves, or the corpus spells `rel` differently — the block is never
+    // excised, `ERROR_CODES`'s own array satisfies every `'CODE'` lookup, and the assertion below
+    // passes having verified nothing. Mutation-checked 2026-09-07: with the constant pointed at a
+    // path that matches no file, this suite was GREEN — the only guard in the #849 set (with
+    // editorStoreActionsReachable) that had no other loud symptom to catch it.
+    expect(
+      files.filter(({ rel }) => rel === MCP_RESULT_REL),
+      `the ERROR_CODES declaration exemption matched no scanned file — ${MCP_RESULT_REL} is not in `
+      + 'the corpus, so the declaration itself is being scanned as though it were a call site and '
+      + 'every code looks reachable',
+    ).toHaveLength(1);
+    const sources = files.map(({ rel, abs }) => {
+      const src = readScannedSource(abs).code;
+      return rel === MCP_RESULT_REL ? withoutDeclaration(src) : src;
     });
 
     const unreachable = ERROR_CODES.filter((code) => !sources.some((src) => src.includes(`'${code}'`)));

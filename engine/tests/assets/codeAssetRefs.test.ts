@@ -139,10 +139,15 @@ function walkFiles(dir: string): string[] {
   }).map(({ abs }) => abs);
 }
 
-function urlFor(abs: string, roots: AssetRoot[]): string | null {
+/** Matches on `rel` — git's own repo-relative POSIX string — rather than on two independently
+ *  derived absolute paths (#849). `roots[].relDir` is `absDir` made repo-relative ONCE per root
+ *  (a handful, not once per file); compared case-insensitively, same convention `repoCorpus.mjs`'s
+ *  own `under` matching already uses. */
+function urlFor(rel: string, roots: (AssetRoot & { relDir: string })[]): string | null {
+  const relLower = rel.toLowerCase();
   for (const r of roots) {
-    if (abs.startsWith(r.absDir + path.sep)) {
-      return (r.urlPrefix + '/' + path.relative(r.absDir, abs).replace(/\\/g, '/')).normalize('NFC');
+    if (relLower.startsWith(r.relDir.toLowerCase() + '/')) {
+      return (r.urlPrefix + '/' + rel.slice(r.relDir.length + 1)).normalize('NFC');
     }
   }
   return null;
@@ -152,11 +157,14 @@ function urlFor(abs: string, roots: AssetRoot[]): string | null {
  *  Includes the whole-image SPRITE guid a 2D/UI texture auto-emits, since a sprite field
  *  legitimately holds that derived guid and it is just as invisible to the build. */
 function buildGuidIndex(): Map<string, string> {
-  const roots = findAssetRoots(PROJECT_ROOT);
+  const roots = findAssetRoots(PROJECT_ROOT).map((r) => ({
+    ...r,
+    relDir: path.relative(PROJECT_ROOT, r.absDir).split(path.sep).join('/'),
+  }));
   const index = new Map<string, string>();
   for (const r of roots) {
-    for (const abs of walkFiles0(r.absDir)) {
-      const url = urlFor(abs, roots);
+    for (const { rel, abs } of walkFiles0(r.absDir)) {
+      const url = urlFor(rel, roots);
       if (!url) continue;
       const type = detectType(url, path.extname(url).toLowerCase());
       if (!type) continue;
@@ -197,12 +205,12 @@ function readSpriteSliceGuids(textureAbs: string): { guid: string; name: string 
  *  same as the old walker's `e.name.startsWith('.')` — git enumeration additionally drops
  *  `*.meta.local.json` for free (gitignored machine-local sidecars — `.gitignore:41`), which
  *  `detectType()` below already classifies as `null` and discards, so nothing downstream changes. */
-function walkFiles0(dir: string): string[] {
+function walkFiles0(dir: string): Array<{ rel: string; abs: string }> {
   return repoFiles({
     under: dir,
     match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
     floor: 0,
-  }).map(({ abs }) => abs);
+  });
 }
 
 /** `export const SOME_GUID = '<guid>'` in engine source — the ENGINE's own asset-GUID constants. */

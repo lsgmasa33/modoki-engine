@@ -112,18 +112,23 @@ const BASELINE: { key: string; why: string }[] = [
  *  git enumeration additionally drops `*.meta.local.json` for free (gitignored machine-local
  *  sidecars — `.gitignore:41`), which `detectType()` below already classifies as `null` and
  *  discards, so nothing downstream changes. */
-function walk(absDir: string): string[] {
+function walk(absDir: string): Array<{ rel: string; abs: string }> {
   return repoFiles({
     under: absDir,
     match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
     floor: 0,
-  }).map(({ abs }) => abs);
+  });
 }
 
-function urlFor(abs: string, roots: AssetRoot[]): string | null {
+/** Matches on `rel` — git's own repo-relative POSIX string — rather than on two independently
+ *  derived absolute paths (#849). `roots[].relDir` is `absDir` made repo-relative ONCE per root
+ *  (a handful, not once per file); compared case-insensitively, same convention `repoCorpus.mjs`'s
+ *  own `under` matching already uses. */
+function urlFor(rel: string, roots: (AssetRoot & { relDir: string })[]): string | null {
+  const relLower = rel.toLowerCase();
   for (const r of roots) {
-    if (abs.startsWith(r.absDir + path.sep)) {
-      return (r.urlPrefix + '/' + path.relative(r.absDir, abs).replace(/\\/g, '/')).normalize('NFC');
+    if (relLower.startsWith(r.relDir.toLowerCase() + '/')) {
+      return (r.urlPrefix + '/' + rel.slice(r.relDir.length + 1)).normalize('NFC');
     }
   }
   return null;
@@ -134,11 +139,14 @@ function urlFor(abs: string, roots: AssetRoot[]): string | null {
  *  purpose rather than factored out, matching how those two already duplicate this walk rather
  *  than share a module. */
 function collectAssets() {
-  const roots = findAssetRoots(PROJECT_ROOT);
+  const roots = findAssetRoots(PROJECT_ROOT).map((r) => ({
+    ...r,
+    relDir: path.relative(PROJECT_ROOT, r.absDir).split(path.sep).join('/'),
+  }));
   const assets: { url: string; type: string; abs: string }[] = [];
   for (const r of roots) {
-    for (const abs of walk(r.absDir)) {
-      const url = urlFor(abs, roots);
+    for (const { rel, abs } of walk(r.absDir)) {
+      const url = urlFor(rel, roots);
       if (!url) continue;
       const ext = path.extname(url).toLowerCase();
       const type = detectType(url, ext);

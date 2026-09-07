@@ -200,6 +200,80 @@ function readClaimsResult() {
   return { ok: true, claims: parsed.claims.filter((c) => c && typeof c.projectRoot === 'string') };
 }
 
+/** Does a STORED claim name the same project root as `root` (already `path.resolve`d by the caller)?
+ *
+ *  The STORED side is resolved too. `deviceClaimsStore.mjs`'s `foreignClaimFor`/`ownAdbClaim`
+ *  resolve both sides as well, and this file's header lists three deliberate divergences from that
+ *  one — comparing raw was never meant to be a fourth.
+ *
+ *  ⚠️ **But they are no longer the SAME comparison, and `deviceClaimsStore.mjs:525-527` still says
+ *  they are.** Those two — plus `claim-guard.mjs`'s `heldByThisClone` and `device.mjs`'s WiFi-claim
+ *  filter — resolve the stored side with NO qualification gate at all, so the defect fixed here is
+ *  still live in all four. It is WORSE there: `foreignClaimFor` returns `null` for "not foreign,
+ *  it's mine", so a corrupt stored `clone` that resolves to this cwd fails **OPEN** — this clone
+ *  proceeds against a phone a sibling holds, defeating the machine-wide device serialization
+ *  (#149/#285). Not fixed here on purpose: different subsystem, opposite failure polarity, and a
+ *  finishing pass is the wrong place to change a device-lease gate. Tracked as **#865**, which also
+ *  records that `deviceClaimsStore.mjs:525-527`'s cross-reference to this file is now stale. Comparing the raw string put
+ *  the burden on every caller to have spelled the root exactly as it was written: `/proj/a` does
+ *  not equal `path.resolve('/proj/a')` on Windows, so a differently-spelled-but-equivalent root
+ *  silently found NO conflict and the claim was GRANTED twice (#847 caught this in tests, where
+ *  three assertions went red and two more passed vacuously).
+ *
+ *  ⚠️ Drive-letter CASE is not normalised by `path.resolve` (`e:\x` !== `E:\x`), so this closes the
+ *  separator and trailing-slash spellings, not that one.
+ *
+ *  ⚠️ **The gate is FULLY-QUALIFIED, not `path.isAbsolute` — that was this function's first version
+ *  and it was wrong on the case most likely to occur.** `path.resolve` is only safe to apply to a
+ *  stored value when it CANNOT consult `process.cwd()`, and on win32 `isAbsolute` admits paths that
+ *  can. Measured here: `path.isAbsolute('/Projects/modoki/games/court')` is `true` on win32, and
+ *  `path.resolve` then re-roots it onto whatever drive the cwd happens to be on — yielding
+ *  `E:\Projects\modoki\games\court`, an EXACT match for this clone's own project root. So a claim
+ *  written by a POSIX clone sharing `~/.modoki` (a network home, or `MODOKI_HOME` — a setup
+ *  `isStale`'s own comment already contemplates, for clock skew) would refuse a legitimate local
+ *  build for the full 60-minute TTL, naming a pid that is not on this machine, with no recovery but
+ *  deleting the claims file by hand.
+ *
+ *  It also made the comparison depend on process state: the same two arguments, cwd on `E:` vs
+ *  `C:`, give different answers. For a CROSS-PROCESS gate that is the wrong property to have,
+ *  independently of whether any caller trips it today.
+ *
+ *  A root this machine wrote is always fully qualified (`acquireBuildClaim` stores `path.resolve`d
+ *  output), so requiring it costs nothing legitimate and makes `sameProjectRoot` a pure function of
+ *  its two arguments again. Anything else on disk — `"."`, `"rel/path"`, or another platform's
+ *  `/Projects/...` — is not this machine's project root, and matches nothing rather than matching
+ *  the wrong thing.
+ *
+ *  ⚠️ So "equivalent spelling" means a different spelling of the same FULLY-QUALIFIED root —
+ *  forward slashes (`git rev-parse --show-toplevel` returns exactly that on Windows, per
+ *  `repoCorpus.mjs`'s header) or a trailing separator. A bare `/proj/x` is NOT one, and a test that
+ *  seeds one must `path.resolve` it as the seeds in `buildClaimsStore.test.ts` already do.
+ *
+ *  ⚠️ Drive-letter CASE is still not normalised by `path.resolve` (`e:\x` !== `E:\x`), so this
+ *  closes the separator and trailing-slash spellings, not that one. */
+/** Is `p` rooted in a way `path.resolve` can finish WITHOUT consulting `process.cwd()`?
+ *
+ *  ⚠️ The UNC arm requires `//server/share`, not merely two leading separators, and that is the
+ *  whole of its correctness. `[\\/]{2}` alone — this function's second version — admits `//`,
+ *  `///`, `//a` and `///a/b`, none of which are UNC: win32 `path.resolve` treats them as
+ *  drive-relative and roots them on the CWD's drive (`'//a'` -> `E:\a` here, `C:\a` from another
+ *  drive). Measured across the family; with the server/share arm every admitted value resolves
+ *  identically from any cwd, and every legitimate form is still admitted — `E:\x`, `E:/x`,
+ *  `//server/share`, `\\server\share\x`, and `\\?\C:\x` long paths.
+ *
+ *  Nothing this repo writes can reach the loose arm anyway (`path.posix.resolve` collapses leading
+ *  slashes, so a POSIX clone stores `/a/b`, never `//a/b`) — but "no writer produces it" is a
+ *  claim about today's callers, and this is a claim about the function. */
+function isFullyQualified(p) {
+  return process.platform === 'win32'
+    ? /^([A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/])/.test(p)
+    : p.startsWith('/');
+}
+
+function sameProjectRoot(claim, root) {
+  return isFullyQualified(claim.projectRoot) && path.resolve(claim.projectRoot) === root;
+}
+
 /** The refusal message for `acquireBuildClaim`'s UNKNOWN branch — names the file and the human's
  *  way out, same tone as `withLock`'s own timeout message just above. */
 function describeBuildClaimsUnreadable(error) {
@@ -330,7 +404,7 @@ export function acquireBuildClaim(projectRoot, label, opts = {}) {
     const result = readClaimsResult();
     if (!result.ok) return { ok: false, message: describeBuildClaimsUnreadable(result.error) };
     const live = result.claims.filter((c) => !isStale(c, opts));
-    const existing = live.find((c) => c.projectRoot === root);
+    const existing = live.find((c) => sameProjectRoot(c, root));
     if (existing) {
       // Re-entrancy: this call is happening inside a CHILD PROCESS an ancestor spawned while
       // already holding the claim for this EXACT resolved root — the token it published onto the
@@ -356,7 +430,7 @@ export function acquireBuildClaim(projectRoot, label, opts = {}) {
     }
     const token = `${process.pid}-${now}-${Math.random().toString(36).slice(2, 10)}`;
     const claim = { projectRoot: root, pid: process.pid, at: now, label, kind, token };
-    writeClaims([...live.filter((c) => c.projectRoot !== root), claim]);
+    writeClaims([...live.filter((c) => !sameProjectRoot(c, root)), claim]);
     held.set(root, token);
     heldDir = claimsDir();
     installExitHook();
@@ -401,7 +475,7 @@ function releaseBuildClaimByToken(root, token) {
       // at least stops believing it holds a claim it can no longer safely touch.
       if (!result.ok) return;
       const all = result.claims;
-      const next = all.filter((c) => !(c.projectRoot === root && c.token === token));
+      const next = all.filter((c) => !(sameProjectRoot(c, root) && c.token === token));
       // Write only when THIS token's claim actually went — a stale release (its claim already
       // gone, or superseded by a later acquisition with a different token) is a silent no-op,
       // never a write, so it can't clobber whatever is CURRENTLY there.
@@ -437,7 +511,7 @@ export function readBuildClaim(projectRoot, opts = {}) {
   const root = path.resolve(projectRoot);
   const result = readClaimsResult();
   if (!result.ok) return null;
-  return result.claims.filter((c) => !isStale(c, opts)).find((c) => c.projectRoot === root) ?? null;
+  return result.claims.filter((c) => !isStale(c, opts)).find((c) => sameProjectRoot(c, root)) ?? null;
 }
 
 /** The refusal text — names the project, the label, the holder's kind and pid, and how long ago.
