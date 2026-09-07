@@ -24,6 +24,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi } from 'vitest';
+import { createTeardownScope } from '../../src/runtime/core/teardownScope';
 
 // previewScene.ts is a plain factory (no React) — its behaviour is exercised directly.
 vi.mock('three/examples/jsm/controls/OrbitControls.js', () => ({
@@ -40,7 +41,7 @@ vi.mock('three/examples/jsm/environments/RoomEnvironment.js', () => ({
 }));
 vi.mock('../../src/runtime/rendering/scene3DSync', () => ({ applyRendererColorConfig: () => {} }));
 vi.mock('../../src/runtime/core/gpuContextTracking', () => ({
-  noteGpuContextCreated: () => {},
+  noteGpuContextCreated: () => () => {},
   noteGpuContextDestroyed: () => {},
 }));
 
@@ -84,7 +85,7 @@ describe('previewScene.ts — a lost context tears the scene down via its OWN di
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const { createPreviewScene } = await import('../../src/editor/panels/previewScene');
     const container = document.createElement('div');
-    const handle = createPreviewScene(container);
+    const handle = createPreviewScene(container, {}, createTeardownScope('test'));
     const canvas = container.querySelector('canvas')!;
     const renderer = rendererInstances[rendererInstances.length - 1];
     expect(canvas).toBeTruthy();
@@ -115,9 +116,25 @@ describe('previewScene.ts — a lost context tears the scene down via its OWN di
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const { createPreviewScene } = await import('../../src/editor/panels/previewScene');
     const container = document.createElement('div');
-    const handle = createPreviewScene(container);
+    const handle = createPreviewScene(container, {}, createTeardownScope('test'));
     expect(handle.disposed).toBe(false);
     handle.dispose();
+    expect(handle.disposed).toBe(true);
+  });
+
+  it('reports `disposed` when the CALLER drains the scope instead of calling dispose() (#858)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { createPreviewScene } = await import('../../src/editor/panels/previewScene');
+    const container = document.createElement('div');
+    // The scope is the caller's now, so there are two doors into teardown and only one of them is
+    // `dispose()`. `Preview3DShell` legitimately takes the other one on its constructor-throw
+    // path. Draining directly must still leave the handle reporting itself dead — `disposed` is
+    // the field whose own doc tells callers to check it before populating, so a handle that lies
+    // here is one a caller will happily populate over a disposed renderer.
+    const scope = createTeardownScope('test');
+    const handle = createPreviewScene(container, {}, scope);
+    expect(handle.disposed).toBe(false);
+    scope.dispose(); // NOT handle.dispose()
     expect(handle.disposed).toBe(true);
   });
 
@@ -125,7 +142,7 @@ describe('previewScene.ts — a lost context tears the scene down via its OWN di
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const { createPreviewScene } = await import('../../src/editor/panels/previewScene');
     const container = document.createElement('div');
-    const handle = createPreviewScene(container);
+    const handle = createPreviewScene(container, {}, createTeardownScope('test'));
     handle.dispose(); // e.g. the GPU-loss teardown
     // A caller that populated AGAINST `disposed` (the bug this test guards, not the fix) would add
     // content onto a dead handle here — model that directly rather than reaching into internals.

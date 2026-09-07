@@ -44,7 +44,7 @@
 import { getWebGPUSupported } from './gpuDetect';
 import { readPlatform, readFormFactor } from '../core/formFactor';
 import { getActiveRenderer, readRendererBackend } from '../core/activeRenderer';
-import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
+import { noteGpuContextCreated } from '../core/gpuContextTracking';
 
 export interface CompressedTextureSupport {
   /** ASTC — the mobile target format for KTX2. */
@@ -142,6 +142,9 @@ async function readDeviceModel(): Promise<string | undefined> {
 function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'compressed'> {
   const none: CompressedTextureSupport = { astc: false, etc2: false, s3tc: false };
   let gl: WebGL2RenderingContext | null = null;
+  // Declared out here so the `finally` can release whatever the `try` managed to take — the same
+  // job the `if (gl)` below did, but keyed on "was it actually counted" rather than re-deriving it.
+  let releaseContextCount: (() => void) | null = null;
   try {
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = 1;
@@ -150,7 +153,7 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
     // Phase 3 of #590 (docs/rendering.md): this throwaway 1x1 context was
     // invisible to the soft GPU-context budget — noted here, paired with the `finally` release
     // below (which already ran on every exit path, success or throw).
-    noteGpuContextCreated();
+    releaseContextCount = noteGpuContextCreated();
 
     // Masked on iOS ('Apple GPU') and blockable elsewhere for fingerprinting — absent, not fatal.
     let gpuRenderer: string | undefined;
@@ -175,7 +178,7 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
     return { compressed: none };
   } finally {
     // Best-effort release; a browser with no such extension reclaims it on GC anyway.
-    if (gl) noteGpuContextDestroyed();
+    releaseContextCount?.();
     try { gl?.getExtension('WEBGL_lose_context')?.loseContext(); } catch { /* not worth reporting */ }
   }
 }

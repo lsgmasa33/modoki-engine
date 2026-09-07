@@ -20,7 +20,8 @@ import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
 import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
-import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
@@ -117,134 +118,165 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     const container = containerRef.current;
     if (!container) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    // Fix 3 of #590's adversarial review (docs/rendering.md): this is
-    // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
-    // context, and an editor session with several previews/viewports open is exactly the surface
-    // that approaches `SOFT_CONTEXT_LIMIT`. Noted after a successful construction (never before
-    // — see `noteGpuContextCreated`'s doc), paired with a `contextLive`-guarded decrement in the
-    // unmount cleanup below, matching `scene3DSync.ts`'s `makeWebGPURenderer` convention.
-    noteGpuContextCreated();
-    let contextLive = true;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(PREVIEW_W, PREVIEW_H);
-    renderer.setClearColor(0x1a1a1a, 1);
-    // Match the main viewport's color/tone conventions (ACESFilmic @ exposure 1.2,
-    // sRGB output) via the single shared config `makeWebGPURenderer` also applies, so
-    // imported PBR materials read the same here as in the live scene.
-    applyRendererColorConfig(renderer);
-    container.appendChild(renderer.domElement);
-    // Loss detection (#795) — wired as soon as the context exists. `stateRef.current === null`
-    // doubles as the stale check: `teardown` below nulls it BEFORE doing anything else, and
-    // React always runs this effect's cleanup (which calls `teardown`) before a later run of
-    // this same effect (the [hasLods] re-run) attaches its own listener, so a stale event from a
-    // superseded renderer can never reach a live `stateRef.current`.
-    const detachLoss = attachRendererLossHandling(
-      { canvas: renderer.domElement },
-      {
-        label: 'ModelPreview', isStale: () => stateRef.current === null,
-        // This panel is embedded in the Model Inspector (`ModelAssetView`, mounted with no `key`)
-        // — selecting a different model re-populates THIS SAME instance rather than unmounting it,
-        // so the default "reopen the panel" hint is wrong (finding 6, third adversarial review of
-        // #795; same shape as `previewScene.ts`'s Mesh/Material Preview3DShell, finding 2).
-        ...makePreviewLossPolicy({ label: 'ModelPreview', teardown: () => teardown(), recoverHint: REOPEN_INSPECTOR_HINT }),
-      },
-    );
+    // #858: the release path, before the first acquisition. This effect has NO try/catch and
+    // `teardown` is only defined ~120 lines below the WebGL context it releases — so a throw in
+    // between (`pmrem.fromScene` is a real GPU op) propagated out of the effect callback and
+    // React registered NO cleanup at all for this run: the GL context, its canvas and the
+    // `gpuContextTracking` live count all leaked, and unlike the other four sites in this class
+    // there was not even a stale closure left behind to call.
+    const scope = createTeardownScope('ModelPreview');
+    try {
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      // Fix 3 of #590's adversarial review (docs/rendering.md): this is
+      // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
+      // context, and an editor session with several previews/viewports open is exactly the surface
+      // that approaches `SOFT_CONTEXT_LIMIT`. Noted after a successful construction (never before
+      // — see `noteGpuContextCreated`'s doc). Its matching release goes straight onto the scope,
+      // so it is paired from the instant the context exists rather than ~120 lines later inside a
+      // closure a throw in between would prevent from ever being built (#858).
+      scope.add(noteGpuContextCreated());
+      // Pushed at the acquisition site. LIFO drains it AFTER `teardown` below — the position these
+      // steps held as that closure's last lines: the owned geometries/materials/textures must go
+      // before the renderer that allocated them.
+      scope.add(() => {
+        // forceContextLoss BEFORE dispose: dispose() does NOT release the GL context — see
+        // previewScene.ts for the full explanation. This effect re-runs on [hasLods] flips too,
+        // not just unmount, so a missing call strands a context per flip.
+        renderer.forceContextLoss();
+        renderer.dispose();
+        try { container.removeChild(renderer.domElement); } catch { /* already gone */ }
+      });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(PREVIEW_W, PREVIEW_H);
+      renderer.setClearColor(0x1a1a1a, 1);
+      // Match the main viewport's color/tone conventions (ACESFilmic @ exposure 1.2,
+      // sRGB output) via the single shared config `makeWebGPURenderer` also applies, so
+      // imported PBR materials read the same here as in the live scene.
+      applyRendererColorConfig(renderer);
+      container.appendChild(renderer.domElement);
+      // Loss detection (#795) — wired as soon as the context exists. `stateRef.current === null`
+      // doubles as the stale check: `teardown` below nulls it BEFORE doing anything else, and
+      // React always runs this effect's cleanup (which calls `teardown`) before a later run of
+      // this same effect (the [hasLods] re-run) attaches its own listener, so a stale event from a
+      // superseded renderer can never reach a live `stateRef.current`.
+      const detachLoss = attachRendererLossHandling(
+        { canvas: renderer.domElement },
+        {
+          label: 'ModelPreview', isStale: () => stateRef.current === null,
+          // This panel is embedded in the Model Inspector (`ModelAssetView`, mounted with no `key`)
+          // — selecting a different model re-populates THIS SAME instance rather than unmounting it,
+          // so the default "reopen the panel" hint is wrong (finding 6, third adversarial review of
+          // #795; same shape as `previewScene.ts`'s Mesh/Material Preview3DShell, finding 2).
+          // ⚠️ `scope.dispose()`, NOT `teardown()`. This panel has TWO entry points into teardown
+          // — this one and the effect's own cleanup — and the renderer's `forceContextLoss`/
+          // `dispose`/`removeChild` live on the scope now, so calling `teardown` alone would tear
+          // down the state and leave the dead context uncounted, undisposed and still in the DOM.
+          // LIFO drains `teardown` first anyway, so this is a superset, not a different order.
+          // `previewScene` (`dispose()`) and `ParticleEditor` (`cleanupRef.current?.()`) both
+          // already route their loss path through the scope; this was the odd one out.
+          ...makePreviewLossPolicy({ label: 'ModelPreview', teardown: () => scope.dispose(), recoverHint: REOPEN_INSPECTOR_HINT }),
+        },
+      );
 
-    const scene = new THREE.Scene();
-    // IBL: a neutral RoomEnvironment gives MeshStandardMaterial the indirect
-    // light it needs so metallic/rough surfaces show form instead of flat white.
-    // The main scene uses HDR envs via a shared cache; for this standalone
-    // preview a procedural RoomEnvironment is the standard drop-in equivalent.
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    const roomEnv = new RoomEnvironment();
-    const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
-    roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
-    pmrem.dispose();
-    scene.environment = envTexture;
-    // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
-    // highlights aren't blown out. Key/fill directionals keep directional form.
-    scene.add(new THREE.AmbientLight(0xffffff, 0.25));
-    const key = new THREE.DirectionalLight(0xffffff, 1.0);
-    key.position.set(2, 3, 2);
-    scene.add(key);
-    const fill = new THREE.DirectionalLight(0xffffff, 0.3);
-    fill.position.set(-2, 1, -1);
-    scene.add(fill);
+      const scene = new THREE.Scene();
+      // IBL: a neutral RoomEnvironment gives MeshStandardMaterial the indirect
+      // light it needs so metallic/rough surfaces show form instead of flat white.
+      // The main scene uses HDR envs via a shared cache; for this standalone
+      // preview a procedural RoomEnvironment is the standard drop-in equivalent.
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      const roomEnv = new RoomEnvironment();
+      const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
+      roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
+      pmrem.dispose();
+      scene.environment = envTexture;
+      // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
+      // highlights aren't blown out. Key/fill directionals keep directional form.
+      scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+      const key = new THREE.DirectionalLight(0xffffff, 1.0);
+      key.position.set(2, 3, 2);
+      scene.add(key);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.3);
+      fill.position.set(-2, 1, -1);
+      scene.add(fill);
 
-    const camera = new THREE.PerspectiveCamera(45, PREVIEW_W / PREVIEW_H, 0.05, 1000);
-    camera.position.set(2, 2, 2);
-    camera.lookAt(0, 0, 0);
+      const camera = new THREE.PerspectiveCamera(45, PREVIEW_W / PREVIEW_H, 0.05, 1000);
+      camera.position.set(2, 2, 2);
+      camera.lookAt(0, 0, 0);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.1;
-    controls.target.set(0, 0, 0);
-    // Render-on-demand: OrbitControls fires 'change' on every camera move
-    // (user orbit/zoom/pan AND each damping-settle step inside update()), so
-    // this is the single source for "the view moved → redraw".
-    const onControlsChange = () => { if (stateRef.current) stateRef.current.needsRender = true; };
-    controls.addEventListener('change', onControlsChange);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.1;
+      controls.target.set(0, 0, 0);
+      // Render-on-demand: OrbitControls fires 'change' on every camera move
+      // (user orbit/zoom/pan AND each damping-settle step inside update()), so
+      // this is the single source for "the view moved → redraw".
+      const onControlsChange = () => { if (stateRef.current) stateRef.current.needsRender = true; };
+      controls.addEventListener('change', onControlsChange);
 
-    const modelRoot = new THREE.Group();
-    scene.add(modelRoot);
+      const modelRoot = new THREE.Group();
+      scene.add(modelRoot);
 
-    stateRef.current = {
-      renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
-      ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
-      raf: null, activeLevel: hasLods ? 'auto' : 0, aborted: false,
-      needsRender: true, // draw the first frame
-    };
+      stateRef.current = {
+        renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
+        ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
+        raf: null, activeLevel: hasLods ? 'auto' : 0, aborted: false,
+        needsRender: true, // draw the first frame
+      };
 
-    const tick = () => {
-      const s = stateRef.current;
-      if (!s) return;
-      // update() returns true while damping is still settling; it also dispatches
-      // 'change' (→ needsRender) on any movement. Render only when something changed.
-      const moving = s.controls.update();
-      if (s.needsRender || moving) {
-        s.needsRender = false;
-        s.renderer.render(s.scene, s.camera);
-      }
-      s.raf = requestAnimationFrame(tick);
-    };
-    stateRef.current.raf = requestAnimationFrame(tick);
+      const tick = () => {
+        const s = stateRef.current;
+        if (!s) return;
+        // update() returns true while damping is still settling; it also dispatches
+        // 'change' (→ needsRender) on any movement. Render only when something changed.
+        const moving = s.controls.update();
+        if (s.needsRender || moving) {
+          s.needsRender = false;
+          s.renderer.render(s.scene, s.camera);
+        }
+        s.raf = requestAnimationFrame(tick);
+      };
+      stateRef.current.raf = requestAnimationFrame(tick);
 
-    // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context, so a
-    // loss tears the preview down exactly the same way an unmount would. Idempotent by
-    // construction: `stateRef.current` is nulled FIRST, so a second call sees `s === null` and
-    // returns immediately.
-    const teardown = () => {
-      const s = stateRef.current;
-      stateRef.current = null;
-      if (!s) return;
-      // Signal any in-flight "load the model" effect to stop attaching/collecting onto this dead
-      // scene (finding 3a, adversarial review of #795) — that effect closes over THIS SAME state
-      // object, so it can observe the flip even though `stateRef.current` above is already null.
-      s.aborted = true;
-      detachLoss();
-      if (s.raf !== null) cancelAnimationFrame(s.raf);
-      s.controls.removeEventListener('change', onControlsChange);
-      s.controls.dispose();
-      disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
-      // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
-      // comment) — kept because disposeSourceModel is the one place that also walks a
-      // freshly-parsed source model's own hierarchy, not just the sets collected from it.
-      if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
-      s.scene.environment = null;
-      s.envTexture?.dispose();
-      // dispose() does NOT release the GL context — see previewScene.ts's dispose() for the
-      // full explanation. This effect re-runs on [hasLods] flips too, not just unmount, so a
-      // missing call strands a context per flip. Placed before dispose() to match previewScene;
-      // either order works (dispose() never touches the extensions closure or _gl), so what is
-      // load-bearing is that the call happens at all — which is what the guard checks.
-      s.renderer.forceContextLoss();
-      s.renderer.dispose();
-      if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
-      try { container.removeChild(s.renderer.domElement); } catch { /* already gone */ }
-    };
-
-    return () => { teardown(); };
+      // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context, so a
+      // loss tears the preview down exactly the same way an unmount would. Idempotent by
+      // construction: `stateRef.current` is nulled FIRST, so a second call sees `s === null` and
+      // returns immediately.
+      const teardown = () => {
+        const s = stateRef.current;
+        stateRef.current = null;
+        if (!s) return;
+        // Signal any in-flight "load the model" effect to stop attaching/collecting onto this dead
+        // scene (finding 3a, adversarial review of #795) — that effect closes over THIS SAME state
+        // object, so it can observe the flip even though `stateRef.current` above is already null.
+        s.aborted = true;
+        detachLoss();
+        if (s.raf !== null) cancelAnimationFrame(s.raf);
+        s.controls.removeEventListener('change', onControlsChange);
+        s.controls.dispose();
+        disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
+        // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
+        // comment) — kept because disposeSourceModel is the one place that also walks a
+        // freshly-parsed source model's own hierarchy, not just the sets collected from it.
+        if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
+        s.scene.environment = null;
+        s.envTexture?.dispose();
+        // The renderer's own `forceContextLoss()`/`dispose()`/`removeChild` used to close this
+        // body; they moved onto the scope above so they are reachable from a partial bring-up.
+        // They still run immediately after this closure — see the LIFO note there.
+      };
+      // Pushed the MOMENT it exists, not at the end of the effect: between `stateRef.current = {…}`
+      // above and this line there is a live rAF driving `renderer.render()`, so a throw in that
+      // window used to drain a scope that did not contain `teardown` — leaving a non-null
+      // `stateRef.current` with `aborted: false` and a frame loop running on a force-lost renderer,
+      // which `gateModelLoad` would then read as a healthy scene to populate.
+      scope.add(teardown);
+    } catch (e) {
+      // Whatever this run took is released; the effect returns a cleanup either way, so React
+      // is never left holding nothing.
+      console.error('[ModelPreview] preview bring-up failed; releasing what it had taken:', e);
+      scope.dispose();
+    }
+    return () => { scope.dispose(); };
   }, [hasLods]);
 
   // ── Load / reload the model when the source or LOD choice changes ────────

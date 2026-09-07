@@ -14,7 +14,8 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
-import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
+import { type TeardownScope } from '../../runtime/core/teardownScope';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
 
@@ -48,7 +49,16 @@ export interface PreviewSceneOptions {
   background?: number;
 }
 
-export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOptions = {}): PreviewSceneHandle {
+export function createPreviewScene(
+  container: HTMLElement,
+  opts: PreviewSceneOptions,
+  /** The CALLER's release path, required (#858). Every acquisition below registers into it as it
+   *  is taken, so a caller whose `createPreviewScene(...)` throws can still release what was
+   *  taken — which it otherwise cannot, because `dispose` only reaches it via the `return` at the
+   *  end of this function and there is no handle to call it on. Owned by the caller precisely
+   *  because the caller is the only one still running when this throws. */
+  scope: TeardownScope,
+): PreviewSceneHandle {
   const width = opts.width ?? 320;
   const height = opts.height ?? 220;
   const background = opts.background ?? 0x1a1a1a;
@@ -62,8 +72,18 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
   // after a successful construction (never before — see `noteGpuContextCreated`'s doc), paired
   // with a `contextLive`-guarded decrement in `dispose()` below so a stray double-dispose can't
   // decrement twice.
-  noteGpuContextCreated();
-  let contextLive = true;
+  // #858. `dispose` is only handed to the caller by the `return` at the very END of this
+  // function, and `Preview3DShell`'s `catch` around the call has nothing to dispose because
+  // `handle` was never assigned — so everything taken between here and that return used to leak
+  // outright. `pmrem.fromScene` below is a real GPU op and a realistic throw point on a degraded
+  // context. The scope makes the release reachable from the first acquisition onward.
+  // Pushed FIRST so LIFO drains it LAST — after which the handle honestly reports itself dead.
+  // The scope is the CALLER's now, so a caller can drain it WITHOUT going through `dispose()`
+  // (`Preview3DShell` legitimately does exactly that on the constructor-throw path). Without this,
+  // `handle.disposed` — the field whose doc tells callers to check it before populating — would
+  // report a live handle over a disposed renderer.
+  scope.add(() => { isDisposed = true; });
+  scope.add(noteGpuContextCreated());
   // Guards both `dispose()` (idempotent — a lost-context teardown and an unmount can both call
   // it) and the loss listener's `isStale` check below (#795): `dispose()` itself forces a context
   // loss, and without this a correct teardown would report itself as a fault. Named `isDisposed`
@@ -74,6 +94,12 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
   renderer.setClearColor(background, 1);
   applyRendererColorConfig(renderer);
   container.appendChild(renderer.domElement);
+  scope.add(() => { try { container.removeChild(renderer.domElement); } catch { /* already gone */ } });
+  // forceContextLoss BEFORE dispose: dispose() frees programs/RTs but does NOT release the
+  // underlying GL context (browser GC decides, nondeterministically). A preview now mounts on
+  // every mesh/material asset click, so without this the live-context count climbs to Chrome's
+  // ~16 cap → "too many active WebGL contexts" blacks out previews AND the main SceneView.
+  scope.add(() => { renderer.forceContextLoss(); renderer.dispose(); });
   const detachLoss = attachRendererLossHandling(
     { canvas: renderer.domElement },
     {
@@ -92,6 +118,8 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
       }),
     },
   );
+
+  scope.add(() => detachLoss());
 
   const scene = new THREE.Scene();
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -170,6 +198,17 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
     needsRender = true;
   };
 
+  // Pushed LAST, so LIFO runs it FIRST. Everything in here closes over locals that only exist
+  // once construction has got this far, which is precisely why `dispose` could not simply be
+  // defined before the acquisitions the way `ShaderPreview.tsx` does it.
+  scope.add(() => {
+    if (raf !== null) cancelAnimationFrame(raf);
+    controls.removeEventListener('change', onControlsChange);
+    controls.dispose();
+    scene.environment = null;
+    envTexture.dispose();
+  });
+
   const dispose = () => {
     // clearContent() runs on EVERY call, even a repeat one — the guard below prevents double
     // renderer teardown, not cleanup of content added AFTER the first dispose. A loss teardown
@@ -179,22 +218,10 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
     clearContent();
     if (isDisposed) return; // idempotent from here down — a lost-context teardown and an unmount can both call this
     isDisposed = true;
-    detachLoss();
-    if (raf !== null) cancelAnimationFrame(raf);
-    controls.removeEventListener('change', onControlsChange);
-    controls.dispose();
-    scene.environment = null;
-    envTexture.dispose();
-    // forceContextLoss BEFORE dispose: dispose() frees programs/RTs but does NOT
-    // release the underlying GL context (browser GC decides, nondeterministically).
-    // A preview now mounts on every mesh/material asset click, so without this the
-    // live-context count climbs to Chrome's ~16 cap → "too many active WebGL
-    // contexts" blacks out previews AND the main SceneView. forceContextLoss frees
-    // it deterministically on unmount.
-    renderer.forceContextLoss();
-    renderer.dispose();
-    if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
-    try { container.removeChild(renderer.domElement); } catch { /* already gone */ }
+    // Drains in reverse acquisition order: the closure above, then detachLoss, the renderer,
+    // the context count, and the canvas removal. Only `detachLoss` moved relative to the old
+    // hand-ordered body (it was first); safe because `isStale` reads `isDisposed`, set above.
+    scope.dispose();
   };
 
   return {

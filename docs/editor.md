@@ -1399,12 +1399,37 @@ model, not of these call sites, so it is not local and it is not obvious:
   it would block a legitimate feature instead of making it safe. This note is the precondition
   instead: **whoever enables popout owns guarding these slots first.**
 - **A second `scene` tab**, or any panel id that also renders `SceneView`.
-- **A throw partway through `setup()` — the one that IS live (#858).** The four arguments above are
-  all about ordering *between* instances. They say nothing about a *single* instance failing
-  mid-bring-up: `cleanup` is assigned last, so a throw after the first registration leaves
-  `teardownViewport()`'s `fn?.()` releasing nothing and every slot registered so far dangling. An
-  identity guard would not help — a release-side guard is inert when release never runs. Tracked
-  separately because the fix is `try/finally`, not a guard.
+- **A throw partway through `setup()` — this WAS live, and is now fixed (#858).** The four
+  arguments above are all about ordering *between* instances. They said nothing about a *single*
+  instance failing mid-bring-up: `cleanup` was assigned last, so a throw after the first
+  registration left `teardownViewport()`'s `fn?.()` releasing nothing and every slot registered so
+  far dangling. An identity guard would not have helped — a release-side guard is inert when
+  release never runs.
+
+  SceneView now seeds `cleanup = scope.dispose` as `setup()`'s FIRST statement
+  (`runtime/core/teardownScope.ts`) and pushes each release at the site that acquires it. **Scoped
+  by one test — does the thing keep ACTING after the bring-up is gone?** On the scope: every
+  module-level registration (the five slots, `onWorldSwap`, the render surface, the
+  bounds/pick/handle providers, the invalidation listener, the dirty subscriptions, the frame
+  callback), the renderer LEASE, the two loss listeners, and the six `window` input listeners plus
+  the `document.body` marquee element. Still terminal-only, and deliberately: the scene graph and
+  GPU objects, plus the listeners on the renderer's own canvas, which dies with it — a partial
+  bring-up leaks those as memory and nothing else. Full rationale in
+  [rendering.md](./rendering.md). **It was one of five sites with that shape** —
+  `Scene3D`, `ParticleEditor`, `previewScene`/`Preview3DShell` and `ModelPreview` were the others,
+  and the renderer LEASE leaked alongside the five slots. The class, the per-site table and what is
+  and is not tested: [rendering.md](./rendering.md) § "The release path must exist before the first
+  acquisition". Ordering is pinned by `tests/architecture/teardownScopeSeeding.test.ts`.
+
+  ⚠️ This does NOT reopen #811, and **does not supply the identity guard** this section says the
+  three unguarded slots still lack. The release pushed for the camera is `() =>
+  setEditorViewportCamera(null)` — the same blind null-write the old closure did. A scope keys
+  which RUN owns a release, not which registrant currently holds the slot, so in the popout
+  scenario instance A's drain still nulls the camera instance B just set. The precondition stands
+  unchanged: **whoever enables popout owns guarding these slots first.**
+
+  ⚠️ One genuinely NEW path into the trap, small but real: those three blind slot-nulls now also run
+  on a PARTIAL drain, where before they ran only when `setup()` completed.
 - **Making the context-loss `rebuild` non-awaiting, or relaxing its coalescing.** `outerDisposed` is
   per-EFFECT, not per-`setup()`-RUN: a rebuild does not set it, so a superseded run has nothing to
   bail on. That is harmless today only because `rendererRecovery.ts` serialises rebuilds (`inFlight`)

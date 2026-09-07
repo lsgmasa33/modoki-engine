@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPreviewScene, type PreviewSceneHandle } from './previewScene';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { gatePopulate } from './preview3DShellLossGuard';
 
 const PREVIEW_W = 320;
@@ -41,9 +42,18 @@ export function Preview3DShell({ populate, resetKey, width = PREVIEW_W, height =
     const container = containerRef.current;
     if (!container) return;
     let handle: PreviewSceneHandle | null = null;
+    // #858: the release path exists before the call that acquires anything. This `catch` used to
+    // return having released NOTHING — `handle` is never assigned when the constructor throws, so
+    // there was no `dispose` to call, and the GL context it had already opened (plus its canvas
+    // and loss listener) leaked. `pmrem.fromScene` inside is a real GPU op, so this is not a
+    // WebGL-less-jsdom-only path: on a degraded context it fires with the context already live,
+    // and `gpuContextTracking`'s live count — the thing that warns about context exhaustion —
+    // silently climbs toward its limit.
+    const scope = createTeardownScope('Preview3DShell');
     try {
-      handle = createPreviewScene(container, { width, height });
+      handle = createPreviewScene(container, { width, height }, scope);
     } catch {
+      scope.dispose();
       setError('3D preview unavailable (no WebGL).');
       setLoading(false);
       return;

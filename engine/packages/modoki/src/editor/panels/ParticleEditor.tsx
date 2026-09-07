@@ -15,6 +15,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { makeWebGPURenderer } from '../../runtime/rendering/scene3DSync';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { makePreviewLossPolicy } from './previewLossPolicy';
 import { canApplyParticleDef, handleParticleLossTeardown } from './particle/particlePreviewLoss';
 import { particleBackend } from '../../runtime/particles/particleBackend';
@@ -118,6 +119,19 @@ export default function ParticleEditor() {
       // the effect's cleanup a no-op and the renderer + loop + ResizeObserver alive forever.
       if (disposed) { disposeActiveRenderer(); renderer.dispose(); renderer.domElement.remove(); return; }
       rendererRef.current = renderer;
+      // #858. The two `await` bails above are guarded — this file's own comment at the second one
+      // spells out exactly why ("`cleanupRef.current` is not assigned until the rAF loop is
+      // already running below, so bailing without this leaves the effect's cleanup a no-op"). What
+      // that guard cannot cover is the ~85 SYNCHRONOUS lines from here to the assignment: no
+      // `disposed` re-check is possible in them and there is no try/catch, so a throw in
+      // `attachRendererLossHandling`, `new OrbitControls` or `new ResizeObserver` left
+      // `cleanupRef.current` null and the renderer permanently on `activeRenderer`'s registrant
+      // stack — `getActiveRenderer()` then hands every consumer a dead ParticleEditor renderer for
+      // the rest of the session. Seeding the scope here closes that window.
+      const scope = createTeardownScope('ParticleEditor');
+      cleanupRef.current = scope.dispose;
+      // Pushed FIRST so LIFO drains it LAST — the position it held as the closure's final lines.
+      scope.add(() => { disposeActiveRenderer(); renderer.dispose(); renderer.domElement.remove(); });
       detachLoss = attachRendererLossHandling(
         { canvas: renderer.domElement, device: (renderer as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
         { label: 'ParticleEditor', isStale: () => disposed, ...makePreviewLossPolicy({
@@ -136,6 +150,8 @@ export default function ParticleEditor() {
           },
         }) },
       );
+
+      scope.add(() => detachLoss());
 
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0x14141f);
@@ -165,6 +181,7 @@ export default function ParticleEditor() {
       controls.enableDamping = true;
       controls.dampingFactor = 0.1;
       controls.target.set(0, 1.6, 0);
+      scope.add(() => controls.dispose());
 
       // Defer resize work to rAF so setSize() doesn't reflow synchronously inside the
       // observer callback (that re-triggers the observer → "ResizeObserver loop" warning).
@@ -177,6 +194,7 @@ export default function ParticleEditor() {
         });
       });
       ro.observe(container);
+      scope.add(() => ro.disconnect());
 
       setSceneReady(true);
 
@@ -202,18 +220,16 @@ export default function ParticleEditor() {
       };
       loop();
 
-      // expose cleanup via closure captured below
-      cleanupRef.current = () => {
-        detachLoss();
+      // Pushed LAST, so LIFO runs it FIRST. The five releases that moved out of it (the loss
+      // listener, the controls, the resize observer and the renderer triple) drain after it, in
+      // reverse acquisition order. Only `detachLoss` changes position relative to the old body;
+      // it is safe there because its `isStale` reads `disposed`, which both teardown paths set
+      // before calling this.
+      scope.add(() => {
         cancelAnimationFrame(raf);
         cancelAnimationFrame(resizeRaf);
-        ro.disconnect();
-        controls.dispose();
         if (handleRef.current) { particleBackend.dispose(handleRef.current); handleRef.current = null; objRef.current = null; }
-        disposeActiveRenderer();
-        renderer.dispose();
-        renderer.domElement.remove();
-      };
+      });
     })();
 
     return () => { disposed = true; cleanupRef.current?.(); cleanupRef.current = null; };

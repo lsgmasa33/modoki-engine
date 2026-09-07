@@ -16,7 +16,7 @@ import { releaseGeometry, retainPanelTexture, releasePanelTexture } from '../../
 import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram } from '../../runtime/rendering/pixiShaderBuilder';
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
-import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
+import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { makePreviewLossPolicy } from './previewLossPolicy';
 
@@ -91,11 +91,11 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // `src/editor` — dev-only, never shipped in a game build — but `app.init()` below creates a
     // REAL PixiJS context, and an editor session with several previews/viewports open is exactly
     // the surface that approaches `SOFT_CONTEXT_LIMIT`. Noted after `app.init()` resolves (never
-    // before), paired with a `contextLive`-guarded decrement everywhere this effect destroys the
-    // app, matching `scene3DSync.ts`'s `makeWebGPURenderer` convention — a fresh `false` per
+    // before); `noteGpuContextCreated` hands back the matching one-shot release, which
+    // `markDestroyed` below runs everywhere this effect destroys the app. A fresh `null` per
     // effect run (a new `app` instance), never carried over from a previous shader/path.
-    let contextLive = false;
-    const markDestroyed = () => { if (contextLive) { contextLive = false; noteGpuContextDestroyed(); } };
+    let releaseContextCount: (() => void) | null = null;
+    const markDestroyed = () => releaseContextCount?.();
     // The mesh THIS run creates, if any — separate from `stateRef.current.mesh` because that ref is
     // shared across every effect run (StrictMode's mount→unmount→mount, or a fast shader-path
     // switch). The catch below used to destroy `stateRef.current.mesh` directly: reachable only
@@ -113,7 +113,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // so a lost context tears the panel down exactly the same way an unmount would. Idempotent by
     // construction: every step below already guards on state a first run clears (`app.renderer`
     // null after the first `destroy(true)`, `stateRef.current.mesh` null after the first
-    // `destroyMesh`, `texUrls` emptied, `markDestroyed`'s own `contextLive` guard), so calling it
+    // `destroyMesh`, `texUrls` emptied, the one-shot inside `markDestroyed`'s release), so calling it
     // twice (once from a loss, once from unmount) is safe.
     const teardown = () => {
       disposed = true;
@@ -142,8 +142,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         await app.init({ preference, canvas, width: SIZE, height: SIZE, backgroundAlpha: 0, antialias: true, preserveDrawingBuffer: true });
         // The context now exists — note it before any of the early-return teardowns below, so a
         // stale/disposed resume still pairs its `app.destroy(true)` with a decrement.
-        contextLive = true;
-        noteGpuContextCreated();
+        releaseContextCount = noteGpuContextCreated();
         // Wire loss detection (#795) as soon as the context exists — a preview left open across
         // a GPU driver reset would otherwise stay blank forever with no error anywhere.
         detachLoss = attachRendererLossHandling(

@@ -53,10 +53,39 @@ let totalDestroyed = 0;
 
 /** Call once a GL/GPU context has actually been created (after a successful `init()`/
  *  `getContext()` — never before, and never speculatively: creating a context purely to COUNT it
- *  would cause the exhaustion this module exists to warn about). */
-export function noteGpuContextCreated(): void {
+ *  would cause the exhaustion this module exists to warn about).
+ *
+ *  RETURNS THE MATCHING RELEASE, one-shot. Hand it to whatever owns the context's lifetime and
+ *  the pairing cannot be forgotten or double-counted:
+ *
+ *      scope.add(noteGpuContextCreated());          // bring-up owns it (previewScene, ModelPreview)
+ *      const release = noteGpuContextCreated();     // an object owns it (a renderer, a pool slot)
+ *      r.dispose = (...a) => { release(); return rawDispose(...a); };
+ *
+ *  ⚠️ Why a returned closure rather than a required `TeardownScope` parameter, which is what #858's
+ *  design first proposed. Seven production sites call this, and they do not share ONE lifetime
+ *  shape: `scene3DSync`'s renderer and `canvas2DPool`'s slots own their context through their own
+ *  `dispose()`, and a slot's context is created and destroyed many times across one slot's life.
+ *  Forcing a scope there would have meant restructuring two currently-correct, heavily-scarred
+ *  modules to manufacture a scope per context — buying compile-time enforcement at the price of
+ *  destabilising the code that was never broken. A returned one-shot serves both shapes and still
+ *  deletes what the duplication actually cost: FIVE hand-copies of
+ *  `let contextLive = true; … if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }`
+ *  (`scene3DSync`, `rampWorkloadGL`, `previewScene`, `ModelPreview`, `ShaderPreview`), each of
+ *  which had to get the one-shot guard right on its own. What it does NOT buy: a caller can still
+ *  drop the returned release on the floor. That is the honest limit of this change. */
+export function noteGpuContextCreated(): () => void {
   liveContexts++;
   totalCreated++;
+  // The one-shot guard, once, here — instead of five hand-rolled `contextLive` flags at the call
+  // sites. PER CALL, deliberately: a shared flag would let one context's release silence another's,
+  // which is exactly the invariant `gpuContextTracking.test.ts` pins.
+  let live = true;
+  const release = (): void => {
+    if (!live) return;
+    live = false;
+    noteGpuContextDestroyed();
+  };
   if (liveContexts > SOFT_CONTEXT_LIMIT && !warned) {
     warned = true;
     console.warn(
@@ -67,6 +96,7 @@ export function noteGpuContextCreated(): void {
       `contexts or an unusually context-heavy scene. (Warned once; not a hard limit.)`,
     );
   }
+  return release;
 }
 
 /** Call once a previously-noted context is actually gone (disposed / explicitly lost). Floors at

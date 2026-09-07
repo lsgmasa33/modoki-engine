@@ -26,6 +26,45 @@ describe('gpuContextTracking', () => {
     expect(liveGpuContextCount()).toBe(0);
   });
 
+  // ── the returned one-shot release (#858) ──────────────────────────────────────────────────
+  // `noteGpuContextCreated` hands back the matching decrement so a caller does not hand-roll a
+  // `contextLive` flag. Five sites used to; the guard being wrong at ONE of them is a permanently
+  // inflated counter, which is the thing `gpuMemoryReport` reads and reports as fact.
+
+  it('returns a release that pairs with the create', () => {
+    const release = noteGpuContextCreated();
+    expect(liveGpuContextCount()).toBe(1);
+    release();
+    expect(liveGpuContextCount()).toBe(0);
+    expect(totalGpuContextsDestroyed()).toBe(1);
+  });
+
+  it('the returned release is ONE-SHOT — calling it twice decrements once', () => {
+    const a = noteGpuContextCreated();
+    const b = noteGpuContextCreated();
+    expect(liveGpuContextCount()).toBe(2);
+    a();
+    a(); // a stray double-dispose, which every call site used to guard by hand
+    a();
+    expect(liveGpuContextCount()).toBe(1); // b's context is still live and must stay counted
+    b();
+    expect(liveGpuContextCount()).toBe(0);
+    // The invariant the module header states: created - destroyed === live, unbroken by the
+    // stray calls above. A shared flag instead of a per-create one would have failed this.
+    expect(totalGpuContextsCreated() - totalGpuContextsDestroyed()).toBe(liveGpuContextCount());
+    expect(totalGpuContextsDestroyed()).toBe(2);
+  });
+
+  it('gives each create its OWN release — one context is not released by another\'s', () => {
+    const first = noteGpuContextCreated();
+    noteGpuContextCreated(); // second context, its release deliberately dropped
+    first();
+    first();
+    // Only the first context was released; dropping the second's release leaks it, and the
+    // counter must SAY so rather than being quietly zeroed by the first one's extra calls.
+    expect(liveGpuContextCount()).toBe(1);
+  });
+
   it('increments on create, decrements on destroy, in step', () => {
     noteGpuContextCreated();
     expect(liveGpuContextCount()).toBe(1);

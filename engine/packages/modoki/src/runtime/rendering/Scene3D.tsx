@@ -16,6 +16,7 @@ import { sceneManager } from '../scene/SceneManager';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } from './frameDriver';
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider } from '../core/screenBounds';
+import { createTeardownScope, type TeardownScope } from '../core/teardownScope';
 import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { withTimeout, TimeoutError } from '../core/abandonment';
@@ -203,6 +204,20 @@ export default function Scene3D() {
     /** Wire a renderer that `adoptRenderer` has cleared for service. */
     function install(r: Awaited<ReturnType<typeof createRenderer>>) {
       renderer = r;
+      // #858: the release path, BEFORE anything is taken. `startRenderLoop()` below is ~630 lines
+      // that register into eight module-level registries and only then assign the teardown
+      // closure — and `install()` has no try/catch while `bringUp().catch` merely logs, so a throw
+      // in there used to leave `cleanupRef.current` null and every registration live forever,
+      // including a `registerBeforeSwap` hook that then fired on every future scene swap against
+      // an abandoned renderer.
+      const scope = createTeardownScope('Scene3D');
+      // `installTornDown` flips FIRST, ahead of every release, so the loss listeners below read as
+      // stale from the instant teardown starts. That matters because `disposed` is per-EFFECT and
+      // the RECOVERY path (`rebuild: teardown(); bringUp()`) never sets it — without this, a
+      // context-loss event dispatched during the rebuild's own `renderer.dispose()` would be
+      // treated as live and queue a redundant rebuild.
+      let installTornDown = false;
+      cleanupRef.current = () => { installTornDown = true; scope.dispose(); };
       // `isStale` also compares against the OUTER `renderer` (not just `disposed`) so a later
       // rebuild that reassigns `renderer` to a NEWER instance immediately disarms an
       // in-flight callback from THIS one, even in the gap before `teardown()` gets to call
@@ -210,12 +225,16 @@ export default function Scene3D() {
       // the WebGL path; the pre-#802 code here deliberately did not, because three's own
       // `WebGLBackend` listener already does — a second `preventDefault()` on the same event
       // changes nothing, so this is a known, harmless behaviour change, not an oversight.
+      const isStale = () => disposed || installTornDown || renderer !== r;
       detachRendererLoss = attachRendererLossHandling(
         { canvas: r.domElement, device: (r as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
-        { label: 'Scene3D', isStale: () => disposed || renderer !== r, ...makeViewportLossPolicy({ renderer: r, isStale: () => disposed || renderer !== r }) },
+        { label: 'Scene3D', isStale, ...makeViewportLossPolicy({ renderer: r, isStale }) },
       );
       detachUncapturedError = attachUncapturedErrorListener(r);
-      startRenderLoop();
+      // On the scope, so a throw inside startRenderLoop still detaches them.
+      scope.add(() => detachUncapturedError(), 'detachUncapturedError');
+      scope.add(() => detachRendererLoss(), 'detachRendererLoss');
+      startRenderLoop(scope);
     }
 
     /** Run the installed teardown exactly once, then forget it — so a bring-up that fails
@@ -265,7 +284,7 @@ export default function Scene3D() {
       abandonScenePaint();
     });
 
-    function startRenderLoop() {
+    function startRenderLoop(scope: TeardownScope) {
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(
         30, container.clientWidth / container.clientHeight, 0.1, 500,
@@ -412,9 +431,11 @@ export default function Scene3D() {
       const flameState = createFlameMeshSyncState();
       const blobShadowState = createBlobShadowSyncState();
       const unsubInvalidation = attachInvalidationListener(renderState, scene);
+      scope.add(unsubInvalidation, 'unsubInvalidation');
       // Publish this surface so the material broker (MaterialInstance) can reach
       // this world's live materials + object userData. getCurrentWorld follows swaps.
       const unregisterSurface = registerRenderSurface(getCurrentWorld, renderState);
+      scope.add(unregisterSurface, 'unregisterSurface');
 
       // Post-FX stack — the ONE composable post-process path (NPR stylize,
       // NPR particles, DOF, bloom, vignette, FXAA). Built lazily on the first
@@ -515,6 +536,7 @@ export default function Scene3D() {
         onPlayStateChange(markRenderDirty), // Play ↔ Stop ↔ Pause edges (render the settled state)
         onTextDirty(markRenderDirty),       // dynamic-font glyph gen / async atlas load (not an ECS write)
       ];
+      for (const unsub of dirtyUnsubs) scope.add(unsub, 'dirtyUnsub');
 
       function renderFrame() {
         if (capturing) return;
@@ -764,7 +786,15 @@ export default function Scene3D() {
       // never fired for it — without prewarming here, the NPR MRT render becomes
       // the renderer's first-ever compile, which intermittently mis-emits the
       // OutputType struct ("unresolved type 'OutputType'") and drops the mesh.
-      const startLoop = () => registerFrameCallback(frameKey, renderFrame, PRIORITY_RENDER_3D);
+      // #858, the mirror-image half: this runs from a PENDING promise, so teardown may already
+      // have happened. Registering then puts `frameKey` back into frameDriver's module-level map
+      // with nothing left to remove it — `renderFrame()` running every frame, forever, against a
+      // disposed renderer and a cleared scene. The scope knows whether that has happened; nothing
+      // else here does (`disposed` is per-EFFECT and a rebuild does not set it).
+      const startLoop = () => {
+        if (scope.disposed) return;
+        registerFrameCallback(frameKey, renderFrame, PRIORITY_RENDER_3D);
+      };
       prewarmShadersForWorld(getCurrentWorld(), renderer, camera).then(startLoop, startLoop);
 
       // ── render_scene (ELECTRON_PLAN Phase 5): deterministic offscreen frame.
@@ -938,6 +968,7 @@ export default function Scene3D() {
         }
       };
       registerSceneRenderer(offscreenRender, 'game-3d');
+      scope.add(() => unregisterSceneRenderer(offscreenRender), 'unregisterSceneRenderer');
 
       // ── Screen-bounds provider (layout-bounds agent op) ── project each entity's
       // live world AABB through the GAME camera to a viewport CSS rect, so an agent
@@ -965,6 +996,7 @@ export default function Scene3D() {
           ids,
         );
       }, 'game-3d');
+      scope.add(unregBounds, 'unregBounds');
 
       // On world swap, drop all cached Three.js objects (entity IDs are world-scoped).
       // Sync functions will rebuild from queries on the next frame.
@@ -1008,7 +1040,9 @@ export default function Scene3D() {
           console.warn('[Scene3D] Shader prewarm failed:', e);
         }
       };
+      scope.add(unsubSwap, 'unsubSwap');
       sceneManager.registerBeforeSwap(prewarmHook);
+      scope.add(() => sceneManager.unregisterBeforeSwap(prewarmHook), 'unregisterBeforeSwap');
 
       function applyResize() {
         const w = container.clientWidth;
@@ -1045,8 +1079,14 @@ export default function Scene3D() {
       // Let the debug menu's Device tab force a re-measure (e.g. after flipping
       // pixelRatioCap live) without waiting on a DOM resize. See resizeBus.ts.
       const unregisterForceResize = onForceResize(applyResize);
+      scope.add(unregisterForceResize, 'unregisterForceResize');
 
-      cleanupRef.current = () => {
+      // Pushed LAST, so LIFO runs it FIRST: this body keeps the order it always had, and the
+      // ten registry releases that moved out of it (onto the scope, at their registration sites)
+      // now drain after it, in reverse. Safe because the whole drain is SYNCHRONOUS — nothing
+      // external can run in between — and the one thing that could be triggered by the disposal
+      // itself, a context-loss event, is covered by `installTornDown` in `isStale`.
+      scope.add(() => {
         // EVERY step is guarded (#121 P1). This teardown now runs on the RECOVERY path too,
         // where the renderer's context is already dead — and three's dispose() paths touch the
         // GPU. Unguarded, one throw would skip every later step: the frame callback left
@@ -1057,23 +1097,13 @@ export default function Scene3D() {
         const step = (what: string, fn: () => void) => {
           try { fn(); } catch (e) { console.warn(`[Scene3D] teardown step "${what}" failed`, e); }
         };
-        step('detachRendererLoss', () => detachRendererLoss());
-        step('detachUncapturedError', () => detachUncapturedError());
-        step('unregisterSceneRenderer', () => unregisterSceneRenderer(offscreenRender));
-        step('unregBounds', unregBounds);
         step('captureRT.dispose', () => captureRT?.dispose());
         captureRT = null;
         captureCanvas = null;
         captureCtx = null;
         captureCam = null;
         captureOrthoCam = null;
-        step('unsubSwap', unsubSwap);
-        step('unsubInvalidation', unsubInvalidation);
-        step('unregisterSurface', unregisterSurface);
-        for (const unsub of dirtyUnsubs) step('dirtyUnsub', unsub);
-        step('unregisterBeforeSwap', () => sceneManager.unregisterBeforeSwap(prewarmHook));
         step('resizeObserver.disconnect', () => resizeObserver.disconnect());
-        step('unregisterForceResize', unregisterForceResize);
         step('unregisterFrameCallback', () => unregisterFrameCallback(frameKey));
         step('disposeParticleSyncState', () => disposeParticleSyncState(particleState, scene));
         step('disposeFlameMeshSyncState', () => disposeFlameMeshSyncState(flameState, scene));
@@ -1107,7 +1137,7 @@ export default function Scene3D() {
         // This surface can no longer paint — release any DOM-level waiter (#334). Last, so a
         // waiter is only released once the teardown it is waiting behind has actually finished.
         step('abandonScenePaint', abandonScenePaint);
-      };
+      });
     }
 
     return () => {

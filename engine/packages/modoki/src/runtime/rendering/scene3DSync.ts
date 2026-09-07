@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
-import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
+import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
@@ -4783,18 +4783,18 @@ export async function makeWebGPURenderer(
   // correct for free, with no second call site to keep in sync: Scene3D's unmount and rebuild
   // paths, the KTX2 caps probe's throwaway renderer (`capsProbeRenderer.ts` via
   // `textureResolver.ts`'s `probe?.dispose()`), and the editor's SceneView/ParticleEditor viewports
-  // all just call `.dispose()` as they already did. Guarded so a stray double-dispose can't
-  // decrement twice for one context.
-  noteGpuContextCreated();
+  // all just call `.dispose()` as they already did. The one-shot guard that stops a stray
+  // double-dispose decrementing twice now lives inside `noteGpuContextCreated`'s returned release,
+  // not in a `contextLive` flag here — it was hand-copied at five sites (#858).
+  const releaseContextCount = noteGpuContextCreated();
   // #715: three's webgl-fallback backend never issues a GL delete for a compiled program/shader
   // (see glProgramRelease.ts's doc for the measurement) — a leak that accumulates for the life of
   // this context. Guarded to a no-op on the WebGPU backend and to a loud, self-disabling no-op if
   // three's private internals this depends on ever move.
   installGlProgramReleaseHatch(r);
-  let contextLive = true;
   const rawDispose = r.dispose.bind(r);
   r.dispose = (...args: Parameters<typeof rawDispose>) => {
-    if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
+    releaseContextCount(); // one-shot inside `noteGpuContextCreated` now — see its doc
     return rawDispose(...args);
   };
   return r;
@@ -4814,7 +4814,7 @@ export async function createRenderer(
   // Awaited: registering now imports three's KTX2Loader on demand (#254), and the caps it
   // detects must be in place before anything this renderer draws asks for a KTX2 texture.
   const disposeActiveRenderer = await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
-  // Compose onto the dispose wrapper above (the `noteGpuContextDestroyed` one) — same pattern,
+  // Compose onto the dispose wrapper above (the GPU-context-count one) — same pattern,
   // same reason: every existing `renderer.dispose()` call site (Scene3D's unmount/rebuild, the
   // KTX2 probe, the editor viewports) stays correct for free instead of needing a second call
   // site to keep in sync.

@@ -3302,6 +3302,98 @@ the rebuilt canvas returned zeros, which is what an un-`preserveDrawingBuffer` c
 compositing regardless of what it drew — evidence of nothing either way. The reopen is verified as
 far as "a fresh, healthy context is up"; nobody has looked at the pixels.
 
+### The release path must exist before the first acquisition (#858)
+
+The three sections above are all about a release that runs at the WRONG time or on the WRONG
+object. This one is about a release that **cannot run at all**, and it was live at five bring-ups
+at once.
+
+Every long bring-up here was written the same way: take things as you go, then build one big
+teardown closure at the END and hand it to the unmount path.
+
+```ts
+let cleanup: (() => void) | undefined;
+const setup = async () => {
+  setEditorViewportCamera(camera);   // ← taken here
+  …2,000 lines…                      // ← a throw anywhere in here
+  cleanup = () => { …release it… };  // ← never reached
+};
+const teardownViewport = () => { const fn = cleanup; cleanup = undefined; fn?.(); };
+```
+
+**A bring-up that ends early — a throw, a rejected await, an early return — therefore leaves
+everything it already took both unreleased and unreachable.** `cleanup` is still `undefined`, so
+`fn?.()` releases nothing, and the closure that knew how to release it was never built. Note what
+this is *not*: an identity guard on the release side (#811) is inert, because release never runs.
+
+**The five sites, and what each one's stale state then said.** All verified by reading, not
+observed running — the honest status #858 carries:
+
+| Site | Release assigned | What ends bring-up early | Who answered wrongly |
+|---|---|---|---|
+| `editor/panels/SceneView.tsx` | end of `setup()` | any sync throw in the ~2,175 lines from the first registration (there is no `await` in that span) | `focusEntityInSceneView()` returns `true` having framed nothing, so `modoki_focus_entity` reports `{ok:true, framed:true}`; "Copy from Editor Camera" reads a disposed camera; `isEcsObjectVisible` answers from a torn-down graph — a **false green** for an e2e collider assertion. Plus the renderer LEASE, which the ticket did not mention |
+| `runtime/rendering/Scene3D.tsx` | end of `startRenderLoop()` | `install()` has no `try/catch`; `bringUp().catch` logs and calls `abandonScenePaint()`, never `teardown()` | a leaked `registerBeforeSwap` hook fires on **every future scene swap**, prewarming against an abandoned renderer and warning each time |
+| `editor/panels/ParticleEditor.tsx` | end of the async IIFE | its two `await` bails ARE guarded — the file's own comment describes this exact bug — but the ~85 synchronous lines after them are not | the renderer never pops off `activeRenderer`'s registrant stack, so `getActiveRenderer()` hands every consumer a dead renderer for the rest of the session |
+| `editor/panels/previewScene.ts` + `Preview3DShell.tsx` | via the factory's `return` | `pmrem.fromScene` is a real GPU op; the caller's `catch` had **nothing to dispose** — `handle` is unassigned when the constructor throws | `gpuContextTracking`'s live count climbs toward `SOFT_CONTEXT_LIMIT` with no decrement: the counter that exists to warn about context exhaustion is the thing being lied to |
+| `editor/panels/ModelPreview.tsx` | defined ~120 lines after the context | no `try/catch` at all, so the `useEffect` callback throws and React registers **no cleanup for that run** | the same counter, and `forceContextLoss()`/`dispose()` never run (cf. #776) |
+
+**The repo already contained the correct shape**, which is the argument that this is one class and
+not five accidents: `ShaderPreview.tsx` defines its `teardown` *before* the async IIFE that acquires
+anything and returns it unconditionally, and `App.tsx`'s boot effect carries the comment *"Claim
+ownership BEFORE the first registration, not after the last"*. Those two got it right by hand.
+
+**The fix is `runtime/core/teardownScope.ts`** — that discipline as an object, for the bring-ups
+whose teardown closes over dozens of locals that do not exist yet and so cannot simply be written
+first. `createTeardownScope(label)` gives a LIFO, idempotent, per-step-caught drain; the bring-up
+assigns `cleanup = scope.dispose` as its FIRST statement and pushes each release at the site that
+takes the thing. The big closure is pushed LAST, so LIFO still runs it FIRST and the existing order
+survives.
+
+⚠️ **Where the line is drawn.** On the scope goes anything whose leak OUTLIVES the bring-up and
+keeps acting: every module-level registration (the stale reader answering wrongly), the renderer
+lease, the loss listeners, the frame callback — and every **global** handler, meaning the six
+`window` input listeners and the `document.body` marquee element SceneView installs. Those last
+seven were nearly left behind on the grounds that what stays in the terminal closure is "just
+memory"; they are not memory, they are live input handlers that would run viewport gesture logic on
+every pointer move in the editor for the rest of the session after a failed bring-up. They
+early-return while no gesture is active, which is exactly why nobody noticed.
+
+What genuinely does stay terminal-only is the scene graph and the GPU objects — geometries,
+materials, the gizmo, `controls`, and the listeners bound to the renderer's own canvas, which dies
+with it. Those a partial bring-up still leaks, and that IS only memory. **The test is not "is it a
+DOM listener" but "does it keep answering after the bring-up is gone".**
+
+Two properties that are there for one site each, not for symmetry:
+- **`add()` after disposal runs the release immediately.** This closes the MIRROR-image defect with
+  the same object: `Scene3D`'s `prewarmShadersForWorld(...).then(startLoop, startLoop)` registers a
+  frame callback from a pending promise, so it could land *after* teardown with nothing left to
+  remove it — `renderFrame()` running forever against a disposed renderer.
+- **`installTornDown` in `Scene3D`'s `isStale`.** `disposed` is per-EFFECT and the recovery path
+  (`teardown(); bringUp()`) never sets it, so without a per-install flag a context-loss event
+  dispatched during the rebuild's own `renderer.dispose()` reads as live.
+
+⚠️ **The one ordering change, at four of the five sites: the loss listener now detaches AFTER the
+GPU disposal instead of before.** Safe, and the reason is worth carrying: every event path in
+`rendererLossHandling.ts` consults `isStale()` first, and `isStale` reads a flag the teardown sets
+before anything drains. Whoever removes that flag owes this note a re-read.
+
+**`noteGpuContextCreated()` now RETURNS its matching release**, one-shot, instead of five sites each
+hand-rolling `let contextLive = true; … if (contextLive) { contextLive = false;
+noteGpuContextDestroyed(); }`. It is not a required `TeardownScope` parameter, which was the first
+design: seven sites call it and they do not share one lifetime shape — `scene3DSync`'s renderer and
+`canvas2DPool`'s slots own their context through their own `dispose()`, and a pool slot cycles many
+contexts. Forcing a scope there would have meant restructuring two currently-correct, heavily
+scarred modules to buy compile-time enforcement. **The honest limit: a caller can still drop the
+returned release on the floor.**
+
+**What is tested, and what deliberately is not.** `teardownScope.test.ts` pins the mechanism
+(mutation-checked; note that idempotence has two independent mechanisms, so only removing BOTH
+turns it red — recorded in that file's header). `teardownScopeSeeding.test.ts` pins the ORDER at all
+five sites, read through `readScannedSource` so a marker in a comment cannot satisfy it (#812).
+Neither is the seam the ticket asked for — "make `setup()` throw from the inside" needs the panel
+MOUNTED, which `CLAUDE.md` forbids in jsdom, and a jsdom mount of a 2,200-line WebGPU bring-up would
+assert the fakes. **Nothing here has been observed failing or fixed on a running editor.**
+
 ### No custom GLSL
 
 Materials are standard Three.js materials (`MeshStandardMaterial`, GLB-imported materials, etc.). `WebGPURenderer` auto-converts them to TSL/WGSL — there is no hand-written shader source in the standard render path. The NPR post-process is the one place that authors node graphs, and it does so through TSL (plus one small raw-WGSL `wgslFn` for FXAA).
