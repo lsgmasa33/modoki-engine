@@ -32,12 +32,15 @@ const ASSET_TYPES_PROSE = ASSET_TYPES.join(' / ');
 
 export { ASSET_TYPES as ASSET_TYPES_FOR_TESTS };
 
-/** The `type` values `modoki_read_asset_def` accepts — the 8 of the 9 `ASSET_TYPES` above that
+/** The `type` values `modoki_read_asset_def` accepts — the 7 of the 9 `ASSET_TYPES` above that
  *  the backend's `read-asset-def` op actually serves; `material` is deliberately absent (that op
  *  refuses it — a material's live cache holds only the compiled THREE.Material, not the authored
- *  JSON). Exported so `assetTypeParity.test.ts` pins this enum against the op directly instead of
- *  letting it drift again like #842/#843. */
-const READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset', 'atlas'] as const;
+ *  JSON). `atlas` is also absent: the op has no `atlas` branch, and atlas holds no engine-side
+ *  cache to read back (`assetInvalidation.ts` — "atlas frames are read straight off the
+ *  manifest"; `persist.ts`'s `invalidateAtlasFile` is a documented no-op). Exported so
+ *  `assetTypeParity.test.ts` pins this enum against the op directly instead of letting it drift
+ *  again like #842/#843. */
+const READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'] as const;
 
 export { READ_ASSET_DEF_TYPES as READ_ASSET_DEF_TYPES_FOR_TESTS };
 
@@ -263,7 +266,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_read_asset_def',
     'Read an asset DEFINITION back: a .particle.json, .anim.json, .timeline.json, .spriteanim.json, ' +
-      '.rig2d.json, .shader.json, .animset.json or .atlas.json, from the LIVE cache (not the file). NOT ' +
+      '.rig2d.json, .shader.json or .animset.json, from the LIVE cache (not the file). NOT ' +
       '.mat.json — a material\'s live cache holds only the compiled THREE.Material, the authored ' +
       'JSON is discarded once built, so read that file directly instead. The companion to ' +
       'modoki_particle_set / ' +
@@ -280,7 +283,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       // was rejected by zod before it could reach the op — the same "a contract keyed to the old
       // asset-type set" defect, one layer up. `material` is deliberately absent: the op refuses it.
       type: z.enum(READ_ASSET_DEF_TYPES).optional()
-        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d/.shader/.animset/.atlas suffix.'),
+        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d/.shader/.animset suffix.'),
     },
     async ({ path, type }) => {
       const q = new URLSearchParams({ path });

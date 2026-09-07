@@ -173,16 +173,17 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
  * to `NUL` changed nothing, because stderr stays piped either way and the wait was never about
  * ping's writes at all.
  *
- * This suite RUNS on CI: it passed on `windows-latest` 117 times between 2026-08-10 and
- * 2026-08-31. A `&& !process.env.CI` gate was added at `dc66059e5` on the theory that the runner
- * reaps the tool before the assertions can see it — but that theory is contradicted by those 117
- * greens, since a reaping runner would have failed the CONTROL every time. The real cause was
+ * This suite RUNS on CI. A `&& !process.env.CI` gate was added at `dc66059e5` on the theory that
+ * the runner reaps the tool before the assertions can see it — but the run history contradicts
+ * that: with the gate absent, the suite ran on every `ci/main` run across that window and passed
+ * on every green one, and a runner that reaped the tool would have failed the CONTROL (which
+ * asserts the orphan is STILL ALIVE) on every single run, not intermittently. The real cause was
  * #184 above: the first CONTROL awaited `close`, which cannot fire until the orphan is dead, so
  * it was unsatisfiable by construction. `origin/win`'s repaired version (awaiting `exit` instead)
  * came in via merge `fda2dfbcc` and is what actually made the gate unnecessary. The gate was
  * briefly and mistakenly re-added under #847 on a belief that the merge had silently reverted it,
  * and removed again here once the run history above was checked. The one genuine residual is a
- * ~4% flake at child discovery (2 of 49 failure runs since 2026-08-10, both
+ * small flake at child discovery (a handful of failure runs since 2026-08-10, each a timeout on
  * `kids.length === 0` at the first CONTROL) — see the poll deadline below.
  */
 describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProcess kills the whole tree on Windows (#182)', () => {
@@ -228,14 +229,19 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
   const spawnAndFindTool = async (): Promise<{ proc: ReturnType<typeof spawnBuildCommand>; kids: number[] }> => {
     const proc = spawnBuildCommand(SIMPLE, { cwd: process.cwd(), env: process.env })
     // Each `childrenOf` call is a PowerShell CIM query costing ~1-3s (docs/windows.md), so a 5s
-    // deadline allowed only 2-3 samples — the observed cause of the ~4% child-discovery flake
-    // above. The tool runs `ping -n 30`, so 15s is still well inside its window. NOT verified on
+    // deadline allowed only 2-3 samples — the observed cause of the child-discovery flake above.
+    // The tool runs `ping -n 30`, so 15s is still well inside its window. NOT verified on
     // Windows from this machine.
     const kids = await poll(() => childrenOf(proc.pid!), (k) => k.length > 0, 15000)
     spawned.push(...kids)
     return { proc, kids }
   }
 
+  // Timeout raised 30_000 → 60_000 on every test in this suite: child discovery above can spend
+  // up to 15s (poll deadline) plus a slow PowerShell CIM call, and the liveness poll elsewhere in
+  // this file can spend up to 8s plus another slow call — leaving no headroom under a 30s vitest
+  // timeout, so a slow-but-correct discovery failed as an unattributed bare timeout instead of a
+  // readable assertion.
   it('CONTROL: a plain proc.kill() kills only cmd.exe, orphaning the tool underneath', async () => {
     const { proc, kids } = await spawnAndFindTool()
     expect(kids.length, 'cmd.exe should have launched PING.EXE as a child').toBeGreaterThan(0)
@@ -250,7 +256,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     await exited
 
     expect(alivePids(kids), 'the orphan this bug is about — still running after `exit`').toEqual(kids)
-  }, 30_000)
+  }, 60_000)
 
   it('CONTROL: `close` is DEFERRED until the orphan dies, because it inherited the stdio pipes', async () => {
     // The other half of the hazard, and the one that says what the pre-#176 symptom actually WAS.
@@ -283,7 +289,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     for (const k of kids) { try { execFileSync('taskkill', ['/F', '/PID', String(k)], { stdio: 'ignore' }) } catch { /* gone */ } }
     await closed
     expect(closeFired).toBe(true)
-  }, 30_000)
+  }, 60_000)
 
   it('killBuildProcess reaches the tool via taskkill /T', async () => {
     const { proc, kids } = await spawnAndFindTool()
@@ -293,13 +299,13 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     // The win32 path is an ASYNC `execFile('taskkill', …)`, so poll rather than sleep a guess.
     const survivors = await poll(() => alivePids(kids), (s) => s.length === 0, 8000)
     expect(survivors, 'no survivors of the tree kill').toEqual([])
-  }, 30_000)
+  }, 60_000)
 
   it('is a no-op on an already-exited child (never taskkills a REUSED pid)', async () => {
     const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcess(proc)).not.toThrow()
-  }, 30_000)
+  }, 60_000)
 
   it('killBuildProcessSync reaps the tree from the `exit` hook — the path that used to skip win32 (#185)', async () => {
     // `ping` is the deliberate stand-in, not a convenience. The shutdown hole hid because every
@@ -320,11 +326,11 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     // exactly the kind this suite already hit at 871ms.
     const survivors = await poll(() => alivePids(kids), (s) => s.length === 0, 8000)
     expect(survivors, 'the sync kill reaps the whole tree').toEqual([])
-  }, 30_000)
+  }, 60_000)
 
   it('killBuildProcessSync is a no-op on an already-exited child', async () => {
     const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcessSync(proc)).not.toThrow()
-  }, 30_000)
+  }, 60_000)
 })

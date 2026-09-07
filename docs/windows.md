@@ -175,7 +175,7 @@ load-bearing and commented as such).
     ~66 sites were deliberately left as-is — they're churn with no defect behind them, not a
     backlog to migrate.
   - **The corpus producer made this class RARE, not unreachable — this bullet claimed the latter
-    for a month, and instance 9 disproved it** (#799/#771/#805; corrected under #847). Guards did
+    for about 16 hours, and instance 9 disproved it** (#799/#771/#805; corrected under #847). Guards did
     not get better at normalising — they stopped producing paths that need it.
     `engine/scripts/repoCorpus.mjs` returns **git's own repo-relative POSIX `rel`**, so a consumer
     that KEEPS that `rel` and compares against `'a/b.ts'` never touches `node:path` and has no
@@ -193,11 +193,13 @@ load-bearing and commented as such).
       writing `.map(({ abs }) => abs)` throws the safe `rel` away, after which any
       `path.relative(REPO, abs)` reconstructs the backslash the producer had removed. That is
       what #847's guard did, and `corpusProducerIsShared.test.ts` cannot see it — the producer
-      IS shared; the consumer discarded its output. Measured 2026-09-07: **30 call sites across
-      28 files** in `engine/tests/**` spell that `.map`, and a sweep found every other one
-      benign — they
+      IS shared; the consumer discarded its output. Measured 2026-09-07, repo-wide: **39 call
+      sites across 36 files** spell that `.map` (an earlier pass scoped to `engine/tests/**` alone
+      found 30 across 28 files, but `engine/packages/modoki/tests/**` is not out of scope — it
+      runs as the second half of `verify`, per `package.json`'s `verify` script — and
+      `engine/scripts/**` adds a few more), and a sweep found every other one benign — they
       normalise before comparing, or never compare at all. So the exposed population is one, not
-      thirty; but it is not zero, and nothing structural keeps it there.
+      thirty-nine; but it is not zero, and nothing structural keeps it there.
       **The fix is to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
     - **Instance 4 is the exception.** `consoleRingOptionsWiring`'s `relPosix` SURVIVES and is live.

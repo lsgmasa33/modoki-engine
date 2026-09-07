@@ -55,20 +55,32 @@ describe('the MCP asset-type enum matches the engine schema list', () => {
   });
 });
 
-// The 7 types `read-asset-def` (agentBridge.ts) actually serves: every `ASSET_SCHEMA_TYPES` entry
-// except `material`, which that op refuses outright (a material's live cache holds only the
-// compiled THREE.Material, not the authored JSON — see agentEditorOps.ts / agentBridge.ts).
-const READ_ASSET_DEF_TYPES = ASSET_SCHEMA_TYPES.filter((t) => t !== 'material');
+// Asset types `read-asset-def` (agentBridge.ts / agentEditorOps.ts) deliberately does NOT serve,
+// each with the reason — mirrors the `NOT_LIVE_RELOADABLE` shape in liveReloadKinds.test.ts. Add a
+// name here only with a verified reason, never to silence a failure.
+const NOT_READABLE: Record<string, string> = {
+  material: 'that op refuses it outright — a material\'s live cache holds only the compiled ' +
+    'THREE.Material, not the authored JSON (see agentEditorOps.ts / agentBridge.ts).',
+  atlas: 'the op has no `atlas` branch (agentEditorOps.ts\'s own error enumerates particle | ' +
+    'animation | spriteanim | timeline | rig2d | shader | animset, no atlas) and atlas holds no ' +
+    'engine-side cache to read back — atlas frames are read straight off the manifest ' +
+    '(assetInvalidation.ts) and persist.ts\'s `invalidateAtlasFile` is a documented no-op, so ' +
+    'there is nothing live to serve.',
+};
+
+// The types `read-asset-def` actually serves: every `ASSET_SCHEMA_TYPES` entry minus the ones in
+// `NOT_READABLE` above.
+const READ_ASSET_DEF_TYPES = ASSET_SCHEMA_TYPES.filter((t) => !(t in NOT_READABLE));
 
 describe('the READ-asset-def enums (modoki + device) match what the op serves (#842/#843)', () => {
   let deviceSurface: DeviceSurface | undefined;
   afterEach(async () => { await deviceSurface?.restore(); deviceSurface = undefined; });
 
-  it('modoki_read_asset_def\'s enum lists exactly the 7 served types, in both directions', () => {
+  it('modoki_read_asset_def\'s enum lists exactly the served types, in both directions', () => {
     expect([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort()).toEqual([...READ_ASSET_DEF_TYPES].sort());
   });
 
-  it('device_read_asset_def\'s enum lists exactly the 7 served types, in both directions', () => {
+  it('device_read_asset_def\'s enum lists exactly the served types, in both directions', () => {
     expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...READ_ASSET_DEF_TYPES].sort());
   });
 

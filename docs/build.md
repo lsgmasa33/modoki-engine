@@ -582,11 +582,14 @@ for all 7 processes across 11 samples of a full build).
 
 `buildStepShell.test.ts` carries a Windows suite that pins that path, and it runs on CI. It was
 gated OFF CI for about a month on the theory that the runner reaps the tool before the assertions
-can see it — but the run history refutes that: the suite passed on `windows-latest` 117 times
-between 2026-08-10 and 2026-08-31, which a reaping runner could not produce. The real cause was the
-suite's CONTROL awaiting the wrong event (`close` instead of `exit`), fixed on the `win` branch and
-merged in. The gate is gone now, and the suite's only residual is a small flake at child discovery,
-addressed by a longer poll deadline in the test itself.
+can see it — but the run history refutes that: with the gate absent, the suite ran on every
+`ci/main` run across that window and passed on every green one, and a runner that reaped the tool
+would have failed the suite's own CONTROL (which asserts the orphan is STILL ALIVE) on every single
+run, not intermittently — so the reaping premise is refuted by the run history regardless of the
+exact count. The real cause was the suite's CONTROL awaiting the wrong event (`close` instead of
+`exit`), fixed on the `win` branch and merged in. The gate is gone now, and the suite's only
+residual is a small flake at child discovery — timeouts on `kids.length === 0` at the first
+CONTROL — addressed by a longer poll deadline in the test itself.
 
 ⚠️ **One residual hole, and one that was closed by measuring it (#185):**
 

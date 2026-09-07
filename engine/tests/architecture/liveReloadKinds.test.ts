@@ -31,7 +31,7 @@
  * `return null` (no broadcast, ever) and nothing here noticed. The added test below closes that by
  * requiring every union member to appear in an explicit `type === '<kind>'` branch.
  *
- * A THIRD gap, found by #832/#831's close-out (#842): `material` and `shader` are two of the eight
+ * A THIRD gap, found by #832/#831's close-out (#842): `material` and `shader` are two of the nine
  * `ASSET_SCHEMA_TYPES` — agent-writable via `/api/asset-write`, and parkable in the Inspector via
  * `persistAssetEdit` — but were absent from `LiveReloadKind` entirely, not just from
  * `classifySceneChange`'s branches. Every check above still passed, because they all start from
@@ -153,7 +153,9 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
     atlas: 'protected by an ifMatch compare-and-swap checked server-side at write time (#831), ' +
       'not by a watcher-driven park-drop — adding it to LiveReloadKind would let ' +
       'dropParkedWriteFor (#439/#469) silently discard a human\'s parked edit, exactly the ' +
-      'silent-discard behaviour #831 replaced with a human-resolved fork.',
+      'silent-discard behaviour #831 replaced with a human-resolved fork. ⚠️ The CAS premise is '
+      + 'not universal: a RENAME re-parks without the baseline and turns it off for the rest of '
+      + 'the session (#854) — that is a bug to fix, not a reason to take the watcher instead.',
   };
 
   it('every agent-writable/parkable asset type is in LiveReloadKind (#842)', () => {
