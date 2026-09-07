@@ -2747,6 +2747,94 @@ filesystem boolean — and stack ordering means the entity is present in the nor
 it pushed its own undo entry, which unwinds first). The abnormal case is a world-rebuild
 guid-index gap, a different bug to chase; fifteen speculative warnings would be noise.
 
+
+#### The same class one layer up: a boolean that could not be false (#884)
+
+⚠️ **#308 fixed the closures that ignored the boolean. It could not fix a boolean that was
+computed from the wrong thing** — and #875 introduced exactly that, without touching a single one
+of those closures.
+
+`/api/delete-asset` reports its outcome **per path**: `missing` (never on disk) and, since #875,
+`failed` (the OS refused it — a locked file, a denied ACL, a >260-char path). The wrappers
+collapsed that to a whole-batch verdict computed from the **HTTP status**: `deleteAssetFile`
+returned `res.ok`, and `deleteAssetFiles` hardcoded `ok: true` on any 200. A refusal answers
+**200**. So every guard #308 had carefully installed was checking a value that could not be false,
+and three consumers went wrong at once:
+
+- the **Assets panel** dropped the row, unbound the editor and offered undo for a file still on
+  disk — while the route, one process away, was carefully filtering its OWN half of the repair
+  under the comment *"Unbinding an editor from a file that is still on disk would be the wrong
+  direction"*;
+- the **folder delete** pruned the tree for a folder that is still there;
+- **`modoki_delete_asset`** told an agent the file was gone. That one had no backstop at all:
+  `isFailureBody` short-circuits on `ok === true` **by design** (*"the route says it succeeded —
+  believe its explicit verdict"*), so the shared MCP false-success guard was defeated by the route
+  being wrong rather than by the guard being weak.
+
+**The fix is a verdict per OUTCOME, not per request.** A route that answers one `ok` for two
+different outcomes gives every caller a value it cannot act on:
+
+| outcome | reply | what a caller should do |
+|---|---|---|
+| everything went | `ok:true`, no `failed` | the ordinary path |
+| some went | `ok:true` + `failed` | reconcile the ones that went; keep the rest |
+| nothing went | `ok:false` + `failed` | report it; change nothing |
+
+#875's argument for never answering a failure here — *a 500 reads as "nothing was deleted" about
+N-1 files that ARE gone* — is exactly right about the **partial** row and says nothing about the
+third. When nothing went, "nothing was deleted" is simply true. It stays a **200** so `missing`,
+`failed` and `manifestRebuilt` survive; `isFailureBody` handles an `{ok:false}` 200 explicitly, and
+that is the shape it exists for.
+
+**Two rules this leaves behind.**
+
+1. **A per-path outcome list is reported in the CALLER'S OWN strings.** `failed` used to map
+   through `absToAssetUrl(abs) ?? abs`, so a path that would not canonicalise arrived as an
+   ABSOLUTE path in a field the renderer can only match against asset urls — the same fallback
+   `/api/move-file` explicitly refuses, one size smaller. `missing`, the sibling list in the same
+   reply, always echoed the input; two outcome lists in one reply that are keyed differently cannot
+   be treated uniformly by anyone. The **renderer repair** keeps `absToAssetUrl` — a different
+   consumer with a different correct key.
+2. **Everything after a partial delete keys off what WENT.** `planDeleteOutcome` (`assetOps.ts`)
+   is that split, in `.ts` so it is testable without mounting the panel. Note the asymmetry it
+   encodes: a refused **sidecar** does NOT keep the asset's row, because the asset itself is gone
+   and a row pointing at nothing is the mirror defect.
+
+**What the close-out review then found — the same class, three more times.** Worth recording
+because every one of them was in code the fix had already touched or should have:
+
+- **`makeDeleteUndo`'s REDO half had the identical defect**, one layer over. `if (!res.ok)` cannot
+  see a partial refusal, so a redo re-listed the refused file and read as a no-op — #291's
+  complaint, reintroduced by #875's new shape. Fixing a false success on the forward path does not
+  fix its twin on the undo path; they are separate call sites of the same wrapper.
+- **`failed` is NOT stable across a retry, and `missing` is.** They were merged into one
+  `notTrashed` set captured at construction — which is wrong precisely because the toast asks the
+  human to close the handle and try again. After a successful retry the second undo skipped that
+  file's write *and* dropped it from the shortfall report: a clean-looking Cmd+Z with the file
+  still in the OS trash. **A filter over a per-path outcome has to be recomputed by whatever
+  re-runs the operation.**
+- **The route had FIVE consumers, and two searches in a row undercounted them.** `CleanupAssetsDialog`
+  posts to `/api/delete-asset` directly, so no search for `deleteAssetFiles` finds it; `modelImport`'s
+  orphan-prune does too, behind a bare `.catch(() => {})` that read neither the status nor the body
+  — while logging `Pruned N orphan files` unconditionally and having already rewritten `generated`,
+  so a refused prune stranded a file nothing would ever retry. The rule this leaves: **when a
+  route's contract changes shape, enumerate its callers from the ROUTE (`grep` the url), not from
+  the wrapper** — and note that the first application of that rule still missed one, because the
+  fix commit said "fourth" when the answer was fifth.
+
+⚠️ **The toast's own reachability is the platform trap, not just its testability.** `describeRefusedDeletes` is driven by `failed`, so on macOS and Linux — where a refusal is a whole-batch
+throw — it produces nothing, and the human got a toast for a failed FOLDER delete and silence for a
+failed FILE delete. A `!ok` fallback covers it. Naming the paths is better; saying nothing is the
+defect.
+
+⚠️ **`failed` is populated on win32 only, and the platforms genuinely disagree.** darwin's
+`osascript` and Linux's `trash-put` are single invocations: a mid-list refusal throws as a whole,
+`parseTrashFailures` finds no marker, `moveToTrash` rethrows and the route 500s. So **an empty
+`failed` is not evidence that every path went — `ok` is**, and the partial row of the table above
+is unreachable outside Windows. That also means the toast cannot be driven from a Mac: the
+behaviour is pinned at the seam (`deleteAssetRouter.test.ts`, `assetUndo.test.ts`,
+`assetDeleteRenamePolicy.test.ts`) and end-to-end confirmation belongs to the `win` clone.
+
 ---
 
 ### Undoable panel state cannot live in `useState` (#309)

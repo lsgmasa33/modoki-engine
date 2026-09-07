@@ -49,13 +49,48 @@ export type DupResult = { asset: AssetEntry; toPath: string };
 /** Build a single coalesced undo/redo for one or more completed deletes. Undo
  *  restores the FULL snapshot set (not just the GLB) so generated mesh/mat/
  *  texture refs don't dangle; redo re-trashes the whole set in ONE call. */
-export function makeDeleteUndo(results: DeleteResult[], refresh: () => void, trashedMissing: string[] = []): UndoAction {
+/** @param notTrashed Paths that did NOT go to the trash, so undo must not touch them and the
+ *    shortfall report must not name them. Restoring one would be a write the user never asked
+ *    for, and reporting one as "still in the trash, recover by hand" sends them hunting for a
+ *    file that was never there.
+ *
+ *    ⚠️ **The two halves are passed SEPARATELY because they age differently, and merging them is
+ *    a bug that has now been written twice.** `missing` is decided once, at the delete: a file
+ *    that was never on disk (`deletionPathsFor` deliberately lists maybe-absent sidecars, #291)
+ *    will not appear later. `failed` is the OS refusing a file that IS there (#884) — and the
+ *    toast tells the human to close the handle and retry, so the very next redo can succeed on
+ *    it. Hence `failed` is recomputed per redo and `missing` is not.
+ *
+ *    ⚠️ And `missing` must NOT be re-read from a redo's reply, which is the subtler half: a redo
+ *    reports a path as `missing` when it is not on disk, and a path whose RESTORE just failed is
+ *    exactly that. Refreshing `missing` from the redo therefore swallows the file the previous
+ *    undo already reported as lost — permanently un-restorable and silent, the very defect this
+ *    parameter's split exists to prevent. */
+export function makeDeleteUndo(
+  results: DeleteResult[], refresh: () => void,
+  notTrashed: { missing?: string[]; failed?: string[] } = {},
+): UndoAction {
   const label = results.length > 1 ? `Delete ${results.length} items` : `Delete ${results[0].asset.name}`;
+  // Fixed at construction — see the docblock. Never re-read from a redo.
+  const neverExisted = new Set(notTrashed.missing ?? []);
+  // Ages: a redo can succeed on a path that was refused. `let`, rewritten by redo only.
+  let refused = new Set(notTrashed.failed ?? []);
+  const isNotTrashed = (p: string) => neverExisted.has(p) || refused.has(p);
   return {
     label,
     undo: async () => {
-      const all = results.flatMap((r) => r.snapshots);
-      for (const s of all) await writeAssetFile(s.path, s.content, s.encoding);
+      // Only what actually went. A file the OS refused is still on disk with the user's own
+      // bytes in it; writing the snapshot back over it would clobber any edit made since.
+      const all = results.flatMap((r) => r.snapshots).filter((s) => !isNotTrashed(s.path));
+      // ⚠️ The WRITE's own result decides whether it was restored — #308's thesis, which this
+      // builder never applied to itself. `writeAssetFile` catches and resolves `false`, so a
+      // restore that 500'd used to be counted as restored: `lost` came out empty and the undo
+      // reported "restored N of N" about a file still sitting in the trash. Exactly the false
+      // success the shortfall report below exists to prevent, one level in from where it looked.
+      const restoredPaths: string[] = [];
+      for (const s of all) {
+        if (await writeAssetFile(s.path, s.content, s.encoding)) restoredPaths.push(s.path);
+      }
       // An undo that restores only SOME of what it trashed is a false success: the panel
       // refreshes, files reappear, and the ones whose snapshot read failed stay in the OS
       // trash with nothing naming them (#291). So report the SHORTFALL, which covers the
@@ -66,10 +101,9 @@ export function makeDeleteUndo(results: DeleteResult[], refresh: () => void, tra
       // deletionPathsFor deliberately lists maybe-absent sidecars (`.meta.local.json` is
       // gitignored and usually not on disk), so a deletePaths-based diff would name files
       // that never existed and send the user hunting in the trash for them.
-      const restored = new Set(all.map((s) => s.path));
-      const neverExisted = new Set(trashedMissing);
+      const restored = new Set(restoredPaths);
       const lost = Array.from(new Set(results.flatMap((r) => r.deletePaths)))
-        .filter((p) => !restored.has(p) && !neverExisted.has(p));
+        .filter((p) => !restored.has(p) && !isNotTrashed(p));
       if (lost.length > 0) {
         console.error(
           `[Assets] Undo of "${label}" restored ${restored.size} of ${restored.size + lost.length} file(s). ` +
@@ -80,12 +114,27 @@ export function makeDeleteUndo(results: DeleteResult[], refresh: () => void, tra
       refresh();
     },
     redo: async () => {
-      // Re-delete the whole set in ONE trash call (same as the original delete).
+      // Re-delete the whole set in ONE trash call (same as the original delete) — including any
+      // path the OS refused last time, which is the whole point of retrying.
       const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
       // Same false-success shape on the other half: a failed re-delete left the files on
       // disk, refresh() re-listed them, and redo read as a no-op (#291).
       const res = await deleteAssetFiles(allPaths);
-      if (!res.ok) console.error(`[Assets] Redo of "${label}" failed — the files are still on disk: ${allPaths.join(', ')}`);
+      if (!res.ok) {
+        console.error(`[Assets] Redo of "${label}" failed — the files are still on disk: ${allPaths.join(', ')}`);
+      } else if (res.failed.length > 0) {
+        // ⚠️ A PARTIAL refusal is `ok:true`, so the check above cannot see it — the very defect
+        // #884 fixed in `executeDeletion`, left standing on this half until the close-out review
+        // found it. Silent here means the redo re-lists the refused file and reads as a no-op.
+        console.error(`[Assets] Redo of "${label}" did not fully apply — the OS refused: ${res.failed.join(', ')}`);
+      }
+      // ⚠️ Only on a SUCCESSFUL redo, and only the `failed` half. On `!res.ok` the redo deleted
+      // nothing — `deleteAssetFiles` answers `{ok:false, missing:[], failed:[]}` for a non-2xx and
+      // for a transport throw alike — so taking its empty lists would wipe the filter that a redo
+      // which never ran has no business changing: the next undo would then name a never-existed
+      // sidecar as "still in the trash" (#291's exact complaint) and, on win32, write a snapshot
+      // back over a refused file the user may have edited since.
+      if (res.ok) refused = new Set(res.failed);
       refresh();
     },
   };

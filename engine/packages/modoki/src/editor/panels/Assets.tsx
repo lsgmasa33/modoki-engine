@@ -20,6 +20,7 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // "serialize entity → write prefab → tag instance → push undo" flow.
 import {
   writeAssetFile as writeFile, deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
+  describeRefusedDeletes, planDeleteOutcome,
   duplicateAssetFile as duplicateAsset, createFolderApi, moveFileTo, createPrefabFromEntity,
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename,
@@ -1014,8 +1015,8 @@ export default function Assets() {
 
   // Build + push a single coalesced undo/redo for one or more completed
   // deletes (builder in assetUndo.ts — F6).
-  const pushDeleteUndo = useCallback((results: DeleteResult[], trashedMissing: string[] = []) => {
-    pushAction(makeDeleteUndo(results, refresh, trashedMissing));
+  const pushDeleteUndo = useCallback((results: DeleteResult[], notTrashed: { missing?: string[]; failed?: string[] } = {}) => {
+    pushAction(makeDeleteUndo(results, refresh, notTrashed));
   }, [refresh]);
 
   // Delete one or more assets in a SINGLE OS-trash call (one trash sound),
@@ -1030,21 +1031,51 @@ export default function Assets() {
     if (results.length === 0) return;
     const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
     const del = await deleteAssets(allPaths);
-    if (!del.ok) { console.error('[Assets] Delete failed'); return; }
-    const removed = new Set(results.map((r) => r.asset.path));
+    // ⚠️ Report the refusal BEFORE branching on `ok` (#884). A total refusal is `ok:false` WITH
+    // `failed` populated, so an early return that only logs "Delete failed" throws away the one
+    // thing the human needs — WHICH files are still on disk. Both levels get the same message.
+    const refusal = describeRefusedDeletes(del.failed, { trashed: del.trashed });
+    if (refusal) {
+      console.error(`[Assets] The OS refused to trash: ${refusal.detail}`);
+      useEditorStore.getState().showToast(refusal.toast, 'warn');
+    } else if (!del.ok) {
+      // ⚠️ A failed delete with NO named survivors — which is every failure on macOS and Linux,
+      // where the trash command throws as a whole and `failed` is therefore always empty (see
+      // DeleteFilesResult). Without this the human gets a toast when a FOLDER delete fails and
+      // silence when a FILE delete does, on every non-Windows machine — and the owner's machine
+      // is one. Named paths would be better; not telling them at all is the actual defect.
+      // ⚠️ Says "did not complete", NOT "nothing was deleted". `deleteAssetFiles` answers ok:false
+      // for a transport throw too, where the request may well have reached the server and deleted —
+      // and "nothing was deleted" about files that ARE gone is the precise over-claim the route's
+      // own comment refuses to make. Same correction as the folder toast below.
+      console.error(`[Assets] Delete did not complete for: ${allPaths.join(', ')}`);
+      useEditorStore.getState().showToast('Could not move to the Trash — the delete did not complete (see console)', 'warn');
+    }
+    if (!del.ok) return;
+    // ⚠️ Everything below acts on what ACTUALLY went, not on what was requested. A file the OS
+    // refused is still on disk, so its row must stay, its editor must stay bound, and undo must
+    // not offer to restore it. The route already draws this line for its own half of the repair
+    // ("Unbinding an editor from a file that is still on disk would be the wrong direction") and
+    // the panel used to undo that care by passing the full requested list to every step.
+    const outcome = planDeleteOutcome(allPaths, results.map((r) => r.asset.path), del.failed);
+    const removed = new Set(outcome.removed);
     setAssets((prev) => prev.filter((a) => !removed.has(a.path)));
     if (selected && removed.has(selected)) { setSelected(null); selectAsset(null); }
     // Same idea as the selection reset above, one layer deeper: an ASSET EDITOR bound to a
     // deleted file would keep editing it, and the write parked for that path would put the file
     // back at the next Cmd+S (#186; the same hazard when the panels autosaved, now deferred to
     // save time — which is also why this repairs the dirty-asset REGISTRY, not only the binding,
-    // see applyAssetPathMoves). Checked against `allPaths`, not `removed`, so a generated file
-    // that a model delete drags along also unbinds.
-    logBindingChanges(unbindDeletedAssetEditors(allPaths));
+    // see applyAssetPathMoves). Checked against every path that WENT, not against `removed`, so a
+    // generated file that a model delete drags along also unbinds — and, since #884, so that a
+    // file the OS refused does NOT: unbinding an editor from a file still on disk is the wrong
+    // direction, which is the same call the route makes for its own half of this repair.
+    logBindingChanges(unbindDeletedAssetEditors(outcome.went));
     console.log(`[Assets] Moved ${del.trashed} file(s) to trash`);
     // `del.missing` is threaded into the undo so a later restore can tell a sidecar that was
-    // never on disk from a file it failed to bring back (#291).
-    pushDeleteUndo(results, del.missing); // ONE undo entry for the whole gesture
+    // never on disk from a file it failed to bring back (#291). `del.failed` joins it for the
+    // same reason from the other side: those files never left, so an undo that "restores" them
+    // would report bringing back a file that never went away.
+    pushDeleteUndo(results, { missing: del.missing, failed: del.failed }); // ONE undo entry for the whole gesture
     if (rescan) refresh();   // ONE rescan, not one per file
   }, [collectDeletion, pushDeleteUndo, refresh, selected, selectAsset]);
 
@@ -1149,7 +1180,20 @@ export default function Assets() {
     const results: DeleteResult[] = [];
     for (const a of inside) { const r = await collectDeletion(a); if (r) results.push(r); }
     const ok = await deleteAsset(folderPath); // trashes files + the dir shell in one call
-    if (!ok) { console.error(`[Assets] Failed to delete folder ${folderPath}`); return; }
+    // ⚠️ `ok` only became trustworthy in #884 — it was the HTTP status, and a folder the OS
+    // refused answers 200, so this guard could not fire and the branch below pruned the tree,
+    // unbound the editors and refreshed for a folder still on disk. It gets the same toast as
+    // the file path: a locked folder is something the human can fix and retry.
+    if (!ok) {
+      console.error(`[Assets] Failed to delete folder ${folderPath}`);
+      // ⚠️ Does NOT claim the folder is still on disk. `deleteAssetFile` resolves false for a 404
+      // (the folder was already gone — a stale panel after a branch switch or a Finder delete) and
+      // for a network error, as well as for a real OS refusal, and the boolean cannot tell them
+      // apart. The message says what is certainly true — the delete did not complete — and sends
+      // them to the console for the status.
+      useEditorStore.getState().showToast(`Could not delete "${folderName}" — the delete did not complete (see console)`, 'warn');
+      return;
+    }
     // Prune any client-side folder state for this subtree.
     const prune = (set: Set<string>) => {
       const n = new Set<string>();

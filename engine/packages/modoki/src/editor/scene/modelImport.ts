@@ -3,6 +3,9 @@
 
 import * as THREE from 'three';
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+// The orphan-prune goes through the shared delete wrapper rather than a hand-rolled fetch (#884);
+// `skinPrefab.ts` already reaches into panels/assetOps for the same helper.
+import { deleteAssetFile } from '../panels/assetOps';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
@@ -1080,11 +1083,15 @@ async function importModelInner(
     const orphanMeshes = (oldGen.meshes ?? []).filter((p) => !newMeshSet.has(p) && ownsPath(p));
     const orphanMaterials = (oldGen.materials ?? []).filter((p) => !newMatSet.has(p) && ownsPath(p));
     const orphanTextures = (oldGen.textures ?? []).filter((p) => !newTexSet.has(p) && ownsPath(p));
-    const trashOne = (p: string) => backendFetch('/api/delete-asset', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: p }),
-    }).catch(() => {});
-    await Promise.all([
+    // ⚠️ Through the shared wrapper, not a hand-rolled fetch (#884 close-out review). This was the
+    // FIFTH consumer of /api/delete-asset and the last one still reading nothing at all: a bare
+    // `.catch(() => {})` discarded the Response, so a refusal was invisible AND the "Pruned N"
+    // line below claimed work that had not happened — while `generated` had ALREADY been rewritten
+    // to the new list, so nothing would ever try to prune that file again. `deleteAssetFile` now
+    // reports the outcome rather than the HTTP status, which is what makes counting possible.
+    // Still best-effort: it never throws, and a failed prune must not fail the import.
+    const trashOne = (p: string) => deleteAssetFile(p);
+    const outcomes = await Promise.all([
       ...orphanMeshes.map(trashOne),
       ...orphanMaterials.map(trashOne),
       // Textures carry a sidecar `.meta.json` with their guid — drop both.
@@ -1092,7 +1099,14 @@ async function importModelInner(
     ]);
     const total = orphanMeshes.length + orphanMaterials.length + orphanTextures.length;
     if (total > 0) {
+      // Count the ones that GENUINELY went, and say so only about those. A maybe-absent sidecar
+      // answers false too (a lone missing path is a 404), so the shortfall is reported as "not
+      // confirmed" rather than as a failure — the honest claim for a best-effort prune.
+      const stuck = outcomes.filter((ok) => !ok).length;
       console.log(`[Import] Pruned ${total} orphan files (${orphanMeshes.length} meshes, ${orphanMaterials.length} materials, ${orphanTextures.length} textures) → OS Trash`);
+      if (stuck > 0) {
+        console.warn(`[Import] ${stuck} of ${outcomes.length} prune delete(s) were not confirmed — those files may still be on disk, and the model's \`generated\` list no longer names them, so nothing will retry.`);
+      }
     }
   }
 

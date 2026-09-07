@@ -15,6 +15,7 @@ import {
   type DeleteResult, type DupResult,
 } from '../../src/editor/panels/assetUndo';
 import { COLLISION_STATUS } from '../../src/editor/undo/undoFailure';
+import { deleteAssetFile, deleteAssetFiles } from '../../src/editor/panels/assetOps';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
 import {
@@ -28,15 +29,15 @@ let calls: Call[] = [];
 
 // Per-URL status override for the NEXT matching call, consumed once — lets a test make e.g.
 // "the second /api/move-file call" fail with a specific status without disturbing the others.
-let statusOverrides: Array<{ url: string; status: number; ok: boolean }> = [];
+let statusOverrides: Array<{ url: string; status: number; ok: boolean; body?: unknown }> = [];
 
 const mockFetch = vi.fn(async (url: string, opts?: any) => {
   calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : undefined });
   const i = statusOverrides.findIndex((o) => o.url === url);
   if (i >= 0) {
-    const { status, ok } = statusOverrides[i];
+    const { status, ok, body } = statusOverrides[i];
     statusOverrides.splice(i, 1);
-    return { ok, status, json: async () => ({}) } as any;
+    return { ok, status, json: async () => body ?? {} } as any;
   }
   return { ok: true, status: 200, json: async () => ({}) } as any;
 });
@@ -53,6 +54,13 @@ function failNext(url: string, status: number) {
 // for a url it is consumed strictly FIFO, so an earlier call can't fall through to the default).
 function succeedNext(url: string) {
   statusOverrides.push({ url, status: 200, ok: true });
+}
+
+// Queue ONE 200 carrying a specific BODY — the shape /api/delete-asset answers when the OS refused
+// some or all of a batch (#884). Distinct from failNext: the refusal arrives at HTTP 200, which is
+// exactly why every caller used to miss it.
+function respondNext(url: string, body: unknown) {
+  statusOverrides.push({ url, status: 200, ok: true, body });
 }
 
 const A = (path: string, type = 'model'): AssetEntry => ({ path, name: path.split('/').pop()!, type });
@@ -184,7 +192,7 @@ describe('makeDeleteUndo', () => {
       // The gitignored sidecar was listed for deletion but was never there.
       deletePaths: ['/assets/x.glb', '/assets/x.glb.meta.local.json'],
     };
-    await makeDeleteUndo([r], vi.fn(), ['/assets/x.glb.meta.local.json']).undo();
+    await makeDeleteUndo([r], vi.fn(), { missing: ['/assets/x.glb.meta.local.json'] }).undo();
     // Everything that actually existed came back → no shortfall → no error at all.
     expect(error).not.toHaveBeenCalled();
   });
@@ -927,5 +935,178 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
     expect(msg).toContain('/assets/a.png');
     expect(msg).toContain('/assets/b.png');
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** #884 — the wrappers used to read the HTTP status where the OUTCOME lives.
+ *
+ *  `/api/delete-asset` answers **200** when the OS refuses a path: `ok:false` when nothing went,
+ *  `ok:true` + `failed` when some did. Both wrappers looked only at `res.ok`, so a delete that
+ *  deleted nothing came back as a success — and every caller that carefully checks the boolean
+ *  (the #308 undo/redo closures, the folder delete) was checking the wrong thing. */
+describe('deleteAssetFile — the boolean is the outcome, not the status (#884)', () => {
+  it('is FALSE for a refused delete, which answers HTTP 200', async () => {
+    // The regression in one line: this used to be `true`.
+    respondNext('/api/delete-asset', { ok: false, trashed: 0, failed: ['/assets/locked.png'] });
+    expect(await deleteAssetFile('/assets/locked.png')).toBe(false);
+  });
+
+  it('ACCEPT SIDE: is TRUE for an ordinary delete', async () => {
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: [] });
+    expect(await deleteAssetFile('/assets/a.png')).toBe(true);
+  });
+
+  it('is TRUE for an UNPARSEABLE body — the trash already happened', async () => {
+    // Deliberate optimism, unchanged from before `failed` existed: an unreadable reply says
+    // nothing about which paths went, and guessing "refused" would break every working delete.
+    statusOverrides.push({ url: '/api/delete-asset', status: 200, ok: true, body: undefined });
+    mockFetch.mockImplementationOnce(async (url: string, opts?: any) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : undefined });
+      statusOverrides.pop();
+      return { ok: true, status: 200, json: async () => { throw new Error('not json'); } } as any;
+    });
+    expect(await deleteAssetFile('/assets/a.png')).toBe(true);
+  });
+});
+
+describe('deleteAssetFiles — reads the body verdict and carries `failed` (#884)', () => {
+  it('reports ok:false from the BODY, not just from the status', async () => {
+    // This used to be a hardcoded `ok: true` on any 200.
+    respondNext('/api/delete-asset', { ok: false, trashed: 0, missing: [], failed: ['/assets/a.png'] });
+    const r = await deleteAssetFiles(['/assets/a.png']);
+    expect(r.ok).toBe(false);
+    expect(r.failed).toEqual(['/assets/a.png']);
+  });
+
+  it('carries `failed` alongside ok:true for a PARTIAL delete', async () => {
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: ['/assets/b.png'] });
+    const r = await deleteAssetFiles(['/assets/a.png', '/assets/b.png']);
+    expect(r.ok).toBe(true);
+    expect(r.trashed).toBe(1);
+    expect(r.failed).toEqual(['/assets/b.png']);
+  });
+
+  it('ACCEPT SIDE: an ordinary delete reports no survivors', async () => {
+    respondNext('/api/delete-asset', { ok: true, trashed: 2, missing: [], failed: [] });
+    const r = await deleteAssetFiles(['/assets/a.png', '/assets/b.png']);
+    expect(r).toEqual({ ok: true, trashed: 2, missing: [], failed: [] });
+  });
+
+  it('ignores a non-string in `failed` rather than trusting the wire shape', async () => {
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, failed: ['/assets/b.png', 7, null] });
+    expect((await deleteAssetFiles(['/assets/a.png', '/assets/b.png'])).failed).toEqual(['/assets/b.png']);
+  });
+});
+
+describe('makeDeleteUndo — a refused file is not the undo\'s to restore (#884)', () => {
+  const R = (path: string): DeleteResult => ({
+    asset: A(path, 'texture'), deletePaths: [path],
+    snapshots: [{ path, content: 'x' }],
+  });
+
+  it('does NOT write back a file that never went — its bytes are the user\'s', async () => {
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), { failed: ['/assets/b.png'] });
+    await undo.undo!();
+    const written = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body.path);
+    expect(written).toEqual(['/assets/a.png']);
+  });
+
+  it('does not name it as "still in the trash" either — it was never in the trash', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const undo = makeDeleteUndo([R('/assets/b.png')], vi.fn(), { failed: ['/assets/b.png'] });
+    await undo.undo!();
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it('ACCEPT SIDE: with nothing refused it restores every snapshot', async () => {
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), {});
+    await undo.undo!();
+    const written = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body.path);
+    expect(written).toEqual(['/assets/a.png', '/assets/b.png']);
+  });
+
+  it('REDO reports a PARTIAL refusal, which ok:true cannot see', async () => {
+    // The #884 defect left standing on the redo half: `if (!res.ok)` is false for a partial, so
+    // the redo re-listed the refused file and read as a no-op.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), {});
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: ['/assets/b.png'] });
+    await undo.redo!();
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(err.mock.calls[0][0]).toContain('/assets/b.png');
+    err.mockRestore();
+  });
+
+  it('REDO refreshes the notTrashed filter, so a retry that SUCCEEDS becomes restorable again', async () => {
+    // The stale-capture bug. `failed` is not stable the way `missing` is: the toast tells the
+    // human to close the handle and retry, so the next redo can succeed on the refused path. A
+    // filter captured once would leave that file permanently un-restorable AND unreported — the
+    // second undo skips its write and also drops it from the `lost` shortfall, so Cmd+Z reports a
+    // clean restore while the file sits in the OS trash.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), { failed: ['/assets/b.png'] });
+    await undo.undo!();                     // b was refused, so only a is restored
+    calls.length = 0;
+    // The retry goes through: nothing refused this time.
+    respondNext('/api/delete-asset', { ok: true, trashed: 2, missing: [], failed: [] });
+    await undo.redo!();
+    calls.length = 0;
+    await undo.undo!();                     // …so THIS undo must bring b back
+    const written = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body.path);
+    expect(written).toEqual(['/assets/a.png', '/assets/b.png']);
+    err.mockRestore();
+  });
+
+  it('a redo does NOT re-read `missing` — a failed restore is missing, and would be swallowed', async () => {
+    // The regression the first fix introduced. Undo #1 fails to restore a.png and correctly
+    // reports it lost. Redo then reports a.png as `missing` — because it is not on disk, which is
+    // WHY it was lost — and folding that into the filter made undo #2 skip it silently forever.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), {});
+    failNext('/api/write-file', 500);        // a.png's restore fails
+    await undo.undo!();
+    expect(err).toHaveBeenCalledTimes(1);    // …and is reported (finding 6)
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: ['/assets/a.png'], failed: [] });
+    await undo.redo!();
+    calls.length = 0;
+    err.mockClear();
+    await undo.undo!();                      // a.png must still be attempted, and still reported
+    const written = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body.path);
+    expect(written).toContain('/assets/a.png');
+    err.mockRestore();
+  });
+
+  it('a FAILED redo leaves the REFUSED set alone — it deleted nothing, so it decides nothing', async () => {
+    // ⚠️ The distinguishing case, and it took a mutation check to find it. `deleteAssetFiles`
+    // answers `{ok:false, missing:[], failed:[]}` for a non-2xx AND a transport throw, so an
+    // unguarded reassignment wipes `refused` to empty. The `missing` half cannot show this —
+    // it lives in `neverExisted`, which redo never touches — so a test built on a never-existed
+    // sidecar passes with the guard DELETED. It has to be a REFUSED path: b.png is still on disk
+    // with the user's own bytes, and undo writing its snapshot back is the clobber the filter
+    // exists to prevent.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), { failed: ['/assets/b.png'] });
+    failNext('/api/delete-asset', 500);
+    await undo.redo!();
+    calls.length = 0;
+    await undo.undo!();
+    const written = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body.path);
+    expect(written, 'a redo that deleted nothing must not un-protect the refused file').toEqual(['/assets/a.png']);
+    err.mockRestore();
+  });
+
+  it('counts a file as restored only when the WRITE succeeded (#308 in this builder)', async () => {
+    // `writeAssetFile` catches and resolves false, so a restore that 500'd was counted as
+    // restored: `lost` came out empty and the undo reported "restored N of N" about a file still
+    // in the trash.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    failNext('/api/write-file', 500);
+    const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), {});
+    await undo.undo!();
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(err.mock.calls[0][0]).toContain('restored 1 of 2');
+    expect(err.mock.calls[0][0]).toContain('/assets/a.png');
+    err.mockRestore();
   });
 });

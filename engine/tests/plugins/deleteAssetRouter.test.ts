@@ -21,11 +21,16 @@ const trashed: string[][] = [];
 // that returns nothing models a function that cannot exist, and an earlier version of this one
 // did exactly that, which is how a route change slipped past it.
 let refuse: string[] = [];
+// Paths this stub should report as failed VERBATIM, whether or not the route asked about them —
+// the only way to model `parseTrashFailures` handing back a string that does not match any abs
+// path the route resolved (#884 close-out review finding 9).
+let refuseRaw: string[] | null = null;
 vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
   moveToTrash: (paths: string | string[]) => {
     const list = Array.isArray(paths) ? paths : [paths];
     trashed.push(list);
+    if (refuseRaw) return { failed: refuseRaw };
     return { failed: list.filter((p) => refuse.some((r) => p.endsWith(r))) };
   },
 }));
@@ -163,27 +168,114 @@ describe('/api/delete-asset rebuilds the asset manifest inline', () => {
    *  moveToTrash THROW on one, which aborted reconciliation for the paths that DID go: the route
    *  500'd, the manifest was not rebuilt, the renderer was never told, and the caller read
    *  "nothing was deleted" about files already in the Recycle Bin. Same shape the rebuild case
-   *  above forbids, and worse, because it also loses the renderer repair and the undo. */
-  it('reconciles what WENT and names what did not, rather than failing the batch', async () => {
+   *  above forbids, and worse, because it also loses the renderer repair and the undo.
+   *
+   *  ⚠️ #884 split the verdict. This used to answer `ok:true` for BOTH outcomes, and the test
+   *  above pinned that — it even noted "nothing actually went" in the same breath as asserting
+   *  success. One `ok` for two outcomes is what defeated every caller at once: `deleteAssetFile`
+   *  returned true, the panel dropped the row, and `isFailureBody` short-circuits on `ok === true`
+   *  by design, so the MCP tool reported a refused delete as a successful call. The pair below is
+   *  the DISTINGUISHING one: a test that only built the total case could not tell this split from
+   *  a blanket `ok:false`. */
+  it('a TOTAL refusal is ok:false — nothing went, so "it succeeded" is simply false', async () => {
     const { ctx, url, dir } = withRealFile();
     refuse = [path.basename(url)];
     let rebuilds = 0;
     const r = (await del({ paths: [url] }, ctx(() => { rebuilds++; return {}; }))) as
-      { status?: number; body: { ok: boolean; trashed: number; failed?: string[]; manifestRebuilt: boolean } };
+      { status?: number; body: { ok: boolean; trashed: number; failed?: string[]; error?: string; manifestRebuilt: boolean } };
     refuse = [];
     fs.rmSync(dir, { recursive: true, force: true });
 
-    expect(r.status, 'a refusal on ONE path must not 500 the batch').toBeUndefined();
-    expect(r.body.ok).toBe(true);
-    // Nothing actually went, so nothing is claimed to have gone…
+    expect(r.status, 'a refusal is reported in the body, not as a 5xx that discards it').toBeUndefined();
+    expect(r.body.ok).toBe(false);
     expect(r.body.trashed).toBe(0);
-    // …and the survivor is NAMED, not merely counted. Asserted by identity rather than exact
-    // spelling: this ctx stubs `absToAssetUrl: () => null` on purpose, so the route falls back
-    // to the absolute path — a fallback the ctx's own comment already declines to pin.
-    expect(r.body.failed).toHaveLength(1);
-    expect(r.body.failed?.[0]).toContain(path.basename(url));
+    // Named, and named in the CALLER'S OWN string. The route used to map through
+    // `absToAssetUrl(abs) ?? abs`, and this ctx stubs that resolver to null on purpose — so the
+    // old code shipped an ABSOLUTE path here, into a field the renderer can only match against
+    // asset urls. Echoing the request removes the round-trip instead of surviving it.
+    expect(r.body.failed).toEqual([url]);
+    expect(r.body.error).toContain(url);
     // No rebuild either: the manifest has nothing to catch up on.
     expect(rebuilds).toBe(0);
     expect(r.body.manifestRebuilt).toBe(false);
+  });
+
+  it('a PARTIAL refusal stays ok:true — the rest of the batch really is in the trash', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-delete-router-partial-'));
+    fs.writeFileSync(path.join(dir, 'went.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'locked.json'), '{}');
+    refuse = ['locked.json'];
+    let rebuilds = 0;
+    const ctx = makeCtx((p) => path.join(dir, p), () => { rebuilds++; return {}; });
+    const r = (await del({ paths: ['/went.json', '/locked.json'] }, ctx)) as
+      { status?: number; body: { ok: boolean; trashed: number; failed?: string[] } };
+    refuse = [];
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // #875's whole point: one bad path must not abort reconciliation for the good ones.
+    expect(r.body.ok).toBe(true);
+    expect(r.body.trashed).toBe(1);
+    expect(r.body.failed).toEqual(['/locked.json']);
+    // The manifest DOES catch up here — something left the disk.
+    expect(rebuilds).toBe(1);
+  });
+
+  it('matches a refusal that differs only in CASE — the family/path-identity shape (#881)', async () => {
+    // Both sides make a round trip through the win32 script (we write stdin, we read stderr), and
+    // Windows paths are case-insensitive, so a raw `includes` puts the path on the WRONG side of
+    // the partition: counted as trashed, its move sent to the renderer, and the editor unbound
+    // from a file still on disk. `samePath` folds case on win32/darwin.
+    const { ctx, url, dir } = withRealFile();
+    refuseRaw = [path.join(dir, 'PROBE.PARTICLE.JSON')];
+    const r = (await del({ paths: [url] }, ctx(() => ({})))) as
+      { body: { ok: boolean; trashed: number; failed?: string[] } };
+    refuseRaw = null;
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // ⚠️ Asserted PER PLATFORM rather than skipped, because case-folding is the contract only
+    // where the filesystem is case-insensitive — `samePath` folds on win32/darwin and not on
+    // Linux, by design. Written as a single expectation each way so this test says something
+    // true on the public Linux runner too, instead of passing on a Mac and going red there.
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      // Recognised as the SAME file: nothing went, so it is a total refusal, named by input.
+      expect(r.body.ok).toBe(false);
+      expect(r.body.trashed).toBe(0);
+      expect(r.body.failed).toEqual([url]);
+    } else {
+      // A genuinely different file on a case-SENSITIVE fs: the probe really was trashed, and the
+      // unmatched refusal still gets reported rather than vanishing (the guard below).
+      expect(r.body.ok).toBe(true);
+      expect(r.body.trashed).toBe(1);
+      expect(r.body.failed).toEqual([path.join(dir, 'PROBE.PARTICLE.JSON')]);
+    }
+  });
+
+  it('an UNMATCHED failure path is still reported, rather than vanishing from both sides', async () => {
+    // ⚠️ `failedInputs` and `wentToTrash` partition `resolved` by the same predicate, so an entry
+    // that matches neither would drop out of BOTH — `{ok:true, trashed:1}` with no `failed`,
+    // which is the silent false success this whole change removes, reintroduced by its own fix.
+    // Not reachable today; the guard keeps the old code's floor (degrade the KEY, never lose the
+    // REPORT) if `parseTrashFailures` ever normalises differently.
+    const { ctx, url, dir } = withRealFile();
+    refuseRaw = ['/some/path/the/route/never/resolved.json'];
+    const r = (await del({ paths: [url] }, ctx(() => ({})))) as
+      { body: { ok: boolean; trashed: number; failed?: string[] } };
+    refuseRaw = null;
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(r.body.failed).toEqual(['/some/path/the/route/never/resolved.json']);
+    // And the real file is still correctly counted as gone — the guard adds a report, it does
+    // not reclassify what went.
+    expect(r.body.trashed).toBe(1);
+    expect(r.body.ok).toBe(true);
+  });
+
+  it('ACCEPT SIDE: with nothing refused the reply carries no `failed` at all', async () => {
+    const { ctx, url, dir } = withRealFile();
+    const r = (await del({ paths: [url] }, ctx(() => ({})))) as
+      { body: { ok: boolean; trashed: number; failed?: string[] } };
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.trashed).toBe(1);
+    expect(r.body.failed).toBeUndefined();
   });
 });

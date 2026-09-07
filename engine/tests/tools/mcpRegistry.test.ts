@@ -550,7 +550,17 @@ describe('the real registered surface', () => {
   // documents its `source: parked|disk` answer, and `new_scene`/`load_scene` document #853's
   // prefab-edit refusal and that discardUnsaved does NOT bypass it. Spent deliberately: ~1k tokens
   // on every agent session's tool surface, to close two silent data-loss paths.
-  const DEFINITION_BYTES = 147_889;
+  // Re-pinned on work-ai 2026-09-07 (147_889 → 152_065). ⚠️ Read the SPLIT before treating this as
+  // one change's cost: ~3.7k of the gap was already on HEAD, inside the headroom and therefore
+  // invisible — the guard was 325 bytes from red before #884 touched anything. Only ~500 bytes are
+  // this change's, and they are spent on the one thing an agent cannot recover from: what
+  // `modoki_delete_asset`'s verdicts MEAN (ok:false = nothing went; ok:true + `failed` = the rest
+  // went; `failed` is win32-only, so an empty one proves nothing), and that `repairFailed` on
+  // delete/move leaves an attached editor holding a dead path — the #186 resurrection, which the
+  // panel repairs for a human and nobody repairs for an agent.
+  // ⚠️ The union hazard from the 2026-09-07 note below has NOT gone away: this number was measured
+  // on one branch, and the hub may still land past it after merging the others.
+  const DEFINITION_BYTES = 152_065;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

@@ -685,7 +685,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { paths: ['/assets/particles/probe.particle.json'] },
-    notes: 'NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
+    notes: 'A TOTAL OS refusal answers ok:false (200) and a PARTIAL one answers ok:true with `failed` naming the paths still on disk — the split exists because a single ok:true for both meant isFailureBody short-circuited and this tool reported a refused delete as a successful call (#884). NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
   },
   modoki_list_creatable_assets: {
     kind: 'read', method: 'GET', route: '/api/creatable-assets',

@@ -225,7 +225,7 @@ import { resolveModules } from '../detect-modules';
 import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
 import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
 // The ONE 'same directory / inside it?' comparison (#869, #881) — see engine/scripts/pathIdentity.mjs.
-import { isUnderOrSame } from '../../scripts/pathIdentity.mjs';
+import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -2348,13 +2348,16 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: assetPath, paths } = (body ?? {}) as { path?: string; paths?: string[] };
       const inputs = Array.isArray(paths) ? paths : (assetPath != null ? [assetPath] : []);
       if (inputs.length === 0) return json({ error: 'No path(s) provided' }, 400);
-      const resolved: string[] = [];
+      // The REQUEST string rides along with the abs path. `failed` below is reported back in the
+      // caller's own strings, not canonicalised ones — see the comment on the reply. Keeping the
+      // pair here is what makes that possible without a second lookup.
+      const resolved: Array<{ input: string; abs: string }> = [];
       const missing: string[] = [];
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
         if (!absPath) return json({ error: 'Path outside allowed directories' }, 403);
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
-        resolved.push(absPath);
+        resolved.push({ input: p, abs: absPath });
       }
       // Single-path back-compat: a lone non-existent target is still a 404.
       if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
@@ -2366,7 +2369,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // The abs path rides along so the list can be filtered by what ACTUALLY went to the trash
       // (below) — the stat itself must still happen HERE, before the delete, while the paths
       // exist. Dropped again immediately after.
-      const candidates = resolved.map((abs) => {
+      const candidates = resolved.map(({ abs }) => {
         let isDir = false;
         try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
         return { abs, move: { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) } };
@@ -2379,15 +2382,23 @@ async function describeUnresolvedAgainstLiveWorld(
       // "nothing was deleted" about N-1 files that were gone — with no undo, and a bound editor
       // still parked on them (the #186 resurrection the unbind below exists to prevent).
       // That is the same 500 the `manifestRebuilt` comment below forbids, for the same reason.
-      const trashFailed = resolved.length > 0 ? moveToTrash(resolved).failed : [];
+      const trashFailed = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)).failed : [];
+      // ⚠️ `samePath`, not `includes`/`===` (#881's shared helper, adopted here when main landed
+      // it). Both sides are absolute paths that made a ROUND TRIP through the win32 script — we
+      // write them to its stdin and read them back off its stderr — so this is exactly the
+      // family/path-identity shape: two operands that must spell one path identically, where a
+      // raw string compare silently answers "different" and the partition below then puts the
+      // path on the WRONG side. Getting it wrong here is not a cosmetic miss: an unmatched
+      // refusal counts as trashed, and the renderer unbinds an editor from a file still on disk.
+      const wasRefused = (abs: string) => trashFailed.some((f) => samePath(f, abs));
       const wentToTrash = trashFailed.length === 0
         ? resolved
-        : resolved.filter((abs) => !trashFailed.includes(abs));
+        : resolved.filter((r) => !wasRefused(r.abs));
       // Repair the renderer for the paths that GENUINELY went. Unbinding an editor from a file
       // that is still on disk would be the wrong direction: the binding is still live and valid.
       const deleted = trashFailed.length === 0
         ? candidates.map((c) => c.move)
-        : candidates.filter((c) => !trashFailed.includes(c.abs)).map((c) => c.move);
+        : candidates.filter((c) => !wasRefused(c.abs)).map((c) => c.move);
       // Rebuild the asset manifest INLINE, like the other asset routes that mint or
       // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
       // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
@@ -2423,10 +2434,59 @@ async function describeUnresolvedAgainstLiveWorld(
       const outcome: RepairOutcome = deleted.length > 0
         ? await applyMovesInRenderer(ctx, deleted)
         : { kind: 'absent' };
+      // Named, not merely counted — the caller has to know WHICH ones are still there.
+      //
+      // ⚠️ Reported in the CALLER'S OWN request strings, not `absToAssetUrl`'s canonical form.
+      // Two reasons, and the second is the one that was wrong before. (1) `missing` — the other
+      // per-path outcome list in this same reply — has always echoed the input, and a caller
+      // cannot treat the two uniformly if they are keyed differently. (2) The earlier
+      // `absToAssetUrl(abs) ?? abs` fallback shipped an ABSOLUTE path into a field the renderer
+      // can only match against asset urls, which is the defect `/api/move-file` refuses a
+      // `?? from` fallback for, one size smaller. Echoing the input removes the round-trip
+      // instead of trying to survive it: the caller compares `failed` against the list it sent.
+      // The RENDERER repair keeps `absToAssetUrl` (see `candidates`) — different consumer,
+      // different correct key, deliberately not unified.
+      //
+      // ⚠️ FAIL LOUD, not silent, if an abs path does not match back. `failedInputs` and
+      // `wentToTrash` partition `resolved` by the SAME predicate, so an unmatched entry would
+      // drop out of both — reporting `{ok:true, trashed:N}` with no `failed` at all, which is the
+      // exact silent false success this whole change exists to remove, reintroduced by the fix
+      // for it. The old code mapped `trashFailed` directly, so a mismatch degraded the KEY and
+      // never lost the REPORT; keeping the unmatched abs path preserves THAT HALF ONLY.
+      //
+      // ⚠️ The report and the reconciliation now agree, because BOTH go through `wasRefused` —
+      // that was the real hole, and `samePath` above is what closed it. What survives is the
+      // residue: a path that `samePath` genuinely cannot match (not a spelling difference but a
+      // string from somewhere else entirely) is still counted in `trashed` and still carries its
+      // move, so the console and the toast tell the truth while the panel state does not. Not
+      // reachable today — the win32 script echoes stdin verbatim and a Windows path cannot carry
+      // trailing whitespace — so this stays a loud-failure guard rather than a further fix.
+      const matched = resolved.filter((r) => wasRefused(r.abs));
+      const unmatched = trashFailed.filter((abs) => !resolved.some((r) => samePath(r.abs, abs)));
+      const failedInputs = trashFailed.length === 0 ? [] : [...matched.map((r) => r.input), ...unmatched];
+      // ⚠️ NOTHING went, and `ok:true` here is simply false. The route used to answer one verdict
+      // for two different outcomes: a PARTIAL refusal genuinely succeeded for the paths that went,
+      // a TOTAL refusal succeeded at nothing. Collapsing them defeated every caller's check —
+      // `deleteAssetFile` returned `true`, the Assets panel filtered the row out, and
+      // `isFailureBody` (the MCP guard) short-circuits on `ok === true` by design, so
+      // `modoki_delete_asset` told an agent the file was gone (#884).
+      //
+      // #875's reason for NOT answering a failure here still holds — but only for the partial
+      // case it was written about: a 500 read as "nothing was deleted" about N-1 files that were
+      // already in the Recycle Bin. When nothing went, "nothing was deleted" is the truth.
+      //
+      // 200 rather than a 5xx: `missing`, `manifestRebuilt` and `failed` are all still meaningful
+      // and a 5xx body is read as an error string, not a result. `isFailureBody` handles an
+      // `{ok:false}` 200 explicitly — that is the shape it exists for.
+      if (failedInputs.length > 0 && wentToTrash.length === 0) {
+        return json({
+          ok: false, trashed: 0, missing, manifestRebuilt, failed: failedInputs,
+          error: `the OS refused to trash ${failedInputs.length === 1 ? 'the file' : `all ${failedInputs.length} files`}: ${failedInputs.join(', ')}`,
+        });
+      }
       return json({
         ok: true, trashed: wentToTrash.length, missing, manifestRebuilt,
-        // Named, not merely counted — the caller has to know WHICH ones are still there.
-        ...(trashFailed.length ? { failed: trashFailed.map((abs) => ctx.absToAssetUrl(abs) ?? abs) } : {}),
+        ...(failedInputs.length ? { failed: failedInputs } : {}),
         ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
         ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
       });

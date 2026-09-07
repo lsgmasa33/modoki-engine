@@ -132,6 +132,13 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'between them.\n\n' +
       'A path that is not on disk is REPORTED in `missing`, not an error — so a list carrying ' +
       'maybe-absent sidecars is safe, and `trashed` counts only files that really existed. ' +
+      'A path the OS REFUSES to trash (locked, denied ACL, >260 chars) is named in `failed` and ' +
+      'is STILL ON DISK: `ok:true` + `failed` means the REST went, `ok:false` means none did. ' +
+      '⚠️ `failed` is populated on Windows only — elsewhere a refusal arrives as ok:false with ' +
+      '`failed` empty, so an empty `failed` is not evidence every path went. `ok` is.\n\n' +
+      '⚠️ `repairFailed` is NOT `failed`: the files are trashed, but an attached editor still ' +
+      'holds bindings and parked writes for the dead path, so the next human Cmd+S can recreate ' +
+      'what you deleted. The panel repairs itself; you, from another process, have no backstop. ' +
       'Verify with modoki_list_assets — NOT modoki_resolve_refs, which resolves ENTITY refs and ' +
       'never answers about an asset GUID at all. The asset manifest is rebuilt ' +
       'BEFORE the reply (`manifestRebuilt:true`), so a check issued straight after — including in ' +
@@ -473,7 +480,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '`mv` is not, because the manifest is rebuilt from the new location. REFUSES rather than '
     + 'clobbering: a destination that already exists is a 409, and a missing source is a 404. A '
     + 'case-only rename (Sprites -> sprites) IS allowed, since on macOS/Windows the two paths are '
-    + 'the same entry rather than a collision. Verify with modoki_list_assets.',
+    + 'the same entry rather than a collision. Verify with modoki_list_assets.\n\n'
+    + '⚠️ `repairFailed` = the file moved but an attached editor was NOT repaired, so its bindings '
+    + 'and parked writes still point at the old path and the next human Cmd+S can undo the move. '
+    + 'The panel repairs itself; you, from another process, have no backstop. Say so.',
     {
       from: z.string().describe('Asset-root URL of the asset to move.'),
       to: z.string().describe('Asset-root URL to move it to, including the filename. Must not already exist (a case-only rename excepted).'),
