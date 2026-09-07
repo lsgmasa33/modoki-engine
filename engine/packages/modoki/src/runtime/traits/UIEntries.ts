@@ -95,32 +95,17 @@ export const UIEntries = trait({
   poolSize: 0,
 });
 
-/** One entry KIND: the name game code uses, and the prefab GUID the scene authors. */
-export interface UIEntryPrefab {
-  name: string;
-  /** Prefab asset GUID. Surfaced to the resource collector + build tree-shaker explicitly, so
-   *  the build can see it — a ref the build cannot see is dropped from production and fails
-   *  only once shipped (#53). */
-  prefab: string;
-}
-
-/** Parse the `prefabs` JSON bank. Never throws: authored JSON is not trusted input, and a
- *  half-written bank must not take the whole scene down with it. Malformed entries are dropped
- *  rather than guessed at. */
-export function parseEntryPrefabs(json: string): UIEntryPrefab[] {
-  if (!json) return [];
-  let raw: unknown;
-  try { raw = JSON.parse(json); } catch { return []; }
-  if (!Array.isArray(raw)) return [];
-  const out: UIEntryPrefab[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const { name, prefab } = item as { name?: unknown; prefab?: unknown };
-    if (typeof name !== 'string' || !name) continue;
-    if (typeof prefab !== 'string' || !prefab) continue;
-    out.push({ name, prefab });
-  }
-  return out;
-}
+/** The bank's type and parser live in `entryPrefabBank.ts` and are re-exported here so every
+ *  existing importer (`loaders/loadSceneFile.ts`, `runtime/ui/entriesSystem.ts`) is unchanged.
+ *  ⚠️ NOT `plugins/asset-tree-shaker.ts` — that's a build plugin and parses the bank INLINE, on
+ *  purpose, rather than importing engine source (see its own comment at `asset-tree-shaker.ts:566`).
+ *
+ *  ⚠️ **Why they moved out of this file:** `loaders/sceneValidation.ts` needs to read the bank in
+ *  order to resolve the view -> entry-prefab edge (#671), and that module is deliberately
+ *  dependency-light so one file runs both in the browser's load path and in the Vite dev server's
+ *  Node process. Importing THIS module to get the parser would drag `trait({...})` — a
+ *  side-effectful registration — into a pure validator. Splitting the parse out is cheaper than
+ *  the second hand-rolled copy that would otherwise appear next to the validator. */
+export { parseEntryPrefabs, type UIEntryPrefab } from './entryPrefabBank';
 
 export type UIEntryLengthUnit = 'px' | '%';

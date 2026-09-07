@@ -269,6 +269,18 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     ids: ['`audio.clip.${i}.key`', '`inspector.field.${meta.name}.${key}`'],
     why: 'the audio clip-bank row key field, and the generic string-field renderer\'s BufferedTextInput branch (same id template as the number/boolean branches) — #724.',
   },
+  {
+    // #671 (editor half): the note used to gate ONLY on the live sibling `UIEntry` trait, so it
+    // could never fire in prefab-edit mode — the surface where the pinned fields are actually
+    // authored. It now also fires there (mode 'entry-prefab', resolved through
+    // /api/find-references — see entryPrefabUse.ts), and this is the mechanism-can't-FIRE class
+    // this repo keeps tripping on: every other layer (the pure filter, the note text, the route)
+    // is unit-tested, but nothing before this drove the real Inspector `useEffect`. One id for
+    // all three modes (inert/mixed/entry-prefab) — the mode is content, not identity.
+    file: 'panels/Inspector.tsx',
+    ids: ['inspector.section.pooledRowNote'],
+    why: 'the pooled-row / entry-prefab advisory note on the UIElement trait section — the only signal an author gets that these fourteen fields are inert (#671).',
+  },
 ];
 
 describe('data-ui-id tagging has not rotted', () => {

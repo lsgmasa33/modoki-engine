@@ -29,16 +29,28 @@ export const EMPTY_WINDOW: AxisWindow = {
   first: 0, visible: 0, pooled: 0, rendered: 0, padLeading: 0, padTrailing: 0,
 };
 
+/** One authored length resolved to px, on one axis, against one viewport extent. Shared by both
+ *  the view's own authored value and the prefab-root fallback below so the two axes cannot
+ *  resolve `%` two different ways — that drift IS the bug this function's caller once had. */
+function lengthToPx(value: number, unit: 'px' | '%', viewport: number): number {
+  return unit === '%' ? (viewport * value) / 100 : Math.max(0, value);
+}
+
 /** Resolve an authored entry size to px.
  *
  *  - `%` resolves against the viewport — this is how a one-at-a-time pager is expressed (100%).
  *  - **`0` means "read it from the prefab"**, so a fixed-size entry is not a second copy of a
  *    number the prefab root's own `UIElement` already states (the single-source-of-truth rule:
- *    a resize should be a one-place edit).
+ *    a resize should be a one-place edit). The prefab's value carries its OWN unit
+ *    (`fromPrefabUnit`) and resolves against the very same viewport axis as the view's own
+ *    authored value — a `%`-sized prefab root is not pinned to its raw number in px.
  */
-export function resolveEntrySize(authored: number, unit: 'px' | '%', viewport: number, fromPrefab: number): number {
-  if (authored === 0) return Math.max(0, fromPrefab);
-  return unit === '%' ? (viewport * authored) / 100 : Math.max(0, authored);
+export function resolveEntrySize(
+  authored: number, unit: 'px' | '%', viewport: number,
+  fromPrefab: number, fromPrefabUnit: 'px' | '%',
+): number {
+  if (authored === 0) return Math.max(0, lengthToPx(fromPrefab, fromPrefabUnit, viewport));
+  return lengthToPx(authored, unit, viewport);
 }
 
 /** Raise the authored overscan to cover how far the scroll actually travelled since the last

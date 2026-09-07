@@ -27,17 +27,35 @@ const axis = (over: Partial<AxisInput> = {}): AxisInput => ({
 });
 
 describe('resolveEntrySize', () => {
-  it('0 means "read it from the prefab" — not "zero-sized"', () => {
+  it('0 means "read it from the prefab" — not "zero-sized" — prefab px is taken literally', () => {
     // The single-source-of-truth rule: a fixed-size entry must not be a second copy of a
     // number the prefab root already states.
-    expect(resolveEntrySize(0, 'px', 600, 96)).toBe(96);
+    expect(resolveEntrySize(0, 'px', 600, 96, 'px')).toBe(96);
+  });
+  it('the prefab fallback resolves ITS OWN % against the same viewport axis (#765)', () => {
+    // A prefab root authored `width: 50, widthUnit: '%'` must resolve to half the viewport,
+    // exactly like a view-authored `entryWidth: 50%` does — not get pinned to a raw 50px.
+    expect(resolveEntrySize(0, 'px', 600, 50, '%')).toBe(300);
+    expect(resolveEntrySize(0, '%', 600, 100, '%')).toBe(600);
   });
   it('% resolves against the viewport — how a one-at-a-time pager is expressed', () => {
-    expect(resolveEntrySize(100, '%', 621, 0)).toBe(621);
-    expect(resolveEntrySize(50, '%', 600, 0)).toBe(300);
+    expect(resolveEntrySize(100, '%', 621, 0, 'px')).toBe(621);
+    expect(resolveEntrySize(50, '%', 600, 0, 'px')).toBe(300);
   });
   it('px is taken literally', () => {
-    expect(resolveEntrySize(120, 'px', 600, 999)).toBe(120);
+    expect(resolveEntrySize(120, 'px', 600, 999, 'px')).toBe(120);
+  });
+  it('the view\'s own non-zero authored value wins over the prefab fallback', () => {
+    // authored !== 0, so fromPrefab/fromPrefabUnit must be ignored entirely regardless of what
+    // they say — even a huge conflicting prefab % must not leak through.
+    expect(resolveEntrySize(120, 'px', 600, 500, '%')).toBe(120);
+    expect(resolveEntrySize(50, '%', 600, 999, 'px')).toBe(300);
+  });
+  it('clamps a negative prefab px fallback to 0', () => {
+    expect(resolveEntrySize(0, 'px', 600, -40, 'px')).toBe(0);
+  });
+  it('clamps a negative resolved prefab % fallback to 0', () => {
+    expect(resolveEntrySize(0, 'px', 600, -10, '%')).toBe(0);
   });
 });
 

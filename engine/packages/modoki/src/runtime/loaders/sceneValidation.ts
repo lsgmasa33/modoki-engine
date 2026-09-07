@@ -14,7 +14,13 @@
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { isSizeInert } from '../ui/anchorLayout';
-import { isElementMarginInert, MARGIN_KEYS } from '../ui/uiAuthoring';
+import {
+  isElementMarginInert, MARGIN_KEYS,
+  POOLED_ROW_GENERIC_WARN_FIELDS, POOLED_ROW_PINNED_GROUPS,
+} from '../ui/uiAuthoring';
+// The bank parser, NOT `traits/UIEntries` itself — that module calls `trait({...})` at import
+// time and this one is deliberately dependency-light (see module docs above).
+import { parseEntryPrefabs } from '../traits/entryPrefabBank';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
  *  these fields must be a GUID or an external URL — never a project-internal
@@ -394,6 +400,317 @@ export function inertLayoutWarnings(traits: unknown, label: string): string[] {
   return out;
 }
 
+/** `UIElement.lineHeight` is emitted in PIXELS (`UINode.tsx` writes `${lineHeight}px`) — React
+ *  leaves a bare number unitless and CSS reads THAT as a font-size multiplier, so the px is
+ *  deliberate. But the Inspector tooltip said "Line height multiplier. 0 = auto" with `step: 0.1`
+ *  for as long as the field existed, and 17 entities across two projects were authored against
+ *  it (#809). A 1.4 there is a 1.4px line box: wrapped lines stack into an unreadable overlap,
+ *  and where `maxLines` is set it also caps the element at `lineHeight * maxLines` px.
+ *
+ *  ⚠️ **Why the ceiling and not a comparison against the entity's own `fontSize`** (the shape
+ *  #809 originally proposed): that comparison had ~1px of headroom on real content — Court's
+ *  `NarrationText` authors 19 against `fontSize` 19 and `RefusalText` 20 against 20, so both pass
+ *  only because the comparison is strict `<`, and anyone "tidying" it to `<=` turns two shipping
+ *  entities into false positives. It also silently compares a px length against a `fontSize` that
+ *  may be authored in `vmin`/`vh` (`fontSizeUnit`, #245), a unit mismatch it cannot see. Every
+ *  plausible multiplier is 1.0-3.0 and no plausible px line height is under 4, so a flat ceiling
+ *  needs no second field, is immune to `fontSizeUnit`, and has four times the margin.
+ *
+ *  ⚠️ **Do not rewrite this docblock as a measurement of the corpus.** #809's own fix converted
+ *  all 17, so a sweep today finds zero — this is a PREVENTATIVE guard, and a justification phrased
+ *  as "it currently catches N" goes stale the moment any branch changes the content (the #549
+ *  scar). Verify it by perturbing a value, which is what the tests do. */
+export const LINE_HEIGHT_MULTIPLIER_CEILING = 4;
+
+/** Line-height-authored-as-a-multiplier warnings for ONE entity's trait bag. */
+export function lineHeightUnitWarnings(traits: unknown, label: string): string[] {
+  const out: string[] = [];
+  if (!traits || typeof traits !== 'object') return out;
+  const uel = (traits as Record<string, unknown>).UIElement;
+  if (!uel || typeof uel !== 'object') return out;
+  const lh = (uel as Record<string, unknown>).lineHeight;
+  // `0` is the authored "auto" sentinel and is explicitly fine; only a positive value below the
+  // ceiling is suspect. A negative is nonsense but is not THIS check's business.
+  if (typeof lh !== 'number' || lh <= 0 || lh >= LINE_HEIGHT_MULTIPLIER_CEILING) return out;
+  const fs = (uel as Record<string, unknown>).fontSize;
+  const suggestion = typeof fs === 'number' && fs > 0
+    ? ` For fontSize ${fs} the equivalent is ${Math.round(lh * fs)}.`
+    : '';
+  out.push(
+    `${label}.UIElement.lineHeight is ${lh}, which looks like a MULTIPLIER — this field is in `
+    + `PIXELS (like fontSize), so it renders a ${lh}px line box and wrapped lines overlap.`
+    + suggestion,
+  );
+  return out;
+}
+
+/** An authored newline in `UIElement.text` that the DOM will COLLAPSE (#676).
+ *
+ *  `UINode` sets `white-space` on exactly two branches — `AnimatedText`'s typewriter span and
+ *  `AutoFitText`'s span, both `pre-wrap`. Every other path — the plain text path (a bare string
+ *  with no autofit and no text animation) AND the `maxLines`-clamp span — sets none, so it
+ *  inherits `white-space: normal` and every authored `\n` collapses to a single space. A
+ *  four-line credits block renders as one run-on paragraph.
+ *
+ *  ⚠️ **`maxLines` is NOT a pre-wrap path, despite looking like one.** `UINode.tsx`'s
+ *  `maxLines > 0` branch builds a height clamp (`overflow: 'hidden'` plus `-webkit-box`/
+ *  `maxHeight` variants) and sets no `white-space` of its own — a newline under `maxLines`
+ *  collapses exactly like the plain path. It was wrongly treated as a third pre-wrap escape here
+ *  once; do not re-add it.
+ *
+ *  ⚠️ **The failure is invisible to every instrument except the render.** `textContent` still
+ *  holds the newlines, the trait still holds them, and a test comparing the formatted string still
+ *  passes — which is exactly why this needs a validator arm rather than a unit test somewhere.
+ *
+ *  ⚠️ **This deliberately does NOT flag runs of SPACES**, though they collapse by the same
+ *  mechanism. Twelve authored space-run sites are accepted content (the owner's call: the `·` and
+ *  `──` separators stay legible when they tighten, and Court's shipping rules lines are not worth
+ *  restructuring for a few px of indent). Warning on them would print twelve lines every time a dev
+ *  hot-reloads a shipping game's scene, or runs `/api/validate-scene` / `modoki_validate_scene`
+ *  against it — never a production runtime load, but still a noisy check that gets muted and takes
+ *  the useful half with it. The space-run rule is enforced at the GATE instead, by the corpus guard
+ *  in `engine/tests/assets/uiAuthoredValues.test.ts`, where an exemption can carry a written reason.
+ *  Newlines get no exemptions and are expected to stay at zero, so they can afford to be loud.
+ *
+ *  Conservative by construction: it skips any entity whose text takes a genuine `pre-wrap` path
+ *  (`autoFitText`, or the `TextAnimation` trait), because there the newline is honoured and
+ *  authoring one is correct. Skipping a real case is the right failure direction for a new warning
+ *  — a false positive on legitimate multi-line text is worse than a miss, since it teaches the
+ *  reader to ignore the message. */
+export function collapsedNewlineWarnings(traits: unknown, label: string): string[] {
+  const out: string[] = [];
+  if (!traits || typeof traits !== 'object') return out;
+  const bag = traits as Record<string, unknown>;
+  const uel = bag.UIElement;
+  if (!uel || typeof uel !== 'object') return out;
+  const el = uel as Record<string, unknown>;
+  const text = el.text;
+  if (typeof text !== 'string' || !text.includes('\n')) return out;
+  // The two ways an entity reaches a `pre-wrap` span instead of the plain path. `maxLines` is
+  // deliberately NOT here — it clamps height, not whitespace (see docblock above).
+  if (el.autoFitText === true) return out;
+  if (bag.TextAnimation) return out;
+  const lines = text.split('\n').length;
+  out.push(
+    `${label}.UIElement.text authors ${lines} lines, but the DOM collapses newlines on this path `
+    + `— it will render as one run-on paragraph. Split it into sibling text elements in a column `
+    + `with an authored gap (docs/ui-system.md § spacing is layout); do not add white-space, and `
+    + `note textContent still reports the newlines, so only the render differs`,
+  );
+  return out;
+}
+
+/** One use of a prefab as a `UIEntries` entry KIND, resolved from a scene.
+ *
+ *  This edge is the thing nothing recorded (#671). It exists in the scene — `UIEntries.prefabs`
+ *  is a JSON bank of `{name, prefab: <guid>}` — but until now it was read only by the runtime
+ *  spawner, the resource collector and the build tree-shaker. No AUTHORING surface resolved it,
+ *  which is why an author could open an entry prefab, set a margin, and get no signal that the
+ *  scroll view overwrites it on the next tick. */
+export interface EntryKindUse {
+  /** The `UIEntries` view entity, as a reader-actionable label. */
+  viewLabel: string;
+  /** The kind name game code uses to ask for this prefab. */
+  kindName: string;
+  /** The entry prefab's asset GUID. */
+  prefabGuid: string;
+  /** Does the view DELEGATE this axis to the prefab root's own `UIElement`?
+   *
+   *  `entryWidth`/`entryHeight` of 0 means "read it from the prefab" (and 0 is the trait default,
+   *  so an absent field means exactly that — a save strips a field equal to its default). The
+   *  distinction matters: on a delegated axis the prefab root's size is genuinely READ, so
+   *  warning that it is overwritten would be a lie. On a non-delegated axis it is discarded. */
+  delegatesWidth: boolean;
+  delegatesHeight: boolean;
+}
+
+/** Resolve every view -> entry-prefab edge in a scene. Pure; no I/O.
+ *
+ *  ⚠️ **Only kind `[0]` of the bank — this is deliberate, not a truncation bug.**
+ *  `entriesSystem.ts`'s `driveView` reads `kinds[0]` for `prefabRootSize`, `ensurePool` and
+ *  `applySlots` (never any other index), so kinds `[1..]` are parsed but never actually spawned as
+ *  a pooled row. Emitting a use per kind, the way this used to, would have every kind past the
+ *  first claim its root is pinned every tick when the runtime never touches it at all — a false
+ *  claim for a prefab that is only ever kind `[1]` of a bank. */
+export function collectEntryKindUses(
+  entities: readonly unknown[],
+  labelOf: (entity: unknown, idx: number) => string,
+): EntryKindUse[] {
+  const out: EntryKindUse[] = [];
+  entities.forEach((raw, idx) => {
+    const traits = (raw as { traits?: unknown } | null)?.traits;
+    if (!traits || typeof traits !== 'object') return;
+    const en = (traits as Record<string, unknown>).UIEntries;
+    // A tag trait serializes as `true`; only a field object can carry a bank.
+    if (!en || typeof en !== 'object') return;
+    const enObj = en as Record<string, unknown>;
+    const bank = enObj.prefabs;
+    if (typeof bank !== 'string' || !bank) return;
+    const delegates = (field: string): boolean => {
+      const v = enObj[field];
+      return v === undefined || v === 0;
+    };
+    const delegatesWidth = delegates('entryWidth');
+    const delegatesHeight = delegates('entryHeight');
+    const kind = parseEntryPrefabs(bank)[0];
+    if (!kind) return;
+    out.push({
+      viewLabel: labelOf(raw, idx), kindName: kind.name, prefabGuid: kind.prefab,
+      delegatesWidth, delegatesHeight,
+    });
+  });
+  return out;
+}
+
+/** Integrity of the `UIEntries.prefabs` bank itself, for ONE entity's trait bag.
+ *
+ *  `REF_FIELDS_BY_TRAIT` is scalar-only and correctly excludes a JSON-string bank, so this is the
+ *  explicit parse the same way `Animator.clips` and `AudioSource.clips` are handled elsewhere.
+ *
+ *  ⚠️ Scope, stated because the obvious wider claim is wrong: the resource manifest
+ *  (`loadSceneFile.ts`) and the build tree-shaker (`plugins/asset-tree-shaker.ts`) BOTH already
+ *  read this bank, so an entry prefab is not an #53 "ref the build cannot see". What was missing
+ *  is only the validator — `parseEntryPrefabs` drops a malformed entry silently, and a dangling
+ *  GUID surfaces only as a pool that never spawns. */
+export function entryBankWarnings(
+  traits: unknown, label: string, assetExists?: AssetRefResolver,
+): string[] {
+  const out: string[] = [];
+  if (!traits || typeof traits !== 'object') return out;
+  const en = (traits as Record<string, unknown>).UIEntries;
+  if (!en || typeof en !== 'object') return out;
+  const bank = (en as Record<string, unknown>).prefabs;
+  if (bank === undefined || bank === '') return out;
+  if (typeof bank !== 'string') {
+    out.push(`${label}.UIEntries.prefabs must be a JSON string, got ${typeof bank}`);
+    return out;
+  }
+  let raw: unknown;
+  try { raw = JSON.parse(bank); } catch {
+    out.push(`${label}.UIEntries.prefabs is not valid JSON — the whole entry bank is dropped, so the view spawns nothing`);
+    return out;
+  }
+  if (!Array.isArray(raw)) {
+    out.push(`${label}.UIEntries.prefabs must be a JSON ARRAY of {name, prefab} — the whole entry bank is dropped, so the view spawns nothing`);
+    return out;
+  }
+  raw.forEach((item, i) => {
+    const at = `${label}.UIEntries.prefabs[${i}]`;
+    if (!item || typeof item !== 'object') { out.push(`${at} is not an object and is silently dropped`); return; }
+    const { name, prefab } = item as { name?: unknown; prefab?: unknown };
+    if (typeof name !== 'string' || !name) out.push(`${at}.name is missing or empty — the kind is silently dropped`);
+    if (typeof prefab !== 'string' || !prefab) { out.push(`${at}.prefab is missing or empty — the kind is silently dropped`); return; }
+    if (!isGuid(prefab)) {
+      out.push(`${at}.prefab must be a prefab GUID, got '${prefab}'${isInternalAssetPath(prefab) ? ' (an asset PATH — use the prefab\'s GUID)' : ''}`);
+      return;
+    }
+    // ⚠️ Branch on the VERDICT, never on truthiness. `AssetRefResolver` returns
+    // `'ok' | 'missing' | 'case-mismatch'` — three non-empty strings, so `!assetExists(prefab)`
+    // is false for every possible answer and the check silently never fires. This arm was
+    // written that way first and was dead code; it is the repo's dominant defect shape (a
+    // mechanism that cannot fire), caught only because the tests asked for the negative case.
+    if (assetExists) {
+      const verdict = assetExists(prefab);
+      if (verdict === 'missing') {
+        out.push(
+          `${at}.prefab: '${prefab}' is a well-formed GUID but no asset in the manifest has it `
+          + `— the entry prefab was deleted or never imported, so this kind's pool never spawns`,
+        );
+      } else if (verdict === 'case-mismatch') {
+        out.push(
+          `${at}.prefab: '${prefab}' matches a manifest asset only when letter case is ignored `
+          + `— asset refs resolve through a case-SENSITIVE lookup, so this kind's pool never spawns. `
+          + `Re-author the ref with the manifest's exact casing (guids are minted lowercase).`,
+        );
+      }
+    }
+  });
+  return out;
+}
+
+/** Warnings for an entry PREFAB's root `UIElement` — the authoring-time half of #671.
+ *
+ *  `entriesSystem` pins 14 `UIElement` fields onto every pooled row root each tick
+ *  (`buildPooledRowPin`), so those authored fields are discarded. The runtime warns about this
+ *  since #761, but only on a LIVE pooled instance: the `UIEntry` trait that gates the Inspector's
+ *  note is stamped at spawn and is `runtimeOnly`, so it exists in no `.prefab.json`. Open the
+ *  entry prefab — the asset you actually author in — and there was no signal at all.
+ *
+ *  ⚠️ **The size fields are conditional, and that condition is the whole reason this needs the
+ *  edge rather than a per-prefab rule.** On an axis the view DELEGATES (`entryWidth`/`entryHeight`
+ *  of 0), `entryPrefabProvider.rootSize` genuinely reads the prefab root's `width`/`height` — that
+ *  IS the single-source-of-truth path the trait docs prescribe — so warning there would tell the
+ *  author to stop doing the correct thing. Only a non-delegated axis is discarded.
+ *
+ *  `isNeutralSize` suppresses `0` and `100%`, which is what nearly every entry prefab root
+ *  authors (a full-bleed page); without it this would fire on shipping content that is behaving
+ *  exactly as intended.
+ *
+ *  ⚠️ **`v === 0` is a PIN check, not a DEFAULT check, and `flexShrink` is where those two split.**
+ *  All nine `POOLED_ROW_GENERIC_WARN_FIELDS` are pinned to `0` (`POOLED_ROW_PINNED_GROUPS`'
+ *  `forcedTo`), and for eight of them `0` is also the trait default — but `UIElement.ts`'s own
+ *  `flexShrink` default is `1`, so an untouched entry prefab root commonly authors `flexShrink: 1`
+ *  (the Inspector's own default) and `v === 0` alone never suppresses it. `entriesSystem.ts`'s
+ *  runtime twin (`pooledFieldNeedsWarning`) already checks against the field's default for exactly
+ *  this reason; here that default is read off the live `schema` (the same `SceneSchema` every
+ *  other type-check in this module is BYOD-optional on) rather than re-typed as a second table —
+ *  without a schema (no browser connected) this degrades to the pin-only check, same as always. */
+export function entryPrefabRootWarnings(
+  use: EntryKindUse, rootTraits: unknown, label: string, schema?: SceneSchema,
+): string[] {
+  const out: string[] = [];
+  if (!rootTraits || typeof rootTraits !== 'object') return out;
+  const uel = (rootTraits as Record<string, unknown>).UIElement;
+  if (!uel || typeof uel !== 'object') return out;
+  const el = uel as Record<string, unknown>;
+  const via = `used as entry kind '${use.kindName}' by ${use.viewLabel}`;
+
+  // The nine always-discarded fields (margins, min/max, flexShrink), derived from the same
+  // constant the pin itself iterates — never a second hand-typed list (#761/#764).
+  for (const field of POOLED_ROW_GENERIC_WARN_FIELDS) {
+    const v = el[field];
+    if (typeof v !== 'number' || v === 0) continue;
+    // A value equal to the trait's OWN default (see docblock above) is never "authored" in any
+    // sense worth warning about — the author never touched it. `flexShrink`'s default (1) is the
+    // one case this matters for today; every other generic field's default is already 0 and is
+    // caught by the `v === 0` check above.
+    const fieldDefault = schema?.traits?.UIElement?.fields?.[field]?.default;
+    if (fieldDefault !== undefined && v === fieldDefault) continue;
+    const group = POOLED_ROW_PINNED_GROUPS.find((g) => g.fields.includes(field));
+    out.push(
+      `${label}.UIElement.${field} is inert: this prefab is ${via}, and a pooled row root has its `
+      + `${group?.label ?? field} pinned to ${group?.forcedTo ?? '0'} every tick — the authored `
+      + `${v} is discarded`,
+    );
+  }
+
+  // `isVisible` is pinned to whether the slot is live, so an authored `false` is the case that
+  // visibly reverts — #761 called it the most legible of the fourteen to a human.
+  if (el.isVisible === false) {
+    out.push(
+      `${label}.UIElement.isVisible is inert: this prefab is ${via}, and a pooled row root's `
+      + `visibility is pinned to whether its slot is live every tick`,
+    );
+  }
+
+  // Size: discarded ONLY on an axis the view does not delegate.
+  for (const axis of ['width', 'height'] as const) {
+    const delegated = axis === 'width' ? use.delegatesWidth : use.delegatesHeight;
+    if (delegated) continue;
+    const v = el[axis];
+    const unit = el[`${axis}Unit`];
+    if (typeof v !== 'number' || isNeutralSize(v, unit)) continue;
+    const entryField = axis === 'width' ? 'entryWidth' : 'entryHeight';
+    out.push(
+      `${label}.UIElement.${axis} is inert: this prefab is ${via}, and that view authors a `
+      + `non-zero ${entryField}, so the row's ${axis} comes from the view — the authored `
+      + `${v}${unitOrDefault(unit)} is discarded. Set ${entryField} to 0 if you want the view to `
+      + `read this prefab's own size instead.`,
+    );
+  }
+  return out;
+}
+
 /** Validate an on-disk scene object. `schema` is optional (see module docs);
  *  `getPrefab` is optional (see `PrefabResolver` docs) — omitted, prefab-instance
  *  overrides are simply not checked for the inert-size trap; `assetExists` is optional
@@ -545,6 +862,18 @@ export function validateSceneData(
     // someone reading the JSON gets no such signal. Axes are independent.
     warnings.push(...inertLayoutWarnings(e.traits, label));
 
+    // #809 — a lineHeight authored as a multiplier. Per-entity and independent of any anchor,
+    // so it sits beside the inert-size check rather than inside it.
+    warnings.push(...lineHeightUnitWarnings(e.traits, label));
+
+    // #676 — authored newlines the DOM collapses. Newlines only; the space-run half of the same
+    // mechanism is enforced at the gate instead (see this function's docblock).
+    warnings.push(...collapsedNewlineWarnings(e.traits, label));
+
+    // #671 — the `UIEntries.prefabs` bank's own integrity. The edge it names is walked once,
+    // scene-wide, after this loop.
+    warnings.push(...entryBankWarnings(e.traits, label, assetExists));
+
     // Prefab self-reference: an instance whose source is its OWN guid would recurse.
     const pi = e.traits?.PrefabInstance;
     if (pi && typeof pi === 'object' && ownGuid) {
@@ -671,7 +1000,48 @@ export function validateSceneData(
     }
   });
 
+  // ── Entry-kind pass (#671): resolve every `UIEntries` view -> entry-prefab edge and check the
+  //    prefab ROOT's authored box against what the pooled-row pin will do to it.
+  //
+  //    Scene-level rather than per-entity because the edge is a JOIN: the rule about the prefab
+  //    root depends on the VIEW's `entryWidth`/`entryHeight`, which lives on a different entity.
+  //
+  //    BYOD, exactly like the prefab-instance twin above: `getPrefab` is caller-injected and
+  //    optional, and without it this stays silent — a conservative false negative rather than a
+  //    wrong claim. All three real callers (`agentBridge`'s `modoki_validate_scene` and the two
+  //    `editorBackendRouter` routes) do pass one.
+  if (getPrefab) {
+    // De-dupe: one prefab used by several views, or listed twice in a bank, must not multiply the
+    // same warning. Keyed by guid + the delegation flags, because those change what is reported.
+    const seen = new Set<string>();
+    for (const use of collectEntryKindUses(scene.entities, (e, i) => entityLabel(e as SceneEntityLike, i))) {
+      const key = `${use.prefabGuid}:${use.delegatesWidth}:${use.delegatesHeight}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let prefab: unknown;
+      try { prefab = getPrefab(use.prefabGuid); } catch { prefab = undefined; }
+      const root = prefabRootTraits(prefab);
+      if (!root) continue; // unresolved — the bank check above already reports a dangling GUID
+      warnings.push(...entryPrefabRootWarnings(use, root, `entry prefab '${use.prefabGuid}'`, schema));
+    }
+  }
+
   return { warnings, schemaApplied };
+}
+
+/** The traits bag of a resolved prefab's ROOT entity, or undefined for any malformed shape.
+ *
+ *  Mirrors `entryPrefabProvider.rootSize`'s own root resolution (`rootLocalId`, falling back to
+ *  the first entity) deliberately: if these two disagreed about which entity is the root, the
+ *  validator would warn about a different element than the one the runtime pins. */
+function prefabRootTraits(prefab: unknown): Record<string, unknown> | undefined {
+  const entities = (prefab as { entities?: unknown } | undefined)?.entities;
+  if (!Array.isArray(entities) || entities.length === 0) return undefined;
+  const rootLocal = (prefab as { rootLocalId?: unknown }).rootLocalId
+    ?? (entities[0] as { localId?: unknown } | null)?.localId;
+  const root = entities.find((e) => (e as { localId?: unknown } | null)?.localId === rootLocal) ?? entities[0];
+  const traits = (root as { traits?: unknown } | null)?.traits;
+  return traits && typeof traits === 'object' ? traits as Record<string, unknown> : undefined;
 }
 
 /** Read an entity's serialized EntityAttributes object, or undefined. */
@@ -798,7 +1168,13 @@ export function validatePrefabData(data: unknown): ValidationResult {
     // localIds, not ECS ids), so that is the address a reader can act on. The name is included
     // when present because it is what they see in the Hierarchy, but the localId is the identity.
     const named = typeof e.name === 'string' && e.name ? ` "${e.name}"` : '';
-    warnings.push(...inertLayoutWarnings(e.traits, `entity[localId=${String(e.localId)}]${named}`));
+    const prefabLabel = `entity[localId=${String(e.localId)}]${named}`;
+    warnings.push(...inertLayoutWarnings(e.traits, prefabLabel));
+    // #809 — a prefab can author a multiplier-shaped lineHeight exactly as a scene can, and the
+    // prefab is the harder one to notice: the value renders wherever the prefab is instantiated,
+    // not where it is authored.
+    warnings.push(...lineHeightUnitWarnings(e.traits, prefabLabel));
+    warnings.push(...collapsedNewlineWarnings(e.traits, prefabLabel));
   }
   // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
   // would tell a caller its type checks ran when they did not.

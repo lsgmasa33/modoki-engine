@@ -70,7 +70,7 @@ function makeProvider(rootOverrides: Record<string, unknown> = {}) {
   return {
     spawned,
     isCached: () => true,
-    rootSize: () => ({ width: 0, height: ENTRY_H }),
+    rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: ENTRY_H, heightUnit: 'px' as const }),
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
       const root = world.spawn(UIElement({ height: ENTRY_H, ...rootOverrides }), RenderableUI(),
         PrefabInstance({ source: PREFAB, localId: 1 }),
@@ -806,7 +806,7 @@ describe('entriesSystem', () => {
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');
     src.registerEntrySource('test.rows', () => ({ members: {} }));
-    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, height: 0 }), spawnInstance: () => 0 });
+    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), spawnInstance: () => 0 });
 
     api.scrollToEntry('view-guid', { y: 42 });
     sys.entriesSystem(testWorld);
@@ -848,12 +848,16 @@ describe('entriesSystem', () => {
   // every one of them reads the prefab FILE, and the file was well-formed. The console was empty.
 
   /** A provider that is cached only once `cached.value` flips — the transient/permanent seam. */
-  function stubProvider(cached: { value: boolean }, size = { width: 0, height: ENTRY_H }) {
+  function stubProvider(
+    cached: { value: boolean },
+    size: { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } =
+      { width: 0, widthUnit: 'px', height: ENTRY_H, heightUnit: 'px' },
+  ) {
     const spawns: string[] = [];
     return {
       spawns,
       isCached: () => cached.value,
-      rootSize: () => (cached.value ? size : { width: 0, height: 0 }),
+      rootSize: () => (cached.value ? size : { width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       spawnInstance: (_w: any, guid: string) => { spawns.push(guid); return 0; },
     };
   }

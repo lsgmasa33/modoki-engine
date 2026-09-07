@@ -394,6 +394,34 @@ Field groups (representative fields, verified against `UIElement.ts`):
   the ported copy can carry a multi-space run that read correctly on the 2D layer and silently loses
   its spacing the moment the same string becomes a DOM `text` field. Sweep a ported string for
   multi-space runs before trusting it, or replace the gap with layout at the same time.
+  ⚠️ **The same collapse eats authored NEWLINES, and that half is easier to miss** (#676). `\n` is
+  whitespace to `white-space: normal` exactly as a space run is, so a four-line credits block
+  authored as one `text` renders as one run-on paragraph. It hid longer than the space-run case
+  because the damage is not "slightly tighter" but "the line structure is gone", which reads as a
+  layout bug rather than a string bug and sends the reader to the wrong file. Three entities
+  carried it — `audio-demo`'s `CreditsBody`, `alien-animal`'s `Credits Body`, `ota-test`'s `Title`
+  — all now split into sibling text elements in a column with an authored `gap`.
+  ⚠️ **Whitespace preservation here is an accident of an unrelated feature flag, and that is worth
+  knowing before you "fix" it the easy way.** `AnimatedText`'s typewriter span and `AutoFitText`'s
+  span both set `white-space: pre-wrap`; every other path — the plain text path (#742's no-wrapper
+  branch) AND the `maxLines`-clamp span (it caps height only — `overflow`/`-webkit-box`/`maxHeight`
+  — and sets no `white-space` of its own) — sets nothing. So the SAME string renders differently
+  depending on whether autofit or the `TextAnimation` trait happens to be on, and a positive
+  `maxLines` does NOT buy that escape. Making the plain path `pre-wrap` to match was considered and
+  **declined** (owner, 2026-09-07): it would also un-collapse every accepted space-run site,
+  including `games/court`'s shipping How-to-Play rules lines, so a credits fix would silently
+  restyle a shipping game. The standing direction stays "spacing is layout", not "preserve the
+  whitespace".
+  **Where each half is enforced, and why they differ:** newlines are checked by
+  `collapsedNewlineWarnings` in `sceneValidation.ts`, which runs on a dev hot-reload and through
+  `/api/validate-scene` / `modoki_validate_scene` — never on a production runtime load — and they
+  have no accepted instances, so they can afford to be loud. Space runs are checked only by the
+  corpus guard (`engine/tests/assets/uiAuthoredValues.test.ts`) against a written exemption ledger,
+  because twelve accepted sites warning on every dev hot-reload or validate call against a shipping
+  game is how a check gets muted and takes the useful half down with it. The newline arm
+  deliberately skips any entity on a genuine `pre-wrap` path (`autoFitText`, or the `TextAnimation`
+  trait), where authoring a newline is correct — a false positive on legitimate multi-line text
+  costs more than a miss.
 
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
@@ -1537,12 +1565,21 @@ The engine decides WHICH pooled instance shows entry (x, y); the game answers WH
   on a prefab's OWN members only — never inner members — so that helper's flat `rootInstanceId
   === rootEcsId` scan would have reached zero of a page prefab's 25 nested tile instances, which
   is why it was not the thing to promote.
-- The scene's generated `resources` manifest only seeds what it is told is a ref:
-  `UIEntries.prefabs[].prefab` must be registered in `REF_FIELDS_BY_TRAIT`
-  (`loaders/sceneValidation.ts`) and in `SCALAR_RESOURCE_TYPE_BY_FIELD` as a `prefab`-typed ref,
-  or the entry prefab is invisible to the manifest — the #53 "assets the build cannot see"
-  class, silent in dev (which serves everything off disk) and broken only once shipped. Once
-  registered, the entry prefab's own assets need nothing further: `SceneManager`'s transitive
+- The scene's generated `resources` manifest only seeds what it is told is a ref, and if
+  `UIEntries.prefabs[].prefab` were missed the entry prefab would be invisible to the manifest —
+  the #53 "assets the build cannot see" class, silent in dev (which serves everything off disk)
+  and broken only once shipped.
+  ⚠️ **It is NOT registered in `REF_FIELDS_BY_TRAIT` or `SCALAR_RESOURCE_TYPE_BY_FIELD`, and must
+  not be** — this paragraph said the opposite until 2026-09-07 and sent at least two readers
+  (including a session working #671) looking for an entry that was never there. Both tables are
+  **scalar-only** by construction; `prefabs` is a JSON-string bank, the same shape as
+  `Animator.clips` and `AudioSource.clips`. It is parsed EXPLICITLY in two places instead:
+  `loaders/loadSceneFile.ts` (`collectResourceRefsFromEntities`, which emits the manifest entry)
+  and `plugins/asset-tree-shaker.ts` (the build keep-walk, which labels the edge
+  `UIEntries.prefabs[].prefab` — the label `/api/find-references` and the Inspector's entry-prefab
+  note both key off). What the tables genuinely did NOT cover is the VALIDATOR, which is why
+  `entryBankWarnings` exists. Once collected, the entry prefab's own assets need nothing further:
+  `SceneManager`'s transitive
   worklist walks its entities with the same collector used for scene entities, so a textured
   entry prefab, a font, or a prefab nested inside it are all acquired and scene-refcounted.
 
@@ -1658,11 +1695,35 @@ field when it discards an authored value by the rule above (keyed `viewGuid:slot
 Inspector shows a "pooled row" note on the `UIElement` section, gated on the sibling `UIEntry`
 trait via `selectionPooledRowGate`.
 
-**The Inspector note cannot reach the case that matters.** `UIEntry` is stamped by the engine on
-the LIVE pooled instance at spawn, so the note appears when you select a running row. The entry
-**prefab** — the thing you actually open and author — carries no marker saying it is used as an
-entry kind, and no such marker exists today. So the authoring path has no editor cover at all, and
-the runtime warning is the only thing that catches it, after the fact.
+**The Inspector note used not to reach the case that matters, and now does (#671, 2026-09-07).**
+`UIEntry` is stamped by the engine on the LIVE pooled instance at spawn, so the note appears when
+you select a running row. The entry **prefab** — the thing you actually open and author — carries
+no such marker, and inventing one on the asset was never necessary: **the relationship already
+exists in the SCENE**, as `UIEntries.prefabs`, and was simply resolved by nothing on the authoring
+side. Two surfaces now resolve it:
+
+- **The validator** (`entryPrefabRootWarnings` in `loaders/sceneValidation.ts`) joins each
+  `UIEntries` view to its entry prefab through the caller-injected `getPrefab` resolver and reports
+  the authored box fields the pin will discard, so the finding reaches scene load,
+  `/api/validate-scene` and `modoki_validate_scene`.
+- **The Inspector** shows the same note in prefab-edit mode, resolving the edge through
+  `/api/find-references` (which already walked the bank for the build) rather than a new index.
+  Gated on `isPrefabEditWorld()` rather than the `editingPrefab` store flag, which can go stale,
+  and on the prefab ROOT entity only — the pin only ever touches the row root, so firing on a
+  child would claim something false.
+
+⚠️ **The size half of the rule is CONDITIONAL, and this is the part that makes the edge necessary
+rather than merely convenient.** On an axis the view DELEGATES (`entryWidth`/`entryHeight` of 0)
+the prefab root's own size IS read, by `entryPrefabProvider.rootSize` — that is the
+single-source-of-truth path the trait docs prescribe. Warning there would tell the author to stop
+doing the correct thing. Only a non-delegated axis is discarded, and no per-prefab rule can know
+which, because the answer lives on a different entity.
+
+⚠️ **A lookup that fails must not assert the negative.** `entryKindUsesOf` returns `null` on any
+failure, missing endpoint or malformed body — never `[]` — and the note stays silent on `null`.
+`[]` means "genuinely not an entry kind"; a failed request must not be able to say that. The note
+only ever ADDS information and never disables a field, so silence on no evidence is the correct
+failure direction. (Same rule `makeTexture2D.textureRefCount` already states for its own count.)
 
 ### Measured on the low-end target
 
@@ -1725,6 +1786,29 @@ found two engine defects this harness had not.
 `entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
 is not a second copy of a number the prefab already states; `%` resolves against the viewport,
 which is how a pager is expressed.
+
+⚠️ **The prefab root's size carries its own UNIT, and until #765 that unit was dropped.**
+`entryPrefabProvider.rootSize` read the root's `UIElement.width`/`height` and ignored
+`widthUnit`/`heightUnit`, so a root authored `width: 50, widthUnit: '%'` was pinned as **50px**.
+The asymmetry is the tell: the view's own authored size had its `%` resolved against the viewport
+and the prefab's did not — on the one branch whose entire purpose is deferring to the prefab.
+`resolveEntrySize` now takes the prefab's unit as a **required** parameter (a default would let a
+future call site silently keep the bug) and both branches convert through one shared helper, so
+the view's axis and the prefab's axis cannot drift apart again.
+
+⚠️ **An ABSENT unit here means `%`, not px** — every `UIElement` length unit defaults to `'%'` and
+a save strips a field equal to its default, so number-with-no-unit is the ordinary on-disk shape
+for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
+keys, i.e. `100%`); it never tripped the bug only because `DictionaryPager` authors both axes
+explicitly at `100%`, so the `0` branch is never taken. Deleting those two redundant fields — which
+is precisely what the single-source-of-truth rule above tells an author to do — would have turned
+its cards into 100px squares, silently. That is why the bug was worth fixing while still latent.
+
+⚠️ **Every entry-sizing test FAKED the provider**, which is why nothing saw this for so long; the
+one test touching the real one (`resourceRefcount.test.ts`) said so in its own docblock. There are
+now fixtures driving the REAL `entryPrefabProvider.rootSize` against a `%`-unit root, a no-unit-key
+root and an explicit-px root. A fake that models behaviour the real dependency lacks makes the
+guard defend the bug.
 
 ### Motion is CSS, and the vocabulary matches
 

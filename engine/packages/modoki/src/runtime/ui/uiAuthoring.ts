@@ -217,17 +217,33 @@ export function pooledRowNoteText(mixed: boolean): string {
  *  encodes, just not pre-flattened to a string. `intro` carries the unanimous-or-nothing `mixed`
  *  wording (#34); `items` is the per-group `{label, forcedTo}` list either way, so a mixed
  *  selection still shows an author WHICH fields are at stake even though none of them are forced
- *  there. */
-export function pooledRowNoteSegments(mixed: boolean): {
+ *  there.
+ *
+ *  `mode` widened from a plain `mixed: boolean` in #671 — the editor half of #671 needed a THIRD
+ *  case: a prefab open in prefab-edit mode that some `UIEntries` view spawns as an entry kind. That
+ *  prefab carries no live `UIEntry` sibling trait (it's `runtimeOnly`, stamped by `entriesSystem` at
+ *  spawn, so it exists in no `.prefab.json`) — the `'inert'`/`'mixed'` cases can never fire there,
+ *  and without a third case the entry prefab's root had no signal at all. `'entry-prefab'` reuses
+ *  `POOLED_ROW_PINNED_GROUPS` verbatim (same fields the pin writes) with future-tense wording: the
+ *  fields are not being overridden RIGHT NOW (nothing is pooled in prefab-edit mode), they WILL be
+ *  once some view spawns this prefab as a row. */
+export function pooledRowNoteSegments(mode: 'inert' | 'mixed' | 'entry-prefab'): {
   intro: string;
   items: readonly { label: string; forcedTo: string }[];
 } {
   const items = POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo }));
-  if (mixed) {
+  if (mode === 'mixed') {
     return {
       intro: `Partly pooled — some of the selected elements are UIEntries pooled rows and some `
         + `aren't. The fields below stay editable so the un-pooled ones can still be authored, but `
         + `the pooled ones ignore what you write. Select them separately to be sure of the result.`,
+      items,
+    };
+  }
+  if (mode === 'entry-prefab') {
+    return {
+      intro: `Entry prefab — a UIEntries scroll view spawns this prefab as an entry kind and will `
+        + `force the fields below on this root every tick.`,
       items,
     };
   }

@@ -305,17 +305,35 @@ describe('pooledRowNoteText (#761 — widened from margin/min-max to all fourtee
 
 describe('pooledRowNoteSegments (#764 — structured note, restores Inspector bolding)', () => {
   it('returns one {label, forcedTo} item per POOLED_ROW_PINNED_GROUPS entry, in order', () => {
-    const { items } = pooledRowNoteSegments(false);
+    const { items } = pooledRowNoteSegments('inert');
     expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
   });
 
   it('the mixed variant carries the same items — a mixed selection still names which fields are at stake', () => {
-    const { items } = pooledRowNoteSegments(true);
+    const { items } = pooledRowNoteSegments('mixed');
     expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
   });
 
   it('intro text matches pooledRowNoteText\'s tone for each mode', () => {
-    expect(pooledRowNoteSegments(true).intro).toContain('stay editable');
-    expect(pooledRowNoteSegments(false).intro).toContain('forces');
+    expect(pooledRowNoteSegments('mixed').intro).toContain('stay editable');
+    expect(pooledRowNoteSegments('inert').intro).toContain('forces');
+  });
+});
+
+describe('pooledRowNoteSegments — entry-prefab mode (#671)', () => {
+  // The prefab-edit-mode signal: a prefab some UIEntries view spawns as an entry kind carries no
+  // live UIEntry sibling (runtimeOnly, stamped at spawn — never present in a .prefab.json), so
+  // neither 'inert' nor 'mixed' can ever fire there. 'entry-prefab' is the third case that gives
+  // the entry prefab's root a signal at all.
+  it('also carries one {label, forcedTo} item per POOLED_ROW_PINNED_GROUPS entry, in order', () => {
+    const { items } = pooledRowNoteSegments('entry-prefab');
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('intro is future-tense ("will force"), not the present-tense pooled-row wording', () => {
+    const { intro } = pooledRowNoteSegments('entry-prefab');
+    expect(intro).toContain('Entry prefab');
+    expect(intro).toContain('will force');
+    expect(intro).not.toContain('stay editable'); // not the mixed wording
   });
 });

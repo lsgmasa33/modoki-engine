@@ -57,8 +57,11 @@ import { POOLED_ROW_PINNED_FIELDS, POOLED_ROW_GENERIC_WARN_FIELDS, buildPooledRo
  *  It also buys a testable seam: a test can install a fake provider and drive the whole system
  *  without a prefab cache or an asset manifest. */
 export interface EntryPrefabProvider {
-  /** The prefab root's authored `UIElement` size, for the `entry{Width,Height} = 0` case. */
-  rootSize(prefabGuid: string): { width: number; height: number };
+  /** The prefab root's authored `UIElement` size, for the `entry{Width,Height} = 0` case. Carries
+   *  its OWN unit — a root authored `width: 50, widthUnit: '%'` must resolve against the
+   *  viewport exactly like the view's own authored `entryWidth`, not get pinned to a raw px
+   *  number (#765). */
+  rootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' };
   /** Spawn one instance under `parentId`. Returns the root ecs id, or 0 if it cannot yet (the
    *  prefab is not cached) — the caller then tries again next frame rather than guessing. */
   spawnInstance(world: World, prefabGuid: string, opts: { parentId: number; guidSeed: string }): number;
@@ -258,10 +261,10 @@ function diagnoseBlankView(viewGuid: string, countX: number, countY: number, sou
 }
 
 /** The entry prefab's own authored root size, for the `entryWidth/Height = 0` case ("read it
- *  from the prefab"). Returns 0 when the prefab is not cached yet — the caller then has no size
- *  and renders nothing this frame rather than guessing one. */
-export function prefabRootSize(prefabGuid: string): { width: number; height: number } {
-  return provider?.rootSize(prefabGuid) ?? { width: 0, height: 0 };
+ *  from the prefab"). Returns 0 (px) when the prefab is not cached yet — the caller then has no
+ *  size and renders nothing this frame rather than guessing one. */
+export function prefabRootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } {
+  return provider?.rootSize(prefabGuid) ?? { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
 }
 
 export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): void {
@@ -382,8 +385,8 @@ function driveView(
   // Entry size. `0` means "read it from the prefab" — the single-source-of-truth rule, so a
   // fixed-size entry is not a second copy of what the prefab root already states.
   const fromPrefab = prefabRootSize(kinds[0].prefab);
-  const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width);
-  const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height);
+  const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width, fromPrefab.widthUnit);
+  const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height, fromPrefab.heightUnit);
 
   // A pending scrollToEntry request, converted here because THIS is where entry size is
   // resolved — the `%`-of-viewport case and the `0` = "read it from the prefab" case both live
@@ -976,16 +979,13 @@ function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): b
  *  `sceneValidation.ts`, which exists for exactly the same "don't warn on the documented
  *  contract" reason.
  *
- *  ⚠️ KNOWN FALSE NEGATIVE, not intended behaviour — do not cite this as evidence the `%`-is-
- *  neutral rule is fine as written. The rule above rests on the view actually RESOLVING the `%`,
- *  which happens for a view-authored `entryWidth`/`entryHeight` but NOT for the `entryWidth: 0`
- *  ("read it from the prefab") case: `entryPrefabProvider.ts`'s `rootSize` returns `ui.width` raw
- *  and ignores `widthUnit`, and `resolveEntrySize` (`entriesLayout.ts`) short-circuits on
- *  `authored === 0` and returns it verbatim as px. So a root authored `width: 100, widthUnit:
- *  '%'` under a view with no `entryWidth` is silently pinned to 100px and NOTHING warns here —
- *  this function never even sees it, because the value never resolves to a differing px pin. The
- *  fix belongs in `rootSize`/`resolveEntrySize` (#765), not here — changing the predicate in this
- *  function would duplicate logic #765's fix must change anyway. */
+ *  Fixed (#765): the `entryWidth: 0` ("read it from the prefab") case used to be an exception to
+ *  the rule above. `entryPrefabProvider.ts`'s `rootSize` used to return `ui.width` raw and ignore
+ *  `widthUnit`, and `resolveEntrySize` (`entriesLayout.ts`) short-circuited on `authored === 0`
+ *  and returned it verbatim as px — so a root authored `width: 100, widthUnit: '%'` under a view
+ *  with no `entryWidth` was silently pinned to 100px with nothing warning here. `rootSize` now
+ *  carries its own unit and `resolveEntrySize` resolves it against the same viewport axis as the
+ *  view's own authored value, so the rule above holds for this case too. */
 function pooledSizeNeedsWarning(curValue: unknown, curUnit: unknown, wantPx: number, def: unknown): boolean {
   if (curUnit !== 'px') return false;
   return curValue !== wantPx && curValue !== def;

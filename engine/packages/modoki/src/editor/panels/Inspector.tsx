@@ -54,6 +54,8 @@ import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
 import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate, isElementMarginInert, selectionMarginGate, MARGIN_KEYS, pooledRowNoteSegments } from '../../runtime/ui/uiAuthoring';
+import { isPrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../scene/prefabEdit';
+import { entryKindUsesOf, type EntryKindUseHit } from './entryPrefabUse';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -772,25 +774,29 @@ function FilterIgnoredNote({ layer }: { layer: string }) {
 
 /** Section-level note for the whole UIElement trait section (not one sub-section — the fields it
  *  covers span Size, Margin, Size Constraints and other sub-sections) when the selected entity is
- *  a pooled UIEntries row (#651, widened to all fourteen pinned fields in #761).
+ *  a pooled UIEntries row (#651, widened to all fourteen pinned fields in #761), OR (#671) a
+ *  PREFAB some UIEntries view spawns as an entry kind — the two are mutually exclusive in
+ *  practice (a live pooled row's sibling `UIEntry` trait never exists inside prefab-edit mode, see
+ *  `entryPrefabUse.ts`'s docblock), so the caller picks exactly one mode per render.
  *
- *  The DECISION — what the note says, and the unanimous-or-nothing `mixed` rule (#34) — lives in
- *  `uiAuthoring.pooledRowNoteSegments` (a plain, tested `.ts` function) so it cannot drift from
- *  what `entriesSystem.ts`'s pin actually writes the way the old two-group text (margin, min/max
- *  size) drifted from the six fields #761 added silently; this component only renders that intro
- *  plus a bolded `label: forcedTo` list, per this repo's "editor .tsx carries no tests"
- *  convention. Structured (not a flattened string) so the labels can be bolded and read as a
- *  short list (#764 — the owner reads this note) rather than one ~300-character sentence naming
- *  the five fields twice. */
-function PooledRowNote({ mixed = false }: { mixed?: boolean }) {
-  const { intro, items } = pooledRowNoteSegments(mixed);
+ *  The DECISION — what the note says for each mode, and the unanimous-or-nothing `mixed` rule
+ *  (#34) — lives in `uiAuthoring.pooledRowNoteSegments` (a plain, tested `.ts` function) so it
+ *  cannot drift from what `entriesSystem.ts`'s pin actually writes the way the old two-group text
+ *  (margin, min/max size) drifted from the six fields #761 added silently; this component only
+ *  renders that intro plus a bolded `label: forcedTo` list, per this repo's "editor .tsx carries
+ *  no tests" convention. Structured (not a flattened string) so the labels can be bolded and read
+ *  as a short list (#764 — the owner reads this note) rather than one ~300-character sentence
+ *  naming the five fields twice. `entry-prefab`'s items have no "forced to" suffix, matching
+ *  `mixed`: the fields are not being forced RIGHT NOW, only described. */
+function PooledRowNote({ mode }: { mode: 'inert' | 'mixed' | 'entry-prefab' }) {
+  const { intro, items } = pooledRowNoteSegments(mode);
   return (
-    <div style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
+    <div data-ui-id="inspector.section.pooledRowNote" style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
       <div>ℹ️ {intro}</div>
       <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
         {items.map((item) => (
           <li key={item.label}>
-            <b>{item.label}</b>{mixed ? '' : <> — forced to {item.forcedTo}</>}
+            <b>{item.label}</b>{mode === 'inert' ? <> — forced to {item.forcedTo}</> : ''}
           </li>
         ))}
       </ul>
@@ -897,6 +903,34 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     });
   })() : [];
   const pooledRowGate = selectionPooledRowGate(pooledRowFlags);
+
+  // Entry-prefab advisory (#671, editor half): the SAME fourteen fields as the pooled-row pin
+  // above, but for the case that pin's live-sibling read can never see — a prefab open in
+  // prefab-edit mode, whose root has no live `UIEntry` trait to gate on (it's `runtimeOnly`,
+  // stamped at spawn, absent from every `.prefab.json` — see `entryPrefabUse.ts`'s docblock).
+  // `entryKindUsesOf` asks the on-disk reference graph instead. `null` = not looked up / unknown
+  // and must never render as "not an entry kind" (see that module) — the effect below only ever
+  // sets `[]` or a populated array once a lookup actually completes.
+  const [entryKindHits, setEntryKindHits] = useState<EntryKindUseHit[] | null>(null);
+  const editingPrefabGuid = editingPrefab?.guid ?? null;
+  const singleSelectedId = entityIds.length === 1 ? entityIds[0] : null;
+  useEffect(() => {
+    setEntryKindHits(null);
+    if (meta.name !== 'UIElement' || !editingPrefabGuid || singleSelectedId === null) return;
+    // Ground truth is the LIVE world, not the store flag — `editingPrefab` can go stale
+    // (prefabEdit.ts's `isEditingPrefab` docs the same trap for Cmd+S).
+    if (!isPrefabEditWorld()) return;
+    // Root only (`PREFAB_EDIT_ROOT_GUID`, prefabEdit.ts): the runtime pin only ever hits the row
+    // ROOT, and `entryPrefabRootWarnings` (the validator arm this mirrors) judges only the root —
+    // firing here on a child would claim something false.
+    const entity = findEntity(singleSelectedId);
+    if (entity?.get(EntityAttributes)?.guid !== PREFAB_EDIT_ROOT_GUID) return;
+    let cancelled = false;
+    void entryKindUsesOf(editingPrefabGuid).then((hits) => {
+      if (!cancelled) setEntryKindHits(hits);
+    });
+    return () => { cancelled = true; };
+  }, [meta.name, editingPrefabGuid, singleSelectedId]);
 
   // Classify fields into an ordered item stream (single field OR a grouped
   // VecField), split by section. A grouped VecField respects its members'
@@ -1212,7 +1246,12 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       {/* UIElement pooled-row note (#651): section-level, not scoped to one sub-section —
           the fields it covers (margin, min/max size) live in TWO different collapsible
           sub-sections (Margin, Size Constraints), so a single note here covers both. */}
-      {meta.name === 'UIElement' && pooledRowGate !== 'live' && <PooledRowNote mixed={pooledRowGate === 'mixed'} />}
+      {meta.name === 'UIElement' && pooledRowGate !== 'live' && <PooledRowNote mode={pooledRowGate === 'mixed' ? 'mixed' : 'inert'} />}
+      {/* Entry-prefab note (#671): the pooled-row gate above is always 'live' in prefab-edit
+          mode (no live UIEntry sibling to read there — see the effect above), so this is the
+          mutually-exclusive OTHER case, not an additional one. Silent on `null` (unknown) —
+          the note only ever adds information, never disables a field. */}
+      {meta.name === 'UIElement' && pooledRowGate === 'live' && !!entryKindHits?.length && <PooledRowNote mode="entry-prefab" />}
 
       {/* Top-level items (no section) — grouped VecFields + singles, in order */}
       {topItems.map(renderItem)}

@@ -93,6 +93,9 @@ const GUIDS: Record<string, { guid: string; type: 'material' | 'mesh' | 'model' 
   '/tree.prefab.json': { guid: '10000000-0000-4000-8000-000000000030', type: 'prefab' },
   '/rock.prefab.json': { guid: '10000000-0000-4000-8000-000000000031', type: 'prefab' },
   '/nested.prefab.json': { guid: '10000000-0000-4000-8000-000000000032', type: 'prefab' },
+  '/entry-percent.prefab.json': { guid: '10000000-0000-4000-8000-000000000033', type: 'prefab' },
+  '/entry-nounit.prefab.json': { guid: '10000000-0000-4000-8000-000000000034', type: 'prefab' },
+  '/entry-px.prefab.json': { guid: '10000000-0000-4000-8000-000000000035', type: 'prefab' },
   '/env/sky.hdr':      { guid: '10000000-0000-4000-8000-000000000040', type: 'environment' },
 };
 const G = (path: string) => GUIDS[path].guid;
@@ -114,6 +117,14 @@ const fetchResponses: Record<string, any> = {
   '/nested.prefab.json': { version: 2, name: 'nested', rootLocalId: 1,
     entities: [{ localId: 1, name: 'Root', traits: {} },
       { localId: 2, name: 'Child', prefab: '10000000-0000-4000-8000-000000000030' }] },
+  // #765 fixtures — a pooled-row root authored `%`, no unit key at all (the on-disk shape a
+  // scene/prefab save leaves once a `%` field equals its trait default), and explicit `px`.
+  '/entry-percent.prefab.json': { version: 1, name: 'entry-percent', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, widthUnit: '%', height: 80, heightUnit: '%' } } }] },
+  '/entry-nounit.prefab.json': { version: 1, name: 'entry-nounit', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, height: 80 } } }] },
+  '/entry-px.prefab.json': { version: 1, name: 'entry-px', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' } } }] },
   '/unknown.mat.json': { type: 'totally-bogus-material-type', color: 0x123456 },
   // '/bad.mat.json' intentionally absent → fetch returns ok:false (404 path).
 };
@@ -391,6 +402,36 @@ describe('refcount cache — prefab', () => {
       await acquirePrefab(1, G('/nested.prefab.json'));
       expect((getCachedPrefab(G('/nested.prefab.json')) as { version?: number })?.version).toBe(2);
       expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'version 2 caches like any other').toBe(true);
+    });
+  });
+
+  /** #765 — `rootSize` against the REAL cache, not a fake that hands back a hardcoded unitless
+   *  number. This is the test whose absence let the bug live: `rootSize` used to read
+   *  `UIElement.width`/`height` and ignore `widthUnit`/`heightUnit`, so a `%`-authored root was
+   *  silently pinned to its raw number in px. */
+  describe('entryPrefabProvider.rootSize (#765)', () => {
+    it('reads an explicitly `%`-unit root as %, not px', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-percent.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-percent.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('an ABSENT unit key means %, not px — the common on-disk shape after a save strips the default', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-nounit.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-nounit.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('reads an explicit `px`-unit root as px, unchanged', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-px.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-px.prefab.json')))
+        .toEqual({ width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' });
     });
   });
 });
