@@ -40,7 +40,7 @@ export function isPluginUnimplemented(e: unknown): boolean {
   return (e as { code?: string } | null)?.code === ExceptionCode.Unimplemented;
 }
 
-/** The owner's Phase 3 decision (docs/plans/mobile-ota-updates-plan.md): a mandatory
+/** The owner's Phase 3 decision (docs/ota-updates.md § "Settled policy decisions"): a mandatory
  *  release blocks with a progress screen while it downloads, then a dead-end
  *  "restart to continue" screen — never a mid-session hot-swap (that would bypass the
  *  two-boot confirm the native watchdog is built around). `'downloading'` covers BOTH

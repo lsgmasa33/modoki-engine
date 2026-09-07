@@ -289,7 +289,7 @@ const MAX_REPORTED_ATTEMPTS = 3;
  *  any legitimate delivery gap (the slow-but-alive-rAF test below proves a genuinely slow chain
  *  recovers well before this fires) and matches the measured iOS WKWebView failure: after a
  *  WebGL context loss, JS/timers/the native bridge stay alive but `requestAnimationFrame` never
- *  delivers again (docs/plans/ios-rendering-update-wedge.md). Past this point re-arming has had
+ *  delivers again (docs/ios-gpu-memory.md). Past this point re-arming has had
  *  its fair chances (see `checkStall()`'s escalation branch) and further silent retries would
  *  just be theatre. */
 const UNRECOVERABLE_AFTER_ATTEMPTS = 4;
@@ -365,7 +365,7 @@ const unrecoverableListeners = new Set<(info: FrameLoopUnrecoverableInfo) => voi
  *  `checkStall()`'s escalation branch). Idempotent — logs and notifies listeners exactly ONCE per
  *  outage. A throwing listener must not stop the others from being notified, matching
  *  `onRendererLost`'s contract in `activeRenderer.ts`. Phase 2 (out of scope here) wires a native
- *  alert to this transition — see docs/plans/ios-rendering-update-wedge.md. */
+ *  alert to this transition — see docs/ios-gpu-memory.md. */
 function declareUnrecoverable() {
   if (unrecoverable) return;
   unrecoverable = true;

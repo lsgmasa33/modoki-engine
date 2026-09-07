@@ -83,6 +83,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { deriveUnscannedRoots, expectedLedgerRows } from '../helpers/unscannedRoots';
 
 const REPO = path.resolve(__dirname, '../../..');
 
@@ -142,54 +143,19 @@ const SCAN_DIRS = [
   'engine/app',
 ];
 
-/** The roots this guard does NOT scan — **DERIVED, not hand-written (#830 review).**
+/** The roots this guard does NOT scan, and the ledger rows whose root this checkout actually has.
  *
- *  ⚠️ This was a hand-listed four (`plugins`, `electron`, `tools`, `toolchain`) under a test titled
- *  "the roots this guard does NOT scan", which is a universal claim — so the ledger below was
- *  vouching for a subset while reading as though it covered everything. Exactly the defect this
- *  whole change is about, in the fix for it.
- *
- *  Now: every top-level source root in the repo, minus the ones SCAN_DIRS already covers. A new
- *  root is in the remainder the day it is created, without anyone remembering. */
-const UNSCANNED_ROOTS: readonly string[] = (() => {
-  const covered = (rel: string) => SCAN_DIRS.some((d) => rel === d || rel.startsWith(`${d}/`));
-  const roots = new Set<string>();
-  for (const { rel } of repoFiles({ match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 500 })) {
-    const parts = rel.split('/');
-    // Depth 2 for the multi-project roots (games/<id>, demos/<id>, engine/<area>), depth 1 for a
-    // flat one like `site/`. Both are compared against SCAN_DIRS' own repo-relative prefixes.
-    const root = parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
-    if (!covered(root) && !SCAN_DIRS.some((d) => d.startsWith(`${root}/`))) roots.add(root);
-  }
-  return [...roots].sort();
-})();
+ *  Both are DERIVED, from the ONE definition of what a "root" is — see
+ *  `tests/helpers/unscannedRoots.ts` for why they must not be transcribed apart. In short: the
+ *  complement is computed from disk while the ledger is absolute, and the public snapshot ships no
+ *  `games/`, so an unfiltered exact-set assertion goes red there over content that was never
+ *  supposed to be present. Filtering the EXPECTATION by the same root list the SCAN used lets the
+ *  two disagree about tokens only. It is NOT a skip: `engine/plugins` is in the snapshot, so a
+ *  fresh ad-hoc epoch in shipped engine code still fails the public gate. */
+const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
 
-/** The ledger rows whose ROOT this checkout actually has — **derived, symmetric with the scan.**
- *
- *  ⚠️ `UNSCANNED_ROOTS` is computed from what is on disk; `KNOWN_OUTSIDE_SCAN_DIRS` is written by
- *  hand and absolute. That asymmetry is a defect: the public engine snapshot
- *  (`scripts/publish-engine-oss.sh`) ships no `games/`, so seven of the eight rows have no root to
- *  come from, the detector correctly returns one hit, and an exact-set assertion goes RED on the
- *  public gate over content that was never supposed to be there. It did — caught by
- *  `verify:publish` at the hub, which is the only place that runs the guards inside the snapshot.
- *
- *  This filters the EXPECTATION by the same root list the SCAN used, so the two can only disagree
- *  about tokens, never about which roots exist. Note what it deliberately does NOT do: skip the
- *  test. The `engine/plugins` row is checkable in the snapshot and still is, so a fresh ad-hoc
- *  epoch in shipped engine code fails on the public gate exactly as it does here.
- *
- *  ⚠️ It is NOT a licence to leave a row unbacked in THIS repo — every root is present in a
- *  developer clone, so a stale row still fails here, at authorship, which is where it should. */
-function expectedOutsideRows(): string[] {
-  const rooted = (rel: string) => {
-    const parts = rel.split('/');
-    return parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
-  };
-  return KNOWN_OUTSIDE_SCAN_DIRS
-    .filter((row) => UNSCANNED_ROOTS.includes(rooted(row.split(' :: ')[0])))
-    .slice()
-    .sort();
-}
+const expectedOutsideRows = (): string[] =>
+  expectedLedgerRows(KNOWN_OUTSIDE_SCAN_DIRS, UNSCANNED_ROOTS);
 
 /** The helper itself implements the token, so its own counters are the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/liveness.ts');

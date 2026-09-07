@@ -1,5 +1,5 @@
 /** Shared live GL/GPU-context counter — Phase 3 of #590
- *  (docs/plans/ios-rendering-update-wedge.md).
+ *  (docs/rendering.md).
  *
  *  Was private to `rendering/canvas2DPool.ts` and counted ONLY its own PixiJS `Application`
  *  contexts. Phase 4's static reading found the gap that made it useless as a real budget:
@@ -30,7 +30,7 @@
  *  in sync.
  *
  *  ── CUMULATIVE TOTALS, NOT JUST THE LIVE COUNT ────────────────────────────────────────────────
- *  A second device measurement (docs/plans/ios-rendering-update-wedge.md) found `fps` and every
+ *  A second device measurement (docs/ios-gpu-memory.md) found `fps` and every
  *  JS-visible resource count — including the LIVE context count — reading perfectly FLAT for 16
  *  minutes up to a confirmed ~296 MB jetsam of the GPU process. A live snapshot cannot see churn:
  *  a context that is repeatedly created and destroyed (e.g. `canvas2DPool`'s rebuild-on-context-

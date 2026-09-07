@@ -11,7 +11,8 @@
  *  still update and a later re-select re-reads from disk via the load effect). */
 
 import { useEffect } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
+import { markAssetDirty } from '../../scene/dirtyAssets';
+import type { AssetSchemaType } from '../../../runtime/assets/assetSchemas';
 import { invalidateMaterial } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateAnimSet, setAnimSet, type AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { clearSpriteMaterialCache } from '../../../runtime/loaders/spriteMaterialCache';
@@ -52,51 +53,42 @@ export function reportWriteFailed(path: string, detail: string): void {
   );
 }
 
-/** Persist an asset-file edit + refresh the live panel for `path` if mounted.
- *  Pure of any React instance — safe to call from an undo/redo closure after the
- *  originating panel has unmounted. `invalidate` is a stable module-level fn
- *  (per asset type), so capturing it in the undo closure is unmount-safe too.
+/** Park an asset-file edit and refresh the live panel for `path` if mounted.
  *
- *  Returns the write's promise so a test can await it; every caller ignores it on purpose — an
- *  undo closure must not have to await a disk write, which is what keeps this callable from one. */
+ *  ⚠️ **This PARKS; it does not write (#831).** It used to POST `/api/write-file` on every
+ *  keystroke, so one numeric field in the Material view hit the disk immediately while
+ *  `get_editor_state` reported `persistenceMode: 'manual'` and `unsavedChanges: false` — a
+ *  committed file rewritten behind the human's back, which is the hazard CLAUDE.md's "stage paths
+ *  EXPLICITLY" rule exists for (#18). #259 made the five asset EDITORS manual on the premise that
+ *  manual save was "every other surface"; that premise was false, and these four asset VIEWS are
+ *  the population it missed. Now they park like everything else and Cmd+S is the write.
+ *
+ *  Pure of any React instance — safe to call from an undo/redo closure after the originating panel
+ *  has unmounted, which is the whole reason this is a module function and not a hook. That matters
+ *  more now, not less: `markAssetDirty` is likewise a plain module function, so the undo path parks
+ *  exactly as the edit path does. (`useParkedAssetDoc`, the five editors' idiom, is a hook and
+ *  cannot be reached from an undo closure — hence the different shape for the same contract.)
+ *
+ *  `type` is REQUIRED and has no default. The registry is keyed by path alone, so the type is what
+ *  lets `pendingAssetDoc` refuse to hand a shader doc to the animset view; making it a parameter
+ *  also means the type checker enumerates every call site rather than a hand-list doing it.
+ *
+ *  ⚠️ The cache + panel still update OPTIMISTICALLY and SYNCHRONOUSLY here, before anything is
+ *  written — unchanged, and still what makes the viewport reflect an Inspector edit immediately.
+ *  What changed is only WHEN the bytes land. There is no longer a write that can fail at this
+ *  point, so nothing is reported here; a failed FLUSH is `flushDirtyAssets`' to report. */
 export function persistAssetEdit(
-  path: string, updated: unknown, invalidate: (path: string, updated: any) => void,
-): Promise<void> {
-  const write = backendFetch('/api/write-file', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    // ⚠️ The trailing `\n` is not cosmetic (#831). Every committed asset JSON has one, and
-    // `JSON.stringify` emits none — so each editor write silently stripped it and produced a
-    // `\ No newline at end of file` line in the diff of an otherwise one-field edit. Measured
-    // 2026-09-06: 101 of 108 committed .mat/.animset/.atlas files had already lost it this way.
-    // Existing files converge as they are next edited; they are deliberately NOT swept here, since
-    // a 101-file rewrite of games/ and demos/ is a far larger blast radius than the defect.
-    body: JSON.stringify({ path, content: `${JSON.stringify(updated, null, 2)}\n` }),
-  })
-    .then(async (res) => {
-      if (res.ok) return;
-      // Prefer the route's own message over a bare status — /api/write-file answers 403 for a path
-      // outside the asset roots, which is a different fix from a 500.
-      let detail = `HTTP ${res.status}`;
-      try {
-        const body = await res.json() as { error?: unknown } | null;
-        if (typeof body?.error === 'string' && body.error) detail = body.error;
-      } catch { /* non-JSON body — the status is all there is */ }
-      reportWriteFailed(path, detail);
-    })
-    .catch((e) => reportWriteFailed(path, e instanceof Error ? e.message : String(e)));
-  // The cache + panel update OPTIMISTICALLY, before the write is known to have landed. That order
-  // is what makes the live viewport reflect an Inspector edit immediately; the failure path above
-  // is what stops it from being a LIE when the write does not land.
+  path: string, type: AssetSchemaType, updated: unknown, invalidate: (path: string, updated: any) => void,
+): void {
+  markAssetDirty(path, type, updated, 'panel');
   invalidate(path, updated);
   _assetViewSetters.get(path)?.(updated); // refresh the mounted panel, if any
-  // Wake the 3D viewport's idle dirty-gate. The Inspector saves via /api/write-file,
-  // which is self-write-guarded (no file-watcher hot-reload), so an asset edit alone
-  // leaves a STATIC scene idle — the invalidated material never gets re-resolved until
-  // some OTHER event (Play, camera move, selection) re-arms the gate. Firing the shared
-  // dirty signal (the same one gizmo/trait writes use) draws for the grace window, long
-  // enough for the async material re-fetch to land and syncMaterial to re-apply it live.
+  // Wake the 3D viewport's idle dirty-gate. An asset edit alone leaves a STATIC scene idle — the
+  // invalidated material never gets re-resolved until some OTHER event (Play, camera move,
+  // selection) re-arms the gate. Firing the shared dirty signal (the same one gizmo/trait writes
+  // use) draws for the grace window, long enough for the async material re-fetch to land and
+  // syncMaterial to re-apply it live.
   fireDirtyListeners();
-  return write;
 }
 
 /** Register `setData` as the live refresher for `path` while the view is mounted. */

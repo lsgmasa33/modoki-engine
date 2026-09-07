@@ -267,7 +267,7 @@ export function createGlProbeSurface(cw: number, ch: number, mark: (stage: strin
     failIfMajorPerformanceCaveat: false,
   }) as WebGL2RenderingContext | null;
   if (!gl) { mark('gl-context-failed'); return null; }
-  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this raw WebGL2 context was
+  // Phase 3 of #590 (docs/rendering.md): this raw WebGL2 context was
   // invisible to the soft GPU-context budget — noted here, right after creation is confirmed,
   // paired with the one-shot `dispose()` below.
   noteGpuContextCreated();

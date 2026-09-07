@@ -263,10 +263,15 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   );
 
   // ── OTA publish (SSE consumed to completion) + status/keygen (JSON) ──
-  // No editor menu entry exists yet for any of these (docs/plans/mobile-ota-updates-plan.md,
-  // Phase 5a — the UI half is deliberately deferred); this tool surface is the ONLY way to
-  // publish an OTA update short of hand-invoking the CLIs, so an agent is a first-class
-  // consumer here, not an afterthought.
+  // The editor DOES have menu entries for the open project's own shell bundle — Build →
+  // "Publish OTA Update…" and Build → "OTA Keys…" (`engine/app/editor/setup.ts`). What has no
+  // editor path is publishing a SUB-GAME bundle (issue #837), which still means invoking
+  // `build-subgame.mjs` + `ota-publish.mjs` by hand. So this tool surface is a first-class
+  // consumer rather than an afterthought, and for the sub-game case it is the only alternative
+  // to the CLIs. See docs/ota-updates.md.
+  // ⚠️ This comment claimed "no editor menu entry exists yet for any of these" until 2026-09-07;
+  // that was false and had been for some time — the dialogs it describes cite their own Build
+  // menu entries in their headers.
   tool(
     'modoki_ota_publish',
     'Publish an OTA update for the open project (docs/ota-updates.md): builds FRESH from the ' +

@@ -284,7 +284,7 @@ describe('frameDriver — a superseded chain', () => {
 });
 
 /**
- * Stall-watchdog ESCALATION (#590 Phase 1 — docs/plans/ios-rendering-update-wedge.md). On iOS,
+ * Stall-watchdog ESCALATION (#590 Phase 1 — docs/ios-gpu-memory.md). On iOS,
  * a WebGL context loss makes WKWebView permanently stop delivering `requestAnimationFrame` —
  * JS/timers/the native bridge stay alive, paint just never resumes. Re-arming (the old repair)
  * cannot fix that, and used to retry forever while flooding the crash reporter. These tests drive

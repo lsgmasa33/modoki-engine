@@ -273,7 +273,7 @@ describe('canvas2DPool — GPU context loss', () => {
     expect(pool.consumeRebuildFlag(), 'read-and-clear — only once').toBe(false);
   });
 
-  // Adversarial review of #590 (docs/plans/ios-rendering-update-wedge.md): the FIRST
+  // Adversarial review of #590 (docs/ios-gpu-memory.md): the FIRST
   // `Application.init()` (in `createSlot`) used to be wrapped in the SAME rejecting `withTimeout`
   // the rebuild path uses — and that turned a merely SLOW cold bring-up (measured 8.5s on a
   // low-end GPU) into a NEVER: `slot.ready` rejected at the 8000ms bound while `initSlotApp` kept

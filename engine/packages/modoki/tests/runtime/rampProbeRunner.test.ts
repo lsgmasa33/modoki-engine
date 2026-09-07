@@ -381,7 +381,7 @@ describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () 
     });
   });
 
-  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this raw WebGL2 probe context was
+  // Phase 3 of #590 (docs/rendering.md): this raw WebGL2 probe context was
   // invisible to the shared GL/GPU-context counter until this phase.
   describe('GPU-context tracking (Phase 3 of #590)', () => {
     it('notes the context created, then destroyed on dispose()', () => {

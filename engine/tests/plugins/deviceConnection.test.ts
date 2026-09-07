@@ -269,6 +269,53 @@ describe('TcpLeaseTransport timeouts', () => {
     }
   });
 
+  /** ⚠️ **The deadline DEREGISTERS, and that is the property that makes this hand-rolled timeout
+   *  correct — nothing pinned it until now (#830).**
+   *
+   *  Every other test in this block asserts only that the caller is REJECTED. That half is
+   *  satisfied just as well by an implementation that rejects and leaves the request registered,
+   *  so all four stayed green over the difference. It matters because a long-lived link issuing
+   *  requests to a wedged device would grow `pending` without bound, each entry pinning its
+   *  resolve/reject closures until the socket happens to drop.
+   *
+   *  It is also the exact difference between this shape and `runtime/core/abandonment`'s
+   *  `withTimeout`, which the #830 ledger records these three engine sites as NOT using. That
+   *  helper cannot express this: its only late hook is `onSettled`, which fires when the wrapped
+   *  promise settles — and a device that never replies never settles it, so the entry would never
+   *  be reclaimed. `withTimeout` is for a promise you did NOT construct and cannot cancel; this
+   *  site owns its own registry and CAN, which is what its own docblock says to prefer. This test
+   *  is what turns that reasoning into a gate: migrate this to `withTimeout` and it goes red. */
+  it('a timed-out request is DEREGISTERED, not just rejected — the deadline reclaims it', async () => {
+    let serverSock: net.Socket | null = null;
+    const server = net.createServer((s) => { serverSock = s; }); // accepts, never replies
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as net.AddressInfo).port;
+    const t = new TcpLeaseTransport('127.0.0.1', port, { requestTimeoutMs: 40 });
+    // The registry is private on purpose — this reaches for it because the invariant IS internal
+    // bookkeeping, and there is no behavioural shadow of a leaked entry to observe instead.
+    const pending = () => (t as unknown as { pending: Map<string, unknown> }).pending;
+    try {
+      await t.open();
+      expect(pending().size, 'nothing should be registered before the first request').toBe(0);
+
+      // Three, not one: a leak is a COUNT, so three make a growing map visible as growth rather
+      // than as one ambiguous entry. (These are awaited in SEQUENCE and never overlap — an earlier
+      // version of this comment claimed they guarded an id COLLISION, which sequential sends
+      // cannot produce. A concurrent `Promise.all` is what would test that.)
+      await expect(t.send('echo', {})).rejects.toThrow(/timed out/i);
+      await expect(t.send('echo', {})).rejects.toThrow(/timed out/i);
+      await expect(t.send('echo', {})).rejects.toThrow(/timed out/i);
+
+      expect(pending().size, 'three requests timed out and their registry entries are still '
+        + 'there — the deadline rejected the caller without reclaiming anything, so a link to a '
+        + 'wedged device grows this map without bound').toBe(0);
+    } finally {
+      t.close();
+      (serverSock as net.Socket | null)?.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
   it('rejects open() on a silent (black-holed) connect via the connect-timeout', async () => {
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — non-routable, so the SYN is dropped.
     const t = new TcpLeaseTransport('192.0.2.1', 9, { connectTimeoutMs: 150 });

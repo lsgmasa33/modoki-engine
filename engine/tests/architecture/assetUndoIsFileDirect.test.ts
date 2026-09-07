@@ -3,8 +3,10 @@
  *
  *  WHAT THE FLAG DOES (undoManager.ts): it opts an action out of bumping the scene's edit-version.
  *  An asset edit changes a `.anim`/`.particle`/`.timeline`/`.spriteanim`/`.rig2d`/`.mat`/`.shader`/
- *  `.animset` file, never a scene entity — its unsaved state is the dirty-asset registry's job, or
- *  (for the Inspector's asset views, which write through `persistAssetEdit`) it is already on disk.
+ *  `.animset` file, never a scene entity — its unsaved state is the dirty-asset registry's job.
+ *  (It used to add "or, for the Inspector's asset views, it is already on disk". That second
+ *  case is gone as of #831: `persistAssetEdit` now PARKS into the same registry as everything
+ *  else instead of writing on every keystroke, so there is one answer here, not two.)
  *
  *  WHY A FALSELY-DIRTY SCENE IS NOT COSMETIC: it self-blocks the file-direct agent routes, makes
  *  `modoki_build` refuse over a scene nobody changed, and — since the Cmd+S/preview work — makes a

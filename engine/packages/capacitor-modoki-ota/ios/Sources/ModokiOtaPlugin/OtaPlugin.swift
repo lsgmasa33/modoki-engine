@@ -183,7 +183,7 @@ enum OtaPaths {
   /// write silently clobbers the first's change. OTA Phase 4 made this a real, not just
   /// theoretical, bug: the shell's own `confirmBoot` and a sub-game's `confirmBoot` can now
   /// fire close together in the same boot, and one's `confirmedBoots` increment was
-  /// observed lost on a real device (see docs/plans/mobile-ota-updates-plan.md). A single
+  /// observed lost on a real device (see docs/ota-updates.md). A single
   /// shared lock serializes every mutation within this process — the only writer of this
   /// file — which is all that's needed (no cross-process access to guard against).
   static let stateLock = NSLock()

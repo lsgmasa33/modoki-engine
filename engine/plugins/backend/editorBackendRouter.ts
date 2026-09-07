@@ -380,9 +380,55 @@ function stripUtf8Bom(buf: Buffer): Buffer {
   return (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) ? buf.subarray(3) : buf;
 }
 
+/** The EXACT bytes a JSON document write puts on disk — the single definition of that, because
+ *  two other places must agree with it byte-for-byte (#831).
+ *
+ *  ⚠️ **The trailing `\n` is load-bearing twice over.** Every committed asset JSON is authored
+ *  with one and `JSON.stringify` emits none, so each editor write silently stripped it and turned
+ *  a one-field edit into a diff carrying `\ No newline at end of file`. Measured 2026-09-06:
+ *  242 of 322 committed asset docs had already lost it this way. Existing files converge as they
+ *  are next written; they are deliberately NOT swept, since rewriting 242 files across `games/`
+ *  and `demos/` is a far larger blast radius than the defect.
+ *
+ *  ⚠️ **And the self-write guard fingerprints these bytes.** `markEditorWrite(abs, sha1(bytes))`
+ *  lets the watcher skip the editor's own save; a fingerprint that does not match what actually
+ *  lands FAILS OPEN — the change event comes back ~150ms later, is read as an EXTERNAL edit, and
+ *  `dropParkedWriteFor` discards whatever the human had parked. Silent data loss in the authoring
+ *  path. That is why the serialisation lives HERE and every caller and fingerprint reads it,
+ *  rather than each site spelling out `JSON.stringify(x, null, 2)` and being kept in step by hand.
+ *  `assetJsonBytesAgree.test.ts` asserts the writer and the fingerprints cannot drift. */
+export function assetJsonBytes(data: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(data, null, 2)}\n`);
+}
+
+/** The bytes for a document that a CLIENT-side writer also produces — **no trailing newline.**
+ *
+ *  ⚠️ **This is not an oversight, it is the other half of an agreement (#831 close-out).** A scene
+ *  is written from two places: this route (`/api/scene-mutate`) and the editor's own save, which
+ *  serialises client-side (`editor/scene/serialize.ts:905`, `JSON.stringify(scene, null, 2)`) and
+ *  POSTs the finished string to `/api/write-file`, written verbatim. If only ONE of the two gains
+ *  a newline, they fight: an agent's `mutate_scene` adds it, the human's next Cmd+S strips it, on
+ *  the repo's most-committed documents, forever. Every committed `.scene.json` ends `}` today.
+ *
+ *  Prefabs, layouts and the AI settings file are here for the same reason — #831 was asked to fix
+ *  the newline on ASSET documents, and changing bytes it was not asked to change is how a fix
+ *  becomes a churn generator.
+ *
+ *  **When #835 lands** (the client seam, 17 sites) this function and `serialize.ts` change
+ *  together, in one commit, and then it can merge back into {@link assetJsonBytes}. Until then the
+ *  split is the correct state and `sceneWriterBytesAgree` pins it. */
+export function sceneJsonBytes(data: unknown): Buffer {
+  return Buffer.from(JSON.stringify(data, null, 2));
+}
+
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
- *  local to avoid an import cycle.) */
-function writeJsonAtomic(absPath: string, data: unknown): void {
+ *  local to avoid an import cycle.)
+ *
+ *  ⚠️ Takes BYTES, not a document, so every caller must say which serialisation it owns —
+ *  {@link assetJsonBytes} (asset docs, trailing newline) or {@link sceneJsonBytes} (scenes,
+ *  prefabs, layouts: none, matching the client-side writer). It used to take the document and
+ *  choose for them, which silently gave the SCENE writer the asset newline. */
+function writeJsonAtomic(absPath: string, bytes: Buffer): void {
   // mkdir -p first, exactly as /api/write-file does. Without it /api/create-asset
   // threw a raw ENOENT 500 whenever the target folder did not exist yet — while
   // the sibling endpoint happily created it, so which of the two you called
@@ -390,7 +436,7 @@ function writeJsonAtomic(absPath: string, data: unknown): void {
   const dir = path.dirname(absPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmp = absPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.writeFileSync(tmp, bytes);
   fs.renameSync(tmp, absPath);
 }
 
@@ -1942,7 +1988,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // `scene`. Only the response's liveHint needs the await; it doesn't touch the file.
       if (changed > 0) {
         stripBackfilledEntityIds(scene, backfilledIds);
-        writeJsonAtomic(absPath, scene);
+        writeJsonAtomic(absPath, sceneJsonBytes(scene)); // scene: matches serialize.ts
       }
       // ── C7: "no entity matching {guid}" was a LIE. ──
       // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
@@ -2627,10 +2673,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // which is the whole reason the invalidation exists.
       const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
       if (selfWrite) {
-        const bytes = Buffer.from(JSON.stringify(out, null, 2));
+        const bytes = assetJsonBytes(out);
         ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
       }
-      writeJsonAtomic(abs, out);
+      writeJsonAtomic(abs, assetJsonBytes(out));
       return json({ ok: true, saved: true, warnings, path: assetPath });
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -2657,12 +2703,13 @@ async function describeUnresolvedAgainstLiveWorld(
       // parked for that path: the live-cache entry AND the `dirtyAssetPaths` entry both vanish, so
       // a later `save_all` writes nothing and reports no error. Silent data loss in the authoring
       // path — an edit made in the second after create_asset, gone. Measured ~500ms end-to-end.
-      // Fingerprint the bytes `writeJsonAtomic` will actually write (JSON.stringify(x, null, 2),
-      // no trailing newline); a mismatch here fails OPEN and silently restores the bug.
+      // Fingerprint the bytes `writeJsonAtomic` will actually write — via `assetJsonBytes`, the
+      // one definition of them, so this cannot drift from the writer; a mismatch here fails OPEN
+      // and silently restores the bug.
       // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
       // so there is no stale cached def the invalidation needs to clear.
-      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(Buffer.from(JSON.stringify(data, null, 2))).digest('hex'));
-      writeJsonAtomic(abs, data);
+      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(assetJsonBytes(data)).digest('hex'));
+      writeJsonAtomic(abs, assetJsonBytes(data));
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
     } catch (e) {
@@ -3163,7 +3210,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const dir = layoutsDir();
       fs.mkdirSync(dir, { recursive: true });
       const data = typeof b.content === 'string' ? JSON.parse(b.content) : b.content;
-      writeJsonAtomic(path.join(dir, `${name}.layout.json`), data);
+      writeJsonAtomic(path.join(dir, `${name}.layout.json`), sceneJsonBytes(data)); // layout: bytes #831 was not asked to change
       return json({ ok: true, name });
     } catch (e) { return json({ error: String(e) }, 500); }
   }
@@ -3201,7 +3248,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const next = { ...readAiSettings(), ...patch };
       const dir = path.join(ctx.projectRoot, '.modoki');
       fs.mkdirSync(dir, { recursive: true });
-      writeJsonAtomic(aiSettingsFile(), next);
+      writeJsonAtomic(aiSettingsFile(), sceneJsonBytes(next)); // settings: as above
       return json(next);
     } catch (e) { return json({ error: String(e) }, 500); }
   }

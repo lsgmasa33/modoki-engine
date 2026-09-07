@@ -55,7 +55,7 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
 
   // Throws in a WebGL-less environment (jsdom) — the caller catches.
   const renderer = new THREE.WebGLRenderer({ antialias: true });
-  // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+  // Fix 3 of #590's adversarial review (docs/rendering.md): this is
   // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
   // context, and an editor session (SceneView + GameView + this preview + ModelPreview +
   // ShaderPreview all open) is exactly the surface that approaches `SOFT_CONTEXT_LIMIT`. Noted

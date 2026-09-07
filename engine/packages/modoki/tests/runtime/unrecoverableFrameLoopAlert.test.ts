@@ -1,5 +1,5 @@
 /** `installUnrecoverableFrameLoopAlert` unit tests (modoki package) — Phase 2 of
- *  docs/plans/ios-rendering-update-wedge.md. Drives a real outage through `frameDriver`'s own
+ *  docs/ios-gpu-memory.md. Drives a real outage through `frameDriver`'s own
  *  watchdog (never-delivering rAF + the manual clock, same machinery `frameDriver.test.ts`'s
  *  "stall watchdog escalation" describe block uses) rather than inventing a fake trigger, so
  *  these tests exercise the actual `onFrameLoopUnrecoverable` wiring end to end. */

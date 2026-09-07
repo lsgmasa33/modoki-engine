@@ -227,7 +227,7 @@ function variantPath(manifestPath: string, ext: 'wgsl' | 'glsl'): string {
 // redo) used to force exactly this: a fresh GL compile on every one of those.
 // `compileHighShaderGpuProgram(...)`, by contrast, already returns `GpuProgram.from({...})` —
 // Pixi's own content cache — so the GPU path was never at risk of the stranded-program leak (see
-// `docs/plans/ios-rendering-update-wedge.md`'s "#716 ... GL-only" note, added in this same body of
+// `docs/rendering.md`'s "#716 ... GL-only" note, added in this same body of
 // work). This module cache still earns its place on the GPU path too, though: it skips the
 // manifest+body FETCH and the string assembly (`customBit`, uniform/sampler block generation) on
 // every call, not just the program compile — that work is backend-agnostic and worth memoizing

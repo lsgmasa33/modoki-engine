@@ -265,7 +265,7 @@ describe('deviceCaps — GL facts', () => {
     expect(caps.compressed).toEqual({ astc: false, etc2: false, s3tc: false });
   });
 
-  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this throwaway context was
+  // Phase 3 of #590 (docs/rendering.md): this throwaway context was
   // invisible to the shared GL/GPU-context counter until this phase — see
   // `gpuContextTracking.test.ts` for the counter's own unit tests.
   it('notes the throwaway context created, then destroyed — net zero once the probe finishes', async () => {

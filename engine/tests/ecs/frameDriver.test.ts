@@ -244,7 +244,7 @@ describe('frameDriver', () => {
 });
 
 /**
- * Stall-watchdog ESCALATION (#590 Phase 1 — docs/plans/ios-rendering-update-wedge.md), exercised
+ * Stall-watchdog ESCALATION (#590 Phase 1 — docs/ios-gpu-memory.md), exercised
  * again here through the PUBLIC `@modoki/engine/runtime` barrel (the other required test surface)
  * rather than the package's internal module path. See
  * `engine/packages/modoki/tests/runtime/frameDriver.test.ts` for the fuller suite (including the

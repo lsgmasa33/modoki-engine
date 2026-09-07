@@ -1,4 +1,4 @@
-/** GPU-memory report — Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md).
+/** GPU-memory report — Phase 3 of #590 (docs/ios-gpu-memory.md).
  *
  *  ── WHY: THE ROOT CAUSE, AND WHERE IT ISN'T ───────────────────────────────────────────────────
  *  A live syslog capture found #590's actual cause: WebKit's separate `com.apple.WebKit.GPU` XPC
@@ -92,8 +92,9 @@
  *  ── `totalBytes` IS ENGINE-TRACKED BYTES, NOT PROCESS GPU MEMORY — DO NOT READ IT AS THAT ──────
  *  `totalBytes` (`gpu3dBytes + gpu2dBytes`) is the sum of what THIS module tracks: 3D renderer
  *  resources (`renderer.info.memory.total`) plus 2D canvas textures reachable from a live
- *  `canvas2DPool` slot. It excludes PixiJS's own geometry/vertex buffers, text meshes, and every
- *  WebKit-side allocation — IOSurface/compositing backing stores — which is where the
+ *  `canvas2DPool` slot. `totalBytes` excludes PixiJS's own geometry/vertex buffers and text
+ *  meshes — those are counted separately in `geometryBytes2D` (#832), deliberately NOT folded in
+ *  here — and every WebKit-side allocation — IOSurface/compositing backing stores — which is where the
  *  overwhelming majority of the GPU PROCESS's memory actually lives. Measured on an iPhone 8 on
  *  2026-09-04: this reported **15.65 MiB** of tracked bytes at the exact moment
  *  `com.apple.WebKit.GPU` was jetsammed at **322 MB** — the engine sees roughly **5%** of what the
@@ -187,27 +188,75 @@ export function estimatePixiTextureBytes(src: PixiTextureSourceLike): number {
   return bytes;
 }
 
+// ── 2D (Pixi) geometry byte estimation ────────────────────────────────────────────────────────
+
+/** The GPU-backed vertex/index buffer behind a Pixi `Geometry`. Duck-typed for the same reason
+ *  `PixiTextureSourceLike` is — this module stays dependency-free from `pixi.js`. `data` is the
+ *  live typed-array view (present for a CPU-resident buffer); `descriptor.size` is the fallback
+ *  for a buffer whose backing array has already been dropped (a GPU-only upload). */
+interface PixiBufferLike {
+  uid?: number;
+  data?: { byteLength?: number } | null;
+  descriptor?: { size?: number } | null;
+}
+
+/** The subset of Pixi `Geometry` this module reads. `buffers` is Pixi 8's own flattened list of
+ *  every GPU buffer the geometry owns — attributes AND the index buffer are already in there
+ *  (verified against 8.19.0: a 2-attribute + indexed geometry reports `buffers.length === 3`,
+ *  `buffers.includes(indexBuffer) === true`), so summing `buffers` is the whole allocation; adding
+ *  the index buffer again on top would double it. */
+interface PixiGeometryLike {
+  uid?: number;
+  buffers?: PixiBufferLike[] | null;
+}
+
 /** A Pixi display object as far as this walk needs it — any object with a `.texture.source`
  *  (Sprite, NineSliceSprite, TilingSprite, or a Mesh with `.texture` set, e.g. the MTSDF text
- *  mesh) and/or `.children`. Duck-typed for the same reason `PixiTextureSourceLike` is. */
+ *  mesh), a `.geometry` (a Mesh's vertex/index buffers — the MTSDF text mesh again, this time for
+ *  its GEOMETRY rather than its shared atlas texture), and/or `.children`. Duck-typed for the
+ *  same reason `PixiTextureSourceLike` is. */
 interface PixiDisplayObjectLike {
   texture?: { source?: (PixiTextureSourceLike & { uid?: number }) | null } | null;
+  geometry?: PixiGeometryLike | null;
   children?: PixiDisplayObjectLike[] | null;
+}
+
+/** One buffer's resident bytes: the live typed array when present, else the descriptor's declared
+ *  size, else 0 — never silently skip a buffer whose `data` was already released, that would
+ *  understate exactly the churny mesh this exists to catch. */
+function bufferBytes(buf: PixiBufferLike): number {
+  return buf.data?.byteLength ?? buf.descriptor?.size ?? 0;
 }
 
 /** Walk `root` and every descendant, adding each distinct texture SOURCE (deduped by `uid` — a
  *  texture shared by several display objects, like the MTSDF atlas reused by every glyph mesh,
- *  must count once) into `into`. Iterative, not recursive — a Pixi container tree is shallow in
- *  practice, but nothing about the shape guarantees it. */
-function collectPixiTextureSources(
+ *  must count once) into `textures`, and each distinct GEOMETRY (deduped by geometry `uid`, into
+ *  `geometries`) along with every distinct BUFFER it owns (deduped by buffer `uid`, into
+ *  `geometryBuffers` — see that param's doc for why this is a SEPARATE dedup key from the
+ *  geometry). Iterative, not recursive — a Pixi container tree is shallow in practice, but
+ *  nothing about the shape guarantees it. One traversal for both, rather than walking the same
+ *  tree twice. */
+function collectPixiRenderResources(
   root: PixiDisplayObjectLike,
-  into: Map<number, PixiTextureSourceLike>,
+  textures: Map<number, PixiTextureSourceLike>,
+  geometries: Map<number, PixiGeometryLike>,
+  /** Deduped by BUFFER uid, not geometry uid — Pixi's batcher SHARES one buffer across several
+   *  geometries, so a geometry-level dedup double-counts every buffer it shares. The GPU
+   *  allocation is per buffer; the geometry is just a view over one or more of them. */
+  geometryBuffers: Map<number, PixiBufferLike>,
 ): void {
   const stack: PixiDisplayObjectLike[] = [root];
   while (stack.length > 0) {
     const obj = stack.pop()!;
     const src = obj.texture?.source;
-    if (src && typeof src.uid === 'number' && !into.has(src.uid)) into.set(src.uid, src);
+    if (src && typeof src.uid === 'number' && !textures.has(src.uid)) textures.set(src.uid, src);
+    const geo = obj.geometry;
+    if (geo && typeof geo.uid === 'number' && !geometries.has(geo.uid)) {
+      geometries.set(geo.uid, geo);
+      for (const buf of geo.buffers ?? []) {
+        if (typeof buf.uid === 'number' && !geometryBuffers.has(buf.uid)) geometryBuffers.set(buf.uid, buf);
+      }
+    }
     if (obj.children) for (const c of obj.children) stack.push(c);
   }
 }
@@ -272,6 +321,49 @@ export interface GpuMemoryReport {
    *  "impossible" accounting, it is "left the tracked set" counted honestly per departure while
    *  "entered the tracked set" is counted once per texture, ever. */
   cumulativeTextureReleases2D: number;
+  /** Sum of every DISTINCT geometry BUFFER (vertex + index) reachable from a live `canvas2DPool`
+   *  slot's display tree — deduped by BUFFER `uid`, not geometry uid. This is deliberately its
+   *  OWN field, not folded into `gpu2dBytes`/`totalBytes`: those two fields already had a
+   *  documented meaning before this existed, and a caller diffing a step change must be able to
+   *  tell "we started counting a new thing" from "the tracked thing actually grew". See the
+   *  module header on #590's text-mesh churn — this is the field that makes that GEOMETRY
+   *  reallocation visible, where `gpu2dBytes` (textures only) could not. */
+  geometryBytes2D: number;
+  /** Distinct 2D geometries this report walked, after cross-slot dedup by geometry `uid` — NOT
+   *  the same count as the number of distinct buffers behind `geometryBytes2D` (Pixi's batcher
+   *  shares one buffer across several geometries, so this can be higher than the buffer count). */
+  geometryCount2D: number;
+  /** Cumulative, monotonic — derived from the largest live geometry `uid` seen, NOT from a Set of
+   *  every uid ever seen. `uid`s are dense and strictly increasing per `pixi.js`'s own
+   *  `uid('geometry')` counter, so the largest one observed is a proxy for "how many have ever been
+   *  allocated". #590 measured ~2,700 text-mesh rebuilds/min, and a never-forgetting Set (the
+   *  texture-churn pattern above) would leak a few thousand entries a minute INSIDE the leak
+   *  detector — so the bound is the point, not an optimisation.
+   *
+   *  ⚠️ **This is a LOWER BOUND, not a count.** Only geometries that are live at a sample INSTANT
+   *  are observable, and the sampler runs every `SAMPLE_INTERVAL_MS`; a geometry created and
+   *  destroyed entirely between two samples is never seen by anything. It is nearly tight for the
+   *  case it was built for — under a text rebuild the newest geometry IS the current text mesh, so
+   *  it is live when the sample lands and the high-water tracks the allocator closely — and it
+   *  degrades badly for genuinely transient geometry that never survives to a sample boundary. Read
+   *  a rise as "at least this many"; never quote it as an allocation total.
+   *
+   *  ⚠️ **It also over-counts in one direction, so do not read it as OUR geometry alone.** The
+   *  `uid('geometry')` counter is advanced by every `Geometry` Pixi allocates, including ones
+   *  outside the walked tree — `DefaultBatcher`'s own `BatchGeometry`, pooled
+   *  `GraphicsContextRenderData`. Those raise this field without moving `geometryCount2D`, so
+   *  concurrent `Graphics` churn inflates it. `BigPool` reuse bounds the effect by peak concurrent
+   *  contexts rather than per frame, and the magnitude here is UNMEASURED.
+   *
+   *  ⚠️ **Verify a change here by PERTURBATION.** Drive a KNOWN number of rebuilds and check this
+   *  moves by the expected amount — and hold `Graphics` activity still while you do, per the
+   *  over-count above. A non-zero figure cannot distinguish "counting geometry" from
+   *  "counting something", which is how the module ended up blind to geometry in the first place. */
+  cumulativeGeometryCreates2D: number;
+  /** Cumulative, monotonic — geometry `uid`s that were live in a PREVIOUS sample and are no longer
+   *  live in this one. Bounded the same way `cumulativeTextureReleases2D` is: the comparison set
+   *  is only the PREVIOUS sample's live uids (small), never a full history. */
+  cumulativeGeometryReleases2D: number;
 }
 
 /** Distinct 2D texture-source `uid`s ever observed live, across every call to
@@ -286,6 +378,19 @@ let previousLiveTextureUids = new Set<number>();
 let cumulativeTextureCreates2D = 0;
 let cumulativeTextureReleases2D = 0;
 
+/** The largest geometry `uid` in the PREVIOUS sample's live set — re-baselined every sample, not a
+ *  running maximum, so the name says "live" rather than "ever". It is the bounded stand-in for a
+ *  `seenTextureUidsEver`-style Set (see `cumulativeGeometryCreates2D` for why a Set is unsafe
+ *  here). Monotonicity of the exported counter comes from the `Math.max` clamp at the call site,
+ *  NOT from this variable — which is what lets a `uid`-counter reset re-baseline it downward
+ *  harmlessly. `-1` means "nothing observed yet". */
+let highestLiveGeometryUid = -1;
+/** The live 2D geometry-uid set as of the PREVIOUS call — mirrors `previousLiveTextureUids`, but
+ *  for geometry releases. Bounded by the live set size, not by history. */
+let previousLiveGeometryUids = new Set<number>();
+let cumulativeGeometryCreates2D = 0;
+let cumulativeGeometryReleases2D = 0;
+
 /** Walk the live registries and compute one report. Not cheap enough to call every frame — see
  *  `SAMPLE_INTERVAL_MS` below — but cheap enough for the 1-2s cadence this module uses.
  *
@@ -295,11 +400,16 @@ let cumulativeTextureReleases2D = 0;
  *  IS a sample as far as churn tracking is concerned. */
 export function computeGpuMemoryReport(): GpuMemoryReport {
   const globalSeen = new Map<number, PixiTextureSourceLike>();
+  const globalGeometries = new Map<number, PixiGeometryLike>();
+  const globalGeometryBuffers = new Map<number, PixiBufferLike>();
   const perSlotBytes2D: Slot2DMemory[] = [];
 
   for (const slot of getSlotsForMemoryReport()) {
     const localSeen = new Map<number, PixiTextureSourceLike>();
-    collectPixiTextureSources(slot.container, localSeen);
+    // Geometry has no per-slot attribution field today (`Slot2DMemory` is texture-only), so its
+    // maps are the GLOBAL ones directly — the walker's own uid-dedup makes accumulating straight
+    // into them across every slot equivalent to a per-slot pass followed by a merge.
+    collectPixiRenderResources(slot.container, localSeen, globalGeometries, globalGeometryBuffers);
     let slotBytes = 0;
     for (const [uid, src] of localSeen) {
       slotBytes += estimatePixiTextureBytes(src);
@@ -311,6 +421,9 @@ export function computeGpuMemoryReport(): GpuMemoryReport {
 
   let gpu2dBytes = 0;
   for (const src of globalSeen.values()) gpu2dBytes += estimatePixiTextureBytes(src);
+
+  let geometryBytes2D = 0;
+  for (const buf of globalGeometryBuffers.values()) geometryBytes2D += bufferBytes(buf);
 
   // Cumulative 2D-texture churn — see the module header. A NEW uid (never seen live before) is a
   // create; a uid that was live LAST call but is absent THIS call is a release. Asymmetric ON
@@ -329,6 +442,28 @@ export function computeGpuMemoryReport(): GpuMemoryReport {
     if (!currentUids.has(uid)) cumulativeTextureReleases2D++;
   }
   previousLiveTextureUids = currentUids;
+
+  // Cumulative 2D-geometry churn — same shape as the texture churn above, but the "ever seen"
+  // side is a high-water mark instead of a Set (see `cumulativeGeometryCreates2D`'s field doc —
+  // #590's ~2,700 rebuilds/min would make a never-forgetting Set itself a leak).
+  const currentGeometryUids = new Set(globalGeometries.keys());
+  let highestThisSample = -1;
+  for (const uid of currentGeometryUids) if (uid > highestThisSample) highestThisSample = uid;
+  // A non-empty live set whose highest uid DROPPED below the running high-water mark means
+  // `pixi.js`'s dense `uid('geometry')` counter went backwards — it cannot do that on its own, so
+  // this is a counter reset (a test's `resetUids()`, in practice). Either way (growth or reset),
+  // re-baseline to what THIS sample actually saw; `cumulativeGeometryCreates2D` below is protected
+  // from the reset case by its own `Math.max`, so it never emits a negative delta.
+  if (currentGeometryUids.size > 0) highestLiveGeometryUid = highestThisSample;
+  // The clamp — not the re-baseline above — is what makes the exported counter monotonic. Both a
+  // reset and an empty sample therefore cost only STALLED growth, never a decrease: after a reset
+  // this field holds its old value until the fresh counter climbs past the previous peak. That is
+  // the honest trade for a bounded mechanism, and `resetUids()` is test-only in this repo anyway.
+  cumulativeGeometryCreates2D = Math.max(cumulativeGeometryCreates2D, highestLiveGeometryUid + 1);
+  for (const uid of previousLiveGeometryUids) {
+    if (!currentGeometryUids.has(uid)) cumulativeGeometryReleases2D++;
+  }
+  previousLiveGeometryUids = currentGeometryUids;
 
   const renderer = getActiveRenderer() as {
     info?: { memory?: { geometries?: number; textures?: number; total?: number } };
@@ -350,6 +485,10 @@ export function computeGpuMemoryReport(): GpuMemoryReport {
     perSlotBytes2D,
     cumulativeTextureCreates2D,
     cumulativeTextureReleases2D,
+    geometryBytes2D,
+    geometryCount2D: globalGeometries.size,
+    cumulativeGeometryCreates2D,
+    cumulativeGeometryReleases2D,
   };
 }
 
@@ -395,18 +534,28 @@ function fractionalChange(before: number, after: number): number {
 export const CHURN_EVENTS_THRESHOLD = 4;
 
 /** Should THIS sample get a console-ring line? True on the very first sample, on a live-context
- *  count change (any leaked/evicted context matters, however small), on a >10% total-bytes swing,
- *  on enough create/destroy CHURN since the last log (even with a flat live view — see the module
- *  header), or once the heartbeat interval has elapsed since the last logged line. */
+ *  count change (any leaked/evicted context matters, however small), on a >10% swing in either
+ *  total bytes or 2D GEOMETRY bytes (the latter is NOT part of `totalBytes` — see
+ *  `geometryBytes2D`), on enough create/destroy CHURN since the last log across contexts,
+ *  textures AND geometry (even with a flat live view — see the module header), or once the
+ *  heartbeat interval has elapsed since the last logged line. */
 function shouldLog(prev: GpuMemoryReport | null, next: GpuMemoryReport): boolean {
   if (!prev) return true;
   if (prev.liveGpuContexts !== next.liveGpuContexts) return true;
   if (fractionalChange(prev.totalBytes, next.totalBytes) >= CHANGE_FRACTION) return true;
+  if (fractionalChange(prev.geometryBytes2D, next.geometryBytes2D) >= CHANGE_FRACTION) return true;
   const churnSinceLastLog =
     (next.totalGpuContextsCreated - prev.totalGpuContextsCreated) +
     (next.totalGpuContextsDestroyed - prev.totalGpuContextsDestroyed) +
     (next.cumulativeTextureCreates2D - prev.cumulativeTextureCreates2D) +
-    (next.cumulativeTextureReleases2D - prev.cumulativeTextureReleases2D);
+    (next.cumulativeTextureReleases2D - prev.cumulativeTextureReleases2D) +
+    // ⚠️ Geometry MUST be in this sum, and it is the case the gate was blindest to. #590's actual
+    // driver is text-mesh rebuild churn, where the MTSDF atlas is shared and stable (no texture
+    // churn), the context count never moves, and `totalBytes` excludes `geometryBytes2D` by
+    // design — so before this term the driving signal reached the ring only on the 30 s
+    // heartbeat, at 1/20th the resolution of the thing it was built to catch.
+    (next.cumulativeGeometryCreates2D - prev.cumulativeGeometryCreates2D) +
+    (next.cumulativeGeometryReleases2D - prev.cumulativeGeometryReleases2D);
   if (churnSinceLastLog >= CHURN_EVENTS_THRESHOLD) return true;
   return next.sampleTimeMs - lastLoggedAtMs >= HEARTBEAT_MS;
 }
@@ -429,6 +578,13 @@ function sampleGpuMemory(): void {
   setCounter('gpu.totalContextsDestroyed', report.totalGpuContextsDestroyed);
   setCounter('gpu.cumulativeTextureCreates2D', report.cumulativeTextureCreates2D);
   setCounter('gpu.cumulativeTextureReleases2D', report.cumulativeTextureReleases2D);
+  setCounter('gpu.geometryBytes2D', report.geometryBytes2D);
+  setCounter('gpu.geometryCount2D', report.geometryCount2D);
+  // ⚠️ The CHURN pair matters more than the two gauges above on this path, and charting only the
+  // gauges reproduces the exact failure this module's header exists to warn about: a live snapshot
+  // reads flat while the leak grows. Both are set for the same reason the texture twins are.
+  setCounter('gpu.cumulativeGeometryCreates2D', report.cumulativeGeometryCreates2D);
+  setCounter('gpu.cumulativeGeometryReleases2D', report.cumulativeGeometryReleases2D);
 
   // Console-ring channel — ALWAYS on (see module header). `console.log` reaches the ring through
   // whatever has patched `console.*` (installConsoleRing in the shipped app, or nothing in a
@@ -461,6 +617,8 @@ function sampleGpuMemory(): void {
       `tracked=${formatMiB(report.totalBytes)}MiB ` +
       `contexts=${report.liveGpuContexts}(created=${report.totalGpuContextsCreated},destroyed=${report.totalGpuContextsDestroyed}) ` +
       `tex2dChurn(created=${report.cumulativeTextureCreates2D},released=${report.cumulativeTextureReleases2D}) ` +
+      `geom2d=${formatMiB(report.geometryBytes2D)}MiB(${report.geometryCount2D}geo) ` +
+      `geom2dChurn(created=${report.cumulativeGeometryCreates2D},released=${report.cumulativeGeometryReleases2D}) ` +
       `rendererInfo(geom=${report.rendererGeometries ?? 'n/a'},tex=${report.rendererTextures ?? 'n/a'})` +
       (top ? ` top2dSlot(entity=${top.entityId},${formatMiB(top.bytes)}MiB)` : '') +
       suppressedSuffix,
@@ -493,7 +651,8 @@ export function getGpuMemoryReport(): GpuMemoryReport | null {
 }
 
 /** Test-only: drop all sampler state, including the cached report, log-throttle bookkeeping, and
- *  the cumulative 2D-texture churn tally (`computeGpuMemoryReport`'s module state). */
+ *  the cumulative 2D-texture and 2D-geometry churn tallies (`computeGpuMemoryReport`'s module
+ *  state). */
 export function __resetGpuMemoryReportForTest(): void {
   stopGpuMemorySampling();
   lastReport = null;
@@ -504,6 +663,10 @@ export function __resetGpuMemoryReportForTest(): void {
   previousLiveTextureUids = new Set();
   cumulativeTextureCreates2D = 0;
   cumulativeTextureReleases2D = 0;
+  highestLiveGeometryUid = -1;
+  previousLiveGeometryUids = new Set();
+  cumulativeGeometryCreates2D = 0;
+  cumulativeGeometryReleases2D = 0;
 }
 
 // Self-register into the provider slot `rendering/useGameLoop.ts` (L2) reaches through — this

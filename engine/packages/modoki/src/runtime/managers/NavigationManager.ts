@@ -6,8 +6,11 @@
  *  owns the actual transitions.
  *
  *  Exposes built-in actions (`engine.loadScene`, `engine.navigateBack`) every
- *  game inherits, and a `canGoBack` read source so a Back button can bind its
- *  disabled state. Registered once at core startup (app scope → engine
+ *  game inherits, and a `canGoBack` read source a Back button binds through
+ *  `UIBinding.visibleBinding` — so the button HIDES at the root. ⚠️ Not a disabled
+ *  state: the engine has no read-source-driven `disabled` (a read source reaches a UI
+ *  element via `visibleBinding`/`textBinding` only, `ui/bindingResolver.ts`), and this
+ *  docblock claimed one for months. Registered once at core startup (app scope → engine
  *  infrastructure, alive the whole session, independent of scene or game).
  *
  *  Only this manager's own methods record history — direct `sceneManager.loadScene`

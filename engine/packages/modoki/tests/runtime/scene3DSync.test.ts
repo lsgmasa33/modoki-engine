@@ -405,7 +405,7 @@ describe('scene3DSync', () => {
       expect(instances[0].forceWebGL).toBe(true);
     });
 
-    // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): the shared GL/GPU-context
+    // Phase 3 of #590 (docs/rendering.md): the shared GL/GPU-context
     // counter (`core/gpuContextTracking.ts`) must be noted exactly once per renderer that
     // actually reaches a live state — never for a fallback attempt that was disposed before it
     // got there, and never twice for the same context on a repeated `dispose()`.

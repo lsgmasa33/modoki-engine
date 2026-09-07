@@ -61,6 +61,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { deriveUnscannedRoots, expectedLedgerRows } from '../helpers/unscannedRoots';
 
 const REPO = path.resolve(__dirname, '../../..');
 
@@ -73,10 +74,17 @@ const REPO = path.resolve(__dirname, '../../..');
  *  detector over the unscanned roots returns the entries below, so "in the tree" was never what was
  *  verified.
  *
- *  These are PINNED rather than migrated, deliberately. Moving them onto the shared helper changes
- *  behaviour in the Electron main process and in the device-connection path — code whose failure
- *  modes need a physical device to exercise — and whether engine runtime code SHOULD be imported
- *  there at all is a design question, not a refactor. Filed on #830.
+ *  These are PINNED rather than migrated, and the reason is now MEASURED rather than deferred
+ *  (2026-09-07). It was "a design question, not a refactor — whether engine runtime code should be
+ *  imported into the Electron main process at all". That import turns out to be a non-issue:
+ *  `./runtime/core/abandonment` is a dedicated deep export of a single file with ZERO imports, so
+ *  nothing browser-oriented rides along. The real answer is that **migrating them would be a
+ *  regression.** All five call sites behind these three rows construct their own promise and own
+ *  the registry that resolves it, so their deadline reclaims — `pending.delete(id)`,
+ *  `socket.destroy()`, `ws.close()`. `withTimeout` cannot: its only late hook is `onSettled`,
+ *  which fires when the wrapped promise settles, and a device that never replies never settles it.
+ *  The entry would leak for the life of the link. See the `deadline RECLAIMS as well as rejects`
+ *  test below, which turns that from prose into a gate.
  *
  *  What the pin buys: a FOURTH instance fails immediately instead of joining a silent population.
  *  ⚠️ It also goes red when one of these is legitimately FIXED — that is intended. Removing an
@@ -95,27 +103,19 @@ const SCAN_DIRS = [
   'engine/app',
 ];
 
-/** The roots this guard does NOT scan — **DERIVED, not hand-written (#830 review).**
+/** The roots this guard does NOT scan, and the ledger rows whose root this checkout actually has.
  *
- *  ⚠️ This was a hand-listed four (`plugins`, `electron`, `tools`, `toolchain`) under a test titled
- *  "the roots this guard does NOT scan", which is a universal claim — so the ledger below was
- *  vouching for a subset while reading as though it covered everything. Exactly the defect this
- *  whole change is about, in the fix for it.
- *
- *  Now: every top-level source root in the repo, minus the ones SCAN_DIRS already covers. A new
- *  root is in the remainder the day it is created, without anyone remembering. */
-const UNSCANNED_ROOTS: readonly string[] = (() => {
-  const covered = (rel: string) => SCAN_DIRS.some((d) => rel === d || rel.startsWith(`${d}/`));
-  const roots = new Set<string>();
-  for (const { rel } of repoFiles({ match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 500 })) {
-    const parts = rel.split('/');
-    // Depth 2 for the multi-project roots (games/<id>, demos/<id>, engine/<area>), depth 1 for a
-    // flat one like `site/`. Both are compared against SCAN_DIRS' own repo-relative prefixes.
-    const root = parts.length > 2 ? parts.slice(0, 2).join('/') : parts[0];
-    if (!covered(root) && !SCAN_DIRS.some((d) => d.startsWith(`${root}/`))) roots.add(root);
-  }
-  return [...roots].sort();
-})();
+ *  Both DERIVED, from the ONE definition of what a "root" is — see
+ *  `tests/helpers/unscannedRoots.ts`. The twin guard `livenessTokenIsShared` had the unfiltered
+ *  form and went RED inside the public engine snapshot, which ships no `games/`: its ledger was
+ *  absolute while its root list was computed from disk. **This guard was not red — all three of
+ *  its rows sit under `engine/`, which the snapshot does ship — so the fix here is about the
+ *  ASYMMETRY, not a live failure.** A future row under `games/` would reproduce it exactly, and
+ *  nothing would have said which of the two twins was hardened. */
+const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
+
+const expectedOutsideRows = (): string[] =>
+  expectedLedgerRows(KNOWN_OUTSIDE_SCAN_DIRS, UNSCANNED_ROOTS);
 
 /** The helper itself IS the implementation — its own timer is the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/abandonment.ts');
@@ -215,7 +215,68 @@ describe('the shared abandonment helper is the only timeout implementation (#801
       + 'the family (#801) has a fresh instance in a root this guard does not police — decide '
       + 'deliberately whether it migrates onto the shared helper or joins the ledger with a '
       + 'reason. One DISAPPEARING is good news: drop its ledger entry in the same commit.')
-      .toEqual([...KNOWN_OUTSIDE_SCAN_DIRS].sort());
+      .toEqual(expectedOutsideRows());
+  });
+
+  /** ⚠️ **Why the three ledger sites are NOT migrated — the reason, made checkable (#830).**
+   *
+   *  Investigated 2026-09-07, and the answer is stronger than the ledger's original "it is a
+   *  design question": migrating them would be a REGRESSION. Every one of the five call sites
+   *  behind those three rows CONSTRUCTS the promise it bounds and owns the registry that resolves
+   *  it, so its deadline can — and does — reclaim: `pending.delete(id)`, `socket.destroy()`,
+   *  `ws.close()`. `withTimeout` is for the opposite case, a promise you did not construct and
+   *  cannot cancel; its only late hook is `onSettled`, which fires when the wrapped promise
+   *  settles. A device that never replies never settles it, so the registry entry would never be
+   *  reclaimed and a link to a wedged device would grow `pending` without bound. The helper's own
+   *  header already says this — "if a real cancellation primitive becomes available, the right fix
+   *  is to wire an `AbortSignal` at that call site, not to lean harder on this file". These sites
+   *  have one.
+   *
+   *  So this asserts the property that EARNS the exemption, rather than leaving it as prose a
+   *  future session has to re-derive: a timer that rejects must also reclaim, in the same body.
+   *  `deviceConnection.test.ts` pins the same invariant behaviourally for the one site reachable
+   *  over a real socket; this covers all five statically, including the two that would need an
+   *  Electron window or a WebSocket server to drive. */
+  it('every ledger site\'s deadline RECLAIMS as well as rejects — the exemption\'s premise', () => {
+    // Reclaim always precedes the reject in these bodies, so the window up to the rejector is the
+    // right one to search — the same window `timerRejects` uses to find them in the first place.
+    const RECLAIM = /\.(?:delete|destroy|close|clear)\s*\(/;
+    const bodies: Array<{ file: string; body: string }> = [];
+
+    for (const row of expectedOutsideRows()) {
+      const rel = row.split(' :: ')[0];
+      const src = readScannedSource(path.join(REPO, rel)).code;
+      const rejectors = new Set([...src.matchAll(REJECTORS)].map((m) => m[1]));
+      for (const rejector of rejectors) {
+        const re = new RegExp(
+          `setTimeout\\(\\s*(?:async\\s*)?\\(\\s*\\)\\s*=>([\\s\\S]{0,2000}?)\\b${esc(rejector)}\\s*\\(`,
+          'g',
+        );
+        for (const m of src.matchAll(re)) bodies.push({ file: rel, body: m[1] });
+      }
+    }
+
+    // Non-vacuity, and it is the whole point here: a regex that stops matching would make the
+    // assertion below pass having read nothing, which is #830's own defect one level up. Five
+    // measured 2026-09-07 (main.ts requestRenderer; deviceCdp connect + send; deviceConnection
+    // open + rpc). A `>=` floor so a legitimate new bounded request does not go red for existing.
+    expect(bodies.length, 'the ledger-site timer scan found almost nothing — it has broken')
+      .toBeGreaterThanOrEqual(5);
+
+    const noReclaim = bodies
+      .filter((b) => !RECLAIM.test(b.body))
+      .map((b) => `${b.file}: ${b.body.trim().replace(/\s+/g, ' ').slice(0, 90)}…`);
+
+    expect(noReclaim, [
+      'A ledger site has a deadline that rejects its caller WITHOUT reclaiming the request it was',
+      'bounding. That is the whole reason these three files are exempt from the shared helper',
+      'rather than migrated onto it — they reclaim at the deadline and `withTimeout` cannot.',
+      'If the reclaim is genuinely unnecessary here, say why and move the row to a migration;',
+      'do not weaken this check, because without the reclaim the site IS the family\'s defect and',
+      'should be using the helper after all.',
+      '',
+      ...noReclaim,
+    ].join('\n')).toEqual([]);
   });
 
   it('no file hand-rolls a promise timeout', () => {

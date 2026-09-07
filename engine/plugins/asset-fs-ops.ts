@@ -8,6 +8,11 @@
  *  path before calling in. */
 
 import fs from 'fs';
+import { assetJsonBytes, sceneJsonBytes } from './backend/editorBackendRouter';
+
+/** A scene/prefab is written by a client-side serialiser too, so its bytes are not ours to
+ *  change unilaterally — see `sceneJsonBytes` and #835. */
+const isSceneOrPrefab = (p: string): boolean => /\.(scene|prefab)\.json$/i.test(p);
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -133,7 +138,14 @@ export function duplicateAssetFile(
     let json: Record<string, unknown>;
     try { json = JSON.parse(txt); } catch { fs.copyFileSync(absFrom, absTo); return null; }
     json.id = newGuid;
-    fs.writeFileSync(absTo, JSON.stringify(json, null, 2));
+    // Bytes from the one definition (#831) — a copied asset must not be born without the trailing
+    // newline every committed asset doc has, or its first edit shows a spurious
+    // `\ No newline at end of file` on a line nobody touched.
+    // ⚠️ But this duplicates ANY `.json`, including `.scene.json` and `.prefab.json`, and those are
+    // also written CLIENT-side by `editor/scene/serialize.ts`, which emits no newline. Giving a
+    // duplicated scene one would make the copy churn on its very first save. Scenes and prefabs
+    // therefore keep the client writer's bytes until #835 changes both together.
+    fs.writeFileSync(absTo, isSceneOrPrefab(absTo) ? sceneJsonBytes(json) : assetJsonBytes(json));
   } else {
     // Binary asset: copy file + duplicate sidecar with fresh id
     fs.copyFileSync(absFrom, absTo);

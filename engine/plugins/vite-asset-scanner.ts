@@ -75,7 +75,7 @@ import { resolveModelSettings, lodUrlSuffix, type ModelImportSettings, type Mode
 import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/runtime/loaders/spriteSheet';
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
-import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
+import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
@@ -263,10 +263,19 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
 /** Atomic write: tmp file + rename. Same pattern as `plugins/meta-sidecar.ts`,
  *  inlined here because this writer handles documents other than sidecars
  *  (JSON-asset `id` stamping) — not to avoid a circular import; this module
- *  already imports from `meta-sidecar.ts` above. */
+ *  already imports from `meta-sidecar.ts` above.
+ *
+ *  ⚠️ **The BYTES come from `assetJsonBytes`, not from a local `JSON.stringify` (#831).** This
+ *  writer used to spell them out itself and so emitted no trailing newline, which made it the
+ *  one surviving way for an asset doc to lose one after the router's writer was fixed. It is not
+ *  a rare path: an asset written without an `id` is HEALED here ~150ms later — a guid is minted
+ *  and the file rewritten — so every newly created JSON asset went out through this line.
+ *  Measured live, and only live: the router's own route wrote the newline correctly and this
+ *  overwrote it milliseconds afterwards, so the request looked right and the file was wrong.
+ *  `meta-sidecar.ts:334` already appends its own; this now shares the router's one definition. */
 function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(json, null, 2));
+  fs.writeFileSync(tmp, assetJsonBytes(json));
   fs.renameSync(tmp, absPath);
 }
 

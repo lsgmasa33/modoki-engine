@@ -517,12 +517,32 @@ presses it through `applyBindings` — so the whole chain from click to history 
 button's own visibility runs. ⚠️ It binds `visibleBinding`, not `disabled`, for the
 reason given further up: the disabled form does not exist.
 
+⚠️ **The visibility half only counts because it RENDERS the real `UINode` — and the reason
+is the JOIN, not the gate.** It was first written asking `evalVisibility` directly, which with
+an empty `visibleOp` reduces to the `getReadValue('canGoBack')` assertion on the line above it:
+a copy of the decision, not the decision. But the obvious justification for fixing that
+("nothing covered `UINode`'s gate") is ALSO false — `uiNode.test.tsx`'s *"a visibility
+binding hides the element when evalVisibility is false"* pins the gate, and deleting it
+reddens that file too. What nothing else covers is the join: `uiNode.test.tsx`
+**mocks** `evalVisibility`, so no other test runs an authored scene through
+`registerReadSource('canGoBack')` → the real resolver → the real gate. Measured: delete
+`bindingResolver.ts`'s read-source fallback and this file goes 2/2 red while
+`uiNode.test.tsx` + `uiRenderer.test.tsx` stay 188/188 green. The entity also has to carry
+`RenderableUI` + `UIElement`, or `uiTreeStore` builds no node and the thing under test is not
+a UI element at all.
+
 ⚠️ **It is not a substitute for the unit suite, measured:** that file fails on pre-#808
 (1 of 2) and PASSES on the deferral shape that shipped and was wrong. It closes the
 *chain* gap; the interleaving gap is closed by `navigationManager.test.ts`, which can
 separate a swap from its promise resolution. What is still missing is an AUTHORED scene
 in a real game — no `games/**` or `demos/**` scene binds these — so the editor-authoring
 side of this remains unexercised.
+
+**That last gap is deliberately recorded HERE and not in the tracker** (owner, 2026-09-07),
+so it is not an oversight to be "corrected" by filing an issue for it. It is latent —
+nothing binds these bindings today — and authoring a Back button into a real game is a UI
+decision, not test infrastructure. The place it matters is this section, which is what
+anyone touching `NavigationManager` reads.
 
 ### Time (System + Manager)
 

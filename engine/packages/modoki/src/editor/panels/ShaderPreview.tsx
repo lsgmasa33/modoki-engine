@@ -87,7 +87,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     host.appendChild(canvas);
     const app = new Application();
 
-    // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+    // Fix 3 of #590's adversarial review (docs/rendering.md): this is
     // `src/editor` — dev-only, never shipped in a game build — but `app.init()` below creates a
     // REAL PixiJS context, and an editor session with several previews/viewports open is exactly
     // the surface that approaches `SOFT_CONTEXT_LIMIT`. Noted after `app.init()` resolves (never

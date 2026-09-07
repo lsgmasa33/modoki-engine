@@ -118,7 +118,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     if (!container) return;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+    // Fix 3 of #590's adversarial review (docs/rendering.md): this is
     // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
     // context, and an editor session with several previews/viewports open is exactly the surface
     // that approaches `SOFT_CONTEXT_LIMIT`. Noted after a successful construction (never before

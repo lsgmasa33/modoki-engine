@@ -65,7 +65,7 @@ public class OtaPlugin extends Plugin {
    *  this a real, not just theoretical, bug: the shell's own confirmBoot and a
    *  sub-game's confirmBoot can now fire close together in the same boot, and one's
    *  confirmedBoots increment was observed lost on a real device (see
-   *  docs/plans/mobile-ota-updates-plan.md). A single static monitor serializes every
+   *  docs/ota-updates.md). A single static monitor serializes every
    *  mutation within this process — the only writer of this file — which is all that's
    *  needed (no cross-process access to guard against). */
   private static final Object STATE_LOCK = new Object();

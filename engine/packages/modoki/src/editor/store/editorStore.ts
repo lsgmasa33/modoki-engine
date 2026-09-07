@@ -241,7 +241,7 @@ interface EditorState {
   findReferencesTarget: { target: string; label: string } | null;
   /** "Build Support" dialog open state (toolchain detection + install/guide). */
   buildSupportOpen: boolean;
-  /** "Publish OTA Update…" dialog open state (docs/plans/mobile-ota-updates-plan.md Phase 5a). */
+  /** "Publish OTA Update…" dialog open state (docs/ota-updates.md). */
   otaPublishOpen: boolean;
   /** "OTA Keys…" dialog open state (generate/inspect the OTA signing keypair). */
   otaKeysOpen: boolean;

@@ -14,7 +14,7 @@ export function useGameLoop(pipeline?: (world: World) => void) {
       registerFrameCallback('ecs', () => pipeline(getCurrentWorld()), PRIORITY_ECS);
     }
     startFrameDriver();
-    // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): the GPU-memory sampler's
+    // Phase 3 of #590 (docs/ios-gpu-memory.md): the GPU-memory sampler's
     // lifetime matches the game's, same as the frame driver — it runs on its own `setInterval`
     // (not a frame callback), specifically so it keeps sampling if the frame loop itself dies.
     // Reached through a provider slot, not a direct import: the sampler lives in `loaders/`

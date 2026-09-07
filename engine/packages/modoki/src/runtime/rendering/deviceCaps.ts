@@ -147,7 +147,7 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
     canvas.width = canvas.height = 1;
     gl = canvas.getContext('webgl2');
     if (!gl) return { compressed: none };
-    // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this throwaway 1x1 context was
+    // Phase 3 of #590 (docs/rendering.md): this throwaway 1x1 context was
     // invisible to the soft GPU-context budget — noted here, paired with the `finally` release
     // below (which already ran on every exit path, success or throw).
     noteGpuContextCreated();

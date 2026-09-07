@@ -12,6 +12,7 @@ import type { ShaderParam, ShaderParamType } from '../../../runtime/loaders/shad
 import { BufferedTextInput, inputStyle } from '../fields';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateShaderFile } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
 import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { ParamField } from './MaterialAssetView';
 import { ShaderPreview } from '../ShaderPreview';
@@ -29,6 +30,14 @@ export function ShaderAssetView({ path }: { path: string }) {
   dataRef.current = data;
 
   useEffect(() => {
+    // ⚠️ A parked (unsaved) edit is NOT on disk (#831), so fetching the file here would re-seed
+    // the panel — and, through the refresher, the live cache — with the PRE-edit document while
+    // the registry still holds the newer one. The panel then shows a document that disagrees with
+    // what Cmd+S would write, which `pendingAssetDoc`'s docblock calls the worst of the three
+    // states; it has been filed three times already (QA-CTX-0008 and two more). Ask the registry
+    // first, exactly as the five asset EDITORS do, and fall back to the file when nothing pends.
+    const parked = pendingAssetDoc(path, 'shader');
+    if (parked) { setData(parked as Record<string, unknown>); return; }
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
       .then((r) => parseAssetJson(r, path))
@@ -42,12 +51,12 @@ export function ShaderAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: Record<string, unknown>, label: string) => {
     const old = dataRef.current;
     if (!old) return;
-    persistAssetEdit(path, updated, invalidateShaderFile);
+    persistAssetEdit(path, 'shader', updated, invalidateShaderFile);
     pushAction({
-      _isFileDirect: true, // already on disk (persistAssetEdit) — see MaterialAssetView for why
+      _isFileDirect: true, // parked, not scene state (persistAssetEdit) — see MaterialAssetView for why
       label,
-      undo: () => persistAssetEdit(path, old, invalidateShaderFile),
-      redo: () => persistAssetEdit(path, updated, invalidateShaderFile),
+      undo: () => persistAssetEdit(path, 'shader', old, invalidateShaderFile),
+      redo: () => persistAssetEdit(path, 'shader', updated, invalidateShaderFile),
     });
   }, [path]);
 

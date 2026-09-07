@@ -1,111 +1,107 @@
-/** The Asset Inspector's write must not fail silently.
+/** The Asset Inspector's edits must PARK, not write — and must still apply live (#831).
  *
- *  `persistAssetEdit` is how a material / shader / animset field edit reaches disk, and it never
- *  looked at the response: the cache invalidation and the panel refresh ran regardless, so a
- *  rejected write left the editor confidently showing a value the file does not have, with nothing
- *  but an unhandled promise rejection to show for it. That is the C7 class — never report a save
- *  that did not happen — on the one surface where it was still live after #259.
+ *  `persistAssetEdit` is how a material / shader / animset field edit leaves the Inspector. It
+ *  used to POST `/api/write-file` on every keystroke, so one numeric field hit the disk with no
+ *  save action while `get_editor_state` reported `persistenceMode: 'manual'` and
+ *  `unsavedChanges: false` — a committed file rewritten behind the human's back, the hazard
+ *  CLAUDE.md's "stage paths EXPLICITLY" rule exists for (#18). #259 made the five asset EDITORS
+ *  manual on the premise that manual save was "every other surface"; the premise was false and
+ *  these four asset VIEWS are the population it missed.
  *
- *  The optimistic update is deliberate and is asserted here too, so a later "fix" cannot quietly
- *  turn a failed write into a value the human loses.
+ *  Two halves are asserted here, and BOTH matter:
+ *   - it parks, and does not write. A test that only checked the registry would pass just as well
+ *     if the function parked AND still wrote, which is the worst outcome available (two
+ *     persistence contracts for one file — exactly what #259 removed for the editors).
+ *   - the optimistic live update still happens, synchronously. That is what makes the viewport
+ *     reflect an Inspector edit immediately, and a later "fix" must not quietly trade it away.
+ *
+ *  The trailing-newline half of #831 is no longer asserted here: the bytes are now produced
+ *  server-side by `assetJsonBytes`, so it is pinned where it actually happens, in
+ *  `tests/plugins/assetJsonBytesAgree.test.ts`, against the file rather than a request body.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { persistAssetEdit } from '../../packages/modoki/src/editor/panels/assetViews/persist';
+import { persistAssetEdit, reportWriteFailed } from '../../packages/modoki/src/editor/panels/assetViews/persist';
+import { clearDirtyAssets, peekDirtyAsset, isAssetDirty, hasDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { useEditorStore } from '@modoki/engine/editor';
 
 const PATH = '/assets/materials/rock.mat.json';
 const DOC = { color: 0xff0000 };
 
-// Typed explicitly: a bare `vi.fn()` infers a mock loose enough that it is not assignable to
-// persistAssetEdit's `invalidate` param, and vitest TRANSPILES tests without checking them — so
-// this passed at runtime and failed `npm run typecheck` (the gap engine/tsconfig.test.json exists
-// to close).
 type Invalidate = (path: string, updated: unknown) => void;
 let invalidate: ReturnType<typeof vi.fn<Invalidate>>;
 let err: ReturnType<typeof vi.spyOn>;
+let fetchSpy: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
+  clearDirtyAssets();
   invalidate = vi.fn<Invalidate>();
   err = vi.spyOn(console, 'error').mockImplementation(() => {});
+  // Any fetch at all is a failure in these tests, so make one loud rather than silently satisfied.
+  fetchSpy = vi.fn(async () => { throw new Error('persistAssetEdit must not perform a write'); });
+  vi.stubGlobal('fetch', fetchSpy);
   useEditorStore.setState({ toast: null });
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { clearDirtyAssets(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 const toast = () => useEditorStore.getState().toast;
 
-describe('persistAssetEdit reports a write that did not land', () => {
-  it('is silent on success — no error, no toast', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response)));
+describe('persistAssetEdit parks the edit instead of writing it (#831)', () => {
+  it('parks the doc under its own type, as a PANEL write', () => {
+    persistAssetEdit(PATH, 'material', DOC, invalidate);
 
-    await persistAssetEdit(PATH, DOC, invalidate);
+    expect(isAssetDirty(PATH)).toBe(true);
+    const parked = peekDirtyAsset(PATH);
+    expect(parked?.data).toEqual(DOC);
+    // The type is what lets `pendingAssetDoc` refuse to hand this doc to a different view.
+    expect(parked?.type).toBe('material');
+    // `panel` (not the `agent` default) is what makes the flush pass `replace:true` — a panel is a
+    // full-document editor, so dropping a top-level key is a legitimate edit for it.
+    expect(parked?.origin).toBe('panel');
+  });
 
+  it('performs NO write — the whole point of the change', () => {
+    persistAssetEdit(PATH, 'material', DOC, invalidate);
+    expect(fetchSpy, 'persistAssetEdit hit the network; parking AND writing is worse than either')
+      .not.toHaveBeenCalled();
     expect(err).not.toHaveBeenCalled();
     expect(toast()).toBeNull();
+  });
+
+  it('still applies the edit LIVE and synchronously — the viewport must not wait for Cmd+S', () => {
+    persistAssetEdit(PATH, 'material', DOC, invalidate);
+    // Synchronously: no await anywhere above, deliberately.
     expect(invalidate).toHaveBeenCalledWith(PATH, DOC);
   });
 
-  it('writes a TRAILING NEWLINE — asserted on the bytes, not a parsed round-trip (#831)', () => {
-    // ⚠️ Byte-level on purpose. `JSON.parse(content)` succeeds identically with or without the
-    // newline, so a round-trip assertion passes without the fix and proves nothing. The defect it
-    // guards is a diff artefact, and only the raw string can see it: every committed asset JSON
-    // ends with a newline, `JSON.stringify` emits none, and each editor write stripped it —
-    // turning a one-field edit into a diff carrying `\ No newline at end of file`.
-    const sent: string[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
-      sent.push(init.body);
-      return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
-    }));
-
-    void persistAssetEdit(PATH, DOC, invalidate);
-
-    expect(sent, 'the write never reached fetch — this assertion would pass vacuously').toHaveLength(1);
-    const content = (JSON.parse(sent[0]) as { content: string }).content;
-    expect(content.endsWith('\n'), `content does not end with a newline: ${JSON.stringify(content.slice(-12))}`).toBe(true);
-    expect(content.endsWith('\n\n'), 'content ends with TWO newlines — the fix double-applied').toBe(false);
+  it('parks each asset type under the type it was given', () => {
+    persistAssetEdit('/assets/shaders/holo.shader.json', 'shader', { name: 'Holo' }, invalidate);
+    persistAssetEdit('/assets/animsets/a.animset.json', 'animset', { clips: [] }, invalidate);
+    expect(peekDirtyAsset('/assets/shaders/holo.shader.json')?.type).toBe('shader');
+    expect(peekDirtyAsset('/assets/animsets/a.animset.json')?.type).toBe('animset');
   });
 
-  it('names the file and the REASON when the backend refuses', async () => {
-    // A 403 (path outside the asset roots) and a 500 need different fixes, so the route's own
-    // message is preferred over a bare status.
-    vi.stubGlobal('fetch', vi.fn(async () => ({
-      ok: false, status: 403, json: async () => ({ error: 'path outside allowed directories' }),
-    } as unknown as Response)));
-
-    await persistAssetEdit(PATH, DOC, invalidate);
-
-    expect(err.mock.calls.flat().join(' ')).toContain(PATH);
-    expect(err.mock.calls.flat().join(' ')).toContain('path outside allowed directories');
-    expect(toast()?.kind).toBe('warn');
-    expect(toast()?.message).toMatch(/FAILED/);
+  it('an UNDO parks too — it must not be the one path that writes', () => {
+    // The undo/redo closures call straight back into this function, and they may run after the
+    // originating panel has unmounted. That is why this is a module function and not a hook.
+    const older = { color: 0x00ff00 };
+    persistAssetEdit(PATH, 'material', DOC, invalidate);
+    persistAssetEdit(PATH, 'material', older, invalidate); // the undo closure's call
+    expect(peekDirtyAsset(PATH)?.data).toEqual(older); // last write wins, per the registry
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(hasDirtyAssets()).toBe(true);
   });
+});
 
-  it('falls back to the status when the body carries no message', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as unknown as Response)));
-
-    await persistAssetEdit(PATH, DOC, invalidate);
-
-    expect(err.mock.calls.flat().join(' ')).toContain('HTTP 500');
-  });
-
-  it('reports a REJECTED write (no response at all) instead of leaving it unhandled', async () => {
-    // The backend restarting mid-edit rejects the fetch outright. Before, this surfaced only as an
-    // unhandled promise rejection — a class of failure the editor never showed anyone.
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Failed to fetch'); }));
-
-    await expect(persistAssetEdit(PATH, DOC, invalidate)).resolves.toBeUndefined();
-
-    expect(err.mock.calls.flat().join(' ')).toContain('Failed to fetch');
-    expect(toast()?.kind).toBe('warn');
-  });
-
-  it('still applies the edit LIVE when the write fails — it reports, it does not revert', async () => {
-    // The value is not lost, and the next edit rewrites the whole file, so editing again IS the
-    // retry. Snapping the Inspector back would destroy the human's work over a transient failure.
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as unknown as Response)));
-
-    await persistAssetEdit(PATH, DOC, invalidate);
-
-    expect(invalidate).toHaveBeenCalledWith(PATH, DOC);
+describe('reportWriteFailed still reports — atlasPersist writes directly and depends on it', () => {
+  // `persistAssetEdit` no longer writes, so it can no longer fail; `atlasPersist.ts` DOES write
+  // (a compare-and-swap queue against /api/write-file-if-match) and reports through this function.
+  // Keeping its cover here rather than deleting it with the write path it used to serve.
+  it('names the file and the reason, in the console AND a toast', () => {
+    reportWriteFailed(PATH, 'HTTP 403');
+    expect(err).toHaveBeenCalled();
+    expect(String(err.mock.calls[0]?.[0])).toContain(PATH);
+    expect(String(err.mock.calls[0]?.[0])).toContain('HTTP 403');
+    expect(toast()?.message).toContain('rock.mat.json');
   });
 });

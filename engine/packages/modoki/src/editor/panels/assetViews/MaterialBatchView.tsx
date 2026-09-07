@@ -10,6 +10,7 @@ import { listShaderOptions, optionValueForMaterial, resolveShaderSchema, type Sh
 import type { ShaderParamSchema } from '../../../runtime/loaders/shaderSchema';
 import { NumberField, ColorField, DropdownField, DEFAULT_COLOR } from './widgets';
 import { persistAssetEdit, invalidateMaterialFile, useAssetViewRefresher } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
 import { ParamField } from './MaterialAssetView';
 import { mergeRecords } from '../assetMerge';
 
@@ -27,6 +28,12 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
   const loadAll = useCallback(async () => {
     setLoaded(false);
     const entries = await Promise.all(paths.map(async (p) => {
+      // ⚠️ Per path, not per panel (#831): a batch selection can mix parked and clean materials,
+      // and a parked edit is NOT on disk. Fetching one of those back would show — and re-seed the
+      // cache with — the PRE-edit document while Cmd+S still writes the newer parked one. Same
+      // rule as the single-asset views, applied to each member of the batch.
+      const parked = pendingAssetDoc(p, 'material');
+      if (parked) return [p, parked as Record<string, unknown>] as const;
       try { const r = await fetch(p); return [p, r.ok ? await r.json() : {}] as const; }
       catch { return [p, {}] as const; }
     }));
@@ -63,10 +70,10 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
       prev[p] = cur;
       next[p] = mutate(cur);
     }
-    const apply = (map: MatMap) => { for (const p of Object.keys(map)) persistAssetEdit(p, map[p], invalidateMaterialFile); };
+    const apply = (map: MatMap) => { for (const p of Object.keys(map)) persistAssetEdit(p, 'material', map[p], invalidateMaterialFile); };
     setMats((m) => ({ ...m, ...next }));
     apply(next);
-    // Asset-FILE edits, already written by persistAssetEdit — see MaterialAssetView.
+    // Asset-FILE edits, PARKED by persistAssetEdit (#831), so pending against the registry, not the scene — see MaterialAssetView.
     pushAction({ _isFileDirect: true, label, undo: () => { setMats((m) => ({ ...m, ...prev })); apply(prev); }, redo: () => { setMats((m) => ({ ...m, ...next })); apply(next); } });
   }, [paths, mats]);
 

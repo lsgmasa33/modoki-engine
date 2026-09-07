@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-/** useGameLoop — Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md) added the GPU-memory
+/** useGameLoop — Phase 3 of #590 (docs/ios-gpu-memory.md) added the GPU-memory
  *  sampler's start/stop alongside the frame driver's. This drives the REAL hook through
  *  `renderHook`, mocking `frameDriver` (a heavy module) and reading the sampler through the SAME
  *  provider slot the hook itself goes through — `rendering/useGameLoop.ts` is L2 and cannot import

@@ -21,7 +21,7 @@ import type { ToolContext } from '../context.js';
  *  ENFORCES (a zod enum rejects before any request is made), so drift here is not a bad error
  *  message — it is a tool that refuses a type the backend serves. `engine/tests/tools/
  *  assetTypeParity.test.ts` compares the two lists and fails the build when they disagree. */
-const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d'] as const;
+const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'] as const;
 
 export { ASSET_TYPES as ASSET_TYPES_FOR_TESTS };
 

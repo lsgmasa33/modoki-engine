@@ -257,7 +257,7 @@ export {
   ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
-// GPU-memory report (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md) — 3D bytes read
+// GPU-memory report (Phase 3 of #590, docs/ios-gpu-memory.md) — 3D bytes read
 // straight from `renderer.info.memory` and 2D (PixiJS) bytes computed per canvas2DPool slot
 // (compressed-format-aware), plus the live GL-context count, sampled on an interval that survives
 // a dead frame loop. `getGpuMemoryReport()` returns the most recent sample (or null before the

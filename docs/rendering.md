@@ -510,6 +510,49 @@ would ship the whole Three node pipeline into a `render3d:false` build (#214). I
 still dies with its source; a 2D-only build never imports the module and the registry stays empty.
 It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
+### The r185 bump — measured, and what it did NOT fix
+
+three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
+fixture, same probe, same island↔empty cycle:
+
+| per cycle | 0.184.0 | 0.185.1 |
+|---|---|---|
+| renderTargets | +5 | **+3** |
+| textures | +9 | **+3** |
+| geometries | +17 | **+17 (unchanged — ours, not three's)** |
+| **texturesSize** | **+72.1 MB** | **+24.1 MB** |
+
+A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
+as predicted — it was the `modelOwners` ownership gap, not a three defect.
+
+⚠️ `"three": "^0.184.0"` is a 0.x caret (`>=0.184.0 <0.185.0`), so a plain `npm install` will NOT pick
+0.185.1 up; the range must be bumped explicitly. **0.185.0 and 0.185.1 are the only releases after
+0.184.0** — there is nothing further to bump to.
+
+**What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
+`pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to
+r184 (still caches `renderTarget.texture` and disposes the wrong object), and the `PMREMGenerator`
+ping-pong target is freed only by `PMREMNode.dispose()`, which nothing calls when the env changes —
+together the residual 24.1 MB/cycle above. It also does not touch the WebGL-fallback program leak
+(#715), which is a different layer entirely.
+
+⚠️ **`@types/three` is deliberately HELD at `^0.183.1`** — owner decision, 2026-09-05, asked directly.
+Bumping it to 0.185.4 fails `verify` with ~20 errors as the TSL node generics became far more
+specific, hitting `particles/billboardTsl.ts`, `gpuComputeBackend.ts`, `spriteBillboard.ts`,
+`postfx/PostFXStack.ts`, `SceneView.tsx` and the `water.ts` shader in both `games/sling` and
+`demos/forest-camp`. Types lagging the runtime is the pre-existing arrangement, **not an open task to
+pick up.** Known cost: a REMOVED symbol still fails loudly at typecheck (the safe direction), but a
+CHANGED SIGNATURE could silently typecheck against the older types.
+
+⚠️ **GTAO is genuinely darker under r185 and the owner ACCEPTED it** (shown the side-by-side,
+2026-09-05: *"diff is fine"*). Mean luminance 42.32 → 39.86 on `demos/postfx-demo` with GTAO forced
+on — for scale, enabling GTAO at all is a -3.35 change, so r185's extra darkening is ~73% as large as
+the entire AO effect. **Do not "fix" it back later as an unreviewed regression.** It ships to nothing
+today regardless: `AmbientOcclusionPostFX` defaults to `enabled: false` and no committed scene turns
+it on. Everything else measured byte-identical, including a scene exercising particles, transparency,
+instancing and an environment.
+
+
 ### HDR conversion (Node — dev server + build)
 
 Source `.hdr` files are downscaled offline into a content cache by `env-convert.ts` + `hdr-codec.ts` — DEPENDENCY-FREE (no ImageMagick / native tool, unlike `toktx` for KTX2):
@@ -4271,6 +4314,74 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
 
+
+#### Rebuild lifetime — what `layoutHash` may gate, and what it must not (#590, #690, #692, #749)
+
+The text pass is where a ~300 MB/6 min iOS leak came from, so the gating rules here are load-bearing
+rather than an optimisation. Platform side of that incident: [ios-gpu-memory.md](ios-gpu-memory.md).
+
+**Shader lifetime must NOT be coupled to geometry rebuild.** The pass originally gated the WHOLE
+rebuild on `layoutHash` — destroying the page meshes AND `slot.textShaders`, then rebuilding both.
+But the two depend on different things:
+
+| | depends on | in `layoutHash`? |
+|---|---|---|
+| geometry | text, fontSize, align, maxWidth, spacing, atlas | yes — correctly |
+| **shader** | texture, atlas, style, fontSize | only `fontSize` + `atlasVersion` |
+
+So a plain TEXT change — a score counter ticking — rebuilt the geometry (correct) and threw away and
+rebuilt the shader **for nothing**. A `fontSize` change needs no recompile either: `fontSize` feeds
+`uScreenPxRange`, a UNIFORM. Split for #690: geometry on `layoutHash`, shader only when the page
+texture or atlas actually moves.
+
+**⚠️ Every `new Shader` on the GL path leaked a compiled `WebGLProgram`, and PixiJS can never free
+one.** The chain, verified in the vendored source rather than inferred:
+
+1. `makeMtsdfPixiShader` ends in **`new GlProgram(...)`** — not the content-cached `GlProgram.from`.
+2. `GlProgram`'s constructor runs `setProgramName` as a **preprocessor**, which keeps a module-global
+   name cache and injects an **incrementing** `#define SHADER_NAME <name>-N` into the shader source.
+   Its escape hatch (`if (src.indexOf("#define SHADER_NAME") !== -1) return src;`) never fired,
+   because our source declared none.
+3. `_key` is computed from the source **AFTER** the preprocessors mutated it ⇒ **a different key on
+   every call, for byte-identical input** ⇒ `GlShaderSystem._getProgramData` always misses ⇒ a fresh
+   program is compiled and linked.
+4. `gl.deleteProgram` has **ZERO call sites in the whole library** (checked in 8.19.0 and 8.20.1),
+   and `GlProgramData.destroy()` only nulls JS fields — so it is never freed, not even at teardown.
+
+At ~2,700 text rebuilds/min that was ~2,700 leaked programs/min, bracketing the measured 38.57 MB/min
+residual. **Fixed on our side by hoisting the two program compiles to module constants
+(`getMtsdfPrograms()`)** so one `GlProgram`/`GpuProgram` pair is reused; the genuinely per-instance
+state is the `UniformGroup`, which is cheap. A fixed `#define SHADER_NAME` in our source is the
+second, independent hardening.
+
+⚠️ **The module-level program cache is load-bearing, not belt-and-suspenders.** With the fixed
+`#define` in place, identical source now HITS the cache, so `generateProgram` never runs for a second
+program and `getSignature` hard-throws on unpopulated `_attributeData`. Reintroducing a per-call
+construction turns the old leak into a crash.
+
+⚠️ **Sweep obligation — this is a property of `new GlProgram`, not of text.** Any path that builds a
+`Shader` per INSTANCE rather than per program has it in full. `pixiShaderBuilder.ts` (2D custom
+materials) had exactly the same shape and was fixed for #716.
+
+⚠️ **#716 is GL-ONLY, and that asymmetry is the whole reason the leak exists.** `compileHighShaderGlProgram` ends in a bare `new GlProgram(...)`, bypassing the content cache; `compileHighShaderGpuProgram` already returns `GpuProgram.from({...})` — Pixi's own content cache — so the **WebGPU path was never at risk of the stranded-program leak**. Do not read a clean WebGPU measurement as evidence the GL path is fine; iOS 16 Safari, where this bug lives, has no WebGPU at all. The module-level program cache still earns its keep on the GPU path, but for a different reason: it skips the manifest fetch and the string assembly, which are backend-agnostic.
+
+**Scale must not be applied by rebuilding geometry** (#692) — rebuilding to apply a scale is wasted
+CPU *unless deforming or batching draw calls*. `layoutText` multiplies every geometric quantity by
+`fs`, so it is a **pure linear scale**, with two exceptions that make the fast path conditional:
+`letterSpacing` is added in px AFTER the multiply so it does not scale, and `maxWidth` wrapping
+genuinely depends on size. Gating on `letterSpacing === 0 && maxWidth == null` covers the
+overwhelming majority. Legitimately deformation, leave alone: `SkinnedSprite2D`, per-glyph
+`TextAnimation`, skeletal, trails.
+
+⚠️ **Moving scale to the transform REQUIRES writing `uScreenPxRange` per frame** — it is
+`(fontSize / atlasSize) * distanceRange`, the MSDF antialiasing width, or glyphs go blurry/crunchy at
+the extremes. It lives in a `UniformGroup` with a mutation path, so this is a float write, not a
+shader rebuild.
+
+⚠️ **`getTextDirtyVersion()` is process-GLOBAL and sits inside `layoutHash`** (#696), so one newly
+rasterised glyph rebuilt every text mesh in the scene. Worst for CJK / dynamic fonts, where new
+glyphs arrive during play.
+
 ### 2D masking — `Mask2D` (#449)
 
 Clip a 2D subtree to a rect or a texture. `Mask2D` on an entity clips **that entity and every
@@ -4443,6 +4554,65 @@ of a resource cache.** See § "GPU context loss is recoverable" above for the re
   never reported last-owner. Nothing was derived and nothing was unlinked; the release ran and
   correctly concluded an owner remained. State the invariant over OWNERS, not only over
   derivatives.
+
+### Destroy ORDER is part of the contract — the PixiJS quirk `releaseGeometry` exists for
+
+`releaseGeometry` (in `Scene2D.tsx`) looks like tidiness and is not. PixiJS's
+`Geometry.destroy()` calls `removeAllListeners()` **one line before** `unload()` fires the `"unload"`
+event:
+
+```js
+destroy(destroyBuffers = false) {
+  this.emit("destroy", this);
+  this.removeAllListeners();            //  ← tears off the "unload" listener
+  if (destroyBuffers) { this.buffers.forEach((buffer) => buffer.destroy()); }
+  this.unload();                        //  ← emits "unload" to nobody
+```
+
+`gl.deleteVertexArray` is reachable ONLY through `GCManagedHash`'s `item.once("unload", …)`, so the
+VAO handle becomes unreachable from JS **permanently**. The buffer GC works correctly; the VAO
+deletion never fires at all.
+
+**`Buffer`, `TextureSource`, `GraphicsContext` and `ViewContainer` all order `unload()` BEFORE
+`removeAllListeners()`. `Geometry` is the only one of the five that inverts it.**
+
+⚠️ **`destroy(true)` is NOT the fix** — `buffers.forEach` still runs before `unload()`, and the VAO is
+still never deleted. **The fix is `g.unload(); g.destroy(true);`** — calling `unload()` while the
+listener is still attached is what reaches the handler. That is exactly what `releaseGeometry` does,
+and it is why cloning it per resource kind is the wrong generalisation (see "Roads not taken" above):
+it encodes ONE library's ordering quirk, not a contract the other kinds share.
+
+One inference, flagged as such because it comes from the GL spec and not from Pixi's source: an
+undeleted VAO holds its attribute buffers' DATA STORE alive even after `gl.deleteBuffer` releases
+their names. That is the link from "VAO leaked" to monotonic growth.
+
+⚠️ **Worth its own measurement before you credit it.** Freeing ~11,000 GL buffers/min properly bought
+only **1.27x** against a control — it is a real release bug and was kept as such, but it was ~21% of
+the growth, not the cause. The dominant term was rebuild VOLUME.
+
+### Procedural buffer SIZING — the failure is silent truncation, not corruption
+
+A classic overrun is **impossible in JS**: TypedArrays are bounds-checked, writing past the end is
+silently ignored, and `.set()` with an oversized source throws `RangeError`. WebGL is specified
+against the driver-side twin too (a deleted buffer name becomes invalid rather than dangling;
+out-of-range index fetches return zeros under robust buffer access).
+
+**The adjacent failure IS real and is the "looks fine" kind: silent truncation** — a wrong size gives
+missing or wrong vertices with no error anywhere. One instance of that shape exists: the in-place
+text-animation upload bails on a length mismatch and silently leaves the OLD data on screen rather
+than failing loudly.
+
+The text path is **verified correct**: `buildTextGeometry` allocates `n*4*2` positions, `n*4*2` uvs,
+`n*4*4` colors and `n*6` indices for `n` quads, with the `Uint16`/`Uint32` switch at the right
+threshold (`n*4 > 65535`). One waste, not a bug: the conversion doubles index memory and allocates a
+second array per rebuild, because the builder emits `Uint16Array` and `MeshGeometry` is fed
+`Uint32Array`.
+
+**When auditing any other procedural allocation** (material quad, skin buffers, particle buffers,
+trail geometry, mask ramp), the three questions are: is the size exactly proportional to the content,
+**can it GROW across rebuilds**, and does any writer silently truncate instead of failing? A size
+that grows is the only version of this that explains memory growth.
+
 
 ### `meshTemplateCache`'s count-based invariant — checked, and it does NOT fire
 

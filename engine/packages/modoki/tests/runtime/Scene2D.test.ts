@@ -1697,7 +1697,7 @@ describe('Scene2D.renderFrame', () => {
     expect(orphanWarnCount()).toBe(1);
   });
 
-  // Adversarial review of #590 (docs/plans/ios-rendering-update-wedge.md): `liveEntityIds` was
+  // Adversarial review of #590 (docs/ios-gpu-memory.md): `liveEntityIds` was
   // built ONLY from `world.query(attrMeta.trait)` (EntityAttributes), but `noteOrphan2D` is
   // reachable from the Renderable2D/SkinnedSprite2D/Text2D passes for entities that have NO
   // EntityAttributes at all — the same entities `orphan2DKey` falls back to an `id:` key for.

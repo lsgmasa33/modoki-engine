@@ -1,5 +1,5 @@
 /** Wires a NATIVE alert to `frameDriver`'s "the frame loop is permanently dead" transition —
- *  Phase 2 of docs/plans/ios-rendering-update-wedge.md. `frameDriver.ts`'s own
+ *  Phase 2 of docs/ios-gpu-memory.md. `frameDriver.ts`'s own
  *  `declareUnrecoverable()` comment already flags this: "Phase 2 (out of scope here) wires a
  *  native alert to this transition." On iOS a WebGL context loss makes WebKit permanently stop
  *  painting — DOM paint is dead too, so an in-page message is impossible and only native

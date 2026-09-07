@@ -10,6 +10,7 @@ import { inputStyle, BufferedNumberInput } from '../fields';
 import { AssetRefField } from '../AssetRefField';
 import { ColorField, NumberField, DropdownField, DEFAULT_COLOR } from './widgets';
 import { clampNum, persistAssetEdit, useAssetViewRefresher, invalidateMaterialFile } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
 import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { MaterialPreview } from '../MaterialPreview';
 
@@ -76,6 +77,14 @@ export function MaterialAssetView({ path }: { path: string }) {
   const [schemaLoading, setSchemaLoading] = useState(false);
 
   useEffect(() => {
+    // ⚠️ A parked (unsaved) edit is NOT on disk (#831), so fetching the file here would re-seed
+    // the panel — and, through the refresher, the live cache — with the PRE-edit document while
+    // the registry still holds the newer one. The panel then shows a document that disagrees with
+    // what Cmd+S would write, which `pendingAssetDoc`'s docblock calls the worst of the three
+    // states; it has been filed three times already (QA-CTX-0008 and two more). Ask the registry
+    // first, exactly as the five asset EDITORS do, and fall back to the file when nothing pends.
+    const parked = pendingAssetDoc(path, 'material');
+    if (parked) { setData(parked as Record<string, unknown>); return; }
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
       .then(r => parseAssetJson(r, path))
@@ -89,16 +98,23 @@ export function MaterialAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: Record<string, unknown>, label: string) => {
     const old = dataRef.current;
     if (!old) return;
-    persistAssetEdit(path, updated, invalidateMaterialFile);
+    persistAssetEdit(path, 'material', updated, invalidateMaterialFile);
     pushAction({
-      // Asset-FILE edit: persistAssetEdit already wrote it to disk, so there is nothing pending for
-      // the scene's edit-version to represent — the literal case this flag names. Without it, editing
-      // a material marked the SCENE dirty, which self-blocks the file-direct agent routes and makes
-      // modoki_build refuse over a file that is already saved.
+      // Asset-FILE edit: it changes a `.mat.json`, never a scene entity, so there is nothing for
+      // the SCENE's edit-version to represent — the literal case this flag names. Without it,
+      // editing a material marked the scene dirty, which is a different and wrong claim.
+      // ⚠️ It no longer stops the file-direct agent routes REFUSING, though: `hasUnsavedChanges()`
+      // folds in `hasDirtyAssets()`, so a parked material edit blocks `mutate_scene`/`modoki_build`
+      // whatever this flag says. Correct in itself (the edit IS unsaved) — but the refusal names
+      // the wrong cause, which is filed separately.
+      // ⚠️ The flag is still right; its old REASON is not. It used to read "persistAssetEdit
+      // already wrote it to disk", which stopped being true in #831 — the edit is now PARKED in
+      // the dirty-asset registry, not written. So this edit is genuinely pending, just not against
+      // the scene: `hasDirtyAssets()` is what represents it, and Cmd+S is what writes it.
       _isFileDirect: true,
       label,
-      undo: () => persistAssetEdit(path, old, invalidateMaterialFile),
-      redo: () => persistAssetEdit(path, updated, invalidateMaterialFile),
+      undo: () => persistAssetEdit(path, 'material', old, invalidateMaterialFile),
+      redo: () => persistAssetEdit(path, 'material', updated, invalidateMaterialFile),
     });
   }, [path]);
 

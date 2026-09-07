@@ -4770,7 +4770,7 @@ export async function makeWebGPURenderer(
       throw e2;
     }
   }
-  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): note the context AFTER a
+  // Phase 3 of #590 (docs/rendering.md): note the context AFTER a
   // successful init, never before — the WebGPU-then-WebGL2 fallback path above can dispose an
   // EARLIER renderer that never reached here, and that one must not be paired with a decrement.
   //

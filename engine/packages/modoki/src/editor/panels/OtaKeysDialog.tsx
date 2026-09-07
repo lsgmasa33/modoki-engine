@@ -1,5 +1,5 @@
 /** "OTA Keys…" dialog — generate/inspect the Ed25519 signing keypair OTA releases are
- *  signed with (docs/ota-updates.md, docs/plans/mobile-ota-updates-plan.md Phase 5a).
+ *  signed with (docs/ota-updates.md).
  *
  *  There is deliberately NO overwrite/regenerate control here, on either side of the
  *  wire: `POST /api/ota/keygen` (engine/scripts/ota-keygen.mjs underneath) refuses to

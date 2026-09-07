@@ -19,6 +19,7 @@ import { defaultTimeline, normalizeTimeline, type TimelineDef } from '../timelin
 import { defaultSpriteClip } from '../traits/SpriteAnimator';
 import { defaultRig2DFile } from '../skinning/rig2dTypes';
 import { MATERIAL_TEXTURE_SLOTS } from './materialTextureSlots';
+import { SHADER_PARAM_TYPES } from '../core/shaderSchema';
 
 /** Every asset type this module serves a schema for — THE list, and the reason it is a `const`
  *  array rather than a bare union: `SCHEMAS` below is a `Record<AssetSchemaType, …>`, so adding a
@@ -32,7 +33,7 @@ import { MATERIAL_TEXTURE_SLOTS } from './materialTextureSlots';
  *  and imports nothing from the engine), so its copy is guarded behaviourally instead — see
  *  `engine/tests/tools/assetTypeParity.test.ts`. */
 export const ASSET_SCHEMA_TYPES = [
-  'material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d',
+  'material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset',
 ] as const;
 
 export type AssetSchemaType = typeof ASSET_SCHEMA_TYPES[number];
@@ -177,6 +178,39 @@ const RIG2D_FIELDS: FieldMeta[] = [
   { key: 'skinWeights', type: 'array', note: 'v1 only: 4 weights per vertex, flat (normalized; unused slots 0)' },
 ];
 
+// ── Shader (the `.shader.json` custom-shader param table, selected by MATERIAL_FIELDS'
+// `shader:"file"` on a material) — NO `version` field on this type; do not add one. ──
+const SHADER_FIELDS: FieldMeta[] = [
+  { key: 'id', type: 'string', note: 'stable GUID (mirrors .meta.json)' },
+  { key: 'name', type: 'string', note: 'display name shown in the editor' },
+  { key: 'space', type: 'enum', enum: ['2d', '3d'], default: '3d', note: 'which renderer the shader targets (shaderSpace()). 3 of the 4 committed shaders are "2d" — omitting it silently means 3d' },
+  { key: 'colorPreserve', type: 'enum', enum: ['alpha'], note: 'OPTIONAL: keep the source alpha when the shader writes colour' },
+  // ⚠️ The param-type union is DERIVED from `SHADER_PARAM_TYPES`, not transcribed. The first
+  // version of this note hand-copied it as `"float"|"color"` and was already false on landing —
+  // `games/space-console/.../ship-halo.shader.json` uses `texture`. A union spelled out in prose
+  // beside the union it describes is a copy that nothing keeps in step.
+  { key: 'params', type: 'object', note: `map of uniform-name -> { type, default, min?, max?, step?, label? } where type is one of ${[...SHADER_PARAM_TYPES].join('|')}. \`color\` defaults are packed 0xRRGGBB integers, same as MATERIAL_FIELDS.color; a \`texture\` default is an asset GUID.` },
+];
+
+// ── AnimSet (the `.animset.json` named-clip table played back against a `source` model's
+// animation bank) — NO `version` field on this type; do not add one. ──
+const ANIMSET_FIELDS: FieldMeta[] = [
+  { key: 'id', type: 'string', note: 'stable GUID (mirrors .meta.json)' },
+  { key: 'source', type: 'ref', note: 'OPTIONAL: the GLB/model GUID the clip names below are looked up against' },
+  { key: 'clips', type: 'array', note: '[{ name, speed?(default 1), loop?(default false), fadeDuration?(seconds, default 0) }] — `name` must match a clip name baked into `source`' },
+];
+
+export function defaultShaderFile(): Record<string, unknown> {
+  // `space` is emitted explicitly: it defaults to '3d' when absent, and 3 of the 4 committed
+  // shaders are '2d', so a scaffold that omits it hands the author the less likely answer with
+  // no field to notice.
+  return { name: 'New Shader', space: '2d', params: { power: { type: 'float', default: 1, min: 0, max: 8, step: 0.1, label: 'Power' } } };
+}
+
+export function defaultAnimSetFile(): Record<string, unknown> {
+  return { clips: [{ name: 'Idle', speed: 1, loop: true, fadeDuration: 0.3 }] };
+}
+
 const SCHEMAS: Record<AssetSchemaType, () => AssetSchema> = {
   material: () => ({ type: 'material', fields: MATERIAL_FIELDS, example: defaultMaterial(), notes: 'Texture slots are GUID refs, never literal paths. shader:"file" uses a custom shader (params block).' }),
   particle: () => ({ type: 'particle', fields: PARTICLE_FIELDS, example: defaultParticleEffect(), notes: 'Nested objects (emission/shape/MinMax/curves/render) follow the example shape. id assigned on save if absent.' }),
@@ -184,6 +218,8 @@ const SCHEMAS: Record<AssetSchemaType, () => AssetSchema> = {
   timeline: () => ({ type: 'timeline', fields: TIMELINE_FIELDS, example: defaultTimeline('', 'New Timeline'), notes: 'A sequencer asset played by a Director trait. Tracks target descendants of the Director root by relative name-path. Animation-track clips are NAMES in the target animator bank; audio cues are audio GUIDs; video clips are video GUIDs; signal markers dispatch UIActions. An animation track drives the target entity own Animator trait — a target without one is silently inert.' }),
   spriteanim: () => ({ type: 'spriteanim', fields: SPRITEANIM_FIELDS, example: defaultSpriteAnimData(), notes: 'A named set of flipbook clips. Each clip\'s `frames` are sprite-slice GUID refs (never literal paths). Referenced by SpriteAnimator.clipSet + an active clip name.' }),
   rig2d: () => ({ type: 'rig2d', fields: RIG2D_FIELDS, example: defaultRig2DFile(), notes: 'A 2D skinning rig: one SHARED bone skeleton plus one-or-more skinnable parts. Two shapes, both valid — v2 lists `parts[]`; v1 keeps a single part\'s sprite/mesh/skinIndices/skinWeights at the top level and is normalized into `parts[0]` at load. Editing parts in the Skin Editor converts v1 → v2, which DROPS those four top-level keys, so a write of a converted rig is a replace (the editor\'s own save passes `replace:true`). Sprite refs are GUIDs, never literal paths. Referenced by SkinnedSprite2D.rig.' }),
+  shader: () => ({ type: 'shader', fields: SHADER_FIELDS, example: defaultShaderFile(), notes: `A custom TSL/WGSL shader's inspector-editable uniform table, selected by a material's \`shader:"file"\`. No \`version\` field on this type — do not add one. \`space\` picks the renderer ('2d' or '3d') and DEFAULTS TO 3d when absent. Each \`params\` entry is one uniform whose \`type\` is one of ${[...SHADER_PARAM_TYPES].join(', ')}; \`min\`/\`max\`/\`step\`/\`label\` are optional UI hints for numeric types. \`id\` assigned on save if absent.` }),
+  animset: () => ({ type: 'animset', fields: ANIMSET_FIELDS, example: defaultAnimSetFile(), notes: 'A named set of playback clips for an animated model, referenced by trait fields that pick a clip BY NAME. No `version` field on this type — do not add one. `source` is an optional model GUID for authoring reference; `clips[].name` must match a clip baked into that model\'s animation bank. `id` assigned on save if absent.' }),
 };
 
 export function getAssetSchema(type: AssetSchemaType): AssetSchema | null {
@@ -197,6 +233,8 @@ export function defaultAssetData(type: AssetSchemaType): unknown {
   if (type === 'spriteanim') return defaultSpriteAnimData();
   if (type === 'timeline') return defaultTimeline('', 'New Timeline');
   if (type === 'rig2d') return defaultRig2DFile();
+  if (type === 'shader') return defaultShaderFile();
+  if (type === 'animset') return defaultAnimSetFile();
   return defaultAnimationClip('', 'New Clip');
 }
 

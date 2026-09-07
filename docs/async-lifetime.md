@@ -160,6 +160,32 @@ case, and the only defence is the convention, not the test.
 Both are the generation token doing its ordinary job — the continuation just is not spelled `await`.
 When you are looking for sites that need a token, grep for the deferral, not for the keyword.
 
+### A fourth shape the helper does NOT cover: capture, and let a THIRD PARTY consume it
+
+Every token above answers *am I still live?* from inside the continuation. `NavigationManager` (#808)
+needed a different question — *did MY operation actually commit?* — and no token can answer it,
+because the continuation cannot see which of several concurrent navigations the engine ended up
+performing. Three repairs tried anyway (a snapshot restored in a `catch`, a supersession epoch, and
+deferring the write past the `await`), and each failed on a different interleaving.
+
+The shape that works: the operation registers a **claim** before its `await`, and an authoritative,
+serialized EVENT handler — `onWorldSwap`, in that case — consumes one claim and does the work. The
+claim is released in a `finally` for the case where the event never comes.
+
+Two rules fall out, both learned the expensive way:
+
+- **Key the claim per CALL, never by a value two callers can share.** A `Set<path>` collapsed two
+  navigations to one scene into a single entry, and the LOSER's `finally` released it before the
+  winner's event arrived, so the winner's work never happened. `runtime/video/videoSystem.ts` is the
+  correct precedent — its map is keyed by a recyclable entity id, but the continuation checks
+  `rec.cancelled` on the record OBJECT it captured, so identity is the real token.
+- **Where two concurrent claims for one key have opposite intent, you are choosing a tie-break, not
+  computing an answer.** Say so at the site. `NavigationManager.takeClaim` takes the most recently
+  started claim — what the player last asked for — and its docblock states that it is a tie-break.
+
+⚠️ **`livenessTokenIsShared.test.ts` does not see this shape**, because nothing is compared against a
+counter. Do not read a green guard as "there is no lifetime question here".
+
 ### Scope: module and instance, not components
 
 The helper and its guard cover module-scoped and instance-scoped state. An editor panel that runs the
@@ -256,6 +282,37 @@ wait for the abandoned generation (that restores the wedge the timeout exists to
 cancel it (`MSDF.dispose()` awaits a comlink round-trip *before* `terminate()`, so it queues behind
 the very call that is stuck). It retires the generator instead: the next call builds a fresh Worker,
 and the window is per-worker. `Scene3D` does the same with its pooled render target.
+
+### When a hand-rolled deadline is the RIGHT answer
+
+The mirror of "wire an `AbortSignal` at the call site" below: **a site that already HAS a
+cancellation primitive should keep its own deadline, and migrating it onto `withTimeout` is a
+regression.** Measured 2026-09-07 while working #830, which listed three engine files as unmigrated
+hand-rolls and treated that as debt.
+
+The discriminator is *who owns the promise*:
+
+| | Use `withTimeout` | Keep the hand-rolled deadline |
+|---|---|---|
+| The promise | handed to you, opaque | you construct it, and hold its `resolve`/`reject` |
+| At the deadline | nothing can be stopped | deregister / destroy / close — a real reclaim |
+| Late settlement | may arrive and own something → `onSettled` | cannot arrive: you already dropped the registration |
+
+`electron/main.ts`'s `requestRenderer`, `plugins/backend/deviceCdp.ts`'s `connect`/`send` and
+`plugins/backend/deviceConnection.ts`'s `open`/`rpc` are all in the right-hand column: each keys a
+request into a `pending` map and its timer calls `pending.delete(id)` / `socket.destroy()` /
+`ws.close()` before rejecting. `withTimeout` cannot express that — per the ⚠️ above, `onSettled`
+fires on settlement, and a wedged device never settles anything, so the entry would be held for the
+life of the link. The reclaim is the whole point, and it is the half a timeout test usually forgets:
+all four existing timeout tests in `deviceConnection.test.ts` asserted only that the caller was
+rejected, and stayed green against an implementation that leaked every entry.
+
+Both halves are now pinned — behaviourally in `tests/plugins/deviceConnection.test.ts` for the site
+reachable over a real socket, and statically across all five in the architecture guard.
+
+⚠️ The import objection that originally deferred this is void: `@modoki/engine/runtime/core/abandonment`
+is a dedicated deep export of a single file with **zero imports**, so using it from the Electron Node
+main process pulls nothing browser-oriented in. The reason these stay is the reclaim, not the import.
 
 ### Enforcement
 

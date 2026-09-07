@@ -201,17 +201,22 @@ describe('canvas2DPool', () => {
   describe('live GPU-context count', () => {
     it('increments on init and drops to zero on destroyPool', async () => {
       const pool = await getModule();
-      expect(pool.liveCanvas2DContextCount()).toBe(0);
+      // Same module registry `getModule()` just populated (resetModules() ran in beforeEach, and
+      // canvas2DPool's own `noteGpuContextCreated`/`noteGpuContextDestroyed` calls write into
+      // THIS instance of gpuContextTracking) — a static top-of-file import would bind to a
+      // different instance and read a count that never moves.
+      const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+      expect(liveGpuContextCount()).toBe(0);
       const s1 = pool.allocate(1)!;
       const s2 = pool.allocate(2)!;
       await Promise.all([s1.ready, s2.ready]);
-      expect(pool.liveCanvas2DContextCount()).toBe(2);
+      expect(liveGpuContextCount()).toBe(2);
       pool.destroyPool();
-      expect(pool.liveCanvas2DContextCount()).toBe(0);
+      expect(liveGpuContextCount()).toBe(0);
     });
   });
 
-  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): the GPU-memory report's per-slot
+  // Phase 3 of #590 (docs/ios-gpu-memory.md): the GPU-memory report's per-slot
   // byte attribution walks EXACTLY the slots this accessor returns.
   describe('getSlotsForMemoryReport', () => {
     it('is empty with no allocated slots', async () => {

@@ -8,7 +8,10 @@ export type ShaderParamType = 'float' | 'color' | 'bool' | 'vec2' | 'vec3' | 've
 
 /** The known param types — used to surface a typo'd `type` at manifest-load time
  *  rather than silently falling through to `coerceParamValue`'s zero default. */
-const SHADER_PARAM_TYPES: ReadonlySet<string> = new Set<ShaderParamType>([
+/** Exported so `assetSchemas.ts` can DERIVE the agent-facing note instead of transcribing it —
+ *  a hand-copied union went stale on the day it landed (#831 close-out): it said
+ *  `"float"|"color"` while a committed shader already used `texture`. */
+export const SHADER_PARAM_TYPES: ReadonlySet<string> = new Set<ShaderParamType>([
   'float', 'color', 'bool', 'vec2', 'vec3', 'vec4', 'texture',
 ]);
 

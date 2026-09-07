@@ -4,8 +4,9 @@
  *  directly or mocks `SceneManager` wholesale, so the chain a player actually travels —
  *  a click on an authored button → `applyBindings` → the input lock → `dispatchUIAction`
  *  → `NavigationManager.back()` → the REAL `SceneManager.loadScene` → `onWorldSwap` →
- *  the history pop → the `canGoBack` read source → the button's own visibility — had
- *  never run end to end. `docs/managers-and-systems.md` § NavigationManager records why.
+ *  the history pop → the `canGoBack` read source → the real UI tree projection → the
+ *  real `UINode` visibility gate — had never run end to end.
+ *  `docs/managers-and-systems.md` § NavigationManager records why.
  *
  *  ⚠️ **What this file does and does not catch, measured — because the obvious claim for
  *  it is too strong.** Run against the shapes #808 went through: it fails on pre-#808
@@ -18,23 +19,45 @@
  *
  *  Nothing is mocked here except `fetch`, which serves the two scene documents. The
  *  scene load, the world swap, the manager registry, the action registry, the read-source
- *  registry, the binding resolver and the input lock are all the shipped ones.
+ *  registry, the binding resolver, the input lock, the tree projection and `UINode` are
+ *  all the shipped ones. ⚠️ The visibility half in particular must stay that way — but be
+ *  precise about WHY, because the first two attempts at this comment were both false.
+ *  `UINode`'s gate is NOT uncovered: `uiNode.test.tsx`'s "a visibility binding hides the
+ *  element when evalVisibility is false" already pins it, and deleting the gate reddens that
+ *  file too. What is uncovered is the JOIN — `uiNode.test.tsx` MOCKS
+ *  `evalVisibility`, so nothing else runs an authored scene through
+ *  `registerReadSource('canGoBack')` → the real resolver → the real gate. Measured: delete the
+ *  read-source fallback (`bindingResolver.ts`, `if (raw == null) raw = getReadValue(field)`)
+ *  and this file goes 2/2 red while `uiNode.test.tsx` + `uiRenderer.test.tsx` stay 188/188
+ *  green. That is the mutation this file exists to catch; asking `evalVisibility` directly
+ *  instead of rendering would give the assertion back to the store-state path and lose it.
  *
- *  ⚠️ The button binds `visibleBinding`, not a disabled state. `docs/managers-and-systems.md`
- *  describes "a Back button binds `disabled={!canGoBack}`" as the motivating example and
- *  the engine has no such binding: a read source reaches a UI element through
+ *  ⚠️ Two things it still does NOT reach: it renders `UINode` directly, so `UIRenderer` and
+ *  the pipeline registration of `uiTreeProjection` are outside it; and it cannot tell
+ *  "consults the node's binding" from "consults `canGoBack`" — hardcoding the field in the
+ *  gate leaves it green. The authored side of that is pinned by the `visibleBinding`
+ *  assertion in `backButtonRendered`, not by the render.
+ *
+ *  ⚠️ The button binds `visibleBinding`, not a disabled state. The engine has no
+ *  read-source-driven `disabled`: a read source reaches a UI element through
  *  `UIBinding.visibleBinding`/`textBinding` only (`ui/bindingResolver.ts`), and the one
  *  `disabled` field that exists — `UIToggle.disabled` — is written by a `set` binding, not
  *  read from the registry. So the shipped shape is "the Back button HIDES at the root",
- *  and this test pins that rather than the doc's aspiration.
+ *  and this test pins that rather than the doc's former aspiration.
  *
- *  ⚠️ koota caps a PROCESS at 16 worlds and every `loadScene` mints one, so this file
- *  stays deliberately small and releases the world it leaves behind. */
+ *  ⚠️ `SceneManager` destroys the outgoing world at every swap, so koota's 16-world
+ *  process cap is not what bounds this file; the `afterEach` destroy is belt-and-braces
+ *  for a test that ends mid-transition. */
+// @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import React from 'react';
+import { render, cleanup } from '@testing-library/react';
 import { completeResponse } from '../stubs/assetResponse';
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { RenderableUI } from '../../src/runtime/traits/RenderableUI';
+import { UIElement } from '../../src/runtime/traits/UIElement';
 import { UIAction } from '../../src/runtime/traits/UIAction';
 import { UIBinding } from '../../src/runtime/traits/UIBinding';
 import { sceneManager } from '../../src/runtime/scene/SceneManager';
@@ -42,22 +65,28 @@ import { navigationManager } from '../../src/runtime/managers/NavigationManager'
 import { registerManager, unregisterManager } from '../../src/runtime/managers/managerRegistry';
 import { getCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { applyBindings, type UIActionBinding } from '../../src/runtime/ui/bindings';
-import { evalVisibility } from '../../src/runtime/ui/bindingResolver';
+import { UINode } from '../../src/runtime/ui/UINode';
+import { uiTreeProjection, useUITreeStore, markUIDirty, type UINodeData } from '../../src/runtime/ui/uiTreeStore';
 import { getReadValue, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 import { setPlayState } from '../../src/runtime/core/playState';
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 import { SCENE_FORMAT_VERSION } from '../../src/runtime/core/version';
 
-// The scene loader spawns traits by NAME out of the real registry, so the three the
-// authored button uses have to be in it — the app registers these at startup
-// (`engine/app/ecs/registerTraits.ts`), which a package test does not run.
+// The scene loader spawns traits by NAME out of the real registry, and `uiTreeStore`
+// resolves the same registry to build the tree, so the five the authored button uses have
+// to be in it — the app registers these at startup (`engine/app/ecs/registerTraits.ts`),
+// which a package test does not run.
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });
+registerTrait({ name: 'RenderableUI', trait: RenderableUI, category: 'component', fields: {} });
+registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fields: {} });
 registerTrait({ name: 'UIAction', trait: UIAction, category: 'component', fields: {} });
 registerTrait({ name: 'UIBinding', trait: UIBinding, category: 'component', fields: {} });
 
 const BACK_GUID = 'back-button-guid';
 
-/** Every scene carries the same Back button, exactly as an authored HUD would. */
+/** Every scene carries the same Back button, exactly as an authored HUD would — including
+ *  `RenderableUI` + `UIElement`, without which `uiTreeStore` builds no node at all and the
+ *  entity is not a UI element in any sense the renderer recognises. */
 const sceneWithBackButton = (name: string) => ({
   id: `scene-${name}`,
   version: SCENE_FORMAT_VERSION,
@@ -67,6 +96,8 @@ const sceneWithBackButton = (name: string) => ({
       id: 1,
       traits: {
         EntityAttributes: { name: `BackButton-${name}`, parentId: 0, guid: BACK_GUID },
+        RenderableUI: {},
+        UIElement: { text: 'Back' },   // elementType defaults to 'div' — the union is div|input|range
         UIAction: { bindings: [{ event: 'click', kind: 'call', action: 'engine.navigateBack' }] },
         UIBinding: { visibleBinding: 'canGoBack' },
       },
@@ -90,19 +121,25 @@ function pressBackButton(): void {
     bindings = (e.get(UIAction) as { bindings: UIActionBinding[] }).bindings;
   });
   expect(bindings, 'the loaded scene must carry the authored Back button').toBeDefined();
+  expect(bindings, 'exactly the one authored click binding').toHaveLength(1);
+  expect(bindings![0].action).toBe('engine.navigateBack');
   applyBindings(bindings, 'click', { selfGuid: BACK_GUID });
 }
 
-/** What the renderer would decide for the button, through the real resolver. */
-function backButtonVisible(): boolean {
-  const world = getCurrentWorld();
-  let binding: { visibleBinding: string; visibleOp: string; visibleValue: string } | undefined;
-  world.query(EntityAttributes, UIBinding).forEach((e) => {
-    if ((e.get(EntityAttributes) as { guid: string }).guid !== BACK_GUID) return;
-    binding = e.get(UIBinding) as typeof binding;
-  });
-  expect(binding, 'the loaded scene must carry the authored visibility binding').toBeDefined();
-  return evalVisibility({}, binding!.visibleBinding, binding!.visibleOp || '', binding!.visibleValue || '');
+/** Project the live world into the real UI tree and RENDER the button's node with the real
+ *  `UINode`. Rendering is the point: `UINode` is where the `visibleBinding` gate lives, so
+ *  asking `evalVisibility` here instead would assert a copy of the decision and leave the
+ *  gate itself uncovered. */
+function backButtonRendered(): boolean {
+  markUIDirty();
+  uiTreeProjection(getCurrentWorld());
+  const node = useUITreeStore.getState().tree.find((n: UINodeData) => n.guid === BACK_GUID);
+  expect(node, 'the loaded scene must project a Back button node').toBeDefined();
+  expect(node!.binding?.visibleBinding, 'the authored visibility binding survives the projection').toBe('canGoBack');
+  const { container } = render(React.createElement(UINode, { node: node!, storeState: {} }));
+  const rendered = container.firstChild !== null;
+  cleanup();
+  return rendered;
 }
 
 describe('a Back button, end to end', () => {
@@ -127,6 +164,7 @@ describe('a Back button, end to end', () => {
   });
 
   afterEach(() => {
+    cleanup();
     unregisterManager('engine.navigation');
     restoreRealClock();
     global.fetch = realFetch;
@@ -138,21 +176,21 @@ describe('a Back button, end to end', () => {
     // NOT record history — nothing was navigated away from.
     await sceneManager.loadScene('/scenes/A.json');
     expect(getReadValue('canGoBack')).toBe(false);
-    expect(backButtonVisible()).toBe(false);   // nothing to go back to → hidden
+    expect(backButtonRendered()).toBe(false);   // nothing to go back to → renders nothing
 
     // The player navigates. Now there IS somewhere to go back to.
     await navigationManager.loadScene('/scenes/B.json');
     expect(sceneManager.getCurrent()?.path).toBe('/scenes/B.json');
     expect(getReadValue('canGoBack')).toBe(true);
-    expect(backButtonVisible()).toBe(true);
+    expect(backButtonRendered()).toBe(true);
 
     // Press the authored button. Everything from here is the shipped chain.
     pressBackButton();
     await vi.waitFor(() => expect(sceneManager.getCurrent()?.path).toBe('/scenes/A.json'));
 
-    // The entry was consumed exactly once: back at the root, button hidden again.
+    // The entry was consumed exactly once: back at the root, button gone again.
     expect(getReadValue('canGoBack')).toBe(false);
-    expect(backButtonVisible()).toBe(false);
+    expect(backButtonRendered()).toBe(false);
   });
 
   it('a second press at the root is inert — it does not reload or strand the stack', async () => {
@@ -163,9 +201,12 @@ describe('a Back button, end to end', () => {
     await vi.waitFor(() => expect(getReadValue('canGoBack')).toBe(false));
     const loadsAfterFirstBack = (global.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
 
-    // ⚠️ Step past the 300ms input-lock floor first. Without this the second press is
-    // swallowed by the LOCK, and the assertion below would pass for a reason that has
-    // nothing to do with an empty history — the test would be green and vacuous.
+    // Step past the 300ms input-lock floor. ⚠️ Not load-bearing TODAY, and the comment that
+    // said it was ("without this the second press is swallowed by the lock") was measured
+    // false: `ui/bindings.ts` releases the lock from its own `onWorldSwap` hook, so the first
+    // Back's swap already freed it. Kept because the assertion below is about an EMPTY
+    // history and should not depend on that release still happening — but it earns no credit,
+    // so do not cite it as what makes this test non-vacuous.
     advanceManual(1000);
     pressBackButton();                       // history is empty — back() must no-op
     await Promise.resolve();

@@ -10,8 +10,8 @@ watchdog, delta transfer, the `rejected` quarantine, blocking/mandatory mode, su
 modules, the editor publish UX, and the public how-to guide) are shipped and device-verified
 on iOS and Android. Sub-game modules get their own doc,
 [ota-subgame-modules.md](./ota-subgame-modules.md); remaining open design questions and
-follow-up work are tracked in
-[plans/mobile-ota-updates-plan.md](./plans/mobile-ota-updates-plan.md).
+follow-up work are tracked as
+[#836](https://github.com/lsgmasa33/modoki/issues/836) and [#837](https://github.com/lsgmasa33/modoki/issues/837).
 
 ## What it is
 
@@ -622,6 +622,19 @@ existence-only guard survives anywhere in the pipeline (#577). For the same reas
 `bundle.zip`, so that its presence genuinely means "this version's contents were committed"
 rather than "an upload got partway". `release.json` is still written after everything.
 
+## Settled policy decisions
+
+Folded from the retired `docs/plans/mobile-ota-updates-plan.md` (2026-09-07). These are closed
+questions, recorded so they are not re-opened by accident.
+
+| Question | Decision |
+|---|---|
+| Sub-game bundle contents | **Code + assets** — each sub-game is an independently-built ES module the shell dynamically imports. Not assets-only. |
+| Apply timing | **Per-release `mandatory` flag.** Routine = background, applies next launch. Mandatory = blocking progress UI, then **"restart to continue"** — NOT a mid-session hot-swap. |
+| Engine-API compatibility | **Exact equality, no range/`>=` policy.** A sub-game built against a different engine version refuses to load, loudly, rather than attempting it. Revisit only if this proves too strict in real use — and note [#837](https://github.com/lsgmasa33/modoki/issues/837) depends on it: any automated publish surface must make the engine-API value it stamps visible rather than defaulted. |
+| `state.json` across a real binary update | **Reset the live bookkeeping** (`active`/`pending`/`bootAttempts`/`confirmedBoots`), **keep the `rejected` quarantine list.** A new binary ships its own latest embedded content, so bookkeeping referencing an abandoned OTA snapshot is meaningless — but a version already proven bad has no reason to become stageable again just because the binary changed. Implemented as `OtaCore.resetForNewBinary` (Swift + Java). |
+| App Store / Play policy | **Permitted.** App Review Guideline 4.7 names first-party HTML5/JS mini-apps/mini-games explicitly; DPLA §3.3.2 allows downloaded interpreted code that does not change the app's advertised primary purpose and is not a storefront for third-party code. Guideline 2.5.2 is the general *compiled*-code ban; 4.7/3.3.2 are the carve-out this feature relies on. Play is more permissive. Practical takeaway: advertise the app as a game collection from v1, and keep every game first-party. |
+
 ## Gotchas
 
 - **`ota-publish.mjs`'s `q()` was NOT a shell quote, and a `/` in `--name` defeated #577** (#649).
@@ -887,13 +900,14 @@ Two gaps found while wiring the runner (2026-08-27), one closed and one open:
 
 `games/ota-test` is the committed device-verification fixture (both native targets, a
 full-screen "OTA TEST vN" scene so a glance at the phone identifies the running bundle).
-The device loop, current key/bucket state, and per-platform relaunch recipes live in the
-plan doc — they involve private infrastructure and are deliberately not duplicated here.
+The device loop, current key/bucket state, and per-platform relaunch recipes live in
+[ota-device-testing.md](./ota-device-testing.md) — they involve private infrastructure and are
+deliberately not duplicated here.
 
 ## Related
 
 - [ota-subgame-modules.md](./ota-subgame-modules.md) — the sub-game module mechanism this doc only summarizes
-- [plans/mobile-ota-updates-plan.md](./plans/mobile-ota-updates-plan.md) — open design questions, known follow-up gaps, the device-test loop
+- [ota-device-testing.md](./ota-device-testing.md) — **Private** — the device-test loop, bucket/key state, per-platform relaunch recipes
 - [build.md](./build.md) — the build pipeline an OTA payload comes out of
 - [native-and-sdks.md](./native-and-sdks.md) — the Capacitor plugin pattern this follows
 - [player-prefs.md](./player-prefs.md) — the other persistence store, and why OTA state isn't in it

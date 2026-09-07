@@ -1,4 +1,4 @@
-/** core/gpuContextTracking.ts — Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md). The
+/** core/gpuContextTracking.ts — Phase 3 of #590 (docs/rendering.md). The
  *  shared live GL/GPU-context counter every context-creating site (`canvas2DPool`, `scene3DSync`'s
  *  `makeWebGPURenderer`, `rampWorkloadGL`, `deviceCaps`) now calls into. This file exercises the
  *  module in isolation, pure; the integration tests proving each REAL call site is actually wired
@@ -80,7 +80,7 @@ describe('gpuContextTracking', () => {
     expect(warn).toHaveBeenCalledTimes(2); // the latch was cleared too — a fresh session can warn again
   });
 
-  // Second device measurement (docs/plans/ios-rendering-update-wedge.md): fps and every live
+  // Second device measurement (docs/ios-gpu-memory.md): fps and every live
   // JS-visible count read FLAT for 16 minutes up to a confirmed jetsam — a live snapshot cannot
   // see create/destroy CHURN. These cumulative totals exist so churn is visible even when the
   // live gauge holds steady.

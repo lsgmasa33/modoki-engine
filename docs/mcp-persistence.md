@@ -113,9 +113,49 @@ entry pending rather than silently dropping it. `hasUnsavedChanges()` and `get_e
 `dirtyAssetPaths` both account for it — a dirty asset an agent can't see is the same silent-loss
 trap the original `unsavedChanges` field exists to close for live scene edits.
 
-**The five asset PANELS park here too, as of #259 — there is no longer a second contract.** The
-Particle, Animation, Timeline, Skin and SpriteAnim editors used to POST their document to disk on a
-400 ms trailing debounce. That was a second way for one file to be written, and each half was right
+**The five asset PANELS park here too, as of #259.** The Particle, Animation, Timeline, Skin and
+SpriteAnim editors used to POST their document to disk on a 400 ms trailing debounce.
+
+⚠️ **This paragraph used to end "— there is no longer a second contract", and that was false for as
+long as it stood (#831).** #259 fixed the five panels it named and left the Inspector's asset VIEWS
+— Material, MaterialBatch, Shader and AnimSet — POSTing `/api/write-file` on every keystroke through
+`persistAssetEdit`, while `get_editor_state` reported `persistenceMode:'manual'` and
+`unsavedChanges:false`. The second contract was still there; only its owner had changed. The lesson
+is the one #830's family is about: **a fix scoped to the instances someone listed reads afterwards
+as a fix to the class**, and the sentence claiming completeness is what stops anyone re-checking.
+The four views park through the same registry as of #831 (`markAssetDirty(path, type, data,
+'panel')`), which is what finally makes the claim true — so it is now stated as a measurement, not
+a flourish: **nine surfaces park, and `grep -rn "persistAssetEdit(" ` names four of them.**
+
+### The bytes a save writes
+
+**`assetJsonBytes` (`engine/plugins/backend/editorBackendRouter.ts`) is the one definition of what
+an asset JSON write puts on disk** — `JSON.stringify(doc, null, 2)` **plus a trailing newline**.
+`writeJsonAtomic` and both self-write FINGERPRINT sites read it, and
+`tests/plugins/assetJsonBytesAgree.test.ts` asserts they cannot drift.
+
+⚠️ **The fingerprint is why this is one function and not three call sites.** `markEditorWrite(abs,
+sha1(bytes))` is how the file watcher skips the editor's own save; a hash that does not match what
+actually landed **fails OPEN** — the change event returns ~150 ms later, is read as an EXTERNAL
+edit, and `dropParkedWriteFor` discards whatever the human had parked. Getting the newline right at
+two of three sites would have been worse than leaving the bug.
+
+Two sibling writers share it (both fixed in #831 after the live check caught them): the asset
+scanner's guid **heal**, which rewrites any doc written without an `id` ~150 ms later, and
+`asset-fs-ops.ts`'s asset **copy**. `scripts/migrate-assets.mjs` carries the same byte as a literal
+(it is `.mjs` and cannot import the `.ts`), with a comment saying so — its old comment justified
+*omitting* the newline by matching the editor, and would have produced exactly the churn it was
+written to prevent once the editor changed.
+
+⚠️ **This covers the SERVER seam only.** Scenes, prefabs, and the panels' create paths serialise
+**client-side** and POST the finished string, so `assetJsonBytes` is not in their path and they
+still drop the newline — 17 sites, tracked as **#835**. `AtlasAssetView` is the one client-side
+writer that already appends it.
+
+⚠️ Two views deliberately do NOT park and are not exceptions to fix: `AtlasAssetView` writes through
+its own compare-and-swap queue (`/api/write-file-if-match`, with conflict detection the registry has
+no equivalent for) and `SceneAssetView` mutates one field via `/api/scene-mutate`. The issue that
+found this listed six views; there are four. That was a second way for one file to be written, and each half was right
 locally: the agent op answered `saved:false` while the panel had already put bytes on disk. What it
 cost, all three measured rather than argued:
 

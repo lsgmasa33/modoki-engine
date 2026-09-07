@@ -1,4 +1,4 @@
-/** "Publish OTA Update…" dialog (docs/plans/mobile-ota-updates-plan.md Phase 5a) —
+/** "Publish OTA Update…" dialog (docs/ota-updates.md) —
  *  the primary Build → OTA action. Shows what's LIVE on the bucket right now vs what
  *  this project would publish, collects a version string + mandatory flag, then drives
  *  GET /api/ota/publish (SSE) to completion. That endpoint already carries the safety

@@ -40,7 +40,7 @@ import {
   attachDeviceLostListener as attachDeviceLostListenerPrimitive,
 } from './rendererLossHandling';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
-import { noteGpuContextCreated, noteGpuContextDestroyed, liveGpuContextCount } from '../core/gpuContextTracking';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
 import { revalidateSubtreeAfterRendererRebuild } from './gpuResourceInvalidation';
 import { withTimeout } from '../core/abandonment';
 
@@ -60,15 +60,11 @@ export async function resolvePixiBackend(): Promise<'webgpu' | 'webgl'> {
 // Each initialized slot Application = one live GPU context. Real Canvas2D counts are 1–2 per
 // scene, and the editor lazy-mounts its 2D surface only in 2D mode — so a healthy session stays
 // well under the cap on its own. The counter itself — and the soft cap it warns against — now
-// live in `core/gpuContextTracking.ts` (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md):
+// live in `core/gpuContextTracking.ts` (Phase 3 of #590, docs/rendering.md):
 // it was PRIVATE to this file and counted only PixiJS pool contexts, invisible to the main Three
 // renderer and the boot-time GL probes, which made the budget it warned against a partial one.
 // `noteGpuContextCreated`/`noteGpuContextDestroyed` below are re-exports of the calls this file
 // already made at every slot-init/slot-destroy site; behaviour here is unchanged.
-/** Live GL/GPU-context count across EVERY tracked site — not just this pool. Kept under its
- *  original name for the existing test/diagnostic callers; see `liveGpuContextCount` for the
- *  general accessor. */
-export function liveCanvas2DContextCount(): number { return liveGpuContextCount(); }
 
 export interface Canvas2DSlot {
   canvas: HTMLCanvasElement;
@@ -990,7 +986,7 @@ export class Canvas2DPool {
   }
 
   /** Snapshot of every live slot's entity id + Pixi container, for the GPU-memory report
-   *  (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md) to walk and attribute bytes
+   *  (Phase 3 of #590, docs/ios-gpu-memory.md) to walk and attribute bytes
    *  per slot. Read-only: the caller must not mutate the container. Includes every slot with a
    *  live entity, initialized or not (an uninitialized slot's container is simply empty). */
   getSlotsForMemoryReport(): ReadonlyArray<{ entityId: number | null; container: Container }> {
