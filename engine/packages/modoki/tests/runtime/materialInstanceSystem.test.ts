@@ -585,7 +585,10 @@ describe('materialInstanceSystem', () => {
 // The system reaches an entity's live 2D-material Shader(s) via sprite2DMaterialBroker.
 // We register a fake per-entity shader map (a real broker registration) and assert its
 // matUniforms.uniforms are driven — sharing the SAME evalSource + clocks as the 3D path.
-const shaders2d = new Map<number, { resources: { matUniforms: { uniforms: Record<string, unknown> } }; _destroyed: boolean }>();
+type Fake2DShader = { resources: { matUniforms: { uniforms: Record<string, unknown> } }; _destroyed: boolean };
+// Entries carry the entity's koota generation, exactly as `Scene2DRenderer.entityShaders` does
+// (#848) — the broker rejects an entry whose generation does not match the reading entity's.
+const shaders2d = new Map<number, { shader: Fake2DShader; gen: number }>();
 
 function fakeShader(declared: Record<string, unknown> = {}) {
   return { resources: { matUniforms: { uniforms: { ...declared } } }, _destroyed: false };
@@ -593,7 +596,7 @@ function fakeShader(declared: Record<string, unknown> = {}) {
 function attach2D(world: ReturnType<typeof createWorld>, overrides: MaterialParamOverride[], declared: Record<string, unknown> = {}) {
   const e = world.spawn(MaterialInstance({ overrides }));
   const sh = fakeShader(declared);
-  shaders2d.set(e.id(), sh);
+  shaders2d.set(e.id(), { shader: sh, gen: e.generation() });
   return { e, sh };
 }
 
@@ -628,8 +631,8 @@ describe('materialInstanceSystem — 2D materials', () => {
 
     materialInstanceSystem(world);
 
-    expect(isEntity2DMaterialDirty(changed.id())).toBe(true);
-    expect(isEntity2DMaterialDirty(settled.id())).toBe(false); // no write → no redraw needed
+    expect(isEntity2DMaterialDirty(changed.id(), changed.generation())).toBe(true);
+    expect(isEntity2DMaterialDirty(settled.id(), settled.generation())).toBe(false); // no write → no redraw needed
   });
 
   it('re-clears the dirty set each frame — a settled constant is dirty once, then clean', () => {
@@ -638,9 +641,9 @@ describe('materialInstanceSystem — 2D materials', () => {
     const { e } = attach2D(world, [{ target: 'uA', kind: 'uniform', source: { type: 'constant', value: 0.75 } }], { uA: 0 });
 
     materialInstanceSystem(world);
-    expect(isEntity2DMaterialDirty(e.id())).toBe(true);  // 0 → 0.75 (first write)
+    expect(isEntity2DMaterialDirty(e.id(), e.generation())).toBe(true);  // 0 → 0.75 (first write)
     materialInstanceSystem(world);
-    expect(isEntity2DMaterialDirty(e.id())).toBe(false); // value unchanged this frame → set cleared, not re-marked
+    expect(isEntity2DMaterialDirty(e.id(), e.generation())).toBe(false); // value unchanged this frame → set cleared, not re-marked
   });
 
   it('does NOT write an undeclared uniform (avoids dead keys)', () => {
@@ -662,7 +665,7 @@ describe('materialInstanceSystem — 2D materials', () => {
 
     expect(() => materialInstanceSystem(world)).not.toThrow();
     expect(sh.resources.matUniforms.uniforms.uReveal).toBe(0); // untouched (not a scalar drive)
-    expect(isEntity2DMaterialDirty(e.id())).toBe(false);        // no uniform change → no redraw
+    expect(isEntity2DMaterialDirty(e.id(), e.generation())).toBe(false);        // no uniform change → no redraw
   });
 
   it('scrolls a time uniform each frame and FREEZES on pause (deterministic clock)', () => {
@@ -711,15 +714,42 @@ describe('materialInstanceSystem — 2D materials', () => {
     spawnTime(world);
     const { e, sh } = attach2D(world, [{ target: 'uK', kind: 'uniform', source: { type: 'constant', value: 0.5 } }], { uK: 0 });
     // A second renderer's map with its OWN shader for the same entity.
-    const map2 = new Map<number, typeof sh>();
+    const map2 = new Map<number, { shader: typeof sh; gen: number }>();
     const sh2 = fakeShader({ uK: 0 });
-    map2.set(e.id(), sh2);
+    map2.set(e.id(), { shader: sh2, gen: e.generation() });
     const unreg = register2DMaterialShaderMap(map2 as never);
 
     materialInstanceSystem(world);
     expect(sh.resources.matUniforms.uniforms.uK).toBeCloseTo(0.5, 9);
     expect(sh2.resources.matUniforms.uniforms.uK).toBeCloseTo(0.5, 9);
     unreg();
+  });
+
+  it('a respawned entity on a recycled id does NOT drive the dead entity 2D Shader (#848)', () => {
+    // The same-frame window this fix exists for: the driver reads the broker at ECS priority 0,
+    // while Scene2D's purge of the stale entry runs in the render pass at priority 20/40 later in
+    // the SAME frame. So the entry below is exactly what the driver would see in that window.
+    const world = newWorld();
+    spawnTime(world);
+    const { e: a, sh: shA } = attach2D(world, [{ target: 'uK', kind: 'uniform', source: { type: 'constant', value: 0.75 } }], { uK: 0 });
+
+    materialInstanceSystem(world);
+    expect(shA.resources.matUniforms.uniforms.uK).toBeCloseTo(0.75, 9); // A drives its own shader
+
+    // A dies. Its entry is deliberately LEFT in the map — that is the state the purge has not
+    // reached yet, and removing it here would test the purge instead of the guard.
+    a.destroy();
+    const b = world.spawn(MaterialInstance({ overrides: [{ target: 'uK', kind: 'uniform', source: { type: 'constant', value: 0.25 } }] }));
+    expect(b.id()).toBe(a.id());                 // the index really was reclaimed…
+    expect(b.valueOf()).not.toBe(a.valueOf());   // …and B is genuinely a different entity
+    expect(shaders2d.get(b.id())?.gen).toBe(a.generation()); // the stale entry is still A's
+
+    materialInstanceSystem(world);
+
+    // Before the fix B's 0.25 landed in A's live Shader. B registered no shader of its own, so
+    // the correct outcome is that nothing is written at all.
+    expect(shA.resources.matUniforms.uniforms.uK).toBeCloseTo(0.75, 9);
+    expect(isEntity2DMaterialDirty(b.id(), b.generation())).toBe(false);
   });
 
   it('a prop override on a 2D material is a no-op and warns once', () => {

@@ -108,6 +108,11 @@ const BASELINE: Record<string, string> = {
     'engine/packages/modoki/tests/runtime/materialInstanceSystem.test.ts',
   'engine/packages/modoki/src/runtime/rendering/materialInstanceClones.ts':
     'engine/packages/modoki/tests/runtime/materialInstanceClones.test.ts',
+  // #848 — the broker's per-frame dirty map. The registered `entityShaders` maps are cleared by
+  // the renderers that OWN them; this map is owned by nobody, so it needs the swap clear and a test
+  // that proves the clear is wired.
+  'engine/packages/modoki/src/runtime/rendering/sprite2DMaterialBroker.ts':
+    'engine/packages/modoki/tests/runtime/sprite2DMaterialBroker.test.ts',
   // #838's seven.
   'engine/packages/modoki/src/runtime/rendering/flameMeshSync.ts':
     'engine/packages/modoki/tests/runtime/flameMeshSync.test.ts',

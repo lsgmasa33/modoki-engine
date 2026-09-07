@@ -51,10 +51,42 @@ Two sanctioned fixes, and the choice is about who else holds the id:
   is also a public *addressing* contract other modules call you with. Used by
   `physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
   [physics-2d.md](physics-2d.md)), by `video/videoSystem.ts` (its `owner` map — #336; its ids reach
-  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), and by
+  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), by
   `rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
   "forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it
-  outlive its entity).
+  outlive its entity), and by `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered
+  `entityShaders` maps and its per-frame dirty map).
+
+⚠️ **A per-frame rebuild is not automatically the "revalidated" exemption below.** The broker's
+dirty map is cleared and refilled every frame and was still wrong, because the mark and the read sit
+on OPPOSITE SIDES of one frame: the driver marks at ECS priority 0, the 2D render pass reads at
+priority 20/40, and a despawn+respawn in between reads the dead entity's mark. The exemption needs
+the entry checked against something **recomputed from the live entity**, not merely written recently.
+
+⚠️ **"Store the generation" is only HALF the shape — the other half is REBUILDING on a mismatch,
+and omitting it is worse than the bug.** The rule above says *keep the id key and store the
+generation alongside it, **rebuilding on a mismatch***; `physics2DSystem` rebuilds the body, and
+`videoSystem` calls `forget(id)` before re-taking ownership. A guard that only *refuses* on a
+mismatch, with no producer re-stamping the entry for the newcomer, converts a transient wrong read
+into a **permanent** one — the newcomer is denied state it legitimately owns, forever, and the
+sweep that would normally clear the entry deliberately keeps it because the newcomer is live. That
+is what #848's first cut shipped: the broker's read was generation-checked while `Scene2D.tsx`
+wrote the stamp only when it BUILT a Mesh, so a respawn reusing the dead entity's slot was locked out
+of the Shader on screen. **When you add a generation check, find every producer, not just every
+consumer** — and the reuse/fast paths are producers even though they build nothing.
+
+⚠️ **Re-stamping restores ACCESS to a reused resource; it does not RESET that resource's state.**
+The two are separate, and only the first is what #848 fixed — a respawned 2D-material entity still
+inherits the dead one's uniform values, because they are seeded only on a build (#873). When the
+sanctioned shape says *rebuilding*, a full rebuild resets both; a cheaper re-stamp resets neither the
+payload nor anything else the build seeded. Decide which you actually need, and say which one you
+implemented.
+
+⚠️ **The choice can be forced by a map you do not own.** `sprite2DMaterialBroker` takes the second
+shape even though its maps look module-private, because `Scene2DRenderer` owns them and keys them in
+the same space as its `slots`/`activeIds`/`last*Render` maps, which one shared sweep deletes
+together — re-keying one of them to `entity.valueOf()` would silently desync that sweep. Ask who
+else *keys* the map, not just who calls you.
 
 Neither is needed for a cache whose every entry is **revalidated against a value recomputed this
 frame** — that is why `skinning/skin2DSystem.ts` is safe despite looking identical, and

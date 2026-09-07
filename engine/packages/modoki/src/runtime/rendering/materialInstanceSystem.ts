@@ -249,7 +249,7 @@ function applyOverrides2D(
       if (uniforms[override.target] !== value) { uniforms[override.target] = value; changed = true; }
     }
   }
-  if (changed) broker2D?.markEntity2DMaterialDirty(id);
+  if (changed) broker2D?.markEntity2DMaterialDirty(id, gen);
 }
 
 export function materialInstanceSystem(world: World): void {
@@ -263,11 +263,14 @@ export function materialInstanceSystem(world: World): void {
     const overrides = mi.overrides;
     if (!overrides || overrides.length === 0) return;
     const id = entity.id();
+    // The koota generation discriminates THIS entity from a dead one whose masked index it
+    // reclaimed — every id-keyed cache reached below takes it (#848, #738, #336).
+    const gen = entity.generation();
 
     // 2D custom-material entities: drive the per-entity Pixi Shader's uniforms. Checked
     // first — a material-bound Renderable2D has no 3D broker presence, so this is exclusive.
-    const shaders2d = broker2D ? broker2D.getEntity2DMaterialShaders(id) : NO_2D_SHADERS;
-    if (shaders2d.length > 0) { applyOverrides2D(shaders2d, overrides, id, entity.generation(), sim, vis); return; }
+    const shaders2d = broker2D ? broker2D.getEntity2DMaterialShaders(id, gen) : NO_2D_SHADERS;
+    if (shaders2d.length > 0) { applyOverrides2D(shaders2d, overrides, id, gen, sim, vis); return; }
 
     const objects = getEntityObjects(world, id);
     if (objects.length === 0) return; // no 3D presence on any surface yet
@@ -281,7 +284,7 @@ export function materialInstanceSystem(world: World): void {
       // build; a per-entity swap would need a clone, like kind:'prop'). Warn once so the
       // silent no-op is discoverable, then skip.
       if (override?.kind === 'texture') {
-        const tex3DKey = `${id}:${entity.generation()}`;
+        const tex3DKey = `${id}:${gen}`;
         if (import.meta.env?.DEV && !_tex3DWarned.has(tex3DKey)) {
           _tex3DWarned.add(tex3DKey);
           console.warn(`[MaterialInstance] entity ${id}: kind:'texture' overrides are only supported on a 2D custom material (space:'2d' shader); this entity's material is 3D — skipped.`);
@@ -295,8 +298,8 @@ export function materialInstanceSystem(world: World): void {
       // SAME id with the same override at the same index would otherwise read the dead entity's
       // accumulated clock value (or `_lastPropValue`'s stale "last written" value, suppressing the
       // dirty-gate arm on the newcomer's very first frame). Closes it for 255 recycles of an id;
-      // koota's generation is 8-bit and wraps.
-      const gen = entity.generation();
+      // koota's generation is 8-bit and wraps. (`gen` is hoisted to the top of this callback —
+      // every id-keyed cache below discriminates on the same value.)
       const value = evalSource(override, `${id}:${gen}:${i}:${override.target}`, sim, vis);
       if (override.kind === 'prop') {
         if (!baseResolved) { base = resolvePropBase(entity, objects as THREE.Mesh[], id); baseResolved = true; }

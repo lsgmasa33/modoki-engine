@@ -63,6 +63,7 @@ import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/sprit
 import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
+import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
 import { computeGroupAlpha } from './groupAlpha';
 import { computeMaskGroups } from './maskGroups';
@@ -688,7 +689,12 @@ export class Scene2DRenderer {
   // Live per-entity 2D-material Shaders (kind 'material'), keyed by entity id — the
   // Scene2D-owned registry MaterialInstance's 2D driver writes uniforms into (Phase 3),
   // the minimal analog of the 3D materialBroker. Populated/cleared with the slot.
-  readonly entityShaders = new Map<number, Shader>();
+  // ⚠️ The value carries the entity's koota GENERATION (#848): the key is the masked index,
+  // which a respawn reclaims LIFO, and the driver reads this through the broker at ECS
+  // priority BEFORE the purge below runs at render priority. Deletes/purges are unaffected —
+  // they only ever use keys — so this stays in the same key space as `slots`/`activeIds`/
+  // `last*Render`, which the shared sweep deletes alongside it.
+  readonly entityShaders = new Map<number, Entity2DShaderEntry>();
   // Pooled per-frame set of entity ids drawn by the material pass — used to purge stale
   // entityShaders entries without a per-frame allocation.
   private readonly _materialIdsScratch = new Set<number>();
@@ -1747,6 +1753,7 @@ export class Scene2DRenderer {
         if (!program) return; // still loading / failed → Step 3 drew the default; nothing here
 
         const id = entity.id();
+        const gen = entity.generation();
         const canvasId = this.findCanvasAncestor(id);
         if (canvasId === null) return;
         const canvasSlot = this.pool.getSlot(canvasId);
@@ -1879,8 +1886,32 @@ export class Scene2DRenderer {
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
           slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matBuildSig, matQuadSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite };
           this.slots.set(id, slot);
-          this.entityShaders.set(id, shader);
+          this.entityShaders.set(id, { shader, gen });
           built = true; // fresh/rebuilt Mesh → must draw at least once
+        }
+
+        // ⚠️ Re-stamp the driver's entry whenever this entity renders as a material — NOT only on a
+        // fresh build (#848). A respawn reclaiming this id with the SAME material GUID and texture
+        // passes the rebuild gate above, so the slot (and its Shader) are reused; a build-only write
+        // would leave the DEAD entity's generation on a Shader the renderer is actively drawing, and
+        // the broker's generation check would then refuse the driver access to it. Permanently, not
+        // for a frame: the per-frame purge below KEEPS this entry, because this id is in
+        // `materialIds` — the newcomer is rendering. The symptom is a respawned entity frozen at the
+        // dead one's last uniform values, with no redraw ever armed.
+        // ⚠️ This restores the driver's ACCESS to the reused Shader. It does NOT reset the Shader's
+        // uniform VALUES, so the newcomer still inherits the dead entity's last driven ones —
+        // `matUniforms` is allocated only in `makePixiShaderInstance`, i.e. only on a build. That is
+        // a real and SEPARATE gap (#873, pre-dating this fix): permanent when the newcomer drives no
+        // `MaterialInstance` at all. Closing it is a design fork — rebuild on mismatch, as
+        // `physics2DSystem` does, versus re-seeding the uniforms in place — with a cost in this hot
+        // path either way, so it is tracked rather than decided here.
+        // Allocation-free once settled: it writes only when the shader or the generation changed.
+        const shaderNow = slot.matShader;
+        if (shaderNow) {
+          const prev = this.entityShaders.get(id);
+          if (!prev || prev.shader !== shaderNow || prev.gen !== gen) {
+            this.entityShaders.set(id, { shader: shaderNow, gen });
+          }
         }
 
         // Quad size/pivot changed but nothing that needs a new Mesh did (#692) — resize in place.
@@ -1921,7 +1952,7 @@ export class Scene2DRenderer {
         // pass). A static-uniform material (no driver, or a driver holding a constant / a
         // stopped clock) now costs zero redraws once settled.
         const snap = this.lastMaterialRender.get(id);
-        const changed = forceAll || built || isEntity2DMaterialDirty(id) || !snap ||
+        const changed = forceAll || built || isEntity2DMaterialDirty(id, gen) || !snap ||
           snap.canvasId !== canvasId || snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz ||
           // ⚠️ `alpha`, NOT `rend.opacity` — the snapshot STORES the product below (#211), so
           // comparing the raw field made the two halves disagree. Both directions were wrong: a

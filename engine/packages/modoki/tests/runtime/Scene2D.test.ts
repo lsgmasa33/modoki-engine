@@ -616,6 +616,49 @@ describe('Scene2D.renderFrame', () => {
       expect(r.entityShaders.has(child.id())).toBe(false);      // purged when the entity leaves
     });
 
+    it('re-stamps the generation when a respawned entity REUSES the dead one\u2019s slot (#848)', async () => {
+      // The case the broker-level #848 tests do NOT reach, and the one that matters most: B does
+      // not merely "register nothing" \u2014 it inherits A's LIVE slot. Same material GUID, same
+      // texture, so the rebuild gate (`slot.matGuid`/`matBuildSig`/`builtEpoch`) passes and the
+      // renderer draws B with A's existing Shader. If the map entry is not re-stamped there, the
+      // generation check refuses the driver access to the very Shader on screen \u2014 permanently,
+      // because the per-frame purge keeps the entry (B IS rendering, so its id is in materialIds).
+      const broker = await import('../../src/runtime/rendering/sprite2DMaterialBroker');
+      const { traits, scene2d, pool, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+      const canvas = spawnCanvas(world, traits);
+      const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+      r.renderFrame();
+      expect(r.entityShaders.get(a.id())?.gen).toBe(a.generation());
+      const shaderA = r.entityShaders.get(a.id())!.shader;
+
+      // Despawn + respawn IDENTICALLY with NO renderFrame in between, so the purge never observes
+      // the gap. This is the pooled-prefab respawn (a bullet, a VFX) that koota's LIFO free list
+      // makes the common case rather than an exotic one.
+      a.destroy();
+      const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+      expect(b.id()).toBe(a.id());                 // the index really was reclaimed\u2026
+      expect(b.valueOf()).not.toBe(a.valueOf());   // \u2026and B is a different entity
+
+      r.renderFrame();
+
+      const slotShader = (r as any).slots.get(b.id())?.matShader;
+      expect(slotShader).toBe(shaderA);            // the slot WAS reused \u2014 nothing rebuilt
+
+      const entry = r.entityShaders.get(b.id());
+      expect(entry?.shader).toBe(slotShader);      // the entry points at the Shader on screen\u2026
+      expect(entry?.gen).toBe(b.generation());     // \u2026stamped for B, not for the dead A
+
+      // The consequence, asserted through the driver's own accessor rather than the map: B's
+      // MaterialInstance must be able to reach it, or B renders frozen at A's last uniforms.
+      const off = broker.register2DMaterialShaderMap(r.entityShaders);
+      try {
+        expect(broker.getEntity2DMaterialShaders(b.id(), b.generation())).toEqual([slotShader]);
+      } finally { off(); }
+    });
+
     it('falls back to the default sprite while the material program is still loading', async () => {
       const { traits, pool, scene2d, world, matReady } = await setup();
       // matGuid NOT ready → ensureSpriteMaterial returns undefined → sprite pass renders it.
@@ -1035,7 +1078,7 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();                                   // settled again
       expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
 
-      broker.markEntity2DMaterialDirty(child.id());            // driver wrote a new uniform this frame
+      broker.markEntity2DMaterialDirty(child.id(), child.generation()); // driver wrote a new uniform this frame
       scene2d.renderFrame();
       expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // uniform change forces a redraw
       broker.clearEntity2DMaterialDirty();
