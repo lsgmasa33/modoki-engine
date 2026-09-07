@@ -233,6 +233,85 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   already shows the new ones, and the stale park would go on to overwrite the reimport's own fresh
   write at the next Cmd+S.
 
+- **Every reader of `/api/read-meta` owes recording what the response TAUGHT it — including a
+  reader exempt from `readMetaPreferringPark`** (#871). `noteMetaReadResult` is the one place that
+  does it, and it records two things: the CAS baseline (the SERVER's hash) on success, and the
+  READ-FAILED flag on anything else — the flag that stops a panel parking a document built on the
+  `{}` fallback, which would write an id-less sidecar and let the scanner mint a fresh GUID.
+  ⚠️ **The two halves are recorded on DIFFERENT conditions, and collapsing them reopens the GUID
+  destruction.** The read-failed flag is armed on *every* non-ok response; the baseline is skipped
+  while a park is live (the parked doc came from older bytes, so a hash taken from disk now is a
+  claim it cannot support), and a `passive` read — the agent surface — records neither. Gating the
+  FLAG on the live park too shipped for one release and reopened the hole: the helper checks the
+  park before its `await` and records after, so a park landing in between hides the failure from a
+  DIFFERENT component whose own read failed and which is now showing the `{}` fallback.
+
+  ⚠️ **Both halves live in one function for the same reason, and the second one is why it is named
+  for the response rather than for the baseline.** The `readFailed` half was added to that block
+  independently, after it had been extracted; taking only the baseline half would have left the
+  exempted video reader recording a baseline and not the failure — the same trap one field down,
+  on the one asset type with no other reader. ⚠️ `VideoAssetView` is a *declared* exemption from the read helper, for a
+  reason that is true and stays true — it keeps a third state (`applied`) that must reflect DISK, so
+  it cannot use a helper that skips the network whenever a park exists. That reason vouches for
+  **which document the panel displays** and for nothing else, and it was read as vouching for the
+  file generally: its raw fetch dropped the header, so `baselines` had no entry for any `.mp4`, the
+  flush passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed*
+  — the #845 precondition was **inert for that whole asset type** while looking present. The
+  exemption map now carries a declared `baseline: 'seeds' | 'none'` and
+  `metaReadPreferringPark.test.ts` checks it both ways, because a prose reason cannot carry that
+  distinction.
+- **A wholesale editor write FORGETS the baseline it invalidated** (#874). Make-2D, a 9-slice or
+  Sprite Save, a model import and the collision-mesh write all replace the sidecar while a panel is
+  mounted on the same path. Leaving the old hash made the human's very next Cmd+S 409 under
+  *"changed on disk since it was read"* — true of the file, a lie about the cause, and #844's class.
+  Forget rather than advance: these callers never read the reply's `sha256`, an absent baseline
+  correctly means unconditional, and the next panel read re-seeds it.
+
+  ⚠️ **Two functions do it, and the difference is the whole defect** — do not collapse them.
+  - `writeMetaWholesale` (the three explicit-action writers) does the write **and forgets ONLY IF
+    it landed**. A failed write changed nothing on disk, so the baseline is still accurate;
+    dropping it there turns every later flush for that path unconditional and an external change
+    is silently clobbered instead of 409'd. That fail-open shipped once, because the rule was
+    copied to three sites and two of them guarded it while one did not. One function now, one
+    test, both directions.
+  - `metaWrittenToDisk` (the callers that post the document themselves and report it in) drops the
+    baseline **first and unconditionally** — including in the superseded case, where it returns
+    `false` for the *park*. Two maps, two questions: *"did this write incorporate the park I
+    read?"* can legitimately be no; *"does this editor still know what is on disk?"* after a
+    confirmed write is always no. It is unconditional only because every one of its call sites is
+    already behind a confirmed-ok write.
+
+  `forgetMetaBaseline` itself is **module-private**: an exported bare "forget" invites the call
+  that has no write behind it, which is exactly the fail-open above.
+- **The teardown is the RELOAD, and that is deliberate.** `clearPendingMeta`/`clearMetaBaselines`
+  are test-only and stay so: opening a project hard-reloads the renderer
+  (`webContents.reloadIgnoringCache()` in `electron/main.ts`'s `setProject`, reached by all three
+  of its callers), which destroys the module. The sibling registries' `clearDirtyAssets` and
+  `clearPendingBaseScenes` have no production caller for the same reason. ⚠️ A **soft** project
+  switch — re-rooting the asset tree without a reload — would make all three real, and `pending`
+  would matter more than `baselines`. (#871 was filed on the reading that a baseline survives a
+  project switch; it does not.)
+- **The park is visible in the panel that made it** (#870). `useMetaDirty(path | paths)` +
+  `<UnsavedMetaBadge>` in all eight parking asset views — the **conditional** `Unsaved ● ⌘S` marker
+  `SceneAssetView` already used, not `useParkedAssetDoc`'s persistent `Unsaved ● ⌘S`/`Saved ✓` span,
+  which belongs to panels owning a whole document. The subscription is the load-bearing part: a
+  bare `isMetaDirty` read is right when the edit is made and wrong afterwards, because a Cmd+S
+  flush and an agent `discard_asset_edits` both empty the registry without touching panel state.
+  `metaDirtyIndicator.test.ts` asserts every parking **`.tsx` under `panels/`** both renders the
+  badge and calls `useMetaDirty` — a badge rendered from a constant is dark forever, and a
+  subscription nothing renders tells the human nothing. ⚠️ Its scan is `.tsx`-only, so a
+  `parkMetaEdit` caller in a plain `.ts` module (`assetEditorBindings.ts`) is outside it.
+- **An agent READS through the registry; the WRITE half is an OPEN contract decision** (#872).
+  `modoki_get_asset_meta` goes to `/api/asset-meta` → the `read-asset-meta` op → the renderer, and
+  reports `source: 'parked' | 'disk'`; with no renderer it falls back to disk and says
+  `editorConnected:false` rather than passing a pre-edit file off as the answer.
+  ⚠️ **`modoki_write_asset_meta` still writes disk without consulting the registry**, and unlike an
+  asset doc nothing reconciles it — `.meta.json` is invisible to `detectType`, so
+  `dropParkedWriteFor` never fires for a sidecar. That is the `LiveReloadKind`-vs-CAS rule in
+  [editor.md](./editor.md) for a third time. Whether the tool should park, drop the park, or refuse
+  is the owner's call and is still open; until then its description says plainly that it writes
+  disk and points at `get_editor_state.pendingImportSettings`.
+
 It is the FIFTH cause `unsavedChangeCauses()` names (`pendingImportSettings`), for the same S3.11
 reason as the fourth.
 

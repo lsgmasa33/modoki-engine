@@ -8,7 +8,7 @@ import { useEditorStore } from './store/editorStore';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
-import { loadScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
+import { loadScene, newScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
 import { getModeOwner } from './scene/playMode';
 import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
@@ -39,6 +39,13 @@ export interface EditorTestBridge {
    *  where #839's first fix regressed: a path-keyed collapse claim read "needs restore" here
    *  and wiped the arrangement the user had just saved. */
   renameCurrentScenePath(scenePath: string): void;
+  /** Replace the whole world with a fresh starter scene under `scenePath` — the engine half
+   *  of Assets → Create Scene (`builtinCreatableAssets`'s override, minus the save dialog and
+   *  the file write). Exposed because that gesture is otherwise only reachable through a
+   *  native save panel, and it is the seam #853 lived in: it replaces every entity, so an
+   *  id-keyed cache that is not invalidated aliases the outgoing scene's state onto the
+   *  incoming entities. Rejects when the editor is in prefab-edit mode, like the real route. */
+  newScene(scenePath: string): Promise<void>;
   /** Name of the currently selected entity, or null if none. */
   selectedEntityName(): string | null;
   /** Read a single trait field off an entity (for asserting edits landed). */
@@ -171,6 +178,9 @@ export function installEditorTestBridge(): void {
     },
     renameCurrentScenePath(scenePath) {
       setCurrentScenePath(scenePath);
+    },
+    newScene(scenePath) {
+      return newScene(scenePath);
     },
     getPointerState() {
       const input = getInput(getCurrentWorld());

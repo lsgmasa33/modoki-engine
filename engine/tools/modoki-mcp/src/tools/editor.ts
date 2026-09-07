@@ -242,10 +242,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_new_scene',
-    'Start a fresh untitled scene (clears all entities, spawns a default Camera). Unsaved ' +
-      'until you modoki_save_all({path}) — it has no path yet, so save_all REQUIRES one. ' +
-      'WARNING: this DISCARDS the live world; anything created and not saved is gone (it ' +
-      'refuses if there are unsaved changes — pass discardUnsaved:true to discard them deliberately).',
+    'Start a fresh untitled scene: replaces the world with a starter set (Camera, HDR ' +
+      'Environment, Directional + Ambient light). Unsaved until you modoki_save_all({path}) — ' +
+      'it has no path yet, so save_all REQUIRES one. WARNING: this DISCARDS the live world; ' +
+      'anything created and not saved is gone (it refuses if there are unsaved changes — pass ' +
+      'discardUnsaved:true to discard them deliberately). ALSO refuses while a prefab is being ' +
+      'edited (#853) — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
+      'it is not about unsaved work. The replacement is a real world swap, so every id-keyed ' +
+      'cache clears and the outgoing scene\'s resources are released immediately — entity ids ' +
+      'are reassigned, so re-read any id you were holding.',
     { discardUnsaved: discardUnsavedParam },
     async ({ discardUnsaved }) => editorAction('new-scene', discardUnsaved ? { discardUnsaved } : {}),
   );

@@ -35,8 +35,42 @@ it isn't active), then calls `setCurrentWorld()` to flip it in one statement.
 Renderers (`Scene3D`, `Scene2D`, and the `useUIEntities` selector) subscribe to
 `onWorldSwap` to flush their per-world caches the moment the swap happens.
 
-> koota caps total worlds at 16. `SceneManager` calls `oldWorld.destroy()`
+> koota caps total worlds at 16 (`WORLD_ID_BITS = 4`). `SceneManager` calls `oldWorld.destroy()`
 > after each swap to free the slot; without it the engine breaks after ~16 swaps.
+
+### Replacing every entity IS a world swap
+
+**`setCurrentWorld` is the engine's only signal for "every entity you were holding is gone", so
+anything that replaces all world content must go through `SceneManager`** — even when no file is
+involved. That is what `replaceWorldContent(populate)` is for: `loadScene`'s mint → populate →
+promote → release → destroy tail with the file I/O removed. `newScene()` (Assets → Create Scene,
+and the `new_scene` agent op) is its only caller.
+
+The rule exists because `newScene()` used to delete and respawn **in place** (#853). It was the one
+path in the repo that replaced every entity without a swap, so all ~46 `onWorldSwap` subscribers
+were skipped — the Hierarchy's collapse restore and its per-scene folder state, SceneView's gizmo /
+outline / collider maps, the module-level 2D renderer's slot and last-render caches, and the
+Timeline's Director-root rebind. Each of those is *written* to defend against exactly this, and
+each was reached by a trigger that never fired.
+
+⚠️ **The damage is not "stale state", it is aliasing.** koota's `.id()` is a masked index — it
+carries neither generation nor world id — and the free list is **LIFO**. Measured against the
+installed koota: destroy 8 entities, and the next spawns take ids `8,7,6,5` then `4,3,2,1`. The
+reuse is *total and in reverse*, so the outgoing scene's per-id state lands exactly on the incoming
+scene's entities rather than merely going out of date.
+
+⚠️ **And the fix is not that ids stop colliding.** A fresh world hands out `1, 2, 3…` again, so they
+still can. What changes is that every holder is *told*. Tests on this path assert that state is
+cleared or rebuilt — never that id values differ.
+
+Two constraints on any future caller:
+
+- **Populate BEFORE promoting.** `aSceneSwapIsHappening()` is false on this path (nothing sets
+  `nextLoad`), so the Hierarchy's settle-wait does not apply — a swap fired against an empty world
+  lets its collapse restore latch an owner on a zero-length tree, which is #839 by another route.
+- **Never route through `unloadAll()`.** It promotes a fresh world and never destroys the old one,
+  so with the 16-world cap above it would break the engine after ~15 uses of a human-repeatable
+  gesture.
 
 ## Resource cache with refcounting
 

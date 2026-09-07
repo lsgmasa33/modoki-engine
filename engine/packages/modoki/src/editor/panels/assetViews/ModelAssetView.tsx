@@ -26,7 +26,11 @@ import { ModelPreview } from '../ModelPreview';
 import { formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
 import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
-import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
+import {
+  parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
+} from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -40,6 +44,8 @@ async function glbHasSkins(url: string): Promise<boolean> {
 }
 
 export function ModelAssetView({ path, name, postprocessor }: { path: string; name: string; postprocessor: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<ModelImportSettings>(DEFAULT_MODEL_SETTINGS);
   // Texture-compression settings for a RIGGED model (its embedded textures are
@@ -528,6 +534,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       {!isSourceModel && !isRigged && (
         <GenerateCollisionMeshRow path={path} name={name} postprocessor={postprocessor} onDone={refreshAssets} />
       )}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.model.unsaved" />
     </>
   );
 }
@@ -575,10 +582,16 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
       await writeCollisionMeshAssets(
         { glbPath, glbBase64: bytesToBase64(glb), meshJsonPath, meshName, modelGuid, meshGuid },
         { post: postWriteFile, registerAsset },
-        () => backendFetch('/api/write-meta', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),
-        }),
+        // #874: writeMetaWholesale is the write AND the forget-on-success — one shape shared with
+        // makeTexture2D and EnvironmentAssetView, so a failed write cannot drop a baseline that is
+        // still accurate, and a throw from the `.mesh.json` write that FOLLOWS this cannot skip a
+        // forget the meta write had already earned.
+        //
+        // The baseline is for `glbPath` — the GENERATED collision GLB, not the source model this
+        // row is mounted on. It can only have been seeded by a ModelAssetView mounted on that
+        // generated asset (a re-run over an existing one), which is exactly the case that would
+        // otherwise 409.
+        () => writeMetaWholesale(glbPath, { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } }),
       );
 
       onDone();

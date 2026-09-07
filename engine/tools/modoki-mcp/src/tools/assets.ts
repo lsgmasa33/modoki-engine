@@ -414,7 +414,18 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'files on disk still reflect the OLD settings while the sidecar claims the new ones. '
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
     + 'multiple-of-4 dimensions, and a non-mult-4 texture with mipmaps renders SOLID BLACK on '
-    + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.',
+    + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.\n\n'
+    + '⚠️ THIS WRITES DISK, AND IT DOES NOT CONSULT THE EDITOR\'S PENDING REGISTRY (#872, open). '
+    + 'Since #845 a human\'s Inspector import-settings change is PARKED, not written. So if one is '
+    + 'pending for this path: your write lands on disk, the park survives it, and the next '
+    + 'modoki_save_all (or the human\'s Cmd+S) flushes that older document straight over what you '
+    + 'just wrote. Both directions lose work. Unlike an asset DOC, nothing reconciles this — a '
+    + '.meta.json is invisible to the file watcher, so the park-drop that protects '
+    + 'modoki_write_asset never fires here.\n\n'
+    + 'CHECK FIRST: modoki_get_editor_state `pendingImportSettings` lists every parked sidecar path. '
+    + 'If yours is on it, run modoki_save_all (keep the human\'s edit, then re-read and re-apply '
+    + 'yours) or modoki_discard_asset_edits — do not write over it blind. Whether this tool should '
+    + 'park, drop the park, or refuse outright is an OPEN contract decision on #872.',
     {
       path: z.string().describe('Asset-root URL of the asset the sidecar belongs to (the ASSET, not the .meta.json).'),
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),

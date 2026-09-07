@@ -247,6 +247,11 @@ export interface SceneManager {
    *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
    *  wins) — leaving the current scene untouched on failure. */
   loadScene(path: string, opts?: LoadOptions): Promise<void>;
+  /** Replace every entity in the live world with freshly-spawned content, through the
+   *  normal mint → populate → promote → release → destroy contract, so `onWorldSwap`
+   *  fires (#853). `populate` spawns into the world it is handed. Not a scene load:
+   *  `loadedScenes` ends empty and `getCurrent()` returns null. */
+  replaceWorldContent(populate: (world: World) => void): Promise<void>;
   /** For tests + shutdown. Releases everything and resets the manager. */
   unloadAll(): Promise<void>;
   /** For tests: reset the sceneId counter so test runs are deterministic. */
@@ -1096,51 +1101,9 @@ class SceneManagerImpl implements SceneManager {
       // scene is untouched.
       for (const sid of toDropSceneIds) releaseAllForScene(sid);
 
-      // Free the old world's slot in koota's worldId pool. koota caps total
-      // worlds at 16; without this, every scene swap permanently consumes a
-      // slot and the engine breaks after ~16 swaps.
-      const destroyOldWorld = () => {
-        try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
-      };
-      if (oldWorld !== promotedWorld) {
-        // #468: a SUPERSEDED load's game-scoped manager can still be inside an
-        // async init() holding `ctx.world === oldWorld` — its own load already
-        // passed `initGameManagersFor` before this later load committed its swap,
-        // and (see the comment below) nothing re-activates or awaits it from
-        // here. Defer the destroy until every in-flight manager init has
-        // settled, so that init never writes into an already-destroyed world.
-        // NOT awaited — a slow init (an LLM download is the documented case)
-        // must not block THIS load; the koota worldId slot is simply freed a
-        // little later, as soon as it is safe.
-        //
-        // Bounded, not open-ended: a manager init that never SETTLES (a hang, not a rejection —
-        // rejections are swallowed by `activate()`) would otherwise leave `pendingManagerInits()`
-        // non-null forever, chaining every LATER swap's destroy behind it and leaking a koota
-        // world slot on each one. Race against `WORLD_DESTROY_DEFER_MAX_MS` and destroy anyway
-        // when the timeout wins — see that constant's comment for the deliberate trade.
-        const inFlight = pendingManagerInits();
-        if (inFlight) {
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          const timeout = new Promise<void>((resolve) => {
-            timer = setTimeout(() => {
-              console.warn(
-                `[SceneManager] old world destroy deferred past ${WORLD_DESTROY_DEFER_MAX_MS}ms `
-                + `waiting on an in-flight manager init — destroying anyway (see WORLD_DESTROY_DEFER_MAX_MS).`,
-              );
-              resolve();
-            }, WORLD_DESTROY_DEFER_MAX_MS);
-          });
-          void Promise.race([inFlight, timeout]).then(() => {
-            // Clear the timer either way — if `inFlight` won the race, an armed timer left
-            // behind would otherwise keep e.g. a test's fake-timer clock (or, in a headless
-            // Node run, the process itself) alive for no reason.
-            if (timer !== undefined) clearTimeout(timer);
-            destroyOldWorld();
-          });
-        } else {
-          destroyOldWorld();
-        }
-      }
+      // Free the old world's koota slot, deferred behind in-flight manager inits.
+      // Shared with replaceWorldContent() — see destroyWorldWhenSafe.
+      this.destroyWorldWhenSafe(oldWorld, promotedWorld);
 
       // 11. Fire per-scene callbacks for dynamic entity spawning, then activate
       // this scene's managers — but ONLY if this load is still the live primary.
@@ -1358,6 +1321,202 @@ class SceneManagerImpl implements SceneManager {
     // this method ever runs.
     sceneData.resources = allRefs;
     return allRefs;
+  }
+
+  /** Replace every entity in the live world with freshly-spawned content, THROUGH the
+   *  normal world-lifecycle contract — mint a staging world, populate it, promote it,
+   *  release and destroy the old one. `populate` spawns into the world it is handed.
+   *
+   *  This exists because `newScene()` used to delete-and-respawn in place, which is the
+   *  only way in the repo to replace all world content WITHOUT emitting a swap (#853).
+   *  `setCurrentWorld` is the engine's one signal for "every entity you were holding is
+   *  gone", and ~46 subscribers key their id-keyed teardown on it — the Hierarchy's
+   *  collapse restore, SceneView's gizmo/outline/collider maps, the 2D renderer
+   *  singleton's slot and last-render caches, the Timeline's Director-root rebind.
+   *  koota recycles entity ids LIFO and TOTALLY (destroy N, then the next N spawns take
+   *  those same ids in reverse), so none of that state merely goes stale — it aliases
+   *  exactly onto the new scene's entities.
+   *
+   *  Not a scene LOAD: no file is read, no resources are acquired, `loadedScenes` ends
+   *  empty and `getCurrent()` returns null. The caller owns the editor's scene path.
+   *
+   *  ⚠️ Do NOT reimplement this as `unloadAll()` + spawn. `unloadAll` promotes a fresh
+   *  world without ever destroying the old one (see its tail), and koota caps worlds at
+   *  16 — that would break the engine after ~15 uses of a human-repeatable gesture. */
+  async replaceWorldContent(populate: (world: World) => void): Promise<void> {
+    // Unload-wins (#535), same head as `unloadAll()` and for the same reason: this drops
+    // every loaded scene, so a `loadScene()` racing it must not win. `teardownInFlight`
+    // rejects a load that STARTS during the awaits below; the token invalidation is what a
+    // load already mid-flight sees at its next checkpoint. The `finally` is load-bearing —
+    // a stuck counter would reject every later load forever.
+    this.teardownInFlight++;
+    this.teardownToken.invalidateAll();
+    try {
+      if (this.nextLoad) {
+        this.nextLoad.controller.abort();
+        releaseAllForScene(this.nextLoad.id);
+        this.nextLoad = null;
+      }
+
+      const oldPath = (this.primaryId !== null ? this.loadedScenes.get(this.primaryId)?.path : undefined) ?? '';
+      const oldWorld = getCurrentWorld();
+
+      const staging = createWorld();
+
+      try {
+        // ⚠️ POPULATE BEFORE PROMOTE, and this is load-bearing rather than stylistic.
+        // `aSceneSwapIsHappening()` is false on this path (nothing sets `nextLoad`), so the
+        // Hierarchy's settle-wait does not apply: a swap fired against an EMPTY world would
+        // let its restore latch `collapseOwnerRef` on a zero-length tree, and the content
+        // would then arrive with the owner already claimed — #839 by another route.
+        populate(staging);
+
+        // The two GLOBAL RESOURCE singletons, materialized exactly as `loadScene` does — same
+        // guard, same `Transient` on Time (see its block for the save-bake reasoning). Nothing
+        // else in the repo spawns either, so a world promoted without them is one where
+        // `inputSystem` and `timeSystem` both early-return on the missing resource and write
+        // nothing: the new scene reads as frozen and dead to input the moment you press Play.
+        //
+        // ⚠️ `Input` in particular would be a REGRESSION this method introduces, not a
+        // pre-existing gap: it is absent from the trait registry, so the old in-place
+        // `deleteEntities(getAllEntities()…)` never saw it and it survived by accident. A fresh
+        // world has no such accident. (`Time` was already being lost on this path.)
+        //
+        // GUARDED, not unconditional, because `populate` is caller-supplied and may author its
+        // own — hosting Time in a shared base scene is a supported setup. Two Time entities is
+        // not benign: `getTime()` is `queryFirst` and picks one, while `timeSystem`/`setTimeScale`
+        // iterate `query` and write BOTH, so a timeScale set through one is read from the other.
+        let hasTime = false;
+        staging.query(Time).updateEach(() => { hasTime = true; });
+        if (!hasTime) spawnEntity(staging, Time(), Transient);
+        let hasInput = false;
+        staging.query(Input).updateEach(() => { hasInput = true; });
+        if (!hasInput) spawnEntity(staging, Input());
+      } catch (e) {
+        // `populate` is caller-supplied and this method is on the public SceneManager
+        // interface. A throw here must not strand the staging world: it was never promoted, so
+        // nothing will ever destroy it, and koota's pool is 16 wide. Mirrors `loadScene`'s own
+        // `nextWorld.destroy()` failure path. Nothing above this point has touched the live
+        // world or any global, so the editor is left exactly as it was.
+        try { staging.destroy(); } catch { /* nothing else to do */ }
+        throw e;
+      }
+
+      // Only now that the new content exists: drop the outgoing world's global bookkeeping.
+      // ⚠️ These clear PROCESS-GLOBAL maps, not world-scoped ones, and nothing restores them —
+      // so they must sit AFTER the try, not before it. Cleared before a throwing `populate`
+      // they would leave the still-live scene with its prefab override marks gone, and the
+      // next save would then re-diff an explicitly-overridden field against the prefab base,
+      // find no difference, and silently drop the override — the exact defect override marks
+      // exist to prevent. The cost of this ordering: a future `populate` that itself seeds
+      // override marks would have them wiped here, so such a caller must clear them itself.
+      clearAllOverrideMarks();
+      clearAuthoredWritesWhileStopped();
+
+      // Scene-scoped managers, disposed while the OUTGOING world is still the current one.
+      // Game-scoped managers are deliberately left active: they survive in-game scene swaps by
+      // design, and an untitled new scene is not evidence the GAME changed — `loadScene()`
+      // disposes them only on a real `gameChanged`.
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: oldPath });
+
+      // Clear the registry's `activeScenePath`, the way `unloadAll` does — otherwise a
+      // `registerManager` arriving before the next real load matches the OUTGOING scene's path
+      // and activates that scene's manager. ⚠️ The self-heal `managerRegistry`'s #554 note
+      // relies on ("`initSceneManagersFor` has no `sceneChanged` gate, so this heals on the very
+      // next swap") does NOT apply here — this swap never calls it.
+      //
+      // ⚠️ POSITION IS THE CORRECTNESS ARGUMENT, not the two lines. `initSceneManagersFor('')`
+      // can spuriously re-activate a manager with no `scenes` filter (`sceneMatches` returns
+      // true for `''`), and `activate()` hands that manager's `init()` `getCurrentWorld()` —
+      // so this must run while that is still the OUTGOING world. `unloadAll` gets away with it
+      // because it promotes afterwards into a world nobody keeps; run AFTER the promote here,
+      // a filter-less manager's `init()` would spawn its entities straight into the brand-new
+      // scene the user is about to see, and the dispose below — holding `oldWorld` — could not
+      // see them to clean up. Hence the second dispose, on the same world as the activation.
+      await initSceneManagersFor('');
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
+
+      // Rebuild bookkeeping BEFORE `setCurrentWorld` — it fires `onWorldSwap` synchronously and
+      // the Hierarchy's handler reads `getLoadedScenes()` to label its scene groups. Same
+      // ordering rule, and same reason, as `loadScene()`'s swap.
+      const toDrop = [...this.loadedScenes.keys()];
+      this.loadedScenes.clear();
+      this.primaryId = null;
+      this.currentBaseScene = undefined;
+
+      setCurrentWorld(staging);
+
+      // Release immediately (owner, 2026-09-07), matching a real scene load rather than
+      // holding GPU memory for a scene that is no longer loaded and has no owner.
+      for (const sid of toDrop) releaseAllForScene(sid);
+
+      this.destroyWorldWhenSafe(oldWorld, staging);
+
+      // Journal it — without this a full world replacement is SILENCE in the journal, awkward
+      // in a repo whose rule is observe, don't infer. Picks the event the same way `loadScene`
+      // does: `@scene-swapped` only when something was actually swapped OUT, so an empty `from`
+      // keeps meaning "there was no previous scene" rather than becoming a swap between two
+      // nameless scenes. `to` is empty because this promotes no scene FILE — the editor owns
+      // whatever path it is about to show.
+      if (oldPath) emit('@scene-swapped', { from: oldPath, to: '' }, staging);
+      else emit('@scene-loaded', { path: '' }, staging);
+    } finally {
+      this.teardownInFlight--;
+    }
+  }
+
+  /** Free `oldWorld`'s slot in koota's worldId pool, deferred behind any in-flight
+   *  manager init. Extracted so `loadScene()`'s swap tail and `replaceWorldContent()`
+   *  share ONE definition of the destroy discipline — a second copy would go stale on
+   *  the first change to either (#853).
+   *
+   *  No-op when the promoted world IS the old one. */
+  private destroyWorldWhenSafe(oldWorld: World, promotedWorld: World): void {
+    // Free the old world's slot in koota's worldId pool. koota caps total
+    // worlds at 16; without this, every scene swap permanently consumes a
+    // slot and the engine breaks after ~16 swaps.
+    const destroyOldWorld = () => {
+      try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
+    };
+    if (oldWorld !== promotedWorld) {
+      // #468: a SUPERSEDED load's game-scoped manager can still be inside an
+      // async init() holding `ctx.world === oldWorld` — its own load already
+      // passed `initGameManagersFor` before this later load committed its swap,
+      // and (see the comment below) nothing re-activates or awaits it from
+      // here. Defer the destroy until every in-flight manager init has
+      // settled, so that init never writes into an already-destroyed world.
+      // NOT awaited — a slow init (an LLM download is the documented case)
+      // must not block THIS load; the koota worldId slot is simply freed a
+      // little later, as soon as it is safe.
+      //
+      // Bounded, not open-ended: a manager init that never SETTLES (a hang, not a rejection —
+      // rejections are swallowed by `activate()`) would otherwise leave `pendingManagerInits()`
+      // non-null forever, chaining every LATER swap's destroy behind it and leaking a koota
+      // world slot on each one. Race against `WORLD_DESTROY_DEFER_MAX_MS` and destroy anyway
+      // when the timeout wins — see that constant's comment for the deliberate trade.
+      const inFlight = pendingManagerInits();
+      if (inFlight) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            console.warn(
+              `[SceneManager] old world destroy deferred past ${WORLD_DESTROY_DEFER_MAX_MS}ms `
+              + `waiting on an in-flight manager init — destroying anyway (see WORLD_DESTROY_DEFER_MAX_MS).`,
+            );
+            resolve();
+          }, WORLD_DESTROY_DEFER_MAX_MS);
+        });
+        void Promise.race([inFlight, timeout]).then(() => {
+          // Clear the timer either way — if `inFlight` won the race, an armed timer left
+          // behind would otherwise keep e.g. a test's fake-timer clock (or, in a headless
+          // Node run, the process itself) alive for no reason.
+          if (timer !== undefined) clearTimeout(timer);
+          destroyOldWorld();
+        });
+      } else {
+        destroyOldWorld();
+      }
+    }
   }
 
   /** For tests + shutdown. Releases everything and resets the manager.

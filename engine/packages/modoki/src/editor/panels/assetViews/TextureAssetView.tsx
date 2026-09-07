@@ -17,6 +17,8 @@ import { SpriteEditor } from '../SpriteEditor';
 import { NineSliceEditor } from '../NineSliceEditor';
 import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -184,6 +186,8 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
 }
 
 export function TextureAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<TextureImportSettings>(DEFAULT_TEXTURE_SETTINGS);
   const [type, setType] = useState<TextureType>('3d');
@@ -382,6 +386,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       {spriteEditorOpen && (
         <SpriteEditor path={path} name={name} onClose={() => { setSpriteEditorOpen(false); loadMeta(); }} />
       )}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.texture.unsaved" />
     </>
   );
 }

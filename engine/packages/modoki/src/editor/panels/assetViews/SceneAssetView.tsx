@@ -51,6 +51,7 @@ import { AssetRefField, assetDisplayName } from '../AssetRefField';
 import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
 import { resolveSceneChain, type FetchSceneMeta } from '../../../runtime/scene/sceneChain';
 import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 /** Editor-side `FetchSceneMeta`: fetch the scene FILE for a path, or resolve a
  *  guid to a path via the asset manifest first. Mirrors SceneManager.loadScene's
@@ -204,11 +205,7 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
           five asset editors carry an `Unsaved ● ⌘S` badge. Only shown for a scene the editor has
           not loaded: for the OPEN scene the ref is live editor state and the editor's ordinary
           unsaved indicator already covers it. */}
-      {pendingHere && (
-        <div data-ui-id="assetView.scene.unsaved" style={{ color: '#e0a06c', fontSize: '10px', marginTop: 2, marginBottom: 4 }}>
-          Unsaved ● ⌘S
-        </div>
-      )}
+      <UnsavedMetaBadge dirty={pendingHere} dataUiId="assetView.scene.unsaved" />
     </>
   );
 }

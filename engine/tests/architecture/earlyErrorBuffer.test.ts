@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { earlyConsoleShimPlugin, type EarlyConsoleShimPluginOptions } from '../../plugins/earlyConsoleShim';
 import { MAX_PER_BURST_WINDOW, STASH_KEY } from '../../packages/modoki/src/runtime/core/globalErrors';
+import { STASH_VERSION } from '../../packages/modoki/src/runtime/core/bootStash';
 import { clearAppServices } from '../../packages/modoki/src/runtime/core/appServices';
 import { setManualEpoch, restoreRealEpoch } from '../../packages/modoki/src/runtime/core/clock';
 
@@ -12,7 +13,7 @@ import { setManualEpoch, restoreRealEpoch } from '../../packages/modoki/src/runt
 // `hierarchyCollapse.test.ts` hit the same gap first; this follows its exact fix: back it with a
 // REAL in-memory map, not a no-op stub, so the stash round-trip assertions below (#825) are not
 // vacuous — a stub that only no-ops would make every "read back what was written" check pass
-// whether or not `stashEarlyErrors()`/`drainStashedEarlyErrors()` actually do anything.
+// whether or not `stashEarlyErrors()`/`replayStashedEarlyErrors()` actually do anything.
 const localStorageBacking = new Map<string, string>();
 vi.stubGlobal('localStorage', {
   getItem: (k: string) => (localStorageBacking.has(k) ? localStorageBacking.get(k)! : null),
@@ -135,7 +136,7 @@ function flushTrackedListenerCleanups(): void {
 // ALSO module-level and outlives every test that calls `registerAppServices({ crashlytics })`
 // without a matching `clearAppServices()` after it — several tests below intentionally register
 // their OWN crashlytics sink to observe a replay. Left in place, a LATER test's
-// `drainEarlyErrors()`/`drainStashedEarlyErrors()` (both fire synchronously inside
+// `drainEarlyErrors()`/`replayStashedEarlyErrors()` (both fire synchronously inside
 // `installGlobalErrorHandlers()`, before that test gets a chance to register its own sink) deliver
 // straight into the stale sink instead of queuing — so the later test's own, freshly-declared
 // `errors` array never receives anything, and it looks exactly like a reporting bug that isn't one.
@@ -630,7 +631,9 @@ describe('fatal-load guard — #823 (widened screen gate) and #825 (cross-boot s
     const raw = localStorage.getItem(STASH_KEY);
     expect(raw).toBeTruthy();
     const parsed = JSON.parse(raw!) as { v: number; entries: Array<Record<string, unknown>> };
-    expect(parsed.v).toBe(1);
+    // v2 is the UNIFIED envelope (#861) — one key and one shape for every buffer whose delivery
+    // sits behind the boot that fills it, replacing #825's errors-only v1 stash.
+    expect(parsed.v).toBe(STASH_VERSION);
     expect(parsed.entries).toHaveLength(1);
     expect(parsed.entries[0]).toMatchObject({ kind: 'error', message: 'module-eval-boom', filename: 'App.tsx', lineno: 4, colno: 2 });
   });
@@ -776,7 +779,7 @@ describe('fatal-load guard — #823 (widened screen gate) and #825 (cross-boot s
   });
 
   it('#825 bounds: a stash older than 7 days is discarded silently on replay — no recordError, no throw', async () => {
-    // Deterministic, not real wall-clock: pin `rawEpochNow()` (what `drainStashedEarlyErrors` reads
+    // Deterministic, not real wall-clock: pin `rawEpochNow()` (what `replayStashedEarlyErrors` reads
     // to compute `stashAgeMs`) at a fixed epoch, and write the stash's `ts` 8 days before it.
     const eightDaysMs = 8 * 24 * 60 * 60 * 1000;
     const fixedEpoch = 1_800_000_000_000;

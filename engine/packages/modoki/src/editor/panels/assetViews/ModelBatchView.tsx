@@ -15,9 +15,15 @@ import { reimportBtnStyle } from './widgets';
 import { reimportPaths } from './reimport';
 import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
 import type { SelectedAsset } from '../../store/editorStore';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
   const paths = assets.map((a) => a.path);
+  // #870: a parked import-settings edit was invisible in the panel that MADE it. ALL the selected
+  // paths, not the first — a batch view parks N sidecars and "any of mine is unsaved" is the only
+  // honest claim it can make.
+  const metaDirty = useMetaDirty(paths);
   const [postprocessors, setPostprocessors] = useState<Record<string, string>>({});
   // The FULL sidecar per path, kept so a postprocessor change can merge into it instead of
   // replacing it. Without this the batch destroyed one guid per selected model, per click.
@@ -93,6 +99,7 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       >
         {importing ? 'Converting…' : `Re-import all (${paths.length})`}
       </button>
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.modelBatch.unsaved" />
     </>
   );
 }

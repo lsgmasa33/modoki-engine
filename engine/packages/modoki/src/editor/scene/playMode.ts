@@ -88,12 +88,16 @@ let _stopRequested = false;
  */
 function currentSceneKey(): string | null {
   // ⚠️ Prefer the live path ONLY when it is the synthetic one. A blanket
-  // `sceneManager.getCurrent()?.path ?? getCurrentScenePath()` looks equivalent and is not:
-  // `newScene()` wipes the ECS world and sets `_currentScenePath` WITHOUT touching sceneManager,
-  // so after an untitled new scene the live path is still the PREVIOUS scene's. Preferring it
-  // there made Stop reload the blank world under the old scene's identity — impersonating a real
-  // file. Narrowing to the synthetic prefix fixes the prefab-edit case (the bug this exists for)
-  // and leaves every other case exactly as it was before.
+  // `sceneManager.getCurrent()?.path ?? getCurrentScenePath()` looks equivalent and is not.
+  // The original scar: `newScene()` used to wipe the ECS world and set `_currentScenePath`
+  // WITHOUT touching sceneManager, so after an untitled new scene the live path was still the
+  // PREVIOUS scene's — and preferring it made Stop reload the blank world under the old scene's
+  // identity, impersonating a real file. Since #853 `newScene()` goes through
+  // `sceneManager.replaceWorldContent()`, which clears `loadedScenes`, so `getCurrent()` is null
+  // there and the fallback is reached honestly rather than by narrowing. The narrowing STAYS:
+  // it is what fixes the prefab-edit case (the bug this exists for), and it is what keeps every
+  // other divergence between the two — a Save As, the boot restore, the dev bridge — reading the
+  // editor's own path rather than a stale live one.
   const live = sceneManager.getCurrent()?.path ?? null;
   return live?.startsWith(PREFAB_EDIT_SCENE_PREFIX) ? live : getCurrentScenePath();
 }

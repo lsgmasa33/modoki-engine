@@ -1,11 +1,11 @@
 /** Serialize the ECS world to scene + materials JSON files.
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
-import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
+import { spawnEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -895,12 +895,16 @@ export async function saveScene(opts: {
   // The guard asks the WORLD (`isPrefabEditWorld`) rather than the store flag, which is the whole
   // point: the flag is what was out of sync. `savePrefabEdit()` is the save for this world, and the
   // Cmd+S callers route to it — this refusal is the backstop for every path that does not.
-  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone. `newScene()` wipes the ECS world and sets
-  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stays SYNTHETIC after
-  // "Create Scene" is used from the Assets panel during prefab-edit — and the bare guard then
-  // refused to write the brand-new scene, silently (neither `create()` nor `runCreate` checks the
-  // result). `_currentScenePath` is the discriminator: prefab-edit deliberately nulls it, while a
-  // real save target means the world is no longer the prefab's. Refusing needs BOTH.
+  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone — and the scar is worth keeping even though
+  // #853 removed the case that caused it. `newScene()` used to wipe the ECS world and set
+  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stayed SYNTHETIC after
+  // "Create Scene" was used from the Assets panel during prefab-edit, and the bare guard then
+  // refused to write the brand-new scene, silently. That route no longer exists: `newScene()`
+  // REFUSES during prefab edit (owner, 2026-09-07) and otherwise promotes a real world, so
+  // `isPrefabEditWorld()` is false by the time a save could reach here. `_currentScenePath`
+  // remains the discriminator for every OTHER path that can leave the two disagreeing:
+  // prefab-edit deliberately nulls it, while a real save target means the world is no longer
+  // the prefab's. Kept as a conjunction because nothing proves those other paths are gone.
   if (isPrefabEditWorld() && !_currentScenePath) return { saved: false, path: null, reason: 'prefab-edit' };
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
@@ -1158,6 +1162,12 @@ export async function loadScene(
   }
 }
 
+/** Thrown by `newScene()` when the editor is in prefab-edit mode. A distinct type so a
+ *  caller can tell a deliberate refusal from a genuine failure and report it as such. */
+export class NewSceneRefusedError extends Error {
+  constructor(message: string) { super(message); this.name = 'NewSceneRefusedError'; }
+}
+
 /** Start a fresh untitled scene: clear ALL entities and spawn a ready-to-use
  *  starting world — a Camera, an Environment (built-in white.hdr, for reflections),
  *  and default lights (a Directional key + an Ambient fill) so objects are actually
@@ -1166,30 +1176,62 @@ export async function loadScene(
  *  as reflections alongside real lights) — without the lights a fresh scene renders
  *  everything black. Then drop the current scene path and swap to the empty
  *  bootstrap undo context (so the previous scene's stack is preserved under its own
- *  key rather than dropped globally). Shared by File → New Scene and the agent
+ *  key rather than dropped globally). Shared by Assets → Create Scene and the agent
  *  `new-scene` op so both produce the identical starting world. The caller clears
- *  editor selection (this stays free of the editor store). */
-export function newScene(): void {
-  deleteEntities(getAllEntities().map((e) => e.id));
-  const world = getCurrentWorld();
-  spawnEntity(world,
-    Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-  );
-  spawnEntity(world,
-    Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-  );
-  spawnEntity(world,
-    Transform({ x: 5, y: 10, z: 7 }),
-    Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-    EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-  );
-  spawnEntity(world,
-    Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-    EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-  );
-  setCurrentScenePath(null);
+ *  editor selection (this stays free of the editor store).
+ *
+ *  Async since #853: the content swap goes through `SceneManager.replaceWorldContent`
+ *  so `onWorldSwap` actually fires. Pass `path` when the new scene already has a file
+ *  target (Assets → Create Scene); omit it for an untitled scene.
+ *
+ *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited. */
+export async function newScene(path: string | null = null): Promise<void> {
+  // ⚠️ REFUSED while editing a prefab (owner, 2026-09-07). Before #853 this produced an
+  // ambiguous half-state that two separate guards had to work around — the prefab-edit
+  // world stayed live under a real scene path (`saveScene`'s conjunction below) and
+  // `currentSceneKey()` had to narrow to the synthetic prefix to stop Stop() reloading a
+  // blank world under the previous scene's identity. Refusing outright is what lets both
+  // of those stop being special cases. Asks the WORLD, not the store flag — the flag is
+  // the thing that goes out of sync (see `saveScene`'s guard).
+  if (isPrefabEditWorld()) {
+    throw new NewSceneRefusedError(
+      'Create Scene is not available while editing a prefab — exit prefab edit mode first, '
+      + 'then create the scene.',
+    );
+  }
+  // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
+  // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
+  // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
+  // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
+  // dependency instead of racing it.
+  setCurrentScenePath(path);
   setCurrentBaseScene(undefined);
-  swapHistory('');
+  // Replace the world CONTENT through SceneManager rather than deleting and respawning in
+  // place (#853). The in-place version was the one path in the repo that replaced every
+  // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
+  // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
+  // aliased exactly onto the incoming scene's entities.
+  await sceneManager.replaceWorldContent((world) => {
+    spawnEntity(world,
+      Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
+    );
+    spawnEntity(world,
+      Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
+    );
+    spawnEntity(world,
+      Transform({ x: 5, y: 10, z: 7 }),
+      Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
+      EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
+    );
+    spawnEntity(world,
+      Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
+      EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
+    );
+  });
+  // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
+  // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+  // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
+  swapHistory(path ?? '');
   markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
   clearAllSceneDirty();
   console.log('[Editor] New scene created');

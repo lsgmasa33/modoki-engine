@@ -142,3 +142,59 @@ test('REGRESSION: Save As re-points the path with no swap — the arrangement mu
   await expect.poll(() => savedGuids(page, RENAMED), { timeout: 5_000 })
     .toEqual(expect.arrayContaining([G.group1, G.group3]));
 });
+
+test('#853: Create Scene replaces every entity — the outgoing collapse set must not survive onto it', async ({ page }) => {
+  // `newScene()` used to delete and respawn into the SAME world, which made it the one path
+  // in the repo that replaces all content without emitting a world swap. The panel's collapse
+  // owner is keyed on the WORLD (#839), so it still matched, `needsCollapseRestore` returned
+  // false, and no restore ran — while the SAVE gate stayed open. koota recycles ids LIFO and
+  // totally, so the outgoing scene's collapsed ids aliased exactly onto the new scene's
+  // entities: rows rendered collapsed with no user action, and the new scene's entry was
+  // written from a set seeded by the old scene's leftovers.
+  //
+  // ⚠️ The discriminator here is deliberately NOT "does a row render collapsed". A fresh scene
+  // has four FLAT starter entities, so nothing has a child and nothing can read as collapsed
+  // either way — that assertion passes against the bug. What separates the two is whether the
+  // restore ran at all, and localStorage is where that is observable: post-fix the restore
+  // replaces the set (a change, so the persistence effect fires and writes `[]` under the NEW
+  // path); pre-fix `collapsed` never changed, so nothing was written under it at all.
+  const CREATED = '/tests/e2e/fixtures/e2e-created-scene.scene.json';
+
+  await gotoEditorWithScene(page, SCENE_COLLAPSE, 'Group1');
+  await clearSaved(page);
+  await setExpanded(page, 'Group1', G.group1A, true);
+  await setExpanded(page, 'Group3', G.group3A, true);
+  await setExpanded(page, 'Group2', G.group2A, false);
+  await expect.poll(() => savedGuids(page, SCENE_COLLAPSE), { timeout: 5_000 }).toEqual([G.group2]);
+
+  // The gesture. `newScene(path)` is the engine half of Assets → Create Scene: it sets the
+  // editor path, then replaces the world through SceneManager. No file is written (the real
+  // route's `saveScene()` is the dialog's job), so this leaves nothing behind on disk.
+  await page.evaluate((p) => (window as any).__modokiEditorTest.newScene(p), CREATED);
+
+  // The swap really happened: the outgoing scene's rows are gone and the starter set is up.
+  await expect.poll(() => rowShown(page, G.group1), { timeout: 10_000 }).toBe(false);
+  await expect(page.getByText('Directional Light', { exact: true }).first()).toBeVisible();
+
+  // THE ASSERTION. Post-fix the restore ran against the new world and wrote an empty set under
+  // the new path. Pre-fix this stayed null — no restore, so no change, so no write.
+  await expect.poll(() => savedGuids(page, CREATED), { timeout: 5_000 }).toEqual([]);
+
+  // …and it did not reach back and rewrite the scene we left.
+  expect(await savedGuids(page, SCENE_COLLAPSE)).toEqual([G.group2]);
+});
+
+// NOT COVERED BY AN E2E, and deliberately recorded rather than left as a gap: the sibling
+// symptom on the SAME mechanism, where the Hierarchy's `scenePath` (re-read only on a world
+// swap) keys the per-scene empty-folder load/save, so a no-swap Create Scene rendered the
+// outgoing scene's folders and wrote the new scene's folder edits back over the OLD scene's
+// entry. An attempt at this spec is what turned it up as untestable from here: an empty folder
+// exists only as a localStorage marker fed into `buildHierarchyFolders`, and seeding that
+// marker — even from an init script, before any editor code runs — does not make the row
+// render, so the spec could not establish its own premise. Rather than assert something
+// weaker and call it covered:
+//   - the ORDERING it depends on is unit-tested ('has already set the editor scene path by the
+//     time swap listeners run', engine/packages/modoki/tests/editor/newScene.test.ts), and
+//   - `Hierarchy.tsx`'s `onWorldSwap(() => setScenePath(...))` subscription is what consumes
+//     it, which the mechanism test proves now fires on this path.
+// What is NOT proven end-to-end is the render. A QA case drives it by hand instead.

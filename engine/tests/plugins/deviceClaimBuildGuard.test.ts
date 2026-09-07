@@ -369,7 +369,14 @@ describe('#865 isSameHolder recognises an owner-claim through a different spelli
  *  and an earlier version of the docblock claimed `subst` coverage it did not have. */
 describe('#865 canonicalClonePath normalisation', () => {
   it.runIf(process.platform === 'win32')('normalises drive-letter case for a path that EXISTS', () => {
-    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-case-')));
+    // `.native`, matching `canonicalClonePath` itself. The JS walk is NOT the same canonicaliser,
+    // and they disagree on an 8.3 SHORT path: on the hosted Windows runner the temp dir arrives
+    // with a tilde-suffixed profile segment, because the account name is too long for 8.3. The JS
+    // walk leaves it short; only `.native` expands it. Seeding the baseline with the JS walk left
+    // `dir` short while the subject returned long, so the assertion failed on short-vs-long — not
+    // on the drive-letter case this test exists to pin. (Spelled out rather than quoted: a literal
+    // profile path trips `scan-publish-safety`'s home-dir-username rule.)
+    const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-case-')));
     try {
       const drive = dir.slice(0, 1);
       const flipped = (drive === drive.toLowerCase() ? drive.toUpperCase() : drive.toLowerCase()) + dir.slice(1);

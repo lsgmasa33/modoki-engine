@@ -521,7 +521,17 @@ describe('the real registered surface', () => {
   // Merged into main 2026-08-31: combines #438 round 5's 10-byte wording change with #456's
   // recursive-sum switch and trim. Re-ran the pin test post-merge — 143_859 + the 4_000 headroom
   // still covers the combined surface, so the number did not need bumping again.
-  const DEFINITION_BYTES = 143_859;
+  // Re-pinned on main 2026-09-07 (143_859 → 147_889, +4_030) after merging work-ai/work-ai2/
+  // work-ai3/work-qa. THE UNION is what broke it: every branch was green alone and the merged
+  // surface landed 30 bytes past the ceiling, so no single close-out could have seen this — the
+  // hub is the only place this is measurable. The growth is EARNED and is nearly all hazard
+  // documentation the agent has to read to avoid destroying a human's work: `modoki_write_asset_meta`
+  // now spells out the #845/#872 park-clobber (a write lands on disk, the park survives it, and the
+  // next save_all flushes the older document over it — both directions lose work), `get_asset_meta`
+  // documents its `source: parked|disk` answer, and `new_scene`/`load_scene` document #853's
+  // prefab-edit refusal and that discardUnsaved does NOT bypass it. Spent deliberately: ~1k tokens
+  // on every agent session's tool surface, to close two silent data-loss paths.
+  const DEFINITION_BYTES = 147_889;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

@@ -703,25 +703,72 @@ THREE distinct windows depending on how far boot got before it died** (#823, #82
 
 | Window | What ran | Fate | Status |
 |---|---|---|---|
-| 1 | Nothing — the fault killed module evaluation before `installGlobalErrorHandlers()` ran | The inline guard in `engine/index.html` buffers it, but the drain lives inside the installer, which sits in the entry chunk's BODY and never runs | **closed by #825** — stashed to `localStorage`, replayed on the next boot |
+| 1 | The fault killed module evaluation of something imported ABOVE `./installErrorCapture` in `main.tsx` — `./sharedRegistry`, react, react-dom, `./index.css` | The inline guard in `engine/index.html` buffers it; nothing in the page will ever drain it | **closed by #825**, re-shaped by #861 — stashed to `localStorage`, replayed on the next boot |
 | 2 | Installer ran AND the game registered its services | `deliver()` → `recordError` | **closed by #636** |
-| 3 | Installer ran, services never registered, boot then died | `deliver()` queues it in memory; the page goes away with the queue unflushed | **OPEN — #860** |
+| 3 | Installer ran, services never registered, boot then died — **including the whole of `App.tsx`'s import graph and its async boot** | `deliver()` queues it in memory; the page goes away with the queue unflushed | **closed by #860/#861** — the queue is persisted eagerly and replayed |
 
-- **Why window 1 exists at all.** Rolldown inlines `main.tsx`'s side-effect imports —
-  `installErrorCapture` among them — into the entry chunk's BODY, which by ES semantics runs only
-  after every static import has finished evaluating. So the installer's carefully-ordered position
-  above `./App.tsx` buys nothing once the app is bundled: a throw anywhere in `App.tsx`'s own
-  static import graph still fires before the installer exists to catch it. The inline `<script>`
-  in `engine/index.html`, registered at HTML-parse time, is the only code on the page early enough
-  to see it. ⚠️ **Not reproducible in the dev editor** — Vite serves unbundled modules there, so
-  real source order holds and the defect does not exist. A green dev-editor run is not evidence for
-  this class; verification needs a production build.
-- **The cross-boot stash.** `stashEarlyErrors()` (`engine/index.html`) writes it the moment the
-  guard's 1400ms re-check confirms `#root` is still empty; `drainStashedEarlyErrors()`
-  (`globalErrors.ts`) reads it on the next boot that reaches the installer. It stashes minimal
-  JSON, not pre-formatted text, so `describe()`'s formatting stays in one place instead of gaining
-  a hand-kept second copy in HTML.
-- ⚠️ **Clear-on-read, and what it costs.** `drainStashedEarlyErrors()` removes the `localStorage`
+- ⚠️ **Where window 1 ENDS — this doc said something false until 2026-09-07, and it mattered.** It
+  claimed rolldown inlines `main.tsx`'s side-effect imports into the entry chunk's BODY, so that
+  the installer's position above `./App.tsx` "buys nothing once the app is bundled" and a throw
+  anywhere in App's static import graph lands in window 1. **Measured and refuted**: on a
+  `--target web` build of `games/sling` served over HTTP, a top-level throw in a module in
+  `App.tsx`'s import graph finds BOTH inline buffers already drained (`done: true`, read at the
+  throwing module's own evaluation time). The side-effect imports keep their source order through
+  the bundle. Window 1 is therefore only what is imported ABOVE `./installErrorCapture` in
+  `main.tsx`, and **everything in `App.tsx`'s graph is window 3** — which is why window 3 is the
+  wide, high-value one and #825's fix covers a narrower slice than its own ticket claimed.
+- ⚠️ **`#823`'s fallback screen does NOT cover window 3.** `consider()` bails on
+  `root.childElementCount > 0`, and `App.tsx` renders `Loading...` for the whole of that window, so
+  the fatality test is already false. A boot effect that throws is caught by App itself
+  (`App.tsx`'s boot `catch` → `console.error` → `setError`), which is why the fault arrives through
+  the console path rather than the `window` listener, and why the user sees App's own red panel.
+- ⚠️ **Not reproducible in the dev editor** — Vite serves unbundled modules there, so real source
+  order holds and the defect does not exist. A green dev-editor run is not evidence for this class;
+  verification needs a production build, served over HTTP (never `file://`).
+- **The cross-boot stash is ONE envelope with ONE budget** — `runtime/core/bootStash.ts` (#861),
+  not a stash per buffer. Three sites have the shape *a buffer whose only delivery path sits behind
+  the boot that fills it*: the guard's error buffer, the early-console shim's ring, and `deliver()`'s
+  `queued[]`. Copy-pasting #825's fix at each would have meant three keys, three staleness bounds
+  and **three independently guessed caps drawing on one undivided rate limiter** — the failure mode
+  `globalErrors.ts`'s own `MAX_PER_BURST_WINDOW` comment names. The divided budget, asserted by
+  `bootStash.test.ts` against the exported limiter constant:
+
+  | Slot | Count | For |
+  |---|---|---|
+  | `REPLAY_ENTRY_CAP` | 6 | faults + pre-formatted reports, ONE shared pool |
+  | `CONSOLE_CONTEXT_SLOT` | 1 | the whole console tail, as a single joined breadcrumb |
+  | `RESERVED_BREADCRUMBS` | 2 | a `[reload]` crumb, and the "N dropped" crumb |
+  | **total** | **9** | ≤ ⌊`MAX_PER_BURST_WINDOW`/3⌋ = 10 — a replay is a GUEST in the live boot's budget |
+
+  Adding a fourth replay source means **re-deriving that total**, not appending another cap; the
+  test goes red on the sum. The 6 was re-derived down from #825's 8 by owner ruling (2026-09-07) to
+  buy the console slot.
+- **The console tail has TWO sources, picked by window.** Once `installConsoleRing()` has run it
+  DRAINS the inline shim, so the ring is the only holder of the boot's output and `globalErrors.ts`
+  reads it from there; before that, the shim still holds them and `engine/index.html` reads them.
+  Same field, same single slot. A fix sourcing it only from the shim would have covered only the
+  rare window while appearing to close both.
+- **The window-3 write is EAGER, and rewrites on every queue.** `pagehide` does not fire when an
+  OOM jetsam kills a native webview, so a `pagehide` trigger would be unreachable in a real slice of
+  this failure. It rewrites rather than latching because the first thing to queue on a dying boot is
+  usually a benign warn, with the fault that killed it arriving later. `flushQueue()` clears the
+  stash when the sink arrives — without that half, a boot that RECOVERED would replay itself.
+- ⚠️ **A replayed report is never re-stashed.** On an app that registers no `crashlytics` at all (a
+  web build), a replayed report finds no sink, gets queued, and would be persisted again — the next
+  boot then replays it, re-prefixes it and re-stashes it, growing `[prev-boot] [prev-boot] …` every
+  launch for the whole staleness window. Found by running a real build, not by reading the code.
+- ⚠️ **The guard's stash constants are INJECTED at build time**, not hand-synced.
+  `plugins/earlyConsoleShim.ts`'s `transformIndexHtml` rewrites each `modoki:stash-const`-tagged
+  literal in `engine/index.html` from `bootStash.ts`. The literals in the file stay real working
+  defaults (the raw file has to run under `earlyErrorBuffer.test.ts`) and a test pins them equal.
+  This replaces the arrangement that let `EARLY_ERROR_CAP` drift to 32 — two OVER its headroom —
+  with nothing noticing. `EARLY_ERROR_CAP` itself is still hand-kept against `MAX_PER_BURST_WINDOW`,
+  with its own `-2` assertion.
+- **It stashes minimal JSON, not pre-formatted text**, so `describe()`'s formatting stays in one
+  place instead of gaining a hand-kept second copy in HTML. The one exception is the console tail:
+  the shim buffers LIVE argument references, which cannot survive a JSON round trip unformatted, so
+  the HTML does a guarded `String(arg)` join there.
+- ⚠️ **Clear-on-read, and what it costs.** `replayStashedEarlyErrors()` removes the `localStorage`
   key before attempting to report anything, which makes the replay once-only so a deterministic
   boot-killing crash cannot re-file on every launch forever. The cost: if the replaying boot ALSO
   dies before the sink registers, that report is lost with it. Accepted — an unbounded re-file loop

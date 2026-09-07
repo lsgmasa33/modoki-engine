@@ -22,7 +22,11 @@ import {
   videoPreviewUrl, describeVideoDelivery, videoSettingsWarnings, conversionSettingsDiffer,
 } from './videoAssetLogic';
 import { withCurrentValue } from './importSettingOptions';
-import { parkMetaEdit, peekPendingMeta, flushPendingMetaFor } from '../../scene/pendingMeta';
+import {
+  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult,
+} from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const DELIVERY_LABELS: Record<VideoDelivery, string> = {
   bundled: 'Bundled — ships in the build',
@@ -61,6 +65,8 @@ const rowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', g
 const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', textTransform: 'uppercase', margin: '8px 0 3px' };
 
 export function VideoAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<VideoImportSettings>(DEFAULT_VIDEO_SETTINGS);
   /** What the last load/apply saw — the baseline `conversionSettingsDiffer` compares
@@ -88,9 +94,20 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
     setConverted(!!m.videoCache);
   }, [path]);
 
+  // ⚠️ #871: the exemption above is about WHICH DOCUMENT THIS PANEL DISPLAYS, and about nothing
+  // else. It is NOT an exemption from recording the CAS baseline — and because this raw fetch used
+  // to drop the `X-Meta-Sha256` header on the floor, `baselines` had no entry for any `.mp4`,
+  // `flushPendingMetaFor` passed `undefined` as `ifMatch`, and the #845 phase-2 precondition was
+  // inert for this entire asset type while looking present everywhere else.
+  //
+  // `noteMetaReadResult` is deliberately the SAME function `readMetaPreferringPark` calls, not
+  // four lines copied here: it carries the three hazards (ok-only, a missing header means NO
+  // baseline rather than "unchanged", never hash client-side) that a second copy would re-derive.
+  // It runs BEFORE the body is consumed and is orthogonal to `applyMeta` — `applied` still comes
+  // from disk and `meta` still prefers the park.
   const loadMeta = useCallback((signal?: AbortSignal) => {
     return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
+      .then((r) => { noteMetaReadResult(path, r); return r.ok ? r.json() : {}; })
       .then((m: Record<string, unknown>) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
   }, [path, applyMeta]);
@@ -291,6 +308,7 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
         </div>
       )}
       {converted && <VideoImportedStats cache={cache} />}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.video.unsaved" />
     </>
   );
 }

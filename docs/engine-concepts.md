@@ -39,7 +39,10 @@ attached to it. Parent/child relationships are expressed by
 ⚠️ **`entity.id()` is the INDEX, not the identity — never trust it across frames.** It masks the
 generation off the packed number, and so do `has()`/`get()`; only `isAlive()` checks it. koota's
 entity index is a **LIFO free list**, so a despawn immediately followed by a same-shape respawn
-reclaims the exact freed index. Any state that (a) is **held across frames/ticks** rather than
+reclaims the exact freed index. ⚠️ **In bulk the reuse is total and in REVERSE**, not occasional:
+measured against the installed koota (#853), destroying 8 entities and then spawning 8 hands back
+`8,7,6,5,4,3,2,1`. So "a collision is unlikely" is never an argument — replace a whole scene's
+worth of entities and every new one lands on an old one's id. Any state that (a) is **held across frames/ticks** rather than
 rebuilt from a query every call and (b) **trusts an `entity.id()` lookup as "still the same logical
 entity"** will hand a new entity the dead one's state. A `seen`-set sweep at the end of a pass is
 not a defence: a despawn+respawn landing BETWEEN two passes never gets one.
@@ -76,11 +79,42 @@ of the Shader on screen. **When you add a generation check, find every producer,
 consumer** — and the reuse/fast paths are producers even though they build nothing.
 
 ⚠️ **Re-stamping restores ACCESS to a reused resource; it does not RESET that resource's state.**
-The two are separate, and only the first is what #848 fixed — a respawned 2D-material entity still
-inherits the dead one's uniform values, because they are seeded only on a build (#873). When the
-sanctioned shape says *rebuilding*, a full rebuild resets both; a cheaper re-stamp resets neither the
-payload nor anything else the build seeded. Decide which you actually need, and say which one you
-implemented.
+The two are separate, and #848 fixed only the first: a respawned 2D-material entity went on
+inheriting the dead one's uniform values, because they are seeded only on a build. Decide which you
+actually need, and say which one you implemented.
+
+⚠️ **"Rebuild on a mismatch" names the OBLIGATION, not the only way to discharge it.** There are
+two, and the choice is a real one:
+
+- **Rebuild** — throw the resource away and construct it for the newcomer. `physics2DSystem`
+  rebuilds the body; `videoSystem` calls `forget(id)` first. Resets everything by construction, so
+  it is the right default and the one to reach for when you are unsure what the resource holds.
+- **Reset in place** — keep the resource and restore the state a build would have given it. Correct
+  only when you can ENUMERATE what a build seeds and show the rest is already covered, so it costs
+  an argument the rebuild does not.
+
+#873 is the case that earns the second, and the reason is worth carrying: on that path *the rebuild
+is itself the leak*. Every `new Shader` mints two `UniformGroup`s with fresh `_resourceId`s, so
+Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn and is cleared only at
+renderer teardown (#699, live upstream, carried as #694 defect 5) — and recycled ids ARE the pooled
+respawn path, the last place to put unbounded growth. So `Scene2D.tsx`'s material pass re-seeds
+`matUniforms` from the program defaults instead, which is the shape #690 (`updateMtsdfPixiMetrics`)
+and #698 (the frame swap) already use in that file. The enumeration that licenses it is in
+`docs/rendering.md` § 2D custom materials.
+
+⚠️ **KEY THE RESET OFF THE THING BEING RESET.** #873's first cut keyed its uniform reset off
+`entityShaders` — the same map #848's ACCESS check uses — and that map's lifetime is strictly
+SHORTER than the resource it was standing in for: a per-frame purge drops the stamp on any frame the
+pass skips the entity, while the resource survives. Result: the reset read "no previous stamp" and
+skipped, permanently, in exactly the scenario it existed for. Caught in its own close-out review, and
+the corrected shape stamps the generation **on the slot that owns the Shader**. Generalised: when the
+guard and the payload live in two different containers, the guard is only as good as the SHORTER
+lifetime — so put the stamp next to the state it describes, and if you must key off something else,
+prove that thing cannot be dropped while the state survives.
+
+**State the invariant, not the mechanism.** "Re-seeds the uniforms" is an implementation note; *a
+respawn renders identically whether or not it reclaimed a dead entity's index* is the thing a test
+can pin and a later optimisation cannot quietly break.
 
 ⚠️ **The choice can be forced by a map you do not own.** `sprite2DMaterialBroker` takes the second
 shape even though its maps look module-private, because `Scene2DRenderer` owns them and keys them in

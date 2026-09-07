@@ -60,25 +60,67 @@ function editorSourceFiles(): string[] {
  *  and forwards a raw GET only when nothing is parked (`pendingMeta.ts`'s own doc explains why). */
 const HELPER_FILE = 'scene/pendingMeta.ts';
 
+/** What an exemption owes beyond a reason (#871).
+ *
+ *  ⚠️ **An exemption from the READ HELPER is not an exemption from the CAS BASELINE, and that
+ *  distinction is the whole of #871.** `VideoAssetView`'s reason was true — and is still true —
+ *  about WHICH DOCUMENT THE PANEL DISPLAYS, and it was read as vouching for the file generally.
+ *  Because its raw fetch dropped `X-Meta-Sha256`, `baselines` never had an entry for any `.mp4`,
+ *  `flushPendingMetaFor` passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent
+ *  `ifMatch` as *proceed* — so #845 phase 2's precondition was INERT for that whole asset type
+ *  while looking present everywhere else.
+ *
+ *  A prose reason cannot carry that, because a reason that is true of one property reads as
+ *  covering all of them. So the cost is DECLARED as a field and CHECKED, not narrated. */
+interface Exemption {
+  /** Why this file cannot route its read through `readMetaPreferringPark`. */
+  reason: string;
+  /** `'seeds'` — this file still records the CAS baseline itself, via `noteMetaReadResult`
+   *  (asserted below). `'none'` — it establishes no baseline, and `costs` says why that is safe. */
+  baseline: 'seeds' | 'none';
+  /** Required when `baseline` is `'none'`: what the bypass COSTS and why that is acceptable here.
+   *  This is the field #871 did not exist to make anyone write. */
+  costs?: string;
+}
+
 /** Files with a raw `/api/read-meta` fetch that deliberately do NOT go through the helper, each
  *  with a verified reason. Add a name here only with a verified reason, never to silence a
  *  failure — see `liveReloadKinds.test.ts`'s `NOT_LIVE_RELOADABLE` for the same discipline. */
-const EXEMPT: Record<string, string> = {
-  'panels/assetViews/VideoAssetView.tsx':
+const EXEMPT: Record<string, Exemption> = {
+  'panels/assetViews/VideoAssetView.tsx': {
+    baseline: 'seeds',
+    reason:
     'keeps a THIRD piece of state (`applied`) that must reflect DISK, never a still-parked edit — '
     + 'preferring the park there would compare a pending edit against itself and hide the '
     + '"re-import to apply" nudge for an edit that was never actually baked. Verified in the '
     + 'inline #845 comment on `applyMeta`: `applied` is set from the raw disk read while `meta` — '
     + 'what the panel actually shows — separately prefers `peekPendingMeta`, so this file already '
     + 'does the RIGHT thing for both, it just cannot do it through a helper that skips the network '
-    + 'call whenever a park exists.',
-  'panels/makeTexture2D.ts':
+    + 'call whenever a park exists. '
+    + '\u26a0\ufe0f #871: that reason is about which DOCUMENT this panel displays and about nothing '
+    + 'else — it is NOT an exemption from the CAS baseline, which this file dropped for every '
+    + '.mp4 until it called `noteMetaReadResult` on the same raw response.',
+  },
+  'panels/makeTexture2D.ts': {
+    baseline: 'none',
+    costs:
+    'establishes no baseline, and does not need one: it flushes this path, reads, and writes '
+    + 'UNCONDITIONALLY in one synchronous body, and `writeMetaConditional`\'s own docblock names an '
+    + 'unconditional write as "the right default for the eight explicit-action writers" — the '
+    + 'human asked for the write and it is built from a read moments earlier. Seeding here would '
+    + 'be actively WRONG: the write below, and then `/api/reimport`, both replace the sidecar, so '
+    + 'a baseline taken from the pre-write read would be stale the moment it was recorded. What '
+    + 'this file owes instead is #874 — it writes through `writeMetaWholesale`, which forgets the '
+    + 'baseline on success, so a Texture Inspector mounted on the same path does not 409 '
+    + 'against a hash this code replaced.',
+    reason:
     'flushes this exact path (`flushPendingMetaFor`) immediately before this read, every time, in '
     + 'the same synchronous function body — so by the time it reads, nothing can be parked for it '
     + 'and there is no park left to prefer. It also cannot tolerate `readMetaPreferringPark`\'s '
     + '"non-ok response -> {}" contract: its own inline comment ("A FAILED READ MUST ABORT — it '
     + 'must never fall back to `{}`") requires telling a failed read apart from an empty-but-'
     + 'successful one, which the shared helper does not distinguish.',
+  },
 };
 
 /** `true` if `code` (already comment-stripped) fetches `/api/read-meta` directly.
@@ -91,6 +133,17 @@ const EXEMPT: Record<string, string> = {
  *  forbidden-pattern guard useless. */
 function hasRawReadMetaFetch(code: string): boolean {
   return code.includes('/api/read-meta');
+}
+
+/** `true` if `code` (already comment-stripped) CALLS `noteMetaReadResult` (#871).
+ *
+ *  \u26a0\ufe0f The trailing `(` is the whole point, and it was learned the hard way: a bare
+ *  `.includes('noteMetaReadResult')` also matches the `import` statement, so the `'seeds'` rule
+ *  stayed green with the call deleted — vacuous for exactly the regression it guards. Unlike
+ *  `hasRawReadMetaFetch` above, where a mention and a use cannot be told apart by shape, here they
+ *  can: an import names the symbol bare, a call follows it with a paren. */
+function callsReadResultRecorder(code: string): boolean {
+  return /\bnoteMetaReadResult\s*\(/.test(code);
 }
 
 describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
@@ -129,6 +182,72 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
       'These exemptions no longer have a raw /api/read-meta fetch — either the file was already '
       + 'migrated to the helper (drop the entry) or this points at the wrong file.',
     ).toEqual([]);
+  });
+
+  /** #871 — the assertion the prose reason could not make.
+   *
+   *  `VideoAssetView`'s exemption reason was true about which document the panel DISPLAYS and was
+   *  read as vouching for the file generally, so the CAS baseline went unrecorded for the whole
+   *  `.mp4` type: `flushPendingMetaFor` passed `undefined` as `ifMatch` and `ifMatchRefusal` reads
+   *  an absent `ifMatch` as *proceed*. A guard that silently does not run — which is why the issue
+   *  carries `family/fail-open-guard`.
+   *
+   *  ⚠️ Both directions, deliberately. A `'seeds'` entry that stopped seeding is the regression
+   *  this exists to catch; a `'none'` entry that quietly started is a declaration that has gone
+   *  stale, and a stale declaration is what let the first one through. */
+  it("a 'seeds' exemption really does record the baseline, and a 'none' one really does not", () => {
+    const wrong: string[] = [];
+    for (const [rel, ex] of Object.entries(EXEMPT)) {
+      const seeds = callsReadResultRecorder(read(rel));
+      if (ex.baseline === 'seeds' && !seeds) {
+        wrong.push(`${rel}: declared 'seeds' but never calls noteMetaReadResult — the #845 `
+          + 'ifMatch precondition is INERT for every asset only this file reads.');
+      }
+      if (ex.baseline === 'none' && seeds) {
+        wrong.push(`${rel}: declared 'none' but DOES call noteMetaReadResult — update the entry `
+          + 'to \'seeds\' and drop `costs`, or the declaration is lying about what this file does.');
+      }
+    }
+    expect(wrong, wrong.join('\n')).toEqual([]);
+  });
+
+  /** A `'none'` entry is a claim that losing the baseline is SAFE HERE, and that claim has to be
+   *  written down — the whole lesson of #871 is that the unstated half is the one that bites. An
+   *  empty `costs` would make the field ceremony. */
+  it("every 'none' exemption states what the bypass costs", () => {
+    const undeclared = Object.entries(EXEMPT)
+      .filter(([, ex]) => ex.baseline === 'none' && (ex.costs ?? '').trim().length < 40)
+      .map(([rel]) => rel);
+    expect(
+      undeclared,
+      'These exemptions establish no CAS baseline and do not say why that is safe. An exemption '
+      + 'from readMetaPreferringPark is NOT an exemption from the baseline (#871) — say what is '
+      + 'given up and why this file can afford it.',
+    ).toEqual([]);
+  });
+
+  /** The detector's own positive control. If `noteMetaReadResult` is ever renamed, the substring
+   *  test above silently stops matching and BOTH checks go vacuously green — the `'seeds'` half
+   *  reads as "nobody seeds" and the `'none'` half as "nobody wrongly seeds". Pin the name against
+   *  the module that defines it. */
+  it('the baseline seeder this rule names actually exists', () => {
+    const helper = read(HELPER_FILE);
+    expect(helper).toContain('export function noteMetaReadResult');
+  });
+
+  /** \u26a0\ufe0f The detector must see a CALL, not a mention — and this is not hypothetical
+   *  tidiness. Written first as a plain `.includes('noteMetaReadResult')`, the rule above passed
+   *  with `VideoAssetView`'s call DELETED, because the file still names the symbol in its
+   *  `import`. The guard was vacuous for the single regression it exists to catch, and only
+   *  mutation-testing it showed that. Same family as `metaMergeNotClobber`'s extractor and
+   *  `hasRawReadMetaFetch` above: pin the detector's behaviour on BOTH sides directly rather than
+   *  inferring it from a corpus that happens to be clean. */
+  it('the seeder detector matches a CALL and not an import mention', () => {
+    expect(callsReadResultRecorder('noteMetaReadResult(path, r);')).toBe(true);
+    expect(callsReadResultRecorder('  noteMetaReadResult (path, r);')).toBe(true);
+    expect(callsReadResultRecorder("import { parkMetaEdit, noteMetaReadResult } from '../x';")).toBe(false);
+    expect(callsReadResultRecorder('import {\n  noteMetaReadResult,\n} from "../x";')).toBe(false);
+    expect(callsReadResultRecorder('const f = noteMetaReadResult;')).toBe(false);
   });
 
   it('every exemption is a real file this scan actually enumerates', () => {

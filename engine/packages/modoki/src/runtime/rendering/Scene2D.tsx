@@ -60,7 +60,7 @@ import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColl
 import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
-import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuilder';
+import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
 import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
@@ -143,7 +143,22 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // Mesh+Shader+Geometry rebuild (#698). `builtEpoch` tracks the sampled sprite's re-slice epoch
   // here (the sprite path's meaning), so re-slicing the sheet invalidates the slot even when the
   // url is unchanged.
-  matShader?: Shader; matGuid?: string; matBuildSig?: string; matQuadSig?: string; materialTexUrls?: string[]; matSpriteRef?: string;
+  // `matGen` is the koota GENERATION of the entity this Shader's uniform state belongs to (#873).
+  // On the SLOT for the same reason `geomSig` below is: slot lifetime === Shader lifetime, and the
+  // reset has to key off the thing being reset. It must NOT be read out of `entityShaders`, which
+  // CAN BE DROPPED WHILE THE SLOT SURVIVES — the per-frame purge deletes that stamp on any frame
+  // the material pass skips the entity, and the sprite pass adds the id to `activeIds` and can then
+  // early-return (its `if (!resolved) return`, which sits BEFORE its kind check) without replacing
+  // the slot: a material still compiling plus a sprite ref with no 2D variant does it. Keyed there,
+  // the reset silently skipped exactly the case it exists for; caught in #873's own close-out
+  // review. (Not "strictly shorter" in both directions — the sprite pass disposes a material slot
+  // without deleting the map entry, which the purge tidies later the same frame. Harmless, and not
+  // what the argument needs.)
+  // ⚠️ Inherits the 8-bit generation wrap `sprite2DMaterialBroker` documents: 256 destroy+spawn
+  // cycles on one index between two frames restore the stamped value and the reset would not fire.
+  // Worse here than at the broker (a wrapped read there merely grants access), but no system in
+  // this repo respawns one index 256 times in a frame — pools reuse entities rather than respawn.
+  matShader?: Shader; matGuid?: string; matBuildSig?: string; matQuadSig?: string; materialTexUrls?: string[]; matSpriteRef?: string; matGen?: number;
   // 'graphics' slots only (#684): the last geometry signature ISSUED into this Graphics. Lives on
   // the SLOT, not on the `lastRender` snapshot, because slot lifetime === Graphics lifetime — a
   // freshly built or rebuilt slot has `geomSig === undefined` and therefore always draws, with no
@@ -1884,10 +1899,57 @@ export class Scene2DRenderer {
           const mesh = new Mesh({ geometry: buildMaterialQuad(rend.width, rend.height, px, py), texture: tex, shader });
           this.containerFor(canvasSlot, id).addChild(mesh);
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
-          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matBuildSig, matQuadSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite };
+          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matBuildSig, matQuadSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite, matGen: gen };
           this.slots.set(id, slot);
           this.entityShaders.set(id, { shader, gen });
           built = true; // fresh/rebuilt Mesh → must draw at least once
+        }
+
+        // ⚠️ RESET the reused Shader's uniform STATE (#873). Placed above the re-stamp block to read
+        // in the order the two things happen conceptually, NOT because anything requires it: the
+        // driver reads that map at ECS priority 0 of the NEXT frame, never between these two
+        // statements, so the order is free and swapping it fixes nothing.
+        // `matUniforms` is allocated only in `makePixiShaderInstance`, i.e.
+        // only on a BUILD, and `applyOverrides2D` is its only other writer — so a slot that survived
+        // into a new generation still holds the DEAD entity's last driven values. Permanent when the
+        // newcomer carries no `MaterialInstance` at all; one wrong frame when it drives the same
+        // targets. THE INVARIANT: a respawn renders identically whether or not it reclaimed a dead
+        // entity's index.
+        //
+        // ⚠️ Keyed on the SLOT's own `matGen`, deliberately NOT on `entityShaders` — see the field's
+        // comment. That map is purged on any frame this pass skips the entity, while the slot
+        // survives, so a reset keyed there skips the very case it exists for.
+        //
+        // ⚠️ RESET, not rebuild — the one place in this file where this diverges from the
+        // `physics2DSystem` shape. `docs/engine-concepts.md` requires ACTING on a generation
+        // mismatch; rebuilding is one way to obey that and resetting is the other, and here the
+        // rebuild is itself the leak: every `new Shader` mints two `UniformGroup`s with fresh
+        // `_resourceId`s, so Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn
+        // and is cleared only at renderer teardown (#699 — still live upstream, carried as #694
+        // defect 5). Recycled ids ARE the pooled-VFX path, the last place to put unbounded growth;
+        // see the #692 note above on `matBuildSig`. The in-place write is the shape
+        // `updateMtsdfPixiMetrics` (#690) and the frame swap (#698) already use — bare into the
+        // group's `uniforms`, no dirty bump, which reaches the GPU on BOTH backends only because
+        // these groups are built with Pixi's default `isStatic: false` (`UboSystem` and
+        // `GlUniformGroupSystem` both re-read `uniforms[name]` per draw and skip their `_dirtyId`
+        // early-out). ⚠️ Constructing ANY of them with `isStatic: true` silently strands EVERY bare
+        // uniform write in the 2D layer — see `docs/rendering.md` for the full list; it is not
+        // limited to the ones this file happens to name.
+        //
+        // The reset set is `matUniforms` and NOTHING else, because every other per-entity thing a
+        // surviving slot carries is already covered: the Mesh's placement/appearance is rewritten
+        // unconditionally below, the quad by `matQuadSig`, the sampled texture by `matBuildSig` +
+        // `builtEpoch`, `uTextureMatrix` by the frame swap, and the extra samplers by `extraSig`
+        // (which folds in this entity's own `kind:'texture'` overrides). Add per-entity state to a
+        // material slot and this is the enumeration you have to extend.
+        if (slot.matGen !== gen) {
+          const u = (slot.matShader?.resources as any)?.matUniforms?.uniforms as Record<string, unknown> | undefined;
+          if (u) {
+            const seed = buildUniformValues(program, undefined);
+            for (const k in seed) u[k] = seed[k].value;
+            built = true;   // the uniforms moved — this canvas must redraw, or the reset is invisible
+          }
+          slot.matGen = gen;
         }
 
         // ⚠️ Re-stamp the driver's entry whenever this entity renders as a material — NOT only on a
@@ -1898,13 +1960,9 @@ export class Scene2DRenderer {
         // for a frame: the per-frame purge below KEEPS this entry, because this id is in
         // `materialIds` — the newcomer is rendering. The symptom is a respawned entity frozen at the
         // dead one's last uniform values, with no redraw ever armed.
-        // ⚠️ This restores the driver's ACCESS to the reused Shader. It does NOT reset the Shader's
-        // uniform VALUES, so the newcomer still inherits the dead entity's last driven ones —
-        // `matUniforms` is allocated only in `makePixiShaderInstance`, i.e. only on a build. That is
-        // a real and SEPARATE gap (#873, pre-dating this fix): permanent when the newcomer drives no
-        // `MaterialInstance` at all. Closing it is a design fork — rebuild on mismatch, as
-        // `physics2DSystem` does, versus re-seeding the uniforms in place — with a cost in this hot
-        // path either way, so it is tracked rather than decided here.
+        // ⚠️ This restores the driver's ACCESS to the reused Shader; the block above is what resets
+        // its VALUES. Two separate mechanisms with two different lifetimes — conflating them is
+        // exactly the defect #873's close-out review caught.
         // Allocation-free once settled: it writes only when the shader or the generation changed.
         const shaderNow = slot.matShader;
         if (shaderNow) {

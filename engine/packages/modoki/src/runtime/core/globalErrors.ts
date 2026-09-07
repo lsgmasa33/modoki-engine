@@ -29,6 +29,11 @@
  */
 
 import { appServices, onAppServicesRegistered } from './appServices';
+import {
+  readAndClearBootStash, writeBootStash, clearBootStash, joinConsoleTail, CONSOLE_TAIL_LINES,
+  type StashedFault, type BootStashEnvelope,
+} from './bootStash';
+import { getConsoleRingTail, isConsoleRingInstalled } from './consoleRing';
 import { rawEpochNow, rawNow } from './clock';
 import { peekResumeReload } from './resumeReload';
 
@@ -93,8 +98,11 @@ export const MAX_PER_BURST_WINDOW = 30;
 const MAX_DISTINCT_TRACKED = 500;
 /** A stack can be arbitrarily long; the SDK truncates anyway and the bridge pays per byte. */
 const MAX_MESSAGE_CHARS = 4000;
-/** Boot queue: deep enough to hold a boot failure's cascade, shallow enough to never be a leak. */
-const MAX_QUEUED = 50;
+/** Boot queue: deep enough to hold a boot failure's cascade, shallow enough to never be a leak.
+ *  Exported for the same reason `MAX_PER_BURST_WINDOW` is: a test asserting what happens AT the
+ *  bound must read the bound, not restate it — a restated copy stops testing the boundary the
+ *  moment the constant moves. */
+export const MAX_QUEUED = 50;
 
 let installed = false;
 let installing = false;
@@ -249,9 +257,22 @@ let breadcrumbsSent = persistedCounters.breadcrumbsSent;
 let windowStart = 0;
 let windowCount = 0;
 
-interface Queued { kind: CaptureKind; text: string }
+/** ⚠️ `fromReplay` exists to stop a stash from immortalising itself. On an app that never
+ *  registers `crashlytics` (a web preview, a game with no telemetry service), a replayed report
+ *  finds no sink, gets queued, and would be persisted AGAIN — so the next boot replays it, re-
+ *  prefixes it, and re-stashes it, growing `[prev-boot] [prev-boot] …` without bound and never
+ *  draining. MEASURED on a real `--target web` build of games/sling, which registers no
+ *  crashlytics at all. A replayed report has already had its one chance; it is not re-stashed. */
+interface Queued { kind: CaptureKind; text: string; fromReplay?: boolean }
 let queued: Queued[] = [];
 let queueOverflowed = false;
+/** How many reports `MAX_QUEUED` refused. ⚠️ A boolean here was DEAD as a stash input: the overflow
+ *  branch returns BEFORE `stashQueuedReports()`, and `queued` only ever shrinks in `flushQueue`
+ *  (which clears the stash outright), so `queueOverflowed` was always false at write time and a
+ *  boot that dropped 100 reports persisted a count of 0. */
+let queueDroppedCount = 0;
+/** True only while `replayStashedEarlyErrors` is running — see `Queued.fromReplay`. */
+let replayingStash = false;
 
 /** The burst window is genuine WALL CLOCK — it bounds how often we talk to a native SDK, which is
  *  not game state and must not scale with `timeScale` or stop when the sim pauses. `rawNow()` is
@@ -342,14 +363,125 @@ function allow(kind: CaptureKind, text: string): boolean {
   return true;
 }
 
+/**
+ * Persist the in-memory queue so a boot that dies before `crashlytics` registers still reports
+ * (#860). THE window this closes is the wide one — measured 2026-09-07, the whole of `App.tsx`'s
+ * static import graph lands here, not in the inline guard's window (see `core/bootStash.ts`).
+ *
+ * ⚠️ EAGER, NOT ON `pagehide`. A `pagehide`/`visibilitychange` trigger fires on a user-initiated
+ * close or reload but NOT when an OOM jetsam kills a native webview — which is a real slice of
+ * this failure — so resting on it would be the unfireable-mechanism pattern this family already
+ * suffers from. Writing when the queue first fills instead costs one `localStorage` write on a boot
+ * that is already failing, and nothing at all on a healthy boot (the sink registers, nothing ever
+ * queues). {@link flushQueue} clears it again the moment the sink arrives, which is the half that
+ * keeps this honest — without that, a boot that RECOVERED would replay its own faults next launch.
+ *
+ * ⚠️ REWRITES WHENEVER THE QUEUE'S CONTENT CHANGES — do NOT "optimise" this with a write-once
+ * latch. The FIRST thing to queue on a dying boot is very often a benign warn, with the fault that
+ * actually killed it arriving several events later; a latch would persist the warn and drop the
+ * crash, which is precisely the failure this whole family is about. A microtask-coalesced write is
+ * no good either: it would not have run yet if the realm dies inside the same task.
+ *
+ * The cost is bounded by ADMISSIONS, not by events: at most `MAX_QUEUED` pushes plus one write per
+ * eviction. A refused event writes NOTHING (see `deliver`), because `queued` is unchanged and only
+ * `dropped` would move. An earlier version wrote on every refusal too and was unbounded — measured
+ * at 61 synchronous `localStorage` writes for 61 events, each re-joining the console tail, on a
+ * boot that is already dying. The trade that buys: `dropped` in the persisted envelope counts drops
+ * up to the LAST content-changing write, so a tail of pure refusals is under-counted there.
+ */
+/** Report priority, shared by the queue's admission policy and the stash's selection so the two
+ *  cannot disagree about what is worth keeping. `error` (uncaught faults and `console.error`)
+ *  outranks `warn`, which outranks `breadcrumb`. */
+function queuedRank(kind: CaptureKind): number {
+  return kind === 'error' ? 0 : kind === 'warn' ? 1 : 2;
+}
+
+/** Index of the LAST lowest-priority queued item, or -1 when the queue is empty. Last, so an
+ *  eviction takes the most recent of the least important — the earliest of a kind is the one most
+ *  likely to be the root cause, which is the same reason `selectReportsForStash` keeps earliest
+ *  within a kind. Replayed items rank as evictable as anything else: they have already had their
+ *  one chance (see `Queued.fromReplay`). */
+function lowestRankedQueuedIndex(): number {
+  let worst = -1;
+  let worstRank = -1;
+  for (let i = 0; i < queued.length; i++) {
+    const r = queuedRank(queued[i].kind);
+    if (r >= worstRank) { worstRank = r; worst = i; }
+  }
+  return worst;
+}
+
+function stashQueuedReports(): void {
+  try {
+    // The console tail comes from the RING here, never the inline shim: by this point
+    // `installConsoleRing()` has run and DRAINED the shim, so the shim's buffer is empty and the
+    // ring is the only thing holding the boot's output. (The inline guard covers the other window,
+    // where the reverse is true.) Gated on the ring actually being installed — a release build
+    // without a console consumer ships no ring, and asking an uninstalled one for a tail would
+    // stash an empty string that reads like "the boot logged nothing".
+    const persistable = queued.filter((q) => !q.fromReplay);
+    // ⚠️ A STASH MEANS "this boot died with something unreported". Writing one for a queue that
+    // holds nothing worth reporting makes the NEXT boot file `previous boot's console tail before
+    // it died` about a boot that booted perfectly — and on an app that registers no crashlytics at
+    // all, that self-sustains: every launch replays the last launch's console as a death report and
+    // re-seeds the stash. Several things reach the queue on a HEALTHY boot and none is a fault: the
+    // `[reload]` breadcrumb, replayed reports (already excluded above), and a game's own analytics
+    // breadcrumbs routed through `captureToCrashlytics` (see `CaptureKind` above). Rather than
+    // enumerate them — an enumeration goes stale on the first new caller — the gate asks the only
+    // question that matters: is there an actual `error`/`warn`? A breadcrumb-only queue is not a crash.
+    const worthStashing = persistable.some((q) => q.kind === 'error' || q.kind === 'warn');
+    if (!worthStashing) {
+      // Clear rather than leave a previous write standing: the faults that justified it may have
+      // just been flushed, and a stale envelope replays as this boot's death.
+      if (queueDroppedCount === 0) clearBootStash();
+      return;
+    }
+    const consoleTail = isConsoleRingInstalled()
+      ? joinConsoleTail(getConsoleRingTail(CONSOLE_TAIL_LINES))
+      : undefined;
+    writeBootStash({
+      reports: persistable.map((q) => ({ kind: q.kind, text: q.text })),
+      dropped: queueDroppedCount,
+      console: consoleTail,
+    });
+  } catch {
+    /* a telemetry write must never amplify the boot failure it is recording */
+  }
+}
+
 function deliver(kind: CaptureKind, text: string): void {
   const svc = appServices().crashlytics;
   if (!svc) {
     if (queued.length >= MAX_QUEUED) {
+      // ⚠️ EVICT THE LOWEST-RANKED ITEM, don't refuse the newcomer. Refusing at the door put the
+      // fix's own headline guarantee back where it started, one layer up: 50 benign warns fill the
+      // queue, the fatal `[uncaught]` arrives, and it is dropped HERE — before ever reaching
+      // `selectReportsForStash`, whose kind-ranking was supposed to protect it. Same failure the
+      // cap had ("kept the benign warns and dropped the crash"), moved from the cap to the queue,
+      // and the test for it stopped at 6 warns so it could not see the branch at 50.
+      // Same ranking as the stash's, so admission and selection agree on what matters.
+      const worstIdx = lowestRankedQueuedIndex();
+      if (worstIdx === -1 || queuedRank(queued[worstIdx].kind) <= queuedRank(kind)) {
+        // Nothing queued is less important than the newcomer — drop it, and DO NOT rewrite the
+        // stash: `queued` is unchanged, so the envelope's reports would be byte-identical and only
+        // `dropped` would move. Writing per refused event made this unbounded (measured: 61
+        // synchronous localStorage writes for 61 events, each re-joining the console tail) on a
+        // boot that is already dying. The count rides along on the next write that changes content.
+        queueOverflowed = true;
+        // A refused REPLAYED report is a previous boot's, already counted in its own envelope —
+        // charging it here would re-report it next launch as newly dropped, two boots deep.
+        if (!replayingStash) queueDroppedCount++;
+        return;
+      }
+      queued.splice(worstIdx, 1);
       queueOverflowed = true;
+      queueDroppedCount++;
+      queued.push(replayingStash ? { kind, text, fromReplay: true } : { kind, text });
+      stashQueuedReports();
       return;
     }
-    queued.push({ kind, text });
+    queued.push(replayingStash ? { kind, text, fromReplay: true } : { kind, text });
+    stashQueuedReports();
     return;
   }
   reporting = true;
@@ -498,39 +630,16 @@ function drainEarlyErrors(): void {
 }
 
 /**
- * Key of the cross-boot stash `engine/index.html`'s fatal-load guard writes to `localStorage`
- * (#825) when it is about to show the fallback screen — the boot-killing case where
- * `installGlobalErrorHandlers` never ran, so `drainEarlyErrors()` above never drained anything.
- *
- * ⚠️ `engine/index.html` is the WRITER (`stashEarlyErrors()`, its own `STASH_KEY`/`STASH_VERSION`
- * literals) and this module is the READER — it is a bare inline `<script>` with no bundler, so it
- * cannot import this constant. The two copies must be kept in sync BY HAND, the same relationship
- * `MAX_PER_BURST_WINDOW` above already has with that file's `EARLY_ERROR_CAP`.
- * `earlyErrorBuffer.test.ts` pins the two literals equal.
+ * Cross-boot stash key. ⚠️ RE-EXPORTED, not owned — `core/bootStash.ts` owns the envelope, the
+ * key, the version, the staleness bound and the replay budget for ALL of its writers (#861). This
+ * module is one reader and one writer of it, not its definition; `engine/index.html`'s inline
+ * guard is the other writer, and its copies of these constants are INJECTED at build time rather
+ * than hand-kept (see that module's header for why the hand-sync had to go).
  */
-export const STASH_KEY = 'modoki-early-error-stash';
-const STASH_VERSION = 1;
-/** A fault from a version the user has long since updated past is noise, not a report. */
-const STASH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export { STASH_KEY } from './bootStash';
 
-/** Shape written by `stashEarlyErrors()` in `engine/index.html` — DATA, not pre-formatted prose
- *  (that function serializes plain fields precisely so this module keeps sole ownership of
- *  formatting via `describe()`, rather than the HTML growing a second copy that could drift). */
-interface StashedEarlyError {
-  kind: 'error' | 'unhandledrejection';
-  message?: string;
-  stack?: string;
-  filename?: string;
-  lineno?: number;
-  colno?: number;
-  ts?: number;
-}
-interface StashedEarlyErrorState {
-  v: number;
-  ts: number;
-  dropped: number;
-  entries: StashedEarlyError[];
-}
+/** Alias kept so this module's own prose reads the same as before the envelope moved out. */
+type StashedEarlyError = StashedFault;
 
 /** Compose one stashed entry's report text, mirroring `drainEarlyErrors`'s `where`/`when`
  *  composition above — message, then stack (a stashed entry carries a plain stack STRING, never a
@@ -562,47 +671,30 @@ function describeStashedEntry(entry: StashedEarlyError, stashAgeMs: number): str
  * boot; a stashed entry crossed a JSON round-trip through `localStorage` into a NEW boot, so there
  * is no live copy of it anywhere in this realm that could re-log and double-report it.
  */
-function drainStashedEarlyErrors(): void {
-  let raw: string | null;
-  try {
-    raw = localStorage.getItem(STASH_KEY);
-    // Clear-on-read, BEFORE reporting anything below. Load-bearing: it is what makes the replay
-    // ONCE-ONLY, so a deterministic boot-killing crash cannot re-file the same fault on every
-    // subsequent launch forever. The cost — accepted — is that if THIS boot also dies before the
-    // crashlytics sink registers, the queued report is lost with it. An unbounded re-file loop on
-    // every future launch is the worse failure.
-    if (raw !== null) localStorage.removeItem(STASH_KEY);
-  } catch {
-    return; // private mode, disabled site data — nothing to replay, and nothing to clear
-  }
-  if (raw === null) return;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return; // unparseable — noise, not a report
-  }
-  if (parsed === null || typeof parsed !== 'object') return;
-  const stash = parsed as Partial<StashedEarlyErrorState>;
-  if (stash.v !== STASH_VERSION) return;
-  if (!Array.isArray(stash.entries)) return;
-  if (typeof stash.ts !== 'number' || !Number.isFinite(stash.ts)) return;
-
-  // `stash.ts` is an epoch stamp written by `engine/index.html` at stash time, and "is this fault
-  // from more than 7 days ago" is a genuinely elapsed-REAL-TIME question — `rawNow()`
-  // (performance.now()-based, resets every navigation) cannot answer it, so this reads
-  // `rawEpochNow()`, the sanctioned epoch reading (`core/clock.ts`), instead of a bare `Date.now()`.
-  // The bound itself matters: a months-old stashed fault replayed now would be filed by Crashlytics
-  // against the CURRENT app version, making an already-fixed bug look live — worse than dropping it.
+function replayStashedEarlyErrors(stash: BootStashEnvelope | null): void {
+  if (stash === null) return;
   const stashAgeMs = rawEpochNow() - stash.ts;
-  if (stashAgeMs > STASH_MAX_AGE_MS) return;
+  replayingStash = true;
+  try {
+    replayStashedEarlyErrorsInner(stash, stashAgeMs);
+  } finally {
+    replayingStash = false;
+  }
+}
 
-  // Bounded independent of what the stash CLAIMS to hold. `STASH_MAX_ENTRIES` in
-  // `engine/index.html` bounds a WELL-BEHAVED writer (that file's own `stashEarlyErrors()`), not a
-  // hand-edited or future-version stash, which could carry arbitrarily many entries — this loop
-  // must not scale with an attacker- or corruption-controlled array length.
-  for (const entry of stash.entries.slice(0, MAX_PER_BURST_WINDOW)) {
+function replayStashedEarlyErrorsInner(stash: BootStashEnvelope, stashAgeMs: number): void {
+
+  // The run-up to the crash goes FIRST, so the fault it explains reads with its context already
+  // in the breadcrumb trail rather than after it. ONE breadcrumb, never one per line — see
+  // `bootStash.ts`'s CONSOLE_CONTEXT_SLOT for why a line-per-event replay cannot fit any division
+  // of the shared window.
+  if (stash.console) {
+    try {
+      captureToCrashlytics('breadcrumb', `[modoki] previous boot's console tail before it died:\n${stash.console}`);
+    } catch { /* same reasoning as the loop below */ }
+  }
+
+  for (const entry of stash.entries) {
     // Per-entry try/catch, same reasoning as drainEarlyErrors's loop: one bad stashed entry must
     // not take the rest of the replay down.
     try {
@@ -613,9 +705,23 @@ function drainStashedEarlyErrors(): void {
       /* never let one unreportable stashed entry break the rest of the replay */
     }
   }
-  if (typeof stash.dropped === 'number' && stash.dropped > 0) {
+  // Pre-formatted reports from the OTHER window (#860) — already through `captureToCrashlytics`
+  // on the boot that died, so the text is final. Re-prefixing it with `describeStashedEntry`'s
+  // `[uncaught-prev-boot]` would double-label a string that already says `[uncaught] …`; the
+  // marker below is added once, at the front, for the same reason that function adds one.
+  for (const report of stash.reports ?? []) {
     try {
-      captureToCrashlytics('breadcrumb', `[modoki] ${stash.dropped} pre-install error event(s) dropped from a previous boot's stash (stash cap)`);
+      if (report === null || typeof report !== 'object') continue;
+      if (report.kind !== 'error' && report.kind !== 'warn' && report.kind !== 'breadcrumb') continue;
+      if (typeof report.text !== 'string' || report.text === '') continue;
+      captureToCrashlytics(report.kind, `[prev-boot] ${report.text}`);
+    } catch {
+      /* never let one unreportable stashed report break the rest of the replay */
+    }
+  }
+  if (stash.dropped > 0) {
+    try {
+      captureToCrashlytics('breadcrumb', `[modoki] ${stash.dropped} event(s) from a previous boot never reached this report (replay budget)`);
     } catch { /* same reasoning as the loop above */ }
   }
 }
@@ -645,8 +751,20 @@ function flushQueue(): void {
   if (!appServices().crashlytics) return;
   const pending = queued;
   queued = [];
-  if (queueOverflowed) {
-    queueOverflowed = false;
+  // Both refusal trackers reset together with the queue they describe. They are NOT redundant:
+  // `queueOverflowed` records that the queue ever refused anything (including a replayed report),
+  // while `queueDroppedCount` counts only what is chargeable to THIS boot. Resetting one here and
+  // the other inside the branch below is how they drift.
+  const overflowed = queueOverflowed;
+  queueDroppedCount = 0;
+  queueOverflowed = false;
+  // ⚠️ The other half of `stashQueuedReports()`'s eager write, and it is not optional. The sink has
+  // arrived, so everything below is about to be delivered LIVE — leaving the persisted copy in
+  // place would replay this same boot's faults again on the next launch, turning a boot that
+  // RECOVERED into a duplicate crash report. Cleared before delivering, so a throw inside
+  // `deliver()` cannot leave a stale stash behind either.
+  clearBootStash();
+  if (overflowed) {
     pending.push({
       kind: 'breadcrumb',
       text: `[modoki] more than ${MAX_QUEUED} events were raised before crash reporting was registered; the excess was dropped.`,
@@ -668,6 +786,10 @@ export function installGlobalErrorHandlers(): void {
   if (installed || installing) return;
   installing = true;
   try {
+    // FIRST, before anything can write a new one: take the previous boot's stash off disk. See the
+    // replay call further down for why reading it any later reports this boot's own faults twice.
+    const previousBootStash = readAndClearBootStash();
+
     onAppServicesRegistered(flushQueue);
 
     // A post-reload crash report otherwise shows a discontinuity in the breadcrumb trail with
@@ -698,8 +820,15 @@ export function installGlobalErrorHandlers(): void {
     // Drain the fatal-load guard's pre-install buffer AFTER the listeners above are registered, so
     // anything thrown while draining is itself covered by them.
     drainEarlyErrors();
-    // THEN a previous boot's stash (#825) — this boot's own live faults take priority.
-    drainStashedEarlyErrors();
+    // THEN the previous boot's stash (#825) — this boot's own live faults take priority.
+    //
+    // ⚠️ READ ABOVE, REPLAYED HERE, and the split is load-bearing. `drainEarlyErrors()` above
+    // reports through `deliver()`, which — with no crashlytics sink registered yet, the normal
+    // state at install time — queues AND now persists (see `stashQueuedReports`). Reading the
+    // stash at this point would therefore read back the stash THIS boot just wrote and replay
+    // every fault a second time, labelled as if it came from a previous launch. Caught by
+    // `earlyErrorBuffer.test.ts`'s #825 case, which saw exactly 2 reports for 1 fault.
+    replayStashedEarlyErrors(previousBootStash);
 
     if (typeof console !== 'undefined') {
       const realError = console.error.bind(console);
@@ -743,9 +872,11 @@ export function __resetGlobalErrorsForTest(opts?: { clock?: () => number; uninst
   windowCount = 0;
   queued = [];
   queueOverflowed = false;
+  queueDroppedCount = 0;
+  replayingStash = false;
   reporting = false;
   now = opts?.clock ?? rawNow;
   clearPersistedCounters(); // else a leftover session budget leaks from one test/realm into the next
-  try { localStorage.removeItem(STASH_KEY); } catch { /* nothing left to try */ } // ditto, for the #825 stash
+  clearBootStash(); // ditto, for the cross-boot stash (#861 — bootStash.ts owns the key now)
   if (opts?.uninstall) installed = false;
 }

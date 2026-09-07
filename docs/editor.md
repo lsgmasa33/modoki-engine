@@ -1494,7 +1494,10 @@ decisions live in `editor/panels/hierarchyCollapse.ts`; `Hierarchy.tsx` keeps on
   other than `loadScene`'s tail leaves it diverged from `sceneManager` **indefinitely** (Save As,
   Assets → Create Scene, the boot restore), and so does a load that throws after the swap, so a
   path comparison is not "not settled yet" but "never settled" — it would shut the restore and the
-  save gate for the rest of the session, which is #839 itself by another route.
+  save gate for the rest of the session, which is #839 itself by another route. (Create Scene was
+  in that list until #853; it now sets the editor path *before* its swap and clears
+  `loadedScenes`, so it no longer diverges. Save As and the boot restore still do, which is why
+  the rule stands.)
 - **⚠️ But the swap handler must SCHEDULE that settled refresh itself.** It used to leave the job
   to `onStructureDirtyCoalesced`, which fires on `registerEntity` — and `loadSceneFile` registers
   the incoming scene's entities into the **staging** world *before* the swap, while `SceneManager`
@@ -1512,9 +1515,27 @@ and persists that over the user's arrangement. A world identity says the true th
 still valid, only the file name moved — so the arrangement carries across and is saved under the
 new path.
 
+⚠️ **A world identity cannot see "same world, all-new content" — and one path used to produce
+exactly that** (#853). `newScene()` deleted and respawned in place, so the owner still matched the
+live world, `needsCollapseRestore` returned false, and no restore ran — while the save gate stayed
+open, seeding the new scene's entry from the old scene's leftovers. That hole is closed **at the
+source** rather than here: `newScene()` now replaces content through
+`SceneManager.replaceWorldContent()`, so the swap is real and this machinery sees it like any other.
+See [scene-loading.md](./scene-loading.md) § "Replacing every entity IS a world swap".
+
+⚠️ **Keying the in-memory set by guid instead of runtime id would NOT have made this section
+redundant**, and #853's body argues that it would — so the correction belongs here, where the next
+reader will be. A guid-keyed stale entry is inert on *read*, which is real: nothing renders wrongly
+collapsed. But the set would still hold the outgoing scene's guids, `shouldPersistCollapse` would
+still be true, and the first toggle in the new scene would write those guids under the **new**
+scene's path. That is not harmless: it consumes the "never seen" sentinel `computeRestoredCollapse`
+depends on (a MISSING entry means collapse-all-by-default), so the new scene permanently loses that
+default. Guid keying still needs a restore trigger that fires on this path — which is the defect —
+so it is hardening, not a replacement for the ownership machinery.
+
 `hierarchyCollapse.test.ts` pins the decisions; `e2e/editor-hierarchy-collapse.spec.ts` pins the
-wiring, including the Save-As case (reverting the panel turns it red). The mechanism class is
-written up in [async-lifetime.md](./async-lifetime.md).
+wiring, including the Save-As case and the Create Scene case (reverting either turns it red). The
+mechanism class is written up in [async-lifetime.md](./async-lifetime.md).
 
 
 ## Asset editors
@@ -1960,7 +1981,11 @@ with neither silently removes the guarantee**, exactly as it did here for two fu
 entire release window.
 
 ⚠️ Still uncovered by either mechanism: `.meta.json` sidecars are invisible to `detectType`
-(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845.
+(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845. **This is the
+reason `modoki_write_asset_meta` can still clobber a human's parked edit (#872, open): the
+watcher-driven park-drop that protects `modoki_write_asset` cannot fire for a sidecar.** The read
+side is closed — `modoki_get_asset_meta` consults the registry — and the CAS half is closed too
+(#871/#874). See [mcp-persistence.md](./mcp-persistence.md) § 5.
 
 ⚠️ **And being watched is not the same as being invalidated WELL.** Adding a kind to
 `LiveReloadKind` makes the broadcast fire; what the matching `ASSET_CACHE_INVALIDATORS` entry then

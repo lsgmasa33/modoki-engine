@@ -1475,6 +1475,11 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
 
   // Persist postprocessor to meta when changed — PARKED, not written immediately (#845). Cmd+S
   // is the write.
+  //
+  // #870: this row needs no `UnsavedMetaBadge` of its own, and adding one would put TWO markers on
+  // screen for one edit. It parks `asset.path`, and `<ModelAssetView path={asset.path} …>` — which
+  // this same Inspector renders below — already shows the badge for that path. The badge is keyed
+  // on the PATH, not on which control made the edit, which is what makes that true.
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
     // No `version` here — `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION` onto every write

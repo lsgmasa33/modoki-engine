@@ -18,10 +18,14 @@ import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCach
 import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
-import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { formatBytes, reimportBtnStyle } from './widgets';
 import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
-import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
+import {
+  parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
+} from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -36,6 +40,8 @@ function acesToneMap(x: number): number {
 }
 
 export function EnvironmentAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Decoded HDR pixel data (linear RGB, one float per channel) + native dims.
   const hdrRef = useRef<{ data: Float32Array | Uint16Array; type: number; w: number; h: number } | null>(null);
@@ -110,7 +116,8 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         const hash = hashBytes(jpeg);
         const updatedMeta = { ...(meta ?? {}), environment: settings, environmentCache: { hash, bytes: jpeg.length } };
         setMeta(updatedMeta);
-        await writeMetaOrWarn(path, updatedMeta);
+        // #874: the write AND the forget-on-success, in one call — see writeMetaWholesale.
+        await writeMetaWholesale(path, updatedMeta);
       } else {
         // Node-side downscale (dependency-free) via the reimport handler.
         setImportStatus(true, `Downscaling ${name}...`);
@@ -276,6 +283,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
           </>
         );
       })()}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.environment.unsaved" />
     </>
   );
 }

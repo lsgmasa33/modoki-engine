@@ -14,8 +14,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { deriveSettingsForType, type TextureImportSettings } from '../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
-import { writeMetaOrWarn } from './assetViews/widgets';
-import { flushPendingMetaFor } from '../scene/pendingMeta';
+import { flushPendingMetaFor, writeMetaWholesale } from '../scene/pendingMeta';
 
 /** Sets a texture's type to `2d` and re-imports it so it gets a whole-image
  *  sprite. Resolves `true` on success; the caller (SpritePicker) is responsible
@@ -72,7 +71,9 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   const prior = (meta as { texture?: Partial<TextureImportSettings> }).texture ?? {};
   const { format: _format, mipmaps: _mipmaps, wrapS: _wrapS, wrapT: _wrapT, ...carried } = prior;
   const updatedMeta = { ...meta, type: '2d', texture: deriveSettingsForType('2d', carried) };
-  const wrote = await writeMetaOrWarn(path, updatedMeta);
+  // #874: writeMetaWholesale IS the write plus the forget-on-success — see its docblock for why
+  // that pairing lives in one function rather than at each of the three call sites.
+  const wrote = await writeMetaWholesale(path, updatedMeta);
   if (!wrote) return false;
 
   const res = await backendFetch('/api/reimport', {

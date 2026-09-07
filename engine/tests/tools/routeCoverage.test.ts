@@ -52,6 +52,7 @@ const EXTRA_ROUTES: Record<string, string[]> = {
  *  claim, one per route, that the agent losing this route costs it nothing. */
 const NO_TOOL_BY_DESIGN: Record<string, string> = {
   // ── consumed by the tool layer itself, so they need no tool of their own ──
+  '/api/read-meta': "the EDITOR's own disk read of a .meta.json — `readMetaPreferringPark` (renderer) and the /api/asset-meta fallback both call it. The agent's read is `modoki_get_asset_meta` -> /api/asset-meta, which PREFERS a parked Inspector edit; pointing a tool at this one would hand an agent the pre-edit file and call it the answer (#872)",
   '/api/identity': "the once-per-process identity probe in context.ts; `modoki_identity` answers FROM it, which is why that contract declares route:null",
   '/api/dev-server-identity': 'the dev server\'s own identity, for the wrong-clone banner',
   '/api/game-tools': 'the DYNAMIC game-tool tail (#270) — the server polls this to materialize a game\'s own tools, which by construction have no contract entry',

@@ -508,6 +508,38 @@ export function isConsoleRingInstalled(): boolean {
   return installed;
 }
 
+/**
+ * The last `max` recorded lines, rendered one-per-line as `LEVEL: arg arg …` (#861).
+ *
+ * For the cross-boot stash, and shaped for it: the run-up to a crash goes into ONE joined
+ * breadcrumb, so this returns already-flattened strings rather than `ConsoleRingEntry` objects a
+ * caller would have to re-render. Every consumer that wants structure keeps using
+ * {@link getConsoleRingEntries}.
+ *
+ * ⚠️ Takes from the END, and that is the whole point. When `installConsoleRing()` HAS run — which
+ * the 2026-09-07 measurement showed is the common case for a boot that dies (see
+ * `core/bootStash.ts`'s header) — the inline shim is already drained and empty, and THIS ring is
+ * the only thing holding the boot's log lines. The lines closest to the fault are the ones that
+ * explain it; the pinned boot prefix is deliberately NOT preferred here for that reason.
+ */
+export function getConsoleRingTail(max: number): string[] {
+  if (!Number.isFinite(max) || max <= 0) return [];
+  const all = [...pinned, ...tail];
+  const slice = all.length > max ? all.slice(all.length - max) : all;
+  // Per-entry try/catch, matching every other read path in this module: `args` are already
+  // stringified at record time, but a caller's `max` and a hand-built entry are not this module's
+  // to trust, and a stash write must never become a second fault on a boot that is already dying.
+  const out: string[] = [];
+  for (const e of slice) {
+    try {
+      out.push(`${e.level}: ${e.args.join(' ')}`);
+    } catch {
+      /* never let one unrenderable entry break the tail */
+    }
+  }
+  return out;
+}
+
 /** Test-only: restore the real console methods, clear the buffer, and reset every counter. */
 export function __resetConsoleRingForTest(): void {
   if (originals) {

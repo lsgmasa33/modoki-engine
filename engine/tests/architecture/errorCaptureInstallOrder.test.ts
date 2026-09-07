@@ -31,7 +31,7 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
  * (`__MODOKI_EARLY_ERRORS__`), but the drain (`globalErrors.ts`'s `drainEarlyErrors`) only runs once
  * `installGlobalErrorHandlers` itself is reached, so it covers an early fault on a boot that
  * COMPLETES. A boot that never completes was #825: the guard now stashes that buffer to
- * `localStorage` and `drainStashedEarlyErrors` replays it on the next boot that reaches the
+ * `localStorage` and `replayStashedEarlyErrors` replays it on the next boot that reaches the
  * installer. Still NOT covered, and deliberately so — see #860: a boot where the installer DID run
  * but the game never registered its services queues the fault in `deliver()` and loses it on unload,
  * which neither this ordering nor the stash can reach.

@@ -1243,7 +1243,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
 | `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
-| `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_get_asset_meta` | GET `/api/asset-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
 | `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
 | `modoki_get_layout_bounds` | GET `/api/layout-bounds` | read-only | editor + renderer | — | *(no args)* |

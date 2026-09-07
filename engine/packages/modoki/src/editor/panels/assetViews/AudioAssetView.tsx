@@ -19,6 +19,8 @@ import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -34,6 +36,8 @@ const LOAD_TYPE_LABELS: Record<AudioLoadType, string> = {
 };
 
 export function AudioAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<AudioImportSettings>(DEFAULT_AUDIO_SETTINGS);
   const [importing, setImporting] = useState(false);
@@ -183,6 +187,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
         {importing ? 'Converting...' : converted ? 'Re-import' : 'Apply'}
       </button>
       {converted && <AudioImportedStats cache={meta?.audioCache as AudioCacheInfo | undefined} />}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.audio.unsaved" />
     </>
   );
 }

@@ -19,6 +19,8 @@ import { withCurrentValue } from './importSettingOptions';
 import { commitAxisDraft, applyAxisEdit } from './fontAxisEdit';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { OUTLINE_MAX_SPREAD } from '../../../runtime/rendering/text/mtsdfStyle';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const CHARSET_OPTIONS: { value: FontCharsetPreset; label: string }[] = [
   { value: 'ascii', label: 'ASCII (printable, 95 glyphs)' },
@@ -65,6 +67,8 @@ const AXIS_LABELS: Record<string, string> = {
 };
 
 export function FontAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<FontImportSettings>(DEFAULT_FONT_SETTINGS);
   const [customChars, setCustomChars] = useState('');
@@ -335,6 +339,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       </button>
       {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} />}
       {converted && <FontAtlasPreview path={path} cache={meta?.fontCache as FontCacheInfo | undefined} />}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.font.unsaved" />
     </>
   );
 }

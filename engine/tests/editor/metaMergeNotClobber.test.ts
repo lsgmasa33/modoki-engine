@@ -66,8 +66,14 @@ function editorSourceFiles(): { rel: string }[] {
 
 /** Files that write (or PARK, #845) a meta sidecar and must therefore merge rather than replace.
  *  Derived by grepping `engine/packages/modoki/src/editor/**` for the write/park call itself
- *  (`writeMetaOrWarn(`, `parkMetaEdit(`, or the `'/api/write-meta'` route string) — an
- *  artifact-shaped search, not a guess from memory. `widgets.tsx` (defines `writeMetaOrWarn`) and
+ *  (`writeMetaOrWarn(`, `writeMetaWholesale(`, `parkMetaEdit(`, or the `'/api/write-meta'` route
+ *  string) — an artifact-shaped search, not a guess from memory.
+ *
+ *  ⚠️ `writeMetaWholesale(` was added when #874 introduced it, and adding it was the POINT: three
+ *  explicit-action writers moved onto that helper, and without the new name this guard silently
+ *  dropped `makeTexture2D.ts` from its own corpus — a file that still builds a merged payload.
+ *  A refactor that renames the call is exactly how a merge-not-clobber guard loses a writer, so
+ *  the name list is what has to keep up. This guard caught it; the list is not optional. `widgets.tsx` (defines `writeMetaOrWarn`) and
  *  `scene/pendingMeta.ts` (defines `parkMetaEdit`/the flush) are deliberately excluded: both
  *  forward whatever payload they are given and construct none themselves, so neither has a
  *  literal of its own to check. */
@@ -104,7 +110,7 @@ function codeLines(src: string): string[] {
  *  every file in WRITERS genuinely posts to the endpoint this guard cares about — not to find
  *  and evaluate the payload. */
 function hasMetaWriteCall(src: string): boolean {
-  return codeLines(src).some((line) => /writeMetaOrWarn\(|\/api\/write-meta|parkMetaEdit\(/.test(line));
+  return codeLines(src).some((line) => /writeMetaOrWarn\(|writeMetaWholesale\(|\/api\/write-meta|parkMetaEdit\(/.test(line));
 }
 
 // ── Payload-literal extraction ──────────────────────────────────────────────────────────────
@@ -216,7 +222,7 @@ function metaPayloadLiterals(src: string): string[] {
   // Shape 1: writeMetaOrWarn(<pathExpr>, <payloadExpr>) or parkMetaEdit(<pathExpr>, <payloadExpr>)
   // — #845 gave every field handler a SECOND way to reach the sidecar (park now, write later),
   // and it carries the exact same (pathExpr, payloadExpr) shape, so one pass handles both.
-  const callRe = /(?:writeMetaOrWarn|parkMetaEdit)\(/g;
+  const callRe = /(?:writeMetaOrWarn|writeMetaWholesale|parkMetaEdit)\(/g;
   let m: RegExpExecArray | null;
   while ((m = callRe.exec(codeSrc))) {
     const parenOpen = m.index + m[0].length - 1;

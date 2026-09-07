@@ -30,10 +30,14 @@ import {
   parkMetaEdit, peekPendingMeta, isMetaDirty, hasPendingMeta, getPendingMetaPaths,
   clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
   readMetaPreferringPark, metaWrittenToDisk, peekMetaBaseline, clearMetaBaselines,
+  writeMetaWholesale,
+  noteMetaReadResult,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
 
 const TEX = '/assets/textures/rock.png.meta.json';
 const OTHER = '/assets/textures/grass.png.meta.json';
+/** #871's asset type: the one whose only reader is the exempted raw fetch in `VideoAssetView`. */
+const VID = '/assets/video/intro.mp4';
 
 type Reply = { status: number; body: unknown };
 let reply: Reply;
@@ -585,5 +589,399 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     await readMetaPreferringPark(TEX);
 
     expect(peekMetaBaseline(TEX)).toBe('BEFORE');
+  });
+});
+
+
+/** #871 — a reader EXEMPT from `readMetaPreferringPark` still owes the CAS baseline.
+ *
+ *  `VideoAssetView` is a declared exemption in `metaReadPreferringPark.test.ts`, for a reason that
+ *  is true and still correct: it keeps a third piece of state (`applied`) that must reflect DISK,
+ *  so it cannot use a helper that skips the network call whenever a park exists. That reason
+ *  vouches for WHICH DOCUMENT THE PANEL DISPLAYS and for nothing else — and it was read as
+ *  vouching for the file generally. Because its raw fetch dropped the `X-Meta-Sha256` header,
+ *  `baselines` never had an entry for any `.mp4`, `flushPendingMetaFor` passed `undefined` as
+ *  `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed*. So #845 phase 2's
+ *  precondition was INERT for that entire asset type, while looking present everywhere else — a
+ *  guard that silently does not run, which is why the issue carries `family/fail-open-guard`.
+ *
+ *  These drive `noteMetaReadResult` directly rather than mounting the panel: editor `.tsx`
+ *  carries no tests by repo policy (`docs/editor.md` § Panels), and the panel's own wiring —
+ *  that it calls this at all — is asserted structurally by `metaReadPreferringPark.test.ts`. */
+describe('an exempted raw reader still records the baseline (#871)', () => {
+  /** The two fields `noteMetaReadResult` reads, shaped like the raw `backendFetch` reply the
+   *  video panel actually holds. */
+  const res = (ok: boolean, sha: string | null) => ({
+    ok, headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-sha256' ? sha : null) },
+  });
+
+  /** Captures what the flush POSTs, with no `/api/read-meta` arm at all — the point of this
+   *  describe is the path that never calls the helper. */
+  function stubWrite(reply: { status: number; body: unknown } = { status: 200, body: { ok: true, sha256: 'AFTER' } }) {
+    const sent: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+      sent.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: reply.status < 400, status: reply.status,
+        headers: { get: () => null }, text: async () => '', json: async () => reply.body,
+      } as unknown as Response;
+    }));
+    return sent;
+  }
+
+  it('seeds the baseline from the header, so the deferred flush is CONDITIONAL', async () => {
+    noteMetaReadResult(VID, res(true, 'DISK-V1'));
+    expect(peekMetaBaseline(VID)).toBe('DISK-V1');
+
+    // The panel parks with two args — it has no baseline of its own to hand over, and does not
+    // need one: the flush reads `baselines` directly.
+    const sent = stubWrite();
+    parkMetaEdit(VID, { video: { crf: 23 } });
+    await flushPendingMetaFor(VID);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].ifMatch, 'the #845 precondition is inert for .mp4 without this').toBe('DISK-V1');
+  });
+
+  /** ⚠️ The ACCEPT side's twin, and the half a "does it refuse?" test cannot reach: the whole
+   *  point of seeding is that a write the server ACCEPTS still advances normally afterwards. */
+  it('the reply advances that baseline, so the second save does not conflict with itself', async () => {
+    noteMetaReadResult(VID, res(true, 'DISK-V1'));
+    const sent = stubWrite();
+
+    parkMetaEdit(VID, { video: { crf: 23 } });
+    await flushPendingMetaFor(VID);
+    parkMetaEdit(VID, { video: { crf: 28 } });
+    await flushPendingMetaFor(VID);
+
+    expect(sent).toHaveLength(2);
+    // ⚠️ BOTH sends are asserted on purpose. Checking only the second passes even with the seeding
+    // deleted — the flush's own `baselines.set(path, r.sha256)` supplies 'AFTER' regardless, so
+    // that assertion tests #845's advance and says nothing about #871. The FIRST send is the one
+    // that can only be 'DISK-V1' because the exempted read recorded it. (Caught by mutation-
+    // checking this test: without this line it stayed green with `noteMetaReadResult` a no-op.)
+    expect(sent[0].ifMatch).toBe('DISK-V1');
+    expect(sent[1].ifMatch).toBe('AFTER');
+  });
+
+  /** A missing header means NO BASELINE, never "unchanged" — the route omits it for a `null`
+   *  sidecar, and an unconditional write is the correct reading of "we have no idea what is on
+   *  disk". Getting this backwards would 409 every first write on a fresh sidecar. */
+  it('records nothing when the response carries no header', async () => {
+    noteMetaReadResult(VID, res(true, null));
+    expect(peekMetaBaseline(VID)).toBeUndefined();
+
+    const sent = stubWrite();
+    parkMetaEdit(VID, { video: { crf: 23 } });
+    await flushPendingMetaFor(VID);
+
+    expect('ifMatch' in sent[0]).toBe(false);
+  });
+
+  /** Same rule as the helper's own: a failed read must not ERASE a baseline an earlier successful
+   *  one established, or the next write goes unconditional exactly when the editor is least sure. */
+  it('a non-ok response leaves an existing baseline intact', () => {
+    noteMetaReadResult(VID, res(true, 'DISK-V1'));
+    noteMetaReadResult(VID, res(false, 'IGNORED'));
+    expect(peekMetaBaseline(VID)).toBe('DISK-V1');
+  });
+
+  /** ⚠️ THE HALF THE MERGE WITH `dfe8ce441` REVEALED, and the reason this helper is named for the
+   *  RESPONSE rather than for the baseline.
+   *
+   *  That commit added the `readFailed` guard — a failed GET must block a later park, because the
+   *  panel is then showing its own defaults with no `id`, and a wholesale write of that document
+   *  makes the scanner mint a fresh GUID and dangles every reference to the asset. It added it
+   *  INSIDE the block this helper had already extracted. Taking only the baseline half would have
+   *  left the exempted video reader recording a baseline and NOT the failure — #871's exact trap
+   *  a second time, one field down, on the one asset type with no other reader.
+   *
+   *  This is the accept-side pair: a failure must ARM the guard, and a later success must DISARM
+   *  it (a dev-server blip is transient; once we have genuinely read the file there is nothing
+   *  left to protect against). Asserted through `parkMetaEdit`'s observable behaviour rather than
+   *  by reaching into `readFailed`, so it survives that set being reshaped. */
+  it('a failed raw read ARMS the park refusal, and a later success DISARMS it', () => {
+    noteMetaReadResult(VID, res(false, null));
+    parkMetaEdit(VID, { video: { crf: 23 } });
+    expect(
+      isMetaDirty(VID),
+      'a park built on the {} fallback would write an id-less sidecar and orphan the asset',
+    ).toBe(false);
+
+    noteMetaReadResult(VID, res(true, 'DISK-V1'));
+    parkMetaEdit(VID, { id: 'g', video: { crf: 23 } });
+    expect(isMetaDirty(VID), 'a transient blip must not refuse this path forever').toBe(true);
+  });
+});
+
+
+/** #874 — an EXPLICIT-ACTION wholesale write must not leave the baseline it invalidated.
+ *
+ *  The other half of #871's original one-sentence mechanism (*"stale where a write must not trust
+ *  it"*). That half was filed against a project switch and refuted — the renderer hard-reloads, so
+ *  nothing survives one. This is its real trigger: a SIBLING WRITE inside a single session.
+ *
+ *  Make-2D, a 9-slice/Sprite Save, a model import and the collision-mesh write all replace the
+ *  sidecar wholesale while a panel is mounted on the same path holding a baseline from its own
+ *  load. Leaving that baseline makes the human's very next Cmd+S 409 under "the .meta.json changed
+ *  on disk since this edit was based on it" — true of the file and a lie about the cause, because
+ *  THIS EDITOR changed it. #844's class exactly, and the refusal's advice ("reopen the asset")
+ *  is not something the human knows to do.
+ *
+ *  These drive the registry against a server stub that actually enforces `ifMatch`, so the
+ *  assertion is the observable outcome (refused vs saved) rather than the argument value. */
+/** Who is allowed to MOVE the baseline (#871/#872 review).
+ *
+ *  A baseline is a claim about the bytes the PANEL'S DISPLAYED DOCUMENT came from, and the flush
+ *  conditions the human's next save on it. So only a read that actually feeds a panel may move it.
+ *  Two readers looked like they qualified and did not, and both were introduced by the very fixes
+ *  meant to close #871/#872 — an observer disarming the guard it observes.
+ *
+ *  ⚠️ Both cases are stated as the OBSERVABLE OUTCOME — was the flush refused? — rather than as a
+ *  baseline value, because that is what the human experiences and it cannot be satisfied by the
+ *  map merely holding some string. */
+describe('only a read that feeds a panel may move the baseline', () => {
+  /** Disk starts at V1 and can be rewritten out from under the editor; a PRESENT `ifMatch` that
+   *  misses is refused, exactly as `ifMatchRefusal` does. */
+  function stubDisk() {
+    const disk = { sha: 'V1', doc: { id: 'g', texture: { maxSize: 256 } } as Record<string, unknown> };
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+      if (String(url).includes('/api/read-meta')) {
+        return {
+          ok: true, status: 200,
+          headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-sha256' ? disk.sha : null) },
+          text: async () => '', json: async () => disk.doc,
+        } as unknown as Response;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      if (body.ifMatch !== undefined && body.ifMatch !== disk.sha) {
+        return {
+          ok: false, status: 409, headers: { get: () => null },
+          text: async () => '', json: async () => ({ ok: false, conflict: true }),
+        } as unknown as Response;
+      }
+      disk.sha = 'W';
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => '', json: async () => ({ ok: true, sha256: disk.sha }),
+      } as unknown as Response;
+    }));
+    return disk;
+  }
+
+  /** #871 review — the EXEMPTED reader must not re-seed while a park is live.
+   *
+   *  `readMetaPreferringPark` gets this free: it early-returns on a park and never reaches the
+   *  network. An exempted reader DOES reach it — that is what the exemption is for — so an
+   *  unconditional `noteMetaReadResult` re-seeds on every remount. The parked document was built
+   *  from the OLD bytes, so advancing the baseline to what disk holds now makes `ifMatch` a claim
+   *  that document cannot support, and the flush overwrites the external change instead of
+   *  refusing it. `.mp4` would have stayed the one type where the guard can be talked out of
+   *  firing — the same asset type #871 was about. */
+  it('an exempted re-read while a park is live does NOT advance it — the flush still refuses', async () => {
+    const disk = stubDisk();
+    // The video panel's mount read.
+    noteMetaReadResult(VID, { ok: true, headers: { get: () => disk.sha } });
+    parkMetaEdit(VID, { id: 'g', video: { crf: 23 } });
+
+    disk.sha = 'EXTERNAL';                       // something rewrites the sidecar
+    // The panel remounts (asset reselected) and reads raw again — the exemption's whole point.
+    noteMetaReadResult(VID, { ok: true, headers: { get: () => disk.sha } });
+
+    const r = await flushPendingMeta();
+
+    expect(r.saved, 'the external change was CLOBBERED by a park built on older bytes').toEqual([]);
+    expect(r.failed).toHaveLength(1);
+    expect(peekPendingMeta(VID), 'and the human keeps their edit').toBeDefined();
+  });
+
+  /** #872 review — an AGENT read is passive and must move nothing.
+   *
+   *  Before #872 `modoki_get_asset_meta` ran in the Node process and could not touch this map at
+   *  all; routing it through the renderer to see parked edits gave it that power as a side effect.
+   *  It feeds no panel, so a baseline it advances describes a document nobody is holding. */
+  it('a PASSIVE read moves nothing, so an agent cannot disarm the panel guard', async () => {
+    const disk = stubDisk();
+    await readMetaPreferringPark(TEX);           // the panel's own read → baseline V1
+    disk.sha = 'EXTERNAL';                       // something rewrites the sidecar
+
+    const agent = await readMetaPreferringPark(TEX, { passive: true });
+    expect(agent.ok, 'the agent still gets a real answer').toBe(true);
+
+    // The human's edit, built on the doc the panel is still showing.
+    parkMetaEdit(TEX, { id: 'g', texture: { maxSize: 1024 } });
+    const r = await flushPendingMeta();
+
+    expect(r.saved, 'the agent read let the human overwrite an external change').toEqual([]);
+    expect(r.failed).toHaveLength(1);
+  });
+
+  /** ⚠️ THE ASYNC WINDOW — the seam a direct `noteMetaReadResult` call cannot reach.
+   *
+   *  `readMetaPreferringPark` checks the park BEFORE its `await` and records the result AFTER, so a
+   *  park landing in between is invisible to the check that started the read. Gating the
+   *  read-failed flag on "is a park live?" therefore skips it for a component whose OWN read
+   *  failed — and that component is showing `meta: {}`, because the helper returns the `{}`
+   *  fallback on `!ok` and every asset view merges onto `{...(meta ?? {})}`.
+   *
+   *  Reachable in production: `Inspector`'s postprocessor row and `ModelAssetView` both read the
+   *  model's path on mount. Park a good doc from one, let the other's GET 500, and the next field
+   *  change in that panel parks a doc with NO `id`, supersedes the good park, and Cmd+S writes an
+   *  id-less sidecar — the scanner mints a fresh GUID and every reference to the asset dangles.
+   *
+   *  So the flag is armed unconditionally and only the BASELINE is skipped while a park is live. */
+  it('a read that FAILS while another component parks still arms the refusal', async () => {
+    // The OTHER component's park — it lands while this read is in flight, which is the whole seam.
+    const parkDuringFlight = () => parkMetaEdit(TEX, { id: 'GUID-1', postprocessor: 'none' });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      parkDuringFlight();
+      return {
+        ok: false, status: 500, headers: { get: () => null },
+        text: async () => '', json: async () => ({}),
+      } as unknown as Response;
+    }));
+
+    const r = await readMetaPreferringPark(TEX);
+    expect(r.ok, 'the read really did fail').toBe(false);
+    expect(r.meta, 'and handed back the {} fallback this panel will merge onto').toEqual({});
+
+    // That panel's next field change, built on the fallback — no `id`.
+    parkMetaEdit(TEX, { model: { lodCount: 2 } });
+
+    expect(
+      peekPendingMeta(TEX),
+      'an id-less park superseded the good one — Cmd+S would orphan every ref to this asset',
+    ).toEqual({ id: 'GUID-1', postprocessor: 'none' });
+  });
+
+  /** The ACCEPT side of the same rule: a NON-passive read by the panel still seeds normally, or
+   *  the fix above would have disarmed #871 in the other direction. */
+  it('a normal (non-passive) read still records the baseline', async () => {
+    stubDisk();
+    await readMetaPreferringPark(TEX);
+    expect(peekMetaBaseline(TEX)).toBe('V1');
+  });
+});
+
+describe('a wholesale editor write does not leave a stale baseline (#874)', () => {
+  /** A stub that behaves like `ifMatchRefusal`: 409 when a PRESENT `ifMatch` misses, and every
+   *  successful write advances what disk holds. */
+  function stubServer() {
+    const state = { sha: 'V1' };
+    const sent: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+      if (String(url).includes('/api/read-meta')) {
+        return {
+          ok: true, status: 200,
+          headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-sha256' ? state.sha : null) },
+          text: async () => '', json: async () => ({ id: 'g' }),
+        } as unknown as Response;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      sent.push(body);
+      if (body.ifMatch !== undefined && body.ifMatch !== state.sha) {
+        return {
+          ok: false, status: 409, headers: { get: () => null },
+          text: async () => '', json: async () => ({ ok: false, conflict: true }),
+        } as unknown as Response;
+      }
+      state.sha += '+';
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => '', json: async () => ({ ok: true, sha256: state.sha }),
+      } as unknown as Response;
+    }));
+    return { state, sent };
+  }
+
+  it('metaWrittenToDisk forgets it, so the next parked edit is not refused', async () => {
+    const { state } = stubServer();
+    await readMetaPreferringPark(TEX);                       // panel mounts → baseline V1
+    expect(peekMetaBaseline(TEX)).toBe('V1');
+
+    // A 9-slice/Sprite Save: it wrote the full document itself and reports that in.
+    //
+    // ⚠️ `state.sha` MUST advance here, and the first version of this test forgot to — which made
+    // both assertions below vacuous. Those editors POST the document themselves rather than
+    // through this stub, so without this line disk stays at 'V1', a stale `ifMatch:'V1'` still
+    // MATCHES, and the flush is accepted whether the baseline was forgotten or not. The test
+    // narrated a 409 that its own fixture made impossible: deleting the mechanism turned it red
+    // only at the `peekMetaBaseline` line, and deleting THAT line left it green with the
+    // mechanism gone. This is the write actually reaching disk.
+    parkMetaEdit(TEX, { id: 'g', border: [1, 1, 1, 1] });
+    state.sha = 'V2';
+    metaWrittenToDisk(TEX, peekPendingMeta(TEX));
+    expect(peekMetaBaseline(TEX), 'the hash it just invalidated').toBeUndefined();
+
+    // The human's next Inspector edit + Cmd+S. With the baseline kept, this sends `ifMatch:'V1'`
+    // against a disk holding 'V2' → the 409 that names no true cause.
+    parkMetaEdit(TEX, { id: 'g', texture: { maxSize: 1024 } });
+    const r = await flushPendingMeta();
+
+    expect(r.failed, 'a 409 naming no true cause — this editor changed the file').toEqual([]);
+    expect(r.saved).toEqual([TEX]);
+  });
+
+  /** #874 review — the pairing itself, which had NO test and is how the fail-open got in.
+   *
+   *  Three explicit-action writers each carried their own copy of "write, then forget the baseline
+   *  it invalidated", and the copies had drifted into two shapes: `makeTexture2D` guarded on the
+   *  write's boolean, `EnvironmentAssetView` did not. So a FAILED write there dropped a baseline
+   *  that was still accurate — disk had not changed — and the #845 precondition for that path went
+   *  UNCONDITIONAL, turning the next external change from a 409 into a silent clobber. The guard
+   *  meant to keep the CAS honest was what disarmed it.
+   *
+   *  Two of the three sites had no test at all, which is why nothing went red for the one that got
+   *  it wrong. They are one function now (`writeMetaWholesale`), and this is its test — BOTH
+   *  directions, because the accept side is the half that was broken. */
+  describe('writeMetaWholesale — forget on success, KEEP on failure', () => {
+    it('forgets the baseline when the write lands', async () => {
+      stubServer();
+      await readMetaPreferringPark(TEX);
+      expect(peekMetaBaseline(TEX), 'positive control').toBe('V1');
+
+      expect(await writeMetaWholesale(TEX, { id: 'g', type: '2d' })).toBe(true);
+
+      expect(peekMetaBaseline(TEX), 'we replaced those bytes ourselves').toBeUndefined();
+    });
+
+    /** ⚠️ THE FAIL-OPEN. A write that did not land changed nothing on disk, so the baseline is
+     *  still accurate and must survive — dropping it makes every later flush for this path
+     *  unconditional, and an external change is then overwritten instead of refused. */
+    it('KEEPS the baseline when the write fails — disk did not change', async () => {
+      stubServer();
+      await readMetaPreferringPark(TEX);
+      expect(peekMetaBaseline(TEX)).toBe('V1');
+
+      // The dev-server blip the modal editors keep their dialogs open for.
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: false, status: 500, headers: { get: () => null },
+        text: async () => '', json: async () => ({ ok: false }),
+      } as unknown as Response)));
+
+      expect(await writeMetaWholesale(TEX, { id: 'g', type: '2d' })).toBe(false);
+
+      expect(peekMetaBaseline(TEX), 'a failed write must not disarm the precondition').toBe('V1');
+    });
+  });
+
+  /** ⚠️ The SUPERSEDED case forgets too. `metaWrittenToDisk` returns false when a newer park
+   *  arrived during the write — correct for the PARK — but the baseline question has a different
+   *  answer: disk changed either way, so a newer park writing against the old hash is the same
+   *  409 one edit later. Two maps, two questions; only one of them takes that early return. */
+  it('forgets the baseline even when the park was superseded and NOT dropped', async () => {
+    const { state } = stubServer();
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { id: 'g', v: 1 });
+    const refAtRead = peekPendingMeta(TEX);
+    state.sha = 'V2';                                         // the wholesale write reached disk
+    parkMetaEdit(TEX, { id: 'g', v: 2 });                     // a newer edit lands mid-write
+
+    expect(metaWrittenToDisk(TEX, refAtRead), 'the newer park must survive').toBe(false);
+
+    expect(peekPendingMeta(TEX)).toEqual({ id: 'g', v: 2 });
+    expect(peekMetaBaseline(TEX)).toBeUndefined();
+    const r = await flushPendingMeta();
+    expect(r.failed).toEqual([]);
   });
 });

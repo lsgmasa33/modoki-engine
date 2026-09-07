@@ -81,7 +81,7 @@ export {
 // calls into, kept exported too for callers that manage their own undo entry.
 export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
-  saveScene, saveAll, serializeScene, loadScene, newScene,
+  saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
   getLastSceneLoadFailureMessage, type SceneLoadOutcome,
 } from './scene/serialize';

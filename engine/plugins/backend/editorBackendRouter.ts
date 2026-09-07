@@ -3701,6 +3701,43 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
+  // ── GET /api/asset-meta?path= (M→R) ── the sidecar, PREFERRING a parked Inspector edit (#872).
+  //
+  // Deliberately a SECOND route rather than a flag on `/api/read-meta`. That one is the editor's
+  // OWN disk read — `readMetaPreferringPark` calls it from the renderer, so making it probe the
+  // renderer back would be circular for every real caller it has. This one is the agent's read,
+  // and it asks the side that actually knows.
+  if (urlPath === '/api/asset-meta' && method === 'GET') {
+    const assetPath = query.get('path');
+    if (!assetPath) return json({ error: 'asset-meta requires ?path=<asset-root URL>' }, 400);
+    // ⚠️ The F10 checks run HERE, BEFORE the renderer, and they are not optional. `/api/read-meta`
+    // fails a bad/escaped/absent path explicitly (400/403/404) precisely so it cannot collapse into
+    // a silent `{}` — but `readMetaPreferringPark`, which the op calls, flattens every non-ok
+    // response to `{meta:{}, ok:false}` and cannot tell 404 from 500. Asking the renderer first
+    // would therefore turn "that asset does not exist" into a 200 carrying an empty document, which
+    // is exactly the ambiguity F10 removed. Node can answer it, so Node answers it.
+    const preResolved = ctx.resolveAssetPath(assetPath);
+    if (!preResolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!fs.existsSync(preResolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
+    try { return json(await ctx.requestBrowser('read-asset-meta', { path: assetPath })); }
+    catch (e) {
+      // Same split as `/api/asset-def` and the editor-action relay: the op answering (400) is not
+      // a dead gateway. But unlike asset-def, a transport failure here is RECOVERABLE — the disk
+      // read is a real, if weaker, answer — so fall back rather than fail, and SAY which it is.
+      // Silently returning disk would be the #872 defect again, one layer down: an agent reading
+      // a pre-edit value with no way to know a newer one might exist.
+      const status = relayFailureStatus(e);
+      if (status === 400) return json({ error: String(e instanceof Error ? e.message : e) }, 400);
+      return json({
+        ok: true, path: assetPath, meta: readMetaSidecar(preResolved), source: 'disk', unsaved: false,
+        read: 'ok', editorConnected: false,
+        note: 'No editor renderer answered, so this is the FILE and a parked Inspector '
+          + 'import-settings edit could NOT be checked for. If an editor is open, a newer unsaved '
+          + 'value may exist — retry, or check modoki_get_editor_state pendingImportSettings.',
+      });
+    }
+  }
+
   // ── POST /api/scene-query {kind, dim, ...} (M→R) ── raycast / shapecast / point-pick against
   // the live PHYSICS world (#288 gap 1). POST rather than GET despite being a pure read: the
   // payload is nested vectors, and a GET would mean serializing arrays through query params for

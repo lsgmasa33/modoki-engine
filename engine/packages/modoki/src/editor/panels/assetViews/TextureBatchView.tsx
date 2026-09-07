@@ -11,12 +11,16 @@ import { mergeRecords } from '../assetMerge';
 import { reimportPaths } from './reimport';
 import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
 import { TextureSettingsControls, type TextureSettingKey } from './TextureAssetView';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 type MetaMap = Record<string, Record<string, unknown>>; // path -> full meta object
 
 const SETTING_KEYS: (keyof TextureImportSettings)[] = ['format', 'maxSize', 'mipmaps', 'wrapS', 'wrapT', 'colorspace'];
 
 export function TextureBatchView({ paths }: { paths: string[] }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(paths);
   const [metas, setMetas] = useState<MetaMap>({});
   const [loaded, setLoaded] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -121,6 +125,7 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
       >
         {importing ? 'Converting…' : `Re-import all (${paths.length})`}
       </button>
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.textureBatch.unsaved" />
     </>
   );
 }

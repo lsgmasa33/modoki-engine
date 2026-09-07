@@ -49,6 +49,7 @@ import {
   getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
+  readMetaPreferringPark, peekPendingMeta,
   getResolvedRender3d,
   probeKeyReach,
   DEVICE_PRESETS, findPresetByName, makeCustomPreset, validateCustomSize,
@@ -1601,10 +1602,14 @@ export function registerEditorAgentOps(): void {
     }
     return { ok: true, ...readEditorState() };
   });
-  registerAgentOp('new-scene', (params) => {
+  registerAgentOp('new-scene', async (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
     guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
-    newScene();
+    // Async since #853 — `newScene` now swaps the world through SceneManager instead of
+    // respawning in place, so `onWorldSwap` fires and every id-keyed cache clears. It also
+    // REFUSES during prefab edit; that throw carries its own message and propagates as this
+    // op's error, the same shape `guardUnsaved` above uses.
+    await newScene();
     setSelectionRaw(null, []);
     return readEditorState();
   });
@@ -2610,6 +2615,61 @@ export function registerEditorAgentOps(): void {
     }
     const dirty = getDirtyAssetPaths().includes(path);
     return { ok: true, path, type: kind, source: 'live', unsaved: dirty, def };
+  });
+
+  /** Read an asset's `.meta.json` sidecar, PREFERRING a parked Inspector edit over disk (#872).
+   *
+   *  The sidecar twin of `read-asset-def` above, and it exists for the same reason one layer over:
+   *  since #845 an Inspector import-settings change PARKS instead of writing, so the file on disk
+   *  is the PRE-EDIT document for as long as the park is unflushed. `modoki_get_asset_meta` was a
+   *  plain `/api/read-meta` GET straight to the Node backend — no `op:`, so it never reached the
+   *  renderer at all — and an agent therefore read a stale value with no way to know a newer one
+   *  existed. It then reasoned from it, or wrote it back.
+   *
+   *  ⚠️ The sibling registry has a safety net this one structurally cannot have. An agent
+   *  `modoki_write_asset` is reconciled by the watcher (`dropParkedWriteFor` in `agentBridge.ts`),
+   *  but `.meta.json` is invisible to `detectType` (`vite-asset-scanner.ts`), so no broadcast
+   *  fires for a sidecar and nothing reconciles anything. That is why the READ being honest
+   *  matters more here than it does for an asset doc.
+   *
+   *  `readMetaPreferringPark` is deliberately the same helper the panels use — it prefers the
+   *  park — but it is called `passive`, so it records NOTHING.
+   *
+   *  ⚠️ **That is a correction to this op's first version, which let the read seed the baseline on
+   *  the grounds that it was "a genuine read by this editor and correct to record". The inference
+   *  does not hold.** A baseline is a claim about the bytes a PANEL's displayed document came
+   *  from, and the flush conditions the human's next save on it; this read feeds no panel. Before
+   *  #872 the tool ran in the Node process and could not touch that map at all, so seeding here
+   *  was a new fail-open introduced by the fix: panel reads V1 → something external rewrites the
+   *  sidecar → the agent reads (baseline → EXTERNAL) → the human's parked edit, built on the
+   *  stale in-memory doc, is now ACCEPTED and overwrites the external change, where without the
+   *  agent's read it was correctly refused. An observer must not disarm the guard it observes.
+   *
+   *  `source` is computed BEFORE the read, from the registry, so it describes where the answer
+   *  came from rather than being inferred from its shape ({} is ambiguous — see `readMetaSidecar`,
+   *  which returns it for an absent sidecar AND an unparsable one, #778). */
+  registerAgentOp('read-asset-meta', async (params) => {
+    const { path } = (params ?? {}) as { path?: string };
+    if (!path) throw new Error('read-asset-meta requires { path } (an asset-root URL, e.g. /assets/textures/rock.png)');
+    const parked = peekPendingMeta(path) !== undefined;
+    const r = await readMetaPreferringPark(path, { passive: true });
+    return {
+      ok: true,
+      path,
+      meta: r.meta,
+      source: parked ? 'parked' : 'disk',
+      unsaved: parked,
+      // ⚠️ `ok:false` from the helper means the GET FAILED and `meta` is a `{}` FALLBACK — NOT an
+      // empty sidecar. An agent about to write this document back wholesale must abort on it, or
+      // it posts a sidecar with no `id` and the scanner's heal pass mints a NEW guid, orphaning
+      // every scene ref to the asset. Same warning `PreferredMetaRead.ok` carries; surfaced here
+      // because across the relay the caller cannot see the helper's own return.
+      read: r.ok ? 'ok' : 'failed',
+      ...(parked
+        ? { note: 'A parked Inspector import-settings edit for this path has NOT reached disk. This is that edit, not the file. modoki_save_all flushes it; modoki_get_editor_state lists it under pendingImportSettings.' }
+        : {}),
+      ...(r.ok ? {} : { note: 'The /api/read-meta GET FAILED — `meta` is an empty FALLBACK, not an empty sidecar. Do NOT write this document back: a wholesale write built on it drops the asset GUID and the scanner then mints a new one, orphaning every reference.' }),
+    };
   });
 }
 

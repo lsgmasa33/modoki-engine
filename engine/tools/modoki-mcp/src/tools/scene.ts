@@ -309,10 +309,22 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   // ── get_asset_meta ──
   tool(
     'modoki_get_asset_meta',
-    'Read an asset\'s .meta.json sidecar (import settings for textures/models, etc.). ' +
-      'Returns {} if there is no sidecar.',
-    { path: z.string().describe('Asset-root URL of the asset.') },
-    async ({ path }) => getJson(`/api/read-meta?path=${encodeURIComponent(path)}`),
+    'Read an asset\'s .meta.json sidecar (import settings for textures/models, etc.), PREFERRING a '
+      + 'parked Inspector edit over the file.\n\n'
+      + 'WHY that matters (#845/#872): an Inspector import-settings change is MANUAL-SAVE — it is '
+      + 'parked in the editor and reaches disk only at modoki_save_all. So the FILE is the '
+      + 'PRE-EDIT document for as long as a park is unflushed, and this tool used to return it '
+      + 'with no way to tell. `source` says where the answer came from: `parked` (an unsaved '
+      + 'editor edit — `unsaved:true`, and modoki_get_editor_state lists it under '
+      + '`pendingImportSettings`) or `disk`.\n\n'
+      + 'HEADLESS: with no editor running, `editorConnected:false` comes back with the file\'s '
+      + 'contents — a real answer, but one that could not check for a park.\n\n'
+      + 'An empty `meta` is AMBIGUOUS: it means no sidecar, a sidecar that does not PARSE (#778), '
+      + 'or — when `read:"failed"` — that the read itself failed. Do NOT write an empty document '
+      + 'back with modoki_write_asset_meta: that route REPLACES the sidecar, so a write built on '
+      + 'one drops the asset GUID and the scanner mints a new one, orphaning every reference to it.',
+    { path: z.string().describe('Asset-root URL of the asset, e.g. /assets/textures/rock.png.') },
+    async ({ path }) => getJson(`/api/asset-meta?path=${encodeURIComponent(path)}`),
   );
 
   // ── reimport_asset ──

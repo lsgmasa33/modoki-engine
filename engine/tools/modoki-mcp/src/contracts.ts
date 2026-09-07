@@ -189,8 +189,14 @@ const DECLS: Record<string, Decl> = {
     filters: ['type', 'name', 'folder', 'limit'],
   },
   modoki_get_asset_meta: {
-    kind: 'read', method: 'GET', route: '/api/read-meta', requires: ['project'], aim: 'asset',
+    kind: 'read', method: 'GET', route: '/api/asset-meta', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png' },
+    // requires:['project'] and NOT ['editor'] on purpose, unlike `modoki_read_asset_def`: the
+    // route falls back to the disk read (labelled `editorConnected:false`) when no renderer
+    // answers, so this keeps working headlessly exactly as it did before #872.
+    notes: 'Prefers a PARKED Inspector import-settings edit over the file — since #845 a sidecar '
+      + 'edit does not reach disk until save_all, so a file read reports the PRE-EDIT value. '
+      + '`source` says which it was.',
   },
   modoki_find_references: {
     kind: 'read', method: 'GET', route: '/api/find-references', requires: ['project'], aim: 'asset',
@@ -362,7 +368,7 @@ const DECLS: Record<string, Decl> = {
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'],
-    notes: 'Same unsaved-work refusal as load-scene.',
+    notes: 'Same unsaved-work refusal as load-scene. ALSO refuses while a prefab is being edited (#853) — exit prefab-edit first; that refusal is not bypassable with discardUnsaved, because it is not about unsaved work. Replaces the world through a real SceneManager swap, so onWorldSwap fires and every id-keyed cache clears; the outgoing scene\'s resources are released immediately.',
   },
   modoki_save_all: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'save-all',

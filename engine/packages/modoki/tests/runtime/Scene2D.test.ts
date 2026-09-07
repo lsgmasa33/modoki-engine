@@ -226,29 +226,55 @@ function mockDeps() {
   // like MeshGeometry.__control's throwOnCall above) letting a test mint a shader with no
   // reachable `resources.textureUniforms.uniforms` — the #698 fast path's fallback trigger.
   let omitResourcesOnce = false;
-  vi.doMock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
-    // Capture the texture the material pass bound as uTexture, and the extra-sampler map
-    // (4th arg), so tests can assert the entity samples its own sprite bitmap AND that each
-    // texture param resolved to its bound Texture (vs the Texture.WHITE fallback).
-    //
-    // `resources.textureUniforms.uniforms.uTextureMatrix` mirrors what a real Shader (built by
-    // pixiShaderBuilder.ts:470-484, then wrapped in Pixi's UniformGroup) exposes — this is the
-    // ONLY thing that makes the #698 in-place frame-swap fast path visible on screen (see
-    // Scene2D.tsx's frame-swap comment). Omitted for one call when `omitResourcesOnce` is set,
-    // to exercise the fast path's rebuild-fallback when the uniform group isn't reachable.
-    makePixiShaderInstance: (_program: any, texture: any, _values: any, extraTextures: any) => {
-      const noResources = omitResourcesOnce;
-      omitResourcesOnce = false;
-      return {
-        id: ++shaderSeq, texture, extraTextures, destroyed: false,
-        destroy() { this.destroyed = true; },
-        ...(noResources ? {} : {
-          resources: { textureUniforms: { uniforms: { uTextureMatrix: texture?.textureMatrix?.mapCoord ?? {} } } },
-        }),
-      };
-    },
-    __setOmitResourcesOnce: () => { omitResourcesOnce = true; },
-  }));
+  vi.doMock('../../src/runtime/rendering/pixiShaderBuilder', async () => {
+    // ⚠️ `buildUniformValues` is re-exported REAL, and the fake Shader below seeds its
+    // `matUniforms` THROUGH it (#873). A hand-written default here would make the uniform
+    // re-seed test assert the mock's idea of a default instead of the engine's — the #838/#828
+    // shape, green whatever the source does. So the only thing this mock stands in for is the
+    // PixiJS object graph (`Shader` + `UniformGroup`); never the values inside it.
+    // `importActual` resolves the module's OWN `pixi.js` import through the mock above, which is
+    // safe because nothing in it touches pixi at module scope.
+    const actual = await vi.importActual<typeof import('../../src/runtime/rendering/pixiShaderBuilder')>(
+      '../../src/runtime/rendering/pixiShaderBuilder',
+    );
+    return {
+      buildUniformValues: actual.buildUniformValues,
+      // Capture the texture the material pass bound as uTexture, and the extra-sampler map
+      // (4th arg), so tests can assert the entity samples its own sprite bitmap AND that each
+      // texture param resolved to its bound Texture (vs the Texture.WHITE fallback).
+      //
+      // `resources.textureUniforms.uniforms.uTextureMatrix` mirrors what a real Shader (built by
+      // pixiShaderBuilder.ts's `makePixiShaderInstance`, then wrapped in Pixi's UniformGroup)
+      // exposes — this is the ONLY thing that makes the #698 in-place frame-swap fast path visible
+      // on screen (see Scene2D.tsx's frame-swap comment). Omitted for one call when
+      // `omitResourcesOnce` is set, to exercise the fast path's rebuild-fallback when the uniform
+      // group isn't reachable.
+      //
+      // `resources.matUniforms.uniforms` mirrors the real one on both counts that matter: it exists
+      // ONLY when the program declares uniform params (`program.params.length > 0` there), and it
+      // holds the RAW value — a number or Float32Array — not the `{value,type}` spec, because that
+      // is what `applyOverrides2D` writes and what the re-seed must restore.
+      makePixiShaderInstance: (program: any, texture: any, values: any, extraTextures: any) => {
+        const noResources = omitResourcesOnce;
+        omitResourcesOnce = false;
+        const specs = (program?.params?.length ?? 0) > 0 ? actual.buildUniformValues(program, values) : undefined;
+        const matUniforms = specs
+          ? { uniforms: Object.fromEntries(Object.entries(specs).map(([k, spec]) => [k, spec.value])) }
+          : undefined;
+        return {
+          id: ++shaderSeq, texture, extraTextures, destroyed: false,
+          destroy() { this.destroyed = true; },
+          ...(noResources ? {} : {
+            resources: {
+              textureUniforms: { uniforms: { uTextureMatrix: texture?.textureMatrix?.mapCoord ?? {} } },
+              ...(matUniforms ? { matUniforms } : {}),
+            },
+          }),
+        };
+      },
+      __setOmitResourcesOnce: () => { omitResourcesOnce = true; },
+    };
+  });
 
   // Stub the asset/texture-resolver surface so the harness needs no manifest.
   //  - A 'http…' / '/…' ref is a passthrough image url (ref === resolved url) — the
@@ -657,6 +683,180 @@ describe('Scene2D.renderFrame', () => {
       try {
         expect(broker.getEntity2DMaterialShaders(b.id(), b.generation())).toEqual([slotShader]);
       } finally { off(); }
+    });
+
+    // #873 — the half #848 deliberately did NOT cover, and the worse half. #848 restored the
+    // driver's ACCESS to a reused Shader; the Shader's uniform STATE is still the dead entity's.
+    // `matUniforms` is allocated only inside `makePixiShaderInstance`, i.e. only on a build, and
+    // `applyOverrides2D` is its only other writer — so a slot handed to a new generation draws at
+    // whatever the dead entity was last driven to. Self-healing one frame late when the newcomer
+    // drives the same targets; PERMANENT when it drives none.
+    //
+    // The fix is a RESET in place, not a rebuild: see Scene2D.tsx's comment at the re-stamp for why
+    // rebuilding the Shader here would trade this bug for #699's unbounded `BindGroupSystem._hash`
+    // growth on exactly the pooled-respawn path. So the slot reuse asserted by the #848 test above
+    // is still expected to hold in every test below — that is what makes these two coexist rather
+    // than one inverting the other.
+    describe('a respawned entity does not inherit the dead one\u2019s uniform values (#873)', () => {
+      // One scalar param, so `program.params.length > 0` and the (real) `buildUniformValues`
+      // seeds `matUniforms` — matching the production shape where the manifest `default` IS the
+      // authored value (`Renderable2D.material` resolves straight to the `.shader.json`, and
+      // Scene2D passes `values: undefined`).
+      const PARAMS: [string, any][] = [['uThreshold', { type: 'float', default: 0.25 }]];
+      const DEFAULT_THRESHOLD = 0.25;
+
+      // Verbatim what `applyOverrides2D` does (`uniforms[target] = <number>`, no dirty bump) —
+      // the production write, invoked directly rather than through `materialInstanceSystem` so the
+      // test does not have to stand up Time/deltas/sources to say something about Scene2D.
+      const drive = (shader: any, v: number) => { shader.resources.matUniforms.uniforms.uThreshold = v; };
+      const read = (shader: any): number => shader.resources.matUniforms.uniforms.uThreshold;
+
+      it('re-seeds a REUSED slot to the program defaults when the newcomer drives nothing', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        r.renderFrame();
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);   // a fresh build starts at the manifest default
+        drive(shaderA, 0.9);                             // A's MaterialInstance runs it to fully dissolved
+
+        // Despawn + respawn IDENTICALLY with no renderFrame between, so nothing observes the gap —
+        // koota's LIFO free list hands B the exact index, and B carries NO MaterialInstance, which
+        // is the case nothing ever heals.
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        r.renderFrame();
+
+        // The slot really was reused — this is the reset, not a rebuild (#848's pin still holds).
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);
+        // …and B nevertheless draws at the DEFAULT, not at A's 0.9.
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);
+
+        // ONCE, on the handover — then B owns the uniforms. Without the `slot.matGen = gen` stamp
+        // the mismatch never clears and every subsequent frame re-seeds, permanently clobbering
+        // B's own driver: a worse bug than the one being fixed, and nothing else pins it.
+        drive(shaderA, 0.7);
+        r.renderFrame();
+        expect(read(shaderA)).toBe(0.7);
+      });
+
+      // The invariant, stated as a comparison rather than a constant: a respawn renders identically
+      // whether or not it reclaimed a dead entity's index. Asserting it this way is what stops a
+      // later change re-introducing the inheritance behind a different default.
+      it('gives a recycled index the same frame-0 uniforms as a FRESH index', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        r.renderFrame();
+        drive(r.entityShaders.get(a.id())!.shader as any, 0.9);
+
+        a.destroy();
+        const recycled = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        const fresh = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' }, 1);
+        expect(recycled.id()).toBe(a.id());        // LIFO: the first respawn reclaims the index…
+        expect(fresh.id()).not.toBe(a.id());       // …the second gets a brand-new one
+
+        r.renderFrame();
+
+        const recycledShader = r.entityShaders.get(recycled.id())!.shader as any;
+        const freshShader = r.entityShaders.get(fresh.id())!.shader as any;
+        expect(recycledShader).not.toBe(freshShader);          // genuinely two entities
+        expect(read(recycledShader)).toBe(read(freshShader));  // …drawing the same frame 0
+        expect(read(recycledShader)).toBe(DEFAULT_THRESHOLD);
+      });
+
+      // The reset is invisible without a redraw: the respawn changes nothing the MaterialSnap gate
+      // can see (same placement, same colour, and the driver's dirty flag is never set for B), so
+      // the uniform write must arm the canvas itself or the GPU keeps presenting A's last frame.
+      it('arms the canvas redraw for the frame it re-seeds on', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        const dirtied: Set<number>[] = [];
+        vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+        r.renderFrame();                                        // build → dirty
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        drive(shaderA, 0.9);
+        r.renderFrame();                                        // settled: a bare uniform write sets no flag
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+        // The other side of the gate, asserted directly rather than only through the dirty flag: a
+        // re-seed that fired on every frame instead of on a generation change would clobber a LIVE
+        // driver's value here, which is a worse bug than the one being fixed.
+        expect(read(shaderA)).toBe(0.9);
+
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        expect(b.id()).toBe(a.id());
+
+        r.renderFrame();
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // the re-seed dirties the canvas
+      });
+
+      // ⚠️ The case the first cut of this fix MISSED, found by the close-out review. The reset was
+      // keyed off `entityShaders`, whose lifetime is strictly SHORTER than the slot's: the
+      // per-frame purge (`!materialIds.has(eid)`) drops the stamp on any frame the material pass
+      // skips the entity, while the end-of-frame slot sweep keeps the slot because the SPRITE pass
+      // reached its `activeIds.add(id)` and then took its `if (!resolved) return` — which sits
+      // BEFORE its slot-kind check — without replacing it. Stamp gone, Shader alive → the old
+      // `prev &&` guard read `undefined` and skipped the reset, permanently, in exactly the
+      // scenario #873 is about. (Cited by symbol, not line: this comment's first draft carried
+      // `:1543`/`:1563` and the very commit that added it shifted both by eight.)
+      //
+      // Production preconditions, none exotic: a `sprite` ref that IS image-typed but has no 2D
+      // variant (`resolveSprite` returns undefined — a 3d-typed KTX2 used as a 2D sprite), plus at
+      // least one frame with the program unavailable, which `Scene2DRenderer.stop()` on a sibling
+      // renderer and any `.shader.json` save (#842/#852) both open. Keyed on the slot's own
+      // `matGen` it fires correctly, which is what this pins.
+      it('still re-seeds when the entityShaders stamp was purged but the SLOT survived', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        // `img:` is image-typed to `isImagePath` but `resolveSprite` returns undefined for it (empty
+        // url) — the sprite pass's `!resolved` early return, reached AFTER `activeIds.add(id)`.
+        const rend = { sprite: 'img:', material: 'matGuid' };
+        const a = spawnChild(world, traits, canvas.id(), rend);
+
+        r.renderFrame();
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        drive(shaderA, 0.9);
+
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), rend);
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        // One frame with the program gone: the material pass returns before touching the slot, the
+        // sprite pass keeps the id alive and bails, so the purge runs and the sweep does not.
+        matReady.delete('matGuid');
+        r.renderFrame();
+        expect(r.entityShaders.has(b.id())).toBe(false);                  // stamp purged…
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);    // …Shader still alive
+
+        matReady.add('matGuid');
+        r.renderFrame();
+
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);    // slot reused, as designed
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);                    // and reset anyway
+      });
     });
 
     it('falls back to the default sprite while the material program is still loading', async () => {

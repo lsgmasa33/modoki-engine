@@ -66,10 +66,10 @@
         // Stashing it to `localStorage` — survives to the NEXT launch, unlike the
         // `sessionStorage` `tryAutoReloadOnce` uses above for its own, deliberately different,
         // purpose — is the only way a fault like that ever reaches Crashlytics at all.
-        var STASH_KEY = 'modoki-early-error-stash';
-        var STASH_VERSION = 1;
+        var STASH_KEY = 'modoki-boot-stash'; /* modoki:stash-const STASH_KEY */
+        var STASH_VERSION = 2; /* modoki:stash-const STASH_VERSION */
         // ⚠️ LOAD-BEARING, not headroom. The replay on the NEXT boot
-        // (`drainStashedEarlyErrors()`, globalErrors.ts) runs right after that boot's OWN
+        // (`replayStashedEarlyErrors()`, globalErrors.ts) runs right after that boot's OWN
         // `drainEarlyErrors()` — both feed the SAME shared rate limiter (`MAX_PER_BURST_WINDOW` =
         // 30) in one synchronous burst. `EARLY_ERROR_CAP` (28) is already sized to nearly consume
         // that window by itself, so stashing up to that same cap could put ~56 events through one
@@ -84,9 +84,14 @@
         // replay is a GUEST in the replaying boot's budget — the arithmetic worst case would let a
         // previous boot's stash consume the entire window and leave the live boot unable to report
         // its own, so the test deliberately holds this to a fraction instead.
-        var STASH_MAX_ENTRIES = 8;
-        var STASH_MAX_MESSAGE = 500;
-        var STASH_MAX_STACK = 2000;
+        var STASH_MAX_ENTRIES = 6; /* modoki:stash-const REPLAY_ENTRY_CAP */
+        var STASH_MAX_MESSAGE = 500; /* modoki:stash-const STASH_MAX_MESSAGE */
+        var STASH_MAX_STACK = 2000; /* modoki:stash-const STASH_MAX_STACK */
+        var STASH_MAX_CONSOLE_CHARS = 2000; /* modoki:stash-const STASH_MAX_CONSOLE_CHARS */
+        // How many trailing console lines to carry as crash context (#859). Mirrors
+        // bootStash.ts's CONSOLE_TAIL_LINES (injected at build time, like the others); bounded also by
+        // STASH_MAX_CONSOLE_CHARS above, which is the bound that actually keeps localStorage honest.
+        var CONSOLE_TAIL_LINES = 40; /* modoki:stash-const CONSOLE_TAIL_LINES */
         function earlyErrorNow() {
           try { return performance.now(); } catch (_) { return 0; }
         }
@@ -121,6 +126,48 @@
             return msg;
           } catch (_) { return ''; }
         }
+        // The run-up to the crash (#859): the LAST `CONSOLE_TAIL_LINES` lines the early-console shim
+        // buffered, joined into ONE string. Not `entries` — one breadcrumb, because the shared burst
+        // limiter is 30 events wide and a line-per-event replay could not fit any division of it
+        // (see `runtime/core/bootStash.ts`'s CONSOLE_CONTEXT_SLOT).
+        //
+        // ⚠️ This is the ONLY window where the shim is the right source. Once `installConsoleRing()`
+        // has run it DRAINS this buffer and the ring holds the lines instead — `globalErrors.ts`
+        // reads them from there for its own window. Measured 2026-09-07: that other window covers
+        // the whole of `App.tsx`'s import graph, i.e. most of a failing boot.
+        //
+        // The shim is STRIPPED from any build with no console-ring consumer
+        // (`plugins/earlyConsoleShim.ts`), so `__MODOKI_EARLY_CONSOLE__` is legitimately absent in a
+        // release build — return '' and let the fault stash without a tail rather than failing.
+        //
+        // Args are stringified here with a plain guarded `String(a)`, NOT `consoleRing.ts`'s
+        // `stringifyArg`. That is deliberate and is the one place this file duplicates formatting:
+        // the shim buffers LIVE argument references, and a reference cannot survive a JSON round
+        // trip unformatted, so the choice is a dumber formatter here or no tail at all.
+        function collectEarlyConsoleTail() {
+          try {
+            var st = globalThis.__MODOKI_EARLY_CONSOLE__;
+            if (!st || !st.entries || !st.entries.length) return '';
+            var list = st.entries;
+            var from = list.length > CONSOLE_TAIL_LINES ? list.length - CONSOLE_TAIL_LINES : 0;
+            var out = [];
+            for (var i = from; i < list.length; i++) {
+              try {
+                var rec = list[i] || [];
+                var args = rec[1] || [];
+                var parts = [];
+                for (var j = 0; j < args.length; j++) {
+                  try { parts.push(String(args[j])); } catch (_) { parts.push('<unprintable>'); }
+                }
+                out.push(String(rec[0]) + ': ' + parts.join(' '));
+              } catch (_) { /* one bad line must not cost the whole tail */ }
+            }
+            var joined = out.join('\n');
+            // Trim the HEAD when over budget: the lines closest to the fault are the ones that
+            // explain it, so an over-long tail loses its oldest lines, never its newest.
+            return joined.length > STASH_MAX_CONSOLE_CHARS ? joined.slice(-STASH_MAX_CONSOLE_CHARS) : joined;
+          } catch (_) { return ''; }
+        }
         // Serialize the buffer to `localStorage` as DATA, not pre-formatted prose — `globalErrors.ts`
         // owns the formatting via its own `describe()`, and a second copy of that here would drift.
         function stashEarlyErrors() {
@@ -128,18 +175,17 @@
             // Once `installGlobalErrorHandlers()` has drained this buffer, `done` is true and
             // `entries` is already empty — writing a stash here would carry `earlyErrors.dropped`'s
             // STALE count (that field is never zeroed by the drain, see `globalErrors.ts`) into a
-            // stash with zero entries, which the NEXT boot's `drainStashedEarlyErrors()` then
+            // stash with zero entries, which the NEXT boot's `replayStashedEarlyErrors()` then
             // reports as its own "dropped (stash cap)" breadcrumb — a lie, attributing an
             // already-reported drop to a cap this stash never hit. Bail before writing anything.
             //
-            // ⚠️ SCOPE GAP this exposes, left open on purpose: a boot where the installer DID run,
-            // but the crashlytics sink never registered (`appServices().crashlytics` stays
-            // undefined) before the page died, loses its queued reports exactly like #825 does —
-            // the live `window` listener captured the fault, `deliver()` queued it in
-            // `globalErrors.ts`'s in-memory `queued` array waiting for `flushQueue()`, and the page
-            // went away before that ever ran. This guard cannot reach that case: `done` is already
-            // true here, so nothing gets stashed, and the queue lives only in memory. NOT covered
-            // by this fix or by #825 — a later reader should not assume this closes that family.
+            // ⚠️ THE SCOPE GAP THIS USED TO EXPOSE IS NOW CLOSED (#860/#861). A boot where the
+            // installer DID run but the crashlytics sink never registered loses its queued reports
+            // the same way — this guard cannot reach that case, because `done` is already true here
+            // and the queue is module state in `globalErrors.ts`. That module now persists its own
+            // queue to the SAME envelope (`runtime/core/bootStash.ts`), so the family is covered
+            // from both sides. Measured 2026-09-07: that other window is the WIDE one — the whole
+            // of `App.tsx`'s import graph lands there, not here.
             if (earlyErrors.done) return;
             var list = earlyErrors.entries;
             var keep = list.length > STASH_MAX_ENTRIES ? list.slice(0, STASH_MAX_ENTRIES) : list;
@@ -169,9 +215,12 @@
               }
               entries.push(entry);
             }
-            localStorage.setItem(STASH_KEY, JSON.stringify({
+            var payload = {
               v: STASH_VERSION, ts: Date.now(), dropped: stashDropped, entries: entries,
-            }));
+            };
+            var tail = collectEarlyConsoleTail();
+            if (tail) payload.console = tail;
+            localStorage.setItem(STASH_KEY, JSON.stringify(payload));
           } catch (_) { /* private mode, quota exceeded, or a hostile buffered value — never let the guard itself throw */ }
         }
         // The RELOAD-RECOVERABLE subset: a packaged editor optimizes @modoki/engine, and
@@ -281,7 +330,7 @@
               // #825: THIS is the moment the boot is confirmed dead — the same condition that is
               // about to show the fallback screen is exactly when `installGlobalErrorHandlers` is
               // now known to have never run, so nothing else will ever drain `earlyErrors`. Stash
-              // it before rendering, so the next launch's `drainStashedEarlyErrors()` can replay it.
+              // it before rendering, so the next launch's `replayStashedEarlyErrors()` can replay it.
               stashEarlyErrors();
               renderFallback(detail);
             }, 1400);

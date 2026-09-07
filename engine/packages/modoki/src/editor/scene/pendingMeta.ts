@@ -76,7 +76,7 @@
 
 import { backendFetch } from '../backend/editorBackend';
 import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
-import { writeMetaConditional } from '../panels/assetViews/widgets';
+import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
 
 /** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
@@ -124,8 +124,134 @@ export function peekMetaBaseline(path: string | undefined): string | undefined {
   return path ? baselines.get(path) : undefined;
 }
 
-/** Test-only: forget every recorded baseline. */
+/** Test-only: forget every recorded baseline (and every recorded failed read).
+ *
+ *  ⚠️ **"Test-only" is the CORRECT state, not an oversight — do not wire this to a project
+ *  switch** (#871 half ②, refuted). That half was filed on the reading that a baseline keyed by an
+ *  asset-root-relative path (`/assets/textures/rock.png` is not distinctive) would carry project
+ *  A's sha into project B. It cannot: **opening a project hard-reloads the renderer**, which
+ *  destroys this module along with everything else. `setProject` (`engine/electron/main.ts`) is the
+ *  only project-switch entry point and every one of its callers ends at
+ *  `webContents.reloadIgnoringCache()`; there is no in-renderer project switch and no
+ *  asset-root-change hook anywhere under `editor/`. The same convention is stated at
+ *  `panels/traitClipboard.ts`, and it is why the two sibling registries' `clearDirtyAssets`
+ *  (`dirtyAssets.ts`) and `clearPendingBaseScenes` (`pendingBaseScene.ts`) likewise have no
+ *  production caller.
+ *
+ *  **What would make it real:** a SOFT project switch — re-rooting the asset tree without
+ *  reloading the renderer. If that is ever built, this function and `clearPendingMeta` below are
+ *  what it must call, and `pending` matters more than `baselines` (a parked edit surviving into
+ *  another project is worse than a stale hash, which only costs one spurious 409 that then drops
+ *  the baseline anyway). */
 export function clearMetaBaselines(): void { baselines.clear(); readFailed.clear(); }
+
+/** Forget the baseline for `path` — this editor no longer knows what the sidecar holds.
+ *
+ *  ⚠️ **MODULE-PRIVATE, and deliberately so.** `dfe8ce441` deleted this function with a stated
+ *  reason worth keeping in view: it had ZERO callers, and its docblock named two call sites that
+ *  actually inline `baselines.delete` instead. #874 brought it back — but exporting it would have
+ *  repeated the mistake one level up, because an exported "forget" invites a caller to forget
+ *  WITHOUT having written anything, which is precisely the fail-open review caught (a failed write
+ *  dropping a baseline that was still accurate). The exported surface is `writeMetaWholesale`,
+ *  which cannot be called that way: it forgets only what its own successful write invalidated.
+ *
+ *  The two callers are both below, and both sit behind a confirmed write: `writeMetaWholesale`
+ *  and `metaWrittenToDisk`. The discard paths still inline `baselines.delete` — deliberate, they
+ *  hold the map directly.
+ *
+ *  A baseline describes bytes at a path, so it is meaningless once this editor has replaced those
+ *  bytes itself. Keeping it makes the human's NEXT edit conflict against a hash for content nobody
+ *  is looking at any more — #874's spurious 409. */
+function forgetMetaBaseline(path: string): void { baselines.delete(path); }
+
+/** Record what a `/api/read-meta` response tells us about `path`: the CAS baseline on success
+ *  (#845 phase 2, #871), and the READ-FAILED flag on anything else (#845 second review).
+ *
+ *  Call this for EVERY raw GET of that route — `readMetaPreferringPark` does it for the one
+ *  blessed path, and a file that is a declared exemption in `metaReadPreferringPark.test.ts`
+ *  owes it too.
+ *
+ *  ⚠️ **AN EXEMPTION FROM THE READ HELPER IS NOT AN EXEMPTION FROM WHAT THE RESPONSE TEACHES.**
+ *  That is the whole of #871: `VideoAssetView` is exempted for a true and still-correct reason —
+ *  it keeps a third piece of state (`applied`) that must reflect DISK, so it cannot use a helper
+ *  that skips the network call whenever a park exists — and that reason was read as vouching for
+ *  the file generally. It vouches only for WHICH DOCUMENT THE PANEL DISPLAYS. Because the raw
+ *  fetch dropped the header, `baselines` had no entry for any `.mp4`, `flushPendingMetaFor`
+ *  passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed* —
+ *  the precondition was inert for that entire asset type while looking present.
+ *
+ *  ⚠️ **The same trap fired a SECOND time, and the merge is what caught it.** `dfe8ce441` added
+ *  the `readFailed` half to the block this function had already extracted, so an exempted reader
+ *  would have recorded the baseline and NOT the read-failure — leaving the video panel free to
+ *  park a document built on the `{}` fallback, with no `id`, which is the GUID destruction
+ *  `readFailed` exists to make unrepresentable. Both halves live here for that reason, and the
+ *  function is named for the response rather than for the baseline so the next addition lands
+ *  inside it too.
+ *
+ *  Three hazards on the baseline half, which is why this is shared and not four lines per site:
+ *
+ *   - **Only on an ok response.** A 403/404 body is `{}` and carries no header, and writing
+ *     `undefined` in on failure would ERASE a baseline an earlier successful read established —
+ *     turning the next write unconditional exactly when the editor is least sure what is on disk.
+ *   - **A missing header means NO BASELINE, never "unchanged".** The route omits it for a `null`
+ *     sidecar, and an absent entry correctly means *unconditional*.
+ *   - **Never hash client-side.** The body is the MERGED view (`.meta.local.json` folded back in)
+ *     and `writeMetaSidecar` stamps/splits on the way out, so the bytes on disk are not the bytes
+ *     a panel ever holds. A client-computed baseline could never match and would 409 forever.
+ *
+ *  Structurally typed rather than taking a `Response` so a test (and a stub backend) can hand it
+ *  the two fields it actually reads. */
+export function noteMetaReadResult(
+  path: string,
+  res: { ok?: boolean; headers?: { get?: (name: string) => string | null | undefined } | null } | null | undefined,
+): void {
+  // ⚠️ A LIVE PARK MEANS THIS RESPONSE DESCRIBES NOBODY'S DOCUMENT — record nothing (#871 review).
+  //
+  // `readMetaPreferringPark` gets this for free: it early-returns on a park and never reaches the
+  // network, so it cannot re-seed while one is live. An exempted reader DOES reach the network
+  // (that is what the exemption is FOR — `VideoAssetView` must see disk to keep `applied`
+  // honest), so without this check it re-seeds on every remount. Measured failure: panel reads
+  // V1 → human parks an edit built on V1 → something external rewrites the sidecar → panel
+  // remounts and re-reads → baseline advances to EXTERNAL → Cmd+S sends `ifMatch: EXTERNAL`, a
+  // claim the parked document cannot support, and the external change is CLOBBERED instead of
+  // 409'd. The baseline must describe the bytes the DISPLAYED document came from; while a park is
+  // live, that is the park, and disk is a stranger.
+  //
+  // The read-failed flag is skipped for the same reason: a park exists, so nothing is about to be
+  // built on the `{}` fallback, and arming the refusal here would block a park that already has
+  // its `id`.
+  // ⚠️ THE READ-FAILED FLAG IS ARMED UNCONDITIONALLY — a live park does NOT excuse it.
+  //
+  // We do NOT know what this sidecar holds. Remember that, so a field change cannot park a
+  // document built on the `{}` fallback — see `readFailed`.
+  //
+  // This was gated on the live-park check below for one release and that reopened the GUID
+  // destruction `readFailed` exists to prevent. The argument for gating it — "a park exists, so
+  // nothing is about to be built on the `{}` fallback" — is true of the parking component and
+  // FALSE of any other component reading the same path, because `readMetaPreferringPark` returns
+  // `meta: {}` on a failed read and every asset view merges onto `{...(meta ?? {})}`. Two
+  // components DO read one path concurrently on mount (`Inspector`'s postprocessor row and
+  // `ModelAssetView`, both on the model's path): park a good doc from one, let the OTHER's GET
+  // 500, and the flag is skipped — then that panel's next field change parks a doc with no `id`,
+  // supersedes the good park, and Cmd+S writes an id-less sidecar. The scanner's heal pass mints a
+  // fresh GUID and every scene/prefab reference to that asset dangles.
+  //
+  // Arming it costs a live park almost nothing: `parkMetaEdit` consults the flag only on the NEXT
+  // park, and any successful read of the path clears it again. A refusal the human sees and can
+  // recover from is the correct trade against a silent write that orphans the asset.
+  if (!res?.ok) {
+    readFailed.add(path);
+    return;
+  }
+  // A successful read means this editor knows the file again, park or no park.
+  readFailed.delete(path);
+  // ⚠️ ONLY THE BASELINE is skipped while a park is live — see this function's docblock. The
+  // parked document was built from older bytes, so a baseline taken from what disk holds NOW is a
+  // claim that document cannot support.
+  if (peekPendingMeta(path) !== undefined) return;
+  const sha = res.headers?.get?.('X-Meta-Sha256');
+  if (sha) baselines.set(path, sha);
+}
 
 let _version = 0;
 const listeners = new Set<() => void>();
@@ -235,27 +361,54 @@ export interface PreferredMetaRead {
  *  just to add that query param. */
 export async function readMetaPreferringPark(
   path: string,
-  opts?: { signal?: AbortSignal; reimportEpoch?: number },
+  opts?: { signal?: AbortSignal; reimportEpoch?: number; passive?: boolean },
 ): Promise<PreferredMetaRead> {
   const parked = peekPendingMeta(path);
   if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true };
   const url = cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, opts?.reimportEpoch ?? 0);
   const r = await backendFetch(url, opts?.signal ? { signal: opts.signal } : undefined);
-  // Record the CAS baseline the server just vouched for (#845 phase 2). Only on an ok response:
-  // a 403/404 body is `{}` and carries no header, and writing `undefined` in on failure would
-  // ERASE a baseline an earlier successful read had established — turning the next write
-  // unconditional exactly when the editor is least sure what is on disk.
-  if (r.ok) {
-    readFailed.delete(path);
-    const sha = r.headers?.get?.('X-Meta-Sha256');
-    if (sha) baselines.set(path, sha);
-  } else {
-    // We do NOT know what this sidecar holds. Remember that, so a field change cannot park a
-    // document built on the `{}` fallback — see `readFailed`.
-    readFailed.add(path);
-  }
+  // ⚠️ `passive` reads record NOTHING (#872 review). A baseline is a claim about the bytes a
+  // PANEL's displayed document came from, and the flush conditions the human's next save on it —
+  // so only a read that feeds a panel may move it. The agent surface (`read-asset-meta`) feeds no
+  // panel: before #872 it ran in the Node process and could not touch this map at all. Measured
+  // failure once it could: panel reads V1 → something external rewrites the sidecar → the AGENT
+  // reads (advancing the baseline to EXTERNAL) → the human parks an edit built on the stale
+  // in-memory doc → the flush is ACCEPTED and overwrites the external change, where without the
+  // agent's read it was correctly refused. An observer must not disarm the guard it observes.
+  if (!opts?.passive) noteMetaReadResult(path, r);
   const meta = r.ok ? await r.json() : {};
   return { meta, pendingRef: undefined, ok: r.ok };
+}
+
+/** Write `path`'s FULL `.meta.json` and, ONLY IF it landed, forget the baseline it invalidated
+ *  (#874). Returns whether the write reached disk.
+ *
+ *  This is the one shape for an EXPLICIT-ACTION wholesale write — the writes
+ *  `writeMetaConditional`'s docblock calls "the right default for the eight explicit-action
+ *  writers": built from a fresh read moments earlier, with the human asking for them, and so
+ *  deliberately UNCONDITIONAL. What they all owe afterwards is the forget, and it exists here
+ *  rather than at each call site for two reasons found by review:
+ *
+ *   - **Three copies had already drifted into two shapes.** `makeTexture2D` guarded on the write's
+ *     boolean; `EnvironmentAssetView` did not, so a FAILED write (a dev-server blip — the case the
+ *     modal editors keep their dialogs open for) dropped a baseline that was still accurate, and
+ *     the next external change was silently CLOBBERED instead of 409'd. The precondition was
+ *     disarmed by the code meant to keep it honest.
+ *   - **A fourth site would not have known the rule.** Two of the three had no test at all, so
+ *     nothing went red for the one that got it wrong. One function has one test.
+ *
+ *  ⚠️ FORGET rather than advance — and that is a CHOICE, not a constraint. `writeMetaOrWarn`
+ *  collapses the reply to a boolean, but this module also imports `writeMetaConditional`, which
+ *  returns the server's post-write `sha256`; switching to it would leave the CAS ARMED instead of
+ *  unconditional until the next panel read. Not done because every current caller re-reads almost
+ *  immediately (Environment's `loadMeta()`, makeTexture2D's re-import) or targets a generated file
+ *  nothing holds a baseline for, so advancing would buy a hash that is stale or unused. Revisit it
+ *  if a caller appears that writes and then sits. Leaving the OLD hash remains the one actively
+ *  wrong option of the three. */
+export async function writeMetaWholesale(path: string, meta: unknown): Promise<boolean> {
+  const wrote = await writeMetaOrWarn(path, meta);
+  if (wrote) forgetMetaBaseline(path);
+  return wrote;
 }
 
 /** The EDITOR just wrote `path`'s FULL `.meta.json` to disk itself, built from a
@@ -294,6 +447,25 @@ export async function readMetaPreferringPark(
  *  the exact clobber this exists to close, and a warn on the common, correct case (nothing raced)
  *  would be alarming noise for a routine event, not a discovery. */
 export function metaWrittenToDisk(path: string, pendingRef: unknown): boolean {
+  // #874: the baseline goes FIRST, and UNCONDITIONALLY — before the park bookkeeping and
+  // regardless of what it decides. Those are two different questions about two different maps:
+  // "did this write already incorporate the park I read?" (below, and it can legitimately be no)
+  // versus "does this editor still know what is on disk?" (here, and the answer after a wholesale
+  // write is always NO — WE changed the file). Getting that wrong is how a stale baseline caused
+  // a 409 on a path nothing external had touched: a Make-2D / 9-slice Save / model import writes
+  // the sidecar, the Inspector still holds the pre-write hash, and the human's very next Cmd+S is
+  // refused with "changed on disk since it was read" — #844's class, a refusal naming no true
+  // cause, and its advice ("reopen the asset") is not something the human knows to do.
+  //
+  // FORGET rather than advance: these callers post the document and never read the reply's
+  // `sha256` (several are raw `backendFetch` calls), so the new hash is not in hand here. An
+  // absent baseline means UNCONDITIONAL, which is the honest reading — the next panel read
+  // re-seeds it via `noteMetaReadResult`. Never leave the OLD one, which is the only actively
+  // wrong option of the three.
+  //
+  // ⚠️ The superseded case still forgets. A newer park writing against a hash for content this
+  // write already replaced is exactly the failure above, just one edit later.
+  forgetMetaBaseline(path);
   if (pendingRef === undefined || pending.get(path) !== pendingRef) return false;
   pending.delete(path);
   bump();
@@ -312,7 +484,9 @@ export function hasPendingMeta(): boolean { return pending.size > 0; }
  *  scene swap would cost, the same way `dirtyAssetPaths`/`getPendingBaseScenePaths` already do. */
 export function getPendingMetaPaths(): string[] { return [...pending.keys()]; }
 
-/** Test-only: drop every pending entry without writing it. */
+/** Test-only: drop every pending entry without writing it. The hard reload on a project switch is
+ *  what tears this map down in production — see `clearMetaBaselines`' note (#871 half ②) for why
+ *  that is correct and what would make it false. */
 export function clearPendingMeta(): void { pending.clear(); bump(); }
 
 /** Drop pending `.meta.json` edits WITHOUT writing them. `paths` omitted = drop everything.
