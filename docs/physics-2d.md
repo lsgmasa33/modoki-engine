@@ -64,6 +64,34 @@ Within the first group, only the `unreachable` panic is a distinct bug: the acco
 value while it was borrowed`) are wasm-bindgen's symptoms **after** the panic has poisoned the
 module. Chasing them as independent failures wastes a session.
 
+### The upstream root cause is KNOWN — do not re-derive it, and do not file it again
+
+**[dimforge/rapier#985](https://github.com/dimforge/rapier/issues/985)** (open) has it diagnosed in
+Rust, by a reporter who ported it out of wasm and reproduced it natively:
+
+In `rapier2d` 0.35.0, the `CcdTargets::FixedList` arm of `handle_candidate` in
+`src/dynamics/ccd/sweeps.rs` dereferences a stale collider handle held by `CCDSolver`'s
+`fixed_targets_cache`, panicking with `No element at index` from the arena.
+
+The cache persists across steps and is rebuilt only when `scene_changed` is true — but that
+invalidation is **only acted on when a CCD pass actually runs**, i.e. when some body is moving fast
+that step. So removing a fixed body's colliders on a quiet step drops the invalidation, and the next
+time anything moves fast the sweep iterates the stale list and indexes a freed arena slot.
+
+⚠️ **That is what makes it a 0.20.0 regression rather than a latent bug we happened to trip.** The
+fast-body sweep now runs **whether or not any body has CCD enabled** — the "sweep-based CCD on by
+default" line in the changelog — so 0.19.3 simply never built the cache in these scenes. Our
+0.19.3-vs-0.20.0 control agrees: identical scenario, 0.19.3 passes every case.
+
+It also explains every discriminator in the table below, which is why they are recorded as
+*observations* and not as a theory: contact-then-removal is required because that is what puts the
+collider in the cache; the gravity/step-size threshold is the falling body reaching sweep speed
+(g=9.81 and dt=1/120 never get there); and sleep is irrelevant because the sweep pass does not
+consult it. Note #985's own title still says `ConvexPolygon` — its author has since shown convex
+shapes are incidental and proposed a retitle, so **searching for "convex" will not find it.**
+
+**When 0.20.x claims a fix, the check is the repro below, not the changelog.**
+
 **Reproduced in pure rapier, with no engine code involved**, and controlled against 0.19.3 running
 the identical scenario: 0.19.3 passes every case, 0.20.0 panics. What the sweep established:
 
@@ -78,6 +106,13 @@ the identical scenario: 0.19.3 passes every case, 0.20.0 panics. What the sweep 
 the removal, `wakeUp()` plus a step before it, `wakeUp()` after it, `removeCollider(col, false)`,
 and `setCanSleep(false)` at body creation. Our own call already passes `wakeUp = true`, so the
 obvious "wake it first" fix is the one thing that was already in place.
+
+The root cause says why none of them could have worked: the dropped invalidation is gated on a body
+being **fast** on the removal step, not on it being **awake**. Waking a body it is resting on leaves
+it moving at ~0, so the CCD pass still does not run and the cache still is not rebuilt. The only
+thing that would suppress it is a body already at sweep speed during that same step — which is not
+something a game can arrange on demand, and would be a coincidence rather than a fix. Treat this as
+blocking until upstream lands a change.
 
 **The repro, so the next attempt can re-run it instead of rebuilding it.** No engine code; save as
 `.mjs` and run from the repo root (bare specifiers resolve there). On 0.19.3 every row prints `ok`;
