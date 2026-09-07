@@ -216,7 +216,11 @@ function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
     const offenders = file === HELPER
       ? []
       : [...new Set(counters)].filter((n) => livenessPair(src, n));
-    results.push({ file: path.relative(REPO, file), counters, offenders });
+    // Normalise to forward slashes HERE, the single point every row is produced — `path.relative`
+    // yields backslashes on Windows, but KNOWN_OUTSIDE_SCAN_DIRS below is a forward-slash ledger.
+    // Every assertion in this file reads `r.file`, so one normalisation point keeps them consistent.
+    const relFile = path.relative(REPO, file).split(path.sep).join('/');
+    results.push({ file: relFile, counters, offenders });
   }
   return results;
 }

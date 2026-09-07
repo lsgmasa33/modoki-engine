@@ -104,7 +104,7 @@ describe('acquireBuildClaim — accept side', () => {
     expect(fs.existsSync(claimsFilePath())).toBe(true);
     const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8'));
     expect(onDisk.claims).toHaveLength(1);
-    expect(onDisk.claims[0]).toMatchObject({ projectRoot: '/proj/a', pid: process.pid, label: 'ios build', kind: 'editor', at: 1000 });
+    expect(onDisk.claims[0]).toMatchObject({ projectRoot: path.resolve('/proj/a'), pid: process.pid, label: 'ios build', kind: 'editor', at: 1000 });
     expect(typeof onDisk.claims[0].token).toBe('string');
   });
 
@@ -182,7 +182,10 @@ describe('acquireBuildClaim — refuse side', () => {
 
   it('a DEAD-pid claim is stale and silently overtaken, not refused', () => {
     fs.mkdirSync(home, { recursive: true });
-    const dead: BuildClaim = { projectRoot: '/proj/j', pid: 424242, at: 500, label: 'stale build', kind: 'cli', token: 'old' };
+    // The seeded root must be `path.resolve`d — the store matches claims against the RESOLVED
+    // project root (`acquireBuildClaim` resolves its own argument before comparing), so a raw
+    // '/proj/x' literal never matches on Windows and the "stale claim overtaken" path goes untested.
+    const dead: BuildClaim = { projectRoot: path.resolve('/proj/j'), pid: 424242, at: 500, label: 'stale build', kind: 'cli', token: 'old' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [dead] }));
 
     const r = acquireBuildClaim('/proj/j', 'fresh build', { now: 600, alive: (pid) => pid === process.pid });
@@ -191,7 +194,7 @@ describe('acquireBuildClaim — refuse side', () => {
 
   it('a LIVE-pid claim within the TTL is refused, not overtaken', () => {
     fs.mkdirSync(home, { recursive: true });
-    const live: BuildClaim = { projectRoot: '/proj/k', pid: 424242, at: 500, label: 'in-flight build', kind: 'editor', token: 'tok' };
+    const live: BuildClaim = { projectRoot: path.resolve('/proj/k'), pid: 424242, at: 500, label: 'in-flight build', kind: 'editor', token: 'tok' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live] }));
 
     const r = acquireBuildClaim('/proj/k', 'new build', { now: 600, alive: (pid) => pid === 424242 || pid === process.pid });
@@ -200,7 +203,7 @@ describe('acquireBuildClaim — refuse side', () => {
 
   it('a live claim PAST BUILD_CLAIM_TTL_MS is stale and overtaken', () => {
     fs.mkdirSync(home, { recursive: true });
-    const old: BuildClaim = { projectRoot: '/proj/l', pid: 424242, at: 1_000, label: 'ancient build', kind: 'editor', token: 'tok' };
+    const old: BuildClaim = { projectRoot: path.resolve('/proj/l'), pid: 424242, at: 1_000, label: 'ancient build', kind: 'editor', token: 'tok' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [old] }));
 
     const r = acquireBuildClaim('/proj/l', 'new build', { now: 1_000 + BUILD_CLAIM_TTL_MS + 1, alive: () => true });
@@ -209,7 +212,7 @@ describe('acquireBuildClaim — refuse side', () => {
 
   it('a future-stamped claim (clock skew) is NOT expired — refused, not overtaken', () => {
     fs.mkdirSync(home, { recursive: true });
-    const skewed: BuildClaim = { projectRoot: '/proj/m', pid: 424242, at: 2_000_000, label: 'clock-skewed build', kind: 'editor', token: 'tok' };
+    const skewed: BuildClaim = { projectRoot: path.resolve('/proj/m'), pid: 424242, at: 2_000_000, label: 'clock-skewed build', kind: 'editor', token: 'tok' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [skewed] }));
 
     const r = acquireBuildClaim('/proj/m', 'new build', { now: 1_000_000, alive: (pid) => pid === 424242 || pid === process.pid });
