@@ -17,6 +17,10 @@ import {
 import { COLLISION_STATUS } from '../../src/editor/undo/undoFailure';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
+import {
+  setExpanded, setPendingFolders, getExpanded, getPendingFolders,
+  __resetAssetFolderStateForTest,
+} from '../../src/editor/panels/assetFolderState';
 
 // Record every /api/* call the builders make.
 type Call = { url: string; body: any };
@@ -466,20 +470,26 @@ describe('makeNewFolderUndo (#308 site 6)', () => {
 });
 
 describe('makeFolderRenameUndo (#308 site 5 — the worst one)', () => {
-  const build = (refresh = vi.fn(), setPendingFolders = vi.fn(), setExpanded = vi.fn()) => makeFolderRenameUndo({
-    oldPath: '/assets/Old', newPath: '/assets/New', folderName: 'New', refresh, setPendingFolders, setExpanded,
+  // ⚠️ These used to pass `vi.fn()` setters in and assert THEY were called. #867 moved the remap
+  // into `applyAssetPathMoves` (`remapFolderSets`), which the builder already calls in both
+  // directions, so the builder no longer takes setters at all. Asserting against the REAL
+  // module-scope store is what #309 was about anyway — a mock setter can be called correctly and
+  // still not be the thing the panel reads.
+  const build = (refresh = vi.fn()) => makeFolderRenameUndo({
+    oldPath: '/assets/Old', newPath: '/assets/New', folderName: 'New', refresh,
   });
+  const seed = (expanded: string[], pending: string[] = []) => {
+    setExpanded(() => new Set(expanded));
+    setPendingFolders(() => new Set(pending));
+  };
+  beforeEach(() => __resetAssetFolderStateForTest());
+  afterEach(() => __resetAssetFolderStateForTest());
 
   it('undo remaps BOTH pendingFolders and expanded when the move succeeds', async () => {
-    const setPendingFolders = vi.fn();
-    const setExpanded = vi.fn();
-    await build(vi.fn(), setPendingFolders, setExpanded).undo();
-    expect(setPendingFolders).toHaveBeenCalledTimes(1);
-    expect(setExpanded).toHaveBeenCalledTimes(1);
-    const pf = setPendingFolders.mock.calls[0][0](new Set(['/assets/New', '/assets/New/inner']));
-    expect(pf).toEqual(new Set(['/assets/Old', '/assets/Old/inner']));
-    const ex = setExpanded.mock.calls[0][0](new Set(['/assets/New']));
-    expect(ex).toEqual(new Set(['/assets/Old']));
+    seed(['/assets/New'], ['/assets/New', '/assets/New/inner']);
+    await build().undo();
+    expect([...getExpanded()]).toEqual(['/assets/Old']);
+    expect([...getPendingFolders()].sort()).toEqual(['/assets/Old', '/assets/Old/inner']);
   });
 
   // #308: this was the active-desync bug — setPendingFolders (and, previously, nothing for
@@ -488,12 +498,11 @@ describe('makeFolderRenameUndo (#308 site 5 — the worst one)', () => {
   it('undo does NOT remap EITHER client set when the move fails (a collision), and toasts', async () => {
     const error = spyConsole('error');
     failNext('/api/move-file', COLLISION_STATUS);
-    const setPendingFolders = vi.fn();
-    const setExpanded = vi.fn();
+    seed(['/assets/New'], ['/assets/New']);
     const refresh = vi.fn();
-    await build(refresh, setPendingFolders, setExpanded).undo();
-    expect(setPendingFolders).not.toHaveBeenCalled();
-    expect(setExpanded).not.toHaveBeenCalled();
+    await build(refresh).undo();
+    expect([...getExpanded()]).toEqual(['/assets/New']);      // untouched
+    expect([...getPendingFolders()]).toEqual(['/assets/New']);
     expect(error).toHaveBeenCalledTimes(1);
     const toast = useEditorStore.getState().toast;
     expect(toast).not.toBeNull();
@@ -504,28 +513,22 @@ describe('makeFolderRenameUndo (#308 site 5 — the worst one)', () => {
   it('redo does NOT remap either client set on a non-collision failure, and does not toast', async () => {
     const error = spyConsole('error');
     failNext('/api/move-file', 500);
-    const setPendingFolders = vi.fn();
-    const setExpanded = vi.fn();
-    await build(vi.fn(), setPendingFolders, setExpanded).redo();
-    expect(setPendingFolders).not.toHaveBeenCalled();
-    expect(setExpanded).not.toHaveBeenCalled();
+    seed(['/assets/Old'], ['/assets/Old']);
+    await build().redo();
+    expect([...getExpanded()]).toEqual(['/assets/Old']);
+    expect([...getPendingFolders()]).toEqual(['/assets/Old']);
     expect(error).toHaveBeenCalledTimes(1);
     expect(useEditorStore.getState().toast).toBeNull();
   });
 
   // #C-3 (#308 close-out) — "the worst site": redo's SUCCESS path had no test at all. A
-  // mutation that swapped `remapPrefix(p, oldPath, newPath)` → `remapPrefix(p, newPath, oldPath)`
-  // in redo's success branch passed the whole suite. Pin the FORWARD direction of both sets.
+  // mutation that swapped the remap's direction in redo's success branch passed the whole suite.
+  // Pin the FORWARD direction of both sets.
   it('redo remaps BOTH pendingFolders and expanded FORWARD when the move succeeds', async () => {
-    const setPendingFolders = vi.fn();
-    const setExpanded = vi.fn();
-    await build(vi.fn(), setPendingFolders, setExpanded).redo();
-    expect(setPendingFolders).toHaveBeenCalledTimes(1);
-    expect(setExpanded).toHaveBeenCalledTimes(1);
-    const pf = setPendingFolders.mock.calls[0][0](new Set(['/assets/Old', '/assets/Old/inner']));
-    expect(pf).toEqual(new Set(['/assets/New', '/assets/New/inner']));
-    const ex = setExpanded.mock.calls[0][0](new Set(['/assets/Old']));
-    expect(ex).toEqual(new Set(['/assets/New']));
+    seed(['/assets/Old'], ['/assets/Old', '/assets/Old/inner']);
+    await build().redo();
+    expect([...getExpanded()]).toEqual(['/assets/New']);
+    expect([...getPendingFolders()].sort()).toEqual(['/assets/New', '/assets/New/inner']);
   });
 });
 

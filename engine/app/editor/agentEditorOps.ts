@@ -36,6 +36,7 @@ import {
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets, flushDirtyAssets,
+  applyAssetPathMoves, type PathMove,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
@@ -2504,6 +2505,37 @@ export function registerEditorAgentOps(): void {
    *  Reads the LIVE cache, not the file, and that distinction is the point: persistence is manual,
    *  so an unsaved edit exists ONLY live. A file read would report the pre-edit value and make a
    *  successful edit look like it did nothing. `source` says which the answer came from. */
+  /** Repair the renderer's path-keyed state after a move the RENDERER did not perform (#867).
+   *
+   *  `POST /api/move-file` is the one place a move happens, and until now the repair
+   *  (`applyAssetPathMoves`) was wired to the thirteen client-side CALL SITES instead — so a move
+   *  from anywhere else silently repaired nothing. `modoki_move_asset` is exactly that case, and
+   *  it is not a forgotten line: the MCP server is a different PROCESS from the renderer, so the
+   *  repair was never reachable from there at all.
+   *
+   *  The route calls this back through `requestBrowser`, the same server→renderer RPC ~20 other
+   *  routes use, which is already abstracted over both transports (Vite HMR and Electron IPC).
+   *
+   *  Applying a move twice is a no-op — `applyMove` matches on `from`, and after the first pass
+   *  nothing is at `from` any more — so the panel keeping its own synchronous call is safe. It
+   *  keeps it because ORDER matters there: the registry must be repaired before the selection
+   *  moves, since `AtlasAssetView`'s load effect keys on the selected path for its CAS baseline.
+   *  This op is the backstop for every caller that is not the panel. */
+  registerAgentOp('apply-asset-path-moves', (params) => {
+    const { moves } = (params ?? {}) as { moves?: PathMove[] };
+    if (!Array.isArray(moves) || moves.length === 0) {
+      throw new Error('apply-asset-path-moves requires { moves: [{from, to, prefix?}] }');
+    }
+    for (const m of moves) {
+      if (typeof m?.from !== 'string' || (typeof m?.to !== 'string' && m?.to !== null)) {
+        throw new Error('apply-asset-path-moves: each move needs { from: string, to: string | null }');
+      }
+    }
+    // The notes are the repair's own account of what it touched — empty when the move hit nothing
+    // bound, parked or selected, which is the overwhelmingly common case.
+    return { ok: true, notes: applyAssetPathMoves(moves) };
+  });
+
   registerAgentOp('read-asset-def', (params) => {
     const { path, type } = (params ?? {}) as { path?: string; type?: string };
     if (!path) throw new Error('read-asset-def requires { path }');

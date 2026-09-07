@@ -98,6 +98,24 @@ const pending = new Map<string, unknown>();
  *  `contentHash.ts`'s docblock warns about. */
 const baselines = new Map<string, string>();
 
+/** Paths whose last `/api/read-meta` FAILED, so this editor does not know what the sidecar holds.
+ *
+ *  ⚠️ This exists to make one specific destruction unrepresentable. `/api/write-meta` replaces the
+ *  sidecar WHOLESALE — it does not merge with disk — and a panel whose load failed is showing its
+ *  own defaults with no `id` in hand. Park a field change from that state and Cmd+S writes an
+ *  id-less document; the scanner's heal pass then MINTS A FRESH GUID, and every scene/prefab
+ *  reference to that asset dangles. A transient 500 on a GET destroys the asset's identity.
+ *
+ *  `makeTexture2D.ts:24` spells this out and returns early, and `NineSlice`/`SpriteEditor` now
+ *  refuse to save — but those are the three RAREST surfaces. The common one is an ordinary field
+ *  change in any of the eight asset views, which needs no modal at all, and guarding it in each of
+ *  them would be eight copies of one rule that the ninth view will not have. So the refusal lives
+ *  HERE, where every read and every park already pass through.
+ *
+ *  Cleared by a later successful read of the same path: a dev-server blip is transient, and once
+ *  we have genuinely read the file there is nothing left to protect against. */
+const readFailed = new Set<string>();
+
 /** The baseline for `path`, or `undefined` when this editor has never read it. `undefined` means
  *  UNCONDITIONAL: `ifMatchRefusal` treats an absent `ifMatch` as "proceed", which is the correct
  *  and deliberate reading — we have no idea what is on disk, so we have no basis to refuse. It
@@ -107,13 +125,7 @@ export function peekMetaBaseline(path: string | undefined): string | undefined {
 }
 
 /** Test-only: forget every recorded baseline. */
-export function clearMetaBaselines(): void { baselines.clear(); }
-
-/** Forget the baseline for `path`. Called when a park is discarded or its file goes away: a
- *  baseline describes bytes at a path, so it is meaningless once this editor stops tracking that
- *  path, and keeping it would make a LATER unrelated edit conflict against a hash for content
- *  nobody is looking at any more. */
-export function forgetMetaBaseline(path: string): void { baselines.delete(path); }
+export function clearMetaBaselines(): void { baselines.clear(); readFailed.clear(); }
 
 let _version = 0;
 const listeners = new Set<() => void>();
@@ -145,6 +157,18 @@ export function getPendingMetaVersion(): number { return _version; }
  *  guarantees", for one spread. The copy is shallow on purpose: only the TOP-LEVEL identity is
  *  the stamp, so deep-cloning would cost more and buy nothing. */
 export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): void {
+  // ⚠️ REFUSE rather than park a document this editor cannot have built correctly. See
+  // `readFailed`: the write is wholesale, so a park made while the panel is showing defaults from
+  // a failed read costs the asset its GUID and dangles every reference to it. Refusing loses one
+  // field edit; parking loses the asset.
+  if (readFailed.has(path)) {
+    console.error(
+      `[pendingMeta] refusing to park an import-settings edit for ${path} — its .meta.json was `
+      + 'never read successfully, so saving this would replace the file with a document missing '
+      + 'its GUID. Reselect the asset once the dev server responds.',
+    );
+    return;
+  }
   pending.set(path, meta && typeof meta === 'object' ? { ...(meta as Record<string, unknown>) } : meta);
   // ⚠️ `ifMatch` is for a CROSS-PATH re-park only (a rename — `applyMovesToParkedMeta`), and an
   // omitted one PRESERVES whatever this path already had rather than clearing it. That mirrors
@@ -222,8 +246,13 @@ export async function readMetaPreferringPark(
   // ERASE a baseline an earlier successful read had established — turning the next write
   // unconditional exactly when the editor is least sure what is on disk.
   if (r.ok) {
+    readFailed.delete(path);
     const sha = r.headers?.get?.('X-Meta-Sha256');
     if (sha) baselines.set(path, sha);
+  } else {
+    // We do NOT know what this sidecar holds. Remember that, so a field change cannot park a
+    // document built on the `{}` fallback — see `readFailed`.
+    readFailed.add(path);
   }
   const meta = r.ok ? await r.json() : {};
   return { meta, pendingRef: undefined, ok: r.ok };
@@ -318,7 +347,16 @@ export interface MetaFlushResult {
    *  `persist.ts`'s `reportWriteFailed` note — the edited value is still correct as an intention,
    *  and snapping the panel back would destroy the human's work to resolve a failure that is
    *  usually transient). */
-  failed: Array<{ path: string; error: string }>;
+  failed: Array<{
+    path: string;
+    error: string;
+    /** The write was REFUSED by the `ifMatch` precondition (409), not merely failed — a DIFFERENT
+     *  remedy, which is why it is a structured flag and not something a reader greps out of
+     *  `error`. A plain failure should be retried; a conflict must not be, because the retry is
+     *  unconditional (the batch flush drops the baseline) and would overwrite whatever changed the
+     *  file. `toastForSave` splits on this, and the two sentences it produces say opposite things. */
+    conflict?: boolean;
+  }>;
 }
 
 /** Set for the duration of a `flushPendingMeta()` call, so `flushPendingMetaFor` can wait for it
@@ -388,6 +426,7 @@ export async function flushPendingMeta(): Promise<MetaFlushResult> {
         error: r.conflict
           ? 'the .meta.json changed on disk since this edit was based on it — the edit is still pending, reopen the asset to see the current values'
           : (r.error ?? 'the /api/write-meta request failed — see the console for the reason'),
+        ...(r.conflict ? { conflict: true } : {}),
       });
       toRepark.push([path, meta]);
     }
@@ -452,9 +491,19 @@ export async function flushPendingMetaFor(path: string): Promise<MetaFlushResult
   }
   if (!pending.has(path)) pending.set(path, meta);
   bump();
-  // Same baseline drop as the batch flush, for the same reason — see `flushPendingMeta`. Without
-  // it a re-import that conflicts once can never flush that path again.
-  if (r.conflict) baselines.delete(path);
+  // ⚠️ **NO baseline drop here, deliberately — unlike the batch flush.** The batch flush drops it
+  // because a refusal there is REPORTED: `toastForSave` names the path and says the file changed,
+  // so a second, explicit Cmd+S is the human choosing to overwrite. That premise does not hold on
+  // this path — **all eight callers `await` this and discard the result** (the six asset views'
+  // Apply handlers, `reimport.ts`'s loop, `makeTexture2D`), so a conflict here reaches no UI at
+  // all. Dropping the baseline would therefore disarm the compare-and-swap SILENTLY, and the next
+  // Cmd+S would write unconditionally over the external change and report success — a worse
+  // outcome than the wedge the drop exists to prevent, reached with the human told nothing.
+  //
+  // The wedge is still closed, because both functions read the same `baselines` map: the path
+  // stays parked, and the next Cmd+S goes through `flushPendingMeta`, which conflicts ONCE, tells
+  // the human, and drops it there. Nothing can be permanently unsaveable; the refusal just has to
+  // happen where somebody sees it.
   // ⚠️ The CONFLICT case here is worth knowing about at the call site: this flush exists so a
   // re-import reads the human's pending settings rather than the pre-edit disk copy, and a refusal
   // means it will now read neither — the file was changed by something else entirely. The edit
@@ -468,6 +517,7 @@ export async function flushPendingMetaFor(path: string): Promise<MetaFlushResult
       error: r.conflict
         ? 'the .meta.json changed on disk since this edit was based on it — the edit is still pending, reopen the asset to see the current values'
         : (r.error ?? 'the /api/write-meta request failed — see the console for the reason'),
+      ...(r.conflict ? { conflict: true } : {}),
     }],
   };
 }

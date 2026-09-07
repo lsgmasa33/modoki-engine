@@ -118,6 +118,36 @@ describe('input source guard (Part A6)', () => {
     ).toEqual([]);
   });
 
+  // ── (#866) Non-vacuity pins ────────────────────────────────────────────────────────────────
+  // Both guards above collect offenders and expect an EMPTY list, which is the shape that goes
+  // GREEN when the scan breaks rather than red. This file is one of #866's sites: it discards
+  // git's own `rel` (it maps the rows down to `abs` — see `engineFiles()` above) and rebuilds
+  // it with `relative(REPO_ROOT, …)`
+  // against a root derived from `import.meta.url`. Those two derivations coincide on macOS, so a
+  // Mac gate cannot see it — but drive-letter case, a `subst`ed or symlinked checkout, or an 8.3
+  // short path make them disagree, and then every `rel` is wrong, `ALLOW` matches nothing, and
+  // both guards pass having checked nothing at all. Only these two pins can tell that apart.
+  it('the scan is not vacuous — it reaches the engine runtime', () => {
+    expect(
+      engine.length,
+      'the engine runtime scan reached almost nothing — the enumeration is broken, not the repo clean',
+    ).toBeGreaterThan(100);
+  });
+
+  it('every ALLOW key names a file the scan actually reached — the allowlist is load-bearing', () => {
+    const scanned = new Set([...engine, ...games].map((f) => f.rel));
+    // A checkout with no `games/` (the public OSS snapshot) legitimately reaches no games file, so
+    // only the keys whose root was actually scanned are required to match.
+    const required = [...ALLOW].filter((k) => (k.startsWith('games/') ? games.length > 0 : true));
+    const unmatched = required.filter((k) => !scanned.has(k));
+    expect(
+      unmatched,
+      'These ALLOW entries match no scanned file. Either the path is stale, or the `rel` derivation '
+      + 'broke (#866) — in which case both guards above are now passing vacuously:\n'
+      + `${unmatched.join('\n')}`,
+    ).toEqual([]);
+  });
+
   it('the allowlist stays small (review pressure)', () => {
     expect(ALLOW.size).toBeLessThanOrEqual(2);
   });

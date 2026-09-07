@@ -100,7 +100,11 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     // `/api/read-meta` returns the merged view and `writeMetaSidecar` transforms what it writes —
     // so a stripped header means `ifMatch` is never sent on the first write of a path, and the
     // precondition guarding a committed file is inert exactly where the editor actually runs.
-    // `X-Writable` is listed for the same reason; it predates this and was never exposed either.
+    // ⚠️ `X-Meta-Sha256` is the only header this actually enables today — an earlier version of
+    // this comment said `X-Writable` was "listed for the same reason", which overstates it: no
+    // client reads that one (`ScriptTree.tsx` takes `writable` from the JSON body; the header is
+    // consumed only by a server-side test). It is listed so that a future client CAN read it
+    // without rediscovering this whole failure mode, not because anything is broken without it.
     res.setHeader('Access-Control-Expose-Headers', 'X-Meta-Sha256, X-Writable');
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;

@@ -270,6 +270,26 @@ every other clone at yours.**
   including when NOTHING holds it. Read-only calls stay allowed. The hook reaches only a Claude
   session's Bash tool in this repo, and **fails OPEN if its path breaks**, so it is a backstop for
   the discipline, not a replacement for it.
+  ⚠️ **"Is this claim mine?" is ONE comparison, `sameClone` — and it was four copies until #865.**
+  `foreignClaimFor`, `ownAdbClaim`, `claim-guard.mjs`'s `heldByThisClone` and `device.mjs`'s
+  WiFi-claim filter each hand-rolled it, in three different normalisations, and none of them
+  checked that the STORED path was rooted in a way `path.resolve` could finish without consulting
+  `process.cwd()`. On win32 `path.isAbsolute('/Projects/modoki')` is `true` and `resolve` re-roots
+  it onto the cwd's drive, so a stored `"."`, `""` or another platform's `/Projects/...` silently
+  became THIS clone. `foreignClaimFor` returns `null` for *"not foreign, it's mine"*, so that
+  failed **OPEN**: the clone proceeded against a phone a sibling held, and `claim-guard.mjs` — the
+  backstop — failed the same way at the same moment. **Polarity is now REFUSE** (owner,
+  2026-09-07): an unrecognisable stored path matches nothing. The accepted cost is that a corrupt
+  `~/.modoki/device-claims.json` can block this clone's own builds until it is deleted by hand.
+  ⚠️ **The second half of #865 is NOT Windows-only, and it fails the other way.** `device.mjs`
+  records `clone: repoRoot` with `findRepoRoot` **realpathing** it, while `vite-asset-scanner.ts`
+  calls `foreignClaimFor`/`ownAdbClaim` with no `clone` at all — so the own side was a bare
+  `process.cwd()`. Through a symlinked, junctioned or `subst`ed checkout the two spell one directory two ways
+  and the editor's build path refuses this clone its OWN phone. `canonicalClonePath` now carries
+  the realpath for every caller — via **`fs.realpathSync.native`**, which is load-bearing and not
+  a detail: see `docs/windows.md` § Paths, the JS walk resolves neither `subst` nor drive-letter
+  case. `claim-guard.mjs` had documented that reasoning and done the
+  realpath; the two it pointed at had not, which is the drift that got #865 filed.
   Detail: [debug-tools-mcp.md](./debug-tools-mcp.md) § "Several phones attached".
 - **Several phones of the SAME platform? Say which one.** Every adb call on the device surface is
   now `-s <serial>`-targeted, resolved ONCE when the lease opens and reused by the CDP tunnel and

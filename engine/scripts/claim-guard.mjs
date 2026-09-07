@@ -48,7 +48,7 @@
 
 import fs, { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { listClaims } from './deviceClaimsStore.mjs';
+import { listClaims, sameClone } from './deviceClaimsStore.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 
 /** Cheap pre-filter: does this command even mention a tool that can touch a phone? Deliberately
@@ -99,10 +99,10 @@ function thisClone(payload) {
 }
 
 function heldByThisClone(claim, clone) {
-  // Same normalisation on both sides — see `thisClone`.
-  let held;
-  try { held = fs.realpathSync(path.resolve(claim.clone)); } catch { held = path.resolve(claim.clone); }
-  return held === clone;
+  // (#865) Was a hand-rolled copy of the same normalisation. `sameClone` IS that comparison, plus
+  // the qualification gate this copy never had: an unqualified stored `clone` resolved onto this
+  // process's cwd and read as MINE, so the hook waved through a phone a sibling clone held.
+  return sameClone(claim.clone, clone);
 }
 
 const CLAIM_HINT = (id) => `Claim it first: \`npm run device:claim ${id}\` (or connect it in the `

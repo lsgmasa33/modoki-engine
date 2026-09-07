@@ -72,6 +72,15 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
 
   useEffect(() => {
     const ac = new AbortController();
+    // ⚠️ Reset the per-path state BEFORE the read, not only inside its `.then`. An abort or a
+    // rejected read would otherwise leave the PREVIOUS path's values in place — and `meta` still
+    // holds that asset's document, `id` included, so a save here would write asset A's sidecar
+    // over asset B and duplicate the GUID. That is strictly worse than the id-less write the
+    // `metaLoadedRef` guard was added for. (I could not construct a live route past the modal
+    // overlay, so this is hardening rather than a demonstrated bug — but the cost is three lines
+    // and the failure is silent.)
+    metaLoadedRef.current = false;
+    pendingRefAtLoadRef.current = undefined;
     readMetaPreferringPark(path, { signal: ac.signal })
       .then(({ meta: m, pendingRef, ok }) => {
         pendingRefAtLoadRef.current = pendingRef;

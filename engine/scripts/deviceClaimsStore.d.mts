@@ -114,6 +114,21 @@ export interface ForeignClaimOpts extends StaleOpts {
   clone?: string;
 }
 
+/** (#865) Is `p` rooted so that `path.resolve` can finish WITHOUT consulting `process.cwd()`?
+ *  win32 requires a drive (`E:\`, `E:/`) or a real `//server/share`; POSIX requires a leading `/`.
+ *  Returns `false` for a non-string, so a corrupt record cannot throw. */
+export declare function isFullyQualified(p: string): boolean;
+
+/** (#865) A clone path in the ONE spelling every claim comparison uses: `fs.realpathSync` of the
+ *  resolved path, falling back to `path.resolve` when it does not exist. */
+export declare function canonicalClonePath(p: string): string;
+
+/** (#865) Does the STORED clone path name the same clone as OWN? The single comparison behind
+ *  `foreignClaimFor`, `ownAdbClaim`, `claim-guard.mjs` and `device.mjs`'s WiFi-claim filter.
+ *  Asymmetric: `own` is derived by this process and trusted, `stored` came off disk and is gated
+ *  on `isFullyQualified`, so an unrecognisable stored path matches NOTHING. */
+export declare function sameClone(stored: string, own: string): boolean;
+
 /** (#285 sibling) The live `DeviceClaim` for `deviceId` when it is held by a DIFFERENT clone than
  *  `opts.clone` (default `process.cwd()`), compared as RESOLVED paths — else `null`. The one
  *  implementation of "is this someone else's phone", used by the build path (`vite-asset-scanner.ts`)

@@ -48,8 +48,8 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { startDragGhost, endDragGhost, setAssetDragPayload, completeAssetDrop, armGrabCursor } from '../utils/dragGhost';
 import {
-  splitAssetPath, duplicatePathFor, pastePathIn, remapPrefix, buildFolderTree, planAutoImports,
-  effectiveAssetsRoot, collectFolderPaths,
+  splitAssetPath, duplicatePathFor, pastePathIn, buildFolderTree, planAutoImports,
+  effectiveAssetsRoot, collectFolderPaths, planFilesDropMoves, isFolderPath,
   type AssetEntry, type FolderNode,
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
@@ -232,26 +232,15 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 
 // ─── Asset row (shared between views) ────────────────────────────────
 
-// Folder-relative move (computes the destination path from a target folder).
 // `logBindingChanges` moved to assetUndo.ts (#308) so the undo/redo builders there can share
 // it without importing this file.
-
-// Distinct from assetOps.moveFileTo, which takes an explicit full target path.
-async function moveFile(fromPath: string, toFolder: string): Promise<boolean> {
-  const name = fromPath.substring(fromPath.lastIndexOf('/') + 1);
-  const normalizedFolder = toFolder === '/' ? '' : toFolder;
-  const toPath = `${normalizedFolder}/${name}`;
-  if (fromPath === toPath) return false;
-  // Prevent moving a folder into itself or a subfolder
-  if (toFolder.startsWith(fromPath + '/') || toFolder === fromPath) return false;
-  try {
-    const res = await backendFetch('/api/move-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: fromPath, to: toPath }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
+//
+// A folder-relative `moveFile(from, toFolder)` used to live here, deriving the destination and
+// re-checking "onto itself" / "into its own descendant" itself. #867 extracted those decisions
+// into `planFilesDropMoves`, which left two independent computations of one destination — they
+// agreed, but the day one grew a collision-suffix rule (as `pastePathIn` already has) the other
+// becomes a lie and `makeFilesDropUndo` moves back from a path the file is not at. Deleted; the
+// drop loop calls `assetOps.moveFileTo(from, to)` with the destination the planner derived.
 
 // Convertible model SOURCES (kept alongside the GLB they bake into). They share
 // the 'model' type with GLB/glTF but aren't the canonical asset, so they get a
@@ -1240,7 +1229,7 @@ export default function Assets() {
   // ── New Folder + folder rename ──────────────────────────────────────
   const createFolder = useCallback(async (parentFolder: string) => {
     const norm = parentFolder === '/' ? '' : parentFolder;
-    const isTaken = (p: string) => pendingFolders.has(p) || diskFolders.includes(p) || assets.some((a) => a.path === p || a.path.startsWith(p + '/'));
+    const isTaken = (p: string) => isFolderPath(p, { pendingFolders, diskFolders, assets });
     let name = 'New Folder';
     let path = `${norm}/${name}`;
     let n = 2;
@@ -1273,14 +1262,15 @@ export default function Assets() {
     if (!safe || safe === parts[parts.length - 1]) return;
     const parent = '/' + parts.slice(0, -1).join('/');
     const newPath = (parent === '/' ? '' : parent) + '/' + safe;
-    if (pendingFolders.has(newPath) || diskFolders.includes(newPath) || assets.some((a) => a.path === newPath || a.path.startsWith(newPath + '/'))) {
+    if (isFolderPath(newPath, { pendingFolders, diskFolders, assets })) {
       console.warn(`[Assets] Folder already exists: ${newPath}`); return;
     }
     const ok = await moveFileTo(node.path, newPath);
     if (!ok) { console.error(`[Assets] Failed to rename folder ${node.path}`); return; }
     const oldPath = node.path;
-    setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
-    setExpanded((p) => remapPrefix(p, oldPath, newPath).add(newPath));
+    // The remap itself is the seam's now (#867). What stays here is the gesture's own nicety:
+    // keep the renamed folder OPEN, which belongs to renaming rather than to the repair.
+    setExpanded((p) => new Set(p).add(newPath));
     // The same prefix remap the two lines above do for folder state, for an open editor
     // bound to an asset INSIDE the renamed folder (#186) — every one of them just moved.
     // remapCurrentFolder runs from inside applyAssetPathMoves now — see its comment.
@@ -1292,7 +1282,7 @@ export default function Assets() {
     // (an active desync, not a no-op). Now gated on the move landing, `setExpanded` is
     // remapped too (previously never remapped by undo/redo at all), and a failure is
     // reported (toast only on a 409 collision).
-    pushAction(makeFolderRenameUndo({ oldPath, newPath, folderName: node.name, refresh, setPendingFolders, setExpanded }));
+    pushAction(makeFolderRenameUndo({ oldPath, newPath, folderName: node.name, refresh }));
   }, [assets, pendingFolders, diskFolders, clearSelection, refresh]);
 
   // Smooth-scroll a path's row into view (after the tree commits).
@@ -1491,15 +1481,22 @@ export default function Assets() {
   // are skipped silently — they're mis-drops, not errors. Successful moves are
   // bundled into a single undo entry.
   const handleFilesDrop = useCallback(async (filePaths: string[], targetFolder: string) => {
-    const normalizedTarget = targetFolder === '/' ? '' : targetFolder;
+    // The DECISION (which drops are skipped, where each lands, and whether it is a FOLDER move)
+    // is pure and lives in `planFilesDropMoves`; only the awaited backend call stays here. A
+    // dragged folder gets `prefix: true` — without it the repair below matched the folder itself
+    // and returned `undefined` for every file under it (#867 member 2).
+    const known = { pendingFolders, diskFolders, assets };
+    const planned = planFilesDropMoves(filePaths, targetFolder, (p) => isFolderPath(p, known));
     const moves: DropMove[] = [];
-    for (const filePath of filePaths) {
-      const originalFolder = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
-      if (targetFolder === originalFolder || targetFolder === filePath || targetFolder.startsWith(filePath + '/')) continue;
-      const ok = await moveFile(filePath, targetFolder);
-      if (!ok) { console.warn(`[Assets] Could not move ${filePath} → ${targetFolder}`); continue; }
-      const fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
-      moves.push({ from: filePath, to: `${normalizedTarget}/${fileName}` });
+    for (const m of planned) {
+      // `moveFileTo(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the
+      // destination, and letting the mover derive its own would be two independent computations
+      // of one value. They agree today; the day `moveFile` grows a collision-suffix rule (as
+      // `pastePathIn` already has) the planner's `to` silently becomes a lie, and
+      // `makeFilesDropUndo` would move back from a path the file is not at — the forking bug.
+      const ok = await moveFileTo(m.from, m.to);
+      if (!ok) { console.warn(`[Assets] Could not move ${m.from} → ${m.to}`); continue; }
+      moves.push(m);
     }
     if (moves.length === 0) return;
     console.log(`[Assets] Moved ${moves.length} item(s) → ${targetFolder}`);
@@ -1514,7 +1511,7 @@ export default function Assets() {
     // (from/to) are already known, so the builder calls moveFileToStatus directly rather than
     // re-deriving a destination from a folder.
     pushAction(makeFilesDropUndo({ moves, refresh }));
-  }, [refresh]);
+  }, [refresh, pendingFolders, diskFolders, assets]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (e.dataTransfer.types.includes('application/editor-entity') || e.dataTransfer.types.includes('Files')) {

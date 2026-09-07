@@ -14,7 +14,7 @@
 import { useSyncExternalStore } from 'react';
 import { ASSETS_SECTION, type ViewMode } from './assetListing';
 import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
-import { applyMove } from '../utils/assetPaths';
+import { applyMove, type PathMove } from '../utils/assetPaths';
 
 const LS_EXPANDED = 'editor:assets:expanded:v2';
 const LS_PENDING_FOLDERS = 'editor:assets:pendingFolders';
@@ -120,6 +120,40 @@ export function remapCurrentFolder(from: string, to: string | null): void {
   if (next === undefined) return; // untouched by this move
   if (next === null) { setCurrentFolder(null); return; }
   setCurrentFolder(next);
+}
+
+/** Repoint the folder-tree sets — `expanded` and `pendingFolders` — for `moves`.
+ *
+ *  Both are keyed by folder path, so a folder rename/move/delete strands every entry under it: a
+ *  collapsed tree on the next mount, and a `pendingFolders` entry naming a folder that no longer
+ *  exists. Three sites did this by hand (`commitFolderRename`, and `makeFolderRenameUndo`'s undo
+ *  AND redo) and the other ten seam callers did not — the same per-call-site wiring #867 removed
+ *  for the bindings, the parked writes, `currentFolder` and the selection.
+ *
+ *  A delete drops the subtree rather than repointing it. Note `commitFolderRename` additionally
+ *  `.add(newPath)`s the destination so a renamed folder stays open; that is a UI nicety belonging
+ *  to that gesture, not to the repair, so it stays at the call site. */
+export function remapFolderSets(moves: Iterable<PathMove>): void {
+  ensureLoaded();
+  const list = [...moves];
+  if (list.length === 0) return;
+  const remap = (prev: Set<string>): Set<string> => {
+    let changed = false;
+    const next = new Set<string>();
+    for (const p of prev) {
+      let out: string | null | undefined;
+      for (const m of list) {
+        out = applyMove(p, { ...m, prefix: true });
+        if (out !== undefined) break;
+      }
+      if (out === undefined) { next.add(p); continue; }
+      changed = true;
+      if (out !== null) next.add(out);
+    }
+    return changed ? next : prev;   // identity preserved when nothing moved — no re-render
+  };
+  setExpanded(remap);
+  setPendingFolders(remap);
 }
 
 /** Apply `updater` and persist. The updater must RETURN A NEW SET rather than mutate the one

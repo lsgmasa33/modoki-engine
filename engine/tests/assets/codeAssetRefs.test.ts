@@ -313,6 +313,19 @@ if (process.env.MODOKI_DUMP_CODE_ASSET_REFS) {
 }
 
 describe('game code must not reference assets by GUID literal (#53)', () => {
+  // (#866) Non-vacuity for the ENGINE scan, which is NOT games-gated. Deliberately outside the
+  // skipIf below: that one asserts about `discoverProjects`, a different producer, and it does
+  // not run on a checkout without `games/` — i.e. exactly the public/`windows-latest` leg where
+  // a vacuously-passing corpus guard is supposed to go red. `walkFiles` discards git's `rel`,
+  // so if its enumeration or its `under` prefix ever stops matching, every guard in this file
+  // passes having read no files at all.
+  it('the engine source scan is not vacuous', () => {
+    const engineSrc = path.join(PROJECT_ROOT, 'engine', 'packages', 'modoki', 'src');
+    expect(
+      walkFiles(engineSrc).length,
+      'the engine source scan reached almost nothing — the enumeration is broken, not the tree empty',
+    ).toBeGreaterThan(100);
+  });
   it.skipIf(!hasGames)('finds project sources to scan (sanity: the guard is actually looking)', () => {
     expect(discoverProjects(PROJECT_ROOT).length).toBeGreaterThan(0);
   });

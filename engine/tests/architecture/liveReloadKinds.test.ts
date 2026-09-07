@@ -174,19 +174,22 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
       'not by a watcher-driven park-drop — adding it to LiveReloadKind would let ' +
       'dropParkedWriteFor (#439/#469) silently discard a human\'s parked edit, exactly the ' +
       'silent-discard behaviour #831 replaced with a human-resolved fork. ⚠️ The CAS premise is '
-      + 'STILL not universal, and the caveat has only NARROWED. #854 fixed the Assets-panel '
-      + 'rename — applyMovesToParkedAssets now carries `ifMatch` across the move '
-      + '(assetEditorBindings.test.ts pins it). It did NOT fix the other ways a file moves: the '
-      + 'repair is client-side and per-call-site, so `modoki_move_asset` (out-of-process, POSTs '
-      + '/api/move-file and nothing else) and a dragged FOLDER (isFolder is dropped, so no '
-      + 'prefix move is built) both bypass it entirely. That is #867; until it lands, '
-      + 'read this reason as "protected on the rename path", not "protected". '
-      + '⚠️ One HALF of this reason has an answer now, and it is deliberately not being used '
-      + 'here: #857 added `viaSibling`, so a broadcast CAN reach the invalidator without '
-      + 'dropParkedWriteFor firing at all. That defuses the silent-discard objection but not '
-      + 'the CAS one above, and a `.meta.json` write is a direct write to its own file rather '
-      + 'than a sibling-raised one, so the flag would be false for it anyway — it is not the '
-      + 'lever that would make adding this kind safe.',
+      + 'now UNIVERSAL across the ways a file moves, which it was not until #867. #854 fixed '
+      + 'the Assets-panel rename only — applyMovesToParkedAssets carries `ifMatch` across the '
+      + 'move — leaving `modoki_move_asset` (out-of-process) and a dragged FOLDER (no prefix '
+      + 'move was built) to bypass the repair entirely, because it was wired to CALL SITES '
+      + 'rather than to the move. #867 moved it onto the move: /api/move-file and '
+      + '/api/delete-asset now call the renderer back through requestBrowser, and the folder '
+      + 'drag builds a prefix move. ⚠️ What is still NOT covered is a move this repo does not '
+      + 'make — a shell `mv`, or any writer that is not one of those two routes; the watcher '
+      + 'sees it as an unrelated unlink+add and no repair runs. So read this reason as '
+      + '"protected on every path the editor and the agent surface can take". '
+      + '⚠️ Separately, one HALF of this reason has an answer now, and it is deliberately not '
+      + 'being used here: #857 added `viaSibling`, so a broadcast CAN reach the invalidator '
+      + 'without dropParkedWriteFor firing at all. That defuses the silent-discard objection '
+      + 'but not the CAS one above, and a `.meta.json` write is a direct write to its own file '
+      + 'rather than a sibling-raised one, so the flag would be false for it anyway — it is not '
+      + 'the lever that would make adding this kind safe.',
   };
 
   it('every agent-writable/parkable asset type is in LiveReloadKind (#842)', () => {

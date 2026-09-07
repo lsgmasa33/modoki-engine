@@ -112,6 +112,23 @@ load-bearing and commented as such).
 
 ## Paths
 
+- ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
+  is.** The JS lstat-walk resolves symlinks and junctions but neither `subst` drive mappings nor
+  drive-letter CASE, both of which are ordinary ways one directory acquires two spellings here.
+  Measured on `win` 2026-09-07 (#865 close-out):
+
+  | input | `realpathSync` | `realpathSync.native` |
+  |---|---|---|
+  | `Y:\` (a `subst` of another dir) | `Y:\` — unresolved | the real target |
+  | `e:\Projects\modoki` | `e:\Projects\modoki` | `E:\Projects\modoki` |
+
+  So a comparison that canonicalises with the JS walk still fails on a `subst`ed checkout or a
+  lower-cased drive letter. `path.resolve` repairs neither. ⚠️ **`.native` only normalises a
+  path that EXISTS** — for a missing path both forms throw and callers fall back to `resolve`,
+  which restores the case problem, so a comparison over paths that may not exist is still
+  spelling-sensitive. `deviceClaimsStore.mjs`'s `canonicalClonePath` is the worked example;
+  **#869** is the open instance of getting this wrong (two `engine/electron/main.ts` guards
+  compare a `__dirname` root against a project root with neither realpath nor case folding).
 - **A drive letter is a colon, and a colon means "remote host" to some tools.** GNU tar reads
   `C:\path\x.zip` as `host:path` and dies with `Cannot connect to C:`. Every drive letter, not
   just non-`C`.
@@ -200,13 +217,33 @@ load-bearing and commented as such).
       `engine/scripts/**` adds a few more), and a sweep found every other one benign — they
       normalise before comparing, or never compare at all. ~~So the exposed population is one, not
       thirty-nine.~~
-      ⚠️ **Nothing GUARDS this — tracked as #866.** `corpusProducerIsShared` enforces that you
-      *use* `repoFiles`; nothing enforces what you do with its output, which is where instance 9
-      and all nine of #849's landed. That issue also records why the obvious scan does not work:
-      of the 32 files that still discard `rel`, **24** also derive their own repo root, so
-      "two derivations in one file" flags 24 benign files and does not discriminate.
-      **The fix is to thread `{ rel, abs }` through and compare on `rel`**, as
+      ✅ **Now GUARDED — #866 closed on `win`, 2026-09-07.** `corpusConsumerPins.test.ts` enforces
+      the pin rule below over the **30** consumers that discard `rel`: a `.ts`/`.tsx`/`.mjs` under
+      `engine/tests`, `engine/packages/modoki/tests` or `engine/scripts` that spells either `.map`
+      must carry a non-vacuity assertion. `corpusProducerIsShared` enforces that you *use*
+      `repoFiles`; this enforces what you do with its output, which is where instance 9 and all
+      nine of #849's landed. The census when it landed: of 32 rel-discarding files, **29 already
+      had a pin**, 2 are migration scripts that assert nothing (a vacuous migration is a no-op,
+      not a false green — they sit in `NOT_A_GUARD`), and **1** was a real guard with none
+      (`inputSourceGuard.test.ts`, now pinned).
+      ⚠️ **What this deliberately does NOT do is detect the defect**, because #866 measured that
+      and it does not work: of the 32 files that still discard `rel`, **24** also derive their own
+      repo root, so "two derivations in one file" flags 24 benign files and does not
+      discriminate. The rule chosen instead (owner, 2026-09-07) makes the class **loud, not
+      absent** — it can still be written; it can no longer pass green having matched nothing. The
+      alternative considered and declined was making `rel` hard to drop at the `repoFiles` API,
+      which prevents it at authoring time on any platform but costs a 32-site migration; it stays
+      on the table if a tenth instance lands. Detection is not left to a human: a push to `main`
+      auto-runs the free public CI, whose `windows-latest` leg is where a vacuous guard goes red,
+      so it surfaces within one merge cycle.
+      **The underlying fix remains to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
+      ⚠️ **Re-deriving the census: append `-- ":!*.md"` to both queries.** Run verbatim they also
+      match this file — `§ Paths` quotes both patterns in order to describe them, and one of those
+      lines is matched by BOTH spellings at once — so a naive re-run reads 36 sites / 33 files and
+      looks like the class growing. It is not: code-only it is **34 sites / 32 files, unchanged
+      since `a2ddf60f6`**. A session re-running them without the pathspec drew the wrong
+      conclusion first, and nearly published it.
       - ⚠️ **"Exposed population is one" was wrong, and the reason is worth more than the number
         (#849, measured on the `win` clone 2026-09-07).** That census counted only the shape it had
         just been burned by — `path.relative()` output compared against a forward-slash literal.

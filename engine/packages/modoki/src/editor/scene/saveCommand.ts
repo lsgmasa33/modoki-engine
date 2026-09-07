@@ -224,6 +224,10 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   // and the file it belongs to is named so the human knows which edit is still only in memory.
   const baseFails = o.baseScenes?.failed ?? [];
   const metaFails = o.importSettings?.failed ?? [];
+  // Split by REMEDY, not by severity: a conflict must not be retried blindly, a plain
+  // failure should be. `conflict` is set only by a 409 from the `ifMatch` precondition.
+  const metaConflicts = metaFails.filter((f) => f.conflict);
+  const metaPlainFails = metaFails.filter((f) => !f.conflict);
   const failSuffix = (assetFails.length
     ? ` — ${assetFails.length} asset write(s) FAILED and are still unsaved: ${assetFails.map((f) => f.path).join(', ')}`
     : '')
@@ -237,8 +241,20 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
     // Same rule again for a rejected import-settings write (#845) — "asset write" is still the
     // wrong noun (it names an ASSET_SCHEMA_TYPES document, not a `.meta.json` sidecar), and a
     // human chasing that noun looks in the Assets panel rather than the Inspector.
-    + (metaFails.length
-      ? ` — ${metaFails.length} import-setting write(s) FAILED and are still unsaved: ${metaFails.map((f) => f.path).join(', ')}`
+    // ⚠️ A CONFLICT is called out separately from a plain failure, because the two have OPPOSITE
+    // remedies and this sentence is what the human acts on. The house rule for a failed write is
+    // "press Save again" (`NineSliceEditor.save`'s dialog stays open saying exactly that) — and a
+    // conflicted write's baseline has just been dropped, so pressing Save again OVERWRITES the
+    // change somebody else made. Wording them identically turns the documented remedy into a
+    // silent clobber, which is the whole reason `MetaWriteResult.conflict` is carried this far.
+    + (metaConflicts.length
+      ? ` — ${metaConflicts.length} import-setting write(s) REFUSED: the file changed on disk since `
+        + `the edit was based on it (${metaConflicts.map((f) => f.path).join(', ')}). The edit is `
+        + `still pending — reopen the asset to see the current values. Saving again will OVERWRITE `
+        + `the newer file.`
+      : '')
+    + (metaPlainFails.length
+      ? ` — ${metaPlainFails.length} import-setting write(s) FAILED and are still unsaved: ${metaPlainFails.map((f) => f.path).join(', ')}`
       : '');
   // A failed write is a WARNING in every branch, including the ones whose own outcome is benign.
   // A cancelled Save-As over a failed asset write was reporting 'info', so the sentence said FAILED

@@ -30,6 +30,12 @@ Three axes, one mechanism:
 All three are one family (`family/unfalsifiable-test`, #838 + #828 + #851) because all three are
 verified the same way — see **The bar** below.
 
+⚠️ **A second, unrelated shape lives in the same family: the guard whose SUBJECT is wrong** (#855).
+The one-instance shapes above all interrogate the right thing with too narrow an input. This one
+interrogates the wrong thing entirely — it asserts a constant against a *sibling* constant and never
+reaches the mechanism it is named for. It is not fixed by adding a second instance; it is fixed by
+asking the subject. See **The wrong-subject shape** below.
+
 ## Key files
 
 | File | Role |
@@ -41,6 +47,7 @@ verified the same way — see **The bar** below.
 | `engine/packages/modoki/tests/editor/selectionRestore.test.ts` | Reference for shape **(B)**, capture-and-invoke |
 | `engine/packages/modoki/tests/runtime/envPmremOwnership.test.ts` | Reference for the two-instance discriminant test |
 | `engine/packages/modoki/tests/video/videoTextureSync2D.test.ts` | The compact model of the same, in `gives each surface its own texture over the SAME element` |
+| `engine/tests/tools/readAssetDefServed.ts` | Reference for the **wrong-subject** shape — probes the op instead of inferring what it serves |
 
 ## How it works
 
@@ -108,6 +115,61 @@ and assert three things — the third is the one people forget:
 2. the underlying build counter incremented **once per instance**, not once in total;
 3. touching instance B does **not** disturb a cache hit already established for instance A.
 
+### The wrong-subject shape: a guard that interrogates a sibling constant (#855)
+
+The shapes above fail on the INPUT. This one fails on the SUBJECT — and it is harder to see, because
+the file reads as a parity guard and its assertions are all true.
+
+`assetTypeParity.test.ts` was named for parity between the two hand-kept MCP `read-asset-def` enums
+and **what the op serves**. It established the second half like this:
+
+```ts
+const NOT_READABLE: Record<string, string> = { material: '…', atlas: '…' };
+const READ_ASSET_DEF_TYPES = ASSET_SCHEMA_TYPES.filter((t) => !(t in NOT_READABLE));
+```
+
+`ASSET_SCHEMA_TYPES` is a sibling constant, and `NOT_READABLE` is a hand-maintained *inference*
+about a dispatch chain in two other files. **Not one assertion in the file called the op.** So every
+comparison was constant-against-constant, and the guard could not tell *"the enum drifted from the
+op"* from *"the enum drifted from a list that has nothing to do with the op"*.
+
+⚠️ **What makes this shape expensive is that it does not merely fail to catch a defect — it PUSHES
+one.** #831 added `atlas` to `ASSET_SCHEMA_TYPES`; the derived list grew to 8, the enums still had 7,
+and the test went red naming exactly that difference. The cheapest way to green was to widen the
+enums, so that is what happened, at the hub, in `de3cdce48` — to a type the op has no arm for.
+`modoki_read_asset_def {type:'atlas'}` then passed zod and died at the backend, with the tool
+description edited to advertise `.atlas.json`. **A tool that ACCEPTS a type it cannot serve is worse
+than one that refuses it.** Reverted in `ac546c720`.
+
+**The fix is to make the mechanism answer.** Both `read-asset-def` surfaces already distinguish
+themselves in their own error text — a type they dispatch misses with `not in the live <kind> cache`,
+a type they do not falls through to `unsupported type '<kind>'` — so the served set is *observable*
+and never needed inferring. `probeServedTypes` calls the op once per candidate type and classifies
+the reply; the enum is then asserted against that.
+
+Three things that shape needs, and each cost a defect to learn:
+
+- **Pass the discriminating input explicitly.** Every probe passes `type`, bypassing
+  `inferAssetDefType`. Left to suffix inference, an unrecognised type lands in the *"cannot tell what
+  kind of asset"* branch instead — a third answer, to a different question, that looks like a refusal.
+- **Assert the probe DISTINGUISHES, in its own test.** One `it` shows a known-served type classifies
+  `served` and a known-unserved one classifies `no-branch`. Without it the parity assertion rests on
+  a classifier that might return one verdict for everything.
+- **Keep "will not" apart from "cannot".** `material` is dispatched and refuses on purpose; `atlas`
+  has no arm. Collapsing them into one exemption map is what made the two look interchangeable — so
+  the verdict is three-valued (`served` / `no-branch` / `other`), not a boolean.
+
+⚠️ **Two surfaces cannot be probed from one module graph.** `registerAgentOp` is register-or-replace
+on a single module-level `Map`, and `registerEditorAgentOps` has a one-shot `registered` flag that
+cannot be un-set — so importing the editor ops permanently replaces the runtime twin for that file.
+The two probes live beside each op's own behaviour tests (`tests/editor/readAssetDef.test.ts` and
+`tests/framework/liveLifecycleOps.test.ts`), which is also where whoever edits an op will see them.
+
+**What stays in the parity file is what it can honestly observe**: that the tools are *registered*
+with their enum and validate against it. That is parity with the transport, not with the op — and it
+is the `modoki_prefab` class, which 400'd on every call for months with a green suite. Both halves
+are worth having; conflating them is what went wrong.
+
 ### The guard, and what it deliberately does not cover
 
 `worldSwapTeardownFalsifiable.test.ts` is **producer-side** — one test per teardown, not one per
@@ -161,6 +223,12 @@ It does **not** catch:
 - **the discriminant half — either axis.** *"This mock is a no-op"* is greppable; *"this cache's key
   is missing a renderer"* is not, and neither is *"missing a `World`"* (#851). Those tests are
   hand-written with no mechanical backstop.
+- **the wrong-subject shape (#855) — and this one is the least visible of the three.** There is no
+  syntax to grep: a guard comparing two constants is indistinguishable from a guard comparing a
+  constant to a value that happens to be constant, and the wrong one reads *better* (no setup, no
+  async, fast). The only thing that finds it is asking, of a named parity guard, **"which line in
+  this file reaches the thing the name says it is parity WITH?"** — and if the answer is "none",
+  the guard is measuring its own left hand against its right.
 
 ### Three shapes already exist for the World axis — copy one, do not mint a fourth
 

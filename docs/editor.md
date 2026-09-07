@@ -1568,19 +1568,54 @@ the binding is repointed via `remapEditingAssetPath` rather than reopened: reope
 re-fetches from disk and would discard the in-memory doc, which after a rename is the newer
 of the two.
 
-**Six call sites, and they are the whole contract** — asset delete (`executeDeletion`),
-folder delete (`handleDeleteFolder`, which deliberately does *not* route through
-`executeDeletion`), asset rename, cut/paste move, folder rename, and drag-drop into a folder
-(`handleFilesDrop`). The four move sites remap in their **undo/redo closures** too, since
-those move the file back — and each closure gates the remap on the move actually succeeding:
-`/api/move-file` 409s when the destination exists, and repointing a binding at a path the
-file is *not* at is the forking bug itself.
+⚠️ **"Binding" undersells what `applyAssetPathMoves` repairs.** It started as the five
+`editing<X>Asset` fields and has grown every time something else turned out to be path-keyed:
+the **parked writes** and their **`ifMatch` CAS baselines** (#259), the **flushed-record maps**,
+**`currentFolder`** (#854) and the **Inspector selection** (#867). Anything else keyed by asset
+path belongs here too, not at a call site — including `expanded` and `pendingFolders`, which were
+remapped by hand at three of the thirteen sites until #867's own review pointed out that they were
+never out of reach: `assetFolderState.ts` holds them at MODULE scope with exported setters (its
+header says they **must not** go back into `useState`, #309), and this module already imported
+`remapCurrentFolder` from that very file. `remapFolderSets` now runs in the seam with everything
+else. What stayed at the call site is `commitFolderRename`'s `.add(newPath)` — keeping a renamed
+folder open is a property of that gesture, not of the repair.
 
-Two sweep lessons are baked into that list. The first version wired only `executeDeletion`
-and missed four; a follow-up sweep for `moveFileTo` call sites still missed `handleFilesDrop`,
-which uses the sibling helper **`moveFile`** (folder target) instead. Grep for the *behaviour*
-— "what changes an asset's path?" — not for one helper's name. A copy/paste is deliberately
-absent: it creates a new file and leaves the original in place, so nothing bound has moved.
+**⚠️ The call sites are NOT the contract any more (#867) — the MOVE carries the repair.**
+This section used to read *"six call sites, and they are the whole contract"*, and both halves
+of that were wrong by the time it was written: there are **13 direct call sites** (5 in
+`Assets.tsx`, 8 in `assetUndo.ts`) plus `unbindDeletedAssetEditors` wrapping it for 4 more, and
+enumerating them was never going to hold. Three sites failing the same way is a **missing seam**,
+not a longer to-do list:
+
+- **`modoki_move_asset` could not call the repair AT ALL.** The MCP server is a different
+  *process* from the renderer. So `POST /api/move-file` — the one place a move actually happens —
+  now calls the renderer back through `ctx.requestBrowser('apply-asset-path-moves', …)`, the same
+  server→renderer RPC ~20 other routes use, already abstracted over Vite HMR and Electron IPC. It
+  swallows a missing renderer on purpose: a CLI move has no in-memory state to repair.
+- **A dragged FOLDER built an exact-path move**, so `applyMove` returned `undefined` for every
+  descendant. `planFilesDropMoves` (`utils/assetPaths.ts`) is now the pure planner and sets
+  `prefix` from whether the thing is a folder — asked of the tree per path, because a
+  multi-selection drag carries ONE payload for many. `DropMove` carries `prefix` through undo and
+  redo; reversing a prefix move is still a prefix move.
+- **The route is the only party that can tell a folder from a file** on the agent path — the
+  client passes two strings and they look identical. `statSync().isDirectory()`.
+
+The panel still repairs synchronously when *it* is the mover, and that is not redundancy:
+**ordering is load-bearing** — the registry must be repaired before the selection moves, because
+`AtlasAssetView`'s load effect keys on the selected path for its CAS baseline. Applying a move
+twice is a no-op (`applyMove` matches on `from`, and after the first pass nothing is at `from`),
+so the route's call is a safe backstop for every caller that is not the panel.
+
+Each undo/redo closure still gates its remap on the move actually succeeding: `/api/move-file`
+409s when the destination exists, and repointing a binding at a path the file is *not* at is the
+forking bug itself. A copy/paste is deliberately absent — it creates a new file and leaves the
+original in place, so nothing bound has moved.
+
+The sweep lesson that produced the old list — *"grep for the behaviour, not for one helper's
+name"* — is what the seam retires. It was good advice for a repair wired to call sites, and it
+still failed twice: the first version wired only `executeDeletion` and missed four, and a
+follow-up sweep for `moveFileTo` missed `handleFilesDrop` because it uses the sibling helper
+`moveFile`. **A repair you have to remember to call is one you will eventually not call.**
 
 Folder matching is **segment-boundary**, not `startsWith`: renaming `/assets/anim` must not
 capture `/assets/animations/…`. Adding a sixth binding editor means adding a row to

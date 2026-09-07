@@ -13,6 +13,10 @@ import { createTestWorld, type TestWorld, Transform, EntityAttributes,
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
+import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { DEVICE_READ_ASSET_DEF_TYPES } from '../../tools/game-debug-mcp/src/mcp-tools';
+import { classifyReadAssetDef, probePathFor, probeServedTypes, type ReadAssetDefProbe }
+  from '../tools/readAssetDefServed';
 
 registerAllTraits();
 
@@ -551,4 +555,42 @@ describe('hierarchy: the cycle-safety bound must not cut a LEGAL deep chain shor
     ]);
     expect(answered).not.toBe('HUNG');
   }, 8000);
+});
+
+/** The DEVICE twin of #855's probe. `device_read_asset_def`'s enum is a second hand-kept copy of
+ *  what an op serves, in a package that likewise cannot import the engine — so it drifts for the
+ *  same reason and was covered by the same const-vs-const guard. Rationale + the shared classifier:
+ *  `engine/tests/tools/readAssetDefServed.ts`. Editor twin: `tests/editor/readAssetDef.test.ts`.
+ *
+ *  Two surfaces, two files, on purpose: `registerAgentOp` is register-or-replace on one Map, and
+ *  importing the editor ops would permanently swap this runtime twin out of the registry. */
+describe('device_read_asset_def\'s enum lists exactly what THIS op dispatches (#855)', () => {
+  /** The device op RETURNS `{ok:false, error}` where the editor op throws. */
+  const probe: ReadAssetDefProbe = async ({ path, type }) => {
+    const r = await runAgentOp('read-asset-def', { path, type }) as { ok?: boolean; error?: string };
+    return r.ok === false ? (r.error ?? 'refused with no error text') : '';
+  };
+
+  it('the probe DISTINGUISHES a dispatched type from one with no arm', async () => {
+    // Non-vacuity: an assertion resting on a probe that cannot tell these apart proves nothing.
+    game = createTestWorld({});
+    expect(classifyReadAssetDef('particle', await probe({ path: probePathFor('particle'), type: 'particle' })))
+      .toBe('served');
+    expect(classifyReadAssetDef('atlas', await probe({ path: probePathFor('atlas'), type: 'atlas' })))
+      .toBe('no-branch');
+  });
+
+  it('every type in the device enum is one the op actually dispatches, and no other is', async () => {
+    game = createTestWorld({});
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...report.served].sort());
+  });
+
+  it('serves the SAME set as the editor twin — two ops, one advertised contract', async () => {
+    // The editor op cannot be probed here (see the header), so this is the honest const-vs-const
+    // half: both enums are hand-kept copies, and each is pinned to its OWN op in its own file.
+    // What this adds is that the two ops have not diverged from each other.
+    const { READ_ASSET_DEF_TYPES_FOR_TESTS } = await import('../../tools/modoki-mcp/src/tools/assets');
+    expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort());
+  });
 });

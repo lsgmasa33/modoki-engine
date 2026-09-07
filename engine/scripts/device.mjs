@@ -37,6 +37,7 @@ import path from 'node:path';
 
 import {
   claimDevice, releaseDevice, listClaims, describeConflict, foreignClaimFor, CLI_CLAIM_TTL_MS,
+  sameClone,
 } from './deviceClaimsStore.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 
@@ -362,10 +363,11 @@ function resolveIosProductType(udid) {
  *     hand what an automated comparison could not settle. */
 function checkIosPhoneCollision(udid, { force }) {
   const foreignWithModel = listClaims().filter(
-    // Compared as PATHS, not strings: a claim recorded with a trailing slash (or any other spelling
-    // of the same directory) must not make this clone look like a stranger and refuse its own phone.
-    // `claim-guard.mjs` resolves the same comparison the same way.
-    (c) => c.deviceId.startsWith('ip:') && path.resolve(c.clone) !== path.resolve(repoRoot) && c.model,
+    // Compared through `sameClone` (#865) — the ONE comparison, shared with `foreignClaimFor`,
+    // `ownAdbClaim` and `claim-guard.mjs`. Two spellings of the same directory still match; an
+    // unqualified stored path now matches NOTHING, so it reads as foreign and gets warned about
+    // rather than silently resolving onto this cwd and vanishing from the list.
+    (c) => c.deviceId.startsWith('ip:') && !sameClone(c.clone, repoRoot) && c.model,
   );
   if (!foreignWithModel.length) return;
 

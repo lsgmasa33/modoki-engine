@@ -27,6 +27,12 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 // was actually trashed) rebuildManifest. The rest is cast away — if a future change
 // makes the handler reach another method, the undefined call will throw loudly
 // rather than pass silently.
+//
+// That is exactly what happened when #867 made this route repair the renderer: the handler
+// started reaching `absToAssetUrl` and `requestBrowser`, and these tests went red rather than
+// quietly passing over a half-exercised route. Both are stubbed here only enough to let the
+// manifest-rebuild branches below run — what the route SENDS the renderer is asserted in
+// `moveFileRouter.test.ts`, against the real resolver.
 function makeCtx(
   resolve: (p: string) => string | null,
   rebuild: () => unknown = () => ({ version: 2, assets: [], folders: [] }),
@@ -35,6 +41,8 @@ function makeCtx(
     projectRoot: os.tmpdir(),
     resolveAssetPath: resolve,
     rebuildManifest: rebuild,
+    absToAssetUrl: () => null,   // → the route falls back to the absolute path; not asserted here
+    requestBrowser: async () => ({ ok: true, notes: [] }),
     getSchema: () => undefined,
     firstRootDir: () => null,
     invalidateProjectConfig: () => {},

@@ -483,6 +483,83 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     void sent;
   });
 
+  /** ⚠️ The per-path flush must NOT drop the baseline, precisely because its result goes nowhere.
+   *
+   *  The batch flush drops it on a 409 because that refusal is REPORTED — `toastForSave` names the
+   *  path — so the next explicit Cmd+S is the human choosing to overwrite. All EIGHT callers of
+   *  `flushPendingMetaFor` discard its result (bare `await`), so a conflict there reaches no UI at
+   *  all. Dropping the baseline would disarm the compare-and-swap silently, and the next save would
+   *  overwrite the external change and report success — worse than the wedge, with nobody told.
+   *
+   *  The wedge stays closed because both read the same map: the path is still parked, and the next
+   *  Cmd+S conflicts ONCE through the batch flush, which does tell the human, and drops it there. */
+  it('flushPendingMetaFor KEEPS the baseline on a conflict — its result reaches no UI', async () => {
+    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+
+    const r = await flushPendingMetaFor(TEX);
+
+    expect(r.failed).toHaveLength(1);
+    expect(r.failed[0].conflict, 'the conflict must be structured, not grepped out of the prose').toBe(true);
+    expect(peekMetaBaseline(TEX), 'a silent drop here disarms the CAS with nobody told').toBe('BEFORE');
+    expect(hasPendingMeta(), 'and the edit must survive').toBe(true);
+  });
+
+  /** The batch flush's drop is the one that IS reported, so it keeps its drop — and marks the
+   *  failure as a conflict so `toastForSave` can say the retry will overwrite rather than wording
+   *  it like a retryable blip. */
+  it('flushPendingMeta marks a 409 as a CONFLICT, distinguishably from a plain failure', async () => {
+    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+
+    const conflicted = await flushPendingMeta();
+    expect(conflicted.failed[0].conflict).toBe(true);
+
+    // A plain 500 must NOT be marked — the two have opposite remedies.
+    clearPendingMeta(); clearMetaBaselines();
+    stubWithHeader('BEFORE', { status: 500, body: { ok: false } });
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+
+    const failed = await flushPendingMeta();
+    expect(failed.failed[0].conflict).toBeUndefined();
+  });
+
+  /** ⚠️ The id-loss guard, at the level that actually covers it. `/api/write-meta` replaces the
+   *  sidecar wholesale, so a park built while the panel shows defaults from a FAILED read writes an
+   *  id-less document — and the scanner then mints a fresh GUID, dangling every reference. The two
+   *  modal editors refuse to save; the eight ASSET VIEWS need no modal at all, which makes an
+   *  ordinary field change the common route to it. Guarding in the registry covers all of them,
+   *  and the ninth view somebody adds tomorrow. */
+  it('refuses to park after a FAILED read — an id-less wholesale write costs the asset its GUID', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 500, headers: { get: () => null }, text: async () => '', json: async () => ({}),
+    } as unknown as Response)));
+    const { meta } = await readMetaPreferringPark(TEX);
+    expect(meta, 'the fallback the panel would spread').toEqual({});
+
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });   // the panel's field change
+
+    expect(hasPendingMeta(), 'parking this is how the GUID gets destroyed').toBe(false);
+  });
+
+  it('parks again once a later read SUCCEEDS — a dev-server blip is transient', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 500, headers: { get: () => null }, text: async () => '', json: async () => ({}),
+    } as unknown as Response)));
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    expect(hasPendingMeta()).toBe(false);
+
+    stubWithHeader('AFTER-RECOVERY');
+    await readMetaPreferringPark(TEX);
+    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+
+    expect(hasPendingMeta(), 'the refusal must not be permanent').toBe(true);
+  });
+
   it('discarding a park forgets its baseline too', async () => {
     stubWithHeader('BEFORE');
     await readMetaPreferringPark(TEX);

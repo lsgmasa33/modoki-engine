@@ -117,6 +117,11 @@ export { resolveAnimatorRootForClip } from './panels/openAssetInEditor';
 // The create path the Assets panel's "New X" flow and the `create-registered-asset` agent op BOTH
 // run, so a kind that works for the human cannot silently differ for a tool (#288 gap 5).
 export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset';
+/** The asset-move repair seam (#867). Exported so the agent op that the /api/move-file route
+ *  calls back into can reach it — an out-of-process move (modoki_move_asset) has no other way
+ *  to repair the renderer's path-keyed state. */
+export { applyAssetPathMoves, unbindDeletedAssetEditors } from './panels/assetEditorBindings';
+export type { PathMove } from './utils/assetPaths';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';

@@ -203,12 +203,18 @@ describe('snapshot identity — useSyncExternalStore compares by reference', () 
 
 describe('the #309 scenario, driven through the real undo builder', () => {
   // The panel is not mounted anywhere in this file — which is exactly the condition under
-  // which the old captured setters no-opped. Passing the store's module functions is what
-  // makes the same call land.
+  // which the old captured setters no-opped.
+  //
+  // ⚠️ This used to pass the store's module functions in, and said that was "what makes the same
+  // call land". It no longer takes them: #867 moved the remap into `applyAssetPathMoves` itself
+  // (`remapFolderSets`), which the builder already calls in both directions, so the wiring these
+  // assertions were said to prove is gone. They still measure the #309 property — a builder's
+  // closures outliving the panel must still reach the module-scope store — they just now prove it
+  // of the seam rather than of a passed-in setter. That is a STRONGER version of the same claim:
+  // there is no longer a setter to forget to pass.
   const renameUndo = () => makeFolderRenameUndo({
     oldPath: '/A', newPath: '/B', folderName: 'A',
     refresh: () => {},
-    setPendingFolders, setExpanded,
   });
 
   it('undo remaps the expanded set back to the old path and persists it', async () => {

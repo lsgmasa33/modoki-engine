@@ -11,7 +11,15 @@
  *  `Record<AssetSchemaType, …>`, makes a missing schema a compile error), and the router imports
  *  it. The MCP package genuinely cannot import it — it bundles standalone with its own
  *  node_modules and pulls nothing from the engine — so this guard is what holds that last copy in
- *  place, from BOTH directions plus the behaviour that actually matters.
+ *  place, from BOTH directions.
+ *
+ *  ⚠️ **Scope, after #855: this file compares the enums to the SCHEMA LIST, never to an op.**
+ *  `ASSET_SCHEMA_TYPES` is a legitimate subject for the `modoki_asset_schema`/`modoki_create_asset`
+ *  enum, because `SCHEMAS` is keyed by it — the constant IS the thing those tools serve. It is NOT
+ *  a legitimate subject for `read-asset-def`, whose served set is a property of a dispatch chain in
+ *  two other files; deriving that here from a hand-maintained exemption map is what made this guard
+ *  unfalsifiable and pushed `de3cdce48` the wrong way. That half now lives with each op — see the
+ *  comment above the second describe below.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -55,41 +63,37 @@ describe('the MCP asset-type enum matches the engine schema list', () => {
   });
 });
 
-// Asset types `read-asset-def` (agentBridge.ts / agentEditorOps.ts) deliberately does NOT serve,
-// each with the reason — mirrors the `NOT_LIVE_RELOADABLE` shape in liveReloadKinds.test.ts. Add a
-// name here only with a verified reason, never to silence a failure.
-const NOT_READABLE: Record<string, string> = {
-  material: 'that op refuses it outright — a material\'s live cache holds only the compiled ' +
-    'THREE.Material, not the authored JSON (see agentEditorOps.ts / agentBridge.ts).',
-  atlas: 'the op has no `atlas` branch (agentEditorOps.ts\'s own error enumerates particle | ' +
-    'animation | spriteanim | timeline | rig2d | shader | animset, no atlas) and atlas holds no ' +
-    'engine-side cache to read back — atlas frames are read straight off the manifest ' +
-    '(assetInvalidation.ts) and persist.ts\'s `invalidateAtlasFile` is a documented no-op, so ' +
-    'there is nothing live to serve.',
-};
+// What `read-asset-def` serves is NOT decided here any more (#855). This file used to derive it:
+//
+//     const READ_ASSET_DEF_TYPES = ASSET_SCHEMA_TYPES.filter((t) => !(t in NOT_READABLE));
+//
+// — a hand-maintained exemption map subtracted from a sibling constant, with nothing in the file
+// ever calling the op. So every assertion compared one derived constant against another and the
+// guard could not fail for the reason it existed; when #831 grew the schema list, the cheapest way
+// to green was to widen the enums, and `de3cdce48` widened them to `atlas`, which the op has no arm
+// for. A tool that ACCEPTS a type it cannot serve is worse than one that refuses it.
+//
+// The enum is now pinned against the OP, by probing it, in the two files that can each reach one:
+//   - `tests/editor/readAssetDef.test.ts`        — modoki_read_asset_def vs agentEditorOps.ts
+//   - `tests/framework/liveLifecycleOps.test.ts` — device_read_asset_def vs agentBridge.ts
+// (Two files because `registerAgentOp` is register-or-replace on one Map and the editor
+// registration is one-shot — see `tests/tools/readAssetDefServed.ts`.)
+//
+// What stays HERE is the half this file can honestly observe: that the shipped tools are
+// registered with that enum and validate against it. That is not parity with the op — it is
+// parity with the transport, and it is the `modoki_prefab` class (400'd on every call for months
+// with a green suite because no test ever loaded the real tool surface).
 
-// The types `read-asset-def` actually serves: every `ASSET_SCHEMA_TYPES` entry minus the ones in
-// `NOT_READABLE` above.
-const READ_ASSET_DEF_TYPES = ASSET_SCHEMA_TYPES.filter((t) => !(t in NOT_READABLE));
-
-describe('the READ-asset-def enums (modoki + device) match what the op serves (#842/#843)', () => {
+describe('the READ-asset-def tools validate against their own enum (#842/#843)', () => {
   let deviceSurface: DeviceSurface | undefined;
   afterEach(async () => { await deviceSurface?.restore(); deviceSurface = undefined; });
 
-  it('modoki_read_asset_def\'s enum lists exactly the served types, in both directions', () => {
-    expect([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort()).toEqual([...READ_ASSET_DEF_TYPES].sort());
-  });
-
-  it('device_read_asset_def\'s enum lists exactly the served types, in both directions', () => {
-    expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...READ_ASSET_DEF_TYPES].sort());
-  });
-
-  it('modoki_read_asset_def ACCEPTS every served type and REFUSES material', async () => {
+  it('modoki_read_asset_def ACCEPTS every type it lists, and REFUSES material', async () => {
     surface = loadSurface();
-    for (const type of READ_ASSET_DEF_TYPES) {
+    for (const type of READ_ASSET_DEF_TYPES_FOR_TESTS) {
       await expect(
         surface.call('modoki_read_asset_def', { path: `/assets/x.${type}.json`, type }),
-        `modoki_read_asset_def refused type '${type}', which read-asset-def serves`,
+        `modoki_read_asset_def refused type '${type}', which it advertises`,
       ).resolves.toBeDefined();
     }
     await expect(
@@ -98,17 +102,36 @@ describe('the READ-asset-def enums (modoki + device) match what the op serves (#
     ).rejects.toThrow();
   });
 
-  it('device_read_asset_def ACCEPTS every served type and REFUSES material', async () => {
+  it('modoki_read_asset_def REFUSES atlas at zod — de3cdce48\'s regression, pinned at the surface', async () => {
+    // The shipped consequence of the widening: the call passed validation and died at the backend,
+    // with the tool description advertising `.atlas.json`. `atlas` is a real ASSET_SCHEMA_TYPES
+    // entry and a real `modoki_create_asset` type, so "it is not an asset type" would be wrong —
+    // it is specifically not a READABLE one.
+    surface = loadSurface();
+    await expect(
+      surface.call('modoki_read_asset_def', { path: '/assets/x.atlas.json', type: 'atlas' }),
+    ).rejects.toThrow();
+    await expect(surface.call('modoki_create_asset', { type: 'atlas', path: '/assets/x.atlas.json' }))
+      .resolves.toBeDefined();
+  });
+
+  it('device_read_asset_def ACCEPTS every type it lists, and REFUSES material', async () => {
     deviceSurface = await loadDeviceSurface();
-    for (const type of READ_ASSET_DEF_TYPES) {
+    for (const type of DEVICE_READ_ASSET_DEF_TYPES) {
       expect(
         deviceSurface.validate('device_read_asset_def', { path: `/assets/x.${type}.json`, type }).ok,
-        `device_read_asset_def refused type '${type}', which read-asset-def serves`,
+        `device_read_asset_def refused type '${type}', which it advertises`,
       ).toBe(true);
     }
     expect(
       deviceSurface.validate('device_read_asset_def', { path: '/assets/x.mat.json', type: 'material' }).ok,
       'device_read_asset_def accepted \'material\', which read-asset-def deliberately refuses',
     ).toBe(false);
+  });
+
+  it('device_read_asset_def REFUSES atlas at zod too', async () => {
+    deviceSurface = await loadDeviceSurface();
+    expect(deviceSurface.validate('device_read_asset_def', { path: '/assets/x.atlas.json', type: 'atlas' }).ok)
+      .toBe(false);
   });
 });

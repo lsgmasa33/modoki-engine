@@ -12,9 +12,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // one call site, and widening the public surface for a test is a cost with no buyer.
 import {
   resolveBindingMoves, ASSET_EDITOR_BINDINGS, applyMovesToParkedAssets,
-  applyAssetPathMoves,
+  applyAssetPathMoves, applyMovesToSelection,
 } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { applyMove } from '../../packages/modoki/src/editor/utils/assetPaths';
+import { applyMove, planFilesDropMoves } from '../../packages/modoki/src/editor/utils/assetPaths';
+import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { makeFilesDropUndo } from '../../packages/modoki/src/editor/panels/assetUndo';
+import * as assetOps from '../../packages/modoki/src/editor/panels/assetOps';
+import { canUndo, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import {
   markAssetDirty, clearDirtyAssets, getDirtyAssetPaths, peekDirtyAsset,
   flushDirtyAssets, getLastFlushedAssetHash, getLastFlushedAsset,
@@ -457,5 +461,212 @@ describe('applyMovesToParkedAssets carries the flushed-hash record across a CHAI
     expect(getLastFlushedAssetHash(C)).toBe(hashFor(B));
     expect(getLastFlushedAsset(B)).toEqual({ doc: 'A' });
     expect(getLastFlushedAsset(C)).toEqual({ doc: 'B' });
+  });
+});
+
+/** #867 member 2 — the dragged FOLDER.
+ *
+ *  `handleFilesDrop` built `{from, to}` with no `prefix`, and `DropMove` had no such field at all,
+ *  so the type foreclosed a folder move: `applyMove` took its exact-path branch and returned
+ *  `undefined` for every descendant. The drag payload has carried `isFolder: true` since folders
+ *  became draggable and nothing has ever read it.
+ *
+ *  ⚠️ The pre-existing 'preserves the CAS BASELINE across a FOLDER move too' test above passes
+ *  `prefix: true` BY HAND. It proves the branch works and says nothing about whether the one
+ *  production caller sets it — which is the entire defect. These tests drive the planner that
+ *  caller now uses. */
+describe('planFilesDropMoves marks a folder drag as a prefix move (#867)', () => {
+  const isFolder = (p: string) => p === '/assets/anim' || p === '/assets/archive';
+
+  it('a dragged FOLDER gets prefix, so the repair reaches everything under it', () => {
+    const moves = planFilesDropMoves(['/assets/anim'], '/assets/archive', isFolder);
+    expect(moves).toEqual([{ from: '/assets/anim', to: '/assets/archive/anim', prefix: true }]);
+    // The consequence, spelled out: a CHILD is repaired only because of that flag.
+    expect(applyMove('/assets/anim/walk.anim.json', moves[0])).toBe('/assets/archive/anim/walk.anim.json');
+  });
+
+  it('a dragged FILE does not get prefix — it must not capture its path-prefix siblings', () => {
+    const moves = planFilesDropMoves(['/assets/anim/walk.anim.json'], '/assets/archive', isFolder);
+    expect(moves[0].prefix).toBeUndefined();
+  });
+
+  it('a mixed multi-selection gets it per PATH, which one drag payload cannot express', () => {
+    // The payload carries a single `isFolder` for the whole drag, so reading it would be wrong
+    // here even if anything did read it. The tree is asked about each path instead.
+    const moves = planFilesDropMoves(
+      ['/assets/anim', '/assets/fx/spark.particle.json'], '/assets/archive', isFolder,
+    );
+    expect(moves.map((m) => m.prefix)).toEqual([true, undefined]);
+  });
+
+  it('keeps the pre-existing skips: same folder, onto itself, into its own descendant', () => {
+    expect(planFilesDropMoves(['/assets/fx/a.json'], '/assets/fx', isFolder)).toEqual([]);
+    expect(planFilesDropMoves(['/assets/anim'], '/assets/anim', isFolder)).toEqual([]);
+    expect(planFilesDropMoves(['/assets/anim'], '/assets/anim/sub', isFolder)).toEqual([]);
+  });
+
+  it('a FOLDER move repairs a parked write for a file inside it, end to end', () => {
+    clearDirtyAssets();
+    const child = '/assets/anim/walk.anim.json';
+    markAssetDirty(child, 'animation', { duration: 3 }, 'panel', 'baseline-sha');
+    const moves = planFilesDropMoves(['/assets/anim'], '/assets/archive', isFolder);
+    applyAssetPathMoves(moves);
+    expect(getDirtyAssetPaths()).toEqual(['/assets/archive/anim/walk.anim.json']);
+    // The CAS baseline has to travel too, or the next Cmd+S 409s at the new path.
+    expect(peekDirtyAsset('/assets/archive/anim/walk.anim.json')?.ifMatch).toBe('baseline-sha');
+    clearDirtyAssets();
+  });
+});
+
+/** #867 member 3 — the Inspector selection was repaired at ONE of thirteen move sites. */
+describe('applyMovesToSelection repairs the Inspector (#867)', () => {
+  const asset = (path: string) => ({ path, type: 'animation', name: path.slice(path.lastIndexOf('/') + 1) });
+  const select = (lead: ReturnType<typeof asset> | null, list: ReturnType<typeof asset>[] = lead ? [lead] : []) =>
+    useEditorStore.getState().remapSelectedAssets({ selectedAsset: lead, selectedAssets: list });
+  afterEach(() => select(null, []));
+
+  it('repoints the lead selection at the new path', () => {
+    select(asset(ANIM));
+    applyMovesToSelection([{ from: ANIM, to: '/assets/anim/run.anim.json' }]);
+    expect(useEditorStore.getState().selectedAsset?.path).toBe('/assets/anim/run.anim.json');
+  });
+
+  it('KEEPS the name when the move only relocated the file', () => {
+    // The name here is the manifest DISPLAY name, deliberately unlike the basename — a fixture
+    // whose name equals its basename cannot tell "kept" from "re-derived", and the first version
+    // of this test could not.
+    select({ path: '/assets/anim/walk.anim.json', type: 'animation', name: 'Walk.Animation' });
+    applyMovesToSelection([{ from: '/assets/anim', to: '/assets/clips', prefix: true, name: 'clips' }]);
+    const sel = useEditorStore.getState().selectedAsset;
+    expect(sel?.path).toBe('/assets/clips/walk.anim.json');
+    // NOT 'clips' (that is the FOLDER's new name — applying it would rename every file in a moved
+    // folder to the folder's name) and NOT 'walk.anim.json' (a third format: the display name is a
+    // stem on the rename path, the manifest name on the click path, never the basename).
+    expect(sel?.name).toBe('Walk.Animation');
+  });
+
+  it('takes the move\'s own name on an EXACT rename', () => {
+    select({ path: '/assets/anim/walk.anim.json', type: 'animation', name: 'Walk.Animation' });
+    applyMovesToSelection([{ from: '/assets/anim/walk.anim.json', to: '/assets/anim/run.anim.json', name: 'run' }]);
+    expect(useEditorStore.getState().selectedAsset?.name).toBe('run');
+  });
+
+  it('DERIVES the stem when a rename carries no name — the agent path (#867)', () => {
+    // `/api/move-file` has no display-name convention to send, so a rename arriving from the MCP
+    // process carries `{from, to}` only. Deriving it the way `planRename` builds one (stem, not
+    // basename) is what keeps the Inspector from showing the previous filename.
+    select({ path: '/assets/anim/walk.anim.json', type: 'animation', name: 'Walk.Animation' });
+    applyMovesToSelection([{ from: '/assets/anim/walk.anim.json', to: '/assets/anim/run.anim.json' }]);
+    expect(useEditorStore.getState().selectedAsset?.name).toBe('run');
+  });
+
+  it('drops a DELETED asset from the multi-selection and clears the lead', () => {
+    select(asset(ANIM), [asset(ANIM), asset(SEQ)]);
+    applyMovesToSelection([{ from: ANIM, to: null }]);
+    const s = useEditorStore.getState();
+    expect(s.selectedAsset).toBeNull();
+    expect(s.selectedAssets.map((a) => a.path)).toEqual([SEQ]);
+  });
+
+  it('leaves an UNRELATED selection alone', () => {
+    select(asset(SEQ));
+    applyMovesToSelection([{ from: ANIM, to: '/assets/anim/run.anim.json' }]);
+    expect(useEditorStore.getState().selectedAsset?.path).toBe(SEQ);
+  });
+
+  it('runs from applyAssetPathMoves — the SEAM, not a fourteenth call site', () => {
+    // This is the assertion that distinguishes the fix from the bug it replaces: every existing
+    // site already calls applyAssetPathMoves, so being inside it IS the repair reaching them all.
+    select(asset(ANIM));
+    applyAssetPathMoves([{ from: ANIM, to: '/assets/anim/run.anim.json' }]);
+    expect(useEditorStore.getState().selectedAsset?.path).toBe('/assets/anim/run.anim.json');
+  });
+
+  it('does NOT push an undo entry — a repair must not land in the history (#867)', () => {
+    // `selectAsset` pushes an undoable `Select …`. If the repair used it, Cmd+Z after a rename
+    // would step through a selection change the user never made.
+    select(asset(ANIM));
+    const before = useEditorStore.getState().selectedAsset?.path;
+    expect(before).toBe(ANIM);
+    const historyBefore = { can: canUndo(), label: undoLabel() };
+    applyAssetPathMoves([{ from: ANIM, to: '/assets/anim/run.anim.json' }]);
+    // The label is the sharp half: a pushed `Select walk.anim.json` would change it even where
+    // canUndo() was already true for an unrelated reason.
+    expect({ can: canUndo(), label: undoLabel() }).toEqual(historyBefore);
+  });
+});
+
+/** #867 — `prefix` has to survive UNDO, or a folder drag repairs its children on the way out and
+ *  abandons them on the way back. That asymmetry is the same defect pointing the other way, and it
+ *  is the shape `bb87c17bc` already shipped once for `currentFolder` (forward path right, undone
+ *  path wrong), so it is worth pinning rather than assuming. */
+describe('makeFilesDropUndo carries prefix in BOTH directions (#867)', () => {
+  const FOLDER = { from: '/assets/anim', to: '/assets/archive/anim', prefix: true };
+  const CHILD_AT_DEST = '/assets/archive/anim/walk.anim.json';
+  const CHILD_AT_SRC = '/assets/anim/walk.anim.json';
+
+  beforeEach(() => {
+    clearDirtyAssets();
+    // The undo/redo closures move files through the backend; this suite is about the PathMoves
+    // they hand the repair, so the move itself is stubbed as succeeding.
+    vi.spyOn(assetOps, 'moveFileToStatus').mockResolvedValue({ ok: true, status: 200 });
+  });
+  afterEach(() => { vi.restoreAllMocks(); clearDirtyAssets(); });
+
+  it('undo repairs a child of the moved folder, not just the folder', async () => {
+    const action = makeFilesDropUndo({ moves: [FOLDER], refresh: () => {} });
+    markAssetDirty(CHILD_AT_DEST, 'animation', { duration: 3 }, 'panel');
+    await action.undo();
+    // Without `prefix` on the reversed move, applyMove returns undefined for this path and the
+    // parked write is stranded at a location the file has left.
+    expect(getDirtyAssetPaths()).toEqual([CHILD_AT_SRC]);
+  });
+
+  it('redo repairs it back', async () => {
+    const action = makeFilesDropUndo({ moves: [FOLDER], refresh: () => {} });
+    markAssetDirty(CHILD_AT_DEST, 'animation', { duration: 3 }, 'panel');
+    await action.undo();
+    await action.redo();
+    expect(getDirtyAssetPaths()).toEqual([CHILD_AT_DEST]);
+  });
+});
+
+/** Review finding: renaming a BOUND asset left the panel header stale (#867).
+ *
+ *  `handleRename` awaits `/api/move-file`, whose repair now runs FIRST and carries no `name`.
+ *  `remapEditingAssetPath` does `name: name ?? cur.name`, so the binding took the new PATH and kept
+ *  the OLD name; the panel's own name-carrying call one line later then found the binding already
+ *  at the destination, `applyMove` returned `undefined`, and the name was never applied. The
+ *  SpriteAnim/Animation/Timeline panel headers render `asset?.name`, so they kept showing the
+ *  previous filename — and `AnimationEditor`/`TimelineEditor` build their fallback doc from it on a
+ *  load failure, which bakes the stale name into what gets saved. */
+describe('resolveBindingMoves keeps a bound editor\'s NAME fresh (#867 review)', () => {
+  const boundTo = (path: string) => [{ label: 'animation', path }];
+
+  it('derives the new stem for a rename that carries no name — the route\'s repair', () => {
+    const [change] = resolveBindingMoves(
+      boundTo('/assets/anim/walk.anim.json'),
+      [{ from: '/assets/anim/walk.anim.json', to: '/assets/anim/run.anim.json' }],
+    );
+    expect(change.to).toBe('/assets/anim/run.anim.json');
+    expect(change.name).toBe('run');
+  });
+
+  it('leaves the name alone for a pure relocation, so the store keeps what it has', () => {
+    // `undefined` is the "keep it" signal — `remapEditingAssetPath` falls back to `cur.name`.
+    const [change] = resolveBindingMoves(
+      boundTo('/assets/anim/walk.anim.json'),
+      [{ from: '/assets/anim', to: '/assets/archive/anim', prefix: true }],
+    );
+    expect(change.to).toBe('/assets/archive/anim/walk.anim.json');
+    expect(change.name).toBeUndefined();
+  });
+
+  it('never applies a FOLDER rename\'s name to a child', () => {
+    const [change] = resolveBindingMoves(
+      boundTo('/assets/anim/walk.anim.json'),
+      [{ from: '/assets/anim', to: '/assets/clips', prefix: true, name: 'clips' }],
+    );
+    expect(change.name).toBeUndefined();
   });
 });

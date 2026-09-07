@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vites
 import {
   getCurrentFolder, setCurrentFolder, remapCurrentFolder, __resetAssetFolderStateForTest,
   __subscribeAssetFolderStateForTest,
+  getExpanded, setExpanded, getPendingFolders, setPendingFolders, remapFolderSets,
 } from '../../packages/modoki/src/editor/panels/assetFolderState';
 import { projectScopedKey } from '../../packages/modoki/src/editor/projectScopedKey';
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
@@ -142,5 +143,47 @@ describe('applyAssetPathMoves repairs currentFolder (the undo/redo path #854 mis
     // Assets.tsx's rename/delete handlers at all.
     applyAssetPathMoves([{ from: '/assets/clips', to: '/assets/anim', prefix: true }]);
     expect(getCurrentFolder()).toBe('/assets/anim');
+  });
+});
+
+/** `remapFolderSets` — `expanded` and `pendingFolders` are keyed by folder path too, and were
+ *  remapped by hand at three of the thirteen seam call sites (#867 review). A folder move left
+ *  every entry under it stranded: a tree that reopens collapsed, and a `pendingFolders` entry
+ *  naming a folder that no longer exists — which `defaultTargetFolder` will happily hand out,
+ *  resurrecting it on the next create. Same mechanism as `remapCurrentFolder` above, one level up. */
+describe('remapFolderSets', () => {
+  it('repoints the moved folder AND everything under it', () => {
+    setExpanded(() => new Set(['/assets/anim', '/assets/anim/sub', '/assets/other']));
+    remapFolderSets([{ from: '/assets/anim', to: '/assets/archive/anim' }]);
+    expect([...getExpanded()].sort()).toEqual(
+      ['/assets/archive/anim', '/assets/archive/anim/sub', '/assets/other'],
+    );
+  });
+
+  it('drops the subtree on a DELETE rather than repointing it', () => {
+    setPendingFolders(() => new Set(['/assets/anim', '/assets/anim/sub', '/assets/keep']));
+    remapFolderSets([{ from: '/assets/anim', to: null }]);
+    expect([...getPendingFolders()]).toEqual(['/assets/keep']);
+  });
+
+  it('does NOT capture a path-prefix sibling — segment boundary, not startsWith', () => {
+    setExpanded(() => new Set(['/assets/animations/x']));
+    remapFolderSets([{ from: '/assets/anim', to: '/assets/clips' }]);
+    expect([...getExpanded()]).toEqual(['/assets/animations/x']);
+  });
+
+  it('preserves set IDENTITY when nothing matched, so no persist and no re-render', () => {
+    // `setSet` bails on an identical reference; returning a fresh Set every time would persist
+    // to localStorage and wake `useSyncExternalStore` on every single-file rename in the project.
+    setExpanded(() => new Set(['/assets/other']));
+    const before = getExpanded();
+    remapFolderSets([{ from: '/assets/anim/walk.anim.json', to: '/assets/anim/run.anim.json' }]);
+    expect(getExpanded()).toBe(before);
+  });
+
+  it('runs from applyAssetPathMoves — the SEAM, not the three call sites it replaced', () => {
+    setExpanded(() => new Set(['/assets/anim/sub']));
+    applyAssetPathMoves([{ from: '/assets/anim', to: '/assets/archive/anim', prefix: true }]);
+    expect([...getExpanded()]).toEqual(['/assets/archive/anim/sub']);
   });
 });

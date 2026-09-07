@@ -21,7 +21,6 @@ import {
   createFolderApi, moveFileToStatus,
 } from './assetOps';
 import type { AssetEntry } from '../utils/assetPaths';
-import { remapPrefix } from '../utils/assetPaths';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
 import type { PathMove } from '../utils/assetPaths';
 import { reportUndoFailure, COLLISION_STATUS } from '../undo/undoFailure';
@@ -286,18 +285,15 @@ export function makeFolderRenameUndo(params: {
   newPath: string;
   folderName: string;
   refresh: () => void;
-  setPendingFolders: (updater: (prev: Set<string>) => Set<string>) => void;
-  setExpanded: (updater: (prev: Set<string>) => Set<string>) => void;
 }): UndoAction {
-  const { oldPath, newPath, folderName, refresh, setPendingFolders, setExpanded } = params;
+  const { oldPath, newPath, folderName, refresh } = params;
   const label = `Rename folder ${folderName}`;
   return {
     label,
     undo: async () => {
       const { ok, status } = await moveFileToStatus(newPath, oldPath);
       if (ok) {
-        setPendingFolders((p) => remapPrefix(p, newPath, oldPath));
-        setExpanded((p) => remapPrefix(p, newPath, oldPath));
+        // (`expanded`/`pendingFolders` are remapped by applyAssetPathMoves itself now — #867.)
         logBindingChanges(applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]));
       } else {
         reportUndoFailure({
@@ -310,8 +306,6 @@ export function makeFolderRenameUndo(params: {
     redo: async () => {
       const { ok, status } = await moveFileToStatus(oldPath, newPath);
       if (ok) {
-        setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
-        setExpanded((p) => remapPrefix(p, oldPath, newPath));
         logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
       } else {
         reportUndoFailure({
@@ -416,8 +410,13 @@ export function makePasteUndo(params: {
 
 /** One item a drag-drop move landed on (Assets.tsx `handleFilesDrop`). `to`/`from` are
  *  explicit full paths (already resolved by the panel's folder-relative `moveFile`), so
- *  undo/redo can call `moveFileToStatus` directly without recomputing a destination folder. */
-export type DropMove = { from: string; to: string };
+ *  undo/redo can call `moveFileToStatus` directly without recomputing a destination folder.
+ *
+ *  ⚠️ `prefix` travels with the move in BOTH directions (#867). It marks the moved thing as a
+ *  FOLDER, so the repair reaches everything under it; a folder drag whose undo dropped the flag
+ *  would leave the descendants unrepaired on the way back, which is the same bug pointing the
+ *  other way. Reversing a prefix move is still a prefix move — only `from`/`to` swap. */
+export type DropMove = { from: string; to: string; prefix?: boolean };
 
 /** Undo/redo for `handleFilesDrop` (Assets.tsx, #308) — same skip-every-item shape as
  *  `makePasteUndo`'s cut branch, and the same fix: collect every move that failed in either
@@ -440,7 +439,7 @@ export function makeFilesDropUndo(params: {
       for (const m of moves) {
         if (undone.has(m.to)) continue; // already moved back by an earlier partial pass
         const { ok, status } = await moveFileToStatus(m.to, m.from);
-        if (ok) { back.push({ from: m.to, to: m.from }); undone.add(m.to); }
+        if (ok) { back.push({ from: m.to, to: m.from, prefix: m.prefix }); undone.add(m.to); }
         else { failed.push(`${m.to} → ${m.from}`); if (status === COLLISION_STATUS) collision = true; }
       }
       logBindingChanges(applyAssetPathMoves(back));
@@ -456,7 +455,7 @@ export function makeFilesDropUndo(params: {
       for (const m of moves) {
         if (!undone.has(m.to)) continue; // already at its destination — nothing to move
         const { ok, status } = await moveFileToStatus(m.from, m.to);
-        if (ok) { fwd.push({ from: m.from, to: m.to }); undone.delete(m.to); }
+        if (ok) { fwd.push({ from: m.from, to: m.to, prefix: m.prefix }); undone.delete(m.to); }
         else { failed.push(`${m.from} → ${m.to}`); if (status === COLLISION_STATUS) collision = true; }
       }
       logBindingChanges(applyAssetPathMoves(fwd));

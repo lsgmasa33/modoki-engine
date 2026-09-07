@@ -20,6 +20,25 @@ import {
 // below is that the STORE applies it — going through the typed shell would test the shell instead.
 import { clampTtlMs, MAX_CLAIM_TTL_MS } from '../../scripts/deviceClaimsStore.mjs';
 
+// (#865) Clone seeds must be FULLY QUALIFIED for the platform, so `path.resolve`, never a POSIX
+// literal. `isSameHolder` now compares through `sameClone`, which refuses a stored path that
+// `path.resolve` cannot finish without consulting `process.cwd()` — and on win32 a bare
+// `/clone/a` is exactly that. Left as literals, the takeover assertion below fails on Windows
+// while passing on macOS, and — worse — the REFUSAL assertions start passing for the wrong
+// reason: two unqualified paths are "not the same clone" even when they are the same clone, so
+// the negative half would go green with the comparison switched off entirely.
+// Production cannot produce these either: `device.mjs` always stores a resolved, realpathed root.
+const CLONE_C = path.resolve('/c');
+const CLONE_MINE_SHORT = path.resolve('/mine');
+const CLONE_A = path.resolve('/clone/a');
+const CLONE_B = path.resolve('/clone/b');
+const CLONE_OTHER = path.resolve('/clone/other');
+const CLONE_OTHER_SHORT = path.resolve('/other');
+const CLONE_MINE = path.resolve('/clone/mine');
+const CLONE_HUB = path.resolve('/Users/x/Projects/modoki');
+const CLONE_AI = path.resolve('/Users/x/Projects/modoki-ai');
+
+
 let home: string;
 let prevHome: string | undefined;
 
@@ -72,7 +91,7 @@ describe('isPidAlive', () => {
 });
 
 describe('isStale', () => {
-  const base: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 999, at: 1_000_000 };
+  const base: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 999, at: 1_000_000 };
 
   it('a dead pid is stale regardless of age (even ONE ms old)', () => {
     expect(isStale({ ...base, at: 999_999 }, { now: 1_000_000, alive: () => false })).toBe(true);
@@ -122,8 +141,8 @@ describe('listClaims / readClaims robustness', () => {
 
   it('filters out stale entries', () => {
     fs.mkdirSync(home, { recursive: true });
-    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: '/c', branch: 'main', pid: process.pid, at: Date.now() };
-    const dead: DeviceClaim = { deviceId: 'adb:DEAD', clone: '/c', branch: 'main', pid: 999_999_999, at: Date.now() };
+    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: CLONE_C, branch: 'main', pid: process.pid, at: Date.now() };
+    const dead: DeviceClaim = { deviceId: 'adb:DEAD', clone: CLONE_C, branch: 'main', pid: 999_999_999, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live, dead] }));
     const result = listClaims({ alive: (pid) => pid === process.pid });
     expect(result.map((c) => c.deviceId)).toEqual(['adb:LIVE']);
@@ -132,7 +151,7 @@ describe('listClaims / readClaims robustness', () => {
 
 describe('claimDevice', () => {
   it('succeeds on a free device and writes the claims file to disk', () => {
-    const r = claimDevice({ deviceId: 'adb:X', clone: '/clone/a', branch: 'main' });
+    const r = claimDevice({ deviceId: 'adb:X', clone: CLONE_A, branch: 'main' });
     expect(r.ok).toBe(true);
     expect(fs.existsSync(claimsFilePath())).toBe(true);
     const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8'));
@@ -142,9 +161,9 @@ describe('claimDevice', () => {
   });
 
   it('a second claim by the SAME pid is a refreshing no-op success (reconnect / re-lease)', () => {
-    const first = claimDevice({ deviceId: 'adb:X', clone: '/clone/a', branch: 'main' }, { now: 1000 });
+    const first = claimDevice({ deviceId: 'adb:X', clone: CLONE_A, branch: 'main' }, { now: 1000 });
     expect(first.ok).toBe(true);
-    const second = claimDevice({ deviceId: 'adb:X', clone: '/clone/a', branch: 'main', purpose: 'installing' }, { now: 2000 });
+    const second = claimDevice({ deviceId: 'adb:X', clone: CLONE_A, branch: 'main', purpose: 'installing' }, { now: 2000 });
     expect(second.ok).toBe(true);
     expect((second as { ok: true; claim: DeviceClaim }).claim.at).toBe(2000);
     expect((second as { ok: true; claim: DeviceClaim }).claim.purpose).toBe('installing');
@@ -156,28 +175,28 @@ describe('claimDevice', () => {
   it('a claim held by a DIFFERENT live pid is refused, naming clone/branch/pid', () => {
     // Simulate a sibling clone by writing the file directly with a pid we inject as "alive".
     fs.mkdirSync(home, { recursive: true });
-    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/other', branch: 'work-ai', pid: 424242, at: 500 };
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_OTHER, branch: 'work-ai', pid: 424242, at: 500 };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
 
     const r = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/mine', branch: 'main' },
+      { deviceId: 'adb:X', clone: CLONE_MINE, branch: 'main' },
       { now: 600, alive: (pid) => pid === 424242 || pid === process.pid },
     );
     expect(r.ok).toBe(false);
     const failure = r as { ok: false; held: DeviceClaim; message: string };
     expect(failure.held).toEqual(held);
-    expect(failure.message).toMatch(/\/clone\/other/);
+    expect(failure.message).toContain(CLONE_OTHER);
     expect(failure.message).toMatch(/work-ai/);
     expect(failure.message).toMatch(/424242/);
   });
 
   it('a stale claim held by a different (dead) pid is silently overtaken, not refused', () => {
     fs.mkdirSync(home, { recursive: true });
-    const dead: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/other', branch: 'work-ai', pid: 424242, at: 500 };
+    const dead: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_OTHER, branch: 'work-ai', pid: 424242, at: 500 };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [dead] }));
 
     const r = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/mine', branch: 'main' },
+      { deviceId: 'adb:X', clone: CLONE_MINE, branch: 'main' },
       { now: 600, alive: (pid) => pid === process.pid }, // 424242 is NOT alive
     );
     expect(r.ok).toBe(true);
@@ -186,14 +205,14 @@ describe('claimDevice', () => {
 
 describe('releaseDevice', () => {
   it('drops only THIS process\'s claim for that id', () => {
-    claimDevice({ deviceId: 'adb:X', clone: '/mine' });
+    claimDevice({ deviceId: 'adb:X', clone: CLONE_MINE_SHORT });
     releaseDevice('adb:X');
     expect(listClaims().find((c) => c.deviceId === 'adb:X')).toBeUndefined();
   });
 
   it('leaves a DIFFERENT pid\'s claim on the same device intact — release must never seize a sibling\'s hardware', () => {
     fs.mkdirSync(home, { recursive: true });
-    const sibling: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/other', branch: 'work-ai', pid: 424242, at: Date.now() };
+    const sibling: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_OTHER, branch: 'work-ai', pid: 424242, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [sibling] }));
 
     releaseDevice('adb:X', { alive: (pid) => pid === 424242 });
@@ -211,9 +230,9 @@ describe('releaseDevice', () => {
 describe('releaseAllForThisProcess', () => {
   it('drops all of this pid\'s claims and none of anyone else\'s', () => {
     fs.mkdirSync(home, { recursive: true });
-    const mine1: DeviceClaim = { deviceId: 'adb:A', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
-    const mine2: DeviceClaim = { deviceId: 'ios:B', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
-    const theirs: DeviceClaim = { deviceId: 'adb:C', clone: '/other', branch: 'work-ai', pid: 424242, at: Date.now() };
+    const mine1: DeviceClaim = { deviceId: 'adb:A', clone: CLONE_MINE_SHORT, branch: 'main', pid: process.pid, at: Date.now() };
+    const mine2: DeviceClaim = { deviceId: 'ios:B', clone: CLONE_MINE_SHORT, branch: 'main', pid: process.pid, at: Date.now() };
+    const theirs: DeviceClaim = { deviceId: 'adb:C', clone: CLONE_OTHER_SHORT, branch: 'work-ai', pid: 424242, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [mine1, mine2, theirs] }));
 
     releaseAllForThisProcess({ alive: (pid) => pid === process.pid || pid === 424242 });
@@ -231,18 +250,18 @@ describe('sweepStaleClaims (#225)', () => {
   // agents at — so the sweep is about the file agreeing with the rule.
   it('a dead-pid claim never blocked anyone in the first place', () => {
     fs.mkdirSync(home, { recursive: true });
-    const dead: DeviceClaim = { deviceId: 'adb:STALE', clone: '/other', branch: 'work-ai3', pid: 424242, at: Date.now() };
+    const dead: DeviceClaim = { deviceId: 'adb:STALE', clone: CLONE_OTHER_SHORT, branch: 'work-ai3', pid: 424242, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [dead] }));
     const alive = (pid: number) => pid === process.pid;
 
     expect(listClaims({ alive })).toEqual([]);
-    expect(claimDevice({ deviceId: 'adb:STALE', clone: '/mine' }, { alive }).ok).toBe(true);
+    expect(claimDevice({ deviceId: 'adb:STALE', clone: CLONE_MINE_SHORT }, { alive }).ok).toBe(true);
   });
 
   it('removes claims whose pid is gone and returns them, keeping live ones', () => {
     fs.mkdirSync(home, { recursive: true });
-    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
-    const dead: DeviceClaim = { deviceId: 'adb:DEAD', clone: '/other', branch: 'work-ai', pid: 424242, at: Date.now() };
+    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: CLONE_MINE_SHORT, branch: 'main', pid: process.pid, at: Date.now() };
+    const dead: DeviceClaim = { deviceId: 'adb:DEAD', clone: CLONE_OTHER_SHORT, branch: 'work-ai', pid: 424242, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [live, dead] }));
 
     const swept = sweepStaleClaims({ alive: (pid) => pid === process.pid });
@@ -254,7 +273,7 @@ describe('sweepStaleClaims (#225)', () => {
 
   it('sweeps a claim that outlived the TTL even though its pid is alive', () => {
     fs.mkdirSync(home, { recursive: true });
-    const old: DeviceClaim = { deviceId: 'adb:OLD', clone: '/mine', branch: 'main', pid: process.pid, at: 1_000 };
+    const old: DeviceClaim = { deviceId: 'adb:OLD', clone: CLONE_MINE_SHORT, branch: 'main', pid: process.pid, at: 1_000 };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [old] }));
 
     const swept = sweepStaleClaims({ now: 1_000 + CLAIM_TTL_MS + 1, alive: () => true });
@@ -269,8 +288,8 @@ describe('sweepStaleClaims (#225)', () => {
     // dropped from the file by the second pass and absent from the returned list — the caller
     // would log "swept 0" having swept 1. `alive` flips on its second probe to force that window.
     fs.mkdirSync(home, { recursive: true });
-    const a: DeviceClaim = { deviceId: 'adb:A', clone: '/mine', branch: 'main', pid: 111, at: Date.now() };
-    const b: DeviceClaim = { deviceId: 'adb:B', clone: '/mine', branch: 'main', pid: 222, at: Date.now() };
+    const a: DeviceClaim = { deviceId: 'adb:A', clone: CLONE_MINE_SHORT, branch: 'main', pid: 111, at: Date.now() };
+    const b: DeviceClaim = { deviceId: 'adb:B', clone: CLONE_MINE_SHORT, branch: 'main', pid: 222, at: Date.now() };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [a, b] }));
     let probes = 0;
     const flaky = (pid: number) => { probes += 1; return pid === 222 ? probes < 3 : false; };
@@ -289,7 +308,7 @@ describe('sweepStaleClaims (#225)', () => {
 
   it('leaves a file of entirely live claims byte-identical', () => {
     fs.mkdirSync(home, { recursive: true });
-    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: '/mine', branch: 'main', pid: process.pid, at: Date.now() };
+    const live: DeviceClaim = { deviceId: 'adb:LIVE', clone: CLONE_MINE_SHORT, branch: 'main', pid: process.pid, at: Date.now() };
     const raw = JSON.stringify({ claims: [live] });
     fs.writeFileSync(claimsFilePath(), raw);
 
@@ -301,10 +320,10 @@ describe('sweepStaleClaims (#225)', () => {
 describe('describeConflict', () => {
   it('names the clone, branch, pid and a time', () => {
     const held: DeviceClaim = {
-      deviceId: 'adb:X', clone: '/Users/x/Projects/modoki-ai', branch: 'work-ai', pid: 8123, at: Date.now() - 5 * 60_000,
+      deviceId: 'adb:X', clone: CLONE_AI, branch: 'work-ai', pid: 8123, at: Date.now() - 5 * 60_000,
     };
     const msg = describeConflict(held);
-    expect(msg).toMatch(/\/Users\/x\/Projects\/modoki-ai/);
+    expect(msg).toContain(CLONE_AI);
     expect(msg).toMatch(/work-ai/);
     expect(msg).toMatch(/8123/);
     expect(msg).toMatch(/\d+ min ago/);
@@ -312,7 +331,7 @@ describe('describeConflict', () => {
 
   it('includes the label and purpose when present', () => {
     const held: DeviceClaim = {
-      deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 1, at: Date.now(), label: 'SC_56C', purpose: 'installing a build',
+      deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 1, at: Date.now(), label: 'SC_56C', purpose: 'installing a build',
     };
     const msg = describeConflict(held);
     expect(msg).toMatch(/SC_56C/);
@@ -322,37 +341,37 @@ describe('describeConflict', () => {
 
 describe('CLI-owned claims (#285) — owner/ttlMs', () => {
   it('an owner-claim (pid 0) is NOT expired by a dead pid while inside its TTL', () => {
-    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
     // alive() would report pid 0 as dead if it were consulted at all — it must not be.
     expect(isStale(claim, { now: 1_000_000 + 1000, alive: () => false })).toBe(false);
   });
 
   it('an owner-claim IS expired once it outlives CLI_CLAIM_TTL_MS, even with a generous `alive`', () => {
-    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb' };
     expect(isStale(claim, { now: 1_000_000 + CLI_CLAIM_TTL_MS + 1, alive: () => true })).toBe(true);
     expect(isStale(claim, { now: 1_000_000 + CLI_CLAIM_TTL_MS, alive: () => true })).toBe(false);
   });
 
   it('a per-claim ttlMs overrides CLI_CLAIM_TTL_MS for an owner-claim', () => {
-    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb', ttlMs: 5000 };
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 0, at: 1_000_000, owner: 'wrapper-adb', ttlMs: 5000 };
     expect(isStale(claim, { now: 1_000_000 + 5000 + 1, alive: () => true })).toBe(true);
     expect(isStale(claim, { now: 1_000_000 + 4999, alive: () => true })).toBe(false);
   });
 
   it('a plain pid-claim\'s expiry rule is completely unchanged: dead pid stale immediately, live pid stale only past CLAIM_TTL_MS', () => {
-    const claim: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 999, at: 1_000_000 };
+    const claim: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 999, at: 1_000_000 };
     expect(isStale(claim, { now: 1_000_000 + 1, alive: () => false })).toBe(true);
     expect(isStale(claim, { now: 1_000_000 + CLAIM_TTL_MS, alive: () => true })).toBe(false);
     expect(isStale(claim, { now: 1_000_000 + CLAIM_TTL_MS + 1, alive: () => true })).toBe(true);
   });
 
   it('the same owner token re-claiming refreshes rather than conflicting', () => {
-    const first = claimDevice({ deviceId: 'adb:X', clone: '/clone/a', branch: 'main', owner: 'wrapper-adb' }, { now: 1000, alive: () => false });
+    const first = claimDevice({ deviceId: 'adb:X', clone: CLONE_A, branch: 'main', owner: 'wrapper-adb' }, { now: 1000, alive: () => false });
     expect(first.ok).toBe(true);
     expect((first as { ok: true; claim: DeviceClaim }).claim.pid).toBe(0);
 
     const second = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', owner: 'wrapper-adb', purpose: 'installing' },
+      { deviceId: 'adb:X', clone: CLONE_A, branch: 'main', owner: 'wrapper-adb', purpose: 'installing' },
       { now: 2000, alive: () => false },
     );
     expect(second.ok).toBe(true);
@@ -363,11 +382,11 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
 
   it('a DIFFERENT owner token is refused, and describeConflict names the owner, not "pid 0"', () => {
     fs.mkdirSync(home, { recursive: true });
-    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/other', branch: 'work-ai', pid: 0, at: 500, owner: 'wrapper-adb' };
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_OTHER, branch: 'work-ai', pid: 0, at: 500, owner: 'wrapper-adb' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
 
     const r = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/mine', branch: 'main', owner: 'other-wrapper' },
+      { deviceId: 'adb:X', clone: CLONE_MINE, branch: 'main', owner: 'other-wrapper' },
       { now: 600, alive: () => false },
     );
     expect(r.ok).toBe(false);
@@ -378,12 +397,12 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
 
   it('an owner-claim from clone A does not block a request from clone A (takeover), but DOES block clone B', () => {
     fs.mkdirSync(home, { recursive: true });
-    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', pid: 0, at: 500, owner: 'wrapper-adb' };
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_A, branch: 'main', pid: 0, at: 500, owner: 'wrapper-adb' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
 
     // Same clone, no owner token (the editor taking over its own CLI's claim) — succeeds.
     const takeover = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main' },
+      { deviceId: 'adb:X', clone: CLONE_A, branch: 'main' },
       { now: 600, alive: () => false },
     );
     expect(takeover.ok).toBe(true);
@@ -391,7 +410,7 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
     // Reset and try from a different clone — refused.
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
     const refused = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/b', branch: 'main' },
+      { deviceId: 'adb:X', clone: CLONE_B, branch: 'main' },
       { now: 600, alive: () => false },
     );
     expect(refused.ok).toBe(false);
@@ -399,11 +418,11 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
 
   it('a pid-claim from another pid still conflicts even when clone matches (the MODOKI_MULTI regression — must NOT be loosened)', () => {
     fs.mkdirSync(home, { recursive: true });
-    const held: DeviceClaim = { deviceId: 'adb:X', clone: '/clone/a', branch: 'main', pid: 424242, at: 500 };
+    const held: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_A, branch: 'main', pid: 424242, at: 500 };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [held] }));
 
     const r = claimDevice(
-      { deviceId: 'adb:X', clone: '/clone/a', branch: 'main' },
+      { deviceId: 'adb:X', clone: CLONE_A, branch: 'main' },
       { now: 600, alive: (pid) => pid === 424242 || pid === process.pid },
     );
     expect(r.ok).toBe(false);
@@ -411,8 +430,8 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
 
   it('releaseDevice with an owner drops only that owner\'s record and leaves another owner\'s record alone', () => {
     fs.mkdirSync(home, { recursive: true });
-    const mine: DeviceClaim = { deviceId: 'adb:X', clone: '/c', branch: 'main', pid: 0, at: Date.now(), owner: 'wrapper-adb' };
-    const theirs: DeviceClaim = { deviceId: 'ios:Y', clone: '/c', branch: 'main', pid: 0, at: Date.now(), owner: 'other-wrapper' };
+    const mine: DeviceClaim = { deviceId: 'adb:X', clone: CLONE_C, branch: 'main', pid: 0, at: Date.now(), owner: 'wrapper-adb' };
+    const theirs: DeviceClaim = { deviceId: 'ios:Y', clone: CLONE_C, branch: 'main', pid: 0, at: Date.now(), owner: 'other-wrapper' };
     fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [mine, theirs] }));
 
     releaseDevice('adb:X', { owner: 'wrapper-adb' });
@@ -425,7 +444,7 @@ describe('CLI-owned claims (#285) — owner/ttlMs', () => {
 
 describe('round-trip through the real file', () => {
   it('claim, then a fresh listClaims read parses the documented on-disk shape', () => {
-    const r = claimDevice({ deviceId: 'adb:RFDEADBEEF1', clone: '/Users/x/Projects/modoki', branch: 'main', guid: 'g-1', label: 'SC_56C', purpose: 'device lease' });
+    const r = claimDevice({ deviceId: 'adb:RFDEADBEEF1', clone: CLONE_HUB, branch: 'main', guid: 'g-1', label: 'SC_56C', purpose: 'device lease' });
     expect(r.ok).toBe(true);
 
     const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')) as { claims: DeviceClaim[] };
@@ -433,7 +452,7 @@ describe('round-trip through the real file', () => {
     const [claim] = onDisk.claims;
     expect(claim).toMatchObject({
       deviceId: 'adb:RFDEADBEEF1',
-      clone: '/Users/x/Projects/modoki',
+      clone: CLONE_HUB,
       branch: 'main',
       pid: process.pid,
       guid: 'g-1',

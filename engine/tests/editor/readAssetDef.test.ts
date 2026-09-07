@@ -31,6 +31,10 @@ import { clearHistory, clearDirtyAssets, markSceneSaved } from '@modoki/engine/e
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { READ_ASSET_DEF_TYPES_FOR_TESTS } from '../../tools/modoki-mcp/src/tools/assets';
+import { classifyReadAssetDef, probePathFor, probeServedTypes, type ReadAssetDefProbe }
+  from '../tools/readAssetDefServed';
 
 /** `particle-set`/`anim-set-clip`/`timeline-set` REPLACE an existing def and now refuse a path no
  *  asset exists at (a typo used to be applied to nothing, reported ok, and then materialised as a
@@ -251,5 +255,48 @@ describe('refusals — a miss must not look like an answer', () => {
 
   it('requires a path', async () => {
     await expect(runAgentOp('read-asset-def', {})).rejects.toThrow(/requires \{ path \}/);
+  });
+});
+
+/** The MCP enum is a hand-kept COPY of what this op serves, and until #855 nothing checked it
+ *  against the op — only against a sibling constant minus a hand-maintained exemption map. That is
+ *  what let `de3cdce48` widen the enum to `atlas`, a type the op has no arm for, with the guard
+ *  green. These tests ask the op instead. Rationale + the shared classifier:
+ *  `engine/tests/tools/readAssetDefServed.ts`. Device twin: `tests/framework/liveLifecycleOps.test.ts`. */
+describe('modoki_read_asset_def\'s enum lists exactly what THIS op dispatches (#855)', () => {
+  /** The editor op THROWS; hand the classifier the message. */
+  const probe: ReadAssetDefProbe = async ({ path, type }) => {
+    try {
+      await runAgentOp('read-asset-def', { path, type });
+      return '';
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
+
+  it('the probe DISTINGUISHES a dispatched type from one with no arm', async () => {
+    // Non-vacuity, first: an assertion built on a probe that cannot tell the two apart would pass
+    // for the wrong reason. `atlas` is in ASSET_SCHEMA_TYPES and has no arm; `particle` has one.
+    expect(classifyReadAssetDef('particle', await probe({ path: probePathFor('particle'), type: 'particle' })))
+      .toBe('served');
+    expect(classifyReadAssetDef('atlas', await probe({ path: probePathFor('atlas'), type: 'atlas' })))
+      .toBe('no-branch');
+  });
+
+  it('every type in the MCP enum is one the op actually dispatches, and no other is', async () => {
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    // THE assertion: the shipped enum, against the op — not against a constant beside it.
+    expect([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort()).toEqual([...report.served].sort());
+  });
+
+  it('names WHY each excluded type is excluded, from the op\'s own words', async () => {
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    // `atlas` cannot be served — it holds no engine-side cache to read back (assetInvalidation.ts;
+    // persist.ts's `invalidateAtlasFile` is a documented no-op), so there is no arm to write.
+    expect(report.noBranch).toEqual(['atlas']);
+    // `material` IS dispatched and refuses on purpose — the built THREE.Material is all that is
+    // retained. "will not" and "cannot" are different facts; the old exemption map collapsed them.
+    expect(Object.keys(report.other)).toEqual(['material']);
+    expect(report.other.material).toMatch(/only the compiled THREE\.Material is retained/);
   });
 });

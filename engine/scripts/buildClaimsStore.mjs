@@ -110,7 +110,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { claimsDir } from './deviceClaimsStore.mjs';
+import { claimsDir, isFullyQualified } from './deviceClaimsStore.mjs';
 
 function claimsFile() {
   return path.join(claimsDir(), 'build-claims.json');
@@ -202,19 +202,17 @@ function readClaimsResult() {
 
 /** Does a STORED claim name the same project root as `root` (already `path.resolve`d by the caller)?
  *
- *  The STORED side is resolved too. `deviceClaimsStore.mjs`'s `foreignClaimFor`/`ownAdbClaim`
- *  resolve both sides as well, and this file's header lists three deliberate divergences from that
- *  one — comparing raw was never meant to be a fourth.
+ *  The STORED side is resolved too, and gated on `isFullyQualified` — imported from
+ *  `deviceClaimsStore.mjs`, which is where that predicate now lives (#865 moved it there so the
+ *  device-claim comparisons could share it instead of copying it a fifth time).
  *
- *  ⚠️ **But they are no longer the SAME comparison, and `deviceClaimsStore.mjs:525-527` still says
- *  they are.** Those two — plus `claim-guard.mjs`'s `heldByThisClone` and `device.mjs`'s WiFi-claim
- *  filter — resolve the stored side with NO qualification gate at all, so the defect fixed here is
- *  still live in all four. It is WORSE there: `foreignClaimFor` returns `null` for "not foreign,
- *  it's mine", so a corrupt stored `clone` that resolves to this cwd fails **OPEN** — this clone
- *  proceeds against a phone a sibling holds, defeating the machine-wide device serialization
- *  (#149/#285). Not fixed here on purpose: different subsystem, opposite failure polarity, and a
- *  finishing pass is the wrong place to change a device-lease gate. Tracked as **#865**, which also
- *  records that `deviceClaimsStore.mjs:525-527`'s cross-reference to this file is now stale. Comparing the raw string put
+ *  ✅ **#865 closed the divergence this comment used to warn about.** The four device-claim
+ *  comparisons — `foreignClaimFor`, `ownAdbClaim`, `claim-guard.mjs`'s `heldByThisClone` and
+ *  `device.mjs`'s WiFi-claim filter — were each resolving the stored side with no qualification
+ *  gate, which failed **OPEN** there (`foreignClaimFor` returns `null` for "not foreign, it's
+ *  mine", so a corrupt stored `clone` resolving to this cwd let a clone drive a phone a sibling
+ *  held). They now all go through `sameClone`, which adds the realpath this file does not need.
+ *  This one keeps its own shape because a project root is not a clone root. Comparing the raw string put
  *  the burden on every caller to have spelled the root exactly as it was written: `/proj/a` does
  *  not equal `path.resolve('/proj/a')` on Windows, so a differently-spelled-but-equivalent root
  *  silently found NO conflict and the claim was GRANTED twice (#847 caught this in tests, where
@@ -251,25 +249,6 @@ function readClaimsResult() {
  *
  *  ⚠️ Drive-letter CASE is still not normalised by `path.resolve` (`e:\x` !== `E:\x`), so this
  *  closes the separator and trailing-slash spellings, not that one. */
-/** Is `p` rooted in a way `path.resolve` can finish WITHOUT consulting `process.cwd()`?
- *
- *  ⚠️ The UNC arm requires `//server/share`, not merely two leading separators, and that is the
- *  whole of its correctness. `[\\/]{2}` alone — this function's second version — admits `//`,
- *  `///`, `//a` and `///a/b`, none of which are UNC: win32 `path.resolve` treats them as
- *  drive-relative and roots them on the CWD's drive (`'//a'` -> `E:\a` here, `C:\a` from another
- *  drive). Measured across the family; with the server/share arm every admitted value resolves
- *  identically from any cwd, and every legitimate form is still admitted — `E:\x`, `E:/x`,
- *  `//server/share`, `\\server\share\x`, and `\\?\C:\x` long paths.
- *
- *  Nothing this repo writes can reach the loose arm anyway (`path.posix.resolve` collapses leading
- *  slashes, so a POSIX clone stores `/a/b`, never `//a/b`) — but "no writer produces it" is a
- *  claim about today's callers, and this is a claim about the function. */
-function isFullyQualified(p) {
-  return process.platform === 'win32'
-    ? /^([A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/])/.test(p)
-    : p.startsWith('/');
-}
-
 function sameProjectRoot(claim, root) {
   return isFullyQualified(claim.projectRoot) && path.resolve(claim.projectRoot) === root;
 }

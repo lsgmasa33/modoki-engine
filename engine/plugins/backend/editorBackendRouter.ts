@@ -694,6 +694,111 @@ async function refuseUndeliverableDeviceInput(method: string, deadlineMs?: numbe
  * Dispatch a backend request. Returns a BackendResult, or `null` if the path is
  * not a router-owned `/api/*` route (the host then handles it or calls next()).
  */
+/** Every absolute path a move will make APPEAR, paired with the sha1 of the bytes landing there
+ *  (or `null` for a TTL-only mark). Computed BEFORE the move, while the bytes are still readable.
+ *
+ *  A file move lands one path and is hashed, which is the case a parked asset edit rides on and
+ *  worth the read. A FOLDER move lands every descendant; those are marked TTL-only rather than
+ *  hashed, because reading a whole subtree to guard a 1500ms window is the wrong trade — and
+ *  before #867 they were not marked at all, which is strictly worse than either. */
+function plannedMoveLandings(absFrom: string, absTo: string, isDir: boolean): Array<[string, string | null]> {
+  if (!isDir) {
+    try {
+      const bytes = fs.readFileSync(absFrom);
+      return [[absTo, crypto.createHash('sha1').update(bytes).digest('hex')]];
+    } catch {
+      // Unreadable for some other reason — still mark the destination, TTL-only.
+      return [[absTo, null]];
+    }
+  }
+  const out: Array<[string, string | null]> = [];
+  const walk = (dir: string, rel: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), childRel);
+      else {
+        out.push([path.join(absTo, childRel), null]);
+        // ⚠️ And the child's OLD path. chokidar emits a per-CHILD `unlink` for a directory
+        // rename, not one event for the directory — so marking only the directory's own path
+        // leaves every child's unlink looking like a foreign change, `classifySceneChange`
+        // recognizes it, and `dropParkedWriteFor(oldChildPath)` discards a human's unsaved edit.
+        // The repair normally wins that race by ~150ms, which is not a reason to leave it open.
+        out.push([path.join(absFrom, childRel), null]);
+      }
+    }
+  };
+  walk(absFrom, '');
+  return out;
+}
+
+/** Ask the renderer to run the move repair (#867 member 1).
+ *
+ *  Returns the repair's own notes, or `null` when there was no renderer to ask — which is a normal
+ *  state, not an error: a CLI invocation, a backend with no editor attached, or a game runtime
+ *  where the editor ops were never registered. The FILE move has already happened and stands
+ *  either way; all that is lost is in-memory state that does not exist in those cases. So this
+ *  swallows, deliberately, rather than turning a successful move into a 5xx. */
+type RepairOutcome =
+  | { kind: 'applied'; notes: string[] }
+  /** No renderer to repair — a CLI call, no editor attached, or a runtime without the op.
+   *  There is no in-memory state in those cases, so nothing was lost. */
+  | { kind: 'absent' }
+  /** A renderer may well be attached and the repair did NOT run. This is the one that matters:
+   *  the file moved and the editor's path-keyed state did not follow it. */
+  | { kind: 'unrepaired'; reason: string };
+
+async function applyMovesInRenderer(
+  ctx: BackendContext,
+  moves: Array<{ from: string; to: string | null; prefix?: boolean }>,
+): Promise<RepairOutcome> {
+  try {
+    // ⚠️ A SHORT timeout, not `requestBrowser`'s 3000ms default. This repair is pure in-memory
+    // bookkeeping in an attached renderer — it answers in milliseconds or there is no renderer to
+    // answer. The default would put 3s on every move and delete whenever the dev server is up with
+    // no page open, and three callers loop: `pasteClipboard`'s cut branch and `handleFilesDrop`
+    // move sequentially, and a model re-import fires N `/api/delete-asset` calls. A 10-file cut
+    // with no page open would have been ~30 seconds of nothing.
+    const r = await ctx.requestBrowser('apply-asset-path-moves', { moves }, RENDERER_REPAIR_TIMEOUT_MS) as { notes?: string[] };
+    return { kind: 'applied', notes: Array.isArray(r?.notes) ? r.notes : [] };
+  } catch (e) {
+    // ⚠️ Deliberately swallowed, but NOT indiscriminately: the file operation has already
+    // happened and stands, so this must never turn a successful move into a 5xx. What it must
+    // also not do is report a renderer-side FAULT as "no renderer attached" — a genuine throw
+    // inside `applyAssetPathMoves` would otherwise read as a clean success with corrupt in-memory
+    // state. An undelivered request (no renderer, or the timeout) is normal and silent; anything
+    // else is the repair itself failing, and gets logged with what the renderer said.
+    const msg = e instanceof Error ? e.message : String(e);
+    // A definitively-absent renderer is a normal state, silent: there is nothing in memory to
+    // repair, so nothing was lost. `unknown agent op` is the same case one layer in — a runtime
+    // build with the editor ops never registered.
+    if (/unknown agent op/i.test(msg)) return { kind: 'absent' };
+    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    // ⚠️ A TIMEOUT is NOT "no renderer", and folding it in there is how this fails silently.
+    // Electron rejects synchronously when the window is gone, so a timeout there means the
+    // renderer IS attached and did not answer in the window — mid-scene-load, a GLB parse, a TSL
+    // compile. On Vite a timeout is ambiguous (the dev server can be up with no page open), and
+    // nothing here can tell the two apart — so it is reported as ambiguous rather than guessed.
+    // The panel path has a local backstop; the AGENT path, which this feature exists for, has none.
+    console.warn(`[move-repair] the renderer did not apply the path repair: ${msg}\n` +
+      '  The file operation SUCCEEDED. If an editor is attached, its bindings, parked writes and ' +
+      'Inspector selection may now point at a path that no longer exists (#186); if none is, ' +
+      'nothing was lost. The reply carries `repairFailed` either way.');
+    return { kind: 'unrepaired', reason: msg };
+  }
+}
+
+/** Milliseconds to wait for the renderer's path repair.
+ *
+ *  Well under `requestBrowser`'s 3000ms default, because three callers loop (`pasteClipboard`'s
+ *  cut branch, `handleFilesDrop`, and a model re-import's N deletes) and a Vite dev server with
+ *  no page open only discovers that by timing out — a 10-file cut would have been 30 seconds.
+ *  Not as short as the 400ms first written here, though: on Electron a timeout can ONLY mean an
+ *  attached-but-busy renderer, and a repair that silently did not run is far worse than a slow
+ *  move. This is the value that trades those two off; it is not a measurement. */
+const RENDERER_REPAIR_TIMEOUT_MS = 1500;
+
 export async function handleBackendRequest(ctx: BackendContext, req: BackendRequest): Promise<BackendResult | null> {
   const { method, urlPath, query, body } = req;
 
@@ -2110,14 +2215,27 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       // Single-path back-compat: a lone non-existent target is still a 404.
       if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
+      // Which of them are FOLDERS — asked before the trash, while they still exist. Same reason
+      // as /api/move-file: only the route can tell, and a folder needs `prefix` or the repair
+      // reaches the folder and none of its contents.
+      // Canonical urls, for the same reason /api/move-file uses them: the renderer compares
+      // exactly and these strings came straight off the wire.
+      const deleted = resolved.map((abs) => {
+        let isDir = false;
+        try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
+        return { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) };
+      }).filter((m): m is { from: string; to: null; prefix?: boolean } => m.from !== null);
       if (resolved.length > 0) moveToTrash(resolved);
       // Rebuild the asset manifest INLINE, like the other asset routes that mint or
       // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
       // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
-      // and neither rebuilds, but both are panel-only and the panel calls refresh().
-      // An earlier draft of this comment named duplicate-asset as a sibling that
-      // rebuilds; it does not. Verified by attributing every ctx.rebuildManifest()
-      // call site to its route.) Both backends DO
+      // and neither rebuilds. An earlier draft of this comment named duplicate-asset as a
+      // sibling that rebuilds; it does not. Verified by attributing every
+      // ctx.rebuildManifest() call site to its route. ⚠️ It also called both "panel-only,
+      // and the panel calls refresh()" — move-file stopped being panel-only when
+      // modoki_move_asset was added, which is #867: an agent move reached this route from
+      // another PROCESS and nothing repaired the renderer. move-file now calls the renderer
+      // back itself; duplicate-asset is still panel-only.) Both backends DO
       // watch `unlink` and rebuild on their own, but on a 150ms debounce — so a
       // reply sent now is AHEAD of the state a caller would verify with, and a
       // /api/scan-assets issued straight after (or a modoki_list_assets in the same
@@ -2132,7 +2250,22 @@ async function describeUnresolvedAgainstLiveWorld(
       if (resolved.length > 0) {
         try { ctx.rebuildManifest(); manifestRebuilt = true; } catch { manifestRebuilt = false; }
       }
-      return json({ ok: true, trashed: resolved.length, missing, manifestRebuilt });
+      // ⚠️ A DELETE bypassed the repair exactly as a move did (#867's mechanism, found by its
+      // close-out sweep). `unbindDeletedAssetEditors` exists for precisely this — "delete
+      // unbinds, move repoints" — and the Assets panel calls it from `executeDeletion`; an agent
+      // reaching this route from the MCP PROCESS could not. The consequence is the resurrection
+      // bug that repair was written for: the panel keeps its binding to a trashed file, the next
+      // edit re-parks a write at the dead path, and Cmd+S recreates the asset the agent deleted.
+      // Not left to the watcher: its `dropParkedWriteFor` covers only paths `classifySceneChange`
+      // recognizes, arrives on a 150ms debounce, and closes no binding at all.
+      const outcome: RepairOutcome = deleted.length > 0
+        ? await applyMovesInRenderer(ctx, deleted)
+        : { kind: 'absent' };
+      return json({
+        ok: true, trashed: resolved.length, missing, manifestRebuilt,
+        ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
+        ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2940,6 +3073,20 @@ async function describeUnresolvedAgainstLiveWorld(
         catch { /* stat failed → treat as a real collision */ }
         if (!sameEntry) return json({ error: 'Destination exists' }, 409);
       }
+      // Moving a folder INTO ITSELF orphans it — `renameSync` throws EINVAL, which would surface
+      // as a 500 ("something broke") rather than the 4xx this is. The drag path cannot reach it
+      // (`planFilesDropMoves` skips it); the agent path can.
+      // (`absTo === absFrom` is NOT included: a case-only rename resolves to the same entry and is
+      // explicitly allowed above. `startsWith(absFrom + sep)` already excludes equality.)
+      if (absTo.startsWith(absFrom + path.sep)) {
+        return json({ error: 'Destination is inside the source' }, 400);
+      }
+      // Is this a FOLDER move? The route is the only place that can answer — the client passes
+      // two strings, and a folder and a file look identical in them. It decides both the
+      // fingerprinting below and the `prefix` on the repair (#867).
+      let isDir = false;
+      try { isDir = fs.statSync(absFrom).isDirectory(); } catch { /* raced away → treat as a file */ }
+
       // The destination is about to APPEAR, and the watcher cannot tell a rename from an
       // external overwrite — so fingerprint it as the editor's own write, exactly as
       // /api/asset-write and /api/write-file already do. Without this the rename's own change
@@ -2947,12 +3094,63 @@ async function describeUnresolvedAgainstLiveWorld(
       // `applyMovesToParkedAssets` just deliberately moved ONTO this path: the human's unsaved
       // edit is gone, the panel still shows it, and the badge reads `Saved ✓`
       // (bug 1MCF9DFktot8hXsgBuWp). Read the bytes BEFORE the move — after it, absFrom is gone.
-      try {
-        const moved = fs.readFileSync(absFrom);
-        ctx.markEditorWrite(absTo, crypto.createHash('sha1').update(moved).digest('hex'));
-      } catch { /* unreadable (a directory move) — fall through; the guard is best-effort */ }
+      //
+      // ⚠️ This used to be a bare `readFileSync(absFrom)` in a try/catch whose comment said a
+      // directory move would "fall through; the guard is best-effort". `readFileSync` on a
+      // directory THROWS, so a folder move was fingerprinted NOT AT ALL — every child arrived at
+      // the watcher as a foreign write and had its parked edit discarded, which is precisely the
+      // bug the guard exists to prevent, on the path where the most edits are at risk. Mark every
+      // file that will land.
+      for (const [absDest, hash] of plannedMoveLandings(absFrom, absTo, isDir)) {
+        ctx.markEditorWrite(absDest, hash);
+      }
+      // And mark the SOURCE, whose `unlink` is otherwise a foreign change: `handleSceneChanged`
+      // routes it to `dropParkedWriteFor(from)`, which discards the human's unsaved edit with a
+      // console.warn. Marking it makes the watcher skip the event entirely, which also removes the
+      // race between that 150ms-debounced event and the repair below.
+      //
+      // ⚠️ Suppressing that event also drops the two things `handleSceneChanged` does BESIDE the
+      // discard: `ASSET_CACHE_INVALIDATORS[kind](from)` and `fireDirtyListeners()`. Deliberate,
+      // and it leaves a residue worth naming rather than pretending away — the cache entry at the
+      // OLD path outlives the file. It self-heals: nothing resolves the old path afterwards (refs
+      // are GUIDs and the manifest is rebuilt), and if a NEW file is later created there its own
+      // `add` invalidates the entry before anything reads it. The destination has had exactly this
+      // property since the fingerprint was first added, so this is not new behaviour, only newly
+      // symmetrical.
+      ctx.markEditorWrite(absFrom, null);
+
       moveAssetFile(absFrom, absTo);
-      return json({ ok: true });
+
+      // Tell the RENDERER to repair its path-keyed state — parked writes, CAS baselines, editor
+      // bindings, the current folder and the Inspector selection all key on a path this move just
+      // invalidated. The panel repairs itself synchronously when IT is the mover; this covers
+      // every other caller, and `modoki_move_asset` (a separate PROCESS) has no other route to it.
+      // ⚠️ CANONICAL urls, never the raw request body. `resolveAssetPath` is deliberately
+      // tolerant — it prepends a missing leading slash, `decodeURIComponent`s, and resolves `.`
+      // and `..` — while the renderer's `applyMove` compares paths EXACTLY. So an agent calling
+      // `modoki_move_asset {from: "assets/fx/spark.particle.json"}` (no leading slash, or a
+      // percent-encoded space) moved the file and then asked the renderer to repair a path that
+      // matches no binding, no parked write and no selection: a silent no-op reported as
+      // `{ok:true, repaired:[]}`, indistinguishable from "nothing was bound", arriving from the
+      // exact out-of-process caller this repair exists for. `assetEditorBindings.ts`'s header
+      // already warned that both sides must originate from the same string "if that ever stops
+      // being true this needs a shared canonicalizer" — `absToAssetUrl` is it.
+      const canonFrom = ctx.absToAssetUrl(absFrom);
+      const canonTo = ctx.absToAssetUrl(absTo);
+      // ⚠️ No `?? from` fallback. Falling back to the raw string ships exactly the defect the
+      // canonicalization fixes — a path the renderer cannot match — just one size smaller, and
+      // reports it as a successful repair. `absToAssetUrl` returns null for a path
+      // `resolveAssetPath` accepted in one case: the asset ROOT itself via a trailing slash
+      // (`/assets/`), which `modoki_move_asset`'s bare `z.string()` does accept. Renaming a
+      // project's whole asset root is not a thing to do half-repaired.
+      const outcome: RepairOutcome = canonFrom && canonTo
+        ? await applyMovesInRenderer(ctx, [{ from: canonFrom, to: canonTo, ...(isDir ? { prefix: true } : {}) }])
+        : { kind: 'unrepaired', reason: `not an asset-root path: ${canonFrom ? to : from}` };
+      return json({
+        ok: true,
+        ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
+        ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -3919,8 +4117,28 @@ function relayFailureStatus(e: unknown): number {
   // `preview`, `overview` and `review`, so "…the PREVIEW was destroyed…" would be misclassified as
   // transport — this fix reintroducing its own bug one word smaller. Caught in review, before it
   // could bite.
-  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
-  return transport ? 504 : 400;
+  return isRelayTransportFailure(msg) ? 504 : 400;
+}
+
+/** Did the relay itself fail, rather than the op answering? The single maintained list of both
+ *  hosts' transport wordings — every string `failPendingRenderer` (electron/main.ts) and the Vite
+ *  HMR relay actually send.
+ *
+ *  ⚠️ **Extracted (#867) because a SECOND hand-copy was written and was born incomplete.** The
+ *  move/delete repair added its own regex to decide "no renderer" vs "the repair failed", and it
+ *  missed `no editor renderer window`, `editor window closed`, `project changed — renderer
+ *  reloading` and `Object has been destroyed` — every Electron string, i.e. the whole default
+ *  editor surface. This list has now been found incomplete three times by review; a copy of it is
+ *  the wrong shape of thing to own. Read the history above before touching the pattern. */
+export function isRelayTransportFailure(msg: string): boolean {
+  return /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
+}
+
+/** Was the relay failure specifically a TIMEOUT — the renderer never answered in the window?
+ *  Distinct from the rest of `isRelayTransportFailure`, which all mean the surface was
+ *  definitively absent. See `applyMovesInRenderer`. */
+export function isRelayTimeout(msg: string): boolean {
+  return /timed out waiting for the (renderer|browser)/i.test(msg);
 }
 
 /** Editor actions the /api/editor-action relay accepts (op names dispatched in

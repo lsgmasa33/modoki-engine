@@ -483,6 +483,13 @@ interface EditorState {
     path: string,
     name?: string,
   ) => void;
+  /** Repoint the ASSET SELECTION at paths a move has changed, WITHOUT an undo entry (#867).
+   *  Selection is path-keyed like the editor bindings, and a repair is not a user action — it is
+   *  what keeps an existing action's result coherent, so it must not land in the history the user
+   *  is about to step back through. `selectAsset` cannot be used for this: it pushes an undoable
+   *  `Select …`. Pass the already-resolved next values; the path arithmetic lives with the moves
+   *  in `applyMovesToSelection`. */
+  remapSelectedAssets: (next: { selectedAsset: SelectedAsset | null; selectedAssets: SelectedAsset[] }) => void;
   /** Seed the open clip from a freshly-loaded asset (updates the live cache, no undo). */
   loadAnimationClip: (clip: AnimationClipDef) => void;
   /** Apply a clip to an asset by path: refreshes the runtime cache + the editor form when
@@ -933,6 +940,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (!cur) return {}; // unbound → nothing to repoint
     return { [field]: { ...cur, path, name: name ?? cur.name } } as Partial<EditorState>;
   }),
+  remapSelectedAssets: (next) => set(() => next),
   loadAnimationClip: (clip) => {
     const { editingAnimationAsset } = get();
     if (editingAnimationAsset) setAnimationClip(editingAnimationAsset.path, clip);
