@@ -215,7 +215,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/reimport',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png' },
-    notes: 'Partial success is a 200 with a non-empty errors[] — deliberately NOT a failed call.',
+    notes: "Partial success is a 200 with a non-empty errors[] — deliberately NOT a failed call. Refuses with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for a target (#882): every handler reads the .meta.json off DISK, so the bake would convert with the pre-edit values and their next save would flush that older document over the cache block it writes. Hatch is `force` — the human's edit is left alone, merely not used — and a forced run reports `bakedFromDisk` rather than passing silently.",
   },
 
   // ── visual capture ──
@@ -776,13 +776,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/write-meta',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png', meta: {} },
-    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does.",
+    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does. REFUSES with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for that path, because a wholesale replace DESTROYS it (#872); the hatch is `discardUnsaved`, the DESTROYED half of §8. requires:['project'] and NOT ['editor'] on purpose — the park is renderer-only state, so a definitively-absent renderer means no park can exist and the write proceeds, labelled editorConnected:false. A renderer that is attached and does NOT answer is refused (NO_RENDERER), never treated as 'nothing is parked' (§5).",
   },
   modoki_duplicate_asset: {
     kind: 'asset', method: 'POST', route: '/api/duplicate-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/probe-copy.particle.json' },
-    notes: 'Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering.',
+    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
   },
   modoki_move_asset: {
     kind: 'asset', method: 'POST', route: '/api/move-file',

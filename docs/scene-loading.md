@@ -38,6 +38,39 @@ Renderers (`Scene3D`, `Scene2D`, and the `useUIEntities` selector) subscribe to
 > koota caps total worlds at 16 (`WORLD_ID_BITS = 4`). `SceneManager` calls `oldWorld.destroy()`
 > after each swap to free the slot; without it the engine breaks after ~16 swaps.
 
+#### One destroy discipline, shared by all three promoters
+
+Three methods promote a world: `loadScene()`'s swap tail, `replaceWorldContent()`, and
+`unloadAll()`. Every one of them frees the world it replaced through the single private helper
+**`destroyWorldWhenSafe(outgoing, promoted)`** — extracted in #853, and `unloadAll` was brought
+inside it in #877 (until then it was the one promoter that leaked its slot: a bare `unloadAll()`
+loop, no scene loaded, exhausted the pool after 15 teardowns and threw on the 16th). #877's
+close-out sweep then found `replaceWorldContent` calling the helper with a **stale** argument,
+which is the second rule below.
+
+Two rules the helper's callers have to keep, both learned the expensive way:
+
+- **Read the outgoing world AT the promote — never a value captured before an await.** Both
+  `unloadAll` and `replaceWorldContent` capture an `oldWorld` at their head for the manager
+  disposes — which is the right argument for *those* (they want the world their managers ran
+  against) and the wrong one for the destroy. `replaceWorldContent`'s version of this is the
+  reachable one: two Create Scene gestures in quick succession both capture the same world. Neither
+  `unloadAll` nor `replaceWorldContent` refuses to start while another teardown is in flight
+  (`teardownInFlight` is a counter both bump, not a lock), so a second
+  teardown — or a second Create Scene — running inside those awaits captures the same world and its
+  tail frees it first. Reusing the head capture then frees that world twice and leaks the one
+  actually current — and koota's
+  `releaseWorldId` is **not idempotent**: for the top-of-cursor id it does `worldCursor--`, so a
+  double release hands one world id out to two live worlds. That is worse than the leak.
+  ⚠️ A racing `loadScene` is *not* the case to reason from, despite looking like the obvious one: its
+  last pre-swap checkpoint and its `setCurrentWorld` sit in one await-free stretch, so it cannot
+  commit a swap inside a teardown's awaits at all.
+- **Defer, don't destroy immediately.** The helper waits on `pendingManagerInits()` (bounded by
+  `WORLD_DESTROY_DEFER_MAX_MS`) because a manager's async `init()` holds `getCurrentWorld()` as its
+  `ctx.world`. On the teardown path this is not redundant with the disposes above it: those cover
+  scene- and game-scoped managers only, and an **app-scoped** manager is never disposed by
+  `unloadAll` at all — it activates at `registerManager` and stays active until unregister.
+
 ### Replacing every entity IS a world swap
 
 **`setCurrentWorld` is the engine's only signal for "every entity you were holding is gone", so
@@ -68,9 +101,11 @@ Two constraints on any future caller:
 - **Populate BEFORE promoting.** `aSceneSwapIsHappening()` is false on this path (nothing sets
   `nextLoad`), so the Hierarchy's settle-wait does not apply — a swap fired against an empty world
   lets its collapse restore latch an owner on a zero-length tree, which is #839 by another route.
-- **Never route through `unloadAll()`.** It promotes a fresh world and never destroys the old one,
-  so with the 16-world cap above it would break the engine after ~15 uses of a human-repeatable
-  gesture.
+- **Never route through `unloadAll()`.** It is the shutdown path — it releases every loaded scene's
+  resources and resets the manager registry's active scope, neither of which a new-scene gesture
+  wants. It used to leak a world slot on top of that (#877, fixed): all three promoters now free the
+  world they replace through the one `destroyWorldWhenSafe` helper, so the 16-world cap is no longer
+  the argument here.
 
 ## Resource cache with refcounting
 

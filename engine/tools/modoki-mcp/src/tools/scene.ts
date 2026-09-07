@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { type ToolResult } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
-import { mutateOpSchema, precisionParam } from '../shapes.js';
+import { mutateOpSchema, precisionParam, unsavedForceParam } from '../shapes.js';
 import { describeShape } from '../../../shared/mcpResult.js';
 
 export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
@@ -332,15 +332,21 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_reimport_asset',
     'Re-run the import pipeline for a source asset (texture → KTX2/WebP, model → LOD ' +
       'GLB + postprocessor bake), or every asset under a folder (recursive). Returns ' +
-      '{converted, skipped, errors}.',
+      '{converted, skipped, errors}.\n\n' +
+      '⚠️ The bake reads the .meta.json settings from DISK, so this refuses (REQUIRES_SAVE) while a ' +
+      'human has a parked Inspector import-settings edit for a target: it would convert with the ' +
+      'PRE-EDIT values while the panel shows the new ones, and their next save would then flush ' +
+      'that older document over the cache block this bake writes. modoki_save_all first (then the ' +
+      'bake uses their settings), or force:true to convert from disk anyway.',
     {
       path: z.string().describe('Asset-root URL of the asset or folder.'),
       recursive: z.boolean().optional().describe('Reimport every asset under the path.'),
+      force: unsavedForceParam,
     },
     // A reimport re-encodes textures (toktx KTX2) and models (LOD GLB) SEQUENTIALLY in a
     // non-streaming handler. On the 30s default a recursive folder reimport aborted mid-bake and
     // reported a spurious "backend did not respond" while the bake kept running and DID land on
     // disk. Give it real headroom (a single import_file already gets 120s). (C7 re-audit.)
-    async ({ path, recursive }) => postJson('/api/reimport', { path, recursive: !!recursive }, recursive ? 10 * 60_000 : 120_000),
+    async ({ path, recursive, force }) => postJson('/api/reimport', { path, recursive: !!recursive, ...(force ? { force: true } : {}) }, recursive ? 10 * 60_000 : 120_000),
   );
 }

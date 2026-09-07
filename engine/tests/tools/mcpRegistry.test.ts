@@ -310,8 +310,14 @@ describe('the real registered surface', () => {
     // The cross-references stay asserted even after the rename: a caller arriving with the old
     // habit has to be able to find where it went, and §1's strict refusal tells them the param is
     // unknown without telling them what to use instead.
-    const destructive = ['modoki_load_scene', 'modoki_new_scene', 'modoki_prefab'];
-    const harmless = ['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish'];
+    // Both lists grew with #872/#882's park gate, and the split is the whole point of the rule:
+    // `write_asset_meta` REPLACES the sidecar, so a parked Inspector edit is destroyed — the
+    // destructive name. `reimport_asset`/`duplicate_asset` only READ the file, so the human's edit
+    // survives and merely goes unused — the harmless one. Putting either on the wrong list is the
+    // exact habit-transfer this pair of names exists to prevent.
+    const destructive = ['modoki_load_scene', 'modoki_new_scene', 'modoki_prefab', 'modoki_write_asset_meta'];
+    const harmless = ['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish',
+      'modoki_reimport_asset', 'modoki_duplicate_asset'];
     for (const name of destructive) {
       const shape = getTool(name)!.shape as Record<string, { description?: string }>;
       expect(shape.force, `${name} must no longer take \`force\``).toBeUndefined();
@@ -328,11 +334,24 @@ describe('the real registered surface', () => {
     }
   });
 
+  it('discardUnsaved never claims to destroy work the operation does not touch (#872 review)', () => {
+    // The reword for `modoki_write_asset_meta` widened the base from "unsaved LIVE-WORLD changes"
+    // to "unsaved work the editor holds" — and `hasUnsavedChanges()` counts a parked .meta.json
+    // edit, which `modoki_load_scene {discardUnsaved:true}` does NOT clear (nothing outside
+    // pendingMeta.ts calls clearPendingMeta). So the param claimed a destruction that does not
+    // happen, on the one surface whose rule is "never told a wrong thing" — and an agent could
+    // read it as a way to clear a pendingImportSettings refusal, which it is not.
+    const d = (getTool('modoki_load_scene')!.shape as Record<string, { description?: string }>).discardUnsaved?.description ?? '';
+    expect(d, 'must scope the destruction to what this operation replaces').toMatch(/only what THIS operation/i);
+    expect(d, 'must say a world swap leaves a parked import-settings edit alone').toMatch(/import-settings edit untouched/i);
+  });
+
   it('…and `force` now means ONE thing, so it needs no exemption', () => {
     // The durable win. While `force` sat in PER_TOOL_MEANING the guard was blind to it — which is
     // how the render_sequence violation survived to be found by hand. Assert the exemption is gone,
     // so re-adding it is a deliberate act rather than a quiet one.
-    const descs = new Set(['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish']
+    const descs = new Set(['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish',
+      'modoki_reimport_asset', 'modoki_duplicate_asset']
       .map((n) => (getTool(n)!.shape as Record<string, { description?: string }>).force?.description));
     expect(descs.size, '`force` must read identically wherever it survives').toBe(1);
   });

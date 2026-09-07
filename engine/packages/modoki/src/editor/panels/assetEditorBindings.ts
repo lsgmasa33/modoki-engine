@@ -227,16 +227,17 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
  *  statement about the file at its new name; there is nothing to re-derive and no reason to
  *  distrust it. See `remapFlushedAssetRecords` in `dirtyAssets.ts` for the sibling's version.
  *
- *  ⚠️ **This repair is reached ONLY through `applyAssetPathMoves`, whose every caller is a
- *  client-side panel or undo site — so it does NOT cover an agent move or a dragged folder (#867).**
- *  `modoki_move_asset` POSTs `/api/move-file` out-of-process and nothing else, and a folder drag
- *  drops `isFolder` so no prefix move is built; either way a parked import-settings edit is
- *  stranded under the old path and the next Cmd+S recreates an orphan sidecar beside a file that no
- *  longer exists (`resolveAssetPath` is a roots/traversal guard with NO existence check). The same
- *  gap the atlas CAS has, which is why #867 is a CLASS issue about wiring the repair to the MOVE
- *  rather than to its call sites. Deliberately not fixed here: that is a seam change, #867 is
- *  claimed by another clone, and it has been told this registry is a second member. Being folded
- *  into `applyMovesToParkedAssets` is what keeps the two fixable in one place when it lands.
+ *  ⚠️ **The AGENT move is covered now — #867 landed, and this paragraph used to say otherwise.**
+ *  `/api/move-file` and `/api/delete-asset` call the renderer back themselves
+ *  (`applyMovesInRenderer` in `editorBackendRouter.ts`), so an agent move re-parks the entry at its
+ *  new path carrying its baseline, and an agent delete DROPS the park — without which the next
+ *  Cmd+S recreated an orphan sidecar beside a file that no longer exists (`resolveAssetPath` is a
+ *  roots/traversal guard with NO existence check). The repair is wired to the MOVE rather than to
+ *  its call sites, which is what #867 was a CLASS issue about.
+ *
+ *  That callback is also the precedent the sidecar PARK GATE copies (#872/#882): a Node route
+ *  asking the renderer about `pendingMeta` before it touches a `.meta.json`. See
+ *  `metaParkGate` and `docs/mcp-persistence.md` § 5.
  *
  *  Exported for tests. */
 export function applyMovesToParkedMeta(moves: Iterable<PathMove>): string[] {

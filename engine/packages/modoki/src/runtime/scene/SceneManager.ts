@@ -1340,9 +1340,12 @@ class SceneManagerImpl implements SceneManager {
    *  Not a scene LOAD: no file is read, no resources are acquired, `loadedScenes` ends
    *  empty and `getCurrent()` returns null. The caller owns the editor's scene path.
    *
-   *  ⚠️ Do NOT reimplement this as `unloadAll()` + spawn. `unloadAll` promotes a fresh
-   *  world without ever destroying the old one (see its tail), and koota caps worlds at
-   *  16 — that would break the engine after ~15 uses of a human-repeatable gesture. */
+   *  ⚠️ Do NOT reimplement this as `unloadAll()` + spawn. `unloadAll` is the shutdown
+   *  path: it drops every loaded scene's resources and resets the manager registry's
+   *  active scope, which a new-scene gesture must not do. (Until #877 it also promoted a
+   *  fresh world without freeing the old one — that half is fixed, and both now share
+   *  `destroyWorldWhenSafe`, so the koota-cap argument this warning used to rest on no
+   *  longer applies. The rest of it still does.) */
   async replaceWorldContent(populate: (world: World) => void): Promise<void> {
     // Unload-wins (#535), same head as `unloadAll()` and for the same reason: this drops
     // every loaded scene, so a `loadScene()` racing it must not win. `teardownInFlight`
@@ -1444,13 +1447,23 @@ class SceneManagerImpl implements SceneManager {
       this.primaryId = null;
       this.currentBaseScene = undefined;
 
+      // ⚠️ Same rule as `unloadAll`'s tail (#877): the world to FREE is the one current at the
+      // promote, read here — NOT `oldWorld`, which was captured before the three manager awaits
+      // above. This one is production-reachable, unlike `unloadAll`'s: two Create Scene gestures
+      // in quick succession (or two `new_scene` agent ops) both capture the same world, and
+      // whichever tail runs first frees it. The second would then free it AGAIN — koota's
+      // `releaseWorldId` is not idempotent: the freed id is popped by the world promoted next,
+      // and the second release pushes that same id back, so a later `createWorld()` hands it to
+      // a SECOND live world — and the world the first gesture promoted leaks. `oldWorld` stays the right argument
+      // for the DISPOSE calls above: those want the world their managers ran against.
+      const outgoing = getCurrentWorld();
       setCurrentWorld(staging);
 
       // Release immediately (owner, 2026-09-07), matching a real scene load rather than
       // holding GPU memory for a scene that is no longer loaded and has no owner.
       for (const sid of toDrop) releaseAllForScene(sid);
 
-      this.destroyWorldWhenSafe(oldWorld, staging);
+      this.destroyWorldWhenSafe(outgoing, staging);
 
       // Journal it — without this a full world replacement is SILENCE in the journal, awkward
       // in a repo whose rule is observe, don't infer. Picks the event the same way `loadScene`
@@ -1586,8 +1599,40 @@ class SceneManagerImpl implements SceneManager {
       this.primaryId = null;
       this.currentBaseScene = undefined;
       // Hand the world registry a fresh empty world so subsequent code doesn't
-      // see stale entities. Tests typically reset modules instead.
-      setCurrentWorld(createWorld());
+      // see stale entities, and free the slot of the one it replaces (#877) —
+      // the same destroy discipline the other two promoters share.
+      //
+      // ⚠️ RE-READ the current world HERE; do NOT reuse `oldWorld` from this
+      // method's head. That capture is five awaits old, and the two OTHER async
+      // promoters that can run inside those awaits — a second `unloadAll()`, and
+      // `replaceWorldContent()` — each promote a world of their own and destroy
+      // what they replaced. Neither refuses while a teardown is in flight
+      // (`teardownInFlight` is a counter both merely bump, not a lock), so a
+      // second teardown starting during our awaits captures the SAME world we
+      // did, and whichever tail runs first frees it. Reusing `oldWorld` would
+      // then (a) free it a second time — koota's `releaseWorldId` is NOT
+      // idempotent: the freed id is popped by the world promoted next, and the
+      // second release pushes that same id back onto `releasedWorldIds`, so a
+      // later `createWorld()` hands it to a SECOND live world. Strictly worse
+      // than the leak this fixes — and (b) leak the world that is actually
+      // current. Regression cover: sceneManagerWorldSlots.test.ts's
+      // "two teardowns racing free each world exactly once".
+      //
+      // NOT the `loadScene` race, despite the shape: a load cannot commit its
+      // swap inside our awaits at all. Its last pre-swap checkpoint and its
+      // `setCurrentWorld` sit in one await-free stretch, so a load either swapped
+      // before our head ran (and IS our `oldWorld`) or is stopped at that
+      // checkpoint by the token this method invalidated.
+      const outgoing = getCurrentWorld();
+      const fresh = createWorld();
+      setCurrentWorld(fresh);
+      // Deferred behind in-flight manager inits, not immediate: the disposes
+      // above only touch scene- and game-scoped managers, so an APP-scoped
+      // manager (never disposed here — it activates at `registerManager` and
+      // stays active) can be inside an async `init()` holding `outgoing` as its
+      // `ctx.world` right now. `pendingManagerInits()` is exactly that set, and
+      // it is empty on the ordinary path, where this destroys synchronously.
+      this.destroyWorldWhenSafe(outgoing, fresh);
     } finally {
       this.teardownInFlight--;
     }

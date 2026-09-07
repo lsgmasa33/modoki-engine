@@ -417,11 +417,11 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
 
     // Load O fully first (no manager registered yet, so nothing can hang here).
     await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
-    // `unloadAll()` below installs a fresh world without destroying this one (a
-    // separate, pre-existing property of `unloadAll`) — reclaim it explicitly so
-    // this test doesn't permanently burn a slot out of koota's 16-world-per-file
-    // cap (see the file docblock: this file is tuned to that budget).
+    // #877: `unloadAll()` below frees the slot of the world it replaces. This
+    // used to be a hand-rolled `worldO.destroy()` at the end of the test, because
+    // it did not — the assertion at the bottom is what replaced it.
     const worldO = getCurrentWorld();
+    const destroyO = vi.spyOn(worldO, 'destroy');
 
     // Register a scene manager for O AFTER O is already active: registerManager
     // self-activates synchronously against the currently-active scene, so
@@ -465,16 +465,19 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     expect(sceneManager.getCurrent()).toBeNull();
     expect(sceneManager.getLoadedScenes().size).toBe(0);
     expect(getCurrentWorld()).not.toBeNull();
-    worldO.destroy();
+    // #877: A never swapped, so the world the teardown replaced is worldO.
+    expect(destroyO).toHaveBeenCalledTimes(1);
+    expect(getCurrentWorld()).not.toBe(worldO);
   });
 
   it('#535: a loadScene already in flight when unloadAll starts is superseded and rejects', async () => {
     const { sceneManager, getCurrentWorld } = await setup();
 
     await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
-    // See the cleanup comment on the previous test — reclaim the koota world
-    // slot `unloadAll()` below leaks.
+    // See the previous test — #877 made this an assertion rather than a manual
+    // reclamation of the slot the teardown used to leak.
     const worldO = getCurrentWorld();
+    const destroyO = vi.spyOn(worldO, 'destroy');
 
     // Hang A mid-flight via a `registerBeforeSwap` hook, awaited at the LAST
     // `isSuperseded` checkpoint before the atomic swap (see the class docblock's
@@ -517,7 +520,9 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
       await pUnload;
 
       expect(sceneManager.getCurrent()).toBeNull();
-      worldO.destroy();
+      // #877: A rejected pre-swap, so worldO is what the teardown replaced.
+      expect(destroyO).toHaveBeenCalledTimes(1);
+      expect(getCurrentWorld()).not.toBe(worldO);
     } finally {
       sceneManager.unregisterBeforeSwap(hook);
     }
@@ -527,9 +532,10 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     const { sceneManager, getCurrentWorld } = await setup();
 
     await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
-    // See the cleanup comment two tests up — reclaim the koota world slot
-    // `unloadAll()` below leaks.
+    // See two tests up — #877 made this an assertion rather than a manual
+    // reclamation of the slot the teardown used to leak.
     const worldO = getCurrentWorld();
+    const destroyO = vi.spyOn(worldO, 'destroy');
     await sceneManager.unloadAll();
 
     // The single most important post-fix case: once a teardown has fully settled
@@ -540,7 +546,9 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
 
     expect(sceneManager.getCurrent()?.path).toBe('/sceneA.json');
     expect(getCurrentWorld()).not.toBeNull();
-    worldO.destroy();
+    // #877: the teardown freed worldO; the load after it promoted its own world,
+    // whose own swap tail freed the empty one the teardown had installed.
+    expect(destroyO).toHaveBeenCalledTimes(1);
   });
 
   it('#535: an unloadAll whose internals throw still leaves the teardown counter at zero', async () => {
@@ -608,6 +616,7 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
     await vi.waitFor(() => { if (!namesInCurrentWorld().includes('A')) throw new Error('A has not swapped in yet'); });
     const worldA = getCurrentWorld();
+    const destroyA = vi.spyOn(worldA, 'destroy');
 
     // unloadAll starts while A is stuck in its post-swap tail. `nextLoad` is
     // already null (A's own swap cleared it), so unloadAll's head-abort has
@@ -626,12 +635,11 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     expect(sceneManager.getLoadedScenes().size).toBe(0);
     expect(getCurrentWorld()).not.toBeNull();
 
-    // `unloadAll()`'s tail installs a fresh empty world without destroying the
-    // one it replaces (a separate, pre-existing property of `unloadAll`, not
-    // this fix's concern) — destroy `worldA` explicitly so this test doesn't
-    // permanently burn a slot out of koota's 16-world-per-file cap (this file's
-    // budget is already tuned to it; see the file docblock).
-    worldA.destroy();
+    // #877: was a hand-rolled `worldA.destroy()`. A's swap committed before the
+    // teardown started, so worldA is the world the teardown replaced and freed;
+    // worldO is A's own tail's business.
+    expect(destroyA).toHaveBeenCalledTimes(1);
+    expect(getCurrentWorld()).not.toBe(worldA);
   });
 
   // #535 defect 2 — liveness proof for `teardownGeneration`: `teardownInFlight` alone
@@ -664,6 +672,7 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
     await vi.waitFor(() => { if (!namesInCurrentWorld().includes('A')) throw new Error('A has not swapped in yet'); });
     const worldA = getCurrentWorld();
+    const destroyA = vi.spyOn(worldA, 'destroy');
     await vi.waitFor(() => { if (!initStarted) throw new Error('mgrA init has not started yet'); });
 
     // Unregister mgrA WITHOUT resolving its hang. A's own `initSceneManagersFor`
@@ -687,9 +696,10 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     expect(sceneManager.getCurrent()).toBeNull();
     expect(sceneManager.getLoadedScenes().size).toBe(0);
 
-    // See the previous test's cleanup comment — `unloadAll()` never destroys the
-    // world it replaces, so this test must reclaim `worldA`'s koota slot itself.
-    worldA.destroy();
+    // See the previous test — #877: the teardown frees the world it replaced,
+    // which here is worldA.
+    expect(destroyA).toHaveBeenCalledTimes(1);
+    expect(getCurrentWorld()).not.toBe(worldA);
   });
 
   // #535 defect 1, real-review finding: the `if (!swapped)` guard in `loadScene`'s

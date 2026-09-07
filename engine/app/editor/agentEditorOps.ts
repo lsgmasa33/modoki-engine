@@ -49,7 +49,7 @@ import {
   getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
-  readMetaPreferringPark, peekPendingMeta,
+  readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
   probeKeyReach,
   DEVICE_PRESETS, findPresetByName, makeCustomPreset, validateCustomSize,
@@ -1729,18 +1729,33 @@ export function registerEditorAgentOps(): void {
     }
     if (p.paths?.length && p.all) throw new Error('discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
     const r = discardDirtyAssets(p.all ? undefined : p.paths);
+    // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
+    // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
+    // that discards "everything" and then re-imports still bakes against the human's unsaved
+    // settings (#882). Say so rather than letting `all:true` imply a clean slate it did not
+    // deliver — §0 ranks a false success as the worst outcome on this surface. Reporting, NOT
+    // discarding: widening what this op destroys would be a blast-radius change nobody asked for,
+    // and `modoki_write_asset_meta {discardUnsaved:true}` is the named exit for a park.
+    const parkedMeta = getPendingMetaPaths();
     return {
       ok: true,
       ...r,
       remaining: getDirtyAssetPaths(),
+      ...(parkedMeta.length ? { remainingImportSettings: parkedMeta } : {}),
       // Say plainly what was NOT undone. The parked write is gone; the value the editor is showing
       // is not, and an agent that reads the def back and sees its own edit must not conclude the
       // discard failed.
-      note: r.discarded.length
+      note: (r.discarded.length
         ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
           + 'def first if you need the value reverted too.'
-        : 'Nothing was pending, so nothing changed.',
+        : 'Nothing was pending, so nothing changed.')
+        + (parkedMeta.length
+          ? ` NOT covered by this call: ${parkedMeta.length} parked import-settings edit(s) (.meta.json) `
+            + `are STILL pending — ${parkedMeta.join(', ')}. They live in a separate registry; `
+            + 'modoki_save_all flushes them, or modoki_write_asset_meta {discardUnsaved:true} drops '
+            + 'the one for the path it writes.'
+          : ''),
     };
   });
 
@@ -2670,6 +2685,52 @@ export function registerEditorAgentOps(): void {
         : {}),
       ...(r.ok ? {} : { note: 'The /api/read-meta GET FAILED — `meta` is an empty FALLBACK, not an empty sidecar. Do NOT write this document back: a wholesale write built on it drops the asset GUID and the scanner then mints a new one, orphaning every reference.' }),
     };
+  });
+
+  /** Is a parked Inspector import-settings edit in the way of a Node-side sidecar operation — and,
+   *  if the caller said so, drop it. The WRITE-side counterpart to `read-asset-meta` (#872/#882).
+   *
+   *  `pendingMeta` lives HERE, in the renderer. Every `.meta.json` access that runs in the Node
+   *  backend is blind to it, and only two routes have ever asked the renderer back
+   *  (`read-asset-meta`, `apply-asset-path-moves`) — which is why this defect arrived one route at
+   *  a time: `/api/write-meta` destroys the park, `/api/reimport` bakes with the pre-edit disk
+   *  value and then loses its own fresh cache block to the park's next flush, and
+   *  `/api/duplicate-asset` copies the pre-edit document. One probe for all three, so route four
+   *  does not get to invent a fourth answer.
+   *
+   *  ⚠️ **`peekPendingMeta`, deliberately NOT `readMetaPreferringPark`.** The peek reads the map
+   *  and touches nothing; the helper records. That is the correction `read-asset-meta` already
+   *  carries as `passive` (see its header): an observer must not disarm the guard it observes.
+   *  Here it matters twice over, because a WRITE gate reading the registry has more power to
+   *  corrupt the state it is consulting than a read does, not less.
+   *
+   *  ⚠️ **Probe and discard are ONE op, not two calls.** Two round trips leave a window in which a
+   *  human's park can land between "is anything parked?" and the write that was cleared to
+   *  proceed. Node is single-threaded and so is the renderer, so answering both in one op closes
+   *  it as far as this seam can.
+   *
+   *  ⚠️ **`readFailed` is deliberately left ARMED by a discard**, because `discardPendingMeta`
+   *  leaves it armed. Clearing it here would let a component still holding the `{}` fallback park
+   *  an id-less document, which the scanner's heal pass answers by minting a fresh GUID and
+   *  orphaning every reference to the asset — the exact destruction that flag exists to prevent.
+   *  A path whose flag is armed can therefore still be wedged for the panel after an agent
+   *  discard; that is #880's second face, reachable by one more route, and it is not papered over
+   *  here. */
+  registerAgentOp('resolve-meta-park', (params) => {
+    const { paths, discard } = (params ?? {}) as { paths?: unknown; discard?: unknown };
+    if (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== 'string' || !p)) {
+      throw new Error(
+        'resolve-meta-park requires { paths: [assetRootUrl, …] } — one or more non-empty asset-root '
+        + `URLs (e.g. /assets/textures/rock.png). Parked now: ${getPendingMetaPaths().join(', ') || '(none)'}`,
+      );
+    }
+    const list = paths as string[];
+    const parked = list.filter((p) => peekPendingMeta(p) !== undefined);
+    // `discarded` is reported separately from `parked` rather than inferred from it: a caller that
+    // asked to discard needs to know what actually went, and the two lists differ the moment a
+    // path is named twice or the registry is emptied concurrently.
+    const discarded = discard === true && parked.length ? discardPendingMeta(parked).discarded : [];
+    return { ok: true, parked, discarded };
   });
 }
 

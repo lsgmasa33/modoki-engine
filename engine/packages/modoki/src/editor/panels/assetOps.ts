@@ -21,6 +21,7 @@ import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { isTextAsset } from './assetUndo';
+import { flushPendingMetaFor } from '../scene/pendingMeta';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -214,13 +215,31 @@ export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResu
 }
 
 /** Copy an asset to a new path; the backend regenerates the GUID so the
- *  duplicate doesn't collide with the original in the manifest. */
+ *  duplicate doesn't collide with the original in the manifest.
+ *
+ *  ⚠️ **Flushes a parked import-settings edit for the SOURCE first** (#882). `duplicateAssetFile`
+ *  in the backend seeds the copy's `.meta.json` from the source's file, so without this the
+ *  duplicate is born with the PRE-EDIT settings while the panel shows the newer ones — and since
+ *  the route now refuses on a park, without it the panel's Duplicate would simply fail, returning
+ *  `false` with the reason discarded and nothing shown to the human.
+ *
+ *  Flushing rather than forcing, and rather than refusing, is the same call
+ *  `assetViews/reimport.ts` already makes: the human clicked Duplicate on this asset, and that
+ *  click is consent to persist their own edit — which an AGENT does not have, which is why the
+ *  agent path keeps the refusal and `force`. */
 export async function duplicateAssetFile(from: string, to: string): Promise<boolean> {
   try {
+    await flushPendingMetaFor(from);
     const res = await backendFetch('/api/duplicate-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to }),
     });
+    if (!res.ok) {
+      // The refusal body carries WHY (§5), and this used to throw it away — a Duplicate that
+      // failed with nothing said anywhere.
+      const detail = await res.text().catch(() => '');
+      console.error(`[Assets] duplicate ${from} → ${to} failed: ${res.status} ${detail.slice(0, 400)}`);
+    }
     return res.ok;
   } catch { return false; }
 }

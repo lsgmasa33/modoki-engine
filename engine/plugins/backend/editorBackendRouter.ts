@@ -799,6 +799,147 @@ async function applyMovesInRenderer(
  *  move. This is the value that trades those two off; it is not a measurement. */
 const RENDERER_REPAIR_TIMEOUT_MS = 1500;
 
+/** An asset-root URL as the RENDERER keys it — the one normalisation `resolveAssetPath` applies
+ *  before it resolves (`vite-asset-scanner.ts`, which imports this rather than repeating it).
+ *
+ *  ⚠️ **A gate keyed on the RAW request string is not keyed on the same thing the registry is**
+ *  (#872 review). `{path: "assets/textures/rock.png"}` and `"/assets/my%20tex.png"` both resolve to
+ *  real files, so the write proceeds — while `peekPendingMeta` is asked about a string the park was
+ *  never filed under, misses, and reports `clear`. The park is then destroyed by the very call that
+ *  checked for it. Normalise once, gate and resolve on the same value. */
+export function normalizeAssetUrl(assetPath: string): string {
+  return decodeURIComponent(assetPath.startsWith('/') ? assetPath : `/${assetPath}`);
+}
+
+/** What the park probe learned. Four outcomes, because "no park" and "could not look" are
+ *  different answers and collapsing them is the fail-open this gate exists to close. */
+export type ParkGateOutcome =
+  /** A renderer answered and nothing is parked for these paths — proceed. */
+  | { kind: 'clear' }
+  /** No renderer EXISTS (no editor window, no page on the dev server, a runtime without the ops).
+   *  `pendingMeta` is renderer-only module state, so with no renderer there is no park to be in
+   *  the way — proceed, and say `editorConnected:false` so the caller knows which it was. */
+  | { kind: 'absent' }
+  /** A park is in the way. `discarded` is non-empty only when the caller passed the override. */
+  | { kind: 'parked'; paths: string[]; discarded: string[] }
+  /** A renderer may well be attached and it did not answer. NOT the same as `absent`. */
+  | { kind: 'unknown'; reason: string };
+
+/** Ask the renderer whether a parked Inspector import-settings edit is in the way of a Node-side
+ *  `.meta.json` operation, and optionally drop it (#872/#882).
+ *
+ *  The ONE gate for all three sidecar routes. `/api/write-meta` DESTROYS a park (it replaces the
+ *  file wholesale and the park then flushes back over it, so both directions lose work);
+ *  `/api/reimport` and `/api/duplicate-asset` merely read the pre-edit bytes, so the human's edit
+ *  goes UN-INCLUDED. Two consequences, two override names — `discardUnsaved` and `force`,
+ *  `docs/mcp-tool-conventions.md` §8 — but ONE probe, so the fourth route to touch a sidecar
+ *  inherits the answer instead of inventing one.
+ *
+ *  ⚠️ **It must not fail OPEN, and that is the whole difficulty.** `requestBrowser` rejects on a
+ *  timeout, and "the renderer did not answer" is not "there is no park" (§5: *could not look is
+ *  never reported as nothing is there*). The classifier is `isRelayTransportFailure` +
+ *  `isRelayTimeout` — the SAME pair `applyMovesInRenderer` uses, deliberately not a second copy:
+ *  that list has been found incomplete by review three times, and #867 extracted it precisely
+ *  because a hand-written second regex was born missing every Electron string.
+ *
+ *  On Electron a timeout can only mean an attached-but-busy renderer (the window being gone
+ *  rejects synchronously). On Vite it is genuinely ambiguous — the dev server can be up with no
+ *  page open — and nothing here can tell those apart, so it is reported as `unknown` rather than
+ *  guessed. A caller turns `unknown` into a refusal; guessing "clear" would be the #872 defect
+ *  rebuilt inside its own fix.
+ *
+ *  The timeout is `RENDERER_REPAIR_TIMEOUT_MS`, shared with the move repair for the same reason it
+ *  was chosen there: this is in-memory bookkeeping that answers in milliseconds or not at all, and
+ *  the default 3000ms would be paid by every headless sidecar write. */
+async function metaParkGate(
+  ctx: BackendContext,
+  paths: string[],
+  opts: { discard?: boolean } = {},
+): Promise<ParkGateOutcome> {
+  const wanted = paths.filter((p) => typeof p === 'string' && p);
+  if (!wanted.length) return { kind: 'clear' };
+  try {
+    const r = await ctx.requestBrowser(
+      'resolve-meta-park',
+      { paths: wanted, ...(opts.discard ? { discard: true } : {}) },
+      RENDERER_REPAIR_TIMEOUT_MS,
+    ) as { parked?: unknown; discarded?: unknown };
+    const parked = Array.isArray(r?.parked) ? r.parked.filter((p): p is string => typeof p === 'string') : [];
+    if (!parked.length) return { kind: 'clear' };
+    const discarded = Array.isArray(r?.discarded) ? r.discarded.filter((p): p is string => typeof p === 'string') : [];
+    return { kind: 'parked', paths: parked, discarded };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // ⚠️ **`unknown agent op` is NOT "absent" here, and reading it that way was a fail-open this
+    // gate produced against itself** (#872 review). `applyMovesInRenderer` may treat it as absent
+    // because it is best-effort repair; this is a GUARD, and the transport underneath is a
+    // BROADCAST: `ws.send` goes to every HMR client and `createBrowserRequestRegistry` is
+    // first-reply-wins. `initAgentBridge()` runs on any editor-flagged page but
+    // `registerEditorAgentOps()` runs only from `editor/setup.ts`, so a second tab on the dev
+    // server's runtime route answers `unknown agent op` INSTANTLY and wins the race against the
+    // editor tab that actually holds the park. Measured shape: editor at `#/editor` with a parked
+    // Max Size edit, a plain `/` tab alongside, agent writes — the runtime tab replies first, this
+    // returned `absent`, the write proceeded, and the reply told the caller "there is no renderer"
+    // while an editor sat there with the human's unsaved edit in it.
+    //
+    // One client's "I do not have that op" says nothing about whether ANOTHER client does, so it
+    // is exactly "could not look" (§5). The cost is that a genuinely editor-op-less renderer now
+    // refuses instead of proceeding — over-conservative, and the named override is the exit.
+    if (/unknown agent op/i.test(msg)) return { kind: 'unknown', reason: msg };
+    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    return { kind: 'unknown', reason: msg };
+  }
+}
+
+/** The §5 envelope for a gate outcome that must stop the operation, or `null` to proceed.
+ *
+ *  `code` and `options` travel in the BODY: `codeFromBody` in the MCP client lifts a code out of
+ *  the payload ahead of the one derived from the HTTP status, and `httpFailure` lifts `options`
+ *  the same way — so the refusal an agent reads names its own exits rather than arriving as a
+ *  generic REFUSED_BY_OP. A refusal that lists the real options is the highest-value thing this
+ *  surface produces (§5); a refusal with no way out is a wedge. */
+function parkGateRefusal(
+  outcome: ParkGateOutcome,
+  what: { verb: string; override: 'discardUnsaved' | 'force'; consequence: string },
+): { body: Record<string, unknown>; status: number } | null {
+  if (outcome.kind === 'parked' && !outcome.discarded.length) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        code: 'REQUIRES_SAVE',
+        error: `${what.verb} refused: a human's unsaved Inspector import-settings edit is parked for `
+          + `${outcome.paths.join(', ')} and has not reached disk. ${what.consequence}`,
+        parked: outcome.paths,
+        options: [
+          'modoki_save_all — flush the human\'s edit to disk first, then repeat this call (it then works from their newest settings)',
+          `${what.override}:true — proceed anyway; see that param's description for exactly what it costs`,
+          'modoki_get_asset_meta reads the PARKED value, so you can see what is pending before deciding',
+        ],
+      },
+    };
+  }
+  if (outcome.kind === 'unknown') {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        code: 'NO_RENDERER',
+        error: `${what.verb} refused: an editor renderer may be attached and it did not answer the `
+          + `parked-import-settings probe (${outcome.reason}), so this could NOT rule out a human's `
+          + 'unsaved edit. "Could not look" is not "nothing is there", and proceeding would be the '
+          + 'silent clobber this check exists to prevent.',
+        options: [
+          'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
+          'modoki_get_editor_state lists parked edits under pendingImportSettings; if it answers, the renderer is alive',
+          `${what.override}:true — proceed without the check, accepting that cost`,
+        ],
+      },
+    };
+  }
+  return null;
+}
+
 export async function handleBackendRequest(ctx: BackendContext, req: BackendRequest): Promise<BackendResult | null> {
   const { method, urlPath, query, body } = req;
 
@@ -2658,9 +2799,47 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/write-meta {path, meta} (M) ──
   if (urlPath === '/api/write-meta' && method === 'POST') {
     try {
-      const { path: assetPath, meta, ifMatch } = (body ?? {}) as { path: string; meta: unknown; ifMatch?: string };
+      const { path: assetPath, meta, ifMatch, discardUnsaved, rendererWrite } = (body ?? {}) as {
+        path: string; meta: unknown; ifMatch?: string; discardUnsaved?: boolean; rendererWrite?: boolean;
+      };
       const resolved = ctx.resolveAssetPath(assetPath);
       if (!resolved) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // ── The park gate (#872) ──────────────────────────────────────────────────────────────
+      // This route REPLACES the sidecar wholesale, and since #845 a human's Inspector
+      // import-settings change is PARKED in the renderer rather than written. Both directions used
+      // to lose work: this write landed on disk, the park survived it, and the next Cmd+S flushed
+      // that older document straight back over it. Nothing reconciled the two, because a
+      // `.meta.json` is invisible to `detectType` so the watcher's `dropParkedWriteFor` — which is
+      // what protects an agent's `modoki_write_asset` — can never fire for a sidecar.
+      //
+      // ⚠️ It runs BEFORE `ifMatchRefusal`, not between it and the write: the CAS check and
+      // `writeMetaSidecar` are synchronous ON PURPOSE (see the comment below) and an `await`
+      // dropped into that window would reopen the race the comment forbids.
+      //
+      // ⚠️ **`rendererWrite` exempts the EDITOR'S OWN writers, and without it this gate refused a
+      // human's save** (#872 review). §8's REQUIRES_SAVE rule is an AGENT-surface rule; this route
+      // is not agent-only. `writeMetaConditional` (`assetViews/widgets.tsx`) is the one definition
+      // of the renderer's POST, and every caller of it — the Sprite Editor, the 9-slice editor, the
+      // Inspector's postprocessor row — loads through `readMetaPreferringPark` and calls
+      // `metaWrittenToDisk` afterwards, i.e. the document being written ALREADY CONTAINS the
+      // parked edit and the write is what legitimately retires it. Measured before the flag:
+      // Inspector → change Max Size → open the Sprite Editor from that same panel → Save → 409,
+      // reported by `writeMetaConditional` as "the file changed on disk", which is a wrong
+      // diagnosis of a file that did not change, and the slices could not be saved at all.
+      //
+      // The flag is an assertion about the CALLING PROCESS, not about the document: a write issued
+      // from the renderer is never blind to the registry — it either read through the park, flushed
+      // it first, or IS the flush. The gate exists for the process that cannot see the registry.
+      const gate = rendererWrite === true
+        ? { kind: 'clear' } as ParkGateOutcome
+        : await metaParkGate(ctx, [normalizeAssetUrl(assetPath)]);
+      const refused = discardUnsaved === true ? null : parkGateRefusal(gate, {
+        verb: 'write-meta',
+        override: 'discardUnsaved',
+        consequence: 'Writing now DESTROYS it: this replaces the file, and their next save flushes '
+          + 'the older parked document back over what you wrote.',
+      });
+      if (refused) return json(refused.body, refused.status);
       // ⚠️ The precondition is checked against the SIDECAR, not the asset. `resolved` is the asset
       // itself (`foo.png`); the bytes a concurrent writer races over are `foo.png.meta.json`.
       // Passing `resolved` here would hash the PNG and 409 every conditional write forever.
@@ -2672,6 +2851,18 @@ async function describeUnresolvedAgainstLiveWorld(
       const refusal = ifMatchRefusal(sidecarPath(resolved), ifMatch);
       if (refusal) return json(refusal, 409);
       writeMetaSidecar(resolved, meta as Parameters<typeof writeMetaSidecar>[1]);
+      const writtenSha = metaSidecarSha256(resolved);
+      // ⚠️ **The discard happens AFTER the write, and the order is the whole point** (#872 review).
+      // It used to ride along with the probe — so a `writeMetaSidecar` that then threw (a read-only
+      // sidecar, ENOSPC) left the human's parked edit destroyed and NOTHING written in its place,
+      // reported as a bare 500 that never mentioned the discard. A failed write must cost nothing.
+      // The residual window is the opposite way round and strictly smaller: a park created between
+      // the write and this call is dropped, and only when the caller explicitly asked to discard.
+      const discardedParked = gate.kind === 'parked' && discardUnsaved === true
+        ? await metaParkGate(ctx, [normalizeAssetUrl(assetPath)], { discard: true })
+          .then((d) => (d.kind === 'parked' ? d.discarded : []))
+          .catch(() => [] as string[])
+        : [];
       // The hash of what we ACTUALLY wrote — the caller cannot derive it, because
       // `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits the cache blocks out
       // into `.meta.local.json`. A panel that keeps editing after a save needs this to advance its
@@ -2681,7 +2872,42 @@ async function describeUnresolvedAgainstLiveWorld(
       // BROADCAST for a self-write, and `detectType` returns null for `.meta.json`
       // (`vite-asset-scanner.ts`), so no broadcast fires for a sidecar in the first place. Adding
       // it would be machinery guarding nothing.
-      return json({ ok: true, sha256: metaSidecarSha256(resolved) });
+      return json({
+        ok: true,
+        sha256: writtenSha,
+        // What the gate saw, so a caller can tell the three accept paths apart. A silent success
+        // cannot distinguish "nothing was parked" from "a park was destroyed on your instruction"
+        // from "nobody was there to ask".
+        ...(discardedParked.length
+          ? {
+            discardedParked,
+            note: 'A parked Inspector import-settings edit for this path was DISCARDED before the '
+              + 'write, as you asked. The human\'s unsaved change is gone and this file is now the '
+              + 'only version. Nothing stale survives to flush back over it.',
+          }
+          : {}),
+        ...(gate.kind === 'absent'
+          ? {
+            editorConnected: false,
+            note: 'No editor renderer answered, so no parked import-settings edit could be in the '
+              + 'way — a park is renderer-only state and there is no renderer. Written unconditionally.',
+          }
+          : {}),
+        // ⚠️ `discardUnsaved` promises that nothing stale survives to flush back over this write,
+        // and on THIS path that promise cannot be kept: the probe never reached the renderer, so no
+        // park was found and none was dropped. Saying so is the whole difference between a
+        // disclosed risk and the false success §0 ranks worst — the override means "I accept the
+        // risk", not "there was no risk".
+        ...(gate.kind === 'unknown'
+          ? {
+            note: 'Written, but the parked-import-settings probe was FORCED past without an answer '
+              + `from the renderer (${gate.reason}). NOTHING was discarded, because nothing could be `
+              + 'checked — if a human did have an unsaved edit for this path, it survives and their '
+              + 'next save will flush it over what you just wrote. Verify with '
+              + 'modoki_get_editor_state pendingImportSettings once the renderer answers again.',
+          }
+          : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2727,6 +2953,30 @@ async function describeUnresolvedAgainstLiveWorld(
       if (targets.length === 0) {
         return json({ ok: false, converted: 0, skipped: 0, errors: [], error: `no manifest asset matches ${JSON.stringify(target)}${recursive ? ' (recursive)' : ''} — check the path/casing (it must be an asset-root path like /games/<id>/assets/…), or list assets first.` }, 404);
       }
+      // ── The park gate (#882) ──────────────────────────────────────────────────────────────
+      // Every re-import handler reads the sidecar off DISK to know what to convert with, and
+      // writes it back with the fresh cache block. With a parked Inspector edit that is wrong
+      // twice: the bake uses the PRE-EDIT value while the panel already shows the new one, and the
+      // human's next save then flushes their older document over the cache block this bake just
+      // wrote. `flushPendingMetaFor` exists for exactly this and every one of its callers is
+      // renderer-side — the UI's own Re-import button flushes first, and this route could not.
+      //
+      // ⚠️ It REFUSES rather than flushing. The button flushes because the human clicked it in the
+      // panel where they made the edit, and that click is consent to persist it; an agent has no
+      // such mandate, and §8's settled precedent (`modoki_build` refuses rather than auto-saving)
+      // is the agent-surface answer. The hatch is `force`, not `discardUnsaved`: proceeding leaves
+      // the human's edit alone and merely does not USE it.
+      // Manifest paths are already canonical, so no `normalizeAssetUrl` here — unlike the two
+      // routes below, whose path comes straight off the request body.
+      const reGate = await metaParkGate(ctx, targets.map((a) => a.path));
+      const reRefused = (body as { force?: boolean } | undefined)?.force === true ? null : parkGateRefusal(reGate, {
+        verb: 're-import',
+        override: 'force',
+        consequence: 'The bake reads the sidecar from DISK, so it would convert with the PRE-EDIT '
+          + 'settings — and their next save would then flush that older document over the cache '
+          + 'block this bake writes.',
+      });
+      if (reRefused) return json(reRefused.body, reRefused.status);
       const summary = { converted: 0, skipped: 0, errors: [] as string[] };
       // Paths whose bake succeeded — pushed to the renderer below so the LIVE viewport
       // evicts its stale GPU cache without a reload. The UI "Re-import" button does this
@@ -2803,6 +3053,25 @@ async function describeUnresolvedAgainstLiveWorld(
         ...summary, ok,
         ...(noHandler.length ? { noHandler } : {}),
         ...(unresolved.length ? { unresolved } : {}),
+        // The forced path is the one that needs saying out loud: the bake DID run and it did NOT
+        // use the human's newest settings. Reporting only on the refusal would make `force:true`
+        // a silent downgrade, which is the false success §0 ranks worst (#882).
+        ...(reGate.kind === 'parked'
+          ? {
+            bakedFromDisk: reGate.paths,
+            note: `${reGate.paths.length} asset(s) had a parked Inspector import-settings edit that `
+              + 'is NOT on disk, and this bake read the file — so those were converted with the '
+              + 'PRE-EDIT settings. The human\'s edit is untouched and their next save will flush it '
+              + 'over this bake\'s cache block. modoki_save_all, then re-import, uses their settings.',
+          }
+          : {}),
+        ...(reGate.kind === 'unknown'
+          ? {
+            note: 'The parked-import-settings probe was FORCED past without an answer from the '
+              + `renderer (${reGate.reason}), so whether a human's unsaved edit was in the way is `
+              + 'unknown — not "there was none".',
+          }
+          : {}),
       }, ok ? 200 : 500);
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -3061,14 +3330,49 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/duplicate-asset {from, to} (M) ── copy + regenerate GUID.
   if (urlPath === '/api/duplicate-asset' && method === 'POST') {
     try {
-      const { from, to } = (body ?? {}) as { from: string; to: string };
+      const { from, to, force } = (body ?? {}) as { from: string; to: string; force?: boolean };
       const absFrom = ctx.resolveAssetPath(from);
       const absTo = ctx.resolveAssetPath(to);
       if (!absFrom || !absTo) return json({ error: 'Path outside allowed directories' }, 403);
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
+      // ── The park gate (#882) ─────────────────────────────────────────────────────────────
+      // `duplicateAssetFile` reads the SOURCE's `.meta.json` off disk to seed the copy's, so a
+      // parked Inspector edit on the source means the duplicate is BORN with the pre-edit import
+      // settings while the panel shows the new ones. Nothing is destroyed here — the copy is
+      // simply built from stale bytes — so the hatch is `force`, the same one `/api/reimport`
+      // takes. The DESTINATION needs no probe: it cannot exist yet (checked above), so no park
+      // can be keyed to it.
+      const dupGate = await metaParkGate(ctx, [normalizeAssetUrl(from)]);
+      const dupRefused = force === true ? null : parkGateRefusal(dupGate, {
+        verb: 'duplicate-asset',
+        override: 'force',
+        consequence: 'The copy is seeded from the source sidecar ON DISK, so it would be born with '
+          + 'the PRE-EDIT import settings while the editor shows the newer ones.',
+      });
+      if (dupRefused) return json(dupRefused.body, dupRefused.status);
       const newGuid = duplicateAssetFile(absFrom, absTo);
-      return json({ ok: true, guid: newGuid });
+      return json({
+        ok: true,
+        guid: newGuid,
+        ...(dupGate.kind === 'parked'
+          ? {
+            copiedFromDisk: dupGate.paths,
+            note: 'The source had a parked Inspector import-settings edit that is NOT on disk, so '
+              + 'this copy carries the PRE-EDIT settings. The source itself is untouched.',
+          }
+          : {}),
+        // The forced-past-an-unanswered-probe case, disclosed here as it already is on
+        // `/api/write-meta` and `/api/reimport`. Leaving it out made this the one route where
+        // `force:true` returned a bare success (#882 review) — the §0 argument applied unevenly.
+        ...(dupGate.kind === 'unknown'
+          ? {
+            note: 'Copied, but the parked-import-settings probe was FORCED past without an answer '
+              + `from the renderer (${dupGate.reason}), so whether the source had an unsaved edit `
+              + 'is unknown — not "there was none". If it did, this copy carries the pre-edit settings.',
+          }
+          : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

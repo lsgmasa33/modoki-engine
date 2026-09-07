@@ -3,7 +3,15 @@
  *  renderer, so the path-keyed GPU cache kept serving stale geometry. It now pushes
  *  every freshly-baked path to the renderer via
  *  requestBrowser('invalidate-assets', {items}) so the live viewport rebinds without
- *  a restart. These tests lock that wiring at the router seam. */
+ *  a restart. These tests lock that wiring at the router seam.
+ *
+ *  ⚠️ **`requestBrowser` is no longer this route's ONLY renderer call** (#872/#882). It now also
+ *  asks `resolve-meta-park` — before the bake — whether a human's Inspector import-settings edit is
+ *  parked for a target, because every handler reads the sidecar off DISK and would otherwise
+ *  convert with the pre-edit values. So these assertions count and inspect the `invalidate-assets`
+ *  call SPECIFICALLY rather than "the one call": a bare `toHaveBeenCalledTimes(1)` here would break
+ *  on any future renderer round trip this route grows, and — worse — would pass while pointing at
+ *  the wrong call. `invalidateCalls` is that filter. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
@@ -37,6 +45,10 @@ function makeCtx(manifest: Manifest, requestBrowser = vi.fn().mockResolvedValue(
   };
 }
 
+/** Only the `invalidate-assets` calls. See the header: the park probe shares this spy. */
+const invalidateCalls = (spy: { mock: { calls: unknown[][] } }) =>
+  spy.mock.calls.filter((c) => c[0] === 'invalidate-assets');
+
 function reimportReq(body: { path: string; recursive?: boolean }) {
   return { method: 'POST', urlPath: '/api/reimport', query: new URLSearchParams(), body };
 }
@@ -58,7 +70,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/models/thing.glb' }));
 
     expect((res as { body: { converted: number } }).body.converted).toBe(1);
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
     expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
       items: [{ path: '/assets/models/thing.glb', type: 'model' }],
     });
@@ -89,8 +101,8 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a', recursive: true }));
 
     expect((res as { body: { converted: number } }).body.converted).toBe(3); // all three baked
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
-    const [, payload] = requestBrowser.mock.calls[0];
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
+    const [, payload] = invalidateCalls(requestBrowser)[0];
     expect(payload).toEqual({
       items: [
         { path: '/assets/a/m.glb', type: 'model' },
@@ -108,12 +120,17 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/x/data.json' }));
 
     expect((res as { body: { skipped: number } }).body.skipped).toBe(1);
-    expect(requestBrowser).not.toHaveBeenCalled();
+    expect(invalidateCalls(requestBrowser)).toHaveLength(0);
   });
 
   it('still returns the bake summary when the renderer is disconnected (requestBrowser rejects)', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/models/thing.glb', type: 'model' }] };
-    const requestBrowser = vi.fn().mockRejectedValue(new Error('no live renderer / timeout'));
+    // ⚠️ The message must be one `isRelayTransportFailure` REALLY matches. It used to read
+    // 'no live renderer / timeout' — a hand-written approximation of a wording no host emits, and
+    // therefore a case that proved nothing about a disconnected renderer once anything started
+    // CLASSIFYING the rejection. `#867` extracted that matcher precisely because hand-copies of it
+    // are born wrong; a hand-copy in a TEST is the same hazard, one layer out.
+    const requestBrowser = vi.fn().mockRejectedValue(new Error('no editor renderer window'));
     const ctx = makeCtx(manifest, requestBrowser);
 
     // Best-effort: the bake landed on disk, so the reimport must not fail on a
@@ -122,7 +139,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
 
     expect((res as { status?: number }).status).not.toBe(500);
     expect((res as { body: { converted: number } }).body.converted).toBe(1);
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
   });
 
   it('a handler that THROWS is excluded from invalidate items; a partial-failure batch still 200s', async () => {
@@ -151,7 +168,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     expect(body.errors[0]).toContain('/assets/a/bad.glb'); // the failure is reported
     expect((res as { status?: number }).status).toBe(200); // converted>0 → not a 500
     // The renderer is told to evict ONLY the successfully re-baked asset.
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
     expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
       items: [{ path: '/assets/a/good.glb', type: 'model' }],
     });
@@ -170,7 +187,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     expect(body.errors.length).toBeGreaterThan(0);
     // converted===0 && errors>0 → 500, and nothing to invalidate → no browser push.
     expect((res as { status?: number }).status).toBe(500);
-    expect(requestBrowser).not.toHaveBeenCalled();
+    expect(invalidateCalls(requestBrowser)).toHaveLength(0);
   });
 
   it('a path matching NO manifest asset → ok:false 404, and never notifies the renderer (F4)', async () => {
@@ -187,7 +204,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     expect(body.converted).toBe(0);
     expect(body.error).toMatch(/no manifest asset matches/);
     expect((res as { status?: number }).status).toBe(404);
-    expect(requestBrowser).not.toHaveBeenCalled();
+    expect(invalidateCalls(requestBrowser)).toHaveLength(0);
   });
 
   it('a recursive path under which NO asset lives → ok:false 404 (F4)', async () => {
@@ -197,7 +214,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/nonexistent', recursive: true }));
     expect((res as { body: { ok: boolean } }).body.ok).toBe(false);
     expect((res as { status?: number }).status).toBe(404);
-    expect(requestBrowser).not.toHaveBeenCalled();
+    expect(invalidateCalls(requestBrowser)).toHaveLength(0);
   });
 
   it("recursive target '/' selects EVERY absolute-path asset (empty prefix special-case)", async () => {
@@ -219,7 +236,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const body = (res as { body: { converted: number; skipped: number } }).body;
     expect(body.converted).toBe(3);   // every asset under root baked
     expect(body.skipped).toBe(0);
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
     expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
       items: [
         { path: '/assets/models/a.glb', type: 'model' },
@@ -259,7 +276,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     expect((res as { status?: number }).status).toBe(200);       // converted>0 → not a 500
     expect(ctx.rebuildManifest).toHaveBeenCalled();               // the route still finished
     // The renderer is told to evict only the two that actually re-baked.
-    expect(requestBrowser).toHaveBeenCalledTimes(1);
+    expect(invalidateCalls(requestBrowser)).toHaveLength(1);
     expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
       items: [
         { path: '/assets/a/good.glb', type: 'model' },

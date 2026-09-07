@@ -192,11 +192,13 @@ describe('newScene()', () => {
   });
 
   it('destroys the world it replaced, so koota\'s 16-world pool is not leaked', async () => {
-    // The method's own docblock cites this as the reason not to reimplement it as
-    // `unloadAll()` + spawn. koota's cap is hard: `allocateWorldId` THROWS "Too many worlds
-    // created. The maximum is 16." So a future edit that drops the destroy ships a hard throw
-    // on the ~16th Create Scene of a session — and, before this test, with a green gate:
-    // deleting `destroyWorldWhenSafe` left all 10804 tests passing.
+    // koota's cap is hard: `allocateWorldId` THROWS "Too many worlds created. The maximum is
+    // 16." So a future edit that drops the destroy ships a hard throw on the ~16th Create Scene
+    // of a session — and, before this test, with a green gate: deleting `destroyWorldWhenSafe`
+    // left all 10804 tests passing. (The method's docblock used to cite this as the reason not
+    // to reimplement it as `unloadAll()` + spawn; since #877 `unloadAll` frees its slot too, so
+    // that warning now rests on what unloadAll ELSE does — drop every scene's resources and
+    // reset the manager registry's active scope.)
     const before = getCurrentWorld();
     const witness = before.spawn(EntityAttributes({ name: 'witness' }));
     expect(witness.isAlive()).toBe(true);
@@ -251,10 +253,12 @@ describe('newScene()', () => {
     // `unloadAll`. ⚠️ What has to be copied is the POSITION, not the two lines:
     // `initSceneManagersFor('')` spuriously re-activates any manager with no `scenes` filter
     // (`sceneMatches` returns true for ''), and `activate()` hands that manager's `init()`
-    // `getCurrentWorld()`. `unloadAll` is safe because it promotes AFTERWARDS, into a world
-    // nobody keeps. Run after the promote here and a filter-less manager's `init()` spawns its
-    // entities straight into the brand-new scene, where the dispose — holding the OLD world —
-    // cannot see them, and the next save writes them into the new scene file.
+    // `getCurrentWorld()`. `unloadAll` is safe because it promotes AFTERWARDS: the spawn lands
+    // in the OUTGOING world, which its own `disposeActiveSceneManagers` covers and (since #877)
+    // its tail then destroys — not in the world the user is about to see. Run after the promote
+    // here and a filter-less manager's `init()` spawns its entities straight into the brand-new
+    // scene, where the dispose — holding the OLD world — cannot see them, and the next save
+    // writes them into the new scene file.
     //
     // No manager in the repo has this shape today (the unfiltered ones carry no `init`), which
     // is exactly why the gate was silent on it — so the test has to build one.

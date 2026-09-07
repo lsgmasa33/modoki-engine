@@ -1079,6 +1079,10 @@ describe('beforeSwap hooks', () => {
 
     sceneManager.unregisterBeforeSwap(captureHook);
     sceneManager.unregisterBeforeSwap(failingHook);
+    // ⚠️ Fire-and-forget, and since #877 this teardown's tail DESTROYS the world current when
+    // it lands. Harmless only because this is the last test in the file and `beforeEach` does
+    // `vi.resetModules()` — a test appended after this one would run against a settling
+    // teardown that can free its world. Await it (or move this cleanup) before adding one.
     sceneManager.unloadAll();
   });
 });

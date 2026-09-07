@@ -141,6 +141,38 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(eJunk.code).toBe('REFUSED_BY_OP');
   });
 
+  it('a route-authored `options` list survives to the caller, like `code` already does (#872)', async () => {
+    // The park gate authors its refusal SERVER-side, because only the renderer knows whether an
+    // Inspector import-settings edit is parked. Its `code` already travelled; its OPTIONS did not,
+    // and options are the half that converts a dead end into the agent's next move (§5). A refusal
+    // that says "no" and not "here is how" is the failure this rule exists to prevent.
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/write-meta'
+        ? {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'REQUIRES_SAVE',
+            error: 'write-meta refused: a parked edit exists for /assets/textures/rock.png',
+            options: ['modoki_save_all — flush it first', 'discardUnsaved:true — destroy it and write'],
+          },
+        }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_write_asset_meta', { path: '/assets/textures/rock.png', meta: { id: 'g' } }));
+
+    expect(e.code).toBe('REQUIRES_SAVE');
+    expect(e.options?.join(' ')).toContain('modoki_save_all');
+    expect(e.options?.join(' ')).toContain('discardUnsaved:true');
+  });
+
+  it('…and a body with no `options` still gets the status-derived ones', async () => {
+    // The accept side: the passthrough must not have displaced the generic advice for every other
+    // route, which is the easy way to "fix" this and lose the 403/404 guidance.
+    const s = (surface = loadSurface(() => ({ status: 403, body: { error: 'token mismatch' } })));
+    const e = envelope(s, await s.call('modoki_get_editor_state'));
+    expect(e.options?.join(' ')).toContain('modoki_identity');
+  });
+
   it('V3 — a 200 answering the SPA HTML is NOT_AVAILABLE_HERE, never an answer', async () => {
     // Measured on the default backend: a missing `/api` route falls through to the editor page and
     // answers 200 with index.html, which the transport happily reported as a successful read whose

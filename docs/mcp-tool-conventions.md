@@ -358,14 +358,27 @@ variance is machine-readable while it lasts.
   entries; that cost is knowingly accepted and documented.)
 - **Persistence is manual and the response says so**: a live edit reports `saved:false` plus the
   hint naming `modoki_save_all`. A tool that writes the file reports `saved:true`. Never guess.
-- **A world-swapping or file-reading operation refuses when unsaved live work would be lost or
-  omitted**, with `REQUIRES_SAVE` and an escape hatch — `discardUnsaved` where the work is
-  DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`), `force` where it merely goes
-  un-included (`build`/`add_native_target`/`ota_publish`). Two consequences, two names: one word
-  for both is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/`build` do
-  this; **`ota_publish` does not** — it builds from the scene file and ships over the air, so an
-  agent that just edited the live world publishes an artifact missing its own work and is told
-  "✅ Published" (S1).
+- **An operation that swaps the world, or READS OR WRITES a file the editor holds unsaved work
+  for, refuses when that work would be lost or omitted**, with `REQUIRES_SAVE` and an escape hatch
+  — `discardUnsaved` where the work is DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`/
+  `write_asset_meta`), `force` where it merely goes un-included (`build`/`add_native_target`/
+  `ota_publish`/`reimport_asset`/`duplicate_asset`). Two consequences, two names: one word for both
+  is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/
+  `build` do this; **`ota_publish` does not** — it builds from the scene file and ships over the
+  air, so an agent that just edited the live world publishes an artifact missing its own work and
+  is told "✅ Published" (S1).
+
+  ⚠️ **This said "world-swapping or file-READING", and the omission was load-bearing** (#872). A
+  file WRITE is the case with the worst consequence — `write_asset_meta` replaces a `.meta.json`
+  wholesale, destroying a parked Inspector edit — and the rule as written did not name it, so the
+  issue that found the defect declared an open three-way contract fork and parked the work for a
+  decision this section had already made. **Check this doc before drafting options**; a rule that
+  covers your case is not always spelled with your case's verb.
+
+  ⚠️ **"Unsaved work" is not only the live world.** Anything the editor is holding that disk does
+  not have counts, including a registry in the RENDERER that the answering route runs too far from
+  to see — the sidecar park gate has to make a round trip to ask, and "the renderer did not answer"
+  must be a refusal, not a proceed (see §5, and `docs/mcp-persistence.md` § 5).
 - **What can be proven wrong BEFORE starting is refused before starting; what is only discovered
   mid-flight is reported per-op.** A `setTrait` naming a field the trait does not have is provably
   ineffective from the schema alone, so `/api/scene-mutate` now refuses the whole call pre-flight —

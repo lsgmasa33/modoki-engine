@@ -70,7 +70,14 @@ export async function writeMetaConditional(path: string, meta: unknown, ifMatch?
   try {
     const res = await backendFetch('/api/write-meta', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, meta, ...(ifMatch !== undefined ? { ifMatch } : {}) }),
+      // `rendererWrite` exempts this from the sidecar PARK GATE (#872). §8's REQUIRES_SAVE rule is
+      // an AGENT-surface rule and this route is shared: every caller of this helper loads through
+      // `readMetaPreferringPark` and calls `metaWrittenToDisk` afterwards, so the document being
+      // posted ALREADY CONTAINS the parked edit and this write is what legitimately retires it.
+      // Without the flag the gate refused a human's Sprite Editor save and `writeMetaConditional`
+      // misreported the 409 below as "the file changed on disk". The flag asserts something about
+      // the calling PROCESS — a renderer write is never blind to a registry it owns.
+      body: JSON.stringify({ path, meta, rendererWrite: true, ...(ifMatch !== undefined ? { ifMatch } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');

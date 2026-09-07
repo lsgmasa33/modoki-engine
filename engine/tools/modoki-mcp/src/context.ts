@@ -203,6 +203,19 @@ export function createToolContext(config: { backend: string; token?: string }): 
       ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
       : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
     const code = codeFromBody(body, statusCode);
+    // Options the ROUTE named beat anything derived here, for the same reason `code` does: the
+    // route knows what its own refusal costs and what the caller's real exits are, and this
+    // function can only guess from a status. Without this a §5 refusal authored server-side —
+    // the park gate's "save first / discardUnsaved:true / read the parked value" (#872) — arrived
+    // with its `why` intact and its options silently dropped, which is the half that converts a
+    // dead end into the agent's next move.
+    const routeOptions = ((): string[] | undefined => {
+      if (!body || typeof body !== 'object') return undefined;
+      const o = (body as { options?: unknown }).options;
+      if (!Array.isArray(o)) return undefined;
+      const list = o.filter((x): x is string => typeof x === 'string' && !!x);
+      return list.length ? list : undefined;
+    })();
     return fail({
       code,
       what,
@@ -210,11 +223,13 @@ export function createToolContext(config: { backend: string; token?: string }): 
         ? `the backend refused with HTTP ${status}: ${detail}`
         : `the backend answered HTTP ${status} with no explanation.`,
       got: body,
-      ...(routeMissing
-        ? { options: ['the route is absent — this editor build may predate the tool; relaunch the editor from this checkout'] }
-        : status === 403
-          ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
-          : {}),
+      ...(routeOptions
+        ? { options: routeOptions }
+        : routeMissing
+          ? { options: ['the route is absent — this editor build may predate the tool; relaunch the editor from this checkout'] }
+          : status === 403
+            ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
+            : {}),
     });
   }
 

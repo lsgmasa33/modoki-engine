@@ -1981,11 +1981,13 @@ with neither silently removes the guarantee**, exactly as it did here for two fu
 entire release window.
 
 ⚠️ Still uncovered by either mechanism: `.meta.json` sidecars are invisible to `detectType`
-(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845. **This is the
-reason `modoki_write_asset_meta` can still clobber a human's parked edit (#872, open): the
-watcher-driven park-drop that protects `modoki_write_asset` cannot fire for a sidecar.** The read
-side is closed — `modoki_get_asset_meta` consults the registry — and the CAS half is closed too
-(#871/#874). See [mcp-persistence.md](./mcp-persistence.md) § 5.
+(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845. **So a sidecar
+gets a THIRD mechanism rather than either of these two: an explicit gate that asks the renderer
+before the write** (#872/#882). The watcher-driven park-drop that protects `modoki_write_asset`
+cannot fire for a sidecar, and `/api/write-meta` sends no `ifMatch` of its own, so neither of the
+two mechanisms above was ever going to reach it. Read side, CAS half and write side are all closed
+now (#872/#871/#874/#882); the gate, why it must not fail open, and the three routes it covers are
+in [mcp-persistence.md](./mcp-persistence.md) § 5.
 
 ⚠️ **And being watched is not the same as being invalidated WELL.** Adding a kind to
 `LiveReloadKind` makes the broadcast fire; what the matching `ASSET_CACHE_INVALIDATORS` entry then

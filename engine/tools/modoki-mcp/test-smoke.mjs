@@ -1554,6 +1554,76 @@ if (canUC3) {
   }
 }
 
+// UC14 — the .meta.json ROUND TRIP, and the live proof that the park gate reaches the renderer
+// (#872/#882).
+//
+// `modoki_write_asset_meta` sat in LIVE_UNCOVERED with a reason that argued for its own removal
+// ("SMOKE-COVERABLE — read the sidecar, write it back unchanged, verify") and no case. It writes a
+// real file in the human's project, which is the bar for that ledger — but written back UNCHANGED
+// it is a no-op on disk, so the case costs nothing and buys the one thing only a live call proves.
+//
+// ⚠️ **The `editorConnected` assertion is the load-bearing half, not the round trip.** The write
+// now asks the renderer whether a human's Inspector import-settings edit is parked, and answers
+// `editorConnected:false` when no renderer answered at all — including when the `resolve-meta-park`
+// op is not registered ("unknown agent op" classifies as a definitively-absent renderer, correctly:
+// a runtime with no editor ops has no registry either). An editor IS attached while this suite
+// runs, so `editorConnected:false` here means the probe did not reach the op — the gate silently
+// degraded to the unguarded write this work replaced. That is precisely the class `npm test` cannot
+// see and `modoki_prefab` hid in for months.
+//
+// The REFUSAL side is deliberately not here: parking an import-settings edit is a human Inspector
+// gesture with no agent equivalent, so no case in this suite can create one. It is hand-verified
+// against a live editor instead, and that limitation is stated rather than left to be discovered.
+const uc14Assets = JSON.parse(text(await client.callTool({
+  name: 'modoki_list_assets', arguments: { type: 'texture', limit: 5 },
+})));
+const uc14Path = uc14Assets?.assets?.[0]?.path;
+if (!uc14Path) {
+  skipped.push('UC14 (.meta.json round trip) — the open project has no texture asset to read a sidecar from');
+} else {
+  const before = JSON.parse(text(await client.callTool({
+    name: 'modoki_get_asset_meta', arguments: { path: uc14Path },
+  })));
+  if (!before.ok) throw new Error(`UC14 could not read the sidecar for ${uc14Path}: ${JSON.stringify(before).slice(0, 300)}`);
+  if (before.unsaved === true) {
+    // A human has an unsaved edit parked for this asset. Writing here would be exactly the
+    // destruction this work exists to prevent, so the case declines rather than "handling" it.
+    skipped.push(`UC14 (.meta.json round trip) — ${uc14Path} has a PARKED Inspector edit; refusing to write over a human's unsaved work`);
+  } else {
+    const wrote = JSON.parse(text(await client.callTool({
+      name: 'modoki_write_asset_meta', arguments: { path: uc14Path, meta: before.meta },
+    })));
+    if (!wrote.ok || typeof wrote.sha256 !== 'string') {
+      throw new Error(`UC14 write_asset_meta did not report a written sidecar: ${JSON.stringify(wrote).slice(0, 300)}`);
+    }
+    if (wrote.editorConnected === false) {
+      throw new Error(
+        'UC14 the write reported editorConnected:false while an editor IS attached — the '
+        + 'resolve-meta-park probe did not reach the renderer, so the park gate is inert and this '
+        + `write was unguarded. Reply: ${JSON.stringify(wrote).slice(0, 300)}`,
+      );
+    }
+    if (wrote.discardedParked) throw new Error(`UC14 discarded a parked edit it never asked to: ${JSON.stringify(wrote)}`);
+    const after = JSON.parse(text(await client.callTool({
+      name: 'modoki_get_asset_meta', arguments: { path: uc14Path },
+    })));
+    // Unchanged in, unchanged out. `readMetaSidecar` merges the gitignored `.meta.local.json` cache
+    // blocks back in and `writeMetaSidecar` splits them out again, so a round trip that is NOT
+    // stable means one of those two halves has drifted — which would silently rewrite every
+    // sidecar an agent touches.
+    if (JSON.stringify(after.meta) !== JSON.stringify(before.meta)) {
+      throw new Error(
+        `UC14 the sidecar for ${uc14Path} did not survive an unchanged round trip.\n  before: `
+        + `${JSON.stringify(before.meta).slice(0, 300)}\n  after:  ${JSON.stringify(after.meta).slice(0, 300)}`,
+      );
+    }
+    if (after.source !== 'disk' || after.unsaved !== false) {
+      throw new Error(`UC14 left a parked edit behind: source=${after.source} unsaved=${after.unsaved}`);
+    }
+    console.log(`UC14 ${uc14Path} sidecar read → written back unchanged → identical, park gate reached the renderer ✓`);
+  }
+}
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

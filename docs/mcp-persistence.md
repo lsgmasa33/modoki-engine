@@ -309,16 +309,103 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   badge and calls `useMetaDirty` — a badge rendered from a constant is dark forever, and a
   subscription nothing renders tells the human nothing. ⚠️ Its scan is `.tsx`-only, so a
   `parkMetaEdit` caller in a plain `.ts` module (`assetEditorBindings.ts`) is outside it.
-- **An agent READS through the registry; the WRITE half is an OPEN contract decision** (#872).
-  `modoki_get_asset_meta` goes to `/api/asset-meta` → the `read-asset-meta` op → the renderer, and
-  reports `source: 'parked' | 'disk'`; with no renderer it falls back to disk and says
+- **The agent surface reads AND writes through the registry now** (#872 read half, #872/#882 write
+  half). `modoki_get_asset_meta` goes to `/api/asset-meta` → the `read-asset-meta` op → the
+  renderer, and reports `source: 'parked' | 'disk'`; with no renderer it falls back to disk and says
   `editorConnected:false` rather than passing a pre-edit file off as the answer.
-  ⚠️ **`modoki_write_asset_meta` still writes disk without consulting the registry**, and unlike an
-  asset doc nothing reconciles it — `.meta.json` is invisible to `detectType`, so
-  `dropParkedWriteFor` never fires for a sidecar. That is the `LiveReloadKind`-vs-CAS rule in
-  [editor.md](./editor.md) for a third time. Whether the tool should park, drop the park, or refuse
-  is the owner's call and is still open; until then its description says plainly that it writes
-  disk and points at `get_editor_state.pendingImportSettings`.
+
+  The write half is **one gate on three routes**, `metaParkGate` in `editorBackendRouter.ts`, asking
+  the new `resolve-meta-park` op. The rule it generalises is worth more than the three fixes:
+  **a registry that lives in the RENDERER is invisible to a NODE route, and consulting it is a
+  round trip nobody makes unless a specific bug forces them to** — which is why this arrived one
+  route at a time, each site individually correct.
+
+  | Route | What a parked edit costs it | §8 consequence → hatch |
+  |---|---|---|
+  | `/api/write-meta` | replaces the sidecar wholesale; the park then flushes back over the write | **DESTROYED** → `discardUnsaved` |
+  | `/api/reimport` | every handler reads the sidecar off DISK, so the bake uses the PRE-EDIT values | **un-included** → `force` |
+  | `/api/duplicate-asset` | seeds the copy's sidecar from the source's FILE | **un-included** → `force` |
+
+  Four things a reader should not have to re-derive:
+
+  - ⚠️ **The gate lives on the ROUTE; the rule it enforces is an AGENT-surface rule. That gap
+    broke the human editor** (#872 review). `/api/write-meta` is not agent-only: the Sprite Editor,
+    the 9-slice editor and the Inspector's postprocessor row all POST through
+    `writeMetaConditional`, and all three LOAD via `readMetaPreferringPark` and call
+    `metaWrittenToDisk` after — so their document already CONTAINS the parked edit and the write is
+    what legitimately retires it. Gating them 409'd a human's save, and `writeMetaConditional`
+    reports a 409 as *"the file changed on disk"* — a wrong diagnosis of a file that did not change,
+    with the slices unsaveable. `rendererWrite: true` exempts the one renderer POST definition, and
+    the flag asserts something about the **calling process**, not about the document: a write issued
+    from the renderer is never blind to a registry it owns. The Assets panel's Duplicate is the same
+    class with a quieter symptom — it flushes the source's park first (the click is consent, as
+    `assetViews/reimport.ts` already does) rather than being refused with the reason discarded.
+  - ⚠️ **`unknown agent op` does NOT mean "no renderer" over this transport.** `ws.send`
+    BROADCASTS to every HMR client and `createBrowserRequestRegistry` is first-reply-wins;
+    `initAgentBridge()` runs on any editor-flagged page but `registerEditorAgentOps()` only from
+    `editor/setup.ts`. So a second tab on the dev server's runtime route answers *"unknown agent
+    op"* instantly and beats the editor tab that actually holds the park — and reading that as
+    "absent" let the write through while telling the caller there was no renderer. One client's
+    "I do not have that op" says nothing about whether another client does; it is "could not look".
+    (`applyMovesInRenderer` may still treat it as absent — it is best-effort repair, not a guard.)
+  - ⚠️ **The discard follows a SUCCESSFUL write, it does not ride along with the probe.** Doing
+    both in one op is tighter against a concurrent park, and it bought that by destroying the
+    human's edit before `writeMetaSidecar` could still fail — a read-only sidecar or ENOSPC left
+    the edit gone and nothing written. The window the split reopens is the opposite way round and
+    strictly smaller.
+  - ⚠️ **Gate on the CANONICAL asset URL** (`normalizeAssetUrl`, shared with `resolveAssetPath`).
+    A raw request string like `assets/x.png` or `/my%20tex.png` resolves to a real file while the
+    park is filed under the canonical form, so the check missed and the write destroyed the park it
+    had just looked for.
+  - ⚠️ **The gate must not fail OPEN, and that is the hard part.** `requestBrowser` rejects on a
+    timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It reuses
+    `applyMovesInRenderer`'s classifier rather than a second copy — `isRelayTransportFailure` minus
+    `isRelayTimeout`. A definitively-absent renderer PROCEEDS (a park is renderer-only state, so
+    with no renderer there is none) and says `editorConnected:false`; a **silent** one REFUSES with
+    `NO_RENDERER`. Reading a timeout as "clear" would be #872 rebuilt inside its own fix, and every
+    test that stubs a working renderer passes either way.
+  - **The probe uses `peekPendingMeta`, never `readMetaPreferringPark`** — the same correction the
+    read half carries as `passive`. An observer must not disarm the guard it observes, and a WRITE
+    gate has more power to get that wrong than a read, not less.
+  - **Probe and discard are ONE op**, so a park cannot land between the check and the write.
+  - **A discard deliberately leaves `readFailed` ARMED.** Clearing it would let a component still
+    holding the `{}` fallback park an id-less document, which is the GUID destruction that flag
+    exists to prevent — so an agent `discardUnsaved` can still leave a path wedged for the panel.
+    That is #880's second face, reachable by one more route, and it is not papered over.
+
+  ⚠️ **It refuses rather than flushing**, which is the one place the agent surface deliberately
+  differs from the UI. `assetViews/reimport.ts` flushes the park before re-importing, because the
+  human clicked Re-import in the panel where they made the edit and that click IS consent to
+  persist it. An agent has no such mandate, and §8's settled precedent (`modoki_build` refuses
+  rather than auto-saving) is the agent-surface answer.
+
+  ⚠️ Still true, and still the reason all of this is needed: nothing reconciles a sidecar the way
+  the watcher reconciles an asset doc — `.meta.json` is invisible to `detectType`, so
+  `dropParkedWriteFor` never fires for one. That is the `LiveReloadKind`-vs-CAS rule in
+  [editor.md](./editor.md) for a third time.
+
+  ⚠️ **`modoki_discard_asset_edits` does NOT cover this registry** and never has. It owns the
+  dirty-asset registry only, so `all:true` reads as a clean slate it does not deliver; it now
+  REPORTS the parked sidecar edits it did not touch (`remainingImportSettings`) rather than
+  widening what it destroys. The named exits from a park are `modoki_save_all` and
+  `modoki_write_asset_meta {discardUnsaved:true}`.
+
+  ⚠️ **The class is wider than this registry, and the remaining member is filed.** The mechanism
+  — *a Node route reads a file while a renderer registry holds a newer unsaved version of it* — is
+  not specific to `pendingMeta`. `duplicateAssetFile`'s JSON branch reads the source asset **doc**
+  off disk with no `dirtyAssets` consult, so duplicating a `.mat.json` with a parked panel edit
+  produces a copy built from pre-edit bytes. Four instances across two registries says the missing
+  abstraction is ONE "what unsaved state exists for these paths" probe spanning all four renderer
+  registries, not a fourth gate; that is the design call in the issue, not something a finishing
+  pass gets to widen into.
+
+  Guarded three ways: `plugins/metaParkGate.test.ts` (both sides of every route),
+  `framework/resolveMetaParkOp.test.ts` (the op's non-recording contract), and
+  `architecture/metaParkGateCoverage.test.ts` — the corpus guard that fails when a FOURTH route
+  touches a sidecar without gating or declaring why it cannot be in the way. Live: smoke UC14
+  asserts the probe actually reaches the renderer (`editorConnected:false` while an editor is
+  attached means the gate has silently gone inert); the REFUSAL side has no agent equivalent to
+  park an edit, so it is hand-verified.
 
 It is the FIFTH cause `unsavedChangeCauses()` names (`pendingImportSettings`), for the same S3.11
 reason as the fourth.

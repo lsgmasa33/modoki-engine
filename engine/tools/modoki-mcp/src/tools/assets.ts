@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
+import { DISCARD_UNSAVED_BASE, unsavedForceParam } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
@@ -415,22 +416,30 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
     + 'multiple-of-4 dimensions, and a non-mult-4 texture with mipmaps renders SOLID BLACK on '
     + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.\n\n'
-    + '⚠️ THIS WRITES DISK, AND IT DOES NOT CONSULT THE EDITOR\'S PENDING REGISTRY (#872, open). '
-    + 'Since #845 a human\'s Inspector import-settings change is PARKED, not written. So if one is '
-    + 'pending for this path: your write lands on disk, the park survives it, and the next '
-    + 'modoki_save_all (or the human\'s Cmd+S) flushes that older document straight over what you '
-    + 'just wrote. Both directions lose work. Unlike an asset DOC, nothing reconciles this — a '
-    + '.meta.json is invisible to the file watcher, so the park-drop that protects '
-    + 'modoki_write_asset never fires here.\n\n'
-    + 'CHECK FIRST: modoki_get_editor_state `pendingImportSettings` lists every parked sidecar path. '
-    + 'If yours is on it, run modoki_save_all (keep the human\'s edit, then re-read and re-apply '
-    + 'yours) or modoki_discard_asset_edits — do not write over it blind. Whether this tool should '
-    + 'park, drop the park, or refuse outright is an OPEN contract decision on #872.',
+    + 'THIS WRITES DISK. Since #845 a human\'s Inspector import-settings change is PARKED in the '
+    + 'editor rather than written, and this replaces the file wholesale — so if one is pending for '
+    + 'this path, writing DESTROYS it: your bytes land, the park survives, and their next Cmd+S '
+    + 'flushes that older document straight back over what you wrote. Both directions lose work, '
+    + 'and unlike an asset DOC nothing reconciles it — a .meta.json is invisible to the file '
+    + 'watcher, so the park-drop that protects modoki_write_asset never fires here.\n\n'
+    + '⚠️ SO THIS REFUSES while a park exists (REQUIRES_SAVE, naming the path). Your exits: '
+    + 'modoki_save_all keeps the human\'s edit (then re-read with modoki_get_asset_meta and re-apply '
+    + 'yours on top), or discardUnsaved:true destroys it and writes. modoki_get_asset_meta already '
+    + 'reads the PARKED value, so you can see what is pending before choosing.',
     {
       path: z.string().describe('Asset-root URL of the asset the sidecar belongs to (the ASSET, not the .meta.json).'),
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
+      discardUnsaved: z.boolean().optional().describe(
+        `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
+        + 'asset: it is dropped before the write, so nothing stale survives to flush back over you.',
+      ),
     },
-    async ({ path, meta }) => postJson('/api/write-meta', { path, meta }, undefined, `write the .meta.json sidecar for ${path}`),
+    async ({ path, meta, discardUnsaved }) => postJson(
+      '/api/write-meta',
+      { path, meta, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
+      undefined,
+      `write the .meta.json sidecar for ${path}`,
+    ),
   );
 
   // ── asset-tree file ops: duplicate / move / create-folder ──
@@ -440,12 +449,21 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'is why this is not a file copy: a byte-for-byte duplicate would carry the original\'s guid '
     + 'and two assets claiming one guid breaks every ref that resolves through the manifest. Use it '
     + 'to fork a material/prefab/particle as a starting point. REFUSES rather than clobbering: a '
-    + 'destination that already exists is a 409. Verify with modoki_list_assets.',
+    + 'destination that already exists is a 409. Verify with modoki_list_assets.\n\n'
+    + '⚠️ The copy\'s .meta.json import settings are seeded from the SOURCE\'S FILE, so this refuses '
+    + '(REQUIRES_SAVE) while the source has a parked Inspector import-settings edit — the copy '
+    + 'would otherwise be born with the pre-edit settings. modoki_save_all first, or force:true.',
     {
       from: z.string().describe('Asset-root URL of the asset to copy.'),
       to: z.string().describe('Asset-root URL to copy it to, including the filename and extension. Must not already exist.'),
+      force: unsavedForceParam,
     },
-    async ({ from, to }) => postJson('/api/duplicate-asset', { from, to }, undefined, `duplicate ${from} to ${to}`),
+    async ({ from, to, force }) => postJson(
+      '/api/duplicate-asset',
+      { from, to, ...(force ? { force: true } : {}) },
+      undefined,
+      `duplicate ${from} to ${to}`,
+    ),
   );
 
   tool(

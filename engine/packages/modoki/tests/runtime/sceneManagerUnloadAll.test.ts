@@ -194,6 +194,10 @@ describe('SceneManager #542 — activeScenePath after unloadAll races a post-swa
 
     // Establish scene O in game 'space'.
     await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never, gameId: 'space' });
+    // #877: watch BOTH worlds' destroys — the assertion at the end of this test
+    // needs to tell "worldO freed once, by A's tail" from "worldO freed twice".
+    const worldO = getCurrentWorld();
+    const destroyO = vi.spyOn(worldO, 'destroy');
 
     // M_wild: no `scenes` filter, so it matches ANY path — including ''.
     // Registered NOW, while O is already active, so `registerManager`'s
@@ -255,6 +259,7 @@ describe('SceneManager #542 — activeScenePath after unloadAll races a post-swa
     pA.catch(() => {});
     await vi.waitFor(() => { if (!namesInCurrentWorld().includes('A')) throw new Error('A has not swapped in yet'); });
     const worldA = getCurrentWorld();
+    const destroyA = vi.spyOn(worldA, 'destroy');
 
     // unloadAll starts while A is stuck in its post-swap tail. `nextLoad` is
     // already null (A's own swap cleared it), so unloadAll's head-abort has
@@ -315,9 +320,16 @@ describe('SceneManager #542 — activeScenePath after unloadAll races a post-swa
     managers.registerManager({ name: 'probeA', scenes: ['sceneA'], init: probeInit });
     expect(probeInit).not.toHaveBeenCalled();
 
-    // `unloadAll()` never destroys the world it replaces (a separate,
-    // pre-existing property) — reclaim worldA's koota slot explicitly. worldO
-    // is destroyed by A's own tail already (oldWorld !== promotedWorld).
-    if (worldA !== getCurrentWorld()) worldA.destroy();
+    // #877: this used to be a hand-rolled `worldA.destroy()` — the teardown
+    // installed a fresh world without freeing the one it replaced, and the test
+    // reclaimed the slot itself. It asserts now instead. Both worlds are freed
+    // exactly once, by different owners: worldO by A's own swap tail, worldA by
+    // the teardown that replaced it. `unloadAll` started AFTER A's swap here, so
+    // its head capture and its tail read are the same world — the case where they
+    // differ needs a second concurrent TEARDOWN, and lives in
+    // sceneManagerWorldSlots.test.ts.
+    expect(destroyA).toHaveBeenCalledTimes(1);
+    expect(destroyO).toHaveBeenCalledTimes(1);
+    expect(worldA).not.toBe(getCurrentWorld());
   });
 });

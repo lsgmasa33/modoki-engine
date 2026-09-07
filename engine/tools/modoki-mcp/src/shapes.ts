@@ -157,9 +157,17 @@ export const precisionParam = (fields?: string) => z.number().int().nonnegative(
 
 /** `force` — "proceed even though the editor has unsaved work", in ONE wording.
  *
- *  Shared by the three tools that build an artifact FROM THE FILES while the live world holds edits
- *  the files do not have (§8's REQUIRES_SAVE rule), around one identical and load-bearing
- *  consequence: the thing you ship does not contain your work.
+ *  Shared by the five tools that work FROM THE FILES while the editor holds edits the files do not
+ *  have (§8's REQUIRES_SAVE rule), around one identical and load-bearing consequence: the thing
+ *  you produce does not contain your work.
+ *
+ *  ⚠️ **The wording was ARTIFACT-SPECIFIC and is no longer** (#872/#882). It said "the artifact is
+ *  built from the FILES", which was true of the original three (`build`/`add_native_target`/
+ *  `ota_publish`) and false of the two that joined them: `modoki_reimport_asset` bakes an asset
+ *  from a `.meta.json` it reads off disk, and `modoki_duplicate_asset` copies one. Same rule, same
+ *  consequence, no artifact — so the shared string now names the CAUSE (this reads disk) rather
+ *  than one family's output. Widening the wording was the alternative to five tools stating one
+ *  rule two ways, which is exactly the drift §2's containment guard exists to catch.
  *
  *  NO PER-TOOL VERB any more. It used to interpolate "Build"/"Scaffold"/"Publish", which reads
  *  nicely and cost the surface its guard: §2's containment check requires every variant of a
@@ -171,11 +179,11 @@ export const precisionParam = (fields?: string) => z.number().int().nonnegative(
  *  With the destructive half renamed to `discardUnsaved`, `force` now means exactly one thing
  *  everywhere it appears, and the guard polices it instead of an exemption list. */
 export const unsavedForceParam = z.boolean().optional().describe(
-  'Proceed even though the editor has unsaved live-world changes. The artifact is built from the '
-  + 'FILES, so it will NOT contain them — this proceeds anyway rather than refusing. Prefer '
-  + 'modoki_save_all first; use this only when you mean to ship the last saved state. '
-  + 'NON-DESTRUCTIVE: your unsaved work is left alone, merely not included — which is why THIS one '
-  + 'keeps the name `force`. The world-swapping tools that destroy it call theirs `discardUnsaved`.',
+  'Proceed even though the editor has unsaved work this operation cannot see. It works from what '
+  + 'is on DISK, so your unsaved changes will NOT be included — this proceeds anyway rather than '
+  + 'refusing. Prefer modoki_save_all first; use this only when you mean to work from the last '
+  + 'saved state. NON-DESTRUCTIVE: your unsaved work is left alone, merely not used — which is why '
+  + 'THIS one keeps the name `force`. The tools that DESTROY it call theirs `discardUnsaved`.',
 );
 
 /** `discardUnsaved` — shared by the three tools that SWAP THE WORLD and destroy live work.
@@ -196,12 +204,25 @@ export const unsavedForceParam = z.boolean().optional().describe(
  *  Found by the close-out sweep after `modoki_render_sequence.force` was renamed for the same
  *  rule — the sibling, and the one with the worse consequence.
  *  `docs/mcp-tool-conventions.md` §2. */
+/** ⚠️ **The base was WORLD-SWAP-SPECIFIC and is no longer** (#872). It opened "Swap the world even
+ *  though…" and ended "…AND from the undo stack" — true of the three world-swapping tools, false of
+ *  `modoki_write_asset_meta`, which swaps nothing and destroys a parked `.meta.json` edit that was
+ *  never on the undo stack in the first place.
+ *
+ *  §2's containment guard is what forces the resolution, and it forces the RIGHT one: every variant
+ *  of a 3+-tool param must contain the shortest verbatim, so a fourth tool cannot quietly restate
+ *  the rule its own way, and it cannot be given a different NAME either — same consequence, same
+ *  name. The base therefore states the CONSEQUENCE (unsaved editor work is destroyed) and each tool
+ *  appends what that work is for it. */
 export const DISCARD_UNSAVED_BASE =
-  'Swap the world even though it has unsaved live-world changes. ⚠️ DESTRUCTIVE and IRREVERSIBLE: '
-  + 'those changes are gone — from the world, from the file, AND from the undo stack. Prefer '
-  + 'modoki_save_all first. This is the param that used to be called `force`; it was renamed '
-  + 'because `force` on modoki_build / modoki_add_native_target / modoki_ota_publish destroys '
-  + 'NOTHING, and one word cannot mean both';
+  'Proceed even though this DESTROYS unsaved editor work. ⚠️ DESTRUCTIVE and IRREVERSIBLE: what '
+  + 'it destroys is gone — from the editor, from the file, and from the undo stack. It destroys '
+  + 'only what THIS operation overwrites or replaces, NOT everything the editor is holding: a '
+  + 'world swap leaves a parked .meta.json import-settings edit untouched, and a sidecar write '
+  + 'leaves the live world untouched — so this is never a way to clear an unrelated '
+  + 'REQUIRES_SAVE. Prefer modoki_save_all first. This is the param that used to be called '
+  + '`force`; it was renamed because `force` on modoki_build / modoki_add_native_target / '
+  + 'modoki_ota_publish destroys NOTHING, and one word cannot mean both';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
 /** A factory for the same `$ref`-dedup reason as `makeEntitySpec` above — `modoki_drag` uses this

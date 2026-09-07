@@ -1383,7 +1383,17 @@ export function assetScannerPlugin(): Plugin {
   /** Cached manifest, rebuilt on file changes. Avoids re-scanning on every fetch. */
   let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: ASSET_MANIFEST_VERSION, assets: [], folders: [] };
   /** Server reference so the watcher can push HMR updates. */
-  let viteServer: { ws: { send: (m: object) => void } } | null = null;
+  // `clients` is READ, not just `send` (see `requestBrowser`'s no-client fast reject): an empty set
+  // is the only PROOF this side has that nobody is listening, and without it the caller is left
+  // with a timeout, which is ambiguous by design. Optional because a future Vite could stop
+  // exposing it — the guard then skips and the behaviour is what it was before.
+  //
+  // ONE type, used by the declaration AND the assignment cast below. They were written separately
+  // and the cast kept the old `{ ws: { send } }` shape, which still compiled (the narrower type is
+  // assignable) while telling the next reader `clients` was not there — the field the guard is
+  // built on. A shared alias makes that impossible rather than tidy.
+  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number } } };
+  let viteServer: ViteServerRef | null = null;
 
   // ── Agent bridge state (dev-only AI/tooling helpers) ──
   // The live trait-registry schema, pushed by the browser over the HMR socket
@@ -1416,6 +1426,24 @@ export function assetScannerPlugin(): Plugin {
    *  on timeout (no app open / no agent bridge connected). */
   function requestBrowser(op: string, params: unknown, timeoutMs = 3000): Promise<unknown> {
     if (!viteServer) return Promise.reject(new Error('dev server websocket not ready'));
+    // ⚠️ **A TIMEOUT and "nobody is listening" are different answers, and only this side can tell
+    // them apart.** With no page open, `ws.send` succeeds into the void and every relay call waited
+    // out its full budget before rejecting with a timeout — which callers must treat as AMBIGUOUS
+    // (`isRelayTimeout`: on Electron a timeout can only mean an attached-but-busy renderer, so it
+    // is never safe to read as "no renderer"). That cost the sidecar park gate its headless path:
+    // a dev server with no page open would have refused every `/api/reimport` with NO_RENDERER,
+    // because it could not prove nothing was parked (#872/#882). The client count PROVES it, so
+    // reject definitively and immediately instead — and the wording is one `isRelayTransportFailure`
+    // already matches, so both hosts' classifiers pick it up without a new string to keep in step.
+    //
+    // It also removes a real cost the move repair documents: three callers loop, and a 10-file cut
+    // with no page open spent its whole budget per file discovering the same thing.
+    //
+    // Optional-chained on purpose: if a future Vite stops exposing `clients`, this guard skips and
+    // the behaviour is exactly what it was before — a timeout — rather than a crash.
+    if (viteServer.ws?.clients?.size === 0) {
+      return Promise.reject(new Error(`no renderer connected to the dev server (op '${op}' was not delivered)`));
+    }
     return browserRequests.request((id) => {
       viteServer!.ws.send({ type: 'custom', event: 'modoki:request', data: { id, op, params } });
     }, timeoutMs);
@@ -1539,7 +1567,7 @@ export function assetScannerPlugin(): Plugin {
     configureServer(server) {
       // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
       reclaimStaleDeviceStateAtStartup();
-      viteServer = server as unknown as { ws: { send: (m: object) => void } };
+      viteServer = server as unknown as ViteServerRef;
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve
       // pending requestBrowser() promises when the browser replies. (See
