@@ -157,6 +157,36 @@ export function remapPrefix(set: Set<string>, oldP: string, newP: string): Set<s
   return next;
 }
 
+/** What happened to a path. `to: null` means the asset is GONE (delete) → unbind; a string
+ *  means it MOVED → remap, because the asset survives (its GUID and `.meta.json` sidecar
+ *  move with it) and only its location changed. `prefix` makes it a FOLDER operation,
+ *  matching the folder itself and everything beneath it. */
+export interface PathMove {
+  readonly from: string;
+  readonly to: string | null;
+  readonly prefix?: boolean;
+  /** Replacement display name, when the caller knows it (an asset rename). */
+  readonly name?: string;
+}
+
+/** Where `path` ends up under `move`, or `undefined` if the move does not touch it.
+ *  `null` = gone. `remapPrefix` above is the sibling of this same segment-boundary rule for
+ *  a `Set<string>` of paths rather than a single one — the two coexist rather than being
+ *  unified because this one needs the three-valued (`undefined`/`null`/string) return that a
+ *  `Set` rewrite has no use for, and both now live in this leaf module so the next person
+ *  sees them together. Exported for the test that pins folder-prefix matching. */
+export function applyMove(path: string, move: PathMove): string | null | undefined {
+  if (move.prefix) {
+    // Segment-boundary match ONLY: renaming `/assets/anim` must not capture
+    // `/assets/animations/x.json`, which a bare startsWith would.
+    if (path !== move.from && !path.startsWith(move.from + '/')) return undefined;
+    if (move.to === null) return null;
+    return move.to + path.slice(move.from.length);
+  }
+  if (path !== move.from) return undefined;
+  return move.to;
+}
+
 /** Collapse a single-folder wrapper chain so redundant manifest roots (e.g. the
  *  virtual `/` named "assets" wrapping the `/assets` URL-prefix folder, also named
  *  "assets") don't render as "assets ▸ assets". Descends while a node has no files

@@ -154,8 +154,13 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
       'not by a watcher-driven park-drop — adding it to LiveReloadKind would let ' +
       'dropParkedWriteFor (#439/#469) silently discard a human\'s parked edit, exactly the ' +
       'silent-discard behaviour #831 replaced with a human-resolved fork. ⚠️ The CAS premise is '
-      + 'not universal: a RENAME re-parks without the baseline and turns it off for the rest of '
-      + 'the session (#854) — that is a bug to fix, not a reason to take the watcher instead.',
+      + 'STILL not universal, and the caveat has only NARROWED. #854 fixed the Assets-panel '
+      + 'rename — applyMovesToParkedAssets now carries `ifMatch` across the move '
+      + '(assetEditorBindings.test.ts pins it). It did NOT fix the other ways a file moves: the '
+      + 'repair is client-side and per-call-site, so `modoki_move_asset` (out-of-process, POSTs '
+      + '/api/move-file and nothing else) and a dragged FOLDER (isFolder is dropped, so no '
+      + 'prefix move is built) both bypass it entirely. That is #867; until it lands, '
+      + 'read this reason as "protected on the rename path", not "protected".',
   };
 
   it('every agent-writable/parkable asset type is in LiveReloadKind (#842)', () => {

@@ -7,15 +7,17 @@
  *  file with the new content (duration 7) while the renamed file kept the old (duration 2)
  *  — the asset forked in two and nothing reported it. The regression to fear is therefore
  *  silent, which is why the pure resolver is tested directly rather than through a panel. */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // Deep path, not the `@modoki/engine/editor` barrel: this is internal editor plumbing with
 // one call site, and widening the public surface for a test is a cost with no buyer.
 import {
-  resolveBindingMoves, applyMove, ASSET_EDITOR_BINDINGS, applyMovesToParkedAssets,
+  resolveBindingMoves, ASSET_EDITOR_BINDINGS, applyMovesToParkedAssets,
   applyAssetPathMoves,
 } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
+import { applyMove } from '../../packages/modoki/src/editor/utils/assetPaths';
 import {
   markAssetDirty, clearDirtyAssets, getDirtyAssetPaths, peekDirtyAsset,
+  flushDirtyAssets, getLastFlushedAssetHash, getLastFlushedAsset,
 } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 const ANIM = '/assets/anim/walk.anim.json';
@@ -176,6 +178,32 @@ describe('applyMovesToParkedAssets', () => {
     expect(peekDirtyAsset(to)?.origin).toBe('agent');
   });
 
+  it('preserves the CAS BASELINE (ifMatch) across the move — this is the only cross-path re-park ' +
+    'in the tree, so markAssetDirty\'s "an omitted ifMatch preserves the destination\'s own" rule ' +
+    'is the wrong default here; a rename does not change bytes, so the source baseline still ' +
+    'describes the file at the new path', () => {
+    const from = '/assets/fx/atlas-src.atlas.json';
+    const to = '/assets/fx/atlas-dst.atlas.json';
+    const BASELINE = 'a'.repeat(64);
+    markAssetDirty(from, 'atlas', { members: ['s1'] }, 'panel', BASELINE);
+    expect(peekDirtyAsset(from)?.ifMatch, 'positive control: the baseline must actually be parked before the move').toBe(BASELINE);
+
+    applyMovesToParkedAssets([{ from, to }]);
+
+    expect(peekDirtyAsset(to)?.ifMatch).toBe(BASELINE);
+  });
+
+  it('preserves the CAS BASELINE across a FOLDER move too — pins the fix on both branches of applyMove', () => {
+    const from = '/assets/anim/atlas.atlas.json';
+    const BASELINE = 'b'.repeat(64);
+    markAssetDirty(from, 'atlas', { members: ['s1'] }, 'panel', BASELINE);
+    expect(peekDirtyAsset(from)?.ifMatch, 'positive control').toBe(BASELINE);
+
+    applyMovesToParkedAssets([{ from: '/assets/anim', to: '/assets/clips', prefix: true }]);
+
+    expect(peekDirtyAsset('/assets/clips/atlas.atlas.json')?.ifMatch).toBe(BASELINE);
+  });
+
   it('follows a FOLDER move, and leaves a sibling folder alone', () => {
     markAssetDirty(ANIM, 'animation', { duration: 1 }, 'panel');
     markAssetDirty(SEQ, 'timeline', { duration: 2 }, 'panel');
@@ -226,5 +254,125 @@ describe('applyAssetPathMoves reaches the registry, not just the bindings', () =
     markAssetDirty(ANIM, 'animation', { duration: 3 }, 'panel');
     applyAssetPathMoves([{ from: ANIM, to }]);
     expect(getDirtyAssetPaths()).toEqual([to]);
+  });
+});
+
+/** The FLUSHED-record maps (`lastFlushed`/`lastFlushedHash`) are keyed by path too, and nothing
+ *  carried them across a move before this — `applyMovesToParkedAssets` walks `getDirtyAssetPaths()`,
+ *  so a path with no PARKED write is never visited and its flushed record is stranded forever
+ *  under a filename that no longer exists. This is exactly that case: the path below is flushed
+ *  (which clears its dirty entry) BEFORE the move, so nothing is parked for it when the move runs —
+ *  a test that parked a doc first would pass even if the remap were wired only inside the
+ *  dirty-paths loop. */
+describe('applyMovesToParkedAssets carries the flushed-hash record across a move (no parked write)', () => {
+  const HASH = 'c'.repeat(64);
+  let bodies: Array<Record<string, unknown>>;
+
+  beforeEach(() => {
+    clearDirtyAssets();
+    bodies = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
+      bodies.push(JSON.parse(init.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, saved: true, sha256: HASH }) } as unknown as Response;
+    }));
+  });
+  afterEach(() => { clearDirtyAssets(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it('follows a rename, and is DROPPED when the path is later deleted', async () => {
+    const path = '/assets/fx/flushed.particle.json';
+    const renamed = '/assets/fx/renamed.particle.json';
+    markAssetDirty(path, 'particle', { version: 1 }, 'panel');
+    await flushDirtyAssets();
+    // Positive control: the flush must actually have cleared the parked write AND recorded the
+    // hash, so the move below is exercised on a path with NOTHING pending — the case the dirty-
+    // paths loop cannot reach.
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(getLastFlushedAssetHash(path)).toBe(HASH);
+    // Positive control for the DOC record (`lastFlushed`) too, before the move touches it.
+    expect(getLastFlushedAsset(path)).toEqual({ version: 1 });
+
+    applyMovesToParkedAssets([{ from: path, to: renamed }]);
+
+    expect(getLastFlushedAssetHash(path)).toBeNull();
+    expect(getLastFlushedAssetHash(renamed)).toBe(HASH);
+    expect(getLastFlushedAsset(path)).toBeNull();
+    expect(getLastFlushedAsset(renamed)).toEqual({ version: 1 });
+
+    applyMovesToParkedAssets([{ from: renamed, to: null }]);
+
+    expect(getLastFlushedAssetHash(renamed)).toBeNull();
+    expect(getLastFlushedAsset(renamed)).toBeNull();
+  });
+
+  it('survives the move even when the SAME path also has a fresh parked write (order matters: ' +
+    'the discard loop\'s forgetFlushedHash(from) must run AFTER the remap, not before, or it wipes ' +
+    'the record before it can follow the move)', async () => {
+    const path = '/assets/fx/edited-again.particle.json';
+    const to = '/assets/fx/edited-again-renamed.particle.json';
+    markAssetDirty(path, 'particle', { version: 1 }, 'panel');
+    await flushDirtyAssets(); // records lastFlushedHash[path], clears the dirty entry
+    expect(getLastFlushedAssetHash(path)).toBe(HASH);
+    markAssetDirty(path, 'particle', { version: 2 }, 'panel'); // edited again — re-parked at the same path
+    expect(getDirtyAssetPaths()).toEqual([path]); // positive control: this path IS in the discard loop now
+
+    applyMovesToParkedAssets([{ from: path, to }]);
+
+    expect(getLastFlushedAssetHash(to)).toBe(HASH);
+  });
+});
+
+/** `remapFlushedAssetRecords` (the two loops `applyMovesToParkedAssets` above delegates its
+ *  flushed-record repair to) used to snapshot each map's KEYS before walking but read each VALUE
+ *  live inside the loop — so a CHAINED move `[A→B, B→C]` re-keyed A→B first, and the B→C step then
+ *  read B's slot with a live `.get(path)`, which by then held A's freshly-written value, not B's.
+ *  Net effect: B's record was silently DESTROYED and C ended up holding A's record under the wrong
+ *  name. (No caller passes a chained move today — this pins the shape, not a live bug, mirroring
+ *  the `applyMovesToParkedAssets` chained-move test above.)
+ *
+ *  The constant-`HASH` stub above cannot tell this apart — both records would read the same value
+ *  either way — so this uses a hash DERIVED from the written path, giving A and B distinguishable
+ *  hashes. */
+describe('applyMovesToParkedAssets carries the flushed-hash record across a CHAINED move', () => {
+  const hashFor = (path: string): string => {
+    let code = 0;
+    for (let i = 0; i < path.length; i++) code = (code * 31 + path.charCodeAt(i)) >>> 0;
+    return code.toString(16).padStart(8, '0').repeat(8).slice(0, 64);
+  };
+
+  beforeEach(() => {
+    clearDirtyAssets();
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
+      const body = JSON.parse(init.body) as { path: string };
+      return { ok: true, status: 200, json: async () => ({ ok: true, saved: true, sha256: hashFor(body.path) }) } as unknown as Response;
+    }));
+  });
+  afterEach(() => { clearDirtyAssets(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it('resolves each hop against the ORIGINAL records, not one already re-keyed by an earlier hop', async () => {
+    const A = '/assets/fx/a.particle.json';
+    const B = '/assets/fx/b.particle.json';
+    const C = '/assets/fx/c.particle.json';
+    markAssetDirty(A, 'particle', { doc: 'A' }, 'panel');
+    markAssetDirty(B, 'particle', { doc: 'B' }, 'panel');
+    await flushDirtyAssets();
+    // Positive control: both records are present, each under its OWN distinct hash, before the
+    // move — a test that could pass without looking would not be a test.
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(getLastFlushedAssetHash(A)).toBe(hashFor(A));
+    expect(getLastFlushedAssetHash(B)).toBe(hashFor(B));
+    expect(hashFor(A)).not.toBe(hashFor(B));
+    // Positive control for the DOC record too — A and B's parked docs are distinguishable
+    // (`{ doc: 'A' }` vs `{ doc: 'B' }`), the same way the path-derived hash tells them apart.
+    expect(getLastFlushedAsset(A)).toEqual({ doc: 'A' });
+    expect(getLastFlushedAsset(B)).toEqual({ doc: 'B' });
+
+    applyMovesToParkedAssets([{ from: A, to: B }, { from: B, to: C }]);
+
+    // B's slot must hold A's (moved-in) record, and C must hold B's — never B destroyed and C
+    // holding A's, which is what the live-read bug produced.
+    expect(getLastFlushedAssetHash(B)).toBe(hashFor(A));
+    expect(getLastFlushedAssetHash(C)).toBe(hashFor(B));
+    expect(getLastFlushedAsset(B)).toEqual({ doc: 'A' });
+    expect(getLastFlushedAsset(C)).toEqual({ doc: 'B' });
   });
 });

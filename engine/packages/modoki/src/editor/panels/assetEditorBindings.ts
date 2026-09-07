@@ -32,7 +32,11 @@
  *  ever stops being true this needs a shared canonicalizer, not a looser match here. */
 
 import { useEditorStore } from '../store/editorStore';
-import { getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets } from '../scene/dirtyAssets';
+import {
+  getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
+} from '../scene/dirtyAssets';
+import { applyMove, type PathMove } from '../utils/assetPaths';
+import { remapCurrentFolder } from './assetFolderState';
 
 /** One editor's binding: the store field naming its asset, and the action that clears it. */
 export interface AssetEditorBinding {
@@ -53,32 +57,6 @@ export const ASSET_EDITOR_BINDINGS: readonly AssetEditorBinding[] = [
   { label: 'animation', assetField: 'editingAnimationAsset', close: 'closeAnimationEditor' },
   { label: 'timeline', assetField: 'editingTimelineAsset', close: 'closeTimelineEditor' },
 ];
-
-/** What happened to a path. `to: null` means the asset is GONE (delete) → unbind; a string
- *  means it MOVED → remap, because the asset survives (its GUID and `.meta.json` sidecar
- *  move with it) and only its location changed. `prefix` makes it a FOLDER operation,
- *  matching the folder itself and everything beneath it. */
-export interface PathMove {
-  readonly from: string;
-  readonly to: string | null;
-  readonly prefix?: boolean;
-  /** Replacement display name, when the caller knows it (an asset rename). */
-  readonly name?: string;
-}
-
-/** Where `path` ends up under `move`, or `undefined` if the move does not touch it.
- *  `null` = gone. Exported for the test that pins folder-prefix matching. */
-export function applyMove(path: string, move: PathMove): string | null | undefined {
-  if (move.prefix) {
-    // Segment-boundary match ONLY: renaming `/assets/anim` must not capture
-    // `/assets/animations/x.json`, which a bare startsWith would.
-    if (path !== move.from && !path.startsWith(move.from + '/')) return undefined;
-    if (move.to === null) return null;
-    return move.to + path.slice(move.from.length);
-  }
-  if (path !== move.from) return undefined;
-  return move.to;
-}
 
 export interface BindingChange<T> { readonly binding: T; readonly to: string | null; readonly name?: string }
 
@@ -136,6 +114,19 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
     }
   }
   const notes: string[] = [];
+  // Remap the flushed-record maps BEFORE discarding, using the same list of moves and the same
+  // "first matching move wins" rule as the loop above. `discardDirtyAssets` below calls
+  // `forgetFlushedHash(from)` — correct when an edit is being DISCARDED, wrong when the file is
+  // merely MOVING. Remapping first means the record has already left `from`, so that call
+  // becomes a harmless no-op and the record survives at `to`.
+  remapFlushedAssetRecords((path) => {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;
+      return to;
+    }
+    return undefined;
+  });
   // Drop every source path FIRST, so a rename onto a path that is itself parked cannot be
   // undone by its own discard landing after the new entry.
   for (const { from } of planned) discardDirtyAssets([from]);
@@ -143,7 +134,11 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
     if (to === null) {
       notes.push(`dropped the unsaved edit parked for ${from} (its asset was deleted)`);
     } else if (doc) {
-      markAssetDirty(to, doc.type, doc.data, doc.origin);
+      // Carry the CAS baseline (ifMatch) across too — this is the only cross-path re-park in the
+      // tree, so "omitted ifMatch preserves what's parked at the destination" (markAssetDirty's
+      // rule for same-path re-parks) is the wrong default here. A rename doesn't change bytes
+      // (renameSync), so the sha256 captured at `from` still describes the file at `to`.
+      markAssetDirty(to, doc.type, doc.data, doc.origin, doc.ifMatch);
       notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
     }
   }
@@ -171,6 +166,14 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   }
   // Independently of the bindings: a parked write can belong to an asset whose panel is CLOSED.
   notes.push(...applyMovesToParkedAssets(moves));
+  // Independently of BOTH of the above: the Assets panel's own "current folder" is also
+  // path-keyed state that must follow a move, and wiring it per call site is exactly the
+  // mistake this module's header already names — "the first version of this fix covered
+  // `executeDeletion` alone and missed the other four" — a third time, this time for
+  // `currentFolder` instead of a binding. `remapCurrentFolder` is a no-op unless `currentFolder`
+  // IS `from` or sits under it, so this is harmless for the overwhelming majority of moves
+  // (single-asset renames/cuts/deletes) where `currentFolder` names an unrelated folder.
+  for (const m of moves) remapCurrentFolder(m.from, m.to);
   return notes;
 }
 

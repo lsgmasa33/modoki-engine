@@ -22,7 +22,8 @@ import {
 } from './assetOps';
 import type { AssetEntry } from '../utils/assetPaths';
 import { remapPrefix } from '../utils/assetPaths';
-import { unbindDeletedAssetEditors, applyAssetPathMoves, type PathMove } from './assetEditorBindings';
+import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
+import type { PathMove } from '../utils/assetPaths';
 import { reportUndoFailure, COLLISION_STATUS } from '../undo/undoFailure';
 
 // Extensions we know are UTF-8 text — everything else is treated as binary so

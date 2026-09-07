@@ -1745,6 +1745,79 @@ narrower one open between two rapid edits; #469 moved the compare-and-write into
 server-side operation on `/api/write-file`; #831 moved the whole write onto the registry, so the
 precondition moved to `/api/asset-write` with it and the client-side queue went away.
 
+⚠️ **A record keyed by a PATH must follow the path when the file moves (#854).** The registry is
+four path-keyed maps — `dirty`, `lastFlushed`, `lastFlushedHash`, `flushErrors` — and a rename
+originally repaired one of them, incompletely. `applyMovesToParkedAssets` re-parked a moved entry
+with `markAssetDirty(to, doc.type, doc.data, doc.origin)` and no fifth argument, so `data` and
+`origin` survived the move and **`ifMatch` did not**. That turned the compare-and-swap off for the
+rest of the session, silently and with no banner: the panel re-seeds `baselineHash` from
+`peekDirtyAsset(path)?.ifMatch` on its parked-doc branch, which was now `undefined`. Park an atlas
+edit, rename the `.atlas.json`, and the `git checkout` hazard this whole section exists to close was
+back — on the one view whose ONLY protection is the CAS, which is exactly the argument used to
+justify not giving `atlas` a `LiveReloadKind`.
+
+Two things made it survive review. `markAssetDirty` documents that an omitted `ifMatch` **preserves**
+whatever the destination key already carried, which is correct for all six same-path re-park callers
+(`adoptParkedDoc`, the agent ops, `useParkedAssetDoc`) — `applyMovesToParkedAssets` is the only
+CROSS-path re-park in the tree, and it is the one place where "preserve what is at this key" and
+"carry what came from the other key" are different answers. And the suite already pinned
+`origin` surviving a move, which reads as coverage of the tuple; it was one field short.
+
+The fix threads `doc.ifMatch` through, which is sound because a rename does not change bytes
+(`/api/move-file` is a `renameSync`), so the hash captured at `from` still describes the file at
+`to` — including a case-only rename on a case-insensitive FS, where the inode is the same entry.
+
+Two ordering invariants hold this together, both load-bearing and neither obvious:
+
+- **`remapFlushedAssetRecords` runs BEFORE the discard loop.** `discardDirtyAssets` calls
+  `forgetFlushedHash`, which is right for an edit being DISCARDED and wrong for a file merely
+  MOVING; remapping first makes that call a no-op and the record survives at `to`. This is also the
+  only repair that reaches a path with NO parked write — `applyMovesToParkedAssets`' own loop
+  iterates `getDirtyAssetPaths()`, so it structurally cannot see one, and those entries were
+  stranded forever under a filename that no longer existed.
+- **`applyAssetPathMoves` runs BEFORE `selectAsset`** in the Assets panel's rename. `selectAsset` is
+  what re-points the Inspector, and `AtlasAssetView`'s load effect is keyed on that path — it reads
+  the parked entry to recover its baseline. Repairing the registry first means the panel cannot
+  observe a half-repaired state. This was never a live bug: both calls are synchronous, so React's
+  automatic batching guarantees no render interleaves. The order is structural so the invariant does
+  not rest on that.
+
+`flushErrors` is deliberately NOT remapped: an errored path is always a dirty path, and a dirty path
+that moves is discarded (which clears its error), so it has no orphan case.
+
+⚠️ **The repair is wired to CALL SITES, not to the move — so it covers the Assets-panel rename and
+not every way a file moves.** This is the honest scope, and an earlier draft of this section (and of
+`liveReloadKinds.test.ts`'s atlas exemption) asserted the opposite as settled fact. `applyAssetPathMoves`
+is client-side, and every caller has to remember to call it with the right arguments:
+
+- **`modoki_move_asset`** POSTs `/api/move-file` and nothing else. It runs **out of process**, so it
+  cannot call the repair at all — the fix has to push a move notification to the renderer, or move
+  the repair server-side. A parked atlas edit survives as a park keyed to a dead path; Cmd+S then
+  409s against a file that no longer exists, and the only forward exit recreates it at the old path.
+- **A dragged FOLDER** sets `isFolder: true` in the drag payload and `handleFilesDrop` never reads
+  it, so it builds an exact-path move with no `prefix`. Nothing under the folder is repaired —
+  `applyMove` returns `undefined` for every child.
+- **Inspector SELECTION** is re-pointed by `handleRename` alone; the cut/paste, drag-drop and
+  undo/redo move paths leave it aimed at the old path, and nothing self-heals when a selected path
+  vanishes from a refreshed listing.
+
+One mechanism — *the client repairs a move per call site instead of the move carrying its own
+repair* — so it wants one fix across all three, not three patches. Tracked as #867.
+
+⚠️ **The remap's own trap, found by reviewing the fix.** `remapFlushedAssetRecords` first
+snapshotted each map's KEYS and then read each VALUE live inside the walk — so a chained move
+`[A→B, B→C]` set `B` to A's record, read that back on the second hop, carried it to `C` and deleted
+`B`. One record destroyed, the other misattributed. Its comment claimed plan-then-apply prevented
+exactly that, which snapshotting keys alone does not buy.
+
+⚠️ **Snapshotting ENTRIES is not the fix either, and that was the first prescription.** With key
+AND value captured up front, the second hop's DELETE of `B` still lands after the first hop's WRITE
+to `B`, so `B` ends up empty rather than holding A's record — the same bug wearing a different
+symptom. It takes the full two-phase shape `applyMovesToParkedAssets` already uses one layer up:
+plan every `(from, to, value)` triple, delete every source key, THEN set every destination. No
+caller passes a chained move today, so this pins the shape rather than a live bug — which is
+precisely why it survived a green gate and four mutation checks aimed at other lines.
+
 ⚠️ **Why this panel and not its siblings — and the answer is narrower than it first looks.** An
 earlier version of this section said the other views were covered because "their types are all
 `SceneChangedKind`s, so an external change drops their parked write through

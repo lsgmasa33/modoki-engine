@@ -14,6 +14,7 @@
 import { useSyncExternalStore } from 'react';
 import { ASSETS_SECTION, type ViewMode } from './assetListing';
 import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
+import { applyMove } from '../utils/assetPaths';
 
 const LS_EXPANDED = 'editor:assets:expanded:v2';
 const LS_PENDING_FOLDERS = 'editor:assets:pendingFolders';
@@ -107,6 +108,20 @@ export function setCurrentFolder(path: string | null): void {
   emit();
 }
 
+/** Repoint `currentFolder` when it is `from` itself or lives under it, on a folder rename
+ *  (`to` a path) or delete (`to: null`) — without this, renaming/deleting the folder the
+ *  human is looking at leaves a stale `currentFolder` that `defaultTargetFolder` still hands
+ *  out (it only checks the path's SHAPE, not whether it exists), and the next import/create
+ *  in that folder resurrects it via `/api/write-file`'s `mkdirSync(recursive: true)`. */
+export function remapCurrentFolder(from: string, to: string | null): void {
+  ensureLoaded();
+  if (currentFolder === null) return;
+  const next = applyMove(currentFolder, { from, to, prefix: true });
+  if (next === undefined) return; // untouched by this move
+  if (next === null) { setCurrentFolder(null); return; }
+  setCurrentFolder(next);
+}
+
 /** Apply `updater` and persist. The updater must RETURN A NEW SET rather than mutate the one
  *  it is handed — `useSyncExternalStore` compares snapshots by identity, so a mutated-in-place
  *  set would persist correctly and never re-render. Every caller already uses the
@@ -158,3 +173,9 @@ export function __resetAssetFolderStateForTest(): void {
   ensureLoaded();
   listeners.clear();
 }
+
+/** FOR TESTS ONLY — the same `subscribe` the `use*` hooks hand to `useSyncExternalStore`,
+ *  exposed so a test can pin that a mutation actually NOTIFIES (the entire reason every
+ *  setter routes through `emit()`) rather than merely changing the module variable a getter
+ *  reads back. */
+export const __subscribeAssetFolderStateForTest = subscribe;

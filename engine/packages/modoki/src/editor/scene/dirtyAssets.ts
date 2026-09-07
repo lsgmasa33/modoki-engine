@@ -146,6 +146,43 @@ const lastFlushedHash = new Map<string, string>();
 export function forgetFlushedAssetHash(path: string): void { lastFlushedHash.delete(path); }
 const forgetFlushedHash = forgetFlushedAssetHash;
 
+/** Re-key `lastFlushed` and `lastFlushedHash` when their subject FILE moves — the same "a
+ *  record keyed by a path must follow that path" rule `applyMovesToParkedAssets` applies to the
+ *  dirty registry, extended to these two, which that function's own loop cannot reach: it walks
+ *  `getDirtyAssetPaths()`, so a path with NO parked write (already flushed, panel closed) is
+ *  never visited, and its flushed record is stranded under a filename that no longer exists.
+ *
+ *  `remap(path)` answers per key: `undefined` = untouched, `null` = the file is gone (delete the
+ *  entry), a string = the new path (re-key to it). Each map is walked independently — a path can
+ *  be a key in one and not the other.
+ *
+ *  PLAN then apply, same as `applyMovesToParkedAssets`: snapshot each map's ENTRIES (key AND
+ *  value) before mutating either one, AND delete every source key before setting any destination
+ *  — a chain resolves every move against the ORIGINAL records this way. Neither half alone is
+ *  enough for a chained `[A→B, B→C]`: snapshotting keys but reading values live would re-key A→B
+ *  first, then read B's slot with a LIVE `.get(path)`, which by then holds A's value, not B's.
+ *  Snapshotting entries but deleting-then-setting INTERLEAVED per key is *also* wrong — writing
+ *  `B ← A`'s value and only afterwards processing the snapshotted `(B, bValue)` entry deletes the
+ *  very value just written, so `B` ends up empty instead of holding `A`'s record. Only "delete
+ *  every source first, set every destination after" gets both hops right. Not observed live — no
+ *  caller passes a chained move today — but it is the same trap the sibling function guards
+ *  against, so it gets the same guarantee. */
+export function remapFlushedAssetRecords(remap: (path: string) => string | null | undefined): void {
+  remapOneFlushedMap(lastFlushed, remap);
+  remapOneFlushedMap(lastFlushedHash, remap);
+}
+
+function remapOneFlushedMap<V>(map: Map<string, V>, remap: (path: string) => string | null | undefined): void {
+  const planned: Array<{ from: string; to: string | null; value: V }> = [];
+  for (const [path, value] of map) {
+    const to = remap(path);
+    if (to === undefined) continue;
+    planned.push({ from: path, to, value });
+  }
+  for (const { from } of planned) map.delete(from);
+  for (const { to, value } of planned) if (to !== null) map.set(to, value);
+}
+
 /** The sha256 of what the last flush actually put on disk for `path`, or null if this session has
  *  never written it.
  *

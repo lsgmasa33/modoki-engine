@@ -1082,11 +1082,29 @@ export default function Assets() {
     const ok = await moveFileTo(asset.path, toPath);
     if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
-    if (selected === asset.path) { setSelected(toPath); selectAsset({ path: toPath, type: asset.type, name: safe }); }
     // …and an open editor bound to it, or its next autosave FORKS the asset: the write goes
     // to the old path, re-creating the file you renamed away from, while the renamed file
     // stops receiving edits (#186). Undo/redo remap back — they move the file too.
+    //
+    // Repair the registry BEFORE selectAsset: selectAsset re-points the Inspector, and
+    // AtlasAssetView's load effect is keyed on that path — it reads the parked entry to recover
+    // its compare-and-swap baseline. Doing the repair first means the panel can never observe a
+    // half-repaired registry.
+    //
+    // ⚠️ Not a live bug today, but NOT for the reason an earlier draft of this comment gave. It
+    // said "React's automatic batching guarantees no render interleaves", which is the wrong
+    // mechanism: batching governs setState, and the registry reaches the Atlas panel through
+    // `useSyncExternalStore`, which React schedules on SyncLane *specifically so it cannot be
+    // batched away*. Nothing interleaves because even SyncLane flushes in a microtask at the end
+    // of the task — a weaker guarantee than the one that was claimed, and one nobody has
+    // observed here either way. The reorder makes the invariant structural so it does not rest
+    // on either.
+    //
+    // ⚠️ This is also ONE move site of several. `pasteClipboard`'s cut branch, `handleFilesDrop`
+    // and `makeRenameUndo` all move files and never re-point the Inspector at all — see the
+    // move-repair class issue #867. Ordering here does not make the selection correct there.
     logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
+    if (selected === asset.path) { setSelected(toPath); selectAsset({ path: toPath, type: asset.type, name: safe }); }
     refresh();
 
     // Undo/redo builder in assetUndo.ts (#308) — each direction gates the remap on the move
@@ -1137,6 +1155,7 @@ export default function Assets() {
     // Folder delete does NOT go through executeDeletion, so it needs its own unbind — an
     // editor bound to an asset inside would otherwise autosave the file back and RECREATE
     // the folder along with it (#186).
+    // remapCurrentFolder runs from inside applyAssetPathMoves now — see its comment.
     logBindingChanges(applyAssetPathMoves([{ from: folderPath, to: null, prefix: true }]));
     clearSelection();
     refresh();
@@ -1253,6 +1272,7 @@ export default function Assets() {
     setExpanded((p) => remapPrefix(p, oldPath, newPath).add(newPath));
     // The same prefix remap the two lines above do for folder state, for an open editor
     // bound to an asset INSIDE the renamed folder (#186) — every one of them just moved.
+    // remapCurrentFolder runs from inside applyAssetPathMoves now — see its comment.
     logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
     clearSelection();
     refresh();
