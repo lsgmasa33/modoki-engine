@@ -1,6 +1,12 @@
 /** @modoki/editor — Visual editor, dev-only. Not shipped in production builds. */
 
-export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
+// `jsonFileBody`/`writeAssetFile` are PUBLIC because a game's own editor panels write asset
+// documents too, and reach the engine only through this barrel (CLAUDE.md: a game may not
+// import by relative path — it is copied out of the repo). Without them the only public tool
+// was raw `backendFetch`, so `games/sling`'s Level and Wave editors each hand-spelled their
+// own body and neither appended the trailing newline — #835's defect, reproduced outside the
+// engine by an export list that offered no alternative.
+export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile } from './backend/editorBackend';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
   pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
@@ -92,6 +98,12 @@ export {
   flushPendingBaseScenes, subscribePendingBaseScenes, getPendingBaseScenesVersion,
   mutateScene, type BaseSceneFlushResult,
 } from './scene/pendingBaseScene';
+export {
+  parkMetaEdit, peekPendingMeta, isMetaDirty, hasPendingMeta, getPendingMetaPaths,
+  clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
+  subscribePendingMeta, getPendingMetaVersion, type MetaFlushResult,
+  readMetaPreferringPark, metaWrittenToDisk, type PreferredMetaRead,
+} from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';

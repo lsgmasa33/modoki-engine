@@ -19,7 +19,8 @@
  *  editor — see above — and absent only where there is no Vite server at all):
  *    1. GAME CODE  — the dev server (plugins/vite-asset-scanner.ts) sends
  *       `modoki:game-code-changed` because a game edit can ONLY be applied by a reload.
- *       We reload, unless that would destroy unsaved scene work — then we say so loudly.
+ *       We reload, unless that would destroy unsaved work — then we say so loudly, NAMING
+ *       what is at stake (#850: it used to say "scene" whatever the actual cause was).
  *    2. RECOVERY   — a hook-order edit throws inside React Fast Refresh and takes down
  *       mounted panels via their error boundaries. Inherent to Fast Refresh, so DETECT
  *       and reload rather than trying to prevent it.
@@ -39,8 +40,9 @@ interface HmrStatus {
   /** True when a game-code reload was CANCELLED, so this editor is knowingly running the
    *  OLD build. Reads here are suspect until it reloads. */
   staleGameCode: boolean;
-  /** True when this page load DISCARDED unsaved scene edits to pick up new game code.
-   *  Survives the reload (sessionStorage) precisely so the loss is never silent. */
+  /** True when this page load DISCARDED unsaved work to pick up new game code — of ANY kind,
+   *  not just scene edits (#850). Survives the reload (sessionStorage) precisely so the loss is
+   *  never silent, and the journal event carries which cause it was. */
   discardedUnsavedEdits: boolean;
 }
 
@@ -59,7 +61,7 @@ const RECENT_CAP = 10;
 const CRASH_WINDOW_MS = 2000;
 /** One reload per crash, ever. Without this a crash that reproduces on boot would loop. */
 const RELOAD_GUARD_KEY = 'modoki:hmr-recovered';
-/** Grace window before discarding unsaved scene work. Long enough to read the banner and
+/** Grace window before discarding unsaved work. Long enough to read the banner and
  *  hit Cancel or Save; short enough that the normal flow still feels immediate. */
 const DISCARD_GRACE_MS = 5000;
 /** Set just before a reload that will drop unsaved edits, read back after it. The whole
@@ -137,19 +139,88 @@ export interface HotLike {
 }
 
 
-/** Reads the live unsaved-scene flag. Injectable for tests; defaults to the real editor. */
-export type DirtyProbe = () => boolean | Promise<boolean>;
+/** One "kind" of unsaved work, keyed by cause name — mirrors `unsavedChangeCauses()`'s return
+ *  shape (`editor/scene/serialize.ts`) but typed structurally (`Record<string, boolean |
+ *  string[]>`) rather than by importing that shape. That keeps a SIXTH cause needing no edit
+ *  here — `describeCauses` below enumerates whatever keys the probe actually returns, rather
+ *  than naming a fixed set (#850: a hand-listed set of causes is the same defect this module
+ *  had with hand-listed MESSAGES, one layer up). It also keeps this module free of a direct
+ *  editor-state import — see `defaultDirtyProbe`. */
+export type UnsavedCauses = Record<string, boolean | string[]>;
+
+/** Reads the causes of live unsaved work, or `false` when there are none. Injectable for
+ *  tests; defaults to the real editor. `false` — not an empty causes object, which would be
+ *  truthy — is the "nothing is dirty" representation, so the two call sites below keep
+ *  branching on truthiness exactly as they did when this returned a plain boolean. */
+export type DirtyProbe = () => UnsavedCauses | false | Promise<UnsavedCauses | false>;
+
+function isAnyCauseDirty(causes: UnsavedCauses): boolean {
+  return Object.values(causes).some((v) => (Array.isArray(v) ? v.length > 0 : v));
+}
 
 const defaultDirtyProbe: DirtyProbe = async () => {
   try {
     // Dynamic + guarded: the editor barrel must not be pulled into a game bundle.
-    const { hasUnsavedChanges } = await import('@modoki/engine/editor');
-    return hasUnsavedChanges();
+    const { unsavedChangeCauses } = await import('@modoki/engine/editor');
+    // The real return type names its fields; UnsavedCauses is deliberately looser (see above)
+    // so this module never needs to import that type to stay in sync with it.
+    const causes = unsavedChangeCauses() as UnsavedCauses;
+    return isAnyCauseDirty(causes) ? causes : false;
   } catch {
     // No editor on this route (plain game page in dev) — nothing to lose.
     return false;
   }
 };
+
+/** Human labels for the causes `unsavedChangeCauses()` reports today. NOT the only source of
+ *  truth for what can appear — `describeCause`'s fallback below handles an unlisted key — this
+ *  is a readability upgrade, not a gate. `bool` is the phrase for a plain boolean cause; `noun`
+ *  is the singular noun for a cause reported as a list of paths ("N <noun>(s)"). */
+interface CauseLabel { readonly bool?: string; readonly noun?: string }
+
+const CAUSE_LABELS: Record<string, CauseLabel> = {
+  sceneDirty: { bool: 'unsaved scene changes' },
+  dirtyAssetPaths: { noun: 'unsaved asset edit' },
+  dirtyScenes: { noun: 'unsaved edit in another loaded scene' },
+  pendingBaseScenes: { noun: 'pending base-scene reference' },
+  pendingImportSettings: { noun: 'pending import-setting edit' },
+};
+
+/** camelCase → "camel case" — the fallback label for a cause key this module has no
+ *  hand-authored entry for in `CAUSE_LABELS`. It exists so a cause added to
+ *  `unsavedChangeCauses()` is readable in the banner the DAY it's added, with no edit here —
+ *  the exact failure this file is the fix for (#850) must not repeat itself one cause later. */
+function humanizeKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+}
+
+/** One cause → a short human phrase, or null if this cause isn't active. `withPaths` names the
+ *  actual paths (the console can afford the detail); without it, only a count — the banner is
+ *  read under a 5s countdown, so it stays short. */
+function describeCause(key: string, value: boolean | string[], withPaths = false): string | null {
+  const label = CAUSE_LABELS[key];
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    const noun = label?.noun ?? humanizeKey(key);
+    const phrase = `${value.length} ${noun}${value.length === 1 ? '' : 's'}`;
+    return withPaths ? `${phrase} (${value.join(', ')})` : phrase;
+  }
+  if (!value) return null;
+  return label?.bool ?? humanizeKey(key);
+}
+
+/** Every active cause, joined into one readable phrase — enumerated from whatever `causes`
+ *  actually carries, never a fixed list of keys (see `UnsavedCauses`'s doc comment). */
+function describeCauses(causes: UnsavedCauses, withPaths = false): string {
+  const parts = Object.entries(causes)
+    .map(([k, v]) => describeCause(k, v, withPaths))
+    .filter((s): s is string => s !== null);
+  return parts.length ? parts.join(' and ') : 'unsaved changes';
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 /** Install the HMR staleness/recovery handlers. No-ops where there is no Vite hot context
  *  (a shipped game build). Call once — `main.tsx` is the only caller. */
@@ -175,12 +246,18 @@ export function initHmrStaleness(
     const raw = sessionStorage.getItem(DISCARDED_KEY);
     if (raw) {
       sessionStorage.removeItem(DISCARDED_KEY);
-      const { file } = JSON.parse(raw) as { file?: string };
+      const { file, causes } = JSON.parse(raw) as { file?: string; causes?: UnsavedCauses };
       status.discardedUnsavedEdits = true;
-      console.warn(`[modoki] unsaved scene edits were DISCARDED to load changed game code (${file}).`);
-      journal('!hmr.discarded-unsaved', { file });
+      // `causes` travels with the record (written at the moment of discard, below), so this —
+      // the LAST thing a human reads before the loss — names what was ACTUALLY lost, instead
+      // of the fixed "scene edits" this warning used to say when the scene was the only thing
+      // that could be unsaved (#850). Falls back for a record written by an older build.
+      const lostShort = causes ? describeCauses(causes) : 'unsaved changes';
+      const lostDetailed = causes ? describeCauses(causes, true) : 'unsaved changes';
+      console.warn(`[modoki] ${lostDetailed} were DISCARDED to load changed game code (${file}).`);
+      journal('!hmr.discarded-unsaved', { file, causes });
       const b = showBanner(
-        'Unsaved scene edits were discarded to load changed game code',
+        `${capitalize(lostShort)} discarded to load changed game code`,
         [{ label: 'Dismiss', onClick: () => b.remove() }],
         'info',
       );
@@ -198,12 +275,12 @@ export function initHmrStaleness(
   //     ghosts. It used to rely on `import.meta.hot.invalidate()` inside each shader module,
   //     which a Fast Refresh boundary upstream silently swallowed.
   // Same handling for both, deliberately: the reload WILL happen (stale is the worse failure),
-  // but never at the cost of unsaved scene work without a readable warning first.
+  // but never at the cost of unsaved work without a readable warning that NAMES it (#850).
   let countdown: ReturnType<typeof setInterval> | null = null;
   const onCodeChanged = (label: string) => async (data: { file?: string }) => {
     const file = data?.file ?? label;
-    const dirty = await isDirty();
-    if (!dirty) {
+    const causes = await isDirty();
+    if (!causes) {
       console.info(`[modoki] ${label} changed (${file}) — reloading to apply.`);
       location.reload();
       return;
@@ -216,19 +293,21 @@ export function initHmrStaleness(
     const deadline = Date.now() + DISCARD_GRACE_MS;
     const discardNow = async (): Promise<void> => {
       if (countdown) clearInterval(countdown);
-      // RE-CHECK, don't trust the flag captured 5s ago. Saving is an advertised response to
-      // this banner, so the common case is that the scene is CLEAN by now — recording a
+      // RE-CHECK, don't trust the causes captured 5s ago. Saving is an advertised response to
+      // this banner, so the common case is that the editor is CLEAN by now — recording a
       // discard that never happened would poison the one signal
       // (`discardedUnsavedEdits` / `!hmr.discarded-unsaved`) that docs tell agents to trust.
-      if (await isDirty()) {
-        try { sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({ file, at: Date.now() })); }
+      const recheck = await isDirty();
+      if (recheck) {
+        try { sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({ file, at: Date.now(), causes: recheck })); }
         catch { /* best effort — the reload still has to happen */ }
       }
       location.reload();
     };
-    const capitalized = label.charAt(0).toUpperCase() + label.slice(1);
+    const capitalized = capitalize(label);
+    const lost = describeCauses(causes);
     const text = (msLeft: number) =>
-      `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; unsaved scene changes will be LOST`;
+      `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; ${lost} will be LOST`;
     const banner = showBanner(text(DISCARD_GRACE_MS), [
       { label: 'Reload now', onClick: () => { void discardNow(); } },
       {
@@ -251,8 +330,8 @@ export function initHmrStaleness(
       },
     ]);
     console.warn(
-      `[modoki] ${label} changed (${file}) and the scene has UNSAVED CHANGES — ` +
-      `reloading in ${DISCARD_GRACE_MS / 1000}s, which will discard them.`,
+      `[modoki] ${label} changed (${file}) and the editor has UNSAVED WORK (${describeCauses(causes, true)}) — ` +
+      `reloading in ${DISCARD_GRACE_MS / 1000}s, which will discard it.`,
     );
     countdown = setInterval(() => {
       const left = deadline - Date.now();

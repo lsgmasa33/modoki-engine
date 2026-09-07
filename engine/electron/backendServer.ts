@@ -90,6 +90,18 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // ⚠️ RESPONSE headers a cross-origin renderer may READ. Without this, `headers.get(...)` for
+    // anything outside the CORS-safelist returns null in the Electron editor — silently, with no
+    // console error and a 200 response, so the caller sees a well-formed reply that is simply
+    // missing a field. Everything above is about which REQUESTS are allowed; this is the other
+    // direction and is easy to forget precisely because nothing complains.
+    //
+    // `X-Meta-Sha256` (#845) is the `.meta.json` CAS baseline. It cannot be computed client-side —
+    // `/api/read-meta` returns the merged view and `writeMetaSidecar` transforms what it writes —
+    // so a stripped header means `ifMatch` is never sent on the first write of a path, and the
+    // precondition guarding a committed file is inert exactly where the editor actually runs.
+    // `X-Writable` is listed for the same reason; it predates this and was never exposed either.
+    res.setHeader('Access-Control-Expose-Headers', 'X-Meta-Sha256, X-Writable');
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;
       res.end();

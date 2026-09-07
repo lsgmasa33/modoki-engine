@@ -2261,7 +2261,7 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
 
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind }): Promise<void> {
+async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }): Promise<void> {
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
   // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
@@ -2270,7 +2270,15 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   const invalidateCachedAsset = ASSET_CACHE_INVALIDATORS[msg.kind];
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
-    await dropParkedWriteFor(msg.urlPath);
+    // ⚠️ Only when THIS asset's own file changed. `viaSibling` says the broadcast was raised by a
+    // SIBLING write — today a `.glsl`/`.wgsl` shader body remapped to its `.shader.json`
+    // descriptor (#857) — and then `dropParkedWriteFor`'s premise ("the file on disk is now
+    // authoritative") is simply false: the descriptor on disk is untouched, so a parked Inspector
+    // edit for it is not stale and must survive. Dropping it here discarded exactly the edit the
+    // author was iterating on — declare a uniform in the Shader Inspector, save the `.wgsl` you
+    // added it to, lose the declaration — which is the very loop #857 exists to enable. The cache
+    // invalidation above still runs either way; only the parked-write discard is conditional.
+    if (!msg.viaSibling) await dropParkedWriteFor(msg.urlPath);
     // The invalidation above is otherwise invisible while the sim is stopped: Scene2D's idle
     // dirty-gate skips the whole frame unless something wakes it, so the viewport would keep
     // showing pre-edit pixels forever. Firing the shared dirty signal wakes EVERY subscribed
@@ -2395,7 +2403,7 @@ export function initAgentBridge(): void {
     // sceneReloadSource for why the Vite HMR path must NOT also drive reloads here.
     if (reloadSource === 'bridge') {
       bridge.on('scene-changed', (data) => {
-        void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind });
+        void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean });
       });
     }
     // Registered whenever the Electron bridge exists — dev included (#503). Unlike
@@ -2449,6 +2457,6 @@ export function initAgentBridge(): void {
   //    here too would double-reload AND bounce the scene on the editor's own writes
   //    (Vite's guard is never marked from this renderer). See sceneReloadSource.
   if (reloadSource === 'vite') {
-    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind }) => { void handleSceneChanged(msg); });
+    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }) => { void handleSceneChanged(msg); });
   }
 }

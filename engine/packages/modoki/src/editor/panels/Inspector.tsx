@@ -1,7 +1,6 @@
 /** Inspector — auto-generates trait editors from the trait registry */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
@@ -30,7 +29,8 @@ import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
-import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex, writeMetaOrWarn } from './assetViews/widgets';
+import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
+import { parkMetaEdit, readMetaPreferringPark } from '../scene/pendingMeta';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
 import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
@@ -1463,15 +1463,18 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
   useEffect(() => {
     if (asset.type !== 'model') return;
     setMetaLoaded(false);
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a postprocessor edit here is PARKED, so disk still
+    // holds the PRE-edit doc until Cmd+S. Re-seeding from disk on a reselect would read as the
+    // edit having been lost (mirrors AtlasAssetView's `pendingAssetDoc` check).
     const ac = new AbortController();
-    backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`, { signal: ac.signal })
-      .then(r => r.ok ? r.json() : {})
-      .then((m: Record<string, unknown>) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
+    readMetaPreferringPark(asset.path, { signal: ac.signal })
+      .then(({ meta: m }) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
       .catch(e => { if (e.name !== 'AbortError') setMetaLoaded(true); });
     return () => ac.abort();
   }, [asset.path, asset.type]);
 
-  // Persist postprocessor to meta when changed
+  // Persist postprocessor to meta when changed — PARKED, not written immediately (#845). Cmd+S
+  // is the write.
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
     // No `version` here — `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION` onto every write
@@ -1479,9 +1482,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
     // worst. See docs/format-versioning.md § 2b.
     const updated = { ...(metaRef.current ?? {}), postprocessor: newPostprocessor };
     metaRef.current = updated;
-    // writeMetaOrWarn, not a raw fetch with `.catch(() => {})` — that swallow-catch is exactly
-    // the pattern it exists to replace (a dev-server outage looked like a successful edit).
-    void writeMetaOrWarn(asset.path, updated);
+    parkMetaEdit(asset.path, updated);
   }, [asset.path]);
 
   return (

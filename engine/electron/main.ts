@@ -903,7 +903,7 @@ async function createWindow(backendBase: string) {
 /** Broadcast watcher events to the renderer over IPC. Shared by every project's
  *  asset backend (recreated on Open Project). */
 const onManifestUpdated = (manifest: unknown) => mainWindow?.webContents.send('modoki:bridge-manifest-updated', manifest);
-const onSceneChanged = (urlPath: string, kind: LiveReloadKind) => mainWindow?.webContents.send('modoki:bridge-scene-changed', { urlPath, kind });
+const onSceneChanged = (urlPath: string, kind: LiveReloadKind, viaSibling: boolean) => mainWindow?.webContents.send('modoki:bridge-scene-changed', { urlPath, kind, viaSibling });
 
 /** Open a different project: stop the old watcher, rebind the asset backend +
  *  SSR loader to the new root, remember it, and reload the renderer so its

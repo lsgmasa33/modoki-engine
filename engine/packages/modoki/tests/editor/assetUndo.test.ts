@@ -77,6 +77,14 @@ describe('isTextAsset', () => {
     expect(isTextAsset('/a/x.glb')).toBe(false);
     expect(isTextAsset('/a/x.png')).toBe(false);
   });
+
+  // #857: TEXT_ASSET_EXTS listed .glsl but not its sibling .wgsl shader body — both are
+  // UTF-8 text. Not a data-loss bug (a .wgsl round-tripped fine through the base64/binary
+  // path too), just an inconsistency: it took the binary path for no reason.
+  it('treats .wgsl as text, matching its .glsl sibling', () => {
+    expect(isTextAsset('/a/holo.wgsl')).toBe(true);
+    expect(isTextAsset('/a/holo.glsl')).toBe(true);
+  });
 });
 
 describe('makeDeleteUndo', () => {

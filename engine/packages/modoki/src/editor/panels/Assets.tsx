@@ -1,7 +1,7 @@
 /** Assets — browse project assets by category or folder structure */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, jsonFileBody } from '../backend/editorBackend';
 import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
@@ -10,6 +10,7 @@ import {
 } from '../scene/prefab';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
+import { readMetaPreferringPark } from '../scene/pendingMeta';
 import { useEditorStore } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
@@ -130,9 +131,14 @@ interface ModelMeta {
 }
 
 async function readMeta(assetPath: string): Promise<ModelMeta> {
+  // #845 close-out: prefer a still-parked Inspector edit (postprocessor / rootTransform, parked by
+  // ModelBatchView.applyPostprocessor / Inspector.handlePostprocessorChange / ModelAssetView.update)
+  // over disk — a stale disk read here would drive the import with the PRE-edit settings while the
+  // panel already shows the new ones. This never writes the sidecar back itself (the import that
+  // follows does — see modelImport.ts), so there is no park to drop here.
   try {
-    const res = await backendFetch(`/api/read-meta?path=${encodeURIComponent(assetPath)}`);
-    if (res.ok) return await res.json();
+    const { meta } = await readMetaPreferringPark(assetPath);
+    return meta as ModelMeta;
   } catch { /* ignore */ }
   return {};
 }
@@ -196,7 +202,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       const dir = assetPath.substring(0, assetPath.lastIndexOf('/'));
       const baseName = assetPath.substring(assetPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
       const prefabPath = `${dir}/${baseName}.prefab.json`;
-      const content = JSON.stringify(prefab, null, 2);
+      const content = jsonFileBody(prefab);
       // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
       // pushing an undo entry for a prefab that was never actually written would make
       // the resulting Cmd+Z trash a file that isn't there.
@@ -984,11 +990,16 @@ export default function Assets() {
     // For a model, the set also covers everything the import generated — read the
     // sidecar to find out what that was. A missing/unreadable meta just means the
     // bare model delete.
-    let generated: { meshes?: string[]; materials?: string[]; textures?: string[] } | null = null;
+    type GeneratedFiles = { meshes?: string[]; materials?: string[]; textures?: string[] };
+    let generated: GeneratedFiles | null = null;
     if (asset.type === 'model') {
       try {
-        const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`);
-        if (metaRes.ok) generated = (await metaRes.json()).generated || null;
+        // #845 close-out: through the shared helper for consistency with every other .meta.json
+        // read — `generated` is never itself a parked field (only an import writes it, and every
+        // re-import flushes any outstanding park for this path first), so this is unaffected by
+        // whether a park exists, but it must not be the one remaining raw fetch either.
+        const { meta } = await readMetaPreferringPark(asset.path);
+        generated = (meta.generated as GeneratedFiles | undefined) || null;
       } catch { /* no meta or read failed — proceed with the bare model delete */ }
     }
 

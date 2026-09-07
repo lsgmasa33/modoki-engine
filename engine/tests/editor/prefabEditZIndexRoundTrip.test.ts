@@ -43,17 +43,21 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
   },
 }));
 
-// savePrefabEdit's writePrefabFile POSTs through backendFetch — capture what it would have
-// written to disk instead of hitting a real dev server.
+// savePrefabEdit's writePrefabFile POSTs through postWriteFile (#835) — capture what it would
+// have written to disk instead of hitting a real dev server. jsonFileBody is left as the REAL
+// implementation (importOriginal) — it's a pure byte producer, not something this test needs to
+// fake, and faking it would silently stop this file from catching a #835 regression in it.
 let written: { path: string; content: string } | null = null;
-vi.mock('../../packages/modoki/src/editor/backend/editorBackend', () => ({
-  backendFetch: async (url: string, init?: { body?: string }) => {
-    if (url === '/api/write-file' && init?.body) {
-      written = JSON.parse(init.body) as { path: string; content: string };
-    }
-    return { ok: true, json: async () => ({}), text: async () => '' } as Response;
-  },
-}));
+vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/backend/editorBackend')>();
+  return {
+    ...actual,
+    postWriteFile: async (path: string, content: string) => {
+      written = { path, content };
+      return { ok: true, json: async () => ({}), text: async () => '' } as Response;
+    },
+  };
+});
 
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
 import { getTraitByName } from '@modoki/engine/runtime';

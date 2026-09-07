@@ -42,11 +42,31 @@
  * real (Inspector) caller — the missing half was the live-reload broadcast, which only this file
  * checks. The test below closes it by asking a THIRD, independent question: does every
  * agent-writable/parkable asset type appear in `LiveReloadKind` at all?
+ *
+ * A FOURTH gap, closed by #857's close-out: every check above cross-checks `classifySceneChange`
+ * against its consumer — none of them ask whether a given watcher even REACHES
+ * `classifySceneChange` with the right input. `onChange` in `engine/plugins/vite-asset-scanner.ts`
+ * (the Vite dev-server watcher) and its independent twin in `engine/electron/assetBackend.ts` (the
+ * Electron main-process watcher — the DEFAULT editor surface per CLAUDE.md, and what the `modoki`
+ * MCP drives) each decided, on their OWN, whether a changed file was even a candidate to classify —
+ * both tested `extname(file).toLowerCase() === '.json'` directly. When #857 taught the Vite side to
+ * remap a shader BODY (`.glsl`/`.wgsl`) to its sibling `.shader.json` descriptor before classifying,
+ * the fix reached only the file that shared `classifySceneChange`'s CALL: the raw `.json` extension
+ * test itself was the one line left duplicated — the same shape as the THIRD gap's
+ * `classifySceneChange` duplication, one call site over. So the fix worked in a browser and stayed
+ * dead in Electron dev/packaged. `pathToClassifyForChange` (`vite-asset-scanner.ts`) is now the
+ * single shared gate; the check below asserts every watcher implementation calls it instead of
+ * re-testing the extension itself — found by ENUMERATING watcher implementations (any file
+ * registering a chokidar/`.watcher.on` handler that also classifies via `classifySceneChange`)
+ * rather than a hand-typed two-file list, so a third such watcher is swept in automatically instead
+ * of silently passing outside the list.
  */
 
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -160,7 +180,13 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
       + 'repair is client-side and per-call-site, so `modoki_move_asset` (out-of-process, POSTs '
       + '/api/move-file and nothing else) and a dragged FOLDER (isFolder is dropped, so no '
       + 'prefix move is built) both bypass it entirely. That is #867; until it lands, '
-      + 'read this reason as "protected on the rename path", not "protected".',
+      + 'read this reason as "protected on the rename path", not "protected". '
+      + '⚠️ One HALF of this reason has an answer now, and it is deliberately not being used '
+      + 'here: #857 added `viaSibling`, so a broadcast CAN reach the invalidator without '
+      + 'dropParkedWriteFor firing at all. That defuses the silent-discard objection but not '
+      + 'the CAS one above, and a `.meta.json` write is a direct write to its own file rather '
+      + 'than a sibling-raised one, so the flag would be false for it anyway — it is not the '
+      + 'lever that would make adding this kind safe.',
   };
 
   it('every agent-writable/parkable asset type is in LiveReloadKind (#842)', () => {
@@ -186,5 +212,120 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
         'ASSET_CACHE_INVALIDATORS in agentBridge.ts — or, if a broadcast is genuinely not needed, ' +
         'add it to NOT_LIVE_RELOADABLE above with a verified reason.',
     ).toEqual([]);
+  });
+});
+
+/**
+ * Every watcher that classifies a changed file via `classifySceneChange` must decide WHAT to
+ * classify through the one shared `pathToClassifyForChange` (#857) — never by re-testing
+ * `extname(file) === '.json'` itself. Two independent copies of that test is exactly how #857
+ * happened: the Vite plugin's `onChange` was taught to remap a shader BODY (`.glsl`/`.wgsl`) to
+ * its sibling `.shader.json` descriptor before classifying, and the fix landed only there — the
+ * raw extension check in the Electron backend's OWN `onChange` was the one line the previous
+ * `classifySceneChange`-sharing fix (the THIRD gap above) left duplicated, so it kept gating on
+ * the un-remapped body path and the whole feature was dead on Electron dev/packaged, the DEFAULT
+ * editor surface per CLAUDE.md.
+ *
+ * `findWatcherClassifierFiles` below is a genuine ENUMERATION, not a hardcoded pair: it walks the
+ * tracked corpus (`repoCorpus.mjs`, git-sourced) for any `.ts`/`.tsx` file that both registers a
+ * watcher (`chokidar.watch(` or the Vite dev server's `server.watcher.on(`) AND classifies via
+ * `classifySceneChange` — the two independent signals that together mean "this is one of the
+ * producer's own watcher implementations", not merely a file that mentions either concept in
+ * passing (`agentBridge.ts` and `dirtyAssets.ts` reference `classifySceneChange` too, as the
+ * CONSUMER, but neither registers a watcher, so neither is swept in). Exactly two files satisfy
+ * both today; a third watcher grown anywhere in the tree that also classifies scene changes is
+ * swept in automatically and held to the same rule, rather than silently passing outside a
+ * hand-typed list the way the THIRD gap's fix once did.
+ */
+describe('live-reload watchers share ONE extension gate, not two (#857)', () => {
+  /** A real watcher registration in this codebase — `chokidar`'s own watch call (the Electron
+   *  backend) or the Vite dev server's watcher `.on(` (verified: repo-wide, only two files match
+   *  either shape today). Deliberately checked against COMMENT-BLANKED code below, not raw text:
+   *  this very describe block's own docblock and comments talk ABOUT both shapes in prose, and a
+   *  raw-text match would flag this test file itself as a watcher implementation (measured while
+   *  writing this guard — the fail mode `readScannedSource`'s own module doc warns about, landing
+   *  here on the first attempt). */
+  const WATCHER_REGISTRATION = /chokidar\.watch\(|\.watcher\.on\(/;
+
+  function findWatcherClassifierFiles(): string[] {
+    // `.ts`/`.tsx` repo-wide — floored far under even the smallest real corpus (the public OSS
+    // snapshot alone ships thousands under `engine/`), so a collapsed enumeration trips this
+    // before it ever reaches the file-content check.
+    const candidates = repoFiles({ match: (rel: string) => /\.tsx?$/.test(rel), floor: 500 });
+    const out: string[] = [];
+    for (const { abs } of candidates) {
+      let raw: string;
+      try { raw = fs.readFileSync(abs, 'utf8'); } catch { continue; } // tracked but absent locally
+      // Cheap RAW pre-filter first — narrows the whole repo down to a handful of candidates
+      // before paying for a comment-blanked parse of each. Widening the candidate set here is
+      // harmless (a raw mention that turns out to be prose is dropped by the blanked check next);
+      // narrowing it here would not be, so this check only ever ADDS candidates relative to the
+      // authoritative one below.
+      if (!WATCHER_REGISTRATION.test(raw) || !raw.includes('classifySceneChange')) continue;
+      // The authoritative check: comment-blanked, so a file that only ever DISCUSSES a watcher
+      // registration or `classifySceneChange` — like this describe block's own docblock — cannot
+      // satisfy it.
+      const { code } = readScannedSource(abs);
+      if (WATCHER_REGISTRATION.test(code) && code.includes('classifySceneChange')) out.push(abs);
+    }
+    return out;
+  }
+
+  /** No whitespace/quote-variant escape: `extname` call, optional `.toLowerCase()`, `===`, a
+   *  quoted `.json` — the exact shape of the duplicated line in both its historical spellings. */
+  const EXTENSION_GATE = /extname\s*\([^)]*\)\s*(?:\.\s*toLowerCase\s*\(\s*\)\s*)?===\s*(['"])\.json\1/;
+
+  /** Slice the `onChange` handler's body out of comment-blanked source (balanced braces — same
+   *  idiom as invalidatorGranularity.test.ts's extractFunctionBody), so a mention of the extension
+   *  gate in a COMMENT can neither satisfy nor defeat this check. Both watcher files declare the
+   *  handler the same way: `const onChange = (file: string) => { ... };`. */
+  function extractOnChangeBody(code: string, label: string): string {
+    const sigIdx = code.indexOf('const onChange = (');
+    if (sigIdx === -1) {
+      throw new Error(`${label}: "const onChange = (" not found — did the watcher handler move or get renamed?`);
+    }
+    const braceStart = code.indexOf('{', sigIdx);
+    if (braceStart === -1) throw new Error(`${label}: no "{" found after "const onChange = ("`);
+    let depth = 1;
+    let j = braceStart + 1;
+    while (depth > 0 && j < code.length) {
+      if (code[j] === '{') depth++;
+      else if (code[j] === '}') depth--;
+      j++;
+    }
+    return code.slice(braceStart, j);
+  }
+
+  const watcherFiles = findWatcherClassifierFiles();
+
+  it('found watcher implementations to check (sanity: the enumeration works, so a pass means something)', () => {
+    // At least the two known today (vite-asset-scanner.ts, assetBackend.ts) — `toBeGreaterThan`
+    // rather than `toBe` so a genuine third implementation does not itself fail this sanity check.
+    expect(watcherFiles.length).toBeGreaterThan(1);
+  });
+
+  it("no watcher's onChange re-implements the .json extension gate — all call pathToClassifyForChange", () => {
+    const violators: string[] = [];
+    for (const abs of watcherFiles) {
+      const rel = path.relative(REPO, abs).split(path.sep).join('/');
+      const { code } = readScannedSource(abs);
+      const body = extractOnChangeBody(code, rel);
+      if (EXTENSION_GATE.test(body)) {
+        violators.push(
+          `${rel}: onChange still tests extname(...) === '.json' directly instead of going through ` +
+          'pathToClassifyForChange — this is the exact duplicated line #857 exposed: a shader BODY ' +
+          '(.glsl/.wgsl) never satisfies a raw .json test, so this watcher can never broadcast a ' +
+          'shader-body edit no matter what pathToClassifyForChange itself does.',
+        );
+      }
+      if (!/pathToClassifyForChange\s*\(/.test(body)) {
+        violators.push(
+          `${rel}: onChange does not call pathToClassifyForChange — every watcher must resolve the ` +
+          'path to classify through the one shared helper, not its own logic, so the two watchers ' +
+          'cannot drift apart the way they did in #857.',
+        );
+      }
+    }
+    expect(violators, violators.join('\n')).toEqual([]);
   });
 });

@@ -14,8 +14,10 @@
  *  editor, which re-reads the layout from disk — is offered then rather than up front, where
  *  it would push people at the heavier action for crashes a remount does fix.
  *
- *  The reload is confirmed in place rather than through `window.confirm`: it discards
- *  unsaved scene edits, and a blocking native dialog in the editor is its own hazard. */
+ *  The reload is confirmed in place rather than through `window.confirm`: it discards unsaved
+ *  scene edits AND parked asset/import-settings edits (#850 — the dialog at the bottom of this
+ *  file names both; this sentence used to name only the scene), and a blocking native dialog in
+ *  the editor is its own hazard. */
 
 import { Component, type CSSProperties, type ErrorInfo, type ReactNode } from 'react';
 

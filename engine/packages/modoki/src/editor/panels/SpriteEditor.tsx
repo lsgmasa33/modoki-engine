@@ -10,13 +10,13 @@
  *  Dev-only (lives under the editor tree, not shipped). */
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { useOverlay } from '../input/useOverlayEscape';
 import { isTextEditable } from '../input/focusScope';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
 import {
   gridSlices, makeSlice, inferGridFromRects, DEFAULT_PIVOT,
   type SpriteSlice, type SpriteRect,
@@ -87,6 +87,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
+  // #845 close-out: the pending-registry value `readMetaPreferringPark` observed for `path` at
+  // load time (or `undefined` when nothing was parked) — carried to `save()` so it can tell
+  // `metaWrittenToDisk` apart "the park this Save already incorporated" from "an Inspector edit
+  // parked while this modal was still open", which must survive to the next Cmd+S. See
+  // pendingMeta.ts's header addendum.
+  const pendingRefAtLoadRef = useRef<unknown>(undefined);
+  /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
+   *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
+   *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
+   *  `false` and only an ok read sets it. `makeTexture2D.ts:24` is the precedent this follows. */
+  const metaLoadedRef = useRef(false);
 
   // ── Load the source image + existing slice meta ──
   useEffect(() => {
@@ -109,9 +120,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   useEffect(() => {
     const ac = new AbortController();
-    backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
+    readMetaPreferringPark(path, { signal: ac.signal })
+      .then(({ meta: m, pendingRef, ok }) => {
+        pendingRefAtLoadRef.current = pendingRef;
+        metaLoadedRef.current = ok;
         setMeta(m);
         const existing = Array.isArray(m.sprites) ? (m.sprites as SpriteSlice[]) : [];
         setSprites(existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } })));
@@ -605,6 +617,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     if (clean.length === 0) { delete (nextMeta as Record<string, unknown>).sprites; delete (nextMeta as Record<string, unknown>).spriteSheet; }
     // AWAIT before onClose() — same race as the 9-slice editor: the Inspector re-reads this
     // file on close, and an un-awaited POST let that GET win and report the pre-edit slices.
+    // ⚠️ REFUSE rather than write a document built on a failed read. `/api/write-meta` replaces
+    // the sidecar wholesale, so a fallback `{}` base writes one with no `id`, and the scanner's
+    // heal pass mints a FRESH GUID — every scene/prefab ref to this asset dangles, silently, from
+    // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
+    // the edit is not thrown away for a reason that has nothing to do with the edit.
+    if (!metaLoadedRef.current) {
+      console.error(`[SpriteEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      return;
+    }
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
@@ -612,6 +633,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       console.error(`[SpriteEditor] save failed for ${path} — the dialog is staying open so the slices are not lost. See the /api/write-meta error above.`);
       return;
     }
+    // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
+    // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
+    // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
+    metaWrittenToDisk(path, pendingRefAtLoadRef.current);
 
     // Live-register the slices so existing references resolve without a rescan, and
     // drop entries for slices that were removed in this session.

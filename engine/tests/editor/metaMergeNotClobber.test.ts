@@ -26,7 +26,17 @@
  *  every writer happened to carry that (inert) literal, and removing it made the writer invisible
  *  to a detector keyed on it. The detector below is re-anchored on the write CALL itself
  *  (`writeMetaOrWarn(` / `'/api/write-meta'`), which is structural and cannot be "cleaned up"
- *  the way a redundant literal can. */
+ *  the way a redundant literal can.
+ *
+ *  ⚠️ #845 moved most of these calls behind a PARK instead of an immediate write — the field
+ *  handler now calls `parkMetaEdit(path, updatedMeta)` (`editor/scene/pendingMeta.ts`), which
+ *  `flushPendingMeta`/`flushPendingMetaFor` later hand to `writeMetaOrWarn` verbatim, unmodified.
+ *  The clobber risk is IDENTICAL either way — a payload that drops keys is just as destructive
+ *  once it reaches disk on Cmd+S as it was on the old immediate write — so the anchor now also
+ *  matches `parkMetaEdit(`. `pendingMeta.ts` itself is EXCLUDED (see `EXCLUDED` below): it
+ *  forwards whatever was parked and constructs no payload of its own, exactly like
+ *  `widgets.tsx` forwards whatever it is given — the actual literal is still checked, just at
+ *  the PARK call site instead of the write call site. */
 
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
@@ -54,12 +64,13 @@ function editorSourceFiles(): { rel: string }[] {
   });
 }
 
-/** Files that write a meta sidecar and must therefore merge rather than replace. Derived by
- *  grepping `engine/packages/modoki/src/editor/**` for the write call itself
- *  (`writeMetaOrWarn(` or the `'/api/write-meta'` route string) — an artifact-shaped search, not
- *  a guess from memory. `widgets.tsx` (defines `writeMetaOrWarn`) is deliberately excluded: it
- *  forwards whatever payload it is given and constructs none itself, so it has no literal to
- *  check. */
+/** Files that write (or PARK, #845) a meta sidecar and must therefore merge rather than replace.
+ *  Derived by grepping `engine/packages/modoki/src/editor/**` for the write/park call itself
+ *  (`writeMetaOrWarn(`, `parkMetaEdit(`, or the `'/api/write-meta'` route string) — an
+ *  artifact-shaped search, not a guess from memory. `widgets.tsx` (defines `writeMetaOrWarn`) and
+ *  `scene/pendingMeta.ts` (defines `parkMetaEdit`/the flush) are deliberately excluded: both
+ *  forward whatever payload they are given and construct none themselves, so neither has a
+ *  literal of its own to check. */
 const WRITERS = [
   'panels/Inspector.tsx',
   'panels/NineSliceEditor.tsx',
@@ -93,7 +104,7 @@ function codeLines(src: string): string[] {
  *  every file in WRITERS genuinely posts to the endpoint this guard cares about — not to find
  *  and evaluate the payload. */
 function hasMetaWriteCall(src: string): boolean {
-  return codeLines(src).some((line) => /writeMetaOrWarn\(|\/api\/write-meta/.test(line));
+  return codeLines(src).some((line) => /writeMetaOrWarn\(|\/api\/write-meta|parkMetaEdit\(/.test(line));
 }
 
 // ── Payload-literal extraction ──────────────────────────────────────────────────────────────
@@ -202,15 +213,17 @@ function metaPayloadLiterals(src: string): string[] {
     declOffsets.push(resolved.offset);
   };
 
-  // Shape 1: writeMetaOrWarn(<pathExpr>, <payloadExpr>)
-  const callRe = /writeMetaOrWarn\(/g;
+  // Shape 1: writeMetaOrWarn(<pathExpr>, <payloadExpr>) or parkMetaEdit(<pathExpr>, <payloadExpr>)
+  // — #845 gave every field handler a SECOND way to reach the sidecar (park now, write later),
+  // and it carries the exact same (pathExpr, payloadExpr) shape, so one pass handles both.
+  const callRe = /(?:writeMetaOrWarn|parkMetaEdit)\(/g;
   let m: RegExpExecArray | null;
   while ((m = callRe.exec(codeSrc))) {
     const parenOpen = m.index + m[0].length - 1;
     const parens = extractBalanced(codeSrc, parenOpen, '(', ')');
     const args = splitTopLevelWithOffsets(parens.slice(1, -1), parenOpen + 1);
     if (args.length < 2) {
-      throw new Error(`metaPayloadLiterals: writeMetaOrWarn call with <2 args near index ${m.index}`);
+      throw new Error(`metaPayloadLiterals: meta write/park call with <2 args near index ${m.index}`);
     }
     const payload = args[1];
     const payloadTrimStart = firstNonWs(payload.text, 0);
@@ -219,7 +232,7 @@ function metaPayloadLiterals(src: string): string[] {
       literals.push(extractBalanced(codeSrc, payloadStart, '{', '}'));
     } else {
       const identMatch = payload.text.slice(payloadTrimStart).match(/^[A-Za-z_$][\w$]*/);
-      if (!identMatch) throw new Error(`metaPayloadLiterals: unrecognized writeMetaOrWarn payload '${payload.text}'`);
+      if (!identMatch) throw new Error(`metaPayloadLiterals: unrecognized meta write/park payload '${payload.text}'`);
       pushResolved(resolveIdentifierLiteral(codeSrc, m.index, identMatch[0]));
     }
   }
@@ -355,7 +368,17 @@ describe('meta sidecar writers merge instead of replacing', () => {
     // by walking the real tree (git-tracked or not — a fresh writer file is on disk before it is
     // ever committed) and comparing it to WRITERS, so the completeness check cannot itself go
     // stale the way the list it verifies did (6 files, per the brief that added this test).
-    const EXCLUDED = ['panels/assetViews/widgets.tsx']; // defines writeMetaOrWarn, builds no payload of its own
+    // Both DEFINE a write/park call and build no payload of their own — they forward whatever
+    // they are handed. `scene/pendingMeta.ts`'s `meta` comes off a `for…of` loop over the pending
+    // map, not a `const meta = {…}` this guard's identifier resolver could bind to; the literal it
+    // forwards was already checked at its origin — the PARK call site in whichever WRITERS file
+    // built it.
+    // `panels/assetEditorBindings.ts` joins them for the SAME reason, not a new one (#845
+    // close-out): when an asset is renamed it re-parks the doc it just took verbatim out of
+    // the registry (`peekPendingMeta` → `parkMetaEdit`), so like the other two it forwards a
+    // payload rather than composing one. There is no literal here to check, and the literal
+    // that matters was already checked wherever the edit was originally parked.
+    const EXCLUDED = ['panels/assetViews/widgets.tsx', 'scene/pendingMeta.ts', 'panels/assetEditorBindings.ts'];
 
     const discovered = editorSourceFiles()
       .map(({ rel }) => rel)
@@ -381,12 +404,22 @@ describe('meta sidecar writers merge instead of replacing', () => {
       const updated = { version: 1, postprocessor: newPostprocessor };
       void writeMetaOrWarn(asset.path, updated);
     `)).toBe(true);
+    // #845: the same clobber, reached through the PARK call instead of the immediate write —
+    // the detector must not treat "not written yet" as "therefore safe".
+    expect(bad(`
+      const updated = { version: 1, postprocessor: newPostprocessor };
+      parkMetaEdit(asset.path, updated);
+    `)).toBe(true);
 
     // Legitimate: merges, inline and via a variable.
     expect(bad(`void writeMetaOrWarn(p, { ...(metas[p] ?? {}), postprocessor: next });`)).toBe(false);
     expect(bad(`
       const updatedMeta = { ...(meta ?? {}), type };
       writeMetaOrWarn(path, updatedMeta);
+    `)).toBe(false);
+    expect(bad(`
+      const updatedMeta = { ...(meta ?? {}), type };
+      parkMetaEdit(path, updatedMeta);
     `)).toBe(false);
 
     // Legitimate: authors a complete sidecar from scratch (import path), inline and via the

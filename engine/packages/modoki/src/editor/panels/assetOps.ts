@@ -12,7 +12,7 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
@@ -161,16 +161,10 @@ export function planRename(
 
 // ── Backend-IO wrappers (shared by Assets + Hierarchy) ───────────────
 
-/** Write a text or base64-encoded file via /api/write-file. */
-export async function writeAssetFile(filePath: string, content: string, encoding?: 'base64'): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content, encoding }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
+/** Write a text or base64-encoded file via /api/write-file. Re-exported from `editorBackend` —
+ *  the ONE client write wrapper (#835) — so the many existing `from './assetOps'` importers
+ *  (assetUndo.ts, createRegisteredAsset.ts, scene/skinPrefab.ts, Assets.tsx) need no change. */
+export { writeAssetFile };
 
 /** Trash ONE asset via /api/delete-asset. */
 export async function deleteAssetFile(assetPath: string): Promise<boolean> {
@@ -317,7 +311,7 @@ export async function createPrefabFromEntity(
   const prefab = serializePrefab(entityId);
   if (!prefab) return null;
   warnInertPrefabSizes(prefab, savePath);
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   if (!(await writeAssetFile(savePath, content))) return null;
 
   // Register the prefab's GUID↔path first so tagEntityTreeAsInstance stores the

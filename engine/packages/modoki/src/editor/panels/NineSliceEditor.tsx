@@ -10,9 +10,9 @@
  *  size), minus the slice machinery — here the only editable state is 4 numbers. */
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
 import { BufferedNumberInput } from './fields';
 import { registerSprite, isGuid, deriveGuid, type SpriteAssetRef } from '../../runtime/loaders/assetManifest';
 import { captureSpriteSnapshot, revertSpritePreview } from './nineSliceRevert';
@@ -48,6 +48,17 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // `undefined` = not captured yet.
   const entrySnapshotRef = useRef<SpriteAssetRef | null | undefined>(undefined);
   const savedRef = useRef(false);
+  // #845 close-out: the pending-registry value `readMetaPreferringPark` observed for `path` at
+  // load time (or `undefined` when nothing was parked) — carried to `save()` so it can tell
+  // `metaWrittenToDisk` apart "the park this Save already incorporated" from "an Inspector edit
+  // parked while this modal was still open", which must survive to the next Cmd+S. See
+  // pendingMeta.ts's header addendum.
+  const pendingRefAtLoadRef = useRef<unknown>(undefined);
+  /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
+   *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
+   *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
+   *  `false` and only an ok read sets it. `makeTexture2D.ts:24` is the precedent this follows. */
+  const metaLoadedRef = useRef(false);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
 
   // ── Load source image + existing border meta ──
@@ -61,9 +72,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
 
   useEffect(() => {
     const ac = new AbortController();
-    backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
+    readMetaPreferringPark(path, { signal: ac.signal })
+      .then(({ meta: m, pendingRef, ok }) => {
+        pendingRefAtLoadRef.current = pendingRef;
+        metaLoadedRef.current = ok;
         setMeta(m);
         const b = m.border as (Partial<NineSliceBorder> & { scale?: number }) | undefined;
         if (b) { setBorder({ l: b.l || 0, r: b.r || 0, t: b.t || 0, b: b.b || 0 }); setEdgeScale(b.scale && b.scale > 0 ? b.scale : 1); }
@@ -327,6 +339,15 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     // the modal, and marking it saved would skip the unmount revert — leaving the live sprite
     // holding a border that never reached disk while the file keeps the old one. That is exactly
     // the divergence the revert exists to prevent, reintroduced on the error path.
+    // ⚠️ REFUSE rather than write a document built on a failed read. `/api/write-meta` replaces
+    // the sidecar wholesale, so a fallback `{}` base writes one with no `id`, and the scanner's
+    // heal pass mints a FRESH GUID — every scene/prefab ref to this asset dangles, silently, from
+    // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
+    // the edit is not thrown away for a reason that has nothing to do with the edit.
+    if (!metaLoadedRef.current) {
+      console.error(`[NineSliceEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      return;
+    }
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
@@ -339,6 +360,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       return;
     }
     savedRef.current = persisted;
+    // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
+    // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
+    // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
+    metaWrittenToDisk(path, pendingRefAtLoadRef.current);
 
     // Live-update the texture's auto whole-image sprite so UINode's border-image
     // reflects the edit without waiting for a rescan.

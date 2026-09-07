@@ -1,15 +1,15 @@
 /** TextureBatchView — multi-select import-settings editor for N textures. Mirrors
  *  TextureAssetView but merges settings across the selection (differing fields show
- *  "Mixed"), writes each changed field to EVERY selected .meta.json, and offers a
- *  single "Re-import all (N)". Meta writes are fire-and-forget, same as single-select. */
+ *  "Mixed"), parks each changed field for EVERY selected .meta.json (#845 — Cmd+S is the
+ *  write, same as single-select), and offers a single "Re-import all (N)". */
 
 import { useState, useEffect, useCallback } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { resolveTextureSettings, resolveTextureType, deriveSettingsForType, type TextureImportSettings, type TextureType } from '../../../runtime/loaders/textureSettings';
-import { reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { reimportBtnStyle } from './widgets';
 import { mergeRecords } from '../assetMerge';
 import { reimportPaths } from './reimport';
+import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
 import { TextureSettingsControls, type TextureSettingKey } from './TextureAssetView';
 
 type MetaMap = Record<string, Record<string, unknown>>; // path -> full meta object
@@ -28,9 +28,13 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
   const loadAll = useCallback(async () => {
     setLoaded(false);
     const entries = await Promise.all(paths.map(async (p) => {
+      // #845: ASK THE REGISTRY BEFORE THE FILE, per path — a still-parked edit means disk holds
+      // the PRE-edit doc, and re-seeding this view from it would read as the edit having been
+      // lost. `reimportAll` flushes every path before it reimports, so nothing is parked here
+      // after one.
       try {
-        const r = await backendFetch(`/api/read-meta?path=${encodeURIComponent(p)}`);
-        return [p, r.ok ? await r.json() : {}] as const;
+        const { meta } = await readMetaPreferringPark(p);
+        return [p, meta] as const;
       } catch { return [p, {}] as const; }
     }));
     setMetas(Object.fromEntries(entries));
@@ -67,7 +71,7 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
         const curType = resolveTextureType(m as { type?: TextureType; texture?: Partial<TextureImportSettings> });
         const updated = { ...m, type: curType, texture: { ...curSettings, ...patch } };
         next[p] = updated;
-        writeMetaOrWarn(p, updated);
+        parkMetaEdit(p, updated);
       }
       return next;
     });
@@ -76,13 +80,18 @@ export function TextureBatchView({ paths }: { paths: string[] }) {
   // Changing the type RESETS the codec block to that type's derived defaults for
   // every selected texture (matches single-select changeType semantics).
   const applyType = useCallback((nextType: TextureType) => {
-    const derived = deriveSettingsForType(nextType);
     setMetas((prev) => {
       const next: MetaMap = { ...prev };
       for (const p of paths) {
-        const updated = { ...(prev[p] ?? {}), type: nextType, texture: derived };
+        // ⚠️ Derive INSIDE the loop. Hoisted, one `derived` object is shared by all N parked docs
+        // — and `parkMetaEdit` copies only the TOP level, so every parked entry's `texture` is the
+        // same reference. Nothing mutates it today, which is why this is a trap rather than a live
+        // bug; but it is the one place among the 18 park sites where a nested object is shared
+        // ACROSS paths, so a future in-place tweak to one texture's codec block would silently
+        // rewrite every other selected texture's parked edit too.
+        const updated = { ...(prev[p] ?? {}), type: nextType, texture: deriveSettingsForType(nextType) };
         next[p] = updated;
-        writeMetaOrWarn(p, updated);
+        parkMetaEdit(p, updated);
       }
       return next;
     });

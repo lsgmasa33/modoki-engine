@@ -2,7 +2,7 @@
  *  Tracks generated files in the model's .meta.json for cleanup on delete. */
 
 import * as THREE from 'three';
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
@@ -19,16 +19,7 @@ import { useEditorStore } from '../store/editorStore';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { sha256Hex } from '../utils/contentHash';
 import { classifyExistingAssetFetchFailure, classifyExistingAssetJson } from './modelImportPersist';
-
-async function writeAssetFile(path: string, content: string): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
+import { readMetaPreferringPark, metaWrittenToDisk } from './pendingMeta';
 
 /** Thrown by `writeAssetFileOrAbort` to unwind a model import whose write did not land (#311).
  *  Caught only at `importModel`'s boundary, which converts it to the falsy return every caller
@@ -48,8 +39,9 @@ class ImportWriteAborted extends Error {
 }
 
 /** Write a generated import artifact, or ABORT the whole import (#311, owner's policy
- *  2026-08-21). `writeAssetFile` above never throws — it resolves `false` — and three call
- *  sites used to discard that. Two of them registered the asset in the manifest FIRST, so a
+ *  2026-08-21). `writeAssetFile` (the shared client write wrapper, `editor/backend/
+ *  editorBackend.ts`, #835) never throws — it resolves `false` — and three call sites used to
+ *  discard that. Two of them registered the asset in the manifest FIRST, so a
  *  failed write left a GUID pointing at a path with no file: everything resolves for the rest
  *  of the session and it surfaces on the next scene load or a fresh editor launch, far from
  *  the cause.
@@ -175,7 +167,7 @@ async function resolveMaterialGuid(path: string): Promise<string> {
   if (!id) {
     id = newGuid();
     if (existing) {
-      await writeAssetFileOrAbort(path, JSON.stringify({ ...existing, id }, null, 2));
+      await writeAssetFileOrAbort(path, jsonFileBody({ ...existing, id }));
     } else {
       console.error(`[modelImport] material override not found: ${path} — minting a GUID; the reference will dangle until the file exists.`);
     }
@@ -184,14 +176,19 @@ async function resolveMaterialGuid(path: string): Promise<string> {
   return id;
 }
 
-/** Read a binary asset's sidecar (`<path>.meta.json`) and return its full
- *  contents — used for textures + the GLB itself, both of which carry their
- *  guid in the sidecar (not the file). Empty object when absent. */
-async function readMeta(path: string): Promise<Record<string, unknown>> {
+/** Read a binary asset's sidecar (`<path>.meta.json`) — used for textures + the GLB itself, both
+ *  of which carry their guid in the sidecar (not the file). Empty object when absent.
+ *
+ *  #845 close-out: every call site below merges this onto a full-document WRITE it is about to
+ *  make (id/rig/generated, or a freshly-minted texture's colorspace seed) — reading raw disk here
+ *  would silently roll back an Inspector edit still only PARKED for this same path (postprocessor,
+ *  a texture setting), and the park would go on to overwrite this write's own fresh id/generated
+ *  list wholesale at the next Cmd+S. `pendingRef` rides along so each write can drop the park it
+ *  already incorporated via `metaWrittenToDisk` — see each call site. */
+async function readMeta(path: string): Promise<{ meta: Record<string, unknown>; pendingRef: unknown }> {
   try {
-    const res = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`);
-    return res.ok ? await res.json() : {};
-  } catch { return {}; }
+    return await readMetaPreferringPark(path);
+  } catch { return { meta: {}, pendingRef: undefined }; }
 }
 
 // ── Material hashing for dedup ──
@@ -428,7 +425,7 @@ async function registerExtractedTextures(
   textureSettings: Map<string, ReturnType<typeof seedTextureSettings>>,
 ): Promise<void> {
   for (const texPath of new Set(texturePaths.values())) {
-    const existingMeta = await readMeta(texPath);
+    const { meta: existingMeta, pendingRef } = await readMeta(texPath);
     const sidecarGuid = (typeof existingMeta.id === 'string' && isGuid(existingMeta.id))
       ? existingMeta.id
       : undefined;
@@ -441,7 +438,7 @@ async function registerExtractedTextures(
       // freshly-minted sidecar (no existing guid), so we never clobber settings a
       // user already tuned in the Texture Inspector.
       const seeded = textureSettings.get(texPath);
-      await backendFetch('/api/write-meta', {
+      const res = await backendFetch('/api/write-meta', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           path: texPath,
@@ -451,7 +448,10 @@ async function registerExtractedTextures(
             ...(seeded ? { texture: { ...(existingMeta.texture as object ?? {}), ...seeded } } : {}),
           },
         }),
-      }).catch(() => {});
+      }).catch(() => null);
+      // #845 close-out: this write just committed whatever `readMeta` read above — drop that
+      // park, unless something newer landed while the write was in flight (see pendingMeta.ts).
+      if (res?.ok) metaWrittenToDisk(texPath, pendingRef);
     }
     // Drop any in-memory texture for this path — re-import may have produced
     // fresh bytes (PNG → KTX2 variants) and a stale cache entry would survive
@@ -510,7 +510,7 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
       }
       // Write BEFORE registering (#311): registering first maps the GUID to a path with no
       // file behind it, and the dangling ref only surfaces on a later scene load.
-      await writeAssetFileOrAbort(dedupPath, JSON.stringify(finalAsset, null, 2));
+      await writeAssetFileOrAbort(dedupPath, jsonFileBody(finalAsset));
       registerAsset(matAsset.id, dedupPath, 'material');
       // Evict the stale in-memory material so the next scene load re-reads from
       // disk — without this, a same-session scene re-open keeps rendering with
@@ -655,7 +655,7 @@ async function importRiggedModel(
   rootTransform?: { scale?: number },
 ): Promise<number> {
   // Resolve / preserve the GLB's guid (re-import keeps it so refs survive).
-  const existingMeta = await readMeta(glbPath);
+  const { meta: existingMeta, pendingRef } = await readMeta(glbPath);
   const glbGuid = (typeof existingMeta.id === 'string' && isGuid(existingMeta.id)) ? existingMeta.id : newGuid();
   registerAsset(glbGuid, glbPath, 'model');
 
@@ -708,7 +708,7 @@ async function importRiggedModel(
   // Record generated `.mat.json` + textures so a delete cleans them up and the
   // re-import orphan-prune (shared with the static path) can run.
   const prevGenerated = (existingMeta.generated as Record<string, unknown> | undefined) ?? {};
-  await backendFetch('/api/write-meta', {
+  const metaRes = await backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       path: glbPath,
@@ -720,7 +720,11 @@ async function importRiggedModel(
         generated: { ...prevGenerated, materials: matFiles, textures: textureFiles },
       },
     }),
-  }).catch(() => {});
+  }).catch(() => null);
+  // #845 close-out: this write just committed whatever `readMeta` read above (a lot of async
+  // texture/material work happened in between) — drop that park, unless something newer landed
+  // while it was in flight (see pendingMeta.ts).
+  if (metaRes?.ok) metaWrittenToDisk(glbPath, pendingRef);
 
   // Auto-fit: scale the bind-pose bbox to ~2 units tall (FBX is often 100× / cm)
   // unless the caller passed an explicit scale.
@@ -900,7 +904,7 @@ async function importModelInner(
   // Resolve / register the GLB's guid BEFORE anything writes refs to it.
   // Re-import preserves the prior id (sidecar `.meta.json`) so external
   // scene/prefab refs survive — a fresh guid would dangle every consumer.
-  const existingGlbMeta = await readMeta(glbPath);
+  const { meta: existingGlbMeta, pendingRef } = await readMeta(glbPath);
   const glbGuid = (typeof existingGlbMeta.id === 'string' && isGuid(existingGlbMeta.id))
     ? existingGlbMeta.id
     : newGuid();
@@ -980,7 +984,7 @@ async function importModelInner(
         material: matRef,
       };
       // Write BEFORE registering — see the note at the material site above (#311).
-      await writeAssetFileOrAbort(meshPath, JSON.stringify(meshAsset, null, 2));
+      await writeAssetFileOrAbort(meshPath, jsonFileBody(meshAsset));
       registerAsset(meshAsset.id!, meshPath, 'mesh');
       meshFileMap.set(meshName, meshPath);
       meshFiles.push(meshPath);
@@ -1004,10 +1008,15 @@ async function importModelInner(
       textures: textureFiles,
     },
   };
-  await backendFetch('/api/write-meta', {
+  const metaRes = await backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: glbPath, meta }),
   });
+  // #845 close-out: this write just committed whatever `readMeta` read above (texture/mesh/material
+  // extraction ran in between) — drop that park, unless something newer landed while it was in
+  // flight (see pendingMeta.ts). Deliberately NOT wrapped in a `.catch` — same as before this
+  // change, a network failure here propagates and aborts the import; it does not silently degrade.
+  if (metaRes.ok) metaWrittenToDisk(glbPath, pendingRef);
 
   // Prune orphans: files the previous import wrote into `generated.*` but
   // the current import didn't regenerate (source GLB changed shape, a mesh

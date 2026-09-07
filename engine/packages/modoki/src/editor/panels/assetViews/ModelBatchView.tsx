@@ -8,12 +8,12 @@
  *  `id`. See the note on the single-asset path in `Inspector.tsx`. */
 
 import { useState, useEffect, useCallback } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { getModelPostprocessorIds } from '../../../runtime/loaders/modelPostprocessorRegistry';
 import { inputStyle, MIXED_PLACEHOLDER } from '../fields';
-import { reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { reimportBtnStyle } from './widgets';
 import { reimportPaths } from './reimport';
+import { parkMetaEdit, readMetaPreferringPark } from '../../scene/pendingMeta';
 import type { SelectedAsset } from '../../store/editorStore';
 
 export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
@@ -31,9 +31,11 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
   const loadAll = useCallback(async () => {
     setLoaded(false);
     const entries = await Promise.all(paths.map(async (p) => {
+      // #845: ASK THE REGISTRY BEFORE THE FILE, per path — see TextureBatchView's `loadAll` for
+      // why. `reimportAll` flushes every path before it reimports, so nothing is parked here
+      // after one.
       try {
-        const r = await backendFetch(`/api/read-meta?path=${encodeURIComponent(p)}`);
-        const m = (r.ok ? await r.json() : {}) as Record<string, unknown>;
+        const { meta: m } = await readMetaPreferringPark(p);
         return [p, (m.postprocessor as string) ?? 'none', m] as const;
       } catch { return [p, 'none', {} as Record<string, unknown>] as const; }
     }));
@@ -53,8 +55,9 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       const updated: Record<string, string> = { ...prev };
       for (const p of paths) {
         updated[p] = next;
-        // MERGE — a bare {version, postprocessor} would replace the whole sidecar.
-        void writeMetaOrWarn(p, { ...(metas[p] ?? {}), postprocessor: next });
+        // MERGE — a bare {version, postprocessor} would replace the whole sidecar. Parked, not
+        // written immediately (#845) — Cmd+S is the write.
+        parkMetaEdit(p, { ...(metas[p] ?? {}), postprocessor: next });
       }
       return updated;
     });

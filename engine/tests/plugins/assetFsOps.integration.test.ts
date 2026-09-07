@@ -101,6 +101,15 @@ describe('duplicateAssetFile', () => {
     expect(JSON.parse(read('a.prefab.json')).id).toBe('orig');
   });
 
+  it('a duplicated PREFAB ends in a trailing newline — assetJsonBytes, not a parsed round-trip (#835)', () => {
+    // Byte assertion, not JSON.parse: a parse succeeds identically with or without the newline,
+    // which is exactly how the old scene/prefab special case (isSceneOrPrefab) hid for so long.
+    write('a.prefab.json', JSON.stringify({ id: 'orig' }));
+    duplicateAssetFile(abs('a.prefab.json'), abs('a copy.prefab.json'), () => 'NEW-GUID');
+    const bytes = fs.readFileSync(abs('a copy.prefab.json'));
+    expect(bytes[bytes.length - 1]).toBe(0x0a);
+  });
+
   it('JSON asset that fails to parse: copies verbatim and returns null', () => {
     write('broken.json', '{ not valid json');
     const guid = duplicateAssetFile(abs('broken.json'), abs('broken copy.json'), () => 'NEW');

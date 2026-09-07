@@ -26,7 +26,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
-import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256 } from '../meta-sidecar';
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -359,7 +359,8 @@ function hasKeyPath(o: unknown, keyPath: string): boolean {
 //   • `unsavedChanges: true` is now the normal state after any agent edit;
 //   • `modoki_build` refuses while unsaved, and the file-direct path 409s while unsaved — both
 //     now routine rather than rare, so their messages must keep naming `modoki_save_all`;
-//   • a game-code edit force-reloads the editor and DISCARDS unsaved scene edits (CLAUDE.md),
+//   • a game-code edit force-reloads the editor and DISCARDS unsaved work of every kind — scene
+//     edits, parked asset docs, and parked import settings alike (CLAUDE.md; #850),
 //     so accumulated unsaved work is more exposed than it was under `auto`.
 export type PersistenceMode = 'manual';
 export const PERSISTENCE_MODE: PersistenceMode = 'manual';
@@ -414,15 +415,17 @@ function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: fa
   return null;
 }
 
-/** The EXACT bytes a JSON document write puts on disk — the single definition of that, because
- *  two other places must agree with it byte-for-byte (#831).
+/** The EXACT bytes a JSON document write puts on disk — the single definition of that, used by
+ *  every JSON write this backend (or its client counterpart) makes: scenes, prefabs, layouts,
+ *  the AI-settings file, and every `ASSET_SCHEMA_TYPES` document alike (#831, converged with the
+ *  client seam in #835 — see the history note below).
  *
  *  ⚠️ **The trailing `\n` is load-bearing twice over.** Every committed asset JSON is authored
  *  with one and `JSON.stringify` emits none, so each editor write silently stripped it and turned
  *  a one-field edit into a diff carrying `\ No newline at end of file`. Measured 2026-09-06:
  *  242 of 322 committed asset docs had already lost it this way. Existing files converge as they
- *  are next written; they are deliberately NOT swept, since rewriting 242 files across `games/`
- *  and `demos/` is a far larger blast radius than the defect.
+ *  are next written; #835 commit 2 additionally sweeps the scene/prefab corpus once, as its own
+ *  dedicated commit — see that commit's message for why it stayed separate from this one.
  *
  *  ⚠️ **And the self-write guard fingerprints these bytes.** `markEditorWrite(abs, sha1(bytes))`
  *  lets the watcher skip the editor's own save; a fingerprint that does not match what actually
@@ -430,38 +433,29 @@ function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: fa
  *  `dropParkedWriteFor` discards whatever the human had parked. Silent data loss in the authoring
  *  path. That is why the serialisation lives HERE and every caller and fingerprint reads it,
  *  rather than each site spelling out `JSON.stringify(x, null, 2)` and being kept in step by hand.
- *  `assetJsonBytesAgree.test.ts` asserts the writer and the fingerprints cannot drift. */
+ *  `assetJsonBytesAgree.test.ts` asserts the writer and the fingerprints cannot drift.
+ *
+ *  ⚠️ **This used to be two functions.** A scene is written from two places — this route
+ *  (`/api/scene-mutate`) and the editor's own save, which serialises client-side
+ *  (`editor/scene/serialize.ts`) and POSTs the finished string to `/api/write-file` — and until
+ *  #835 the client side emitted no trailing newline, on purpose, so a separate `sceneJsonBytes`
+ *  (no newline) covered the scene/prefab/layout/AI-settings writers to agree with it: if only ONE
+ *  side gained a newline they would fight forever, an agent's write adding it and the next Cmd+S
+ *  stripping it. #835 moved the client seam onto this same byte shape (`jsonFileBody` in
+ *  `editor/backend/editorBackend.ts` — the client mirror of this function), so the split has
+ *  nothing left to agree with: `sceneJsonBytes` is gone and every writer below uses this one
+ *  function. */
 export function assetJsonBytes(data: unknown): Buffer {
   return Buffer.from(`${JSON.stringify(data, null, 2)}\n`);
-}
-
-/** The bytes for a document that a CLIENT-side writer also produces — **no trailing newline.**
- *
- *  ⚠️ **This is not an oversight, it is the other half of an agreement (#831 close-out).** A scene
- *  is written from two places: this route (`/api/scene-mutate`) and the editor's own save, which
- *  serialises client-side (`editor/scene/serialize.ts:905`, `JSON.stringify(scene, null, 2)`) and
- *  POSTs the finished string to `/api/write-file`, written verbatim. If only ONE of the two gains
- *  a newline, they fight: an agent's `mutate_scene` adds it, the human's next Cmd+S strips it, on
- *  the repo's most-committed documents, forever. Every committed `.scene.json` ends `}` today.
- *
- *  Prefabs, layouts and the AI settings file are here for the same reason — #831 was asked to fix
- *  the newline on ASSET documents, and changing bytes it was not asked to change is how a fix
- *  becomes a churn generator.
- *
- *  **When #835 lands** (the client seam, 17 sites) this function and `serialize.ts` change
- *  together, in one commit, and then it can merge back into {@link assetJsonBytes}. Until then the
- *  split is the correct state and `sceneWriterBytesAgree` pins it. */
-export function sceneJsonBytes(data: unknown): Buffer {
-  return Buffer.from(JSON.stringify(data, null, 2));
 }
 
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
  *  local to avoid an import cycle.)
  *
- *  ⚠️ Takes BYTES, not a document, so every caller must say which serialisation it owns —
- *  {@link assetJsonBytes} (asset docs, trailing newline) or {@link sceneJsonBytes} (scenes,
- *  prefabs, layouts: none, matching the client-side writer). It used to take the document and
- *  choose for them, which silently gave the SCENE writer the asset newline. */
+ *  ⚠️ Takes BYTES, not a document — every caller composes them with {@link assetJsonBytes}
+ *  first, the one definition (#831/#835), rather than spelling out its own
+ *  `JSON.stringify(x, null, 2)`. It used to take the document and serialise it itself, which is
+ *  how a caller could silently pick the wrong bytes for what it was writing. */
 function writeJsonAtomic(absPath: string, bytes: Buffer): void {
   // mkdir -p first, exactly as /api/write-file does. Without it /api/create-asset
   // threw a raw ENOENT 500 whenever the target folder did not exist yet — while
@@ -1860,7 +1854,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // generic wording rather than crashing on a missing field.
       type EditorStateProbe = {
         playState?: string; unsavedChanges?: boolean; scenePath?: string;
-        unsavedCauses?: { sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[] };
+        // ⚠️ Every cause `unsavedChangeCauses()` returns must be declared here, or the refusal
+        // below cannot name it and falls through to a generic string that blames the wrong
+        // thing (#844). The two below were on the wire and undeclared, which is exactly how
+        // they went unnamed — the DATA arriving is not the same as the type admitting it.
+        unsavedCauses?: {
+          sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[];
+          pendingBaseScenes?: string[]; pendingImportSettings?: string[];
+        };
       };
       let st: EditorStateProbe | null = null;
       let probeFailed = false;
@@ -1997,6 +1998,19 @@ async function describeUnresolvedAgainstLiveWorld(
         if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
         if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
         if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+        // ⚠️ The two causes below were MISSING, and their absence reintroduced exactly the defect
+        // #844 fixed. With `pendingImportSettings` (or `pendingBaseScenes`) as the ONLY unsaved
+        // work, `causes` came out empty and the generic fallback fired — blaming
+        // create_entity/duplicate_entity/prefab and sending an agent to hunt live entities it
+        // never created. The fallback exists for an OLDER renderer that sends no `unsavedCauses`
+        // at all; a renderer that sends a cause this list does not know about is a different case
+        // and must not be answered with a confident wrong sentence.
+        //
+        // The renderer-side twin (`agentEditorOps.ts`'s guardUnsaved) was updated when each cause
+        // was added; this server-side copy was missed both times. Two copies of one cause list,
+        // which is why they drifted — worth collapsing if a third appears.
+        if (Array.isArray(c?.pendingBaseScenes) && c.pendingBaseScenes.length) causes.push(`${c.pendingBaseScenes.length} pending baseScene ref(s) awaiting a save: ${c.pendingBaseScenes.join(', ')}`);
+        if (Array.isArray(c?.pendingImportSettings) && c.pendingImportSettings.length) causes.push(`${c.pendingImportSettings.length} pending IMPORT-SETTINGS edit(s) (.meta.json) awaiting a save: ${c.pendingImportSettings.join(', ')}`);
         const error = causes.length
           ? `the editor has UNSAVED work — ${causes.join(' AND ')}. This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`
           // No `unsavedCauses` on the probe (an older/mismatched renderer) — fall back to the
@@ -2041,7 +2055,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // `scene`. Only the response's liveHint needs the await; it doesn't touch the file.
       if (changed > 0) {
         stripBackfilledEntityIds(scene, backfilledIds);
-        writeJsonAtomic(absPath, sceneJsonBytes(scene)); // scene: matches serialize.ts
+        writeJsonAtomic(absPath, assetJsonBytes(scene)); // scene: matches serialize.ts (#835)
       }
       // ── C7: "no entity matching {guid}" was a LIE. ──
       // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
@@ -2283,7 +2297,16 @@ async function describeUnresolvedAgainstLiveWorld(
     // as well as for one that is absent (#778 — see that function's own warning). A caller must
     // not read `{}` as "there was nothing here"; the write path is what protects the authored
     // fields and the GUID, by quarantining and salvaging respectively.
-    return { kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)) };
+    // The CAS baseline travels in a HEADER, not the body (#845 phase 2). The body is the MERGED
+    // view (`.meta.local.json` folded back in) and every existing caller does `res.json()` on it,
+    // so wrapping it in `{meta, sha256}` would break all of them; a header is additive and ignored
+    // by anyone who does not look. `null` sidecar → header omitted, which a client must read as
+    // "no baseline", NOT as "unchanged" — see `readMetaPreferringPark`.
+    const sha = metaSidecarSha256(resolved);
+    return {
+      kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)),
+      ...(sha ? { headers: { 'X-Meta-Sha256': sha } } : {}),
+    };
   }
 
   // ── GET /api/font-axes?path= (M) ── the variation axes a font actually exposes,
@@ -2481,11 +2504,30 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/write-meta {path, meta} (M) ──
   if (urlPath === '/api/write-meta' && method === 'POST') {
     try {
-      const { path: assetPath, meta } = (body ?? {}) as { path: string; meta: unknown };
+      const { path: assetPath, meta, ifMatch } = (body ?? {}) as { path: string; meta: unknown; ifMatch?: string };
       const resolved = ctx.resolveAssetPath(assetPath);
       if (!resolved) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // ⚠️ The precondition is checked against the SIDECAR, not the asset. `resolved` is the asset
+      // itself (`foo.png`); the bytes a concurrent writer races over are `foo.png.meta.json`.
+      // Passing `resolved` here would hash the PNG and 409 every conditional write forever.
+      //
+      // ⚠️ And nothing may `await` between this check and the write below — the read+hash+compare
+      // in `ifMatchRefusal` is synchronous and Node is single-threaded, so the guard holds only
+      // while the call site keeps that window closed. `writeMetaSidecar` is synchronous; keep it
+      // that way, and see `ifMatchRefusal`'s own docblock.
+      const refusal = ifMatchRefusal(sidecarPath(resolved), ifMatch);
+      if (refusal) return json(refusal, 409);
       writeMetaSidecar(resolved, meta as Parameters<typeof writeMetaSidecar>[1]);
-      return json({ ok: true });
+      // The hash of what we ACTUALLY wrote — the caller cannot derive it, because
+      // `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits the cache blocks out
+      // into `.meta.local.json`. A panel that keeps editing after a save needs this to advance its
+      // baseline, or its next save 409s against a file only WE changed. Mirrors `/api/asset-write`.
+      //
+      // No `markEditorWrite` here, deliberately: that guard suppresses the watcher's hot-reload
+      // BROADCAST for a self-write, and `detectType` returns null for `.meta.json`
+      // (`vite-asset-scanner.ts`), so no broadcast fires for a sidecar in the first place. Adding
+      // it would be machinery guarding nothing.
+      return json({ ok: true, sha256: metaSidecarSha256(resolved) });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -3278,7 +3320,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const dir = layoutsDir();
       fs.mkdirSync(dir, { recursive: true });
       const data = typeof b.content === 'string' ? JSON.parse(b.content) : b.content;
-      writeJsonAtomic(path.join(dir, `${name}.layout.json`), sceneJsonBytes(data)); // layout: bytes #831 was not asked to change
+      writeJsonAtomic(path.join(dir, `${name}.layout.json`), assetJsonBytes(data)); // layout: #835
       return json({ ok: true, name });
     } catch (e) { return json({ error: String(e) }, 500); }
   }
@@ -3316,7 +3358,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const next = { ...readAiSettings(), ...patch };
       const dir = path.join(ctx.projectRoot, '.modoki');
       fs.mkdirSync(dir, { recursive: true });
-      writeJsonAtomic(aiSettingsFile(), sceneJsonBytes(next)); // settings: as above
+      writeJsonAtomic(aiSettingsFile(), assetJsonBytes(next)); // settings: #835
       return json(next);
     } catch (e) { return json({ error: String(e) }, 500); }
   }

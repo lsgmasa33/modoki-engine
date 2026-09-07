@@ -20,11 +20,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 // Each load yields a DISTINCT instance so "did the surface rebind?" is answerable by identity.
-const hdr = vi.hoisted(() => ({ n: 0 }));
+// `created` records EVERY texture the loader handed out, so a test can reach the one that did
+// NOT win the cache — otherwise "the loser was freed" and "the loser was orphaned" are
+// indistinguishable from outside (#863).
+const hdr = vi.hoisted(() => ({ n: 0, created: [] as any[] }));
 vi.mock('three/examples/jsm/loaders/HDRLoader.js', () => ({
   HDRLoader: class {
     load(path: string, onLoad: (texture: any) => void) {
       const tex = { mapping: 0, isTexture: true, dispose: vi.fn(), uuid: `hdr-${path}-${++hdr.n}` };
+      hdr.created.push(tex);
       setTimeout(() => onLoad(tex), 0);
     }
   },
@@ -56,6 +60,7 @@ const spawnEnv = (world: ReturnType<typeof createWorld>, showAsBackground = true
   world.spawn(Environment({ hdrPath: GUID, intensity: 1, showAsBackground, backgroundIntensity: 1, backgroundBlurriness: 0 }));
 
 beforeEach(() => {
+  hdr.created.length = 0; // per-test, or `created.find(...)` below reaches a SIBLING test's texture
   clearManifest();
   registerAsset(GUID, PATH, 'environment'); // unconverted → the load URL is the source path
 });
@@ -160,21 +165,33 @@ describe('invalidateEnvironment retires instead of destroying', () => {
     expect(tex.dispose).toHaveBeenCalledTimes(1);
   });
 
-  it('an invalidate mid-flight retires the losing load instead of orphaning it', async () => {
-    // invalidateEnvironment clears envLoadPromises, so a fetch already in flight no longer
-    // dedupes a second one: both callbacks reach `envCache.set` and the first is overwritten.
-    // Overwritten silently it is unreachable to every lookup AND to the sweep — an HDR-sized
-    // leak. It must land in retiredEnvs instead.
+  it('an invalidate mid-flight discards the losing load outright, instead of writing then retiring it (#863)', async () => {
+    // Before #863: invalidateEnvironment cleared envLoadPromises, so a fetch already in flight no
+    // longer deduped a second one — both callbacks reached `envCache.set`, with the SECOND writer
+    // retiring whichever texture the FIRST one left behind. #863 gave `fetchEnvironment` its own
+    // PER-KEY liveness capture, so the invalidated (first) load's own guard now disposes it
+    // directly before it ever reaches the cache — there is nothing left to retire. See
+    // `environmentInvalidateKeyRace.test.ts` for #863's own dedicated (order-controlled) coverage
+    // of this race.
     acquireEnvironment(1, GUID);            // fetch #1, deliberately NOT awaited
-    invalidateEnvironment(PATH);            // clears the in-flight promise
+    invalidateEnvironment(PATH);            // clears the in-flight promise AND its liveness capture
     acquireEnvironment(1, GUID);            // fetch #2 starts alongside it
     await settle();
 
     const cached = getCachedEnvironment(GUID) as any;
-    expect(cached, 'one of the two loads must occupy the cache').toBeTruthy();
-    const retired = [...retiredEnvironments()];
-    expect(retired.length, 'the loser is retired, not orphaned').toBe(1);
-    expect(retired[0]).not.toBe(cached);
+    expect(cached, 'the surviving (post-invalidate) load must occupy the cache').toBeTruthy();
+    // FAILS pre-#863: that version left ONE env retired (the discarded-then-overwritten loser)
+    // instead of zero.
+    expect(retiredEnvironments().size, 'the loser was discarded outright, not retired').toBe(0);
+    // ⚠️ The two assertions below are what keep this test honest, and are why the retired-set
+    // check cannot stand alone: an EMPTY retired set is ALSO exactly what a LEAK looks like —
+    // orphaned, unreachable to `envCache`, to the sweep and to `disposeAllCachedResources`. That
+    // leak is the property this test was written for (#315), so #863 narrowing the race must not
+    // quietly downgrade it to "the set is empty". Name the loser and prove it was FREED.
+    const loser = hdr.created.find((t) => t !== cached);
+    expect(loser, 'both loads must actually have produced a texture').toBeTruthy();
+    expect(loser.dispose, 'the discarded loser must be freed, not orphaned').toHaveBeenCalledTimes(1);
+    expect(cached.dispose, 'the survivor must NOT be freed — it is the live env').not.toHaveBeenCalled();
   });
 
   it('takes the background back when showAsBackground goes off, and when the env goes away', async () => {

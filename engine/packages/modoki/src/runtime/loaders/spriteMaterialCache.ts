@@ -22,7 +22,8 @@ import { buildPixiShaderProgram, invalidatePixiShaderProgram } from '../renderin
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { createTeardownToken } from '../core/liveness';
 import { isGuid } from '../core/assetRefRules';
-import { getGuidForPath } from './assetManifest';
+import { getGuidForPath, resolveRef } from './assetManifest';
+import { emitAssetInvalidated } from '../core/assetInvalidation';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
@@ -155,10 +156,28 @@ export function clearSpriteMaterialCache(): void {
  *  `invalidatePixiShaderProgram(manifestPath)` runs unconditionally either way — it's the
  *  optimisation on top (its own docblock says so): it evicts just the one path from
  *  `pixiShaderBuilder`'s module-level program cache instead of the whole thing, so a re-`ensure`
- *  doesn't recompile every OTHER shader's SOURCE too. */
+ *  doesn't recompile every OTHER shader's SOURCE too.
+ *
+ *  #864: this is also the ONLY wired invalidator (`invalidateModel`/`invalidateAudio`/
+ *  `invalidateTexture`/`invalidateEnvironment` all do) that emitted nothing through the shared
+ *  `assetInvalidation` registry — so a `space:'3d'` file shader had NO invalidation path at all:
+ *  a 3D material built from it is cached in `meshTemplateCache`'s `materialCache` keyed by the
+ *  `.mat.json` path, which nothing here can reach directly (and must not — see
+ *  `assetInvalidation.ts`'s `shader` doc for why this stays an event edge, not an import).
+ *  `emitAssetInvalidated('shader', …)` closes that: `meshTemplateCache` subscribes and evicts
+ *  every material it recorded an edge for. Emit the resolved PATH on both branches below —
+ *  never the guid — so a path-keyed subscriber isn't handed a guid from one branch and a path
+ *  from the other. */
 export function invalidateShader(manifestPath: string): void {
   const guid = isGuid(manifestPath) ? manifestPath : getGuidForPath(manifestPath);
   if (guid) {
+    // `manifestPath` is already the path in the common (real) case — only a guid INPUT needs
+    // resolving back to one.
+    const shaderPath = isGuid(manifestPath) ? (resolveRef(manifestPath) ?? manifestPath) : manifestPath;
+    // Emit BEFORE evicting, same ordering as invalidateModel/invalidateAudio/invalidateEnvironment
+    // (#304) — a subscriber (meshTemplateCache's 3D reverse index) can still read what's about to
+    // be dropped.
+    emitAssetInvalidated('shader', shaderPath);
     // Snapshot this guid's waiters BEFORE evicting, fire them AFTER — the per-key mirror of
     // `clearSpriteMaterialCache`'s wake, and load-bearing for the same reason (#523). A
     // superseded compile's resolve/reject deliberately fires no `onReady`, so a renderer still
@@ -176,6 +195,9 @@ export function invalidateShader(manifestPath: string): void {
   } else {
     // Unresolved guid — fail SAFE, not silent. See the docblock above: "unknown" must not be
     // treated as "absent", or an edit to a not-yet-indexed shader would silently not take.
+    // `manifestPath` is already the path here (see the ternary above: this branch is only
+    // reached when the input wasn't a guid), so it's the same shape as the branch above.
+    emitAssetInvalidated('shader', manifestPath);
     clearSpriteMaterialCache();
   }
   invalidatePixiShaderProgram(manifestPath);

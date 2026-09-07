@@ -1,0 +1,473 @@
+/** Pending `.meta.json` edits — the manual-save half of Inspector import-settings edits (#845).
+ *
+ *  A texture-compression dropdown, an LOD-ratio slider, and every other Inspector control bound
+ *  to a `.meta.json` sidecar used to POST `/api/write-meta` the moment the field changed — no save
+ *  action, while `get_editor_state` reported `persistenceMode:'manual'`. That is #831's defect on
+ *  a fifth surface: `writeMetaOrWarn` (`assetViews/widgets.tsx`) is a plain fetch wrapper with no
+ *  registry behind it, so none of #831's four asset-VIEW fixes (which went through
+ *  `persistAssetEdit`/`dirtyAssets.ts`) touched it.
+ *
+ *  ## Why this is NOT the dirty-asset registry
+ *
+ *  `dirtyAssets.ts` parks whole `ASSET_SCHEMA_TYPES` documents and flushes them through
+ *  `/api/asset-write`, which 400s on an unknown type. `.meta.json` is a SIDECAR, not one of those
+ *  eight schemas — it is hard-keyed to `AssetSchemaType` throughout (the route, the MCP zod enums,
+ *  `assetTypeParity.test.ts`, the watcher classification), and widening it to carry a ninth,
+ *  differently-shaped document would leak into all of them. So this is a SIBLING registry,
+ *  mirroring `pendingBaseScene.ts` — same problem, same author's answer, one field's worth of
+ *  shape.
+ *
+ *  ## No live branch, and therefore no `activeFlushMarkers`
+ *
+ *  `pendingBaseScene.ts` needs a marker set per in-flight flush because `applyBaseSceneEdit` has a
+ *  LIVE branch (the currently-open scene) that bypasses the park entirely — a case its own re-park
+ *  guard (`!pending.has(path)`) cannot see on its own, because the live branch's `pending.delete`
+ *  is a no-op once the flush has already taken the map empty. There is no equivalent branch here:
+ *  EVERY `.meta.json` field change parks, full stop. `!pending.has(path)` is therefore already
+ *  correct with nothing further to close.
+ *
+ *  ⚠️ Do not "restore" `activeFlushMarkers` here on the strength of the sibling file having it —
+ *  it would be machinery with nothing to guard, covering a live-write race that cannot occur.
+ *
+ *  ## The flush runs ALONGSIDE the other two, not before or after them
+ *
+ *  Unlike `/api/scene-mutate`, `/api/write-meta` carries no unsaved-work refusal, so there is no
+ *  ordering constraint forcing this flush to run last (or first, or anywhere in particular)
+ *  relative to the scene write or the dirty-asset flush. It is wired in next to every
+ *  `flushDirtyAssets()` call for locality, not because the order matters — see
+ *  `saveCommand.ts`/`serialize.ts`.
+ *
+ *  ## Re-import races the flush
+ *
+ *  A re-import (`/api/reimport`, fired from an Apply/Re-import button or a batch view) reads the
+ *  CURRENT `.meta.json` off DISK — both to know what to convert with, and to report back what it
+ *  baked. With parking in place, firing one while an edit is still only parked would either (a)
+ *  bake the OLD settings while the panel already shows the new ones, or (b) leave the pending
+ *  park's now-stale snapshot to overwrite the re-import's own fresh disk write at the next Cmd+S —
+ *  worse than the bug being fixed, since the earlier immediate-write behaviour never let the two
+ *  drift. `flushPendingMetaFor` exists for exactly that: every call site that is about to read the
+ *  sidecar because a re-import is about to (or just did) touch it flushes THIS path first, so the
+ *  read — and whatever it feeds — sees the same truth the panel does. A load that is NOT chasing a
+ *  re-import (a plain mount / asset reselect) should prefer the parked value instead of flushing —
+ *  see `peekPendingMeta`.
+ *
+ *  ## The OTHER half of the race - a full-document READ that misses the park (#845 close-out)
+ *
+ *  Parking created a SECOND way to be wrong, symmetric with the write-side risk documented above:
+ *  several call sites read `.meta.json` off disk and either DECIDE something from it (what
+ *  postprocessor to show, what to merge a new edit onto) or WRITE THE WHOLE DOCUMENT BACK (the
+ *  9-slice/sprite editors' Save, a model import's id/generated-file merge) - and none of them
+ *  consulted this registry before `readMetaPreferringPark` existed. Concretely:
+ *
+ *   1. Human edits 9-slice insets in the Texture Inspector -> `updateBorder` PARKS `meta.border`.
+ *   2. Human opens the 9-Slice editor. Its load effect GETs `/api/read-meta`, which returns DISK -
+ *      without the parked border.
+ *   3. Human saves in that editor. It writes the FULL `nextMeta`, built on the stale base -> the
+ *      parked border is absent from what lands on disk.
+ *   4. Cmd+S flushes the park, which overwrites the WHOLE document with the Inspector's older
+ *      base -> the 9-Slice editor's slices/border are destroyed.
+ *
+ *  Both directions lose real work, and neither existed before parking did - nothing was ever
+ *  concurrently "about to land" on disk when every edit wrote immediately. `readMetaPreferringPark`
+ *  is the fix for the READ half (`peekPendingMeta` before the GET, exactly like this file's
+ *  existing mount-time-load callers already did by hand); `metaWrittenToDisk` is the other half -
+ *  it lets an immediate full-document writer drop the park its own write already incorporated,
+ *  without dropping one that arrived AFTER it read. See both functions below. */
+
+import { backendFetch } from '../backend/editorBackend';
+import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
+import { writeMetaConditional } from '../panels/assetViews/widgets';
+
+/** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
+ *  dirty-asset registry: a second edit before a save simply supersedes the first. */
+const pending = new Map<string, unknown>();
+
+/** path -> sha256 of the `.meta.json` bytes as this editor last SAW them (#845 phase 2).
+ *
+ *  Deliberately a SEPARATE map rather than a field on the pending entry, for two reasons. The
+ *  entry's object identity is `metaWrittenToDisk`'s version stamp, so widening it into
+ *  `{doc, ifMatch}` would put the stamp on a wrapper and quietly change what "the same park"
+ *  means. And a baseline outlives its park: it is captured on a plain READ, survives the flush
+ *  that clears the park, and is what the panel's NEXT edit writes against.
+ *
+ *  ⚠️ The value comes from the SERVER (`X-Meta-Sha256`, and `sha256` in the write reply), never
+ *  from hashing anything here. `/api/read-meta` returns the MERGED view — `.meta.local.json`
+ *  folded back in — and `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits those
+ *  blocks back out, so the bytes on disk are not the bytes a panel ever holds. Hashing client-side
+ *  would produce a baseline that can never match and 409 every write forever, which is the failure
+ *  `contentHash.ts`'s docblock warns about. */
+const baselines = new Map<string, string>();
+
+/** The baseline for `path`, or `undefined` when this editor has never read it. `undefined` means
+ *  UNCONDITIONAL: `ifMatchRefusal` treats an absent `ifMatch` as "proceed", which is the correct
+ *  and deliberate reading — we have no idea what is on disk, so we have no basis to refuse. It
+ *  does NOT mean "unchanged". */
+export function peekMetaBaseline(path: string | undefined): string | undefined {
+  return path ? baselines.get(path) : undefined;
+}
+
+/** Test-only: forget every recorded baseline. */
+export function clearMetaBaselines(): void { baselines.clear(); }
+
+/** Forget the baseline for `path`. Called when a park is discarded or its file goes away: a
+ *  baseline describes bytes at a path, so it is meaningless once this editor stops tracking that
+ *  path, and keeping it would make a LATER unrelated edit conflict against a hash for content
+ *  nobody is looking at any more. */
+export function forgetMetaBaseline(path: string): void { baselines.delete(path); }
+
+let _version = 0;
+const listeners = new Set<() => void>();
+function bump(): void { _version += 1; for (const fn of listeners) fn(); }
+
+/** Subscribe to changes (park / flush / discard). Returns an unsubscribe. */
+export function subscribePendingMeta(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => { listeners.delete(fn); };
+}
+/** Monotonic change counter — the `getSnapshot` for a `useSyncExternalStore` subscriber. */
+export function getPendingMetaVersion(): number { return _version; }
+
+/** Park a `.meta.json` edit for `path`. `meta` is the FULL sidecar object — every call site
+ *  already merges onto whatever it loaded (same contract `writeMetaOrWarn` had), so this simply
+ *  holds that object instead of POSTing it.
+ *
+ *  ⚠️ **The stored value is a SHALLOW COPY, and that copy is what makes `metaWrittenToDisk`'s
+ *  reference-identity stamp correct rather than merely true today.** That stamp assumes each park
+ *  produces a value distinct from the last, and the 18 call sites happen to satisfy it because
+ *  every one spreads a fresh object literal. But that is an invariant held by the DISCIPLINE of
+ *  eighteen unrelated call sites, enforced by nothing — and the day someone parks a
+ *  mutated-in-place object (the obvious way to write the nineteenth), `pending.get(path) ===
+ *  pendingRef` starts matching a park that is genuinely NEWER than the read, so
+ *  `metaWrittenToDisk` drops it and the edit is silently lost. That is the exact clobber this
+ *  module exists to close, reached through the mechanism closing it.
+ *
+ *  Copying here moves the invariant from "every caller must remember" to "the registry
+ *  guarantees", for one spread. The copy is shallow on purpose: only the TOP-LEVEL identity is
+ *  the stamp, so deep-cloning would cost more and buy nothing. */
+export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): void {
+  pending.set(path, meta && typeof meta === 'object' ? { ...(meta as Record<string, unknown>) } : meta);
+  // ⚠️ `ifMatch` is for a CROSS-PATH re-park only (a rename — `applyMovesToParkedMeta`), and an
+  // omitted one PRESERVES whatever this path already had rather than clearing it. That mirrors
+  // `markAssetDirty`'s rule and matters for the same reason: the 18 ordinary field-change callers
+  // pass nothing, and clearing on omission would turn the compare-and-swap off on the second
+  // keystroke.
+  //
+  // At a NEW key the two are genuinely different questions — #854, on the sibling registry, the
+  // same day: "preserve what is here" and "carry what came from there" have different answers, and
+  // dropping it there turns the CAS off for the rest of the session on a file the human is
+  // actively working on.
+  if (ifMatch !== undefined) baselines.set(path, ifMatch);
+  bump();
+}
+
+/** The parked `.meta.json` for `path`, or `undefined` when nothing is pending for it. A mount-time
+ *  load should call this BEFORE fetching `/api/read-meta` and use it in place of the network
+ *  response when present — the disk copy is the PRE-edit doc for as long as the park is
+ *  unflushed, and re-seeding the panel from it would read as the edit having been lost (mirrors
+ *  `AtlasAssetView`'s `pendingAssetDoc` check for asset docs). */
+export function peekPendingMeta(path: string | undefined): unknown | undefined {
+  return path ? pending.get(path) : undefined;
+}
+
+/** What `readMetaPreferringPark` hands back. */
+export interface PreferredMetaRead {
+  /** The doc to use — the parked edit when one exists, else what `/api/read-meta` returned (`{}`
+   *  on a non-ok response, matching every existing call site's `r.ok ? r.json() : {}`). */
+  meta: Record<string, unknown>;
+  /** The EXACT value `pending` held for `path` at the moment of this read — the same object
+   *  reference as `meta` when a park existed, `undefined` when none did. A caller about to write
+   *  `meta` back to disk WHOLESALE holds onto this and passes it to `metaWrittenToDisk` afterward;
+   *  a caller that only decides (never writes back) ignores it. */
+  pendingRef: unknown;
+  /** Did this read actually establish the document? `true` for a parked doc, and for an ok GET.
+   *  `false` means the GET failed and `meta` is the `{}` FALLBACK, not an empty sidecar.
+   *
+   *  ⚠️ **A caller that writes the document back WHOLESALE must abort on `false`.**
+   *  `/api/write-meta` → `writeMetaSidecar` replaces the sidecar; it does not merge with disk. So
+   *  spreading a fallback `{}` writes a sidecar with no `id`, and the scanner's heal pass then
+   *  MINTS A NEW GUID for the asset — silently orphaning every scene/prefab reference to it. A
+   *  transient 500 on a read would destroy the asset's identity. `makeTexture2D.ts:24` spells this
+   *  out at length and returns early; it is the precedent, and this flag is what lets the other
+   *  wholesale writers follow it instead of each re-deriving the argument.
+   *
+   *  ⚠️ `ok: true` is NOT "there is a sidecar" — `readMetaSidecar` also returns `{}` for a file
+   *  that exists and does not PARSE (#778). That case is survivable for a different reason
+   *  (`writeMetaSidecar` salvages the `id` textually before quarantining), so do not re-derive a
+   *  "safe to spread" argument from this flag alone. It distinguishes a failed READ, nothing more. */
+  ok: boolean;
+}
+
+/** Read `path`'s `.meta.json`, preferring a parked edit over disk (#845 close-out — see this
+ *  module's header addendum). The ONE place a `.meta.json` GET happens: every other reader either
+ *  goes through here or is a documented exemption in `metaReadPreferringPark.test.ts`
+ *  (`engine/tests/architecture`).
+ *
+ *  Does not swallow a network/abort error — the caller's own `.catch`/try decides what "the read
+ *  failed" means for it, exactly as every call site already did for its raw `fetch` before this
+ *  existed (some treat an abort specially; most just keep defaults).
+ *
+ *  `reimportEpoch`, when passed, cache-busts the GET the same way several mount-time loads already
+ *  did by hand (`cacheBustReimport`) — folded in here so a caller does not need its own raw fetch
+ *  just to add that query param. */
+export async function readMetaPreferringPark(
+  path: string,
+  opts?: { signal?: AbortSignal; reimportEpoch?: number },
+): Promise<PreferredMetaRead> {
+  const parked = peekPendingMeta(path);
+  if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true };
+  const url = cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, opts?.reimportEpoch ?? 0);
+  const r = await backendFetch(url, opts?.signal ? { signal: opts.signal } : undefined);
+  // Record the CAS baseline the server just vouched for (#845 phase 2). Only on an ok response:
+  // a 403/404 body is `{}` and carries no header, and writing `undefined` in on failure would
+  // ERASE a baseline an earlier successful read had established — turning the next write
+  // unconditional exactly when the editor is least sure what is on disk.
+  if (r.ok) {
+    const sha = r.headers?.get?.('X-Meta-Sha256');
+    if (sha) baselines.set(path, sha);
+  }
+  const meta = r.ok ? await r.json() : {};
+  return { meta, pendingRef: undefined, ok: r.ok };
+}
+
+/** The EDITOR just wrote `path`'s FULL `.meta.json` to disk itself, built from a
+ *  `readMetaPreferringPark` read — drop the park that read observed, so a later Cmd+S does not
+ *  flush that now-superseded doc straight over what was just written. Returns whether a park was
+ *  actually dropped.
+ *
+ *  ⚠️ **Pass the exact `pendingRef` THAT READ RETURNED — never a fresh `peekPendingMeta(path)`
+ *  call.** The whole point is telling "the park this write already incorporated" apart from "a
+ *  park made SINCE the read (during a slow write, or the network round trip)", and only the value
+ *  captured at read time can do that:
+ *
+ *   - `pending.get(path) === pendingRef` (a defined value, unchanged) — nothing has moved since the
+ *     read; the write already carries this park's contents, so it is safe — and correct — to drop.
+ *   - `pending.get(path)` is a DIFFERENT object than a defined `pendingRef` — a newer edit
+ *     superseded the one this write read. That edit is on screen, is not (yet) on disk, and must
+ *     survive to the next flush — dropping it here would be the exact clobber this function exists
+ *     to prevent, just moved to the other side.
+ *   - `pendingRef` was `undefined` (the read fell through to disk) and something is parked now —
+ *     same rule: it landed after the read, keep it.
+ *   - both `undefined` — nothing was ever parked for this write to race against; a no-op.
+ *
+ *  Reference equality needs no extra bookkeeping: `pending`'s values are a fresh object per edit, so
+ *  the identity `readMetaPreferringPark` handed back already IS a version stamp for that entry — a
+ *  monotonic counter would only track information the map already carries for free.
+ *
+ *  ⚠️ That freshness is guaranteed by `parkMetaEdit` COPYING what it is handed — not by the call
+ *  sites all happening to pass object literals, which is how it started and is not a property a
+ *  reader can check. See the warning on `parkMetaEdit` for what breaks if that copy is removed.
+ *
+ *  ⚠️ **Deliberately NOT `dirtyAssets.ts`'s `assetWrittenToDisk` shape (no `pendingRef` argument,
+ *  unconditional drop + a loud `console.warn`).** That sibling fires for a CREATE/one-shot write
+ *  where nothing sensible could already be parked, so an unconditional drop is correct and a warn
+ *  is honest ("I just discarded something"). This fires after an ordinary read-modify-write, which
+ *  an Inspector edit can land in the middle of — an unconditional drop would silently reintroduce
+ *  the exact clobber this exists to close, and a warn on the common, correct case (nothing raced)
+ *  would be alarming noise for a routine event, not a discovery. */
+export function metaWrittenToDisk(path: string, pendingRef: unknown): boolean {
+  if (pendingRef === undefined || pending.get(path) !== pendingRef) return false;
+  pending.delete(path);
+  bump();
+  return true;
+}
+
+/** Is a `.meta.json` edit parked for exactly this path? A panel's dirty indicator. */
+export function isMetaDirty(path: string | undefined): boolean {
+  return !!path && pending.has(path);
+}
+
+/** True if any `.meta.json` edit is pending a save. Folded into `hasUnsavedChanges()`. */
+export function hasPendingMeta(): boolean { return pending.size > 0; }
+
+/** The pending paths, for `get_editor_state` — an agent must be able to SEE what a discard or a
+ *  scene swap would cost, the same way `dirtyAssetPaths`/`getPendingBaseScenePaths` already do. */
+export function getPendingMetaPaths(): string[] { return [...pending.keys()]; }
+
+/** Test-only: drop every pending entry without writing it. */
+export function clearPendingMeta(): void { pending.clear(); bump(); }
+
+/** Drop pending `.meta.json` edits WITHOUT writing them. `paths` omitted = drop everything.
+ *
+ *  Mirrors `discardPendingBaseScenes`/`discardDirtyAssets`, including telling a caller apart from
+ *  a typo: "I dropped your edit" and "there was nothing to drop" are different answers. */
+export function discardPendingMeta(paths?: readonly string[]): { discarded: string[]; notPending: string[] } {
+  if (!paths) {
+    const discarded = [...pending.keys()];
+    // A baseline describes bytes at a path this editor is tracking. Dropping the park without it
+    // leaves a hash for content nobody is looking at any more, which would make a LATER unrelated
+    // edit to the same path conflict against it.
+    for (const p of discarded) baselines.delete(p);
+    pending.clear();
+    if (discarded.length) bump();
+    return { discarded, notPending: [] };
+  }
+  const discarded: string[] = [];
+  const notPending: string[] = [];
+  for (const p of paths) {
+    if (pending.delete(p)) { discarded.push(p); baselines.delete(p); } else notPending.push(p);
+  }
+  if (discarded.length) bump();
+  return { discarded, notPending };
+}
+
+export interface MetaFlushResult {
+  /** Paths written successfully. */
+  saved: string[];
+  /** Paths whose write was rejected or threw — RE-PARKED, so still pending and still counted by
+   *  `hasUnsavedChanges()`. A failed flush is never silently dropped: report, do not revert (see
+   *  `persist.ts`'s `reportWriteFailed` note — the edited value is still correct as an intention,
+   *  and snapping the panel back would destroy the human's work to resolve a failure that is
+   *  usually transient). */
+  failed: Array<{ path: string; error: string }>;
+}
+
+/** Set for the duration of a `flushPendingMeta()` call, so `flushPendingMetaFor` can wait for it
+ *  instead of racing it. Without this, a re-import landing WHILE a Cmd+S flush is mid-write could
+ *  read the sidecar before that flush's own write for the SAME path lands — the read gets the
+ *  pre-flush bytes, and whatever it feeds (a merge-write, a conversion) is built on a doc the flush
+ *  is about to overwrite out from under it a moment later. */
+let inFlight: Promise<unknown> | null = null;
+
+/** Write every pending `.meta.json` edit through `writeMetaOrWarn` (the existing `/api/write-meta`
+ *  wrapper — no second fetch implementation). Called alongside every `flushDirtyAssets()` call in
+ *  `saveCommand.ts`/`serialize.ts`; the position relative to those does not matter (see this
+ *  module's header) so there is no "run last" invariant to preserve here the way
+ *  `pendingBaseScene.ts` has one.
+ *
+ *  Independent failures: one rejected write does not block the others. */
+export async function flushPendingMeta(): Promise<MetaFlushResult> {
+  const saved: string[] = [];
+  const failed: Array<{ path: string; error: string }> = [];
+  // Take the whole batch out BEFORE issuing anything — the dirty-asset/base-scene flushes both do
+  // this, and for the same reason here: a `flushPendingMetaFor` call landing mid-flush must see an
+  // empty map for every path this flush is already holding, not a doc it is about to overwrite.
+  const batch = [...pending.entries()];
+  if (!batch.length) return { saved, failed };
+  pending.clear();
+  bump();
+
+  const run = (async (): Promise<MetaFlushResult> => {
+    // Re-parked entries, collected and applied AFTER the loop — never inside it. `/api/write-meta`
+    // carries no unsaved-work refusal (unlike `/api/scene-mutate`), so the specific 409-poisons-
+    // the-rest cascade `pendingBaseScene.ts` guards against cannot happen here today. The shape is
+    // kept anyway: it is the one that stays correct the moment a precondition (phase 2's `ifMatch`)
+    // is added to `/api/write-meta`, which is exactly what is coming next.
+    const toRepark: Array<[string, unknown]> = [];
+    for (const [path, meta] of batch) {
+      const r = await writeMetaConditional(path, meta, baselines.get(path));
+      if (r.ok) {
+        saved.push(path);
+        // Advance the baseline to what the server says it actually wrote, so a panel still mounted
+        // on this path can keep editing. Without this its next save carries the PRE-flush hash and
+        // 409s under "the file changed on disk" — when the only thing that changed it was us.
+        if (r.sha256) baselines.set(path, r.sha256);
+        continue;
+      }
+      // A CONFLICT is reported differently from a failure, because the remedy differs: a failed
+      // request is worth retrying, a refused one is not — the file moved under this edit, and
+      // writing it again without re-reading is the clobber the precondition exists to stop.
+      // Either way the entry is RE-PARKED below: report, never revert (see `persist.ts`).
+      //
+      // ⚠️ …and the BASELINE IS DROPPED, which is what stops a refusal becoming a permanent wedge.
+      // `readMetaPreferringPark` returns early whenever a park exists, so it never re-reads the
+      // file and never refreshes the baseline; `baselines` is written in only two places, an ok
+      // GET and a successful write. So without this line a stale baseline has NO path back: every
+      // later Cmd+S 409s, `hasUnsavedChanges()` stays true forever, and with it every refusal it
+      // drives — `modoki_build`, `load_scene`, the file-direct `scene-mutate`, and the game-code
+      // reload countdown. The toast even tells the human to reopen the asset, which cannot help,
+      // because reopening hits that same early return. Restarting the editor was the only exit,
+      // and it discards the edit.
+      //
+      // Dropping it makes the NEXT save unconditional, and that is a deliberate semantic rather
+      // than a loophole: the human has been shown one refusal naming the path, so a second,
+      // explicit Cmd+S is them choosing to overwrite. Refuse once and report; do not refuse
+      // forever and offer no way out.
+      if (r.conflict) baselines.delete(path);
+      failed.push({
+        path,
+        error: r.conflict
+          ? 'the .meta.json changed on disk since this edit was based on it — the edit is still pending, reopen the asset to see the current values'
+          : (r.error ?? 'the /api/write-meta request failed — see the console for the reason'),
+      });
+      toRepark.push([path, meta]);
+    }
+    for (const [path, meta] of toRepark) {
+      // Only if nothing newer claimed the path while the flush was in flight — the same rule
+      // `flushDirtyAssets`/`flushPendingBaseScenes` apply to their own re-parks, and for the same
+      // reason: an edit made during the save is on screen, is not on disk, and must not be
+      // replaced by the older value this flush was carrying.
+      if (!pending.has(path)) pending.set(path, meta);
+    }
+    if (failed.length) bump();
+    return { saved, failed };
+  })();
+
+  inFlight = run;
+  try {
+    return await run;
+  } finally {
+    if (inFlight === run) inFlight = null;
+  }
+}
+
+/** Flush ONE path — the re-import callers need (see this module's header). Awaits any
+ *  `flushPendingMeta()` already in flight before it reads the map, so it can never observe (or
+ *  write on top of) a half-finished full flush.
+ *
+ *  A no-op (`{saved:[], failed:[]}`) when nothing is pending for `path` — the common case, since
+ *  most re-imports fire with no unsaved edit in front of them. */
+export async function flushPendingMetaFor(path: string): Promise<MetaFlushResult> {
+  if (inFlight) {
+    // Swallow a rejection from the OTHER flush — its own caller is responsible for reporting it;
+    // this call only needs to know the map is quiescent again before it reads `path`.
+    await inFlight.catch(() => {});
+  }
+  const meta = pending.get(path);
+  if (meta === undefined) return { saved: [], failed: [] };
+  pending.delete(path);
+  bump();
+  // Register in `inFlight` too, not just READ it above. Without this, two concurrent
+  // `flushPendingMetaFor` calls for the same path do not see each other: A takes the entry and
+  // awaits its write; B finds an empty map, returns `{saved:[],failed:[]}` immediately, and lets
+  // its re-import read the sidecar BEFORE A's write lands — failure mode (a) from this module's
+  // header, reached through the very mechanism meant to prevent it. Hard to drive from the UI (the
+  // import overlay blocks a double-click) but free to close, and the asymmetry was the bug.
+  let settle: () => void = () => {};
+  const gate = new Promise<void>((res) => { settle = res; });
+  const prior = inFlight;
+  inFlight = gate;
+  if (prior) await prior.catch(() => {});
+  let r;
+  try {
+    r = await writeMetaConditional(path, meta, baselines.get(path));
+  } finally {
+    // Always clear, and only if we are still the registered gate — a later flush may have replaced
+    // it, and stomping that would let a third caller through while its write is in flight.
+    if (inFlight === gate) inFlight = null;
+    settle();
+  }
+  if (r.ok) {
+    if (r.sha256) baselines.set(path, r.sha256);
+    return { saved: [path], failed: [] };
+  }
+  if (!pending.has(path)) pending.set(path, meta);
+  bump();
+  // Same baseline drop as the batch flush, for the same reason — see `flushPendingMeta`. Without
+  // it a re-import that conflicts once can never flush that path again.
+  if (r.conflict) baselines.delete(path);
+  // ⚠️ The CONFLICT case here is worth knowing about at the call site: this flush exists so a
+  // re-import reads the human's pending settings rather than the pre-edit disk copy, and a refusal
+  // means it will now read neither — the file was changed by something else entirely. The edit
+  // stays parked (never reverted), and the re-import proceeds against whatever is actually on
+  // disk, which is the honest answer; the caller surfaces the failed path the same way a failed
+  // write is surfaced.
+  return {
+    saved: [],
+    failed: [{
+      path,
+      error: r.conflict
+        ? 'the .meta.json changed on disk since this edit was based on it — the edit is still pending, reopen the asset to see the current values'
+        : (r.error ?? 'the /api/write-meta request failed — see the console for the reason'),
+    }],
+  };
+}

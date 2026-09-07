@@ -25,7 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { readScannedSource } from '@modoki/engine/testing';
-import { handleBackendRequest, assetJsonBytes, sceneJsonBytes, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { handleBackendRequest, assetJsonBytes, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 
 let projectRoot = '';
 
@@ -83,34 +83,30 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
       .toBe(crypto.createHash('sha1').update(onDisk).digest('hex'));
   });
 
-  /** ⚠️ **A SCENE must NOT get the asset newline — the two writers have to agree (#831 close-out).**
-   *
-   *  This is the regression the first cut of #831 shipped and the review caught. `assetJsonBytes`
-   *  was introduced for asset documents, but `writeJsonAtomic` is shared and its SCENE caller
-   *  (`/api/scene-mutate`) went with it — while the editor's own save serialises client-side and
-   *  still emits none. An agent's `mutate_scene` would add the newline, the human's next Cmd+S
-   *  would strip it, forever, on the repo's most-committed documents. Every committed
-   *  `.scene.json` ends `}` today, which is what makes this the correct direction, not an
-   *  arbitrary one.
+  /** ⚠️ **A SCENE now gets the SAME bytes as every other document — the two writers converged
+   *  in #835.** Until then `assetJsonBytes` was asset-only and a separate `sceneJsonBytes` (no
+   *  trailing newline) covered scenes/prefabs/layouts/AI-settings to agree with the editor's
+   *  client-side save (`editor/scene/serialize.ts`), which emitted none. #835 moved that client
+   *  writer onto `jsonFileBody` (`editor/backend/editorBackend.ts`) — the client mirror of THIS
+   *  function, newline included — so `sceneJsonBytes` had nothing left to agree with and is gone.
    *
    *  Driving `/api/scene-mutate` itself needs a live browser (it relays `apply-scene-ops`), so the
-   *  agreement is pinned where it actually lives: the two serialisations, and the call site that
-   *  chooses between them. When #835 fixes the client seam these flip together with
-   *  `serialize.ts` — in one commit, not before. */
-  it('sceneJsonBytes reproduces exactly what serialize.ts POSTs — no trailing newline', () => {
+   *  agreement is pinned where it actually lives: this function's bytes against what the client
+   *  writer now produces. */
+  it('assetJsonBytes reproduces exactly what serialize.ts now POSTs — WITH a trailing newline', () => {
     const scene = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', version: 1, entities: [] };
-    // `editor/scene/serialize.ts:905`: `const content = JSON.stringify(scene, null, 2);`
-    const whatTheClientWrites = Buffer.from(JSON.stringify(scene, null, 2));
-    expect(sceneJsonBytes(scene).equals(whatTheClientWrites)).toBe(true);
-    expect(sceneJsonBytes(scene).at(-1)).toBe(0x7d);          // '}'
-    expect(assetJsonBytes(scene).at(-1)).toBe(0x0a);          // '\n' — asset docs differ, on purpose
+    // `editor/backend/editorBackend.ts`'s `jsonFileBody`: `` `${JSON.stringify(data, null, 2)}\n` ``
+    // — the client mirror `editor/scene/serialize.ts` now composes scene bodies through.
+    const whatTheClientWrites = Buffer.from(`${JSON.stringify(scene, null, 2)}\n`);
+    expect(assetJsonBytes(scene).equals(whatTheClientWrites)).toBe(true);
+    expect(assetJsonBytes(scene).at(-1)).toBe(0x0a); // '\n'
   });
 
-  it('the scene, layout and settings writers use sceneJsonBytes; the asset writers use assetJsonBytes', () => {
+  it('every writeJsonAtomic call — scene, layout, settings, asset — uses assetJsonBytes', () => {
     // A source check because the route needs a live browser. It is the half that actually
-    // regressed: `writeJsonAtomic` used to take the DOCUMENT and serialise it itself, so the scene
-    // caller silently inherited the asset newline. It now takes BYTES, and this pins that no
-    // caller picks the wrong producer.
+    // regressed once (#831 close-out): `writeJsonAtomic` used to take the DOCUMENT and serialise
+    // it itself, so the scene caller silently inherited the asset newline. It now takes BYTES, and
+    // this pins that every caller composes them with the one producer.
     // Through the shared reader (#812), not fs.readFileSync: the router's own PROSE mentions
     // `writeJsonAtomic` several times, and a comment that happens to contain a call-shaped string
     // would be counted as a call here — a guard satisfied by a comment is the defect that reader
@@ -126,22 +122,22 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
     // A call may name its producer INLINE (`writeJsonAtomic(abs, assetJsonBytes(out))`) or through
     // a local the same file assigns from one (`const outBytes = assetJsonBytes(out)` — which
     // /api/asset-write needs, because it also hashes those exact bytes into the reply and must not
-    // serialise them twice). Both DECLARE which serialisation the call owns, which is the claim;
-    // a bare identifier that traces to neither producer does not, and still fails.
+    // serialise them twice). Either DECLARES which serialisation the call owns, which is the
+    // claim; a bare identifier that traces to no producer does not, and still fails.
     const declaredFrom = (id: string) =>
-      new RegExp(`(?:const|let)\\s+${id}\\s*(?::[^=]+)?=\\s*(?:assetJsonBytes|sceneJsonBytes)\\(`).test(src);
+      new RegExp(`(?:const|let)\\s+${id}\\s*(?::[^=]+)?=\\s*assetJsonBytes\\(`).test(src);
     const untyped = calls.filter((c) => {
-      if (/assetJsonBytes\(|sceneJsonBytes\(/.test(c)) return false;
+      if (/assetJsonBytes\(/.test(c)) return false;
       const arg = /writeJsonAtomic\([^,]+,\s*([A-Za-z_$][\w$]*)\s*\)/.exec(c);
       return !(arg && declaredFrom(arg[1]));
     });
-    expect(untyped, 'a writeJsonAtomic call passes neither assetJsonBytes nor sceneJsonBytes — not '
-      + 'inline, and not through a local this file assigns from one — so nothing states which '
-      + 'serialisation it owns. That is how the scene writer silently '
-      + 'inherited the asset trailing newline.\n\n' + untyped.join('\n')).toEqual([]);
-    // And the scene caller specifically must be on the client-matching one.
-    expect(calls.some((c) => /sceneJsonBytes\(scene\)/.test(c)),
-      'the /api/scene-mutate writer no longer uses sceneJsonBytes — it will churn against Cmd+S')
+    expect(untyped, 'a writeJsonAtomic call does not pass assetJsonBytes — not inline, and not '
+      + 'through a local this file assigns from one — so nothing states which serialisation it '
+      + 'owns.\n\n' + untyped.join('\n')).toEqual([]);
+    // And the scene caller specifically must be on the (now single) producer — this is the line
+    // that used to read `sceneJsonBytes(scene)`.
+    expect(calls.some((c) => /assetJsonBytes\(scene\)/.test(c)),
+      'the /api/scene-mutate writer no longer serialises `scene` through assetJsonBytes')
       .toBe(true);
   });
 

@@ -28,7 +28,7 @@
 
 import { fireDirtyListeners } from './renderDirty';
 
-export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment';
+export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment' | 'shader';
 
 /** Not every re-importable asset type is here, and the absences were measured (#304
  *  close-out). `font` has its OWN channel — `onFontInvalidated` in `assetManifest`,
@@ -36,7 +36,16 @@ export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment'
  *  subscribe to — so a font re-import from any path already refreshes. `atlas` and
  *  `video` hold no engine-side cache to evict: atlas frames are read straight off the
  *  manifest, and a video streams from its URL. Add a kind here when a cache exists
- *  that a re-import would otherwise leave serving stale bytes. */
+ *  that a re-import would otherwise leave serving stale bytes.
+ *
+ *  `shader` (#864) is exactly that: a `space:'3d'` file shader is compiled into a
+ *  `THREE.Material` and cached in `meshTemplateCache`'s `materialCache`, keyed by the
+ *  *.mat.json* path, not the shader's — so nothing keyed on the shader path could reach it.
+ *  `spriteMaterialCache`'s `invalidateShader` is the 2D-only invalidation path (it evicts its
+ *  own GUID-keyed program map + `pixiShaderBuilder`'s cache); it must not import
+ *  `meshTemplateCache` directly (that would pull three.js into a 2D-only build and defeat the
+ *  `__MODOKI_MODULE_RENDER3D__` tree-shaking `materialPresets.ts` relies on), so it emits
+ *  through this registry instead and `meshTemplateCache` subscribes on the 3D side. */
 
 /** `path` is the source asset path whose bytes changed. `targets` names every
  *  path whose cached derivations are about to be dropped — for a model that is

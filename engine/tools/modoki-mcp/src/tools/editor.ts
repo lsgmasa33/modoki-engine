@@ -64,8 +64,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '"write this file" tools and always write.\n\n' +
       'SO: call modoki_save_all before anything that reads the scene FILE — modoki_build refuses ' +
       'while unsaved, and a file-direct mutate (a scene that is NOT the one open, or setBaseScene) ' +
-      '409s while unsaved. A game-code edit force-reloads the editor and DISCARDS unsaved scene ' +
-      'edits, so do not let unsaved work pile up.\n\n' +
+      '409s while unsaved. A game-code edit force-reloads the editor and DISCARDS ALL unsaved work — ' +
+      'scene edits AND any pending asset edit parked above — so do not let unsaved work pile up.\n\n' +
       'The former \'auto\' mode (save on every mutation) was REMOVED so a tool\'s effect never ' +
       'depends on invisible session state. Passing `mode` is refused with a 400, not ignored.',
     {},

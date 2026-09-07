@@ -111,20 +111,13 @@ for (const rel of [...files].sort()) {
 
   if (changed || didBump) {
     // Match the editor's writer: 2-space indent AND a trailing newline — otherwise the next
-    // in-editor save churns the file back.
-    // ⚠️ This comment used to say "NO trailing newline", for that same churn reason, and it was
-    // right until #831 moved the editor's asset writer onto `assetJsonBytes`, which emits one.
-    // The invariant is "agree with the editor", not "omit the newline"; inverting the byte while
-    // keeping the reason is the whole point. Kept as a literal rather than an import because this
-    // is .mjs and `assetJsonBytes` is .ts — the same keep-in-sync split as PROJECT_ROOT_DIRS.
-    // ⚠️ SCENES are NOT written by that path — `editor/scene/serialize.ts` serialises them
-    // client-side and POSTs the string — so they still have no trailing newline. Filed; do not
-    // "fix" scenes here alone or this script and the editor will fight over every scene file.
-    // ⚠️ Asset docs get the newline; SCENES and PREFABS do not — they are also written by
-    // `editor/scene/serialize.ts` client-side, which emits none, so adding one here makes this
-    // script and the editor fight over every scene file. Both change together in #835.
-    const isPrefab = json.rootLocalId !== undefined;
-    if (!DRY) writeFileSync(abs, JSON.stringify(json, null, 2) + (isScene || isPrefab ? '' : '\n'));
+    // in-editor save churns the file back. This used to omit the newline for scenes/prefabs
+    // because the client-side writer (`editor/scene/serialize.ts`) emitted none — #835 moved
+    // that writer onto the same `jsonFileBody`/`assetJsonBytes` byte shape every other asset
+    // document uses, so this script no longer needs a scene/prefab exception to agree with it.
+    // Kept as a literal rather than an import of `assetJsonBytes` because this is .mjs and that
+    // module is .ts — the same keep-in-sync split as PROJECT_ROOT_DIRS.
+    if (!DRY) writeFileSync(abs, JSON.stringify(json, null, 2) + '\n');
     rewritten++;
     if (didBump) bumped++;
     console.log(`${DRY ? 'would migrate' : 'migrated'}${changed ? ' (fields)' : ''}${didBump ? ` (v→${SCENE_FORMAT_VERSION})` : ''}: ${rel}`);

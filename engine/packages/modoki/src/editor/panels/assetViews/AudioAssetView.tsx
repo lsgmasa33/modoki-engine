@@ -1,7 +1,8 @@
 /** AudioAssetView (+ AudioImportedStats) — audio import settings editor + Apply
- *  (ffmpeg convert) action, mirroring TextureAssetView. Settings persist to the
- *  clip's .meta.json on change; Apply runs the conversion + reloads. Preview is a
- *  native <audio controls> (play/stop/scrub for free) plus a decoded waveform. */
+ *  (ffmpeg convert) action, mirroring TextureAssetView. Settings PARK to the
+ *  clip's .meta.json on change (#845 — Cmd+S is the write); Apply runs the conversion
+ *  + reloads. Preview is a native <audio controls> (play/stop/scrub for free) plus a
+ *  decoded waveform. */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
@@ -12,11 +13,12 @@ import {
   type AudioImportSettings, type AudioFormat, type AudioLoadType, type AudioCacheInfo,
 } from '../../../runtime/loaders/audioSettings';
 import { invalidateAudio } from '../../../runtime/loaders/audioBufferCache';
-import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { getAudioContext } from '../../../runtime/audio/audioContext';
 import { inputStyle } from '../fields';
-import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -46,16 +48,20 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
   // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
   const reimportEpoch = useAssetInvalidationEpoch('audio', (p) => p === path);
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    setSettings(resolveAudioSettings(m as { audio?: Partial<AudioImportSettings> }));
+    setConverted(!!m.audioCache);
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        setSettings(resolveAudioSettings(m as { audio?: Partial<AudioImportSettings> }));
-        setConverted(!!m.audioCache);
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a settings edit here is PARKED, so disk still holds
+    // the PRE-edit doc until Cmd+S. `apply` flushes this path before it reimports, so by the time
+    // this runs after one, nothing is parked here and this falls through to a fresh read.
+    return readMetaPreferringPark(path, { signal, reimportEpoch })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path, reimportEpoch]);
+  }, [path, reimportEpoch, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -70,7 +76,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       const next = { ...prev, ...patch };
       const updatedMeta = { ...(meta ?? {}), audio: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -79,6 +85,9 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
     setImporting(true);
     setImportStatus(true, `Converting ${name}...`);
     try {
+      // #845: `/api/reimport` reads the settings off DISK — flush any still-parked edit first, or
+      // the conversion would bake the OLD settings while the UI already shows the new ones.
+      await flushPendingMetaFor(path);
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),

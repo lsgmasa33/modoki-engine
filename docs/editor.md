@@ -1501,6 +1501,54 @@ consecutive same-field edits **coalesce** into one undo entry within a ~500 ms w
 persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
 runtime cache so any live entity referencing the asset updates next frame.
 
+#### The client write seam — one JSON body producer, one wrapper (#835)
+
+The editor serialises scene/prefab/asset-document JSON **client-side** and POSTs the finished
+string to `/api/write-file` — unlike `/api/asset-write`, which parks an OBJECT and lets the
+server produce the bytes (`assetJsonBytes`, `editorBackendRouter.ts`). Before #835, every
+`/api/write-file` JSON call site spelled out its own `JSON.stringify(x, null, 2)`, and none of
+them appended the trailing newline the committed corpus (and `assetJsonBytes`) carries — 537
+committed `.scene.json`/`.prefab.json` files lost it this way.
+
+**`jsonFileBody`** (`editor/backend/editorBackend.ts`) is the client mirror of the server's
+`assetJsonBytes` — the one place a JSON document's final bytes are composed. **`writeAssetFile`**
+(same file) is the one write wrapper: it POSTs `content` to `/api/write-file` completely
+unchanged, so a JSON caller must run `jsonFileBody(data)` first and a binary caller passes its
+base64 string with `encoding:'base64'` — the function itself does not know or care which. Every
+JSON call site now reads `writeAssetFile(path, jsonFileBody(data))`; the five near-identical
+wrapper functions #835 replaced (`serialize.ts`'s `writeFileToServer`, this module's own prior
+duplicate, a third copy in `modelImport.ts`, `writeAssetFileOrAbort`, and an inline `post` lambda
+in `ModelAssetView.tsx`) are gone.
+
+**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to a UltraHDR JPEG, an
+extracted PNG texture, or a converted GLB corrupts the asset. Three sites deliberately keep their
+own raw `backendFetch('/api/write-file', …)` call rather than routing through `writeAssetFile`:
+`assetViews/EnvironmentAssetView.tsx`, `scene/modelImport.ts` (its texture-extraction write only —
+the material/mesh JSON writers in the same file DO route through the wrapper), and
+`scene/convertToGLB.ts`. `tests/architecture/clientJsonWriteSeam.test.ts` enforces the split: no
+file outside the wrapper reaches the route directly unless it is on that file's EXEMPT ledger,
+scanned against the ROUTE STRING rather than the `JSON.stringify` pattern (which is exactly what
+let four real call sites hide from the original bug report's grep).
+
+`AtlasAssetView` is not on this seam at all — since #831 it parks an object through
+`/api/asset-write` and the server produces the bytes, same as the debounced asset-editor
+persistence below. It is the template for "hand the server an object" where that shape fits; the
+five editors below stay on `/api/write-file` because each already had its own write plumbing this
+commit chose not to restructure further.
+
+⚠️ **A GAME's editor panels write asset documents too, and they reach the engine ONLY through the
+public barrel** — a game is copied out of the repo, so it may not import
+`editor/backend/editorBackend.ts` by a relative path (portability, #29). While the barrel exported
+raw `backendFetch` and nothing else, the one definition of a document's bytes was unreachable from
+the only place still spelling its own, and `games/sling/editor/{Level,Wave}Editor.tsx` duly
+reproduced the pre-#835 shape — hand-rolled `JSON.stringify`, no trailing newline, all four of
+their committed `.level`/`.wave` files churning on every save.
+
+So **`jsonFileBody` and `writeAssetFile` are exported from `@modoki/engine/editor`**, and both
+sling call sites go through them. The general rule: a helper that games must not bypass belongs on
+the public barrel, or the export list itself becomes the reason the defect recurs outside the
+engine.
+
 #### The binding is a PATH, so every file move must update it (#186)
 
 The five binding editors — Particle, SpriteAnim, Skin, Animation, Timeline — each hold

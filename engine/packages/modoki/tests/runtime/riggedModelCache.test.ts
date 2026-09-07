@@ -337,6 +337,23 @@ describe('riggedModelCache', () => {
       expect(getRiggedModel(REF)).toBeUndefined();
       expect(bodyHolder.mesh.geometry.dispose).toHaveBeenCalled();
     });
+
+    // #863: `invalidateRiggedModel` (a re-import) used to touch only `cache`/`loadPromises`,
+    // never `liveness` — so a load carrying the PRE-import bytes that resolved AFTER the
+    // per-key evict re-cached the stale prototype (owners are left intact by invalidate, so the
+    // `!owners.has(path)` half of the guard alone could not catch this — only the liveness half
+    // can). Distinct from the test above: that one is the FULL-teardown path
+    // (`disposeAllRiggedModels`, which already bumped `liveness` wholesale); this is the PER-KEY
+    // path that had no liveness check at all before #863.
+    it('invalidateRiggedModel mid-load discards the stale result, not just a full teardown', async () => {
+      const p = acquireRiggedModel(1, REF); // starts the load; onLoad fires on a 0ms timer
+      invalidateRiggedModel(REF); // per-key evict while the load is still pending — owner untouched
+      await p;
+      // FAILS before #863: the stale prototype would land in `cache` here.
+      expect(getRiggedModel(REF)).toBeUndefined();
+      expect(bodyHolder.mesh.geometry.dispose).toHaveBeenCalled();
+      expect(bodyHolder.mesh.material.dispose).toHaveBeenCalled();
+    });
   });
 
   // F4 — the editor-import parse handoff: importModel parses the GLB once for rig

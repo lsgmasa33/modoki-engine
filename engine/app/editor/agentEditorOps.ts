@@ -295,7 +295,8 @@ function readEditorState() {
     // `set-focus-scope` can see what it may focus instead, without a second round trip (#301).
     openPanels: s.openPanels,
     // HMR staleness. `staleGameCode: true` means game code changed on disk but the editor
-    // could NOT reload (unsaved scene work), so this world is running the OLD build —
+    // could NOT reload (unsaved work of any kind, not only scene edits — #850), so this world
+    // is running the OLD build —
     // every measurement taken here is suspect until it reloads. `hmrUpdates` is how many
     // hot updates have landed since boot; 0 means "nothing has changed under me". Exposed
     // as DATA because the failure mode is otherwise SILENT — neither a human nor an agent
@@ -1530,7 +1531,7 @@ export function registerEditorAgentOps(): void {
     // fixed string blamed only the first: an agent whose pending work was a dirty
     // particle/anim/timeline doc was sent looking for live entities it had never created. Both
     // clear with save_all; the difference is what `discardUnsaved:true` would discard.
-    const { sceneDirty, dirtyAssetPaths, dirtyScenes, pendingBaseScenes } = unsavedChangeCauses();
+    const { sceneDirty, dirtyAssetPaths, dirtyScenes, pendingBaseScenes, pendingImportSettings } = unsavedChangeCauses();
     const causes: string[] = [];
     if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
     if (dirtyAssetPaths.length) causes.push(`${dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${dirtyAssetPaths.join(', ')}`);
@@ -1541,6 +1542,11 @@ export function registerEditorAgentOps(): void {
     // not loaded. It is neither a live-world edit nor an asset document, so before this row a
     // refusal driven by it alone named no cause at all — S3.11's failure, one population later.
     if (pendingBaseScenes.length) causes.push(`${pendingBaseScenes.length} pending base-scene ref(s) awaiting a save: ${pendingBaseScenes.join(', ')}`);
+    // Fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked instead
+    // of written immediately. Same S3.11 reasoning as the fourth cause — it is neither a live-world
+    // edit nor an ASSET_SCHEMA_TYPES document, so without its own row a refusal driven by it alone
+    // would name no cause at all.
+    if (pendingImportSettings.length) causes.push(`${pendingImportSettings.length} pending import-setting edit(s) awaiting a save: ${pendingImportSettings.join(', ')}`);
     throw new Error(
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
       `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +

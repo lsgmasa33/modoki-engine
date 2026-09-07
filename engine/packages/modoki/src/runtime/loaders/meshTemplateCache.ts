@@ -9,7 +9,7 @@ import { hdrLoaderCtor, makeGltfLoader, ultraHdrLoaderCtor } from './threeLoader
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getMaterialBuilder } from './materialTypes';
 import { registerBuiltinMaterialTypes } from './materialPresets';
-import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry } from './assetManifest';
+import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
@@ -495,6 +495,11 @@ export function invalidateModel(modelPath: string) {
       cacheDelete(key);
     }
     hierarchyCache.delete(target);
+    // #863: refuse an in-flight load of THIS target — without this, a load carrying the
+    // PRE-import bytes that resolves after this invalidate re-caches the stale template on top
+    // of whatever re-import follows. Per-key (not `invalidateAll()`, which is full teardown's
+    // job): invalidating one LOD path must not also refuse an unrelated in-flight load.
+    cacheToken.invalidateKey(target);
     // Loading keys are `${path}` (runtime) or `${path}:${postprocessorId}`
     // (editor hook-applied) — see loadModelTemplates. Asset paths contain no ':',
     // so split on the last ':' and exact-match the path: this matches both shapes
@@ -512,7 +517,10 @@ export function invalidateModel(modelPath: string) {
   for (const [path, asset] of meshAssetCache) {
     if (asset === MESH_FAILED) continue;
     const assetModelPath = refToPath(asset.model);
-    if (assetModelPath === modelPath) meshAssetCache.delete(path);
+    if (assetModelPath === modelPath) {
+      meshAssetCache.delete(path);
+      cacheToken.invalidateKey(path); // refuse an in-flight fetch of this .mesh.json's OLD bytes
+    }
   }
   console.log(`[MeshCache] Invalidated + disposed cache for ${modelPath} (${targets.size} GLBs, ${disposedGeo.size} geometries, ${disposedMat.size} materials, ${disposedTex.size} textures)`);
 }
@@ -560,7 +568,9 @@ export function loadModelTemplates(
   // token) doesn't `cache.set` owner-less geometry into the freshly-cleared
   // map — it would survive until the NEXT teardown as a stranded GPU leak. Mirrors
   // the material + HDR + rigged-cache guards. (F11)
-  const stillLive = cacheToken.capture();
+  // Captured on PATH, not `key` — invalidateModel works in path space, so the liveness key
+  // must meet it there (#863: a per-key invalidate must also refuse an in-flight load).
+  const stillLive = cacheToken.capture(path);
 
   const promise = new Promise<void>((resolve, reject) => {
     const onGltf = async (gltf: { scene: THREE.Group }) => {
@@ -979,9 +989,18 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
   if (meshAssetCache.has(meshPath)) return Promise.resolve();
   if (meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
 
+  // Same per-key liveness as its sibling fetchers (#863 close-out). This cache had none at all,
+  // and it IS invalidated per-key: `invalidateModel` drops every meshAssetCache entry whose
+  // `asset.model` resolves to the re-imported GLB, so without this an in-flight fetch of the
+  // PRE-import `.mesh.json` re-seats the stale asset on top of the refetch. Outside #863's own
+  // sweep only because that one enumerated `invalidate*` functions and there is no
+  // `invalidateMeshAsset` — the cache is invalidated through the model's name, not its own.
+  const stillLive = cacheToken.capture(meshPath);
+
   const promise = (async () => {
     try {
       const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT);
+      if (!stillLive()) return;
       if (!res.ok) {
         meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
         return;
@@ -1000,9 +1019,11 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
               `this build's MESH_FORMAT_VERSION (${MESH_FORMAT_VERSION}) — not caching it.`
             : `[MeshCache] refusing ${meshPath}: version field is unreadable (${verdict.reason}) — not caching it.`,
         );
+        if (!stillLive()) return;
         meshAssetCache.set(meshPath, MESH_FAILED);
         return;
       }
+      if (!stillLive()) return;
       meshAssetCache.set(meshPath, asset);
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
@@ -1053,6 +1074,67 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
 const materialCache = new Map<string, THREE.Material | typeof MATERIAL_FAILED>(); // path → material
 /** In-flight material fetches, keyed by .mat.json path. Awaitable for the refcount API. */
 const materialLoadPromises = new Map<string, Promise<void>>();
+
+/** Shader → material reverse index (#864). `type:'custom'` materials name their shader by ref
+ *  (`fetchMaterial`'s `data.shader`), but nothing indexed the other direction — so a
+ *  `space:'3d'` file shader's `.shader.json` had no way to find the materials built from it.
+ *  `spriteMaterialCache`'s `invalidateShader` is 2D-only and reaches this 3D cache only through
+ *  the `assetInvalidation` event edge (see that module's `shader` doc) — this is the 3D side.
+ *  `materialToShader` is the reverse pointer, kept so a `.mat` RE-IMPORTED to point at a
+ *  DIFFERENT (or no) shader prunes its stale forward edge in O(1) instead of leaving a wrong one
+ *  behind — `recordShaderEdge` below is the one place both maps are written, together.
+ *
+ *  ⚠️ **Keyed by shader GUID, not path.** Everything else in the shader system is GUID-keyed
+ *  (`spriteMaterialCache`'s `programs` and `liveness`, the `.mat`'s own `shader` ref), and a GUID
+ *  survives what a path does not: MOVE or RENAME a `.shader.json` in the asset browser without
+ *  touching the `.mat`, and a path-keyed edge recorded at fetch time no longer matches the path
+ *  resolved at invalidation time — the 3D material would keep its stale compiled NodeMaterial
+ *  while the 2D half, being GUID-keyed, recovered. Failing that way would ALSO be silent, not
+ *  fail-safe: `invalidateShader`'s unresolved-guid branch falls back to a wholesale
+ *  `clearSpriteMaterialCache()` for 2D, but a missed lookup here just finds nothing. */
+const shaderToMaterials = new Map<string, Set<string>>(); // shader GUID → matPaths built from it
+const materialToShader = new Map<string, string>();       // matPath → the shader GUID it currently names
+
+/** The one place `shaderToMaterials`/`materialToShader` are written. `shaderGuid` is the file
+ *  shader this material currently names, or `undefined` when it doesn't (rebuilt as a non-custom
+ *  type, a code-registered shader, or an unresolved ref) — passing `undefined` is what prunes a
+ *  material's edge on re-import or eviction. */
+function recordShaderEdge(matPath: string, shaderGuid: string | undefined): void {
+  const prev = materialToShader.get(matPath);
+  if (prev === shaderGuid) return;
+  if (prev !== undefined) {
+    const set = shaderToMaterials.get(prev);
+    if (set) {
+      set.delete(matPath);
+      if (set.size === 0) shaderToMaterials.delete(prev);
+    }
+  }
+  if (shaderGuid !== undefined) {
+    let set = shaderToMaterials.get(shaderGuid);
+    if (!set) { set = new Set(); shaderToMaterials.set(shaderGuid, set); }
+    set.add(matPath);
+    materialToShader.set(matPath, shaderGuid);
+  } else {
+    materialToShader.delete(matPath);
+  }
+}
+
+/** #864: a `space:'3d'` file-shader invalidation (`spriteMaterialCache.invalidateShader`, routed
+ *  through the shared `assetInvalidation` registry since this module must not import that 2D-only
+ *  one — see its `shader` kind doc) invalidates every material recorded against it. Copy the set
+ *  before iterating: `invalidateMaterial` calls `recordShaderEdge(matPath, undefined)`, which
+ *  mutates THIS SAME set mid-loop. */
+onAssetInvalidated((kind, path) => {
+  if (kind !== 'shader') return;
+  // The event carries the shader's PATH (assetInvalidation's contract: "the source asset path
+  // whose bytes changed"), while this index is GUID-keyed — resolve across that seam here rather
+  // than weakening either side. `path` can already BE a guid on `invalidateShader`'s guid branch.
+  const shaderGuid = isGuid(path) ? path : getGuidForPath(path);
+  if (!shaderGuid) return;
+  const matPaths = shaderToMaterials.get(shaderGuid);
+  if (!matPaths) return;
+  for (const matPath of [...matPaths]) invalidateMaterial(matPath);
+});
 
 /** Invalidate a cached material so it will be re-fetched on next resolve. */
 /** Every texture a material binds — the same walk `disposeMaterial` uses (enumerable texture
@@ -1105,6 +1187,12 @@ export function invalidateMaterial(matPath: string) {
   if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+  // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+  // re-caches the stale material on top of whatever refetch follows.
+  cacheToken.invalidateKey(matPath);
+  // #864: this path is being evicted, so its shader edge (if any) would otherwise outlive the
+  // material entry it describes. A successful refetch re-records a fresh edge via `fetchMaterial`.
+  recordShaderEdge(matPath, undefined);
 }
 
 /** Materials evicted while a live mesh still bound them (see {@link invalidateMaterial}).
@@ -1208,12 +1296,17 @@ function fetchMaterial(matPath: string): Promise<void> {
   if (materialCache.has(matPath)) return Promise.resolve();
   if (materialLoadPromises.has(matPath)) return materialLoadPromises.get(matPath)!;
 
-  const stillLive = cacheToken.capture(); // capture to detect disposal during async load
+  const stillLive = cacheToken.capture(matPath); // per-key: detects disposal OR a per-path invalidate during async load
 
   const promise = (async () => {
     try {
       const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT);
       if (!res.ok) {
+        // Liveness-guarded like every other write in this function (#863 residual, found by
+        // #864's close-out): MATERIAL_FAILED is a PERMANENT sentinel — `resolveMaterial` returns
+        // undefined for it forever — so a stale continuation stamping it over a material that was
+        // re-imported and refetched successfully kills that material for the session.
+        if (!stillLive()) return;
         materialCache.set(matPath, MATERIAL_FAILED); // cache failure — don't retry
         return;
       }
@@ -1233,6 +1326,7 @@ function fetchMaterial(matPath: string): Promise<void> {
               `this build's MATERIAL_FORMAT_VERSION (${MATERIAL_FORMAT_VERSION}) — not building it.`
             : `[MeshCache] refusing ${matPath}: version field is unreadable (${verdict.reason}) — not building it.`,
         );
+        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
         materialCache.set(matPath, MATERIAL_FAILED);
         return;
       }
@@ -1242,9 +1336,41 @@ function fetchMaterial(matPath: string): Promise<void> {
       // Dispatch to the appropriate builder based on `type`. Defaults to 'pbr'
       // for legacy .mat.json files with no type field.
       const type = (data.type as string) ?? 'pbr';
+
+      // #864: record (or prune) this material's shader edge — `type:'custom'` naming a ref that
+      // resolves to a `.shader.json` FILE shader (a code-registered shader, e.g. "outline", stays
+      // undefined here: `refToPath` passes a non-guid/non-path name through unchanged, so it never
+      // ends in `.shader.json`). Recorded regardless of whether the build below actually succeeds,
+      // so a material that failed for an unrelated reason still recovers once the shader it names
+      // is fixed and re-invalidated.
+      const shaderRefRaw = type === 'custom' ? (data.shader as string | undefined) : undefined;
+      const shaderPath = shaderRefRaw !== undefined ? refToPath(shaderRefRaw) : undefined;
+      // Same liveness guard as every other write here, and for the same reason: the edge is
+      // METADATA ABOUT the cache entry, so it must be written under the entry's own guard or the
+      // two can disagree. Concretely — `invalidateMaterial` clears `materialLoadPromises`, so two
+      // fetches for one matPath can overlap (#863); if the STALE one records last, the edge names
+      // the OLD shader and this material stops responding to invalidations of the shader it
+      // actually uses. Found by #864's close-out, not by its tests.
+      // Guards the EDGE WRITE only — deliberately not an early `return`. Bailing out here would
+      // skip the build below, and with it the `disposeMaterial` on the losing load that
+      // `materialInvalidationRetires` + `acquireMaterialPrefabMidLoadGuard` pin: "freed, not
+      // orphaned" is the property those tests exist for, and a fix for a DIFFERENT defect must not
+      // quietly retire it by making the allocation never happen.
+      if (stillLive()) {
+        recordShaderEdge(
+          matPath,
+          shaderPath?.endsWith('.shader.json')
+            // Prefer the ref itself when it is already a guid (the GUID-only invariant means it
+            // almost always is); fall back to the manifest for a legacy path-shaped ref.
+            ? (isGuid(shaderRefRaw) ? shaderRefRaw : getGuidForPath(shaderPath))
+            : undefined,
+        );
+      }
+
       const builder = getMaterialBuilder(type);
       if (!builder) {
         console.warn(`[MeshCache] Unknown material type "${type}" in ${matPath}. Falling back to a pink material.`);
+        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
         materialCache.set(matPath, MATERIAL_FAILED);
         return;
       }
@@ -1366,6 +1492,14 @@ function fetchMaterial(matPath: string): Promise<void> {
       fireDirtyListeners();
     } catch (e) {
       console.warn(`[MeshCache] Failed to load material ${matPath}:`, e);
+      // The FOURTH post-await MATERIAL_FAILED write, and the most reachable of them in dev:
+      // `parseAssetJson` THROWS (MissingAssetError on the dev-server SPA fallback, a plain Error
+      // on a bad parse), so a missing or half-written .mat.json lands HERE, not in the `!res.ok`
+      // branch above. Same guard as its three siblings and for the same reason — the sentinel is
+      // PERMANENT and `fetchMaterial` short-circuits on `materialCache.has`, so a stale
+      // continuation stamping it over a successfully refetched material kills that material for
+      // the session with nothing to retry it.
+      if (!stillLive()) return;
       materialCache.set(matPath, MATERIAL_FAILED);
     } finally {
       materialLoadPromises.delete(matPath);
@@ -1442,6 +1576,9 @@ export function disposeAllCachedResources() {
   }
   materialCache.clear();
   materialLoadPromises.clear();
+  // #864: the shader→material reverse index dies with the materials it describes.
+  shaderToMaterials.clear();
+  materialToShader.clear();
   // Retired materials too: their sweep runs from `syncSceneRenderables3D`, so a surface that
   // stops rendering (or a build with no 3D surface) would otherwise strand them. Everything
   // binding them is torn down with this generation anyway.
@@ -1950,6 +2087,9 @@ export function invalidateEnvironment(hdrRef: string): void {
   if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+  // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+  // re-caches the stale texture on top of whatever refetch follows.
+  cacheToken.invalidateKey(hdrPath);
 }
 
 /** HDR envs evicted by {@link invalidateEnvironment} while a render surface still bound them.
@@ -2019,7 +2159,8 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
 
   // Snapshot liveness BEFORE the async load so a release-mid-load (or a
   // full disposeAllCachedResources) is observable when the texture arrives.
-  const stillLive = cacheToken.capture();
+  // Per-key (#863): a per-path invalidateEnvironment must also be observable, not just teardown.
+  const stillLive = cacheToken.capture(hdrPath);
 
   const promise = (async () => {
     // Load the converted variant (`~env.hdr` downscaled Radiance, or `~ultrahdr.jpg`
@@ -2120,12 +2261,20 @@ export function invalidatePrefab(prefabRef: string): void {
     if (!key) continue;
     prefabCache.delete(key);
     prefabLoadPromises.delete(key);
+    // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+    // re-caches the stale prefab on top of whatever refetch follows.
+    cacheToken.invalidateKey(key);
   }
 }
 
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
+
+  // Snapshot liveness so a fetch that resolves AFTER an invalidatePrefab (or full teardown)
+  // doesn't re-seat the pre-invalidation bytes into the freshly-cleared cache (#863). Mirrors
+  // the model/material/environment guards above — this cache had none at all.
+  const stillLive = cacheToken.capture(prefabPath);
 
   const promise = (async () => {
     try {
@@ -2142,6 +2291,7 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       // since this runs unconditionally on every row, not just non-nested ones), not just
       // entry.traits.
       for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+      if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {

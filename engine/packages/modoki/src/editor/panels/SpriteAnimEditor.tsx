@@ -11,7 +11,7 @@
  *  asset updates next frame. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
@@ -182,7 +182,7 @@ export default function SpriteAnimEditor() {
     if (!path) return;
     const guid = newGuid();
     const doc = { id: guid, ...defaultSpriteAnimData() };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(doc));
     if (!ok) return;
     // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
     // is authoritative — drop any parked write for that path.

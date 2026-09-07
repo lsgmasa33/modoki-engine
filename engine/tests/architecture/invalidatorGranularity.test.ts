@@ -21,12 +21,29 @@
  * noticing, which a per-module behavioural test would only catch for the module it was written
  * against.
  *
+ * ⚠️ **A `createTeardownToken` has TWO halves, and checking only one is how this recurred THREE
+ * times.** #487 fixed five sites that bumped NEITHER half (undershoot: a stale in-flight load
+ * re-caches itself on top of a fresh re-import) and cited two sites that call `invalidateAll()`
+ * (overshoot: superseding every OTHER in-flight load) as "the correct precedent" — without
+ * noticing overshoot is itself a bug, just a different one. #852 then found `invalidateShader`
+ * doing exactly that. #856 swept the rest of the overshoot sites; #863 found five MORE undershoot
+ * sites, because the guard #852 asked for (below) only ever checked for per-key evidence, never
+ * for a wholesale call sitting right next to it. The second `describe` block below is the fix for
+ * that pattern: every teardown-backed invalidator is held to BOTH directions at once — call
+ * `.invalidateKey(`, never call `.invalidateAll(` — not just whichever direction a given incident
+ * happened to be about.
+ *
  * What this CANNOT catch (be honest about the gap, not silent about it):
+ *  - Whether the module's LOADER captures with the SAME key the invalidator bumps. A keyless
+ *    `capture()` ignores `keyGenerations` entirely (`runtime/core/liveness.ts`), so a module can
+ *    satisfy every check below and still have a dead mechanism — this repo's dominant defect
+ *    class. Hand-checked 2026-09-07 during #856/#863's close-out: all of audio, fontAtlas, font,
+ *    model, material, environment, prefab and rigged capture with a matching key today. Closing
+ *    this properly needs the capture site paired to the invalidator, which is a behavioural check,
+ *    not a source scan.
  *  - A function whose `.delete(`/`.invalidateKey(` call is genuinely there but keyed on something
  *    OTHER than its own argument (a hardcoded key, or an unrelated map/key it deletes as a red
  *    herring while the REAL eviction still routes through a wholesale clear elsewhere in the body).
- *  - A function that calls a per-key delete AND unconditionally ALSO wholesale-clears — this guard
- *    only checks for the PRESENCE of per-key evidence, not the ABSENCE of a wholesale call next to it.
  *  - An invalidator wired into the table but defined outside `runtime/loaders/*.ts` — reported as a
  *    violation (fail-SAFE direction: it shows up as "not found", not as a silent pass).
  * A behavioural, table-driven check that actually exercises each cache would close these gaps; if
@@ -128,6 +145,119 @@ describe('every ASSET_CACHE_INVALIDATORS entry evicts per-key, not wholesale (#8
           `${name} (${found.file}): body has no ".delete(" or ".invalidateKey(" call of its own — it ` +
           'can only be delegating to a wholesale clear, which drops every unrelated cache entry for ' +
           'an edit to just one of them (#852: this was invalidateShader\'s exact defect).',
+        );
+      }
+    }
+    expect(violators, violators.join('\n')).toEqual([]);
+  });
+});
+
+/** A module CONSTRUCTS its own `createTeardownToken` — `= createTeardownToken(` — rather than
+ *  merely importing the type. That construction is the precondition for either failure direction
+ *  existing at all: a module with no token can be neither an overshoot nor an undershoot. Matched
+ *  against comment-blanked code so a docblock mentioning the call (several of these modules have
+ *  one, explaining the choice) can't satisfy it. */
+const CONSTRUCTS_TEARDOWN_TOKEN = /=\s*createTeardownToken\s*(?:<[^>]*>)?\s*\(/;
+
+/** Every `export function invalidate<Something>(<at least one param>)` in a `runtime/loaders/*.ts`
+ *  module that constructs its own `createTeardownToken` — the FULL population, not just the ~8
+ *  wired into `ASSET_CACHE_INVALIDATORS` above. A zero-param `invalidateXxx()` is excluded on
+ *  purpose: with no key to bump selectively it can only be (or delegate to) a wholesale clear by
+ *  construction, so it isn't the shape this check is about — none exist under this directory
+ *  today; a hypothetical future one is a different question than the one this file answers.
+ *  Comment-blanked per file, same as `scanLoaderFunctions` above and for the same reason (#419):
+ *  a naive scan over raw source reports the OPPOSITE verdict for six of these — their own comments
+ *  explain, in the literal string `invalidateAll()`, why the body does NOT call it. (Checked
+ *  2026-09-07: `readScannedSource` itself is sound here — it preserves `capture(path)`,
+ *  `invalidateKey(path)` and the teardown's `invalidateAll()` in `fontLoader.ts` verbatim. A
+ *  close-out sweep reported the opposite; that was ITS OWN hand-rolled blanker, not this one.)
+ *
+ *  ⚠️ Scans `runtime/loaders/` AND `runtime/rendering/`, matching the SCAN_DIRS of the sibling
+ *  guard `invalidatorsAreReachable.test.ts` — which was widened to both by #842 precisely because
+ *  the key-taking `invalidatePixiShaderProgram` lives in `rendering/`. Scanning one directory here
+ *  while the sibling scans two would be a claim this defect can only exist in `loaders/`, and
+ *  nothing makes that true. (`invalidatePixiShaderProgram` is not REPORTED today: its module
+ *  constructs no teardown token, because its `programCache` is keyed on shader CONTENT — a stale
+ *  re-seat lands under a key nothing will compute again. The widening is about the next
+ *  token-backed invalidator someone adds there, not about that one.) */
+const INVALIDATOR_SCAN_DIRS = [
+  LOADERS_DIR,
+  path.join(REPO, 'engine/packages/modoki/src/runtime/rendering'),
+];
+
+function scanTeardownBackedInvalidators(): { name: string; file: string; code: string }[] {
+  const out: { name: string; file: string; code: string }[] = [];
+  for (const dir of INVALIDATOR_SCAN_DIRS) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
+      const { code } = readScannedSource(path.join(dir, entry.name));
+      if (!CONSTRUCTS_TEARDOWN_TOKEN.test(code)) continue;
+      for (const m of code.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(([^)]*)\)/g)) {
+        if (m[2].trim() === '') continue; // zero-param — see docblock above
+        out.push({ name: m[1], file: entry.name, code });
+      }
+    }
+  }
+  return out;
+}
+
+/** Invalidators sanctioned to skip the `.invalidateKey(` requirement below, because they are
+ *  correct by a DIFFERENT mechanism than a teardown-token key bump. ⚠️ **This list is a licence to
+ *  rot if it's ever treated as a place to silence a failure** — a new entry needs the same standard
+ *  of proof as the one below: a named alternative mechanism, cited at file:line, not "this one is
+ *  fine". The test below asserts this set is EXACTLY `['invalidateTexture']`, so adding (or
+ *  removing) a member is a visible edit to THIS file, not a quiet change to a regex elsewhere. */
+const EXEMPT_FROM_PER_KEY_CHECK: ReadonlySet<string> = new Set([
+  // `invalidateTexture` (textureResolver.ts): `loadTexture3D` inserts its cache entry into
+  // `texCache` SYNCHRONOUSLY, before any `await` (textureResolver.ts:510,
+  // `texCache.set(key, entry)`), and every write that happens AFTER an await identity-checks
+  // against the captured entry/texture instead of trusting a re-lookup by key
+  // (textureResolver.ts:507, `if (texCache.get(key) === entry) texCache.delete(key);`; :538,
+  // `if (entry.texture && entry.texture !== tex) return;`). A load that resolves after
+  // `invalidateTexture` has evicted its key therefore has no path back into the map — there is no
+  // stale-generation window for a key bump to close, which is exactly what `.invalidateKey(`
+  // exists to do. `sharedTextureLiveness` (this module's token) is used here only via `.capture()`
+  // for a different sequencing guarantee (racing `disposeAllSharedTextures`), never
+  // `.invalidateKey(` or `.invalidateAll(`.
+  'invalidateTexture',
+]);
+
+describe('every teardown-backed loader invalidator evicts per-key AND never wholesale (#487 -> #852 -> #856/#863)', () => {
+  const all = scanTeardownBackedInvalidators();
+
+  it('found a plausible number of teardown-backed invalidators (sanity: a collapsed scan passes vacuously)', () => {
+    // Floor, not a pin (see the guard's own docblock) — 16 exist today across 13 modules; a
+    // legitimate new cache should only ever raise this, never need it lowered.
+    expect(all.length).toBeGreaterThan(10);
+  });
+
+  it('the sanctioned exemption set is exactly the expected one, and every exempted name is real', () => {
+    expect([...EXEMPT_FROM_PER_KEY_CHECK].sort()).toEqual(['invalidateTexture']);
+    const found = new Set(all.map((f) => f.name));
+    for (const name of EXEMPT_FROM_PER_KEY_CHECK) {
+      expect(found.has(name), `exempted name "${name}" was not found by the scan above — a rename ` +
+        'or removal left this exemption pointing at nothing, silently exempting no one').toBe(true);
+    }
+  });
+
+  it("every non-exempt invalidator's own body calls .invalidateKey( and never .invalidateAll(", () => {
+    const violators: string[] = [];
+    for (const { name, file, code } of all) {
+      if (EXEMPT_FROM_PER_KEY_CHECK.has(name)) continue;
+      const body = extractFunctionBody(code, name);
+      if (!/\.invalidateKey\(/.test(body)) {
+        violators.push(
+          `${name} (${file}): body never calls ".invalidateKey(" — UNDERSHOOT (#863): a stale ` +
+          'in-flight load for this exact key that resolves after this eviction has nothing ' +
+          're-checking its liveness, so it re-caches pre-invalidation bytes on top of whatever ' +
+          're-import follows.',
+        );
+      }
+      if (/\.invalidateAll\(/.test(body)) {
+        violators.push(
+          `${name} (${file}): body calls ".invalidateAll(" — OVERSHOOT (#852/#856): this ` +
+          'supersedes every OTHER in-flight load in the module, not just the one keyed by this ' +
+          'invalidator\'s own argument.',
         );
       }
     }

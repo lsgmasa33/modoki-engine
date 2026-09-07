@@ -29,10 +29,12 @@ const loading = new Map<string, Promise<string>>();
  *  bug this map exists for (#276). */
 const faces = new Map<string, FontFace>();
 
-/** Teardown liveness — no per-key epoch: every invalidation/teardown invalidates wholesale. A
- *  load captures it before awaiting and refuses to register if it changed: otherwise a load of
- *  the OLD bytes that was still in flight when the re-import landed resolves afterwards and
- *  re-registers the stale face on top of the fresh one. Mirrors fontAtlasLoader's liveness guard. */
+/** Teardown liveness — PER-KEY (#856): `invalidateFontFace` invalidates only the re-imported
+ *  path's own key, so an unrelated font's in-flight load started around the same time is not
+ *  superseded. A load captures its own path's key before awaiting and refuses to register if it
+ *  changed: otherwise a load of the OLD bytes that was still in flight when the re-import landed
+ *  resolves afterwards and re-registers the stale face on top of the fresh one. Full teardown
+ *  (`disposeAllFontFaces`) still invalidates wholesale. Mirrors fontAtlasLoader's liveness guard. */
 const liveness = createTeardownToken();
 
 /** Drop the {@link FontInfo} a path contributed to {@link loadedFonts} (and the family
@@ -70,7 +72,7 @@ async function doLoadFont(path: string): Promise<string> {
     style: info.style,
   });
 
-  const stillLive = liveness.capture();
+  const stillLive = liveness.capture(path);
   await face.load();
   // Invalidated (or torn down) while this was in flight: these are the OLD bytes and a
   // reload for the new ones is already running. Registering now would put the stale face
@@ -172,7 +174,7 @@ export function invalidateFontFace(path: string): void {
   // re-import and stranding the font on the stale face until an editor restart. `faces`
   // survives a failed reload precisely because the old face is still registered.
   if (!faces.has(path) && !loading.has(path)) return;
-  liveness.invalidateAll();  // any in-flight load is now carrying the OLD bytes — refuse it
+  liveness.invalidateKey(path);  // this path's in-flight load is now carrying the OLD bytes — refuse it
   loading.delete(path);
   loadedPaths.delete(path);
   void loadFont(path).catch(e => {

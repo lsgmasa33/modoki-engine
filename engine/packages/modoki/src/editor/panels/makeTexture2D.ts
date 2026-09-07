@@ -15,6 +15,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { deriveSettingsForType, type TextureImportSettings } from '../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { flushPendingMetaFor } from '../scene/pendingMeta';
 
 /** Sets a texture's type to `2d` and re-imports it so it gets a whole-image
  *  sprite. Resolves `true` on success; the caller (SpritePicker) is responsible
@@ -39,6 +40,11 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // `writeMetaSidecar` salvages the `id` textually out of the damaged bytes before quarantining
   // them, so the identity is restored even though the payload posted from here lacks it. Do not
   // re-derive a "safe to spread" argument from the status code alone.
+  // #845: a still-parked Inspector settings edit for this path has not reached disk yet. Flush it
+  // first, or this read-modify-write would build its merge on the PRE-edit doc, silently discard
+  // the parked edit from what gets written below, and leave the (now stale) parked entry to
+  // overwrite this function's own write at the next Cmd+S.
+  await flushPendingMetaFor(path);
   const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`).catch(() => null);
   if (!metaRes || !metaRes.ok) {
     console.error(`[SpritePicker] could not read the meta for ${path} (${metaRes ? metaRes.status : 'network error'}) — not converting, because overwriting the sidecar from a failed read would discard its GUID.`);

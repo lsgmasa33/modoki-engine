@@ -29,7 +29,7 @@ import { reportUndoFailure, COLLISION_STATUS } from '../undo/undoFailure';
 // Extensions we know are UTF-8 text — everything else is treated as binary so
 // the delete-undo snapshot round-trips bytes through base64 instead of
 // fetch().text() (which silently UTF-8 corrupts binary files like .glb).
-const TEXT_ASSET_EXTS = new Set(['.json', '.txt', '.md', '.ts', '.tsx', '.js', '.jsx', '.css', '.html', '.svg', '.glsl']);
+const TEXT_ASSET_EXTS = new Set(['.json', '.txt', '.md', '.ts', '.tsx', '.js', '.jsx', '.css', '.html', '.svg', '.glsl', '.wgsl']);
 
 export function isTextAsset(p: string): boolean {
   const lower = p.toLowerCase();

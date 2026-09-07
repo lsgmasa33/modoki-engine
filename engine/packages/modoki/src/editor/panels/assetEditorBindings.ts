@@ -35,6 +35,9 @@ import { useEditorStore } from '../store/editorStore';
 import {
   getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
 } from '../scene/dirtyAssets';
+import {
+  getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline,
+} from '../scene/pendingMeta';
 import { applyMove, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder } from './assetFolderState';
 
@@ -140,6 +143,66 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
       // (renameSync), so the sha256 captured at `from` still describes the file at `to`.
       markAssetDirty(to, doc.type, doc.data, doc.origin, doc.ifMatch);
       notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
+    }
+  }
+  notes.push(...applyMovesToParkedMeta(list));
+  return notes;
+}
+
+/** The same rule for PARKED IMPORT SETTINGS (`.meta.json`, #845) — a move carries the edit, a
+ *  delete drops it.
+ *
+ *  ⚠️ This is not a nicety, it is a regression this range would otherwise ship. Before parking,
+ *  every `.meta.json` edit wrote immediately, so no pending edit could outlive its path. Now one
+ *  can, and `pendingMeta` is keyed by ASSET PATH with nothing migrating those keys:
+ *
+ *   - **Delete** `foo.png` with a parked Max Size change → the next Cmd+S POSTs `/api/write-meta`
+ *     for a path with no asset. `resolveAssetPath` is a roots/traversal guard with no existence
+ *     check and `assertSidecarWritable` only checks the format version, so the write SUCCEEDS and
+ *     recreates a committed `foo.png.meta.json` beside a file that no longer exists — a
+ *     resurrection, exactly as the sibling's docblock above describes for asset docs.
+ *   - **Rename** `foo.png`→`bar.png` → the park stays keyed to `foo.png`: an orphan sidecar is
+ *     written AND `bar.png` never receives the edit.
+ *
+ *  Folded into `applyMovesToParkedAssets` rather than given its own call site, because the two
+ *  registries must move together — a caller that remembered one and forgot the other is precisely
+ *  how this gap appeared.
+ *
+ *  ⚠️ **The CAS baseline is CARRIED, not dropped** — and an earlier version of this comment argued
+ *  the opposite ("the first write at the new path is unconditional-but-informed"). `#854` settled
+ *  it for the sibling registry on the same day and the reasoning transfers exactly: at a new key,
+ *  *"preserve what is here"* and *"carry what came from there"* are different answers, and dropping
+ *  the baseline turns the compare-and-swap OFF for the rest of the session — precisely the
+ *  git-checkout hazard it exists for, on a path the human just renamed and is therefore actively
+ *  working on. A rename moves the sidecar's BYTES unchanged, so the old baseline is still a true
+ *  statement about the file at its new name; there is nothing to re-derive and no reason to
+ *  distrust it. See `remapFlushedAssetRecords` in `dirtyAssets.ts` for the sibling's version.
+ *
+ *  Exported for tests. */
+export function applyMovesToParkedMeta(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  // PLAN then apply, for the same chained-move reason spelled out in the sibling above.
+  const planned: { from: string; to: string | null; doc: unknown }[] = [];
+  for (const path of getPendingMetaPaths()) {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;
+      if (to !== path) planned.push({ from: path, to, doc: peekPendingMeta(path) });
+      break;
+    }
+  }
+  // Read the baselines BEFORE any discard — `discardPendingMeta` clears them with the park, which
+  // is right when an edit is genuinely abandoned and wrong here, where the entry is moving.
+  const carried = new Map<string, string | undefined>();
+  for (const { from } of planned) carried.set(from, peekMetaBaseline(from));
+  const notes: string[] = [];
+  for (const { from } of planned) discardPendingMeta([from]);
+  for (const { from, to, doc } of planned) {
+    if (to === null) {
+      notes.push(`dropped the unsaved import-settings edit parked for ${from} (its asset was deleted)`);
+    } else if (doc !== undefined) {
+      parkMetaEdit(to, doc, carried.get(from));
+      notes.push(`moved the unsaved import-settings edit parked for ${from} → ${to}`);
     }
   }
   return notes;

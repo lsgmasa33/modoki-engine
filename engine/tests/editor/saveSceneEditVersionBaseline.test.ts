@@ -1,7 +1,7 @@
 /** `saveScene` must not claim an edit made DURING its disk write was saved (#573).
  *
  *  `markSceneSaved()` recorded `getEditVersion()` at CALL time — which, in `saveScene`, is on the
- *  far side of two awaits (`serializeScene`, then `writeFileToServer`; and on the Save-As path a
+ *  far side of two awaits (`serializeScene`, then `writeAssetFile`; and on the Save-As path a
  *  NATIVE MODAL a human can leave open for as long as they like). The bytes written to disk were
  *  serialized BEFORE those awaits. So an edit landing inside the window was folded into the
  *  "matches disk" baseline without ever being written.
@@ -13,7 +13,7 @@
  *  at this site for a different cause (the partially-failed Save All term).
  *
  *  THE PRODUCTION CADENCE, stated because a red-green test proves nothing if its scenario cannot
- *  occur: the editor is a live app. `writeFileToServer` is a real `fetch` to the dev server, and
+ *  occur: the editor is a live app. `writeAssetFile` is a real `fetch` to the dev server, and
  *  the human keeps typing, dragging a gizmo, or running an agent op while it is in flight. No
  *  contrived scheduling is needed — only that an edit lands between serialize and the write
  *  resolving, which is an ordinary keystroke.

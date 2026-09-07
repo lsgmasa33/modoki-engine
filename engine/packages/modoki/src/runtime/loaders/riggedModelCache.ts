@@ -63,8 +63,9 @@ const cache = new Map<string, RiggedModel>();
 const loadPromises = new Map<string, Promise<void>>();
 const owners = new Map<string, Set<SceneId>>();
 
-// Teardown liveness — no per-key epoch: only full dispose invalidates, so a load that resolves
-// AFTER teardown disposes its result instead of leaving an owner-less entry in the cache forever.
+// Teardown liveness, captured per PATH before each load and re-checked after: a load that
+// resolves AFTER teardown (or a per-key invalidateRiggedModel) disposes its result instead of
+// leaving an owner-less — or stale — entry in the cache (#863).
 const liveness = createTeardownToken();
 
 // Constructed lazily on first load (not at module scope) so importing this
@@ -175,7 +176,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
   if (cache.has(path)) { disposePendingGltf(path); return Promise.resolve(); }
   if (loadPromises.has(path)) return loadPromises.get(path)!;
 
-  const stillLive = liveness.capture();
+  const stillLive = liveness.capture(path);
   // Try the derived variant first; on failure, fall back to the raw source so a
   // missing/mis-based variant (e.g. project served in a different URL context
   // than it was imported in) never leaves the model invisible.
@@ -370,6 +371,9 @@ export function invalidateRiggedModel(modelRef: string): void {
     if (model) disposePrototype(model);
     cache.delete(key);
     loadPromises.delete(key);
+    // #863: an in-flight load of THIS key is carrying pre-invalidation bytes — refuse it, or it
+    // re-caches the stale prototype on top of whatever re-import follows.
+    liveness.invalidateKey(key);
   }
 }
 

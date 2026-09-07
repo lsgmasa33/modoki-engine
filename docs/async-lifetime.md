@@ -80,6 +80,63 @@ that answers the wrong question is not a weaker guard, it is a guard that cannot
   because `releaseAllForScene` intentionally does not bump the generation: the owner-set answers
   supersession, the generation answers teardown, and neither substitutes for the other.
 
+### The scope rule: a key-taking invalidator bumps exactly its own key
+
+A `TeardownToken` has two halves — `invalidateAll()` and `invalidateKey(k)` — and the rule that
+decides which one a call site gets is not a style preference:
+
+> **A function handed ONE asset's key bumps exactly that key. Only a teardown bumps wholesale.**
+
+Both ways of breaking it are silent, and both have shipped here:
+
+| Direction | The call | What actually happens |
+|---|---|---|
+| **Overshoot** | `invalidateAll()` where `invalidateKey(k)` was meant | Every OTHER asset's in-flight load is superseded. Its result is computed *successfully* and thrown away. |
+| **Undershoot** | neither half — the load captures keylessly | The asset's own in-flight load, carrying the PRE-import bytes, resolves after the eviction and re-caches itself on top of the fresh one. |
+
+Overshoot is the more surprising one, because nothing errors and the damage lands on an asset
+nobody touched. Its severity depends entirely on whether the victim retries: `fontAtlasLoader`
+re-checks every frame, so a superseded font blanks and refetches, while `acquireAudio` runs only at
+scene load — so a superseded decode meant that clip was **silently missing audio for the rest of the
+scene**.
+
+**The eviction half being correct tells you nothing about the liveness half.** In every instance
+found so far the `.delete(key)` sitting next to the wrong call was already right. That is why the
+guard checks the token, not the map.
+
+### Why an owner-set check cannot stand in for the key
+
+Two invalidators guard their post-await write with `owners.has(key)` and look covered. They are not:
+each one deliberately **keeps** its owners so the next acquire re-fetches — `invalidateEnvironment`
+("KEEPS the scene owners"), `invalidateRiggedModel` ("Owners are left intact"). So the check is true
+by construction on exactly the path that needs it. It is answering the scene-release question from
+the table above, which is a different question, and the two do not substitute for each other.
+
+The third sanctioned shape is neither: `invalidateTexture` is correct with **no** key at all,
+because its loader inserts into `texCache` synchronously **before any await** and identity-checks
+every post-await write. Nothing can resolve back into a map it was never going to write to. That is
+a real alternative, not an oversight — it is the one exemption the guard carries.
+
+### The history, so the next reader does not re-derive it
+
+This class has recurred three times, and each round fixed a subset:
+
+- **#487** diagnosed the undershoot half and fixed five caches — and cited `fontLoader` /
+  `fontAtlasLoader` as *"the correct precedent"* because they bump. They bumped **wholesale**: two
+  of the overshoot bugs. Five other undershooting caches were never swept.
+- **#852** fixed a fourth overshoot (`invalidateShader`) and added the granularity guard — scoped to
+  the wired invalidator table, and checking only for the PRESENCE of per-key evidence.
+- **#856 / #863** fixed the remaining three overshoot and five undershoot sites, and widened that
+  guard to both directions over every loader invalidator whose module owns a token.
+
+All five of #487's correctly-fixed sites still carry the comment *"Precedent:
+fontLoader.invalidateFontFace"*. Those citations are true now; they were not when they were written.
+
+⚠️ **A guard for one direction is blind to the other**, which is why the two were fixed as one
+change. And it must run on **comment-blanked** source: a naive regex over the 16 key-taking
+invalidators reports 9 violations, six of them correct implementations whose *comments* contain the
+string `invalidateAll()` while explaining why they don't call it.
+
 ### An identity token can wear a number
 
 `managerRegistry`'s `activationId` looks like an epoch and is not one. It is allocated per entry from
@@ -260,6 +317,25 @@ The three-way table above is what makes that checkable without flow analysis —
 and id generators are separable syntactically.
 
 **What it catches:** a sixth hand-rolled epoch. That is the failure mode that produced this doc.
+
+**A second guard covers the scope rule above.** `engine/tests/architecture/invalidatorGranularity.test.ts`
+holds every `export function invalidate<X>(key)` under `runtime/loaders/` whose module constructs
+its own `createTeardownToken` — 16 functions across 13 modules — to BOTH directions at once: the
+body must call `.invalidateKey(`, and must never call `.invalidateAll(`. Checking one direction is
+what let the class recur three times, so it deliberately does not.
+
+Two properties of that guard are load-bearing rather than incidental, and a future edit should not
+quietly drop either:
+- it reads **comment-blanked** source (`readScannedSource`, #419). On raw text it reports the
+  opposite verdict for six correct implementations, whose comments contain the literal string
+  `invalidateAll()` while explaining why the body does not call it.
+- its enumeration is **floored**, so a scan that collapses to nothing fails instead of passing
+  vacuously.
+
+`invalidateTexture` is its one exemption, and the exemption set is asserted to be *exactly* that —
+so adding a member is a visible edit to the guard, not a quiet regex change. A new exemption owes
+the same standard of proof the existing one carries: a named alternative mechanism, cited at
+file:line.
 
 **What it does not catch:** a new deferring site that guards *nothing at all*. Detecting that needs
 statement-order analysis — a deferral followed by a write to non-local state with no intervening

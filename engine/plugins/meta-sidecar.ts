@@ -42,6 +42,7 @@
  */
 
 import fs from 'fs';
+import crypto from 'crypto';
 import {
   classifyJsonFormatVersion,
   type FormatVerdict,
@@ -58,8 +59,36 @@ import { isGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
  *  not bump it casually. */
 export const SIDECAR_FORMAT_VERSION = 2;
 
-function sidecarPath(absPath: string): string {
+export function sidecarPath(absPath: string): string {
   return absPath + '.meta.json';
+}
+
+/** sha256 of the COMMITTED sidecar's bytes, or `null` when it does not exist (#845 phase 2).
+ *
+ *  The `ifMatch` precondition on `/api/write-meta` needs both sides to agree on the same bytes,
+ *  and for a sidecar they cannot be derived on the client: `/api/read-meta` returns
+ *  `readMetaSidecar`, which MERGES the gitignored `.meta.local.json` cache blocks back in, and
+ *  `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits those blocks back out
+ *  again. So the response body a panel receives is not what is on disk and hashing it would
+ *  produce a baseline that can never match — the failure `contentHash.ts`'s docblock warns about,
+ *  where every conditional write 409s forever with no way to succeed.
+ *
+ *  Hashing here, server-side, is what makes the two ends agree: the same file, the same bytes, the
+ *  same digest as `ifMatchRefusal` computes. BOM-stripped for the same reason it is there — a
+ *  Windows-authored sidecar would otherwise hash differently on the two sides forever.
+ *
+ *  ⚠️ Deliberately covers ONLY `.meta.json`. `.meta.local.json` is gitignored per-machine cache
+ *  and is not what a concurrent edit races over; including it would make the baseline change
+ *  whenever a texture was re-encoded locally and 409 an edit nobody else touched. */
+export function metaSidecarSha256(absPath: string): string | null {
+  try {
+    const buf = fs.readFileSync(sidecarPath(absPath));
+    const body = (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf)
+      ? buf.subarray(3) : buf;
+    return crypto.createHash('sha256').update(body).digest('hex');
+  } catch {
+    return null;
+  }
 }
 
 /** Where an unparsable sidecar is moved before it is replaced (#778).

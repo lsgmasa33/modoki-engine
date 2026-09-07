@@ -10,6 +10,7 @@
  *  from this call. Each `registerAsset` below now runs ONLY after its own write is confirmed. */
 
 import { MESH_FORMAT_VERSION } from '../../../runtime/traits';
+import { jsonFileBody } from '../../backend/editorBackend';
 
 export interface CollisionMeshWriteResult {
   ok: boolean;
@@ -57,7 +58,7 @@ export async function writeCollisionMeshAssets(
   await writeMeta();
 
   const meshAsset = { id: meshGuid, version: MESH_FORMAT_VERSION, model: modelGuid, mesh: meshName, postprocessor: 'none', material: '' };
-  const meshRes = await deps.post(meshJsonPath, JSON.stringify(meshAsset, null, 2));
+  const meshRes = await deps.post(meshJsonPath, jsonFileBody(meshAsset));
   if (!meshRes.ok) throw new Error(`write .mesh.json failed (${meshRes.status})`);
   deps.registerAsset(meshGuid, meshJsonPath, 'mesh');
 }

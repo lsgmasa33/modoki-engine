@@ -1,7 +1,9 @@
 /** SHA-256 of the UTF-8 encoding of a string, hex-encoded lowercase (#469).
  *
- *  This is the CLIENT half of the `ifMatch` precondition on `POST /api/write-file`
- *  (`editorBackendRouter.ts`): the server hashes the raw file bytes with Node's
+ *  This is the CLIENT half of the `ifMatch` precondition on `POST /api/asset-write`
+ *  (`editorBackendRouter.ts`) — the only route a client actually threads `ifMatch` through
+ *  today (`atlasPersist.ts`); `/api/write-file` carries the same precondition server-side
+ *  but no client caller passes it yet (#835). The server hashes the raw file bytes with Node's
  *  `crypto.createHash('sha256')`, and both sides must agree on the same bytes for the
  *  same content, or every conditional write reports a spurious conflict. Kept here —
  *  not inlined in one panel — so any future conditional-write caller hashes the same

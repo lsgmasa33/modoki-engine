@@ -17,7 +17,7 @@ import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
-  isUnderAssetRoot,
+  isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
   otaPublishBundleNameAllowed, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
@@ -232,6 +232,87 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
     for (const { type, sample, kind } of CACHED_ASSET_TYPES) {
       expect(classifySceneChange(sample), `${type} must broadcast a cache-invalidation kind`).toBe(kind);
     }
+  });
+});
+
+/** The watcher's shader-BODY remap (#857): editing the `.glsl`/`.wgsl` file an author
+ *  actually iterates on (`ShaderAssetView.tsx` tells them to edit it) used to broadcast
+ *  NOTHING, because `onChange` gated the whole `modoki:scene-changed` path on the changed
+ *  file's own extension being `.json`. `pathToClassifyForChange` is the extracted piece of
+ *  `onChange` that decides which path to classify — the file itself for `.json`, or the
+ *  sibling `.shader.json` descriptor for a body (when it exists on disk) — tested directly
+ *  per this file's own module doc, since the surrounding Vite plugin/watcher wiring isn't
+ *  testable without a mocked server. */
+describe('pathToClassifyForChange (shader body → descriptor remap, #857)', () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-shader-remap-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('a .glsl body with a sibling descriptor remaps to the descriptor, classified as shader', () => {
+    const manifestPath = path.join(tmpDir, 'holo.shader.json');
+    const bodyPath = path.join(tmpDir, 'holo.glsl');
+    fs.writeFileSync(manifestPath, '{"params":{}}');
+    fs.writeFileSync(bodyPath, 'vec4 main() { return vec4(1.0); }');
+
+    const target = pathToClassifyForChange(bodyPath);
+    expect(target).toBe(manifestPath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('shader');
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: tmpDir }];
+    expect(absToAssetUrl(target!, roots)).toBe('/games/x/assets/holo.shader.json');
+  });
+
+  it('same for a .wgsl body', () => {
+    const manifestPath = path.join(tmpDir, 'holo.shader.json');
+    const bodyPath = path.join(tmpDir, 'holo.wgsl');
+    fs.writeFileSync(manifestPath, '{"params":{}}');
+    fs.writeFileSync(bodyPath, 'fn main() -> vec4<f32> { return vec4<f32>(1.0); }');
+
+    const target = pathToClassifyForChange(bodyPath);
+    expect(target).toBe(manifestPath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('shader');
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: tmpDir }];
+    expect(absToAssetUrl(target!, roots)).toBe('/games/x/assets/holo.shader.json');
+  });
+
+  it('a .glsl body with NO sibling descriptor yields no target — not a shader change', () => {
+    const bodyPath = path.join(tmpDir, 'orphan.glsl');
+    fs.writeFileSync(bodyPath, 'vec4 main() { return vec4(1.0); }');
+    expect(pathToClassifyForChange(bodyPath)).toBeNull();
+  });
+
+  it('leaves .json changes unaffected — a .scene.json still classifies as scene', () => {
+    const scenePath = path.join(tmpDir, 'main.scene.json');
+    fs.writeFileSync(scenePath, '{"entities":[]}');
+    const target = pathToClassifyForChange(scenePath);
+    expect(target).toBe(scenePath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('scene');
+  });
+});
+
+describe('absToAssetUrl \u2014 NFC normalization (#857)', () => {
+  it("normalizes an NFD-decomposed path to NFC, matching scanDir's own normalization", () => {
+    // '\u00e9' as NFD (bare 'e' U+0065 + combining acute accent U+0301, TWO codepoints) vs
+    // NFC (single precomposed U+00E9 codepoint, ONE codepoint) -- macOS stores non-ASCII
+    // filenames as NFD on disk. Built from explicit \u escapes (not a literal accented
+    // character in the source) so the byte sequence can't be silently re-normalized by an
+    // editor/tool somewhere in the authoring pipeline.
+    const nfd = 'caf\u0065\u0301.glsl'; // c, a, f, e, COMBINING ACUTE ACCENT
+    const nfc = 'caf\u00e9.glsl'; // c, a, f, LATIN SMALL LETTER E WITH ACUTE
+    // Guard: if this ever ran on a system that handed us NFC already, the rest of the test
+    // would pass by accident.
+    expect(nfd).not.toBe(nfc);
+    expect(nfd.normalize('NFC')).toBe(nfc);
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: '/project/assets' }];
+    const url = absToAssetUrl(path.join('/project/assets', nfd), roots);
+    expect(url).toBe(`/games/x/assets/${nfc}`);
+    expect(url).not.toBe(`/games/x/assets/${nfd}`);
   });
 });
 
@@ -1465,3 +1546,33 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
   });
 });
 
+
+
+describe('isSiblingRaisedChange — a body write must not discard the descriptor\'s parked edit (#857 close-out)', () => {
+  const DESC = '/games/g/assets/shaders/holo.shader.json';
+  const BODY = '/games/g/assets/shaders/holo.wgsl';
+
+  it('a body write is sibling-raised, so the parked descriptor edit survives', () => {
+    expect(isSiblingRaisedChange(BODY, DESC, undefined)).toBe(true);
+  });
+
+  it('a write to the descriptor itself is NOT sibling-raised — disk really is authoritative', () => {
+    expect(isSiblingRaisedChange(DESC, DESC, undefined)).toBe(false);
+  });
+
+  it('a direct descriptor write ANYWHERE in the debounce window wins over earlier body writes', () => {
+    // foo.wgsl, then foo.glsl, then foo.shader.json — all collapse onto ONE urlPath. The parked
+    // edit IS stale after that last one, so the AND must fall to false and stay there.
+    let flag = isSiblingRaisedChange(BODY, DESC, undefined);
+    expect(flag).toBe(true);
+    flag = isSiblingRaisedChange('/games/g/assets/shaders/holo.glsl', DESC, flag);
+    expect(flag, 'two body writes are still sibling-raised').toBe(true);
+    flag = isSiblingRaisedChange(DESC, DESC, flag);
+    expect(flag, 'the direct write flips it').toBe(false);
+  });
+
+  it('once flipped by a direct write, a later body write in the same window cannot flip it back', () => {
+    const afterDirect = isSiblingRaisedChange(DESC, DESC, undefined);
+    expect(isSiblingRaisedChange(BODY, DESC, afterDirect)).toBe(false);
+  });
+});

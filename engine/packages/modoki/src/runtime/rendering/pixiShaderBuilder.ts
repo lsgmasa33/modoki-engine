@@ -52,7 +52,7 @@ import {
 } from 'pixi.js';
 import { resolvePixiBackend } from './canvas2DPool';
 import {
-  coerceParamValue, mergeParamDefaults, shaderSpace,
+  coerceParamValue, mergeParamDefaults, shaderSpace, shaderBodyPath,
   type ShaderParam, type ShaderParamType, type ShaderManifest, type ShaderParamSchema,
 } from '../core/shaderSchema';
 import { assetPlumbing } from '../core/assetPlumbing';
@@ -206,11 +206,6 @@ export interface PixiShaderProgram {
   /** `texture` params (extra samplers) in binding order — each needs a bound Texture
    *  in {@link makePixiShaderInstance}. */
   textureParams: [string, ShaderParam][];
-}
-
-/** Derive the sibling body path from a `.shader.json` manifest path. */
-function variantPath(manifestPath: string, ext: 'wgsl' | 'glsl'): string {
-  return manifestPath.replace(/\.shader\.json$/i, `.${ext}`);
 }
 
 // Program cache (fixes #716; re-keyed on CONTENT in the #716 close-out review) — mirrors
@@ -372,7 +367,7 @@ async function fetchPixiShaderSource(manifestPath: string, webgpu: boolean): Pro
   // `buildPixiShaderProgram`'s comment.
   const ext: 'wgsl' | 'glsl' = webgpu ? 'wgsl' : 'glsl';
   const plumbing = assetPlumbing.get();
-  const bodyRes = plumbing ? await fetch(plumbing.assetUrl(variantPath(manifestPath, ext)), plumbing.fetchInit).catch(() => null) : null;
+  const bodyRes = plumbing ? await fetch(plumbing.assetUrl(shaderBodyPath(manifestPath, ext)), plumbing.fetchInit).catch(() => null) : null;
   const body = bodyRes?.ok ? (await bodyRes.text()).trim() : '';
   if (!body) {
     console.warn(`[pixiShader] ${manifestPath}: missing ${ext.toUpperCase()} body for the active backend — falling back to the default sprite shader.`);

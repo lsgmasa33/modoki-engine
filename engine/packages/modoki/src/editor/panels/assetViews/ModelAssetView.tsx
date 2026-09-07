@@ -7,7 +7,7 @@
  *      → refreshAssets + invalidateModel. */
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody, postWriteFile } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { importModel } from '../../scene/modelImport';
 import { glbDeclaresSkin } from '../../scene/rigBones';
@@ -23,9 +23,10 @@ import { newGuid } from '../../../runtime/core/assetRefRules';
 import { decimateMesh, buildCollisionGLB, bytesToBase64, mergeModelGeometry } from '../../scene/collisionMeshGen';
 import { inputStyle, BufferedNumberInput } from '../fields';
 import { ModelPreview } from '../ModelPreview';
-import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
-import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -91,16 +92,20 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
   // once via this epoch. Harmless: one coalesced call returning the same bytes.
   const reimportEpoch = useAssetInvalidationEpoch('model', (_p, targets) => targets.has(path));
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    setSettings(resolveModelSettings(m as { model?: Partial<ModelImportSettings> }));
+    setTexSettings(resolveTextureSettings(m as Parameters<typeof resolveTextureSettings>[0]));
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        setSettings(resolveModelSettings(m as { model?: Partial<ModelImportSettings> }));
-        setTexSettings(resolveTextureSettings(m as Parameters<typeof resolveTextureSettings>[0]));
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a settings edit here is PARKED, so disk still holds
+    // the PRE-edit doc until Cmd+S. `apply` flushes this path before it reimports, so by the time
+    // this runs after one, nothing is parked here and this falls through to a fresh read.
+    return readMetaPreferringPark(path, { signal, reimportEpoch })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path, reimportEpoch]);
+  }, [path, reimportEpoch, applyMeta]);
 
   // Probe whether the model's prefab exists on disk — drives the button label
   // (Import when missing, Re-import when present). Re-runs after import so the
@@ -140,7 +145,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       }
       const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -153,7 +158,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const next = { ...prev, ...patch };
       const updatedMeta = { ...(meta ?? {}), texture: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -166,7 +171,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const next: ModelImportSettings = { ...prev, lodRatios: ratios, lodDistances: dists };
       const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -178,7 +183,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       const next: ModelImportSettings = { ...prev, lodEncoders: encoders };
       const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -194,7 +199,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
         : { ...prev, lodAggressive: arr };
       const updatedMeta = { ...(meta ?? {}), model: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -203,6 +208,10 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
     setImporting(true);
     setImportStatus(true, `Importing ${name}...`);
     try {
+      // #845: Stage A/B below reads LOD ratios/encoder + texture-compression settings off DISK —
+      // flush any still-parked edit first, or the bake would run against the OLD settings while
+      // the UI already shows the new ones.
+      await flushPendingMetaFor(path);
       // 1. Server-side bake (Stage A fixups + Stage B LOD simplification).
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -250,10 +259,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
                 if (existing && Array.isArray(existing.entities)) prefab = mergeRiggedPrefab(prefab, existing);
               }
               if (prefab) {
-                await backendFetch('/api/write-file', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ path: prefabPath, content: JSON.stringify(prefab, null, 2) }),
-                });
+                await writeAssetFile(prefabPath, jsonFileBody(prefab));
                 // Refresh the editor cache to the just-written prefab AND evict the
                 // runtime refcounted prefab cache (meshTemplateCache) — otherwise the
                 // NEXT scene load / Play→Stop revert re-expands the STALE cached copy
@@ -298,7 +304,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
     const rig = (meta?.rig as Record<string, unknown> | undefined) ?? {};
     const updatedMeta = { ...(meta ?? {}), rig: { ...rig, expandSkeleton: on } };
     setMeta(updatedMeta);
-    writeMetaOrWarn(path, updatedMeta);
+    parkMetaEdit(path, updatedMeta);
   }, [meta, path]);
 
   const labelStyle: React.CSSProperties = { flex: 1, color: '#888', fontSize: '11px' };
@@ -559,17 +565,16 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
       const meshGuid = newGuid();
 
       const glb = buildCollisionGLB(dec.positions, dec.normals, dec.indices, meshName);
-      const post = (p: string, content: string, encoding?: string) => backendFetch('/api/write-file', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: p, content, encoding }),
-      });
       // Ordering + response-checking live in collisionMeshWrite.ts (#784 phase C2b item 5), which
       // is unit-tested — a `.tsx` carries no tests of its own (CLAUDE.md § Panels). The
       // `.meta.json` write itself stays HERE, inline, as an object literal (not threaded through
-      // as data) — see collisionMeshWrite.ts's header for why.
+      // as data) — see collisionMeshWrite.ts's header for why. `postWriteFile` is the ONE client
+      // /api/write-file wrapper (#835) — collisionMeshWrite.ts composes the `.mesh.json` JSON
+      // body itself (`jsonFileBody`) before handing it to `post`, so this is a raw passthrough,
+      // not a second place that stringifies a document.
       await writeCollisionMeshAssets(
         { glbPath, glbBase64: bytesToBase64(glb), meshJsonPath, meshName, modelGuid, meshGuid },
-        { post, registerAsset },
+        { post: postWriteFile, registerAsset },
         () => backendFetch('/api/write-meta', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: glbPath, meta: { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } } }),

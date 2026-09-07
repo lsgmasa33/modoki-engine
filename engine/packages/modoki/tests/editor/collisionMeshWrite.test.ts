@@ -87,4 +87,17 @@ describe('writeCollisionMeshAssets', () => {
     const written = JSON.parse(meshWriteCall[1] as string);
     expect(typeof written.version).toBe('number');
   });
+
+  it('the .mesh.json write ends in a trailing newline — jsonFileBody, not a parsed round-trip (#835)', async () => {
+    // Byte assertion, not JSON.parse: a parse succeeds identically with or without the
+    // newline, which is exactly how this write's missing newline went unnoticed before #835.
+    const deps = makeDeps();
+    await writeCollisionMeshAssets(INPUT, deps, noopWriteMeta);
+    const meshWriteCall = (deps.post as ReturnType<typeof vi.fn>).mock.calls.find(([p]) => p === INPUT.meshJsonPath)!;
+    const body = meshWriteCall[1] as string;
+    expect(body.endsWith('\n')).toBe(true);
+    // And the GLB (binary base64) write on the same deps must NOT gain one — it isn't JSON.
+    const glbWriteCall = (deps.post as ReturnType<typeof vi.fn>).mock.calls.find(([p]) => p === INPUT.glbPath)!;
+    expect(glbWriteCall[1]).toBe(INPUT.glbBase64);
+  });
 });

@@ -29,11 +29,14 @@ const providers = new Map<string, FontProvider>();                   // guid →
 const loadPromises = new Map<string, Promise<FontProvider | null>>(); // guid → in-flight load
 const owners = new Map<string, Set<SceneId>>();                      // guid → owning scenes
 const unknownSeen = new Set<string>();                               // warn-once for bad guids
-// Teardown liveness — no per-key epoch: invalidated wholesale whenever ANY font is
-// released/disposed (invalidateFont, releaseFontsForScene, disposeAllFonts). An in-flight acquire
-// captures it and refuses to cache its result if it changed (or the owner vanished) — otherwise a
-// fetch that resolves AFTER its scene was released re-inserts an owner-less provider that
-// releaseFontsForScene can never reclaim (leak). Mirrors audioBufferCache's liveness guard.
+// Teardown liveness — PER-KEY (#856): invalidateFont and releaseFontsForScene's per-guid drop each
+// invalidate only THAT guid's key, so an unrelated font's in-flight acquire started around the same
+// time is not superseded. This matters because `ensureFontLoaded` is called per frame from
+// `Scene2D.tsx` and `scene3DSync.ts`, so a live unrelated acquire genuinely can be in flight at a
+// scene swap. An in-flight acquire captures its own guid's key and refuses to cache its result if
+// it changed (or the owner vanished) — otherwise a fetch that resolves AFTER its scene was released
+// re-inserts an owner-less provider that releaseFontsForScene can never reclaim (leak). Full
+// teardown (`disposeAllFonts`) still invalidates wholesale. Mirrors audioBufferCache's liveness guard.
 const liveness = createTeardownToken();
 
 function addOwner(guid: string, sceneId: SceneId): void {
@@ -90,7 +93,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
   // actually breaks the font then produces no console line at all.
   unknownSeen.delete(guid);
 
-  const stillLive = liveness.capture();
+  const stillLive = liveness.capture(guid);
   const promise = (async (): Promise<FontProvider | null> => {
     try {
       // Dynamic (path B): generate glyphs at runtime from real outlines — the pinned
@@ -182,7 +185,7 @@ export function invalidateFont(guid: string): void {
   if (p) p.dispose();
   providers.delete(guid);
   loadPromises.delete(guid);
-  liveness.invalidateAll();
+  liveness.invalidateKey(guid);
   markTextDirty(guid);
 }
 // Re-acquire on any Font-Inspector mode flip or re-bake (no editor restart needed).
@@ -200,7 +203,7 @@ export function releaseFontsForScene(sceneId: SceneId): void {
       providers.get(guid)?.dispose();
       providers.delete(guid);
       loadPromises.delete(guid);
-      liveness.invalidateAll(); // invalidate any in-flight acquire for this guid
+      liveness.invalidateKey(guid); // invalidate any in-flight acquire for this guid
     }
   }
 }

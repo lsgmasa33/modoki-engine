@@ -11,7 +11,7 @@ import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -31,6 +31,7 @@ import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
+import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
 
 // ── Types ───────────────────────────────────────────────
@@ -749,16 +750,6 @@ export function setCurrentScenePath(path: string | null) {
   }
 }
 
-async function writeFileToServer(filePath: string, content: string): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
-
 /** Save scene to the current path (via the backend write-file API).
  *  If no path is set yet (first save / Save As), asks for a name and writes the
  *  scene into the project's scenes folder via the backend. */
@@ -803,7 +794,7 @@ export function markSceneSaved(atEditVersion?: number): void {
  *  human's work believing there was none. */
 export function hasUnsavedChanges(): boolean {
   return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0
-    || hasPendingBaseScenes();
+    || hasPendingBaseScenes() || hasPendingMeta();
 }
 
 /** WHICH kind of unsaved work exists — the three independent causes above, told apart.
@@ -821,6 +812,7 @@ export function hasUnsavedChanges(): boolean {
  *  no cause at all. */
 export function unsavedChangeCauses(): {
   sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[]; pendingBaseScenes: string[];
+  pendingImportSettings: string[];
 } {
   return {
     sceneDirty: getEditVersion() !== _savedAtEditVersion,
@@ -830,6 +822,11 @@ export function unsavedChangeCauses(): {
     // NOT the open one. It is neither a live-world edit nor an asset document, so without its own
     // row a refusal triggered by it alone would name no cause at all — the S3.11 failure again.
     pendingBaseScenes: getPendingBaseScenePaths(),
+    // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
+    // instead of written immediately. Named for what a human reads in a banner ("unsaved import
+    // settings") — matching the Inspector section's own label — not for the sidecar's file
+    // extension, which means nothing to the reader of that banner.
+    pendingImportSettings: getPendingMetaPaths(),
   };
 }
 
@@ -867,6 +864,12 @@ export interface SaveResult {
    *  outcome and the caller has to be able to say so (#259). Never report a bare failure over a
    *  result that carries `assets.saved` — that is the C7 lie with the roles reversed. */
   assets?: FlushResult;
+  /** Parked `.meta.json` import-settings edits (Inspector, #845) flushed by this save, if any.
+   *
+   *  Separate from `assets` for the same reason `baseScenes` is: a sidecar is not an
+   *  `ASSET_SCHEMA_TYPES` document, so it does not go through `/api/asset-write`. Present on a
+   *  FAILED result too — this flush is unconditional, same as the asset flush above. */
+  importSettings?: MetaFlushResult;
 }
 
 export async function saveScene(opts: {
@@ -917,7 +920,7 @@ export async function saveScene(opts: {
   // Saving is the authored write that persists identity — commit minted guids
   // to the live world so subsequent refs resolve and the next save is stable.
   const scene = await serializeScene({ assignGuids: true });
-  const content = JSON.stringify(scene, null, 2);
+  const content = jsonFileBody(scene);
   // The version `content` actually represents. Captured HERE — after serializeScene, which mints
   // guids into the live world and so moves the version itself, and before the disk write, which is
   // the deferral an edit can land inside. Every `markSceneSaved` below is handed this rather than
@@ -927,7 +930,7 @@ export async function saveScene(opts: {
   const knownPath = explicitPath || _currentScenePath;
   if (knownPath) {
     // Save to known path via dev server
-    const ok = await writeFileToServer(knownPath, content);
+    const ok = await writeAssetFile(knownPath, content);
     if (ok) {
       // scene.id is always populated by serializeScene (required field).
       registerAsset(scene.id, knownPath, 'scene');
@@ -958,7 +961,7 @@ export async function saveScene(opts: {
     prompt: 'Save Scene As',
   });
   if (!target) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
-  const ok = await writeFileToServer(target, content);
+  const ok = await writeAssetFile(target, content);
   if (ok) {
     registerAsset(scene.id, target, 'scene');
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
@@ -1243,8 +1246,15 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
   // four of those five are "the human pressed Cmd+S and nothing saved their edit".
   const assets = await flushDirtyAssets();
-  const withAssets = <T extends SaveResult>(r: T): T =>
-    (assets.saved.length || assets.failed.length ? { ...r, assets } : r);
+  // Alongside the asset flush — not before or after it in any load-bearing sense (#845). Unlike
+  // `/api/scene-mutate`, `/api/write-meta` carries no unsaved-work refusal, so this flush has none
+  // of `flushPendingBaseScenes`' "must run last" constraint below. See `pendingMeta.ts`'s header.
+  const importSettings = await flushPendingMeta();
+  const withAssets = <T extends SaveResult>(r: T): T => ({
+    ...r,
+    ...(assets.saved.length || assets.failed.length ? { assets } : {}),
+    ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}),
+  });
   const primaryResult = await saveScene(opts);
   // LAST, and deliberately so — `/api/scene-mutate` refuses while `hasUnsavedChanges()` is true,
   // and these entries are themselves part of that report. Run before the scene write and every
@@ -1289,7 +1299,7 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
       failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
       continue;
     }
-    const ok = await writeFileToServer(entry.path, JSON.stringify(sceneFile, null, 2));
+    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
     if (!ok) {
       console.error(`[Editor] Failed to save scene to ${entry.path}`);
       failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });

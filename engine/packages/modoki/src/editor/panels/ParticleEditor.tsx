@@ -8,7 +8,7 @@
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -420,7 +420,7 @@ export default function ParticleEditor() {
     if (!path) return;
     const guid = newGuid();
     const def = { ...defaultParticleEffect(), id: guid };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(def, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(def));
     if (!ok) return;
     // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
     // see it — so the file is authoritative: drop any parked write for that path, or the next save

@@ -9,7 +9,7 @@
  *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
@@ -997,7 +997,7 @@ export default function AnimationEditor() {
     if (!path) return;
     const guid = newGuid();
     const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(defaultAnimationClip(guid, name), null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(defaultAnimationClip(guid, name)));
     // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
     // is authoritative — drop any parked write for that path.
     if (ok) assetWrittenToDisk(path);

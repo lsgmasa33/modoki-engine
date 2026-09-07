@@ -14,7 +14,7 @@
  *  are follow-ups; bone POSING already lives in the SceneView. */
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -563,7 +563,7 @@ export default function SkinEditor() {
     if (!path) return;
     const guid = newGuid();
     const doc: Rig2DFile = { id: guid, ...defaultRig2DFile() };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(doc));
     if (!ok) return;
     assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park
     registerAsset(guid, path, 'rig2d');
@@ -598,7 +598,7 @@ export default function SkinEditor() {
     const rigGuid = newGuid();
     const rig = autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside });
     const rigPath = sel.path.replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.rig2d.json';
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rigPath, content: JSON.stringify(rig, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(rigPath, jsonFileBody(rig));
     if (!ok) return;
     // ⚠️ The one path where this REALLY matters: `rigPath` is DERIVED from the sprite, so
     // auto-rigging the same sprite twice regenerates over a rig that may already have unsaved

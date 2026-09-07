@@ -15,6 +15,7 @@ import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { serializePrefab, setPrefabCache, type PrefabFile } from './prefab';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
+import { jsonFileBody } from '../backend/editorBackend';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 import { reportUndoFailure } from '../undo/undoFailure';
 
@@ -79,7 +80,7 @@ export async function makeRigPrefabAsset(
   deleteEntity(rootId);
   if (!prefab) return null;
 
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   if (!(await writeAssetFile(savePath, content))) return null;
   const cacheKey = prefab.id ?? savePath;
   if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');

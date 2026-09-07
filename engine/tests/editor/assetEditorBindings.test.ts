@@ -19,6 +19,10 @@ import {
   markAssetDirty, clearDirtyAssets, getDirtyAssetPaths, peekDirtyAsset,
   flushDirtyAssets, getLastFlushedAssetHash, getLastFlushedAsset,
 } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import {
+  parkMetaEdit, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths, peekPendingMeta,
+  peekMetaBaseline,
+} from '../../packages/modoki/src/editor/scene/pendingMeta';
 
 const ANIM = '/assets/anim/walk.anim.json';
 const SEQ = '/assets/seq/intro.timeline.json';
@@ -254,6 +258,85 @@ describe('applyAssetPathMoves reaches the registry, not just the bindings', () =
     markAssetDirty(ANIM, 'animation', { duration: 3 }, 'panel');
     applyAssetPathMoves([{ from: ANIM, to }]);
     expect(getDirtyAssetPaths()).toEqual([to]);
+  });
+});
+
+
+/** The SECOND registry has to move with the first (#845 close-out).
+ *
+ *  ⚠️ This is a regression the parking commit would otherwise have shipped, not a pre-existing
+ *  gap: before `f85c6820f` every `.meta.json` edit wrote immediately, so no pending edit could
+ *  outlive its path. Now one can, and `pendingMeta` is keyed by ASSET path with nothing migrating
+ *  those keys — so a deleted asset's parked edit is a resurrection waiting for the next Cmd+S, and
+ *  `/api/write-meta` will happily perform it (`resolveAssetPath` is a roots/traversal guard with
+ *  no existence check).
+ *
+ *  Driven through `applyAssetPathMoves`, the real entry point, for the same reason the block above
+ *  is: the pure helper passes whether or not anything calls it. */
+describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => {
+  const PNG = '/assets/textures/rock.png';
+  beforeEach(() => { clearDirtyAssets(); clearPendingMeta(); clearMetaBaselines(); });
+  afterEach(() => { clearDirtyAssets(); clearPendingMeta(); clearMetaBaselines(); });
+
+  it('DROPS a parked meta edit when its asset is deleted — no orphan sidecar is resurrected', () => {
+    parkMetaEdit(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
+
+    const notes = applyAssetPathMoves([{ from: PNG, to: null }]);
+
+    expect(getPendingMetaPaths()).toEqual([]);
+    expect(notes.join(' ')).toContain(PNG);
+    expect(notes.join(' ')).toMatch(/import-settings/);
+  });
+
+  it('MOVES a parked meta edit when its asset is renamed — the edit follows, no orphan is written', () => {
+    const to = '/assets/textures/stone.png';
+    parkMetaEdit(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
+
+    applyAssetPathMoves([{ from: PNG, to }]);
+
+    expect(getPendingMetaPaths()).toEqual([to]);
+    expect(peekPendingMeta(to)).toEqual({ id: 'a-guid', texture: { maxSize: 512 } });
+    expect(peekPendingMeta(PNG), 'the old path must not still be parked').toBeUndefined();
+  });
+
+  /** ⚠️ The CAS baseline must FOLLOW the rename, not be dropped with the old key.
+   *
+   *  Main's #854 settled this for the sibling registry on the same day, and the reasoning transfers
+   *  exactly: dropping it turns the compare-and-swap off for the rest of the session, on a file the
+   *  human just renamed and is therefore actively working on — precisely the git-checkout hazard it
+   *  exists for. A rename moves the sidecar's bytes unchanged, so the old baseline is still a true
+   *  statement about the file under its new name.
+   *
+   *  My first version of this helper dropped it and argued in a comment that this was correct
+   *  ("unconditional-but-informed"). That is why the assertion is here and not just the comment. */
+  it('CARRIES the CAS baseline across a rename — dropping it would silently disarm the guard', () => {
+    const to = '/assets/textures/stone.png';
+    parkMetaEdit(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
+    expect(peekMetaBaseline(PNG)).toBe('BASELINE-SHA');   // positive control
+
+    applyAssetPathMoves([{ from: PNG, to }]);
+
+    expect(peekMetaBaseline(to)).toBe('BASELINE-SHA');
+    expect(peekMetaBaseline(PNG), 'the old key must not keep it either').toBeUndefined();
+  });
+
+  it('a DELETE drops the baseline with the park — there is no path left to describe', () => {
+    parkMetaEdit(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
+
+    applyAssetPathMoves([{ from: PNG, to: null }]);
+
+    expect(peekMetaBaseline(PNG)).toBeUndefined();
+  });
+
+  it('moves BOTH registries in one call, so neither can be forgotten', () => {
+    const to = '/assets/textures/stone.png';
+    markAssetDirty(ANIM, 'animation', { duration: 3 }, 'panel');
+    parkMetaEdit(PNG, { id: 'a-guid' });
+
+    applyAssetPathMoves([{ from: ANIM, to: null }, { from: PNG, to }]);
+
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(getPendingMetaPaths()).toEqual([to]);
   });
 });
 

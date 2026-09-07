@@ -2,7 +2,7 @@
 
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { backendFetch } from '../backend/editorBackend';
+import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -1621,12 +1621,9 @@ export async function writePrefabFile(source: string, prefab: PrefabFile): Promi
   // through resolveRef would trip its internal-path rejection.
   const path = isGuid(source) ? (resolveRef(source) || source) : source;
   registerAsset(prefab.id, path, 'prefab');
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content }),
-    });
+    const res = await postWriteFile(path, content);
     if (res.ok) {
       // Evict the runtime refcounted prefab cache so the NEXT scene load re-reads
       // the new file from disk. Without this, opening another scene that uses this

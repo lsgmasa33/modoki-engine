@@ -12,9 +12,19 @@
  *
  * Uses a gated `fetch` mock (same pattern as scene3DSyncMaterialOwnership.test.ts) so
  * the release can be interleaved between the fetch call and its resolution.
+ *
+ * ⚠️ #863 changed HOW the material test below closes: `releaseMaterialByPath` (called by
+ * `releaseAllForScene` on last release) has always called `invalidateMaterial`, and #863 gave
+ * `fetchMaterial` its own PER-KEY liveness capture — so that `invalidateMaterial` call now also
+ * refuses the in-flight fetch's own liveness check, and `fetchMaterial` disposes the result
+ * directly (never writing it to `materialCache`) before `acquireMaterial`'s post-await guard
+ * below even runs. Before #863, `fetchMaterial` could not see that mid-flight invalidate at all
+ * (its capture was keyless, invalidated only by a FULL teardown), so it wrote an ownerless entry
+ * that THIS function's guard then retired — see the updated assertion for the new shape.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as THREE from 'three';
 import { clearManifest, registerAsset } from '../../src/runtime/loaders/assetManifest';
 import {
   acquireMaterial, acquirePrefab, releaseAllForScene, getResourceStats,
@@ -57,27 +67,35 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Restore here, not at the end of a test body: a spy on THREE.Material.prototype installed by a
+  // test that then FAILS never reaches an in-body mockRestore, and survives into every later test
+  // in this file, making their dispose counts nonsense. Observed while mutation-checking #863 in
+  // the sibling materialInvalidationRetires suite.
+  vi.restoreAllMocks();
   disposeAllCachedResources();
   clearManifest();
   vi.unstubAllGlobals();
 });
 
 describe('acquireMaterial — post-await release guard (#520)', () => {
-  it('retires the material and drops it from materialCache when releaseAllForScene lands inside the fetch', async () => {
+  it('discards the material outright (never cached, so nothing to retire) when releaseAllForScene invalidates it mid-fetch', async () => {
     expect(retiredMaterials3D().size, 'sanity — nothing retired yet').toBe(0);
+    const disposeSpy = vi.spyOn(THREE.Material.prototype, 'dispose');
 
     const p = acquireMaterial(1, MAT_GUID);
     await Promise.resolve(); // let acquireMaterial reach the fetch/gate
-    releaseAllForScene(1); // lands inside the load, before the owner is consumed
+    releaseAllForScene(1); // lands inside the load, before the owner is consumed — and (#863)
+    // also invalidates the in-flight fetch's OWN per-key liveness capture via releaseMaterialByPath's invalidateMaterial call.
     gateFor(MAT_PATH).release();
     await p;
 
     // Ownerless: not counted in the refcount map.
     expect(getResourceStats().materials[MAT_PATH]).toBeUndefined();
-    // And RETIRED (#317's rule), not left live+ownerless in materialCache — deliberately
-    // checked without calling resolveMaterial(), which would itself kick off a fresh
-    // (unawaited, dangling) fetch now that the cache entry is gone.
-    expect(retiredMaterials3D().size, 'the re-seated instance must be retired, not orphaned').toBe(1);
+    // #863: `fetchMaterial`'s own liveness guard now catches this BEFORE the material is ever
+    // written to `materialCache`, so there is nothing left for `acquireMaterial`'s post-await
+    // guard to retire — it is disposed directly instead (still freed, never leaked).
+    expect(retiredMaterials3D().size, 'never cached — nothing to retire').toBe(0);
+    expect(disposeSpy, 'the re-seated instance must still be freed, just earlier and more directly').toHaveBeenCalled();
   });
 
   it('keeps the material when a second live scene shares the in-flight load', async () => {

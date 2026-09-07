@@ -38,6 +38,7 @@ import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
 import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
+import { shaderManifestPathForBody } from '../packages/modoki/src/runtime/core/shaderSchema';
 import {
   readMetaSidecar,
   assertSidecarWritable,
@@ -536,6 +537,50 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   if (type === 'shader') return 'shader';
   if (type === 'scene') return 'scene';
   return null;
+}
+
+/** For a changed file under an asset root, resolve the path `onChange` should actually
+ *  classify: the file itself for `.json`; for a shader BODY (`.glsl`/`.wgsl`) — deliberately
+ *  NOT a manifest asset itself (`assetTypeClassifier.ts`), but the file `ShaderAssetView.tsx`
+ *  tells authors to edit — its sibling `.shader.json` descriptor, PROVIDED that descriptor
+ *  exists on disk (a body with no descriptor is not a shader change). Returns null for a
+ *  body with no descriptor, or for a change to anything else — `onChange`'s
+ *  `scheduleRebuild()` still runs unconditionally in that case; only the classify + broadcast
+ *  are gated on this. (#857)
+ *
+ *  Pure aside from the fs check, so — per this file's own module doc — it's exported and
+ *  tested directly rather than through a mocked Vite server. */
+export function pathToClassifyForChange(file: string): string | null {
+  if (path.extname(file).toLowerCase() === '.json') return file;
+  const manifestPath = shaderManifestPathForBody(file);
+  return manifestPath && fs.existsSync(manifestPath) ? manifestPath : null;
+}
+
+/** Did THIS broadcast's urlPath get raised by a write to a SIBLING rather than to its own file?
+ *  Today the only such case is a `.glsl`/`.wgsl` shader body remapped to its `.shader.json`
+ *  descriptor (#857).
+ *
+ *  It matters downstream, not here: `agentBridge`'s `dropParkedWriteFor` discards an unsaved
+ *  parked Inspector edit on the grounds that "the file on disk is now authoritative". That is true
+ *  when the descriptor itself was rewritten and FALSE when only its body sibling was — and
+ *  discarding then throws away exactly the edit the author is iterating on (declare a uniform in
+ *  the Shader Inspector, save the `.wgsl` you added it to, lose the declaration), which is the very
+ *  loop #857 exists to enable.
+ *
+ *  `prev` is the flag already accumulated for this urlPath in the current debounce window, and the
+ *  rule is an AND: a DIRECT write to the descriptor anywhere in the window makes the drop correct
+ *  again, so it wins. Absent `prev` (the first change in the window) starts permissive.
+ *
+ *  ⚠️ Lives here, called by BOTH watchers, deliberately. The Vite plugin and
+ *  `engine/electron/assetBackend.ts` have drifted four times, every time through a rule one of
+ *  them re-implemented — the classifier, then the extension gate. This is that rule's third
+ *  chance to become a fifth drift, and it does not get one. */
+export function isSiblingRaisedChange(
+  changedFile: string,
+  classifiedTarget: string,
+  prev: boolean | undefined,
+): boolean {
+  return classifiedTarget !== changedFile && (prev ?? true);
 }
 
 /** True if `url` targets one of the SSE routes (which own their own streaming
@@ -1242,7 +1287,11 @@ export function absToAssetUrl(absPath: string, roots: AssetRoot[]): string | nul
   for (const root of roots) {
     const rel = path.relative(root.absDir, absPath);
     if (rel === '' || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) continue;
-    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/');
+    // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
+    // filename with non-ASCII characters is stored NFD on disk, and without this the two
+    // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
+    // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
+    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
   }
   return null;
 }
@@ -1418,7 +1467,7 @@ export function assetScannerPlugin(): Plugin {
       if (isGameCodeFile(ctx.file, gameCodeRoot, assetRoots)) {
         if (viteServer) {
           // The RENDERER decides whether to reload now or surface a banner — an
-          // unconditional reload would silently destroy unsaved scene edits (there is no
+          // unconditional reload would silently destroy unsaved work of any kind (#850 — there is no
           // beforeunload guard anywhere). See app/debug/hmrStaleness.ts.
           try { viteServer.ws.send({ type: 'custom', event: 'modoki:game-code-changed', data: { file: ctx.file } }); }
           catch { /* ws not ready */ }
@@ -1428,7 +1477,7 @@ export function assetScannerPlugin(): Plugin {
       // Engine SHADER GRAPH (postfx/npr TSL): same "only a reload can apply this" situation as
       // game code, for a different reason — the old node graph is already baked into a compiled
       // pipeline. Reuses the SAME renderer-decides handshake, so a shader edit can't silently
-      // destroy unsaved scene edits either. See isShaderGraphFile + app/debug/hmrStaleness.ts.
+      // destroy unsaved work either. See isShaderGraphFile + app/debug/hmrStaleness.ts.
       if (isShaderGraphFile(ctx.file)) {
         if (viteServer) {
           try { viteServer.ws.send({ type: 'custom', event: 'modoki:shader-code-changed', data: { file: ctx.file } }); }
@@ -1518,15 +1567,22 @@ export function assetScannerPlugin(): Plugin {
       let pendingRebuild: NodeJS.Timeout | null = null;
       // Scene/prefab files edited since the last flush → broadcast to the browser
       // so it hot-reloads the active scene (app/debug/agentBridge.ts).
-      const pendingSceneChanges = new Map<string, LiveReloadKind>();
+      // `viaSibling` = this urlPath's OWN file did not change; a SIBLING did (today: a
+      // `.glsl`/`.wgsl` body remapped to its `.shader.json` descriptor, #857). The consumer needs
+      // it because `dropParkedWriteFor` discards an unsaved parked edit on the grounds that "the
+      // file on disk is now authoritative" — true when the descriptor itself was rewritten, FALSE
+      // when only its body sibling was, and discarding then throws away exactly the Inspector edit
+      // the author was iterating on. Collapsing several changes in one debounce window ANDs the
+      // flag, so a direct write to the descriptor in the same window wins and the drop still happens.
+      const pendingSceneChanges = new Map<string, { kind: LiveReloadKind; viaSibling: boolean }>();
       const flushPending = () => {
         pendingRebuild = null;
         rebuildManifest();
         // Broadcast after the manifest rebuild so guid→path changes are already
         // live on the client before it re-loads the scene.
         if (pendingSceneChanges.size && viteServer) {
-          for (const [urlPath, kind] of pendingSceneChanges) {
-            try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind } }); }
+          for (const [urlPath, { kind, viaSibling }] of pendingSceneChanges) {
+            try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind, viaSibling } }); }
             catch { /* ws not ready */ }
           }
           pendingSceneChanges.clear();
@@ -1541,15 +1597,29 @@ export function assetScannerPlugin(): Plugin {
         if (!isUnderAssetRoot(file, assetRoots)) return;
         // Classify via the same detector the scanner uses — new scenes are
         // `.scene.json`; a plain `.json` under a `scenes/` dir is the legacy fallback (#54).
-        if (path.extname(file).toLowerCase() === '.json' && !isEditorWrite(file, () => hashFileSync(file))) {
-          const rel = file.split(path.sep).join('/');
+        // A shader BODY (.glsl/.wgsl) is the file an author actually edits, so it remaps to
+        // its sibling `.shader.json` descriptor before classifying (#857) — `target` is that
+        // descriptor for a body (when it exists on disk), the file itself for `.json`, or
+        // null for anything else (a body with no descriptor is not a shader change).
+        const target = pathToClassifyForChange(file);
+        // isEditorWrite is checked against `file` (the BODY actually written), never
+        // `target` (the remapped descriptor) — it's a content-hash guard, and hashing the
+        // wrong file would defeat it.
+        if (target && !isEditorWrite(file, () => hashFileSync(file))) {
+          const rel = target.split(path.sep).join('/');
           // classifySceneChange just forwards detectType's verdict for 'scene' now that
           // the catch-all is gone (#54) — every 'scene' is positively identified (suffix
           // or legacy /scenes/ dir), so no further gating is needed. 'prefab' always broadcasts.
           const kind = classifySceneChange(rel);
           if (kind) {
-            const urlPath = absToAssetUrl(file, assetRoots);
-            if (urlPath) pendingSceneChanges.set(urlPath, kind);
+            const urlPath = absToAssetUrl(target, assetRoots);
+            // Editing both `foo.glsl` and `foo.wgsl` inside one debounce window both remap to
+            // the SAME descriptor path, so `pendingSceneChanges` (keyed by urlPath) collapses
+            // them into ONE broadcast for `foo.shader.json` — intended.
+            if (urlPath) {
+              const viaSibling = isSiblingRaisedChange(file, target, pendingSceneChanges.get(urlPath)?.viaSibling);
+              pendingSceneChanges.set(urlPath, { kind, viaSibling });
+            }
           }
         }
         scheduleRebuild();

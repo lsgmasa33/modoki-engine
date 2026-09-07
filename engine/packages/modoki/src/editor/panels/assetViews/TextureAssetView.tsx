@@ -1,7 +1,7 @@
 /** TextureAssetView (+ TextureImportedStats) — texture import settings editor +
  *  Apply (convert) action. Extracted from Inspector.tsx (editor-inspector.md F2).
- *  Settings persist to the texture's .meta.json on change; Apply runs the
- *  conversion + reloads. */
+ *  Settings PARK to the texture's .meta.json on change (#845 — Cmd+S is the write);
+ *  Apply runs the conversion + reloads. */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
@@ -12,10 +12,11 @@ import { registerSprite, isGuid, deriveGuid } from '../../../runtime/loaders/ass
 import { markUIDirty } from '../../../runtime/ui/uiTreeStore';
 import { inputStyle, BufferedNumberInput, MIXED_PLACEHOLDER } from '../fields';
 import { withCurrentValue } from './importSettingOptions';
-import { DropdownField, SubSection, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { DropdownField, SubSection, formatBytes, reimportBtnStyle } from './widgets';
 import { SpriteEditor } from '../SpriteEditor';
 import { NineSliceEditor } from '../NineSliceEditor';
-import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -215,17 +216,24 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   // readout. Same dep placement + double-read note as ModelAssetView (#303).
   const reimportEpoch = useAssetInvalidationEpoch('texture', (p) => p === path);
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    setSettings(resolveTextureSettings(m as { type?: TextureType; texture?: Partial<TextureImportSettings> }));
+    setType(resolveTextureType(m as { type?: TextureType; texture?: Partial<TextureImportSettings> }));
+    setConverted(!!m.textureCache);
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        setSettings(resolveTextureSettings(m as { type?: TextureType; texture?: Partial<TextureImportSettings> }));
-        setType(resolveTextureType(m as { type?: TextureType; texture?: Partial<TextureImportSettings> }));
-        setConverted(!!m.textureCache);
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE. A settings edit here is PARKED, so between the edit
+    // and Cmd+S the file on disk still holds the PRE-edit doc — fetching it would re-seed this
+    // panel with the older settings while the newer ones are still queued to be written, which
+    // reads as the edit having been lost (mirrors AtlasAssetView's `pendingAssetDoc` check). Every
+    // re-import path flushes this path FIRST (see `apply` below, `reimportPaths`), so by the time
+    // this runs after one, nothing is parked here and this falls through to the fresh read.
+    return readMetaPreferringPark(path, { signal, reimportEpoch })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path, reimportEpoch]);
+  }, [path, reimportEpoch, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -233,14 +241,14 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
     return () => ac.abort();
   }, [loadMeta]);
 
-  // Persist a settings change to the meta sidecar immediately (controls are
-  // discrete, so no debounce needed). The full meta is preserved (id/textureCache).
+  // Persist a settings change to the meta sidecar — PARKED, not written immediately (#845). The
+  // full meta is preserved (id/textureCache); Cmd+S is the write.
   const update = useCallback((patch: Partial<TextureImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
       const updatedMeta = { ...(meta ?? {}), type, texture: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path, type]);
@@ -258,7 +266,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       const nextB = { l: merged.l, r: merged.r, t: merged.t, b: merged.b,
         ...(merged.scale !== 1 ? { scale: merged.scale } : {}) };
       const updatedMeta: Record<string, unknown> = { ...(prev ?? {}), border: nextB };
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       // Live-apply to the texture's auto whole-image sprite so the scene view reflects
       // border/edge-scale edits immediately (without a re-import/rescan) — same path
       // the visual 9-slice editor uses.
@@ -285,13 +293,17 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
     setSettings(next);
     const updatedMeta = { ...(meta ?? {}), type: nextType, texture: next };
     setMeta(updatedMeta);
-    writeMetaOrWarn(path, updatedMeta);
+    parkMetaEdit(path, updatedMeta);
   }, [meta, path]);
 
   const apply = useCallback(async () => {
     setImporting(true);
     setImportStatus(true, `Converting ${name}...`);
     try {
+      // #845: `/api/reimport` reads the settings off DISK, not out of this panel's state. A still-
+      // parked edit has not reached disk yet, so without this the conversion would bake the OLD
+      // settings while the UI already shows the new ones — see pendingMeta.ts's header.
+      await flushPendingMetaFor(path);
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),

@@ -28,9 +28,11 @@ const audioBufferCache = new Map<string, AudioBuffer>();
 const audioLoadPromises = new Map<string, Promise<void>>();
 const audioOwners = new Map<string, Set<SceneId>>();
 
-// Teardown liveness — no per-key epoch: BOTH invalidateAudio (a single clip's re-import) and
-// disposeAllAudioBuffers (full teardown) invalidate wholesale, so an in-flight fetch/decode that
-// resolves after either is dropped instead of re-populating a stale/dead cache.
+// Teardown liveness — PER-KEY (#856): invalidateAudio (a single clip's re-import) invalidates only
+// that clip's key, so an in-flight fetch/decode of an UNRELATED clip started around the same time
+// is not superseded and its result still gets installed. disposeAllAudioBuffers (full teardown)
+// still invalidates wholesale, so an in-flight fetch/decode that resolves after a teardown is
+// dropped instead of re-populating a dead cache.
 const audioLiveness = createTeardownToken();
 
 const unknownGuidSeen = new Set<string>();
@@ -124,7 +126,9 @@ export function invalidateAudio(ref: string): void {
   // Invalidate so an in-flight fetch/decode of the OLD bytes is discarded by
   // fetchAudioBuffer's `stillLive()` guard instead of racing the stale buffer back
   // into the cache after we clear it (same reason disposeAllAudioBuffers invalidates).
-  audioLiveness.invalidateAll();
+  // PER-KEY (#856): only THIS path's in-flight decode is superseded — an unrelated clip's
+  // concurrent fetch/decode must not be discarded just because a sibling was re-imported.
+  audioLiveness.invalidateKey(path);
   audioBufferCache.delete(path);
   audioLoadPromises.delete(path);
 }
@@ -188,7 +192,7 @@ function fetchAudioBuffer(path: string): Promise<void> {
   const ctx = getAudioContext();
   if (!ctx) return Promise.resolve(); // headless — owner registered, no decode
 
-  const stillLive = audioLiveness.capture();
+  const stillLive = audioLiveness.capture(path);
   const promise = (async () => {
     try {
       const bytes = await xhrAudioBytes(servedAudioUrl(path));

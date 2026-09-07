@@ -4,8 +4,9 @@
  *  <img> (the browser can't decode Radiance .hdr). We load it with three's
  *  HDRLoader, tonemap a downsampled copy onto a <canvas>, and expose an exposure
  *  slider so the user can preview how bright the map is. The Import section exposes
- *  per-asset settings (format `hdr`/`ultrahdr` + max size) written to the `.meta.json`
- *  sidecar and applied via re-import, mirroring `TextureAssetView`. */
+ *  per-asset settings (format `hdr`/`ultrahdr` + max size) PARKED to the `.meta.json`
+ *  sidecar (#845 — Cmd+S is the write) and applied via re-import, mirroring
+ *  `TextureAssetView`. */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
@@ -14,12 +15,13 @@ import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
-import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -54,16 +56,20 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
   const reimportEpoch = useAssetInvalidationEpoch('environment', (p) => p === path);
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    setSettings(resolveEnvSettings(m as { environment?: Partial<EnvImportSettings> }));
+    setConverted(!!m.environmentCache);
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        setSettings(resolveEnvSettings(m as { environment?: Partial<EnvImportSettings> }));
-        setConverted(!!m.environmentCache);
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a settings edit here is PARKED, so disk still holds
+    // the PRE-edit doc until Cmd+S. `apply` flushes this path before it reimports/re-writes, so by
+    // the time this runs after one, nothing is parked here and this falls through to a fresh read.
+    return readMetaPreferringPark(path, { signal, reimportEpoch })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path, reimportEpoch]);
+  }, [path, reimportEpoch, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -76,7 +82,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       const next = { ...prev, ...patch };
       const updatedMeta = { ...(meta ?? {}), environment: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -84,6 +90,11 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   const apply = useCallback(async () => {
     setImporting(true);
     try {
+      // #845: both branches below are about to read (the reimport route, off disk) or write (the
+      // ultrahdr route, a full-document merge) this sidecar — flush any still-parked settings edit
+      // first, or the branch would work from a stale doc and a leftover park would overwrite its
+      // own fresh write at the next Cmd+S. See pendingMeta.ts's header.
+      await flushPendingMetaFor(path);
       if (settings.format === 'ultrahdr') {
         // Browser-side gainmap encode (needs WebGL) → commit `~ultrahdr.jpg` next to
         // the source (the Node build can't regenerate it), then write the meta so the

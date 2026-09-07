@@ -34,14 +34,9 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT } from './assetFetch';
 import { sideOf } from './materialUtils';
 import { loadTexture3D } from './textureResolver';
-import { coerceParamValue, fetchShaderManifest, type ShaderParam } from './shaderSchema';
+import { coerceParamValue, fetchShaderManifest, shaderBodyPath, type ShaderParam } from './shaderSchema';
 
 type CallFn = (args: Record<string, unknown>) => unknown;
-
-/** Derive the sibling body path from a `.shader.json` manifest path. */
-function variantPath(manifestPath: string, ext: 'wgsl' | 'glsl'): string {
-  return manifestPath.replace(/\.shader\.json$/i, `.${ext}`);
-}
 
 /** Strip // line and block comments, then trim. Three's WGSL/GLSL function
  *  parsers expect the source to begin at the function declaration, so leading
@@ -121,7 +116,7 @@ export async function buildFileShaderMaterial(
   const webgpu = await getWebGPUSupported();
   const ext: 'wgsl' | 'glsl' = webgpu ? 'wgsl' : 'glsl';
 
-  const srcRes = await fetch(assetUrl(variantPath(manifestPath, ext)), ASSET_FETCH_INIT);
+  const srcRes = await fetch(assetUrl(shaderBodyPath(manifestPath, ext)), ASSET_FETCH_INIT);
   if (!srcRes.ok) return null; // variant missing for this backend → fall back to standard
   const source = stripComments(await srcRes.text());
 

@@ -215,6 +215,27 @@ about it are worth knowing before touching either:
 It is the FOURTH cause `unsavedChangeCauses()` names, for the S3.11 reason: a refusal driven by it
 alone used to name no cause at all.
 
+⚠️ **The Inspector's import-settings controls (texture compression, LOD ratios, …) are manual too,
+and they are a SECOND surface that does not fit this registry (#845).** Their target is a
+`.meta.json` SIDECAR, not one of the eight `ASSET_SCHEMA_TYPES` documents — it is hard-keyed to
+`AssetSchemaType` throughout (the route, the MCP zod enums, `assetTypeParity.test.ts`, the watcher
+classification), so widening the registry to carry a ninth, differently-shaped document would leak
+into all of them. They get their OWN sibling registry instead, `editor/scene/pendingMeta.ts`,
+flushed alongside the dirty-asset registry (no ordering constraint — `/api/write-meta` carries no
+unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowing:
+
+- **There is no live branch and therefore no `activeFlushMarkers`.** `pendingBaseScene.ts` needs
+  one because the OPEN scene bypasses its park entirely; every `.meta.json` field change parks,
+  full stop, so its plain `!pending.has(path)` re-park guard is already sufficient.
+- **A re-import reads the sidecar off DISK**, both to know what to convert with and to report back
+  what it baked — so every call site that fires one flushes ITS path first
+  (`flushPendingMetaFor`), or the conversion would run against the OLD settings while the panel
+  already shows the new ones, and the stale park would go on to overwrite the reimport's own fresh
+  write at the next Cmd+S.
+
+It is the FIFTH cause `unsavedChangeCauses()` names (`pendingImportSettings`), for the same S3.11
+reason as the fourth.
+
 Now every panel edit is a `markAssetDirty(path, type, doc, 'panel')` and **Cmd+S is the write**.
 Three consequences worth knowing:
 
@@ -349,11 +370,13 @@ scanner's guid **heal**, which rewrites any doc written without an `id` ~150 ms 
 *omitting* the newline by matching the editor, and would have produced exactly the churn it was
 written to prevent once the editor changed.
 
-⚠️ **This covers the SERVER seam only.** Scenes, prefabs, and the panels' create paths serialise
-**client-side** and POST the finished string, so `assetJsonBytes` is not in their path and they
-still drop the newline — 17 sites, tracked as **#835**. (`AtlasAssetView` used to be the one
-client-side writer that appended it; since #831 it parks an OBJECT and the bytes are
-`assetJsonBytes`' like every other asset doc, so it is no longer on that seam at all.)
+This used to cover the SERVER seam only — scenes, prefabs, and the panels' create paths serialise
+**client-side** and POST the finished string, so `assetJsonBytes` was not in their path and they
+dropped the newline. #835 gave the client the same byte producer (`jsonFileBody` in
+`editor/backend/editorBackend.ts`) and a single write wrapper every client JSON site routes
+through — see `docs/editor.md` § "The client write seam" for that half. (`AtlasAssetView` was
+already off this seam before #835: since #831 it parks an OBJECT and the bytes are
+`assetJsonBytes`' like every other asset doc.)
 
 ### Abandoning a parked write — `discard_asset_edits`
 
