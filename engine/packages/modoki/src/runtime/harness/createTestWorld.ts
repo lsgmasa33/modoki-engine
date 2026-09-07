@@ -23,7 +23,7 @@ import { Time } from '../core/traits/Time';
 import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
-import { setManualNow, restoreRealClock } from '../core/clock';
+import { setManualNow, restoreRealClock, restoreRealEpoch } from '../core/clock';
 import { advanceFixedSteps } from '../core/stepSimulation';
 import { resetTimeBaseline } from '../core/timeSystem';
 import { getPlayState, setPlayState, type PlayState } from '../core/playState';
@@ -151,6 +151,11 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       for (const n of actionNames) unregisterUIAction(n);
       for (const n of systemNames) unregisterSystem(n);
       restoreRealClock();
+      // `restoreRealClock()` only clears the manual MONOTONIC override (`_manualNow`) — clock.ts's
+      // epoch/monotonic split means a manually-pinned epoch (`setManualEpoch`, e.g. a test staging
+      // a cross-boot-staleness scenario) is a SEPARATE override that survives it. `dispose()`'s own
+      // contract above is "ALL global state", so it owns this teardown too.
+      restoreRealEpoch();
       resetTimeBaseline();
       _resetCaptureSeq();                // reset the shared cap counter (V3) for the next test
       for (const t of verboseCaptureState().types) setVerboseCapture(t, false); // close Tier-2 captures

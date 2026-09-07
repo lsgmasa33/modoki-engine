@@ -200,6 +200,11 @@ load-bearing and commented as such).
       `engine/scripts/**` adds a few more), and a sweep found every other one benign — they
       normalise before comparing, or never compare at all. ~~So the exposed population is one, not
       thirty-nine.~~
+      ⚠️ **Nothing GUARDS this — tracked as #866.** `corpusProducerIsShared` enforces that you
+      *use* `repoFiles`; nothing enforces what you do with its output, which is where instance 9
+      and all nine of #849's landed. That issue also records why the obvious scan does not work:
+      of the 32 files that still discard `rel`, **24** also derive their own repo root, so
+      "two derivations in one file" flags 24 benign files and does not discriminate.
       **The fix is to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
       - ⚠️ **"Exposed population is one" was wrong, and the reason is worth more than the number

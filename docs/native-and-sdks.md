@@ -698,6 +698,54 @@ journal, which `setJournalEnabled` switches off in a release build.
   report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
   messages and pinned by a test.
 
+**A JS fault during boot has to reach `appServices().crashlytics` to be reported, and there are
+THREE distinct windows depending on how far boot got before it died** (#823, #825, #860):
+
+| Window | What ran | Fate | Status |
+|---|---|---|---|
+| 1 | Nothing — the fault killed module evaluation before `installGlobalErrorHandlers()` ran | The inline guard in `engine/index.html` buffers it, but the drain lives inside the installer, which sits in the entry chunk's BODY and never runs | **closed by #825** — stashed to `localStorage`, replayed on the next boot |
+| 2 | Installer ran AND the game registered its services | `deliver()` → `recordError` | **closed by #636** |
+| 3 | Installer ran, services never registered, boot then died | `deliver()` queues it in memory; the page goes away with the queue unflushed | **OPEN — #860** |
+
+- **Why window 1 exists at all.** Rolldown inlines `main.tsx`'s side-effect imports —
+  `installErrorCapture` among them — into the entry chunk's BODY, which by ES semantics runs only
+  after every static import has finished evaluating. So the installer's carefully-ordered position
+  above `./App.tsx` buys nothing once the app is bundled: a throw anywhere in `App.tsx`'s own
+  static import graph still fires before the installer exists to catch it. The inline `<script>`
+  in `engine/index.html`, registered at HTML-parse time, is the only code on the page early enough
+  to see it. ⚠️ **Not reproducible in the dev editor** — Vite serves unbundled modules there, so
+  real source order holds and the defect does not exist. A green dev-editor run is not evidence for
+  this class; verification needs a production build.
+- **The cross-boot stash.** `stashEarlyErrors()` (`engine/index.html`) writes it the moment the
+  guard's 1400ms re-check confirms `#root` is still empty; `drainStashedEarlyErrors()`
+  (`globalErrors.ts`) reads it on the next boot that reaches the installer. It stashes minimal
+  JSON, not pre-formatted text, so `describe()`'s formatting stays in one place instead of gaining
+  a hand-kept second copy in HTML.
+- ⚠️ **Clear-on-read, and what it costs.** `drainStashedEarlyErrors()` removes the `localStorage`
+  key before attempting to report anything, which makes the replay once-only so a deterministic
+  boot-killing crash cannot re-file on every launch forever. The cost: if the replaying boot ALSO
+  dies before the sink registers, that report is lost with it. Accepted — an unbounded re-file loop
+  is the worse failure.
+- ⚠️ **The replay is labelled `[uncaught-prev-boot]`, deliberately not made to look live.**
+  `drainEarlyErrors` already carries a `(t=Nms)` suffix because a report reading as "now" misleads
+  at exactly the moment it did not happen; a report arriving a whole launch late is that problem an
+  order of magnitude worse.
+- ⚠️ **The 7-day staleness bound is not hygiene.** A months-old fault replayed now is filed by
+  Crashlytics against the CURRENT app version, which makes an already-fixed bug look live.
+- ⚠️ **`STASH_MAX_ENTRIES` is 8, not `EARLY_ERROR_CAP`'s 28, and the reason is the SHARED burst
+  budget.** Every replay drains through the same `MAX_PER_BURST_WINDOW` limiter, in one synchronous
+  burst, right after that boot's own `drainEarlyErrors()`. A cross-boot replay is a guest in the
+  replaying boot's budget, so the bound is a fraction of the window rather than the arithmetic
+  leftover — at most a third of it, breadcrumbs included; `earlyErrorBuffer.test.ts` pins the exact
+  margin. ⚠️ An overflow here is **completely silent** — a limiter refusal emits nothing, and
+  clear-on-read has already discarded the payload by the time anything could notice.
+- **The widened fallback screen (#823).** `consider()` no longer gates on the error's message
+  text; what actually establishes fatality is `#root` being empty and STILL empty after the 1400ms
+  re-check. ⚠️ Because the first error through claims the latch, the screen's DETAIL is re-derived
+  at timer time from the buffered entries (preferring the last one carrying a real stack) rather
+  than frozen at scheduling time — otherwise a benign early error like `ResizeObserver loop limit
+  exceeded` names itself on screen and the actual boot-killer appears nowhere.
+
 ### Deliberate native fault triggers (#278)
 
 The sibling of the above, for everything that does **not** originate in JavaScript.

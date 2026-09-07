@@ -29,7 +29,7 @@
  */
 
 import { appServices, onAppServicesRegistered } from './appServices';
-import { rawNow } from './clock';
+import { rawEpochNow, rawNow } from './clock';
 import { peekResumeReload } from './resumeReload';
 
 /** `console.error` AND `console.warn` → a non-fatal Crashlytics ISSUE (grouped, alerted on).
@@ -498,6 +498,129 @@ function drainEarlyErrors(): void {
 }
 
 /**
+ * Key of the cross-boot stash `engine/index.html`'s fatal-load guard writes to `localStorage`
+ * (#825) when it is about to show the fallback screen — the boot-killing case where
+ * `installGlobalErrorHandlers` never ran, so `drainEarlyErrors()` above never drained anything.
+ *
+ * ⚠️ `engine/index.html` is the WRITER (`stashEarlyErrors()`, its own `STASH_KEY`/`STASH_VERSION`
+ * literals) and this module is the READER — it is a bare inline `<script>` with no bundler, so it
+ * cannot import this constant. The two copies must be kept in sync BY HAND, the same relationship
+ * `MAX_PER_BURST_WINDOW` above already has with that file's `EARLY_ERROR_CAP`.
+ * `earlyErrorBuffer.test.ts` pins the two literals equal.
+ */
+export const STASH_KEY = 'modoki-early-error-stash';
+const STASH_VERSION = 1;
+/** A fault from a version the user has long since updated past is noise, not a report. */
+const STASH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Shape written by `stashEarlyErrors()` in `engine/index.html` — DATA, not pre-formatted prose
+ *  (that function serializes plain fields precisely so this module keeps sole ownership of
+ *  formatting via `describe()`, rather than the HTML growing a second copy that could drift). */
+interface StashedEarlyError {
+  kind: 'error' | 'unhandledrejection';
+  message?: string;
+  stack?: string;
+  filename?: string;
+  lineno?: number;
+  colno?: number;
+  ts?: number;
+}
+interface StashedEarlyErrorState {
+  v: number;
+  ts: number;
+  dropped: number;
+  entries: StashedEarlyError[];
+}
+
+/** Compose one stashed entry's report text, mirroring `drainEarlyErrors`'s `where`/`when`
+ *  composition above — message, then stack (a stashed entry carries a plain stack STRING, never a
+ *  live `Error` object, so `describe()` cannot recover it from `message` the way it does for a
+ *  real `Error`), then the `filename:lineno:colno` suffix, then the within-boot capture time, then
+ *  how long ago the stash itself was written. Every field is routed through `describe()` so a
+ *  malformed/hand-edited stash degrades to `'<unprintable>'`-style text rather than "undefined". */
+function describeStashedEntry(entry: StashedEarlyError, stashAgeMs: number): string {
+  const label = entry.kind === 'unhandledrejection' ? '[unhandledrejection-prev-boot]' : '[uncaught-prev-boot]';
+  const stackPart = entry.stack ? `\n${describe(entry.stack)}` : '';
+  const where = entry.filename ? ` (${entry.filename}:${entry.lineno}:${entry.colno})` : '';
+  const when = typeof entry.ts === 'number' && Number.isFinite(entry.ts) ? ` (t=${Math.round(entry.ts)}ms)` : '';
+  const ago = ` (prev boot, ${Math.round(stashAgeMs / 60_000)}m ago)`;
+  return `${label} ${describe(entry.message)}${stackPart}${where}${when}${ago}`;
+}
+
+/**
+ * Replay a PREVIOUS boot's stashed early-error buffer (#825) — the complement to
+ * `drainEarlyErrors()` above, for the boot that died before that function's own installer ever
+ * ran. Called right after it: this boot's own live faults are more urgent than a previous boot's.
+ *
+ * Deliberately labeled `-prev-boot`, not `-early` — seeing this land at a moment nothing actually
+ * went wrong THIS boot would be misleading in exactly the way `drainEarlyErrors`'s `(t=Nms)` suffix
+ * already guards against for a same-boot replay, one order of magnitude worse for a cross-boot one.
+ *
+ * ⚠️ Deliberately does NOT touch `alreadyReported` (the WeakSet `drainEarlyErrors` and the live
+ * listeners use to stop a fault from double-filing when Capacitor/React re-logs the SAME object
+ * through `console.error`). That protocol exists for a live object reference surviving within one
+ * boot; a stashed entry crossed a JSON round-trip through `localStorage` into a NEW boot, so there
+ * is no live copy of it anywhere in this realm that could re-log and double-report it.
+ */
+function drainStashedEarlyErrors(): void {
+  let raw: string | null;
+  try {
+    raw = localStorage.getItem(STASH_KEY);
+    // Clear-on-read, BEFORE reporting anything below. Load-bearing: it is what makes the replay
+    // ONCE-ONLY, so a deterministic boot-killing crash cannot re-file the same fault on every
+    // subsequent launch forever. The cost — accepted — is that if THIS boot also dies before the
+    // crashlytics sink registers, the queued report is lost with it. An unbounded re-file loop on
+    // every future launch is the worse failure.
+    if (raw !== null) localStorage.removeItem(STASH_KEY);
+  } catch {
+    return; // private mode, disabled site data — nothing to replay, and nothing to clear
+  }
+  if (raw === null) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return; // unparseable — noise, not a report
+  }
+  if (parsed === null || typeof parsed !== 'object') return;
+  const stash = parsed as Partial<StashedEarlyErrorState>;
+  if (stash.v !== STASH_VERSION) return;
+  if (!Array.isArray(stash.entries)) return;
+  if (typeof stash.ts !== 'number' || !Number.isFinite(stash.ts)) return;
+
+  // `stash.ts` is an epoch stamp written by `engine/index.html` at stash time, and "is this fault
+  // from more than 7 days ago" is a genuinely elapsed-REAL-TIME question — `rawNow()`
+  // (performance.now()-based, resets every navigation) cannot answer it, so this reads
+  // `rawEpochNow()`, the sanctioned epoch reading (`core/clock.ts`), instead of a bare `Date.now()`.
+  // The bound itself matters: a months-old stashed fault replayed now would be filed by Crashlytics
+  // against the CURRENT app version, making an already-fixed bug look live — worse than dropping it.
+  const stashAgeMs = rawEpochNow() - stash.ts;
+  if (stashAgeMs > STASH_MAX_AGE_MS) return;
+
+  // Bounded independent of what the stash CLAIMS to hold. `STASH_MAX_ENTRIES` in
+  // `engine/index.html` bounds a WELL-BEHAVED writer (that file's own `stashEarlyErrors()`), not a
+  // hand-edited or future-version stash, which could carry arbitrarily many entries — this loop
+  // must not scale with an attacker- or corruption-controlled array length.
+  for (const entry of stash.entries.slice(0, MAX_PER_BURST_WINDOW)) {
+    // Per-entry try/catch, same reasoning as drainEarlyErrors's loop: one bad stashed entry must
+    // not take the rest of the replay down.
+    try {
+      if (entry === null || typeof entry !== 'object') continue;
+      if (entry.kind !== 'error' && entry.kind !== 'unhandledrejection') continue;
+      captureToCrashlytics('error', describeStashedEntry(entry, stashAgeMs));
+    } catch {
+      /* never let one unreportable stashed entry break the rest of the replay */
+    }
+  }
+  if (typeof stash.dropped === 'number' && stash.dropped > 0) {
+    try {
+      captureToCrashlytics('breadcrumb', `[modoki] ${stash.dropped} pre-install error event(s) dropped from a previous boot's stash (stash cap)`);
+    } catch { /* same reasoning as the loop above */ }
+  }
+}
+
+/**
  * True when THIS boot is a same-origin reload rather than a fresh navigation.
  *
  * `performance.getEntriesByType('navigation')` is not a clock read — it is a one-shot descriptor
@@ -575,6 +698,8 @@ export function installGlobalErrorHandlers(): void {
     // Drain the fatal-load guard's pre-install buffer AFTER the listeners above are registered, so
     // anything thrown while draining is itself covered by them.
     drainEarlyErrors();
+    // THEN a previous boot's stash (#825) — this boot's own live faults take priority.
+    drainStashedEarlyErrors();
 
     if (typeof console !== 'undefined') {
       const realError = console.error.bind(console);
@@ -621,5 +746,6 @@ export function __resetGlobalErrorsForTest(opts?: { clock?: () => number; uninst
   reporting = false;
   now = opts?.clock ?? rawNow;
   clearPersistedCounters(); // else a leftover session budget leaks from one test/realm into the next
+  try { localStorage.removeItem(STASH_KEY); } catch { /* nothing left to try */ } // ditto, for the #825 stash
   if (opts?.uninstall) installed = false;
 }
