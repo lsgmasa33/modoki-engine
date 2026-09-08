@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { hasPublishScripts } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   releaseBranchFor,
   parseReleaseVersion,
@@ -312,6 +313,49 @@ describe('claimLabelFor — a release branch claims as the HUB', () => {
   });
 });
 
+describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', () => {
+  /** ⚠️ The regression this pins was found by the PUBLIC ci/main windows-latest leg, not locally, and
+   *  it made the guard fail OPEN. The entry check was
+   *  `import.meta.url === `file://${process.argv[1]}``; on win32 `argv[1]` is `C:\a\b.mjs`, so that
+   *  builds `file://C:\a\b.mjs` against an `import.meta.url` of `file:///C:/a/b.mjs` — never equal,
+   *  so the CLI block never ran and node exited 0. The publisher does `node … check || exit 2`, so
+   *  exit 0 meant `--release` skipped every precondition and published anyway.
+   *
+   *  This runs on darwin because the SAME defect has a POSIX-reachable variant: through a symlink,
+   *  Node resolves the main module's symlinks so `import.meta.url` is the real path while `argv[1]`
+   *  keeps the typed spelling, and the naive compare misses. Measured before the fix: direct
+   *  invocation ran, symlinked invocation printed nothing and exited 0. So the win32 case has a
+   *  local proxy, and a platform we cannot run is not a reason to leave the class unpinned (#910). */
+  it('still enters CLI mode when reached through a symlinked repo root', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-symlink-'));
+    try {
+      const link = path.join(dir, 'repo');
+      fs.symlinkSync(REPO, link, 'dir');
+      const viaLink = path.join(link, 'engine/scripts/releaseBranch.mjs');
+      const r = spawnSync(process.execPath, [viaLink, '--branch-for', '0.7.0'], {
+        encoding: 'utf8',
+      });
+      // The failure shape is silence, not an error: declining CLI mode looks exactly like being
+      // imported. So assert on OUTPUT, not on the exit code — the broken version also exits 0.
+      expect(r.stdout.trim()).toBe('release_0_7_0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the path-identity SSOT rather than a hand-rolled compare', () => {
+    // A source assertion, deliberately: the win32 half cannot be driven here, and this is the
+    // property that makes it correct on every platform at once. #910 owns generalising it to the
+    // other nine sites; this pins the one that gates a release.
+    // ⚠️ Comment-STRIPPED, via the shared reader #812 mandates. The docblock above the fix quotes
+    // the broken idiom in order to explain it, so a raw read makes this assertion fail on correct
+    // source — the guard tripping over its own subject's prose.
+    const { code } = readScannedSource(path.join(REPO, 'engine/scripts/releaseBranch.mjs'));
+    expect(code).toContain('samePath(fileURLToPath(import.meta.url), process.argv[1])');
+    expect(code).not.toContain('`file://${process.argv[1]}`');
+  });
+});
+
 describe('releaseBranch.mjs CLI — the seam the shell publisher reads', () => {
   const run = (args: string[]) =>
     spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
@@ -418,9 +462,18 @@ describe.skipIf(!hasPublishScripts())(
     }
   });
 
-  it('refuses --release on the wrong branch, naming the branch it wanted', () => {
-    // Runs in the real repo, which is never on a release branch during a test run.
-    const r = run(['--release']);
+  it('refuses --release when the branch cannot match, whatever is checked out', () => {
+    // ⚠️ This used to run a bare `--release` and rely on "the real repo is never on a release branch
+    // during a test run". That premise is FALSE while a release is in flight: on release_0_7_0 with
+    // package.json at 0.7.0 the guard correctly ACCEPTS, so the test went red at the exact moment
+    // someone cut a release — the worst time for a release-machinery test to break, and it did
+    // (measured 2026-09-08, mid-cut of v0.7.0).
+    //
+    // A version no checkout can ever be on makes it deterministic: it refuses from `main` as
+    // `wrong-branch` and from a release branch as `branch-version-skew`, and both exit 2 naming a
+    // release_ branch. The test asserts the PROPERTY (it refuses, and says which branch) rather than
+    // depending on where HEAD happens to be.
+    const r = run(['--release', '--version', '99.99.99']);
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/release_\d+_\d+_\d+/);
     expect(r.stdout).not.toContain('Assembling');

@@ -235,11 +235,42 @@ export function checkReleaseState({
   return { ok: true, code: 'ok', message: `${expected} clean — publishing v${version} from it` };
 }
 
+import { fileURLToPath } from 'node:url';
+import { samePath } from './pathIdentity.mjs';
+
+/** Was this module RUN, or merely imported?
+ *
+ *  ⚠️ **Not `import.meta.url === `file://${process.argv[1]}``, which this file used and which is
+ *  broken on Windows in the worst direction.** There `argv[1]` is `C:\a\b.mjs`, so the template
+ *  builds `file://C:\a\b.mjs` while `import.meta.url` is `file:///C:/a/b.mjs` — never equal, so
+ *  the CLI block never ran and node exited **0**. The publisher does
+ *  `node releaseBranch.mjs check … || exit 2`, so exit 0 meant `--release` performed NO checks and
+ *  proceeded: a guard that fails OPEN on the one platform CLAUDE.md says cannot be diagnosed from a
+ *  Mac. Found by the public `ci/main` windows-latest leg, not locally.
+ *
+ *  `samePath` is the SSOT for "do two spellings name one path" (#869, missing-path half fixed in
+ *  #892) — it canonicalises and case-folds both sides, so it also handles the symlink/`subst`/8.3
+ *  variant of this same bug. Using it rather than hand-rolling a seventh recipe is the point: see
+ *  #910 for the class, which counts ten sites across three recipes.
+ *
+ *  The try/catch is load-bearing for the same reason `clonePort.mjs`'s is: `fileURLToPath` throws on
+ *  a non-`file:` `import.meta.url` (a bundler shim, a custom loader), and this runs at module load —
+ *  an unguarded throw would stop the TEST importing the module at all, rather than declining CLI
+ *  mode. */
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
+  try {
+    return samePath(fileURLToPath(import.meta.url), process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
 // ── CLI: `node engine/scripts/releaseBranch.mjs check --version X.Y.Z --branch NAME [--dirty]` ────
 // Used by scripts/publish-engine-oss.sh. Exits 0 and prints the ok message, or exits 2 and prints
 // the refusal on stderr — so the shell can `|| exit 2` without re-deriving anything.
 // `--branch-for X.Y.Z` prints just the branch name, for messages and for the release ritual.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint()) {
   // Top-level await is fine here: this file is an ES module.
   const argv = process.argv.slice(2);
   const flag = (name) => {
