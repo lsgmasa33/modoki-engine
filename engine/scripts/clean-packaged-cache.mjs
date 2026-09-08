@@ -186,7 +186,12 @@ if (isPackagedRunning()) {
     // the one that runs there too. Up to 2s, re-asking each 100ms.
     const nap = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     for (let i = 0; i < 20 && isPackagedRunning(); i += 1) nap();
-    if (outcome === REAP_ERROR || isPackagedRunning()) {
+    // ⚠️ **Two different facts, and only one of them justifies refusing.** An earlier version
+    // OR'd them and then printed "is STILL RUNNING" — stating as fact something the line above
+    // had just measured to be false (a box with no `pkill` gives REAP_ERROR; if the human quits
+    // the editor during the wait, the app is gone and the message is a lie). The measurement
+    // wins: what makes the wipe unsafe is the app being ALIVE, not the reap's verdict.
+    if (isPackagedRunning()) {
       console.error(
         `[clean-packaged-cache] refusing to continue: "${NAME}" is STILL RUNNING after the reap`
         + `${outcome === REAP_ERROR ? ' (and the reap itself failed to run)' : ''}. `
@@ -194,6 +199,12 @@ if (isPackagedRunning()) {
         + 'and re-run.',
       );
       process.exit(1);
+    }
+    if (outcome === REAP_ERROR) {
+      // The reap did not run, but the app is demonstrably gone — so the wipe below is safe and
+      // refusing would block a legitimate `--force`. Say it happened; do not stop.
+      console.warn(`[clean-packaged-cache] the reap did not run, but "${NAME}" is no longer `
+        + 'running — continuing.');
     }
   }
 }

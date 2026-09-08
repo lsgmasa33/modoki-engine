@@ -380,6 +380,14 @@ edit, and adding an unused export (tree-shaken). Neither changes the artifact, s
 was current. Only a *reachable semantic* change reddens it. "The test stayed green" is a finding
 about your mutation before it is a finding about the test.
 
+⚠️ **A currency guard on a gitignored artifact taxes every clone, so say so where they read it.**
+This one reddens `verify` on any clone that has ever packaged, whenever the MCP source changes —
+including a change that arrives via `git merge` rather than one the session made. That was accepted
+deliberately (owner, 2026-09-09) because the failure it prevents is silent and reaches real users,
+and it is announced in `CLAUDE.md` § Tests rather than left to be discovered as a mystery red. The
+fix is always `npm run build:electron`. If you add a guard of this shape, budget for the same
+announcement — a gate that fails for reasons the reader cannot place gets disabled, not obeyed.
+
 ⚠️ **Know which runs your guard is actually live on.** `dist/` is gitignored and CI never runs
 `build:electron`, so both shipped-artifact cases skip on every CI run — they are a
 developer-machine guard, not a CI gate. Say that in the suite rather than letting the coverage be

@@ -16,7 +16,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
-import { killPackaged, altPathSpelling, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
+import { killPackaged, altPathSpelling, decodeWinReap, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
 
 vi.mock('node:child_process', () => {
   const execFileSyncMock = vi.fn();
@@ -303,27 +303,49 @@ describe('the reap outcome actually reaches a consumer (#944 close-out)', () => 
     // Anti-vacuity: if a future change dropped `2>/dev/null` from the call sites, the rule above
     // would be defending a constraint that no longer applies, and should be revisited rather
     // than silently kept.
-    const scripts = ['test-packaged.sh', 'smoke-packaged.sh', 'assert-app-renders.sh', 'repro-cold-boot.sh']
-      .map((f) => path.resolve(__dirname, '../../scripts', f))
-      .filter((f) => fs.existsSync(f));
+    // Derived, not a hardcoded list of four: a rename would silently drop a file from a
+    // hardcoded list and the rest would keep this green (close-out re-review).
+    const scriptsDir = path.resolve(__dirname, '../../scripts');
+    const scripts = fs.readdirSync(scriptsDir).filter((f) => f.endsWith('.sh')).map((f) => path.join(scriptsDir, f));
     const callers = scripts.flatMap((f) => readScannedSource(f, { language: 'shell' }).code
       .split('\n').filter((l) => /\$PATHS" kill/.test(l)));
     expect(callers.length, 'no `$PATHS kill` call sites found — this rule lost its subject').toBeGreaterThan(0);
-    for (const c of callers) expect(c).toContain('2>/dev/null');
+    for (const c of callers) {
+      expect(c).toContain('2>/dev/null');
+      // …and stdout must stay OPEN. A future `>/dev/null 2>&1` at a call site would satisfy the
+      // line above while re-muting the alarm the fix exists to deliver — the same defect, moved.
+      expect(c, 'stdout is redirected too — the ERROR line is muted again').not.toMatch(/>\s*\/dev\/null\s+2>&1|&>\s*\/dev\/null/);
+    }
   });
 });
 
-describe('the Windows branch decodes its OWN exit codes (#944 close-out)', () => {
-  it('does not route PowerShell through pkill’s vocabulary', () => {
-    // CONFIRMED defect: one shared catch served both branches and mapped `status === 1` to
-    // REAP_NONE. `powershell.exe -Command` exits 1 on a TERMINATING error (WMI unavailable,
-    // access denied), so a Windows reap that failed outright reported "nothing running" — the
-    // exact silence #944 exists to remove, on the branch that had just gained the count.
-    const src = readScannedSource(
-      path.resolve(__dirname, '../../scripts/packagedAppPaths.mjs'), { language: 'js' },
-    ).code;
-    const win = src.slice(src.indexOf("if (process.platform === 'win32')"), src.indexOf('const pattern ='));
-    expect(win, 'the win32 branch must catch and decode for itself').toMatch(/catch\s*\{[^}]*REAP_ERROR/);
-    expect(win, 'an unparseable count is an ERROR, never an empty match').toMatch(/Number\.isFinite/);
+describe('the Windows reap decode (#944 close-out)', () => {
+  // ⚠️ **Executed, not scanned.** Every behavioural describe in this file is
+  // `skipIf(process.platform === 'win32')`, so on a Mac NOTHING runs the win32 branch — and the
+  // text scan this replaces covered 15KB of source, from `candidates()` to `killPackaged`, while
+  // claiming to check "the win32 branch". It was blind to the defect it sat next to: the code
+  // said `Number.isFinite`, the comment said an empty stdout is an ERROR, and `Number('')` is 0
+  // so `isFinite` passed it straight through as "nothing running". `decodeWinReap` is pure and
+  // exported for exactly this reason, the way `winKillCommand` already was.
+  const CASES: [stdout: string, expected: string, why: string][] = [
+    ['1', REAP_KILLED, 'one process matched and was stopped'],
+    ['3', REAP_KILLED, 'several matched'],
+    ['0', REAP_NONE, 'a real, printed count of zero — the genuine "nothing running"'],
+    ['', REAP_ERROR, 'EMPTY stdout: the command never got far enough to print a count'],
+    ['   ', REAP_ERROR, 'whitespace only — same as empty'],
+    ['WARNING: blah\n0', REAP_ERROR, 'a warning ahead of the number is not a count'],
+    ['not-a-number', REAP_ERROR, 'unparseable'],
+  ];
+  it.each(CASES)('decodeWinReap(%j) → %s (%s)', (stdout, expected) => {
+    expect(decodeWinReap(stdout)).toBe(expected);
+  });
+
+  it('treats empty stdout as ERROR, not as an empty match — the regression this exists for', () => {
+    // Called out on its own because it is the one the table above would be easiest to "fix"
+    // wrongly: on Windows `Stop-Process -EA SilentlyContinue` exits 0 whether it stopped
+    // something or matched nothing, so the COUNT is the only signal there is. Reading its absence
+    // as zero is a reap that never ran reporting success.
+    expect(decodeWinReap('')).toBe(REAP_ERROR);
+    expect(decodeWinReap('0')).toBe(REAP_NONE);
   });
 });

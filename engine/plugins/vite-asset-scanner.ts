@@ -730,13 +730,27 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
  *  The drive-letter direction, which this DOES fold, is the reachable one: `path.relative` on
  *  win32 is case-insensitive, so a case-flipped drive passes containment and then misses the Map.
  *
- *  ⚠️ **Adjacent and NOT resolved** (noted here so the next reader does not have to re-derive the
- *  above to reach it): if a client's `/@fs/` spelling can ever differ from `projectRoot`'s, that
- *  403 is itself the bug — every save through a symlinked `MODOKI_PROJECT` would fail, which is
- *  worse than a missed guard. `buildProjectRoot` is a lexical `path.resolve` of `MODOKI_PROJECT`
- *  while Vite mints `/@fs/` from its own module resolution. NOT OBSERVED — the question was found
- *  while refuting #960 and is out of its scope. The cheap check is to open the editor through a
- *  symlinked project path and Ctrl+S. */
+ *  ⚠️ **The adjacent question — MEASURED, and the answer is "real mechanism, unreachable flow".**
+ *  If a client's `/@fs/` spelling can ever differ from `projectRoot`'s, that 403 is itself a bug
+ *  worse than the missed guard: it refuses the save outright. Driven against a live editor
+ *  launched with `MODOKI_PROJECT` pointing at a SYMLINK to `games/video-test`:
+ *
+ *    POST /api/write-file  /@fs<logical>/runtime/assets/probe.json   -> 200   (same file)
+ *    POST /api/write-file  /@fs<physical>/runtime/assets/probe.json  -> 403   (same file)
+ *    POST /api/write-file  /@fs/tmp/outside/probe.json               -> 403   (control)
+ *
+ *  So the mechanism is real. What makes it unreachable in the normal flow is that nothing hands
+ *  the client a PHYSICAL spelling: every `/@fs/` URL the backend mints goes through
+ *  `toFsUrl(ctx.projectRoot)`, i.e. the same lexical `path.resolve` of `MODOKI_PROJECT` that the
+ *  containment check compares against — and the open scene does not use the `/@fs/` branch at all
+ *  (it resolves as an asset-root path, `/assets/scenes/main.scene.json`). Vite serves BOTH
+ *  spellings with a 200, so it does not force a mismatch either.
+ *
+ *  ⚠️ **It stays a live trap for anything that introduces a resolved path**: a native file dialog
+ *  (macOS returns resolved paths), a pasted path, or a drag-drop would all spell it physically and
+ *  be refused. If you add such a seam, canonicalise BOTH sides of the containment check — do not
+ *  reach for `realpathSync` in the write guard below, which is a different question that #960
+ *  settled the other way. */
 export function normalizeWriteGuardKey(absPath: string): string {
   return absPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
 }

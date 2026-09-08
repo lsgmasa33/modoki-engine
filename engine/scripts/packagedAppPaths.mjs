@@ -169,6 +169,25 @@ export const REAP_KILLED = 'killed';
 export const REAP_NONE = 'none';
 export const REAP_ERROR = 'error';
 
+/** Decode the win32 reap's stdout into an outcome. Pure and exported for the same reason
+ *  `winKillCommand` is: the decision is unit-testable without spawning anything, and the
+ *  behavioural cases in `killPackagedGuard.test.ts` are all `skipIf(win32)` so on a Mac NOTHING
+ *  executes this branch. A text scan over the source cannot see an off-by-one in it — and did
+ *  not: the first version's own comment claimed an empty stdout was an ERROR while the code
+ *  returned NONE, because `Number('')` is 0 and `Number.isFinite(0)` is true.
+ *
+ *  ⚠️ **Empty stdout is an ERROR, not "nothing running".** `Stop-Process -EA SilentlyContinue`
+ *  exits 0 whether it stopped something or matched nothing, so the COUNT is the only signal;
+ *  no count at all means the command did not get far enough to print one. Reading that as an
+ *  empty match is how a Windows reap that never ran reports success — #944's exact silence.
+ *  Requires a bare run of digits: a warning line ahead of the number, or a blank stream, is
+ *  not a count. */
+export function decodeWinReap(stdout) {
+  const t = String(stdout ?? '').trim();
+  if (!/^\d+$/.test(t)) return REAP_ERROR;
+  return Number(t) > 0 ? REAP_KILLED : REAP_NONE;
+}
+
 /** Kill a leftover packaged instance. Chromium's --remote-debugging-port fails SILENTLY
  *  when the port is held, so a stale process makes the CSP probe look at a port its app
  *  never opened. Best-effort by design — "nothing to kill" is the normal case.
@@ -240,15 +259,12 @@ function _killOne(appDir, name) {
       // `REAP_NONE`/"nothing running" — reintroducing, on the branch that had just gained the
       // count plumbing, precisely the silence #944 exists to remove.
       //
-      // So: a clean exit with a parseable count is the ONLY non-error outcome. `Number('')` is
-      // 0, which would read as a legitimate "nothing running", so the parse is checked
-      // explicitly — an empty stdout means the command did not get far enough to print, which
-      // is an ERROR, not an empty match.
+      // So: a clean exit with a parseable count is the ONLY non-error outcome. The decode lives
+      // in `decodeWinReap` — pure, exported and unit-tested, because every behavioural case in
+      // killPackagedGuard.test.ts is skipIf(win32) and so never executes this branch on a Mac.
       try {
         const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', winKillCommand(appDir, name)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-        const n = Number(String(out).trim());
-        if (!Number.isFinite(n)) return REAP_ERROR;
-        return n > 0 ? REAP_KILLED : REAP_NONE;
+        return decodeWinReap(out);
       } catch {
         return REAP_ERROR; // any non-zero exit here is a failure to RUN the reap, never "no match"
       }

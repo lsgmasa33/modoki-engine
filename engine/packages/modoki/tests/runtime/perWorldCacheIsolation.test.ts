@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach, onTestFinished } from 'vitest';
 import type { World } from 'koota';
 import { twoWorlds, assertIsolated, assertClearIsScoped } from '../helpers/twoWorlds';
-import { setCurrentWorld, getCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { setCurrentWorld, peekCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { runZoneTriggers, clearZoneState } from '../../src/runtime/zones/zoneTriggerCore';
 import { createZoneEventBus } from '../../src/runtime/zones/zoneEventBus';
 import { cueSound, drainAudioCues, clearAudioCues } from '../../src/runtime/audio/audioCues';
@@ -180,7 +180,11 @@ describe('physicsWorldRegistry holds one Rapier state per World (#851)', () => {
     // one still alive. Freeing the wrong side here frees WASM handles the live world is stepping.
     const { a, b } = twoWorlds();
     const { reg, freed } = freeing();
-    const restore = getCurrentWorld();
+    // `peek`, not `get`: `getCurrentWorld()` lazily ALLOCATES a world when none is current, and
+    // worldRegistry documents exactly this case — a fresh-module test must not accidentally
+    // spend one of koota's 16 slots on a world it only wanted to read. Restoring `null` is also
+    // the honest restore; promoting a synthetic world is not.
+    const restore = peekCurrentWorld();
     try {
       setCurrentWorld(a);
       reg.worlds.set(a, { tag: 'A' });
@@ -189,7 +193,7 @@ describe('physicsWorldRegistry holds one Rapier state per World (#851)', () => {
       expect(freed, 'the swap should free exactly the OUTGOING world').toEqual(['A']);
       expect(reg.worlds.get(b)?.tag, 'the swap freed the INCOMING world’s state').toBe('B');
     } finally {
-      setCurrentWorld(restore);
+      if (restore) setCurrentWorld(restore);
     }
   });
 
@@ -262,6 +266,14 @@ describe('audioSystem keeps its live-voice state per World (#851)', () => {
 
   it('stopWorldAudio(A) does not cut world B’s voices', () => {
     const { a, b } = twoWorlds();
+    // ⚠️ **Shift B's entity ids, or the primary assertion below CANNOT FAIL.** Two fresh koota
+    // worlds hand out the same ids from 0, and `AudioState.sources` is keyed by raw numeric
+    // entity id — so under a shared `states` map B's voice OVERWRITES A's entry rather than
+    // coexisting with it, and the surplus stop lands in A's journal. `stopReasons(b)` is then
+    // `[]` under BOTH hypotheses. Measured in close-out re-review: without this line the case
+    // passed with the mechanism deleted, and only the CONTROL failed — by accident, via that
+    // same id collision. A red COUNT is not a red TEST.
+    b.spawn(EntityAttributes({ guid: newGuid() }));
     startVoice(a);
     startVoice(b);
 

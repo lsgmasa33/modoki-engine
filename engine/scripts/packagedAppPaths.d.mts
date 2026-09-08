@@ -42,6 +42,12 @@ export declare const REAP_NONE: 'none';
 export declare const REAP_ERROR: 'error';
 export type ReapOutcome = typeof REAP_KILLED | typeof REAP_NONE | typeof REAP_ERROR;
 
+/** Decode the win32 reap's stdout into an outcome. Pure + exported so the decision is unit
+ *  testable without spawning: every behavioural case in killPackagedGuard.test.ts is
+ *  skipIf(win32), so on a Mac nothing else executes that branch. Empty/unparseable stdout is an
+ *  ERROR, never an empty match — the count is Windows' only signal (#944). */
+export declare function decodeWinReap(stdout: string | undefined): ReapOutcome;
+
 /** Kill a leftover packaged instance. `appDir` omitted means "any packaged instance, any
  *  clone" (a caller that means that deliberately — see the .mjs source comment). Throws on EVERY
  *  platform when `appDir` is passed but empty/implausibly short: since the Windows branch became

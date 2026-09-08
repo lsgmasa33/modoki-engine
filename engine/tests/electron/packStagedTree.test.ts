@@ -62,7 +62,11 @@ function makeContext(opts: { withThree: boolean; platform?: string }) {
     fs.mkdirSync(path.join(jsm, 'loaders'), { recursive: true });
     fs.writeFileSync(path.join(jsm, 'loaders', 'GLTFLoader.js'), '// glb');
     fs.writeFileSync(path.join(jsm, 'loaders', 'HDRLoader.js'), '// hdr');
-    fs.writeFileSync(path.join(jsm, 'loaders', 'OrbitControls.js'), '// orbit');
+    // `controls/`, which is where real three keeps it — the fixture previously put it under
+    // `loaders/` (via a `'controls','..','loaders'` join that normalized away), which made the
+    // tree a shape three never produces and quietly turned this file into loader-count padding.
+    fs.mkdirSync(path.join(jsm, 'controls'), { recursive: true });
+    fs.writeFileSync(path.join(jsm, 'controls', 'OrbitControls.js'), '// orbit');
   } else {
     fs.mkdirSync(projectDir, { recursive: true });
   }
@@ -79,6 +83,9 @@ describe('copy-three-addons afterPack hook (#945 B4)', () => {
     const dest = path.join(resources, 'app.asar.unpacked', 'node_modules', 'three', 'examples', 'jsm');
     expect(fs.existsSync(path.join(dest, 'loaders', 'GLTFLoader.js')), 'GLTFLoader must reach the packed app').toBe(true);
     expect(fs.existsSync(path.join(dest, 'loaders', 'HDRLoader.js')), 'HDRLoader must reach the packed app').toBe(true);
+    // A subdirectory OTHER than loaders/, so the copy is proved recursive rather than
+    // loaders-shaped — OrbitControls is what the editor's own viewport needs.
+    expect(fs.existsSync(path.join(dest, 'controls', 'OrbitControls.js')), 'OrbitControls must reach the packed app').toBe(true);
   });
 
   it('resolves the Resources dir per platform, not just on macOS', async () => {

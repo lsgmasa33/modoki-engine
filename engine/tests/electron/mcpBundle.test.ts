@@ -104,11 +104,19 @@ describe('modoki-mcp packaged bundle', () => {
  *  redden the gate on a fresh clone for a file nothing has built yet.
  *
  *  ⚠️ **Be precise about what that skip costs, because it is more than "a fresh clone".** `dist/`
- *  is gitignored and `.github/workflows/ci.yml` never runs `build:electron`, so **both cases here
- *  skip on EVERY CI run** — they are live only on a machine that has packaged at some point.
- *  These are therefore a developer-machine guard, not a CI gate, and the thing that actually
- *  stops a stale bundle shipping is that every packaging path re-runs `build-electron` before
- *  packing. Said plainly so the coverage is not overread. */
+ *  is gitignored, and no CI leg builds it: the private `ci.yml` is retired in practice (CLAUDE.md
+ *  § Tests — do not describe it as a gate that exists), and the FREE public CI on the
+ *  `modoki-engine` mirror is a subset gate over a transformed snapshot that does not run
+ *  `build:electron` either. So **both cases here skip on every CI run** — they are live only on a
+ *  machine that has packaged at some point. These are a developer-machine guard, not a CI gate,
+ *  and the thing that actually stops a stale bundle shipping is that every packaging path re-runs
+ *  `build-electron` before packing. Said plainly so the coverage is not overread.
+ *
+ *  ⚠️ **On a clone that HAS a `dist/`, this reddens `verify` after any change to the MCP source
+ *  until `npm run build:electron` runs** — including one that arrives via a `git merge`, which is
+ *  how it first fired: main brought #889's `contracts.ts` changes in and the local bundle was
+ *  behind. That is the guard working (a Windows dev editor spawns this exact file), but it is a
+ *  real cost on every clone, so it is called out here rather than discovered. */
 describe('the SHIPPED modoki-mcp bundle (#945 B1)', () => {
   const shipped = fs.existsSync(mcpOutfile);
 
@@ -125,6 +133,11 @@ describe('the SHIPPED modoki-mcp bundle (#945 B1)', () => {
     // This is NOT the "rebuild your own copy" defect #945 is about. The rebuild here is an
     // ORACLE for currency; the artifact under test is still the shipped file, which the next case
     // spawns. Restating the options would be the defect — they come from `mcpBuildOpts.mjs`.
+    // ⚠️ **esbuild's bundle output is `process.cwd()`-dependent** — the same options run from `/`
+    // produce a different byte count than from the repo root, because the module-path comments it
+    // emits are relative to the cwd. This case is valid only because npm runs BOTH vitest and
+    // `build:electron` from the repo root; invoked from elsewhere it would report a false STALE.
+    // If this ever needs to survive an arbitrary cwd, pin `absWorkingDir` in `mcpOpts`.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mcp-current-'));
     try {
       // Same basename, because `sourcemap: true` bakes `//# sourceMappingURL=<basename>.map`
