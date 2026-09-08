@@ -26,6 +26,7 @@ import {
   configureIap, resetIap, purchase, reconcile, isEntitled, balanceOf,
   type StoreBackend, type StoreTransaction, type IapLedgerStore, type IapProduct,
 } from '../../src/runtime/iap';
+import type { ConfigureIapOptions } from '../../src/runtime/iap/purchaseService';
 
 const COINS: IapProduct = { id: 'coins.100', kind: 'consumable', grant: 100 };
 const NOADS: IapProduct = { id: 'noads', kind: 'non-consumable' };
@@ -99,9 +100,56 @@ let disk: FakeDisk;
 let store: FakeStore;
 
 /** Boot a session against the CURRENT disk + store. Called once per simulated launch. */
-function launch(): void {
+function launch(onGrant?: ConfigureIapOptions['onGrant']): void {
   resetIap();
-  configureIap({ backend: store, store: disk, products: CATALOG });
+  configureIap({ backend: store, store: disk, products: CATALOG, onGrant });
+}
+
+/**
+ * A game whose truth lives OUTSIDE the ledger — a coin wallet, in effect (#371). Survives a
+ * simulated crash exactly like `FakeDisk` does, which is what lets the rows below distinguish
+ * "the engine granted" from "the player actually has the coins".
+ */
+class FakeGame {
+  coins = 0;
+  /** The hook's own idempotency key set — the contract `IapGrant.transactionId` demands. */
+  applied = new Set<string>();
+  /** Insertion order of `applied`, so a simulated relaunch can drop exactly the LAST mark — the
+   *  one that raced the process death — not an arbitrary one. */
+  private appliedOrder: string[] = [];
+  /** Simulate the game failing to store its half (a full disk, a rejected write). */
+  refuse = false;
+  /** Simulate the hook throwing rather than returning false. */
+  throws = false;
+  /** Court's real ordering (finding 3/6): credit the coins and mark applied FIRST, and only then
+   *  refuse — e.g. because a later durability confirm failed. Unlike `refuse`, the credit and the
+   *  mark are already made before this returns false, which is what lets a row reproduce finding
+   *  1/2's window instead of designing it out. */
+  refuseAfterCredit = false;
+  calls = 0;
+
+  hook = (g: { transactionId: string; units: number }): boolean => {
+    this.calls++;
+    if (this.throws) throw new Error('simulated: the game could not write');
+    if (this.refuse) return false;
+    // Idempotent by transaction id — the hook sees repeats by design.
+    if (!this.applied.has(g.transactionId)) {
+      this.coins += g.units;
+      this.applied.add(g.transactionId);
+      this.appliedOrder.push(g.transactionId);
+    }
+    if (this.refuseAfterCredit) return false;
+    return true;
+  };
+
+  /** Simulate a relaunch where the idempotency MARKER write was rejected while the coin write
+   *  landed — the exact asymmetry finding 1 describes for `court.iap.applied`. Drops only the most
+   *  recently added mark; `coins` is untouched, because this object IS the durable wallet and the
+   *  credit already survived. */
+  loseLastMark(): void {
+    const last = this.appliedOrder.pop();
+    if (last !== undefined) this.applied.delete(last);
+  }
 }
 
 beforeEach(() => {
@@ -358,5 +406,163 @@ describe('concurrent settle — the store is destructive, so the ledger alone is
     expect(balanceOf(COINS.id)).toBe(100);        // credited once
     expect(store.finishCalls).toBe(1);            // and finished once — the destructive step
     expect(store.acknowledgeCalls).toBe(1);
+  });
+});
+
+/**
+ * The grant hook (#371) — invariant 1 extended to the GAME's own state.
+ *
+ * Every row here is about the same window: the engine's ledger is durable, but the game's wallet is
+ * not yet. Without the hook the finish lands in that window and the purchase is gone, because a
+ * finished transaction is never re-delivered. These prove it cannot.
+ */
+describe('the grant hook — the consume is LAST, after the GAME has written', () => {
+  it('runs before the finish, and a refusal withholds it so the purchase survives', async () => {
+    const game = new FakeGame();
+    game.refuse = true;
+    launch(game.hook);
+
+    const r = await purchase('coins.100');
+    expect(r.outcome).toBe('failed');
+    // The destructive step never happened — this is the whole point.
+    expect(store.finishCalls).toBe(0);
+    expect(game.coins).toBe(0);
+
+    // Next launch, with the game able to write again: the store re-delivers and the player is paid.
+    game.refuse = false;
+    launch(game.hook);
+    await reconcile();
+    expect(game.coins).toBe(100);
+    expect(store.finishCalls).toBe(1);
+  });
+
+  it('a THROWING hook is treated as a refusal, never as a reason to finish anyway', async () => {
+    const game = new FakeGame();
+    game.throws = true;
+    launch(game.hook);
+
+    const r = await purchase('coins.100');
+    expect(r.outcome).toBe('failed');
+    expect(store.finishCalls).toBe(0);
+
+    game.throws = false;
+    launch(game.hook);
+    await reconcile();
+    expect(game.coins).toBe(100);
+  });
+
+  it('⚠️ runs on the ALREADY-GRANTED path — the crash between the ledger write and the game write', async () => {
+    // THE row this hook exists for. The ledger records the grant, then the process dies before the
+    // game stores its half. On relaunch the ledger says "processed", so without the hook running on
+    // that path the settle would go straight to the finish and the coins would never arrive — with
+    // no re-delivery left to repair it, because finishing is what stops re-delivery.
+    const game = new FakeGame();
+    game.refuse = true;                 // the game's write fails; the ledger's succeeds
+    launch(game.hook);
+    await purchase('coins.100');
+
+    // The engine believes it granted — the ledger holds the units.
+    expect(balanceOf('coins.100')).toBe(100);
+    // The player does not have them, and the transaction is still open.
+    expect(game.coins).toBe(0);
+    expect(store.finishCalls).toBe(0);
+
+    // Relaunch: the store re-delivers, the ledger no-ops, and the hook runs anyway.
+    game.refuse = false;
+    launch(game.hook);
+    await reconcile();
+
+    expect(game.coins).toBe(100);
+    expect(store.finishCalls).toBe(1);
+  });
+
+  it('credits ONCE across many relaunches, because the hook keys on the transaction id', async () => {
+    // The mirror of row 3 above: the hook seeing repeats is by design, so it must be the hook's own
+    // idempotency that stops the double credit — not the engine skipping the call.
+    const game = new FakeGame();
+    store.failFinish = true;
+    launch(game.hook);
+    await purchase('coins.100');
+    expect(game.coins).toBe(100);
+
+    for (let i = 0; i < 5; i++) {
+      launch(game.hook);
+      await reconcile();
+    }
+    expect(game.coins).toBe(100);
+    expect(game.calls).toBeGreaterThan(1);   // it really was re-offered
+
+    store.failFinish = false;
+    launch(game.hook);
+    await reconcile();
+    expect(game.coins).toBe(100);
+    expect(store.finishCalls).toBe(1);
+  });
+
+  it('is OPTIONAL — omitting it leaves the subsystem exactly as it was', async () => {
+    // `games/iap-test` and every other existing caller pass no hook. Their behaviour must not move.
+    launch();
+    const r = await purchase('coins.100');
+    expect(r.outcome).toBe('granted');
+    expect(balanceOf('coins.100')).toBe(100);
+    expect(store.finishCalls).toBe(1);
+  });
+
+  it('no consume without a grant: refusing AFTER a durable credit still withholds the finish', async () => {
+    // Court's real ordering (finding 6): the hook credits `coins` and marks applied BEFORE it can
+    // refuse, e.g. because a later durability confirm failed. Unlike the plain `refuse` rows above,
+    // the credit already landed — this row is the one that would catch a "finish on any return
+    // value" regression that `refuse` (which never touches `coins`) cannot.
+    const game = new FakeGame();
+    game.refuseAfterCredit = true;
+    launch(game.hook);
+
+    const r = await purchase('coins.100');
+    expect(r.outcome).toBe('failed');
+    expect(game.coins).toBe(100);          // the durable credit landed
+    expect(store.finishCalls).toBe(0);     // but it is NOT consumed — no finish without an affirmative grant
+
+    // Re-delivered repeatedly while the hook keeps refusing: still never finished.
+    for (let i = 0; i < 3; i++) {
+      launch(game.hook);
+      await reconcile();
+      expect(store.finishCalls).toBe(0);
+    }
+  });
+
+  it('no double credit: the engine never finishes without an affirmative grant, however many ' +
+     'times a lost marker forces the hook to be re-invoked', async () => {
+    // Models finding 1's failure mode end to end: the marker write ( `applied` ) races the process
+    // death and is lost while the value write ( `coins` ) survives. `FakeGame.loseLastMark()`
+    // simulates exactly that loss.
+    //
+    // A hook built like this — naive about a lost mark — WILL re-credit on the next delivery; that
+    // is not something this engine can prevent, because it never sees the game's own idempotency
+    // state. It is the failure `courtOnGrant` must be durability-safe against (write the mark and
+    // the value as one durable unit, per plan §8's "how to fix these"), so this row does not assert
+    // a final `coins` value either way — asserting a doubled balance as expected would codify the
+    // bug finding 1 exists to prevent. What the ENGINE guarantees, and what is asserted below, is
+    // narrower but load-bearing: it never finishes a transaction whose hook has not affirmatively
+    // returned true, and it keeps re-invoking the hook on every re-delivery, so a durability-safe
+    // hook gets the chance to recover.
+    const game = new FakeGame();
+    game.refuseAfterCredit = true;
+    launch(game.hook);
+
+    const first = await purchase('coins.100');
+    expect(first.outcome).toBe('failed');
+    expect(store.finishCalls).toBe(0);
+    expect(game.calls).toBe(1);
+
+    // The marker write is lost across the simulated relaunch; the credit is not.
+    game.loseLastMark();
+
+    launch(game.hook);
+    await reconcile();
+
+    // Re-invoked, and STILL never finished — the engine's guarantee holds regardless of what the
+    // hook's own idempotency did or did not preserve.
+    expect(game.calls).toBe(2);
+    expect(store.finishCalls).toBe(0);
   });
 });

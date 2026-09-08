@@ -68,8 +68,23 @@ export interface VideoHandle {
   setMuted(muted: boolean): void;
   /** Base rate, BEFORE timeScale. `applyTimeScale` multiplies onto this. */
   setRate(rate: number): void;
+  /** #433: live-applied, like `setMuted`/`setRate` — a game (or the Inspector) toggling
+   *  `VideoPlayer.loop` takes effect on the running element immediately. */
+  setLoop(loop: boolean): void;
+  /** #433: live-applied. Changes `effectiveRate()`, so this reapplies the rate immediately
+   *  rather than waiting for the next `applyTimeScale` call to notice. */
+  setTimeMode(mode: VideoTimeMode): void;
   readonly ended: boolean;
   readonly timeMode: VideoTimeMode;
+  /** #431: true only once playback is OBSERVED running — `!paused && !blocked && !ended`.
+   *  Deliberately excludes `readyState` (jsdom reports 0 always, which would make this
+   *  unreachable in tests, and a real element that hasn't buffered a frame yet still counts
+   *  as "playing" for this contract's purposes: it is not autoplay-blocked and not paused). */
+  readonly playing: boolean;
+  /** True when the last `play()` request was refused (autoplay policy, almost always) and the
+   *  clip is waiting for a gesture. Distinct from `paused`: the game ASKED for playback and did
+   *  not get it. `videoSystem` reports this once per refused play REQUEST — see `@video.blocked`. */
+  readonly autoplayBlocked: boolean;
   dispose(): void;
 }
 
@@ -92,7 +107,9 @@ let currentTimeScale = 1;
 
 class LiveVideoHandle implements VideoHandle {
   readonly element: HTMLVideoElement;
-  readonly timeMode: VideoTimeMode;
+  // Not `readonly`: #433 makes `timeMode` live-appliable via `setTimeMode`. The interface's
+  // own `timeMode` stays `readonly` — nothing outside this class reassigns it directly.
+  timeMode: VideoTimeMode;
   /** Set by the element's `ended` EVENT. Never read directly — see the `ended` getter. */
   private endedEvent = false;
 
@@ -116,6 +133,15 @@ class LiveVideoHandle implements VideoHandle {
     if (this.endedEvent) return true;
     return !this.element.loop && this.element.ended;
   }
+  /** #431: see the interface doc. Read by `videoSystem` BEFORE it calls `play()` each pass —
+   *  see that call site for why the ordering matters. */
+  get playing(): boolean {
+    return !this.element.paused && !this.blocked && !this.ended;
+  }
+  /** True when the last `play()` request was refused (autoplay policy, almost always) and the
+   *  clip is waiting for a gesture. Distinct from `paused`: the game ASKED for playback and did
+   *  not get it. `videoSystem` reports this once per refused play REQUEST — see `@video.blocked`. */
+  get autoplayBlocked(): boolean { return this.blocked && !this.disposed; }
   /** Base rate the game asked for, before timeScale is folded in. */
   private baseRate = 1;
   /** True when a `play()` was rejected by the autoplay policy and is awaiting a gesture. */
@@ -228,6 +254,11 @@ class LiveVideoHandle implements VideoHandle {
    *  deliberately — a gesture must not override the game's intent. */
   retryBlockedPlay(): void {
     if (this.disposed || !this.blocked || this.deliberatelyPaused || this.ended) return;
+    // Time-stopped (e.g. a pause menu): don't start a blocked clip (and its audio) under
+    // it. The retry comes from `applyTimeScale`, which calls this again on the next
+    // timeScale TRANSITION — NOT from `applyRate`, whose resume path excludes a blocked
+    // clip on purpose (it runs per frame via videoSystem's setRate/setTimeMode).
+    if (this.effectiveRate() <= 0) return;
     void this.attemptPlay();
   }
 
@@ -254,6 +285,26 @@ class LiveVideoHandle implements VideoHandle {
 
   setRate(rate: number): void {
     this.baseRate = rate;
+    this.applyRate();
+  }
+
+  setLoop(loop: boolean): void {
+    if (this.disposed) return;
+    this.element.loop = loop;
+    // Turning loop ON must un-strand a clip that already ended: the `ended` getter's own
+    // `!element.loop &&` term already treats a looping element as never ended, but
+    // `endedEvent` (latched by the element's `ended` DOM event, cleared only by `seek()`) is
+    // OR'd in ahead of that term and stays set regardless of `loop`. Left set, `ended` reads
+    // true forever, and `play()`'s `if (this.ended) return;` refuses to ever resume it — a
+    // clip that is live-applied `loop:true` but never plays again. Clearing it here makes the
+    // flag agree with the getter: a looping element cannot be "ended".
+    if (loop) this.endedEvent = false;
+  }
+
+  setTimeMode(mode: VideoTimeMode): void {
+    this.timeMode = mode;
+    // `effectiveRate()` depends on `timeMode` — reapply now, or the change is invisible
+    // until the next `applyTimeScale` call happens to run.
     this.applyRate();
   }
 
@@ -307,7 +358,15 @@ export function playVideo(spec: VideoPlaySpec): VideoHandle {
 export function applyTimeScale(timeScale: number): void {
   if (timeScale === currentTimeScale) return;
   currentTimeScale = timeScale;
-  for (const h of live) h.applyRate();
+  for (const h of live) {
+    h.applyRate();
+    // #545: a clip that was gesture-unlocked DURING a time-stop refused to start then
+    // (retryBlockedPlay's effectiveRate guard) and is still carrying `blocked`. Nothing
+    // else is guaranteed to retry it — a second gesture may never come — so a timeScale
+    // TRANSITION is where it gets its retry. Safe to call unconditionally: retryBlockedPlay
+    // self-guards on disposed/blocked/deliberatelyPaused/ended and on the rate still being 0.
+    h.retryBlockedPlay();
+  }
 }
 
 /** Stop and release every live clip (scene teardown / Stop). */

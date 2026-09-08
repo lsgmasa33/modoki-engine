@@ -32,7 +32,9 @@ game just imports and calls it; there is no registration.
 | `runtime/storage/playerPrefs.ts` | The singleton, the sync API, the envelope, and the debounced write pipeline. |
 | `runtime/storage/backends.ts` | `PrefsBackend` interface + `InMemoryBackend` / `LocalStorageBackend` / `PreferencesBackend` + `selectDefaultBackend()`. |
 | `runtime/storage/index.ts` | Re-exports; surfaced from `runtime/index.ts`. |
-| `engine/app/App.tsx` | Hydrates per game (`init({ namespace: gameId, backend: selectDefaultBackend() })`) and registers flush-on-background. |
+| `engine/app/App.tsx` | Hydrates per game (`init({ namespace: gameId, backend: selectDefaultBackend() })`). |
+| `engine/app/useBackgroundFlush.ts` | Registers flush-on-background. Its own module so the edge set can be pinned by a test without rendering the app shell. |
+| `engine/app/useResumeReload.ts` | Flushes and then checks `pendingKeys()` before a resume-reload destroys the realm (#574) — see the first Gotcha. |
 | `engine/packages/modoki/tests/runtime/playerPrefs*.test.ts` | Core, backends, and save→reload→restore integration tests. |
 
 ## API
@@ -43,6 +45,7 @@ import { PlayerPrefs } from '@modoki/engine/runtime';
 type JsonValue = null | boolean | number | string | JsonValue[] | { [k: string]: JsonValue };
 
 await PlayerPrefs.init({ namespace, backend })   // hydrate the cache once at boot (app does this)
+                                                  // → { discardedPending: string[] } (see Gotchas)
 PlayerPrefs.get<T>(key): T | undefined           // sync, returns a fresh copy
 PlayerPrefs.set<T>(key, value): void             // sync into cache; atomic durable write is debounced
 PlayerPrefs.has(key): boolean
@@ -50,7 +53,10 @@ PlayerPrefs.delete(key): void                    // also: set(key, undefined)
 PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
+PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
+PlayerPrefs.swapGeneration(): number              // opaque token — capture before your own await, compare after (see Gotchas)
 PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
+PlayerPrefs.pendingKeys(): string[]               // the authoritative pending set (see Gotchas — NOT keys().filter(hasPendingWrite))
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
 ```
 
@@ -76,21 +82,188 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   else in-memory (SSR / private-mode). Each backend maps one logical key to one atomic
   single-entry write.
 - **Namespacing.** Every key is stored under `mk:<namespace>:<logical>` — the app uses the
-  `gameId`, so two games on the same device/browser can't collide.
-- **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. The version
-  guards the on-disk format (not the game's data shape) so a future migration is possible; a
-  corrupt/unparseable entry fails soft to `undefined`, never a throw.
+  `gameId`, so two games on the same device/browser can't collide. **That guarantee has two parts,
+  and only one is closed.** `init()` is `async`: it captures the prefix, awaits
+  `backend.getAll(prefix)`, then hydrates. Unserialized, a second `init()` could swap the namespace
+  and clear the cache inside that await, and the first call's continuation then poured its rows into
+  the second call's cache — g2's saved data readable *and re-writable* under g3's namespace, since
+  `set()` marks the key dirty and `fullKey()` uses the *current* prefix. **The init-vs-init path is
+  fixed (#428):** `init()` queues on its own promise chain (mirroring the write pipeline below), so
+  an overlapped call is **queued, never superseded and never rejected**, and no two `init()` bodies
+  interleave. Queuing rather than bailing is what keeps `discardedPending` meaningful — the second
+  call runs a *real* swap from the first's finished state instead of reporting `[]` because the
+  first already cleared `dirty`. **The write-side path is closed too (#438):** the OUTGOING
+  `namespace`/`backend`/`cache`/`dirty` stay live for the *entire* `await backend.getAll(prefix)`
+  round-trip — the incoming namespace/backend are computed into locals and installed in one
+  synchronous block right after the await, with no `await` in between. So a synchronous
+  `set()`/`del()`/`clear()` racing the window — e.g. an outgoing game's async auth/sync handler
+  resolving mid-swap — still lands in the *outgoing* namespace, never contaminating the incoming
+  one. `isHydrated()` deliberately stays `true` throughout the window: it is truthfully describing
+  the outgoing store, which has genuinely been read from its backend. Two `dirty`-only pending-key
+  snapshots are taken to tell what happened to a write that raced the window — one just before the
+  await (`preWindowPending`), one at install time (`fullPending`). **`fullPending` does NOT
+  include everything in `preWindowPending`** — a pre-window key that lands successfully during the
+  window (the outgoing backend accepts it before the install runs) drops out of `dirty` and so out
+  of `fullPending`, which is exactly why the discarded report filters `preWindowPending` down to
+  `preWindowPending.filter(k => fullPendingSet.has(k))` rather than reporting the raw snapshot: only a
+  pre-window key STILL pending at install is genuinely lost, reported via `reportDiscarded`. A key
+  that appears in `fullPending` but was NOT in `preWindowPending` was written during the window
+  itself, after the pre-swap flush loop had already finished, and never offered to a flush at all —
+  that's a raced write, reported via `reportRaced`. Neither snapshot sees a `drain()` batch that is
+  genuinely mid-flight (taken out of `dirty` for its own `Promise.all`, not yet settled) at the
+  instant either snapshot is taken — that write's eventual settlement is handled by `drain()`
+  itself, not by `discardedPending`: a late success lands durably in the outgoing store (nothing
+  to report); a late rejection, arriving after the swap has already moved `namespace` away, is
+  reported through `drain()`'s own "already swapped" `console.error` instead — `drain()` captures
+  `batchNamespace`/`batchBackend` locals at the start of each batch precisely so a rejection
+  settling after a swap is reported as lost rather than silently re-queued against the incoming
+  namespace/backend. If `getAll()` throws, the incoming namespace is still installed, but
+  explicitly empty and unhydrated (see the `getAll()`-rejection gotcha below) — this is a fail-loud
+  path, not a silent one. **Callers cannot write during the window either:**
+  `PlayerPrefs.isSwapInFlight()` reports `true` for the duration, and `agentBridge.ts`'s
+  `player-prefs-write` op refuses with `NOT_AVAILABLE_HERE` — ALL FOUR actions, `flush` included,
+  since any of them can settle after the install and answer for a namespace it no longer owns —
+  rather than accept an op it cannot truthfully report on. `player-prefs-read` is NOT refused,
+  since a read during the window answers truthfully about the (still fully hydrated) outgoing
+  store.
+- **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. This is the
+  repo-wide format-versioning pattern applied to saves — the rule, the three verdicts and the
+  decision table covering every versioned document are in
+  [format-versioning.md](./format-versioning.md); PlayerPrefs is where that rule was first
+  settled (#630). The version
+  describes the on-disk format, not the game's data shape. `readEnvelope` **enforces** it (#630 —
+  before that it was stamped on every write and read by nothing, while a comment claimed
+  otherwise). Three outcomes: a version this build understands is read; a corrupt/unparseable
+  entry fails soft to `undefined`, never a throw; an intact envelope under a version this build
+  has **no migration for** — i.e. a save written by a NEWER build — reads as absent *and is
+  protected from being overwritten*.
+- ⚠️ **`set()` can refuse, and a game author should know why.** On a key holding an unreadable
+  (newer-format) save, `set()` warns and does nothing. This is deliberate: the game reads its
+  defaults and plays normally, but must not stomp a save it cannot read, so the player's progress
+  survives if they return to the build that wrote it. Reachable in practice via TestFlight → App
+  Store, a rollback, or reinstalling an older version. The protection is against *silent
+  clobbering*, not the player's intent — `delete()` and `clear()` still remove such a key, and
+  `delete()` frees it for a subsequent `set()`. `get()`/`has()`/`keys()` all report it as absent,
+  deliberately: `has(k) === true` implies `get(k) !== undefined`, and game code relies on that.
+  ⚠️ **That same asymmetry means the durability accessors can disagree with each other** (#630
+  review) — `PlayerPrefs.isProtected(key)` is the way to ask "absent, or present-but-unreadable?"
+  where `has()` cannot answer. A refused `set()` never touches `cache`/`dirty`/the in-flight
+  ledger, so `hasPendingWrite(key)` correctly reports `false` — there genuinely is no pending
+  write — but that made `createPrefsDocStore(key).durable()` (`!hasPendingWrite(key)` alone)
+  report `true` for a write that never happened. `durable()` now also checks `isProtected(key)`,
+  so it is `false` for a refused write; `hasPendingWrite()` is unchanged and still answers its own
+  question correctly. The agent surface's `player-prefs-write` op uses `isProtected` the same way:
+  `action:'delete'` on a protected key proceeds instead of a false `NOT_FOUND` (the key reads as
+  absent from `has()`, same as any other key this protects), and `action:'set'` on one reports the
+  protected cause instead of misdiagnosing it as a non-serializable value.
 - **Write pipeline.** The cache stores the serialized envelope string per key (so `get()`
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;
   a backend rejection (localStorage quota, native I/O) **re-queues the key and never poisons
-  the chain**.
+  the chain**, and the re-queuing drain **schedules its own retry** — backed off from 500 ms and
+  capped at 5 attempts, so a permanently-rejecting backend cannot spin at the debounce interval.
+  Hitting the cap is not permanent: the next `set()`/`del()`/`clear()` re-arms the budget. Before
+  #619 nothing scheduled that retry at all — `scheduleFlush()` is reached only from the three
+  mutators — so "will retry on next flush" promised a flush that might never come.
 - **Lifecycle.** `App.tsx` hydrates on each game load *before* scene load, so systems that
   read saved progress at spawn see it. It flushes on background — `visibilitychange` /
-  `pagehide` on web, Capacitor `App` `appStateChange` on native — and a game swap flushes the
-  outgoing namespace before clearing the cache.
+  `pagehide` on web, Capacitor `App` `appStateChange` **and `'pause'`** on native — and a game swap
+  flushes the outgoing namespace before clearing the cache. ⚠️ **`'pause'` is not redundant with
+  `appStateChange` on Android** (#619): `fireStatusChange(false)` has exactly one caller,
+  `BridgeActivity.onStop()` (and it is gated on `activityDepth == 0`), so a *translucent* Activity
+  on top — Play Billing's `ProxyBillingActivity` is the one that bit us — pauses the host without
+  stopping it and produces **no BACKGROUND `appStateChange`**. ⚠️ Not "no `appStateChange` at all":
+  `fireStatusChange(true)` at `onResume()` is UNCONDITIONAL, so dismissing it fires an
+  `isActive:true` with no `false` before it — see the unpaired-resume warning in
+  [native-and-sdks.md](./native-and-sdks.md) before writing any consumer that assumes the two pair up. `'pause'` comes from
+  `AppPlugin.handleOnPause()` and does fire — measured on the A23, not inferred: behind a translucent
+  Activity `pause` fires alone, with `appStateChange` and `visibilitychange` both silent
+  ([native-and-sdks.md](./native-and-sdks.md) has the table and the HOME-press control). On iOS it maps to `didEnterBackground`, which is *later*
+  than the `willResignActive` already driving `appStateChange(false)`, so there it is a harmless
+  duplicate — additive, never a replacement. Flushing on every pause is free when nothing is
+  pending — `drain()` short-circuits on `dirty.size === 0` before touching the backend — but not
+  while a write is failing: `flush()` also cancels the pending backed-off retry timer, so a burst
+  of pause edges with no intervening write spends the retry budget faster than its backoff
+  intends (more attempts sooner, then silence until the next write re-arms it).
 
 ## Gotchas
+
+- ⚠️ **A game's own document format must be ADDITIVE — owner's ruling, 2026-09-05.** This is about a
+  layer *above* the envelope described in "Envelope" above, and the two are easy to conflate. The
+  scenario: a player leaves TestFlight for the App Store, or reinstalls an older build (a rollback),
+  and the OLD app opens a document a NEWER build wrote. If the old app's reader rebuilds the document
+  from the named fields it knows about and writes that rebuilt object back, every field the newer
+  build added is destroyed — permanently, at the next write. The ruling: an old build's reader must
+  read the fields it understands and **carry through untouched the ones it does not**, rather than
+  stripping them.
+
+  **This is a different exposure than the envelope's own protection, not the same one restated.**
+  #630's envelope protection (above) fires only when the NEWER build also bumped the envelope
+  `SCHEMA_VERSION` — the whole entry then hydrates as unreadable and `set()` refuses outright, so
+  nothing is destroyed. The case this rule is about is the ORDINARY one: an additive change to a
+  game's *own* document shape that does **not** bump the envelope version. The envelope hydrates the
+  document just fine; the game's own reader is what silently drops the fields it doesn't recognise.
+
+  **Reference implementation:** `games/wordweave/runtime/store.ts` (landed in #735, commit
+  `3b78c9425`). `readPurchases` populates an explicit `unknownFields` bag from any top-level key it
+  doesn't recognise; the single `serializePurchases()` is the only place a `StoredPurchases` becomes
+  the plain object PlayerPrefs stores, and it spreads `unknownFields` **first** so the known fields
+  (written last) always win on a colliding key. `IapAppliedEntry` carries an index signature so
+  `readIapApplied`'s `{ ...v, seq, coins }` preserves per-entry additions the same way. `readPurchases`
+  also writes the version back as `Math.max(PURCHASES_SCHEMA_VERSION, raw.v)`, never down — so a v2
+  document read by this v1 build still reports v2 when serialized, and a newer build can tell its
+  document was never downgraded.
+
+  **This is not "trust everything read back."** `readIapApplied` still rejects a per-entry
+  `seq`/`coins` that isn't a finite, non-negative number, exactly as before the fix — a foreign or
+  corrupted document still cannot hand the game a fake "already applied" marker or a negative
+  balance. Only fields the reader has no opinion about ride through untouched.
+
+  ⚠️ **Validation and preservation are NOT cleanly orthogonal — they fork at ENTRY granularity, and
+  additivity loses.** The paragraph above is true field-by-field on the top-level document, but
+  `iapApplied` is a *map* of entries, and the unit `readIapApplied` preserves-or-drops is the whole
+  ENTRY, not the field. An entry failing the `seq`/`coins` check is **dropped in full** — including
+  any per-entry fields a newer build added that this build cannot otherwise read (`IapAppliedEntry`'s
+  index signature) — because there is no way to keep "the parts we don't recognise" of an entry
+  without also keeping the marker itself, and an unvalidatable marker is exactly the fake-marker risk
+  this reader exists to refuse. So the additive rule's real shape here is **additive per FIELD, bounded
+  by validation per ENTRY**: a newer build's *shape* survives being read by an older build only for
+  entries the older build can still validate; an entry it cannot validate is destroyed, not carried.
+  Confirmed by probe: crediting a document holding one already-validated entry (`sub1`) alongside one
+  the reader cannot validate (missing `coins`) writes back `sub1` intact and the other entry gone.
+  This is latent, not live, today — nothing currently writes an `iapApplied` entry in a shape this
+  build cannot validate — but it is the fork the next consumer of this rule will hit, and the reason
+  is documented on `PURCHASES_SCHEMA_VERSION` in `store.ts` as the reference implementation's own
+  exception.
+
+  **The floor knob is a separate question, and it deliberately does not do this job.**
+  `MIN_READABLE_PURCHASES_VERSION` (`store.ts`) and the older `MIN_READABLE_SESSION_VERSION`
+  (`games/wordweave/runtime/save.ts`) exist to refuse a document too OLD to trust, or as the knob to
+  raise the day a bump changes what an EXISTING field *means* (not merely adds one). In `store.ts`
+  today's floor lets a too-NEW document through untouched — the additive pass-through above is what
+  handles it, not the floor. ⚠️ `save.ts`'s floor is currently the OTHER shape: its
+  `isReadableVersion` check is a **two-sided** range (`v >= MIN_READABLE_SESSION_VERSION && v <=
+  SAVE_SCHEMA_VERSION`), so `readLevelSession` still refuses a too-new session document outright
+  today, by a reasoned pre-existing decision (no replayable action log to salvage against, unlike
+  Court's daily state) — that file has not yet been brought in line with this ruling; see the open
+  instances below.
+
+  **Known open instances**, tracked as issues rather than restated here: **#760** (Court — twelve
+  readers rebuild named fields instead of preserving unknowns, three of them on the money key).
+  **#763** (wordweave's own `progress` and `session` documents — `saveProgress`
+  (`games/wordweave/runtime/systems.ts`) writes a literal without reading the stored document at
+  all, and `readLevelSession`'s refusal of a too-new session is not paired with a refusal to
+  overwrite it).
+
+- **`await flush()` resolving is NOT evidence the writes landed — check `pendingKeys()` after it.**
+  `drain()` catches every backend rejection, re-queues the key onto `dirty` and warns, precisely so
+  one failing write cannot poison `writeChain` for the rest of the session. The flush promise
+  therefore resolves identically whether everything landed or nothing did, and a caller that treats
+  it as a success signal is reading a value that cannot fail. The reload-on-resume trigger
+  (`runtime/core/resumeReload.ts`, #574) is the worked example: it flushes, then **declines to
+  reload** while `pendingKeys()` is non-empty, because reloading would destroy the realm holding
+  the re-queued writes. ⚠️ This is a weaker claim than durability even when it passes — empty
+  `pendingKeys()` means *the backend accepted them*, which the bullet below is about.
 
 - **Atomic ≠ durable, and `flush()` does NOT close that gap — it is not an fsync on ANY backend.**
   A crash right after `set()` can lose that write; it is never partially written. `flush()` gets the
@@ -157,6 +330,134 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
   `false` means the platform accepted it, not that it is on the platter.
 
+  ⚠️ **A write that is IN FLIGHT is reported as pending (#559) — one awaited `flush()` is enough.**
+  This was not always true, and the history matters because two money defects came out of it.
+  `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the backend, and
+  both accessors used to read `dirty` alone — so for the whole duration of every batch each write
+  in it reported as landed, even though none had been accepted and one might be about to be
+  rejected. Court hit it twice (#532 F17, where a gate credited coins for a rejected write and
+  logged nothing; #558, the same shape in account deletion) and worked around it game-side with a
+  flush-until-stable loop, which could not close it either: under a repeating concurrent flush BOTH
+  of that loop's samples land mid-drain and agree — measured 8/8 from a 1 ms to a 100 ms churn
+  cadence. **No caller could have fixed this**, because "a drain is in flight" is private to
+  `playerPrefs.ts`. The store now keeps an in-flight ledger and the accessors read the union of it
+  and `dirty`, so a write is pending from the moment it is queued until the backend settles it.
+
+  ⚠️ **`pendingKeys()` and `queuedKeys()` answer DIFFERENT questions — do not merge them.**
+  `pendingKeys()`/`hasPendingWrite` mean "has the backend accepted this yet", so they must include
+  in-flight writes. `queuedKeys()` means "queued and never offered to a flush at all", which is what
+  `init()`'s swap-discard report needs — an in-flight write WAS offered. Folding in-flight state
+  into that report was tried in #438 round 4 and announced a write that goes on to SUCCEED as
+  discarded; it was reverted then, and widening the shared accessor silently reintroduced it during
+  #559 until the two were split. The four #454 swap tests are what caught it.
+
+  ⚠️ **The lesson from #559, which generalises past this module: a documented gap becomes a
+  licence.** The under-report was pinned by a TEST asserting it as intended — titled "pinning KNOWN
+  behaviour the doc now qualifies, not a bug" (#422, `7630bed04`, 2026-08-29). Both money defects
+  that followed (#532 C3b's F17 and #558) landed on 2026-09-01 and each built a game-side workaround
+  ON TOP of the documented behaviour rather than questioning it; neither fixed the layer that could
+  actually close it.
+
+  ⚠️ Two corrections to an earlier draft of this paragraph, both caught in review and both worth
+  keeping as the scar. It said the gap was known for **"months"** and that **"four months"** of
+  nobody re-litigating it was made to feel reasonable — the real interval is **three days**
+  (`7630bed04` → `681176252`), an unmeasured figure asserted in the very paragraph arguing that
+  claims must be measured, and shipped into `docs/**`, which is a publish surface. It also said both
+  defects **"cited"** the test's framing; a repo-wide grep finds no such citation in either commit,
+  so that is downgraded to what is actually visible — they worked around the behaviour rather than
+  challenging it. Three days was enough. The lesson does not need the number inflated, and inflating
+  it is the failure it describes.
+
+  The second half is about where evidence has to come from. #559's severity was set by REASONING —
+  a claim that Court's wipe path churned once per frame, which made the false-confirm look live in
+  production. It was false — and the CORRECTION was then partly false too, in the other direction,
+  so the same sentence needed fixing twice before it was right. It was only ever settled by someone
+  reading the code rather than the argument, three times running. Reasoning set the priority; observation corrected it. Several other
+  claims in the same change went the same way, always prose asserting a mechanism, never wrong code.
+  **When a durability claim decides what gets built, measure it before it sets.**
+
+  **An irreversible step still wants `await flush()` then `hasPendingWrite`** — that pair is the
+  durability check, and it is sound again. A repeated-flush loop is now only a RETRY convenience
+  (each turn re-attempts a rejected write), not a correctness requirement. Court's
+  `flushToStablePoint()` is retained on that reduced basis.
+
+- ⚠️ **`keys()` cannot see a rejected DELETE — use `pendingKeys()`, not `keys().filter(hasPendingWrite)`.**
+  `delete(key)` removes the key from `cache` (and so from `keys()`) in the same call that marks it
+  `dirty`, so a key with a rejected `backend.remove()` is dirty and simultaneously absent from every
+  cache-derived view. `pendingKeys()` reads `dirty` directly and is the only source that sees it
+  (#422 — the agent-facing `player-prefs` ops reported `pendingWrites: []` for exactly this case
+  before the fix). ⚠️ It reads the union of `dirty` and the in-flight ledger, NOT `dirty` alone, and
+  the "authoritative only at a stable point" qualifier this bullet used to carry is gone with #559 —
+  see the bullet above. Do not re-add it; a reader who takes the two bullets together would
+  otherwise conclude a bare `await flush()` is still unsound and rebuild the game-side loop #559
+  exists to retire.
+
+- ⚠️ **`init()` DISCARDS whatever a failed flush re-queued — it now REPORTS this instead of
+  silently dropping it (#421).** `init()` clears `cache`/`dirty` unconditionally to hydrate the new
+  namespace/game, and the swap PROCEEDS regardless — a quota-exceeded phone must not hard-block an
+  OTA sub-game switch. But `dirty` can be non-empty when it does, for up to THREE distinct reasons,
+  and `init()` now `console.error`s the discarded keys — through a message specific to each reason —
+  and returns the union as `discardedPending` (sorted):
+  - **A real game swap** (`init()` re-called while already hydrated): the pre-swap step drains to
+    CONVERGENCE, not `flush()`'s bounded two drains — `flush()` alone snapshots `dirty` before
+    awaiting the backend, so a `set()` landing during its second drain is never attempted by anyone
+    and would otherwise be reported as "rejected" when it was never even tried (#421 review). If the
+    loop converges, anything still `dirty` was genuinely **rejected by the backend** (quota, native
+    I/O). If it hits its cap (`MAX_PRESWAP_FLUSHES`) still changing, the message says explicitly that
+    some keys may have been attempted-and-rejected and others may never have been attempted — it
+    does not claim either. Either way, the outgoing game's last write to that key is lost.
+  - **The very first `init()` call**: no flush runs on this path at all, so a dirty key here was
+    `set()` *before* `init()` ever ran — it only ever lived in the throwaway `'default'`-namespace
+    cache `init()` is about to clear, and nothing was ever sent to a backend. This is the "every
+    signal says success" case above (a caller bug — writing before `init()`), not a rejection, and
+    the message says so — do not conflate the two in a message, that conflation is what cost two
+    review rounds on #422's sibling issue.
+  - **A write that raced the swap window (#438):** written by the outgoing game *during* the
+    `await backend.getAll(prefix)` round-trip, after the pre-swap flush loop above had already
+    finished — never offered to a flush at all, and discarded by the synchronous install the
+    instant it runs. Reported through its own message (`reportRaced`) that says exactly this,
+    rather than blaming the backend the way the first bullet's message would.
+    **Two shapes reach this message, not one (#454 B).** The second is a key that was pending
+    *before* the window, LANDED durably during it, and was then re-set before the window closed:
+    it is back in the pending set at install time and, by set membership alone, is
+    indistinguishable from a key the backend never accepted — so it used to be reported as
+    discarded, blaming a backend that had in fact accepted the write. `drain()` records every
+    accepted key into a `windowLanded` set while a window is open, which is what tells the two
+    apart; `discardedPending` (the caller-visible union) was already correct and is unchanged by
+    this — only the console attribution moved. `windowLanded` tracks the LATEST attempt for a
+    key, not "ever landed" (review finding 1) — a key that lands, is re-set, and whose re-write
+    is then genuinely rejected goes back to being reported as discarded, not raced. There are
+    therefore four outcomes for a pre-window key, not two: never lands (discarded); lands and
+    stays landed (reported nowhere); lands and is re-set with the re-write still pending (raced);
+    lands, is re-set, and the re-write is rejected (discarded again).
+  Both callers (`App.tsx`'s `GameShell` boot effect, `editor/setup.ts`'s `createGameEditor`) log the
+  discarded keys with the outgoing/incoming game context `init()` itself doesn't have. Neither
+  routes this through the event journal — a game swap is a two-world atomic swap, and the journal is
+  per-world, so the record would land in the world being discarded.
+
+  ⚠️ **A `getAll()` rejection leaves `hydrated` correctly `false`, not stale-`true`.** `init()` sets
+  `hydrated = false` immediately after clearing `cache`/`dirty`, before the `await backend.getAll()`
+  — so a throw there is answered as "not hydrated" (the true state for the new namespace) rather
+  than carrying over the PREVIOUS namespace's `true`. `agentBridge.ts`'s `prefsUnhydrated()` gates
+  every prefs read/write on this flag; before this, a throwing `getAll()` left it stale-true and a
+  caller got `keys: []` for a store it never actually opened, indistinguishable from a genuinely
+  empty one.
+
+  ⚠️ **`GameShell` is the only in-process seam that reaches the swap case — File → Open Project in
+  the Electron editor cannot, and neither can the web-served editor, for two different reasons.**
+  #421 named "File → Open Project in the editor" as a discard seam; it is not one. In the Electron
+  editor, `setProject` ends with `mainWindow.webContents.reloadIgnoringCache()`
+  (`engine/electron/main.ts`), so `createGameEditor` always runs in a FRESH renderer with
+  `hydrated === false` and the pre-swap flush never executes there. In the web-served editor there
+  is no in-process "Open Project" action at all to begin with — `EditorApp`'s `React.lazy(() =>
+  createGameEditor())` is a module-level constant evaluated once per page load
+  (`engine/app/App.tsx`), and the project a dev server serves is fixed by `MODOKI_PROJECT` at server
+  start; "File → Open Project" itself is an Electron-only native menu item (`onOpenProject` in
+  `engine/electron/main.ts`), absent from the web build. Either way, `createGameEditor` can only
+  ever hit the write-before-`init()` case. The live swap seams are an **OTA sub-game switch** and
+  **hash navigation between two baked games**, both re-entering `GameShell`'s `[gameId]` boot effect
+  in a live process.
+
 - **No cross-key transaction.** Two values that must stay consistent belong in **one** key.
 - **JSON only.** `undefined` deletes the key. A top-level function/symbol or a cyclic value is
   skipped with a warning (not stored). Nested functions are dropped by `JSON.stringify`;
@@ -171,7 +472,7 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 /api/player-prefs`) expose the store to an agent; `device_player_prefs` / `device_write_player_prefs`
 are the on-device twins. Split in two per `docs/mcp-tool-conventions.md` §7 ("if one argument value
 changes whether it writes to disk, it is more than one tool") — verified in the code: `get`/`keys`/
-`has`/`hasPendingWrite` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
+`has`/`hasPendingWrite`/`pendingKeys` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
 `set`/`delete`/`clear` all dirty a key and schedule a durable write.
 
 Every reply names its `namespace`, and it must be read, not assumed: the editor deliberately
@@ -186,12 +487,86 @@ nothing survives.
 `set`/`delete` flush before replying, so `saved:true` means the backend accepted the durable write;
 a rejected write (quota, native I/O error) keeps its value in the cache, so a read-back structurally
 cannot see the failure (see `hasPendingWrite` above) — such a write reports PARTIAL, never success.
+
+ALL FOUR actions — `set`/`delete`/`clear`/`flush` — are refused with `NOT_AVAILABLE_HERE` while a
+game/namespace swap is in flight (`PlayerPrefs.isSwapInFlight()` — see Gotchas, #438), `flush`
+included. ⚠️ **That refusal is an INTERVAL, not a sample (#454 C).** The entry-time check only
+answers for the instant the op started; a swap landing during one of the op's own
+`await PlayerPrefs.flush()` calls would let the `pendingKeys()`/`hasPendingWrite()` readback
+answer against the INCOMING namespace and report a clean success for writes belonging to the
+outgoing store. So the op captures `PlayerPrefs.swapGeneration()` alongside the namespace at entry
+and re-checks it after **every** internal flush, degrading the reply if it moved.
+
+**This post-flush check does NOT refuse (#454, review finding 2).** By the time it can fire, the
+mutation has already happened — the cache write landed, and a durable write was at least
+attempted against the outgoing namespace — so `NOT_AVAILABLE_HERE` (which at entry truthfully
+means "nothing was done") would be a lie here; worse, a caller retrying a `delete` whose durable
+remove already landed would then see `NOT_FOUND: nothing was deleted` and conclude its delete
+never happened. Instead it reports `PARTIAL` with `durability:'unknown'`, merging in whichever
+facts that action already knows are true (`deleted:true`, `cleared:<n>`, etc.) but never a
+`saved`/`pendingWrites` field — those are exactly what's unknown. The check is also deliberately
+**conservative**: it fires whenever a swap started during the await, even in cases where the
+readback would in fact still have been truthful (the swap may be parked behind this op's own
+`writeChain` and not yet installed) — over-reporting "unknown" is the safe direction, claiming a
+durability we could not observe is not.
+
+It is a generation counter rather than a second `isSwapInFlight()` sample because a swap that
+opens *and closes* entirely inside the op's await leaves that flag back at `false` by the time the
+op resumes — a re-sampled flag structurally cannot see it, and a monotonic counter can. The
+counter's justification is defence-in-depth plus a genuinely reachable case: two queued `init()`
+calls where one completes entirely inside this op's own await (`initChain` serializes them, so the
+first can finish before the second even starts). A swap that both opens and fully closes *inside a
+single `init()`'s own body* while parked behind this op's `writeChain` proved impossible to
+construct against the real, serialized `init()` — any swap on an already-hydrated store must
+itself call `flush()` before it can install, and that `flush()` shares this op's own `writeChain`,
+so it cannot finish before this op's own gated write settles. Don't present that unconstructible
+case as the driver for the counter; the review's own regression test records that it could not be
+built.
+
+A round-4 fix exempted `flush` on the theory that draining whatever the outgoing store already
+owes is harmless — but a `flush` that is still draining when the install runs settles *after* the
+swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply) answers against the
+already-installed INCOMING namespace instead: a write that never landed anywhere reported
+`{ok:true, flushed:true, pendingWrites:[]}`, a false success. The same reasoning applies to
+`set`/`delete`/`clear`: even where the write itself durably lands in the OUTGOING backend, this op
+cannot truthfully report so once the swap has moved the namespace out from under it. Reads are NOT
+refused during the same window — a read answers truthfully about the (still fully hydrated)
+outgoing store, since there is nothing for it to settle across.
+
+**A second production consumer of `swapGeneration()` — `probeVerdictProvider`'s `write()` (#487)
+— shows the other shape this pattern takes.** `agentBridge.ts`'s check above fires AFTER the
+mutation has already happened, so it can only degrade the reply (`PARTIAL`, `durability:'unknown'`);
+it cannot undo a write already attempted. The probe-verdict check fires BEFORE its write, so it CAN
+refuse outright, and does — a verdict whose captured namespace or generation no longer matches is
+dropped, not stored. Dropping is safe there specifically because the cost is one re-probe next
+launch; a durable-write consumer rarely has that option. **The generalizable fact: what a
+post-await session check should DO depends on whether the mutation it's guarding has already
+happened** — refuse before, degrade after. See `docs/rendering.md` § "The boot ramp probe" for the
+probe's own mechanics; this is only the `swapGeneration()`-consumer shape of it.
+
 `action` is required on the WRITE tool (the read takes only an optional `key`), and
 `action:'clear'` additionally requires `confirm:true` — one rule on both surfaces, and on the device
 the target is a real player's save data on an installed app.
 
 `PlayerPrefs` gained a `namespace()` getter for this (`runtime/storage/playerPrefs.ts`) — a key list
 is meaningless without knowing which store it came from.
+
+Three behavioural refinements to the op contract (#422 follow-up — a key dirty-and-absent-from-cache
+is not proof of a rejection; it's the identical signature an ordinary DEBOUNCED write leaves too):
+
+- **`delete` on a key that is dirty and absent from the cache flushes rather than assuming a
+  rejection.** If the flush settles it (the key was only ever debounced, never attempted), the op
+  returns `ok:true, deleted:true, saved:true, alreadyRemoved:true` — the durable remove genuinely
+  happened, this call just performed it. Only if the flush leaves the key pending does it return
+  `PARTIAL` (the backend actually rejected it).
+- **The named-key read's `present:false` branch carries `pendingWrite`**, but that flag means "the
+  durable remove has not been accepted yet" — rejected, or merely still debounced — not "still on
+  disk". `player-prefs-read` never flushes, so it can't settle which one it is; it only reports the
+  ambiguity.
+- **`clear`'s `PARTIAL` separates keys this call enumerated from keys already pending beforehand.**
+  `pendingWrites` is the honest full dirty set; `failed` (keys this clear's own `flush()` retried and
+  saw rejected again) and `alsoPending` (dirty before the clear ran) are reported as separate clauses
+  so the count in the message stays consistent with `cleared`/`keys`.
 
 ## Related
 

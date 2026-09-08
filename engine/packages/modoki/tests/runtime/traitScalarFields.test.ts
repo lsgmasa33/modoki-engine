@@ -50,6 +50,7 @@ const ALLOWLIST = new Set<string>([
   'Input.pressed',                // Record<DigitalAction,boolean> — rising edges
   'Input.released',               // Record<DigitalAction,boolean> — falling edges
   'Input.pointer',                // PointerFrame — pos/down/drag of the active pointer, rewritten each frame
+  'Input.gesture',                // GestureFrame — multi-touch pan/pinch/tap, rewritten each frame (#443)
   // AudioSource.clips is a JSON-STRING scalar bank (like Collider2D.points), NOT a
   // non-scalar field — so it passes the guard automatically, no allowlist entry.
   // SpriteAnimator.clips was migrated to a GUID-referenced .spriteanim.json asset

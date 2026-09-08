@@ -12,6 +12,7 @@ import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { WDA_NOT_IOS_REASON, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
 import { _resetDeviceCdpStateForTests, _setDeviceCdpSessionProbeForTests } from '../../plugins/backend/deviceCdp';
 import { _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
+import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
 /** Minimal lease-speaking device that also echoes a data method.
  *  `dataMethods` adds canned answers for other methods (e.g. `screenshot`). */
@@ -549,5 +550,159 @@ describe('/api/device/request sizes the transport deadline from the op (#153)', 
     await post('/api/device/request', { method: 'eval', params: { code: '1', timeoutMs: 'soon' } });
     await post('/api/device/request', { method: 'eval', params: { code: '1', timeoutMs: -5 } });
     expect(seen.every((d) => d === undefined)).toBe(true);
+  });
+
+  // LOW 4 (#682 close-out round 3): `refuseUndeliverableDeviceInput`'s own `input-deliverability`
+  // probe used to hardcode NO deadline at all, paying the connection's flat 5000ms default even
+  // when the op it is guarding carries its own (larger or smaller) budget — an extra, unsized round
+  // trip ahead of the very path `deviceConnection.proxy(m, p, deadline)` above already sizes
+  // correctly. It must receive the SAME sized deadline as every other proxy call this request makes.
+  it("a CDP-routable method's input-deliverability probe carries the OP-SIZED deadline too, not the flat default", async () => {
+    const seenCalls: Array<{ method: string; timeoutMs?: number }> = [];
+    deviceConnection.proxy = (async (m: string, _p: Record<string, unknown>, timeoutMs?: number) => {
+      seenCalls.push({ method: m, timeoutMs });
+      if (m === 'input-deliverability') {
+        return {
+          visibilityState: 'visible', hasFocus: true,
+          frameLoop: { status: 'running', unrecoverable: false, msSinceLastFrame: 16 },
+        };
+      }
+      return 'ok';
+    }) as typeof deviceConnection.proxy;
+    await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2, timeoutMs: 20_000 } });
+    const probe = seenCalls.find((c) => c.method === 'input-deliverability');
+    expect(probe, 'the probe must have been made at all').toBeDefined();
+    expect(probe!.timeoutMs).toBe(25_000); // same +5000ms headroom every other op-sized call gets
+  });
+});
+
+// #682 close-out (HIGH 1): CDP/WDA dispatch input HOST-SIDE, over the CDP session / WebDriverAgent
+// — never through `bridge.ts`'s in-page handlers — so `frameLoopRefusal` (bridge.ts) never ran
+// for them and a dead rAF chain reported a false `ok … [input:trusted-cdp]`. `press-key` is the
+// sharpest case: unlike tap/drag/hover/scroll it never round-trips through `resolve-aim` at all
+// (no coordinates to resolve), so a guard placed only in `handleResolveAim` would still miss it.
+// These drive the ROUTER path via `handleBackendRequest` (never `handleTap` directly — a test
+// that calls the in-page handler is what produced the original defect, per the review) to prove
+// the refusal fires for every CDP-routable method before any transport is attempted.
+describe('/api/device/request refuses trusted input when the frame loop cannot deliver it (#682 HIGH 1)', () => {
+  afterEach(async () => {
+    await deviceConnection.disconnect();
+    _resetWdaLauncherForTests();
+    _resetDeviceWdaStateForTests();
+    _resetDeviceCdpStateForTests();
+  });
+
+  // `status` is typed against `FrameLoopStatus` (the same type `editorBackendRouter.ts`'s
+  // `InputDeliverabilityReply` now uses), not a bare string literal (#682 close-out round 3,
+  // BLOCKER 2) — a rename of `'stalled'` in `frameLoopStatus.ts` fails THIS fixture's compile too,
+  // instead of leaving it green while the router's guard silently stops firing.
+  function frameLoopReply(status: FrameLoopStatus, rest: { unrecoverable: boolean; detail?: string; msSinceLastFrame: number }) {
+    return { status, ...rest };
+  }
+
+  const stalledDeliverability = {
+    visibilityState: 'visible', hasFocus: true,
+    frameLoop: frameLoopReply('stalled', { unrecoverable: false, detail: 'the frame loop has not ticked for 4000ms', msSinceLastFrame: 4000 }),
+  };
+
+  it('a TAP is refused before CDP session discovery is even attempted', async () => {
+    let asked = 0;
+    const spy = async () => { asked++; return null; };
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'input-deliverability': stalledDeliverability });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      _setDeviceCdpSessionProbeForTests(spy);
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(String(bodyOf(req).result)).toMatch(/^Error:/);
+      expect(String(bodyOf(req).result)).toContain('frame loop');
+      expect(asked, 'CDP session discovery must not even be attempted once the loop is known dead').toBe(0);
+    } finally {
+      _setDeviceCdpSessionProbeForTests(null);
+      await device.close();
+    }
+  });
+
+  it('a PRESS-KEY is refused too — the op that never round-trips through resolve-aim', async () => {
+    // `tryDeviceCdpInput`'s `press-key` case dispatches straight over the CDP session with no aim
+    // to resolve, so a guard living only in `handleResolveAim` cannot see it — this is the case
+    // the review named as the gap `handleResolveAim` alone would leave open.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'input-deliverability': stalledDeliverability });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'press-key', params: { key: 'a' } });
+      expect(String(bodyOf(req).result)).toMatch(/^Error:/);
+      expect(String(bodyOf(req).result)).toContain('frame loop');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('an UNRECOVERABLE loop refuses too, not merely a transient stall', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': {
+        visibilityState: 'visible', hasFocus: true,
+        frameLoop: frameLoopReply('stalled', { unrecoverable: true, detail: 'the watchdog gave up', msSinceLastFrame: 20_000 }),
+      },
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'hover', params: { x: 1, y: 2 } });
+      expect(String(bodyOf(req).result)).toMatch(/^Error:/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('accept side: a HEALTHY frame loop still dispatches normally', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': {
+        visibilityState: 'visible', hasFocus: true,
+        frameLoop: frameLoopReply('running', { unrecoverable: false, msSinceLastFrame: 16 }),
+      },
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      // No trusted route available in this mock (no CDP/WDA session), so it falls back to
+      // synthetic with the usual banner — proving the healthy case is NOT refused.
+      const result = bodyOf(req).result as { inputFidelityWarning?: string } | string;
+      expect(JSON.stringify(result)).not.toMatch(/^"?Error:/);
+      expect(JSON.stringify(result)).toContain('SYNTHETIC INPUT');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('a reply with no `frameLoop` field (older bridge, or the op unanswered) fails OPEN', async () => {
+    // No canned reply for 'input-deliverability' at all — the mock answers the generic
+    // `{ok:false, reason:'not-owner'}`, which carries no `frameLoop` field either. Input must
+    // still be attempted rather than refused over a probe that could not be read.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string } | string;
+      expect(JSON.stringify(result)).not.toMatch(/^"?Error:/);
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('an `Unknown method` reply (the real wire shape for a genuinely unregistered op) fails OPEN', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, { 'input-deliverability': 'Unknown method: input-deliverability' });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = bodyOf(req).result as { inputFidelityWarning?: string } | string;
+      expect(JSON.stringify(result)).not.toMatch(/^"?Error:/);
+    } finally {
+      await device.close();
+    }
   });
 });

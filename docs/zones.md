@@ -76,7 +76,7 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
   clean start-of-play). On **Pause** membership is frozen — no spurious re-enter on resume.
 - **Despawn-safe.** Membership is recomputed and diffed each frame, so removing a zone fires `exit`
   for all its occupants, and removing an occupant fires `exit` from every zone it was in — the same
-  discipline `synthesizeContactExits` gives the physics sensors.
+  discipline `collectContactExits`/`routeContactExits` gives the physics sensors.
 - **Deactivation = GONE, not paused.** Setting `EntityAttributes.isActive: false` on a zone (or on
   any ancestor of it) fires `exit` for everyone inside; on an occupant it fires `exit` from every
   zone it was in. Re-activating fires a fresh `enter` for whoever is still inside, so a one-shot

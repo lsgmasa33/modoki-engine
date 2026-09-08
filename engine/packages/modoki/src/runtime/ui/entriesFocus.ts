@@ -37,7 +37,9 @@
  *  segment as an ERROR by design, which is right for an authored resolver key — a silent
  *  multi-write is the failure there — and wrong here, because this path is DERIVED from an
  *  entity that provably exists, so refusing it means declining to re-target focus that is
- *  demonstrably sitting somewhere. `level-tile.prefab.json` alone carries three `Num`s.
+ *  demonstrably sitting somewhere. (The worked example was `level-tile.prefab.json` carrying
+ *  three `Num`s — ⚠️ #344 collapsed it to one, so the reasoning stands but that prefab no longer
+ *  demonstrates it.)
  *
  *  Name + **ordinal among siblings** is the tempting fix, and it is unsound. The sibling order
  *  it would count against comes from `buildChildIndex`, which iterates `world.entities` — and

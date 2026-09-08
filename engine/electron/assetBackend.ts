@@ -14,7 +14,7 @@ import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
   findAssetRoots, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
-  normalizeWriteGuardKey, isUnderAssetRoot,
+  normalizeWriteGuardKey, isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
@@ -47,7 +47,7 @@ export function createAssetBackend(opts: {
   /** Called after the manifest is rebuilt (guid→path map refresh). */
   onManifestUpdated?(manifest: ElectronAssetManifest): void;
   /** Called when an active scene/prefab file changes (hot-reload trigger). */
-  onSceneChanged?(urlPath: string, kind: LiveReloadKind): void;
+  onSceneChanged?(urlPath: string, kind: LiveReloadKind, viaSibling: boolean): void;
 }): ElectronAssetBackend {
   const { projectRoot, onManifestUpdated, onSceneChanged } = opts;
   let assetRoots: AssetRoot[] = findAssetRoots(projectRoot);
@@ -102,12 +102,19 @@ export function createAssetBackend(opts: {
   //    same logic as the Vite plugin's onChange/flushPending. ──
   let watcher: FSWatcher | null = null;
   let pendingRebuild: NodeJS.Timeout | null = null;
-  const pendingSceneChanges = new Map<string, LiveReloadKind>();
+  // `viaSibling` = this urlPath's OWN file did not change; a SIBLING did (today: a
+  // `.glsl`/`.wgsl` body remapped to its `.shader.json` descriptor, #857). The consumer needs
+  // it because `dropParkedWriteFor` discards an unsaved parked edit on the grounds that "the
+  // file on disk is now authoritative" — true when the descriptor itself was rewritten, FALSE
+  // when only its body sibling was, and discarding then throws away exactly the Inspector edit
+  // the author was iterating on. Collapsing several changes in one debounce window ANDs the
+  // flag, so a direct write to the descriptor in the same window wins and the drop still happens.
+  const pendingSceneChanges = new Map<string, { kind: LiveReloadKind; viaSibling: boolean }>();
   const flushPending = () => {
     pendingRebuild = null;
     rebuildManifest();
     if (pendingSceneChanges.size) {
-      for (const [urlPath, kind] of pendingSceneChanges) onSceneChanged?.(urlPath, kind);
+      for (const [urlPath, { kind, viaSibling }] of pendingSceneChanges) onSceneChanged?.(urlPath, kind, viaSibling);
       pendingSceneChanges.clear();
     }
   };
@@ -123,18 +130,34 @@ export function createAssetBackend(opts: {
     // chokidar is seeded from these very roots, but there's no reason to keep a fourth
     // hand-rolled copy of containment logic when a tested one is already exported.
     if (!isUnderAssetRoot(file, assetRoots)) return;
-    if (path.extname(file).toLowerCase() === '.json' && !isEditorWrite(file, () => hashFileSync(file))) {
-      const rel = file.split(path.sep).join('/');
-      // CALL the shared classifier — do NOT re-implement it. This block used to duplicate
-      // classifySceneChange's logic ("same logic as the Vite plugin"), so when that gained
-      // 'animation' (C7 — invalidate the stale clip cache) the fix reached the Vite path and
-      // silently MISSED this one: i.e. it worked in a browser and was dead in the Electron
-      // editor, dev AND packaged — every surface the modoki MCP actually targets. Duplicated
-      // logic rots; one function cannot.
+    // CALL the shared classifier — do NOT re-implement it. This block used to duplicate
+    // classifySceneChange's logic ("same logic as the Vite plugin"), so when that gained
+    // 'animation' (C7 — invalidate the stale clip cache) the fix reached the Vite path and
+    // silently MISSED this one: i.e. it worked in a browser and was dead in the Electron
+    // editor, dev AND packaged — every surface the modoki MCP actually targets. Duplicated
+    // logic rots; one function cannot.
+    //
+    // ⚠️ Sharing `classifySceneChange` fixed THAT gap but left the raw `extname(file) ===
+    // '.json'` extension test itself duplicated — the ONE line the fix above didn't route
+    // through a shared helper. That is exactly the line #857's shader-body fix exposed: a
+    // `.glsl`/`.wgsl` body edit is never itself `.json`, so when the Vite plugin's `onChange`
+    // was taught (via `pathToClassifyForChange`) to remap a shader BODY to its sibling
+    // `.shader.json` descriptor before classifying, this copy's own `.json` test kept gating on
+    // the un-remapped body path and could never pass — the fix worked in a browser and stayed
+    // dead here. `pathToClassifyForChange` is now the one shared gate for BOTH what to test and
+    // what to classify, so this can't drift from the Vite plugin's copy again.
+    const target = pathToClassifyForChange(file);
+    // isEditorWrite is checked against `file` (the BODY actually written), never `target` (the
+    // remapped descriptor) — it's a content-hash guard, and hashing the wrong file would defeat it.
+    if (target && !isEditorWrite(file, () => hashFileSync(file))) {
+      const rel = target.split(path.sep).join('/');
       const kind = classifySceneChange(rel);
       if (kind) {
-        const urlPath = absToAssetUrl(file, assetRoots);
-        if (urlPath) pendingSceneChanges.set(urlPath, kind);
+        const urlPath = absToAssetUrl(target, assetRoots);
+        if (urlPath) {
+          const viaSibling = isSiblingRaisedChange(file, target, pendingSceneChanges.get(urlPath)?.viaSibling);
+          pendingSceneChanges.set(urlPath, { kind, viaSibling });
+        }
       }
     }
     scheduleRebuild();

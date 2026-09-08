@@ -28,6 +28,7 @@ import {
   createRenderState, disposeRenderState, attachInvalidationListener,
   makeWebGPURenderer, computeActiveFrameFit, applyOrthoFrustum,
 } from '../../runtime/rendering/scene3DSync';
+import { disposeVideoTextures } from '../../runtime/rendering/videoTextureSync';
 import { registerRenderSurface } from '../../runtime/rendering/materialBroker';
 import {
   registerFrameCallback, unregisterFrameCallback,
@@ -36,6 +37,7 @@ import {
 } from '../../runtime/rendering/frameDriver';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
 import { registerBoundsProvider } from '../../runtime/core/screenBounds';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { computeEntityScreenBounds } from '../../runtime/rendering/entityScreenBounds';
 import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
@@ -46,9 +48,12 @@ import { getWorldTransform2D, getWorldTransform2DInto } from '../../runtime/rend
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
 import {
   noteRendererProgress, reportRendererInitFailure, clearRendererInitFailure, onRendererLost,
+  makeViewportLossPolicy, attachUncapturedErrorListener,
 } from '../../runtime/core/activeRenderer';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
+import { disposeSceneViewEntityObjects } from './sceneViewResources';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
@@ -407,7 +412,7 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
 export default function SceneView() {
   const hmrEpoch = useHmrEpoch();
   // Mode lives in the editor store (init from localStorage there) so it's agent-drivable
-  // (`set-scene-view-mode` / `modoki_scene_view_mode`). The setter persists to localStorage +
+  // (`set-scene-view-mode` / `modoki_set_scene_view_mode`). The setter persists to localStorage +
   // marks 2D dirty.
   //
   // The <select> below carries `data-ui-id="sceneView.toolbar.mode"` so it can at least be
@@ -1016,19 +1021,24 @@ interface Scene2DInteractionOpts {
 // Mirrors Canvas2DLayer's draw-loop scale computation, for the Pixi pick overlay (which has no draw
 // loop feeding canvasScaleRef).
 // A Canvas2D's reference resolution + scale mode (trait defaults), independent of any renderer.
-// Used by computeScale2DFor AND the chrome overlay's boundary rect (which needs refW/refH).
-function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' } {
+// Used by computeScale2DFor AND the chrome overlay's boundary rect. ⚠️ The boundary must be
+// stroked from `CanvasScale.refW/refH` (the EFFECTIVE box), never from the raw pair this
+// returns — those differ the moment `maxReferenceWidth` adapts the box (#774), and the overlay
+// would then outline the box the scene USED to have while the content fills the real one.
+function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number } {
   let refW = fallbackW || 1, refH = fallbackH || 1;
   let scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' = 'fitH';
+  let maxRefW = 0;
   const c2dMeta = getAllTraits().find((t) => t.name === 'Canvas2D');
   const canvasEntity = findEntity(canvasEntityId);
   if (c2dMeta && canvasEntity?.has(c2dMeta.trait)) {
-    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none' };
+    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number };
     refW = c2d.referenceWidth || 1080;
     refH = c2d.referenceHeight || 1920;
     scaleMode = c2d.scaleMode || 'fitH';
+    maxRefW = c2d.maxReferenceWidth || 0;
   }
-  return { refW, refH, scaleMode };
+  return { refW, refH, scaleMode, maxRefW };
 }
 
 // Install the capture-phase 2D pointer handlers on opts.getTargetEl(). Returns a cleanup fn.
@@ -1686,7 +1696,6 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
 
 interface Scene2DDrawOpts {
   cs: ReturnType<typeof computeCanvasScale>;
-  refW: number; refH: number;
   gizmoScreenScaleRef: { current: number };
   showBoundaryRef: { current: boolean };
   hoveredRef: { current: GizmoHandle | null };
@@ -1698,7 +1707,7 @@ interface Scene2DDrawOpts {
 // The 2D CONTENT (sprites, skinned mesh) is drawn by the Pixi Scene2DRenderer underneath; this chrome
 // canvas stacks the editor-only overlays on top. (Was shared with the now-deleted DOM Canvas2DLayer.)
 function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: Scene2DDrawOpts): void {
-  const { cs, refW, refH, gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef } = o;
+  const { cs, gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef } = o;
   const allTraits = getAllTraits();
   const transformMeta = allTraits.find((t) => t.name === 'Transform');
   const r2dMeta = allTraits.find((t) => t.name === 'Renderable2D');
@@ -1720,7 +1729,9 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
         ctx.strokeStyle = '#4a9eff';
         ctx.lineWidth = 2 * bs;
         ctx.setLineDash([6 * bs, 4 * bs]);
-        ctx.strokeRect(0, 0, refW, refH);
+        // `cs.refW`/`cs.refH`, not the authored pair: under an adaptive box (#774) they differ,
+        // and this outline is what a human retunes the box against.
+        ctx.strokeRect(0, 0, cs.refW, cs.refH);
         ctx.setLineDash([]);
       }
 
@@ -2265,13 +2276,13 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, pw, ph);
-      const { refW, refH, scaleMode } = readCanvas2DRefDims(canvasEntityId, pw, ph);
-      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode);
+      const { refW, refH, scaleMode, maxRefW } = readCanvas2DRefDims(canvasEntityId, pw, ph);
+      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW);
       canvasScaleRef.current = cs;
       const rectW = canvas.getBoundingClientRect().width;
       gizmoScreenScaleRef.current = (rectW > 0 && cs.scale > 0) ? pw / (cs.scale * rectW) : 1;
       drawScene2D(ctx, canvasEntityId, {
-        cs, refW, refH,
+        cs,
         gizmoScreenScaleRef, showBoundaryRef, hoveredRef, gizmo2DHandleStateRef,
       });
     };
@@ -2336,7 +2347,15 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
     editorScene2DRenderer.start();
     startFrameDriver();
     editorScene2DRenderer.markDirty();
-    return () => { editorScene2DRenderer.stop(); stopFrameDriver(); };
+    // #718: `stop()` drops each slot's sim claim, but `reclaimIfUnclaimed` returns the slot to the
+    // FREE pool with its `Application` and GPU context still live — only `pendingDestroy` tears
+    // that down, and only `destroyPool()` sets it. The shrink pass that would otherwise collect it
+    // cannot run: `stop()` and `stopFrameDriver()` have just removed the callbacks that drive
+    // `renderAll`. So without this the comment above ("no GPU context is held ... when the 2D layer
+    // is toggled off") was false, and toggling the layer accumulated contexts against
+    // SOFT_CONTEXT_LIMIT. Mirrors `Game.tsx`'s `stopScene2D()` + `destroyPool()` — the runtime pool
+    // had that caller all along and the editor pool had none.
+    return () => { editorScene2DRenderer.stop(); editorCanvas2DPool.destroyPool(); stopFrameDriver(); };
   }, [show2D]);
 
   const renderCanvas2D = show2D
@@ -2507,6 +2526,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     noteRendererProgress('viewport effect entered; renderer init starting');
 
     const setup = async () => {
+    // #858: THE FIRST STATEMENT, and it is load-bearing. Everything below registers into module
+    // scope or takes a GPU resource long before the big teardown closure at the end of this
+    // function exists, and a throw in between used to leave `cleanup` undefined — so
+    // `teardownViewport()`'s `fn?.()` released NOTHING and every slot taken so far dangled into a
+    // viewport that was never finished. Seeding the scope here makes a PARTIAL teardown possible:
+    // each acquisition below pushes its own release the moment it takes the thing, so whatever
+    // this run managed to take is released whether or not it reached the end.
+    // A fresh scope per run, because the context-loss rebuild calls `setup()` again.
+    const scope = createTeardownScope('SceneView');
+    cleanup = scope.dispose;
     // Three.js r183 WebGPU's node system warns 'Light node not found' for
     // dynamically-added lights (they still work — a Three.js internal issue). It's
     // emitted at render time, so it's suppressed via the SCOPED `withWarnFilter`
@@ -2590,7 +2619,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       releaseRenderer(container);
       return;
     }
-    await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
+    const disposeActiveRenderer = await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
+    // Compose onto the renderer's own `dispose()` rather than adding a second teardown path:
+    // `rendererLease.ts`'s `releaseRenderer`/`discardRenderer` are the only callers of
+    // `renderer.dispose()` for a leased renderer, so wrapping it here makes both correct for
+    // free, the same pattern `scene3DSync.ts`'s `createRenderer` already uses.
+    const priorDispose = renderer.dispose.bind(renderer);
+    renderer.dispose = (...args: Parameters<typeof priorDispose>) => {
+      disposeActiveRenderer();
+      return priorDispose(...args);
+    };
     noteRendererProgress('renderer registered (setActiveRenderer called)');
     // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
     // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so
@@ -2604,8 +2642,57 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       return;
     }
     rendererRef.current = renderer;
+    // Pushed HERE, not earlier: the two `outerDisposed` bails above call `releaseRenderer`
+    // themselves and return, so registering it before them would double-release. From this point
+    // on the lease is the scope's to drop — including on the throw path, where it used to be
+    // stranded because the only `releaseRenderer` was the last line of the closure below (#858).
+    //
+    // Drop our hold instead of disposing outright. Under StrictMode this cleanup is followed
+    // immediately by a remount, which re-acquires the same renderer; the lease only tears the
+    // GPU device down once nothing has claimed it by the next macrotask. Pushed FIRST, so LIFO
+    // still runs it LAST — the position it held as the closure's final line.
+    scope.add(() => releaseRenderer(container));
 
     let disposed = false;
+    // GPU-context/device loss detection (#802) — wired directly rather than relying on
+    // `setActiveRenderer`'s shared handle, which no longer arms any fault channel: a second
+    // registrant (the Particle Editor, or GameView) used to silently disarm this viewport's
+    // detection by re-seating the old single-slot `attachedRenderer`. `disposed` above is set at
+    // the START of `cleanup` below, which runs on both real unmount AND the context-loss rebuild
+    // path (`teardownViewport()`), so a superseded renderer from either path stops speaking.
+    //
+    // `attachContextLossListeners` (inside `attachRendererLossHandling`) calls
+    // `e.preventDefault()` on the WebGL path; the pre-#802 code here deliberately did not, because
+    // three's own `WebGLBackend` listener already does — a second `preventDefault()` on the same
+    // event changes nothing, so this is a known, harmless behaviour change, not an oversight.
+    // `isStale` compares renderer IDENTITY, not just this run's `disposed` flag — matching
+    // `Scene3D.tsx`'s. The deleted `attachGpuFaultListeners` refused a second attach for a renderer
+    // it already held (`if (renderer === attachedRenderer) return attachedDetach`), and the shared
+    // contract has no equivalent, so two live attachments on ONE canvas would turn one
+    // `webglcontextlost` into two `reportRendererLoss` calls and spend two of the three recovery
+    // attempts on a single loss.
+    //
+    // ⚠️ That is NOT reachable here, and an earlier cut of this comment asserted it was — via this
+    // setup's documented throw plus a remount reusing the lease. It cannot happen: the lease map in
+    // `rendererLease.ts` is keyed on the CONTAINER NODE and `ThreeJSViewport` is rendered with no
+    // `key`, so a remount is a new React instance with a new container div — new lease, new
+    // renderer, new canvas. What the identity check actually earns is silencing an orphaned
+    // attachment from a SUPERSEDED renderer (the `recovery.rebuild()` path calls
+    // `discardRenderer(container)`, so setup 2 builds a different one), where a closure-local
+    // `disposed` never goes true for the orphan.
+    const isStale = () => disposed || rendererRef.current !== renderer;
+    const detachRendererLoss = attachRendererLossHandling(
+      { canvas: renderer.domElement, device: (renderer as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
+      { label: 'SceneView', isStale, ...makeViewportLossPolicy({ renderer, isStale }) },
+    );
+    const detachUncapturedError = attachUncapturedErrorListener(renderer);
+    // Released from the scope rather than only from the closure below, so a throw in the ~2,200
+    // lines between here and there still detaches them. They now run AFTER that closure's GPU
+    // disposal instead of before it, which is safe for a reason worth stating: every event path in
+    // `rendererLossHandling.ts` consults `isStale()` first (`:89`, `:106`, `:136`), and `isStale`
+    // reads `disposed`, which that closure sets as its FIRST statement.
+    scope.add(detachUncapturedError);
+    scope.add(detachRendererLoss);
 
     // ── Scene ───────────────────────────────────────────
     const scene = new THREE.Scene();
@@ -2636,6 +2723,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     controls.target.set(0, 0, 0);
 
     setEditorViewportCamera(camera); // Inspector's "Copy from Editor Camera" reads this
+    scope.add(() => setEditorViewportCamera(null)); // drop the dangling ref to the disposed camera
 
     // ── Idle render gate (F2) ──────────────────────────────────────────────
     // The 3D viewport used to re-sync the full ECS world + submit a GPU frame
@@ -2657,6 +2745,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const gate = gateRef.current; // shared gate (created at mount; see gateRef above)
     const markViewportDirty = () => { gate.markDirty(); };
     controls.addEventListener('change', markViewportDirty);
+    scope.add(() => controls.removeEventListener('change', markViewportDirty));
     const dirtyUnsubs = [
       addDirtyListener(markViewportDirty),         // trait writes (incl. gizmo fireDirtyListeners)
       onStructureDirty(markViewportDirty),         // entity create / delete / reparent
@@ -2690,6 +2779,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       subscribeUndo(markViewportDirty),
       useEditorStore.subscribe(markViewportDirty), // selection, gizmo mode/space, view mode, layers, particlePreview, gameRect …
     ];
+    for (const unsub of dirtyUnsubs) scope.add(unsub);
 
     // ── Transform Gizmo ─────────────────────────────────
     const gizmo = new TransformControls(camera, renderer.domElement);
@@ -2813,6 +2903,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       }
       return out;
     });
+    scope.add(unregGizmo3DHandles);
 
     // Disable orbit when gizmo is actively dragging
     const onGizmoDraggingChanged = (event: any) => {
@@ -2848,6 +2939,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     };
     window.addEventListener('keydown', onSnapKey);
     window.addEventListener('keyup', onSnapKey);
+    scope.add(() => {
+      window.removeEventListener('keydown', onSnapKey);
+      window.removeEventListener('keyup', onSnapKey);
+    });
 
     // ── Selection raycasting on pointer down ──
     const raycaster = new THREE.Raycaster();
@@ -3210,6 +3305,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     };
     window.addEventListener('pointermove', onSelectMove);
     window.addEventListener('pointerup', onSelectUp);
+    scope.add(() => {
+      window.removeEventListener('pointermove', onSelectMove);
+      window.removeEventListener('pointerup', onSelectUp);
+    });
 
     // ── Marquee (box) selection ──
     // Shift + left-drag on empty 3D viewport space draws a rubber-band rect and ADDS every entity
@@ -3220,6 +3319,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const marqueeEl = document.createElement('div');
     marqueeEl.style.cssText = 'position:fixed;border:1px solid #5a9fd4;background:rgba(90,159,212,0.15);pointer-events:none;z-index:9999;display:none;';
     document.body.appendChild(marqueeEl);
+    scope.add(() => marqueeEl.remove());
     const marqueeMove = (ev: PointerEvent) => {
       if (!marquee) return;
       if (!marquee.moved && Math.hypot(ev.clientX - marquee.x0, ev.clientY - marquee.y0) > MARQUEE_MIN_PX) {
@@ -3267,6 +3367,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     };
     window.addEventListener('pointermove', marqueeMove);
     window.addEventListener('pointerup', marqueeUp);
+    // These six `window` listeners and the `document.body` marquee element are GLOBAL handlers, not
+    // memory: left behind by a failed bring-up they run viewport gesture logic on every pointer
+    // move in the editor for the rest of the session. They early-return while no gesture is active,
+    // which is why nothing ever noticed — it is still not something to leave terminal-only.
+    scope.add(() => {
+      window.removeEventListener('pointermove', marqueeMove);
+      window.removeEventListener('pointerup', marqueeUp);
+    });
 
     // Predicts what a real click at a viewport point would select in THIS 3D viewport — the
     // exact candidate-gather + pick3D call `onPointerDown` below runs, hoisted out so it can
@@ -3403,6 +3511,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Publish the game-camera billboard raycast for the 2D overlay's pointer handler. Uses the
     // SAME letterboxed NDC + gameCam as the in-viewport pick3D (line ~2263) so 2D-mode picking
     // can't drift from what's drawn. Only billboards — 3D meshes aren't the target in 2D mode.
+    scope.add(() => { _pickBillboardInUI = null; }); // drop the 2D-overlay picking bridge
     _pickBillboardInUI = (clientX, clientY) => {
       const r = renderer.domElement.getBoundingClientRect();
       const { x, y } = computeUIModeNDC(clientX, clientY, r,
@@ -3573,10 +3682,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // ── ECS Entity Meshes (3D only) ─────────────────────
     const renderState = createRenderState();
     setEcsObjectsRegistry(renderState.ecsObjects); // E2E observation (collider-only mode etc.)
+    scope.add(() => setEcsObjectsRegistry(null)); // drop the dangling ref to the disposed renderState
     const unsubInvalidation = attachInvalidationListener(renderState, scene);
+    scope.add(unsubInvalidation);
     // Publish this editor surface to the material broker so MaterialInstance drives
     // materials in the SceneView too (keeps it in sync with GameView).
     const unregisterSurface = registerRenderSurface(getCurrentWorld, renderState);
+    scope.add(unregisterSurface);
 
     // Percept (V5b): editor-viewport bounds provider. The runtime Scene3D provider only
     // reports where the GAME renderer is active (a shipped game / a configured GameView),
@@ -3610,6 +3722,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         ids,
       );
     }, 'scene-view');
+    scope.add(unregBounds);
 
     // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
     // beside `onPointerDown`) is the SAME candidate-gather + pick3D call the pointer handler
@@ -3618,6 +3731,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // (`entityResolve.ts`). Left at the default priority (0) — the 2D canvas overlay above
     // registers at 10 since it visually sits on top and must win when both answer (#80).
     const unregPick = registerPickProvider(pickEntityAtViewportPoint, 'scene-view');
+    scope.add(unregPick);
 
     const outlineMeshes = new Map<number, THREE.LineSegments>();
     // Dimmer secondary outlines for the selected entity's descendants (children,
@@ -3684,7 +3798,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       }
       controls.update();
     };
-    const unregisterFocusHandler = setFocusEntityHandler(focusEntityInView);
+    scope.add(setFocusEntityHandler(focusEntityInView));
 
     // ── Orientation-gizmo view snap (SceneViewGizmo corner widget) ──────────
     // The widget drives the camera through the sceneViewBus controller (it has no access
@@ -3755,11 +3869,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       gate.markDirty();
     };
 
-    const unregisterViewportController = setViewportController({
+    scope.add(setViewportController({
       snapToAxis,
       toggleProjection,
       getProjection: () => projection,
-    });
+    }));
 
     // Particle emitter gizmo icons + opt-in in-scene effect preview.
     const particleState = createParticleSyncState();
@@ -3787,33 +3901,42 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // detach the shared bone proxy first so it isn't left dangling under a disposed
       // group across the swap (mirrors the effect-cleanup detach at teardown).
       if (boneProxy.parent) boneProxy.parent.remove(boneProxy);
+      // Before the meshes go: release() restores each mesh's previous material slot.
+      if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
-      for (const [, outline] of outlineMeshes) { scene.remove(outline); outline.geometry.dispose(); (outline.material as THREE.Material).dispose(); }
-      outlineMeshes.clear();
-      for (const [id] of colliderWires) disposeColliderWire(id);
       // Skip the persistent camGizmoPivot — it's added to scene once at init
       // and reused across world swaps. Removing it here would orphan it and
-      // make TransformControls warn every frame on next Camera select.
-      for (const [, g] of ecsGizmos) {
-        if (g === camGizmoPivot) continue;
-        scene.remove(g);
-        ((g as THREE.Mesh).material as THREE.Material)?.dispose();
-      }
-      ecsGizmos.clear();
+      // make TransformControls warn every frame on next Camera select. This also disposes
+      // descOutlineMeshes on swap (previously left to the next frame's prune) — a strict
+      // improvement, not a behaviour this issue asked for.
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights }, camGizmoPivot);
       particleGizmoIds.clear();
       particleScratchIds.clear();
       emptyGizmoIds.clear();
       emptyScratchIds.clear();
       frameGizmoIds.clear();
       frameScratchIds.clear();
+      // koota recycles entity ids across a world swap. If these weren't cleared here, a
+      // stale id (e.g. 5, a Zone3D in the OLD scene) could be reused for a different
+      // entity type in the NEW scene (a Light, even the active Camera) — the zone reap
+      // loop in the frame callback below would then wrongly tear down that other
+      // entity's gizmo for one frame
+      // (scene.remove + material.dispose + ecsGizmos.delete) before self-healing next
+      // frame. Same family as #738/#759: a structure keyed on a recyclable entity id
+      // outliving the world that minted the id.
+      zoneGizmoIds.clear();
+      zoneScratchIds.clear();
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
       lastPreviewT = 0;
-      for (const [, l] of ecsLights) { scene.remove(l); l.dispose(); }
-      ecsLights.clear();
       if (scene.environment) { scene.environment = null; }
     });
+    // The worst of the eight this pass moved: left registered, this fires on EVERY subsequent
+    // scene load for the life of the editor session, disposing the abandoned viewport's
+    // renderState and re-arming the global paint/compile signals. Scene3D's twin
+    // (`registerBeforeSwap`) was migrated in the first pass and this one was missed.
+    scope.add(unsubSwap);
 
     const _editorBgColor = new THREE.Color(0x1e1e2e);
     // UI-mode background = the active Camera's clearColor, mirroring GameView
@@ -3981,8 +4104,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         }
       }
 
-      // Sync ECS environment (shared runtime logic)
-      syncEnvironment(getCurrentWorld(), scene);
+      // Sync ECS environment (shared runtime logic). Pass THIS panel's own renderer (#739) — a
+      // PMREM output belongs to a specific GPU context, so `syncEnvironment` must never resolve
+      // it through the global "most recently registered" renderer lookup.
+      syncEnvironment(getCurrentWorld(), scene, renderer);
       // EVERY surface that calls syncEnvironment must reconcile its OWN exposure right after it:
       // the IBL-off compensation is gated on module state that syncEnvironment overwrites, so a
       // surface that only sets it and never reads it back keeps whatever exposure it was created
@@ -4783,6 +4908,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     if (!disposed) {
       registerFrameCallback(editorFrameKey, animate, PRIORITY_EDITOR_3D);
       startFrameDriver();
+      scope.add(() => { unregisterFrameCallback(editorFrameKey); stopFrameDriver(); });
       noteRendererProgress('viewport live (frame loop started)');
     }
 
@@ -4804,39 +4930,20 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     });
     resizeObserver.observe(container);
 
-    cleanup = () => {
+    // Pushed LAST, so LIFO runs it FIRST — preserving the order this body always had, with the
+    // eight releases that moved out of it (the renderer lease, the two listeners and the five
+    // module-level slots) now running after it, in reverse acquisition order.
+    scope.add(() => {
       disposed = true;
-      _pickBillboardInUI = null; // drop the 2D-overlay picking bridge into the disposed viewport
-      unregisterFocusHandler();
-      unregisterViewportController();
-      setEditorViewportCamera(null); // drop the dangling reference to the disposed camera
-      setEcsObjectsRegistry(null); // drop the dangling reference to the disposed renderState
-      unsubSwap();
-      unsubInvalidation();
-      unregisterSurface();
-      unregBounds();
-      unregPick();
-      unregGizmo3DHandles();
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDownCapture, true);
       renderer.domElement.removeEventListener('pointermove', onPointerMoveCapture, true);
       renderer.domElement.removeEventListener('pointerup', onPointerUpCapture, true);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('pointermove', onSelectMove);
-      window.removeEventListener('pointerup', onSelectUp);
-      window.removeEventListener('pointermove', marqueeMove);
-      window.removeEventListener('pointerup', marqueeUp);
-      marqueeEl.remove();
-      unregisterFrameCallback(editorFrameKey);
-      stopFrameDriver();
-      controls.removeEventListener('change', markViewportDirty);
-      for (const unsub of dirtyUnsubs) unsub();
       setSkeletalPreview(false, 0); // don't leave the runtime preview flag stuck on
       clearSkeletalSeeks(); // drop any timeline scrub-preview seek so a rig isn't pinned to a scrubbed frame
       controls.dispose();
       gizmo.removeEventListener('dragging-changed', onGizmoDraggingChanged);
-      window.removeEventListener('keydown', onSnapKey);
-      window.removeEventListener('keyup', onSnapKey);
       gizmo.removeEventListener('mouseDown', onGizmoMouseDown);
       gizmo.removeEventListener('change', onGizmoChange);
       gizmo.removeEventListener('mouseUp', onGizmoMouseUp);
@@ -4844,19 +4951,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.remove(groupProxy); // multi-select group-gizmo pivot proxy
       scene.remove(gizmoHelper); // F5: explicit detach, independent of scene.clear() below
       gizmo.dispose();
+      // Before the meshes go: release() restores each mesh's previous material slot.
+      if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
-      for (const [, outline] of outlineMeshes) {
-        outline.geometry.dispose();
-        (outline.material as THREE.Material).dispose();
-      }
-      for (const [, gizmo] of ecsGizmos) {
-        // Some gizmos are THREE.Group containers (no material) — the onWorldSwap
-        // teardown above already uses `?.dispose()` defensively; mirror that here.
-        ((gizmo as THREE.Mesh).material as THREE.Material | undefined)?.dispose();
-      }
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights });
       grid.geometry.dispose(); (grid.material as THREE.Material).dispose();
       axes.geometry.dispose(); (axes.material as THREE.Material).dispose();
       scene.environment = null; // detach shared env — cache owns the texture
@@ -4869,13 +4970,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       GIZMO_SHAPES.particle.dispose();
       GIZMO_SHAPES.empty.dispose();
       GIZMO_SHAPES.frameBox.dispose();
+      GIZMO_SHAPES.zoneSphere.dispose();
+      GIZMO_SHAPES.zoneCircle.dispose();
+      GIZMO_SHAPES.zonePlane.dispose();
+      GIZMO_SHAPES.zoneCylinder.dispose();
       scene.clear();
-      // Drop our hold instead of disposing outright. Under StrictMode this cleanup is followed
-      // immediately by a remount, which re-acquires the same renderer; the lease only tears the
-      // GPU device down once nothing has claimed it by the next macrotask.
-      releaseRenderer(container);
       initedRef.current = false;
-    };
+    });
     }; // end setup
 
     // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
@@ -4884,8 +4985,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // rather than re-pointing a renderer through ~2000 lines of wiring. A lost three renderer
     // cannot be revived — see `core/activeRenderer.ts` for why this rebuilds instead.
     //
-    // `discardRenderer` is LOAD-BEARING and not obvious. `cleanup` ends in
-    // `releaseRenderer(container)`, which defers teardown to a macrotask precisely so a
+    // `discardRenderer` is LOAD-BEARING and not obvious. `cleanup` still ENDS in
+    // `releaseRenderer(container)` — it is the scope's first-pushed release, so LIFO drains it
+    // last (#858) — and that defers teardown to a macrotask precisely so a
     // StrictMode remount can re-acquire the SAME renderer. This rebuild is `cleanup(); setup();`
     // in one task, so without the discard its `acquireRenderer` would cancel that timer and be
     // handed the DEAD renderer straight back — recovery silently doing nothing, no error

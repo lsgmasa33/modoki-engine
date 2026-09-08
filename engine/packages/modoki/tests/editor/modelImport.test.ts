@@ -72,7 +72,25 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
     writtenMeta = { path: body.path, meta: body.meta };
     return { ok: true };
   }
-  return { ok: false };
+  // ⚠️ A MISSING SIDECAR IS A 200 WITH `{}` — the route (`editorBackendRouter.ts`'s
+  // `/api/read-meta`) 404s only when the ASSET FILE is absent; an asset with no sidecar gets
+  // `readMetaSidecar`'s `{}` at 200. Answering non-ok here says "the read FAILED", which since
+  // #880 aborts the import rather than minting a guid over an id this editor could not read.
+  if (url.startsWith('/api/read-meta')) {
+    return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
+  }
+  // ⚠️ **`status: 404`, not a bare `ok: false`** (#896). This fallthrough stands for "the asset
+  // document is not there yet" — a first-time import, which is what almost every test here drives.
+  // Since #896 that has to be SAID: `parseAssetJson` throws `MissingAssetError` for every non-ok
+  // status, but only a 404/410 (or the SPA fallback) sets `absent`, and only `absent` lets
+  // `classifyExistingAssetFetchFailure` return `'absent'` and the import mint a GUID. A 5xx must
+  // ABORT instead, because the file may exist and minting would dangle every reference to it.
+  //
+  // A bare `ok: false` left `status` undefined, which fails CLOSED — `absent: false` → `'abort'` →
+  // every import in this file stopped writing anything (19 red). That is the right default for
+  // unknown, and a real `fetch` always populates `status`, so the mock was simply under-specified:
+  // it meant 404 and did not say so.
+  return { ok: false, status: 404 };
 });
 vi.stubGlobal('fetch', mockFetch);
 
@@ -117,6 +135,10 @@ vi.mock('../../src/runtime/traits', () => {
     Transform: transformFn,
     EntityAttributes: eaFn,
     ModelSource: msFn,
+    // #784 phase C2b: modelImport.ts stamps these onto every mesh/material asset it writes. A
+    // mocked module with no export would silently hand back `undefined`, which JSON.stringify
+    // then drops — masking the constant entirely rather than exercising it.
+    MESH_FORMAT_VERSION: 1, MATERIAL_FORMAT_VERSION: 1,
   };
 });
 
@@ -483,7 +505,11 @@ describe('importModel', () => {
 
     expect(writtenMeta).not.toBeNull();
     expect(writtenMeta!.path).toBe('/assets/models/scene.glb');
-    expect(writtenMeta!.meta.version).toBe(2);
+    // The CLIENT no longer sends `version` — `writeMetaSidecar` owns the sidecar's
+    // format version and stamps it server-side (#734). Asserting its absence here
+    // pins that ownership: if a client-side writer starts supplying `version` again,
+    // it is once more a value two places can disagree about.
+    expect(writtenMeta!.meta.version).toBeUndefined();
     expect(writtenMeta!.meta.generated.meshes).toHaveLength(2);
     expect(writtenMeta!.meta.generated.materials.length).toBeGreaterThanOrEqual(1);
   });

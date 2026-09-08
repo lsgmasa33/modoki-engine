@@ -2,9 +2,12 @@
  *  Tracks generated files in the model's .meta.json for cleanup on delete. */
 
 import * as THREE from 'three';
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+// The orphan-prune goes through the shared delete wrapper rather than a hand-rolled fetch (#884);
+// `skinPrefab.ts` already reaches into panels/assetOps for the same helper.
+import { deleteAssetFile } from '../panels/assetOps';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
-import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
+import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
 import { ensureRiggedModelLoaded, invalidateRiggedModel } from '../../runtime/loaders/riggedModelCache';
 import { offerParsedGltf, disposePendingGltf } from '../../runtime/loaders/parsedGltfHandoff';
@@ -16,16 +19,10 @@ import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { convertSourceToGLB, needsGLBConversion } from './convertToGLB';
 import { extractRigBones, type RigBoneInfo } from './rigBones';
 import { useEditorStore } from '../store/editorStore';
-
-async function writeAssetFile(path: string, content: string): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content }),
-    });
-    return res.ok;
-  } catch { return false; }
-}
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { sha256Hex } from '../utils/contentHash';
+import { classifyExistingAssetFetchFailure, classifyExistingAssetJson } from './modelImportPersist';
+import { readMetaPreferringPark, metaWrittenToDisk, metaCameFromFailedRead } from './pendingMeta';
 
 /** Thrown by `writeAssetFileOrAbort` to unwind a model import whose write did not land (#311).
  *  Caught only at `importModel`'s boundary, which converts it to the falsy return every caller
@@ -33,16 +30,21 @@ async function writeAssetFile(path: string, content: string): Promise<boolean> {
 class ImportWriteAborted extends Error {
   // Declared, not a parameter property — `erasableSyntaxOnly` rejects those.
   readonly path: string;
-  constructor(path: string) {
-    super(`failed to write ${path}`);
+  /** `message` defaults to the write-failure wording; the read-before-write classification below
+   *  (item 3/4, #784 phase C2b) passes an explicit message naming the verdict instead — "failed to
+   *  write" would be false for a document that was never written to because it could not be
+   *  safely READ. */
+  constructor(path: string, message?: string) {
+    super(message ?? `failed to write ${path}`);
     this.name = 'ImportWriteAborted';
     this.path = path;
   }
 }
 
 /** Write a generated import artifact, or ABORT the whole import (#311, owner's policy
- *  2026-08-21). `writeAssetFile` above never throws — it resolves `false` — and three call
- *  sites used to discard that. Two of them registered the asset in the manifest FIRST, so a
+ *  2026-08-21). `writeAssetFile` (the shared client write wrapper, `editor/backend/
+ *  editorBackend.ts`, #835) never throws — it resolves `false` — and three call sites used to
+ *  discard that. Two of them registered the asset in the manifest FIRST, so a
  *  failed write left a GUID pointing at a path with no file: everything resolves for the rest
  *  of the session and it surfaces on the next scene load or a fresh editor launch, far from
  *  the cause.
@@ -57,16 +59,12 @@ async function writeAssetFileOrAbort(path: string, content: string): Promise<voi
   if (!await writeAssetFile(path, content)) throw new ImportWriteAborted(path);
 }
 
-/** SHA-256 hex of a string, via SubtleCrypto. Used to derive stable, content-
- *  addressed filenames for extracted textures so re-imports of the same source
- *  bytes land on the same path — and so the existing `.meta.json` sidecar
- *  (which carries the guid) survives and external material refs don't dangle. */
-async function sha256Hex(text: string): Promise<string> {
-  const buf = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0')).join('');
-}
+// SHA-256 hex of a string, for stable content-addressed filenames of extracted textures — so
+// re-imports of the same source bytes land on the same path and the existing `.meta.json`
+// sidecar (which carries the guid) survives and external material refs don't dangle. This used
+// to be a byte-identical local copy of `contentHash.ts`'s `sha256Hex` (#490 review finding 4);
+// consolidated into the one place per that module's own docstring ("so any future
+// conditional-write caller hashes the same way").
 
 /** base64-encode bytes in chunks (avoids arg-count blowups from
  *  `String.fromCharCode(...wholeArray)` on multi-megabyte texture PNGs).
@@ -102,30 +100,56 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
   return out;
 }
 
+/** Read an existing asset JSON document, classifying it before handing it back (#784 phase C2b,
+ *  items 3+4 — see `modelImportPersist.ts`'s header). `null` means genuinely ABSENT: the file does
+ *  not exist, so minting a fresh GUID / writing a brand-new document is correct, exactly as
+ *  before this fix. Anything this build cannot safely read — a real parse failure (truncated or
+ *  conflict-markered bytes) or a document stamped by a newer build — throws `ImportWriteAborted`
+ *  instead of returning `null`: the old behaviour collapsed both into the same falsy value, which
+ *  is precisely how a corrupt-but-still-referenced `.mesh.json`/`.mat.json` got a FRESH guid
+ *  minted over it and dangled every scene/prefab that pointed at the old one (§ 4's third trap). */
+async function readAssetJsonOrAbort(path: string, current: number): Promise<Record<string, unknown> | null> {
+  let json: unknown;
+  try {
+    const res = await fetch(path, { cache: 'no-store' });
+    json = await parseAssetJson(res, path);
+  } catch (e) {
+    const outcome = classifyExistingAssetFetchFailure(e);
+    if (outcome.kind === 'absent') return null;
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — could not read ${path}: ${outcome.reason}. A fresh GUID was ` +
+      'NOT minted and the file was NOT overwritten. Fix or restore the file and re-import.',
+    );
+  }
+  const outcome = classifyExistingAssetJson(json, current);
+  if (outcome.kind === 'abort') {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — refusing to read ${path}: ${outcome.reason}. A fresh GUID ` +
+      'was NOT minted and the file was NOT overwritten.',
+    );
+  }
+  return json as Record<string, unknown>;
+}
+
 /** Read an existing asset JSON file's `id` so re-import can preserve the
  *  stable guid instead of minting a fresh one (which would dangle every
  *  external reference). Returns undefined when the file doesn't exist yet
- *  (first-time import) or doesn't carry a valid guid. */
-async function readExistingId(path: string): Promise<string | undefined> {
-  try {
-    const res = await fetch(path, { cache: 'no-store' });
-    if (!res.ok) return undefined;
-    const json = await res.json();
-    return typeof json?.id === 'string' && isGuid(json.id) ? json.id : undefined;
-  } catch { return undefined; }
+ *  (first-time import) or doesn't carry a valid guid. `current` is the format
+ *  constant for THIS file's document type (`MESH_FORMAT_VERSION` /
+ *  `MATERIAL_FORMAT_VERSION`) — see `readAssetJsonOrAbort`. */
+async function readExistingId(path: string, current: number): Promise<string | undefined> {
+  const json = await readAssetJsonOrAbort(path, current);
+  return typeof json?.id === 'string' && isGuid(json.id) ? json.id : undefined;
 }
 
-/** Read an existing `.mat.json`'s full contents (or null when absent / unparseable).
- *  Used to carry manual material edits across a re-import — a hand-assigned
- *  texture or NPR field the source GLB/DAE can't reproduce would otherwise be
+/** Read an existing `.mat.json`'s full contents (or null when genuinely absent — see
+ *  `readAssetJsonOrAbort`). Used to carry manual material edits across a re-import — a
+ *  hand-assigned texture or NPR field the source GLB/DAE can't reproduce would otherwise be
  *  clobbered by the freshly-extracted (textureless) material. */
 async function readExistingMaterial(path: string): Promise<Record<string, unknown> | null> {
-  try {
-    const res = await fetch(path, { cache: 'no-store' });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json && typeof json === 'object' ? json : null;
-  } catch { return null; }
+  return readAssetJsonOrAbort(path, MATERIAL_FORMAT_VERSION);
 }
 
 /** Resolve the stable GUID for a pre-existing material file (an override target
@@ -146,7 +170,7 @@ async function resolveMaterialGuid(path: string): Promise<string> {
   if (!id) {
     id = newGuid();
     if (existing) {
-      await writeAssetFileOrAbort(path, JSON.stringify({ ...existing, id }, null, 2));
+      await writeAssetFileOrAbort(path, jsonFileBody({ ...existing, id }));
     } else {
       console.error(`[modelImport] material override not found: ${path} — minting a GUID; the reference will dangle until the file exists.`);
     }
@@ -155,14 +179,56 @@ async function resolveMaterialGuid(path: string): Promise<string> {
   return id;
 }
 
-/** Read a binary asset's sidecar (`<path>.meta.json`) and return its full
- *  contents — used for textures + the GLB itself, both of which carry their
- *  guid in the sidecar (not the file). Empty object when absent. */
-async function readMeta(path: string): Promise<Record<string, unknown>> {
+/** Read a binary asset's sidecar (`<path>.meta.json`) — used for textures + the GLB itself, both
+ *  of which carry their guid in the sidecar (not the file). Empty object when absent.
+ *
+ *  #845 close-out: every call site below merges this onto a full-document WRITE it is about to
+ *  make (id/rig/generated, or a freshly-minted texture's colorspace seed) — reading raw disk here
+ *  would silently roll back an Inspector edit still only PARKED for this same path (postprocessor,
+ *  a texture setting), and the park would go on to overwrite this write's own fresh id/generated
+ *  list wholesale at the next Cmd+S. `pendingRef` rides along so each write can drop the park it
+ *  already incorporated via `metaWrittenToDisk` — see each call site.
+ *
+ *  ⚠️ **A FAILED READ ABORTS THE IMPORT — it must never fall back to `{}` (#880 close-out).**
+ *  This is the THIRD door onto `/api/write-meta`: the three call sites below POST it directly,
+ *  through neither `parkMetaEdit` nor `writeMetaWholesale`, so `pendingMeta`'s own two guards
+ *  cannot see them. And the hazard here is not the id-less write those guards refuse — this read
+ *  exists to PRESERVE the guid (`existingMeta.id ?? newGuid()` at every call site), so a failed
+ *  read does not write a document with no `id`, it writes one with a **DIFFERENT** id. Every
+ *  scene/prefab ref to the model dangles, and the scanner's heal pass never even flags it, because
+ *  the sidecar it finds looks complete. That is strictly worse than the case the panels guard.
+ *
+ *  Aborting rather than continuing is this file's existing policy for exactly this failure on the
+ *  documents it reads through `readAssetJsonOrAbort` — *"A fresh GUID was NOT minted and the file
+ *  was NOT overwritten"*. The GLB's own sidecar, which is the one document that actually OWNS the
+ *  model's identity, was the one read excluded from it. Both failure shapes abort: a non-ok GET
+ *  (which `readMetaPreferringPark` reports by tagging its fallback) and a thrown one (which it
+ *  deliberately does not swallow).
+ *
+ *  ⚠️ An absent sidecar is NOT a failed read and must still return `{}` — a first import has no
+ *  sidecar to preserve a guid from, and `/api/read-meta` answers 200 with `{}` for one (only a
+ *  missing ASSET 404s). Aborting on that would make importing any new model impossible. */
+async function readMeta(path: string): Promise<{ meta: Record<string, unknown>; pendingRef: unknown }> {
+  let read: { meta: Record<string, unknown>; pendingRef: unknown };
   try {
-    const res = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`);
-    return res.ok ? await res.json() : {};
-  } catch { return {}; }
+    read = await readMetaPreferringPark(path);
+  } catch (e) {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — could not read ${path}: ${e instanceof Error ? e.message : String(e)}. `
+      + 'A fresh GUID was NOT minted and the file was NOT overwritten. Retry once the editor '
+      + 'backend is reachable.',
+    );
+  }
+  if (metaCameFromFailedRead(read.meta)) {
+    throw new ImportWriteAborted(
+      path,
+      `[modelImport] Import ABORTED — ${path} could not be read, so this import cannot know the `
+      + "asset's existing GUID and would mint a fresh one over it, dangling every scene/prefab "
+      + 'reference to it. A fresh GUID was NOT minted and the file was NOT overwritten.',
+    );
+  }
+  return read;
 }
 
 // ── Material hashing for dedup ──
@@ -219,7 +285,7 @@ function materialFileName(mat: THREE.MeshStandardMaterial): string {
 
 function extractMaterialAsset(mat: THREE.MeshStandardMaterial, _textureDir: string, texturePaths: Map<string, string>): MaterialAsset {
   const asset: MaterialAsset = {
-    version: 1,
+    version: MATERIAL_FORMAT_VERSION,
     color: mat.color?.getHex() ?? 0xffffff,
     roughness: mat.roughness ?? 1,
     metalness: mat.metalness ?? 0,
@@ -399,7 +465,7 @@ async function registerExtractedTextures(
   textureSettings: Map<string, ReturnType<typeof seedTextureSettings>>,
 ): Promise<void> {
   for (const texPath of new Set(texturePaths.values())) {
-    const existingMeta = await readMeta(texPath);
+    const { meta: existingMeta, pendingRef } = await readMeta(texPath);
     const sidecarGuid = (typeof existingMeta.id === 'string' && isGuid(existingMeta.id))
       ? existingMeta.id
       : undefined;
@@ -412,18 +478,20 @@ async function registerExtractedTextures(
       // freshly-minted sidecar (no existing guid), so we never clobber settings a
       // user already tuned in the Texture Inspector.
       const seeded = textureSettings.get(texPath);
-      await backendFetch('/api/write-meta', {
+      const res = await backendFetch('/api/write-meta', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           path: texPath,
           meta: {
             ...existingMeta,
-            version: (existingMeta.version as number) ?? 2,
             id: guid,
             ...(seeded ? { texture: { ...(existingMeta.texture as object ?? {}), ...seeded } } : {}),
           },
         }),
-      }).catch(() => {});
+      }).catch(() => null);
+      // #845 close-out: this write just committed whatever `readMeta` read above — drop that
+      // park, unless something newer landed while the write was in flight (see pendingMeta.ts).
+      if (res?.ok) metaWrittenToDisk(texPath, pendingRef);
     }
     // Drop any in-memory texture for this path — re-import may have produced
     // fresh bytes (PNG → KTX2 variants) and a stale cache entry would survive
@@ -457,8 +525,15 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
     // managed). For those, resolve the ref the same way as the override branch.
     if (!ctx.protectedMatPaths.has(dedupPath)) {
       const matAsset = extractMaterialAsset(mat, ctx.textureDir, ctx.texturePaths);
-      // Preserve the existing id from disk so external refs don't dangle.
-      const existingId = await readExistingId(dedupPath);
+      // ONE read-before-write classification for this file, not two (docs/format-versioning.md
+      // § 5 step 4) — the old code called `readExistingId` AND `readExistingMaterial` on the same
+      // path, fetching and classifying it twice for no reason. Preserve the existing id from disk
+      // so external refs don't dangle; derive it from the SAME parsed doc used below to carry
+      // manual edits forward. Either read throws `ImportWriteAborted` (propagating out of this
+      // function, caught only at `importModel`'s boundary) when the file is too-new or corrupt —
+      // see `readAssetJsonOrAbort`.
+      const existingMat = await readExistingMaterial(dedupPath);
+      const existingId = typeof existingMat?.id === 'string' && isGuid(existingMat.id) ? existingMat.id : undefined;
       matAsset.id = existingId ?? newGuid();
       // Carry over manual edits the importer doesn't itself write: a hand-assigned
       // `texture` (kept only when the source has none, so a real source map still
@@ -468,7 +543,6 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
       // ABSENT so a hand-assigned map on a source-less slot survives, while a real
       // source map (defined) still wins.
       const finalAsset: Record<string, unknown> = { ...matAsset };
-      const existingMat = await readExistingMaterial(dedupPath);
       if (existingMat) {
         for (const k of Object.keys(existingMat)) {
           if (finalAsset[k] === undefined) finalAsset[k] = existingMat[k];
@@ -476,7 +550,7 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
       }
       // Write BEFORE registering (#311): registering first maps the GUID to a path with no
       // file behind it, and the dangling ref only surfaces on a later scene load.
-      await writeAssetFileOrAbort(dedupPath, JSON.stringify(finalAsset, null, 2));
+      await writeAssetFileOrAbort(dedupPath, jsonFileBody(finalAsset));
       registerAsset(matAsset.id, dedupPath, 'material');
       // Evict the stale in-memory material so the next scene load re-reads from
       // disk — without this, a same-session scene re-open keeps rendering with
@@ -621,7 +695,7 @@ async function importRiggedModel(
   rootTransform?: { scale?: number },
 ): Promise<number> {
   // Resolve / preserve the GLB's guid (re-import keeps it so refs survive).
-  const existingMeta = await readMeta(glbPath);
+  const { meta: existingMeta, pendingRef } = await readMeta(glbPath);
   const glbGuid = (typeof existingMeta.id === 'string' && isGuid(existingMeta.id)) ? existingMeta.id : newGuid();
   registerAsset(glbGuid, glbPath, 'model');
 
@@ -674,20 +748,23 @@ async function importRiggedModel(
   // Record generated `.mat.json` + textures so a delete cleans them up and the
   // re-import orphan-prune (shared with the static path) can run.
   const prevGenerated = (existingMeta.generated as Record<string, unknown> | undefined) ?? {};
-  await backendFetch('/api/write-meta', {
+  const metaRes = await backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       path: glbPath,
       meta: {
         ...existingMeta,
-        version: (existingMeta.version as number) ?? 2,
         id: glbGuid,
         source: sourcePath,
         rig: { clips: rig.clipNames, expandSkeleton },
         generated: { ...prevGenerated, materials: matFiles, textures: textureFiles },
       },
     }),
-  }).catch(() => {});
+  }).catch(() => null);
+  // #845 close-out: this write just committed whatever `readMeta` read above (a lot of async
+  // texture/material work happened in between) — drop that park, unless something newer landed
+  // while it was in flight (see pendingMeta.ts).
+  if (metaRes?.ok) metaWrittenToDisk(glbPath, pendingRef);
 
   // Auto-fit: scale the bind-pose bbox to ~2 units tall (FBX is often 100× / cm)
   // unless the caller passed an explicit scale.
@@ -801,8 +878,13 @@ export async function importModel(
       'nothing was registered for that file. Earlier generated files remain on disk and will be ' +
       'overwritten by a successful re-import.',
     );
+    // The toast used to hard-code "a file could not be written" — false since #784 phase C2b,
+    // where `readAssetJsonOrAbort` started throwing `ImportWriteAborted` for a READ-side refusal
+    // too (a too-new/corrupt existing `.mesh.json`/`.mat.json`), never even reaching a write. The
+    // `console.error` above already carries `e.message`, the real reason; the toast now does too
+    // (#784 phase C adversarial review, finding 4).
     useEditorStore.getState().showToast(
-      `Import FAILED for ${modelPath.split('/').pop() ?? modelPath} — a file could not be written (see console)`,
+      `Import FAILED for ${modelPath.split('/').pop() ?? modelPath} — ${e.message} (see console)`,
       'warn',
     );
     return 0;
@@ -862,7 +944,7 @@ async function importModelInner(
   // Resolve / register the GLB's guid BEFORE anything writes refs to it.
   // Re-import preserves the prior id (sidecar `.meta.json`) so external
   // scene/prefab refs survive — a fresh guid would dangle every consumer.
-  const existingGlbMeta = await readMeta(glbPath);
+  const { meta: existingGlbMeta, pendingRef } = await readMeta(glbPath);
   const glbGuid = (typeof existingGlbMeta.id === 'string' && isGuid(existingGlbMeta.id))
     ? existingGlbMeta.id
     : newGuid();
@@ -932,17 +1014,17 @@ async function importModelInner(
     if (!meshFileMap.has(meshName)) {
       const meshPath = `${meshDir}/${safeMeshName}.mesh.json`;
       // Preserve existing id so external refs (prefabs, scenes) don't dangle.
-      const existingMeshId = await readExistingId(meshPath);
+      const existingMeshId = await readExistingId(meshPath, MESH_FORMAT_VERSION);
       const meshAsset: MeshAsset = {
         id: existingMeshId ?? newGuid(),
-        version: 1,
+        version: MESH_FORMAT_VERSION,
         model: glbGuid,
         mesh: meshName,
         postprocessor: postprocessorId,
         material: matRef,
       };
       // Write BEFORE registering — see the note at the material site above (#311).
-      await writeAssetFileOrAbort(meshPath, JSON.stringify(meshAsset, null, 2));
+      await writeAssetFileOrAbort(meshPath, jsonFileBody(meshAsset));
       registerAsset(meshAsset.id!, meshPath, 'mesh');
       meshFileMap.set(meshName, meshPath);
       meshFiles.push(meshPath);
@@ -956,7 +1038,6 @@ async function importModelInner(
   const meta = {
     ...existingGlbMeta,
     id: glbGuid,
-    version: 2,
     postprocessor: postprocessorId,
     // Record the original source for converted models (OBJ/FBX/DAE → GLB) so the
     // GLB is traceable back to its authoring file. Omitted for native GLB imports.
@@ -967,10 +1048,15 @@ async function importModelInner(
       textures: textureFiles,
     },
   };
-  await backendFetch('/api/write-meta', {
+  const metaRes = await backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: glbPath, meta }),
   });
+  // #845 close-out: this write just committed whatever `readMeta` read above (texture/mesh/material
+  // extraction ran in between) — drop that park, unless something newer landed while it was in
+  // flight (see pendingMeta.ts). Deliberately NOT wrapped in a `.catch` — same as before this
+  // change, a network failure here propagates and aborts the import; it does not silently degrade.
+  if (metaRes.ok) metaWrittenToDisk(glbPath, pendingRef);
 
   // Prune orphans: files the previous import wrote into `generated.*` but
   // the current import didn't regenerate (source GLB changed shape, a mesh
@@ -997,11 +1083,15 @@ async function importModelInner(
     const orphanMeshes = (oldGen.meshes ?? []).filter((p) => !newMeshSet.has(p) && ownsPath(p));
     const orphanMaterials = (oldGen.materials ?? []).filter((p) => !newMatSet.has(p) && ownsPath(p));
     const orphanTextures = (oldGen.textures ?? []).filter((p) => !newTexSet.has(p) && ownsPath(p));
-    const trashOne = (p: string) => backendFetch('/api/delete-asset', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: p }),
-    }).catch(() => {});
-    await Promise.all([
+    // ⚠️ Through the shared wrapper, not a hand-rolled fetch (#884 close-out review). This was the
+    // FIFTH consumer of /api/delete-asset and the last one still reading nothing at all: a bare
+    // `.catch(() => {})` discarded the Response, so a refusal was invisible AND the "Pruned N"
+    // line below claimed work that had not happened — while `generated` had ALREADY been rewritten
+    // to the new list, so nothing would ever try to prune that file again. `deleteAssetFile` now
+    // reports the outcome rather than the HTTP status, which is what makes counting possible.
+    // Still best-effort: it never throws, and a failed prune must not fail the import.
+    const trashOne = (p: string) => deleteAssetFile(p);
+    const outcomes = await Promise.all([
       ...orphanMeshes.map(trashOne),
       ...orphanMaterials.map(trashOne),
       // Textures carry a sidecar `.meta.json` with their guid — drop both.
@@ -1009,7 +1099,14 @@ async function importModelInner(
     ]);
     const total = orphanMeshes.length + orphanMaterials.length + orphanTextures.length;
     if (total > 0) {
+      // Count the ones that GENUINELY went, and say so only about those. A maybe-absent sidecar
+      // answers false too (a lone missing path is a 404), so the shortfall is reported as "not
+      // confirmed" rather than as a failure — the honest claim for a best-effort prune.
+      const stuck = outcomes.filter((ok) => !ok).length;
       console.log(`[Import] Pruned ${total} orphan files (${orphanMeshes.length} meshes, ${orphanMaterials.length} materials, ${orphanTextures.length} textures) → OS Trash`);
+      if (stuck > 0) {
+        console.warn(`[Import] ${stuck} of ${outcomes.length} prune delete(s) were not confirmed — those files may still be on disk, and the model's \`generated\` list no longer names them, so nothing will retry.`);
+      }
     }
   }
 

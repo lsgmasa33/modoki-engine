@@ -64,6 +64,39 @@ describe('unsaved-work gate: an editor that ANSWERS', () => {
   }
 });
 
+describe('unsaved-work gate: naming the ACTUAL cause (#844)', () => {
+  // The refusal used to be one fixed sentence blaming create_entity/duplicate_entity/prefab,
+  // regardless of what was actually unsaved. Since #831 a Material slider drag parks a dirty
+  // ASSET the same way create_entity parks a live-world edit, so an agent whose only pending work
+  // was a dirty material went looking for entities it never created.
+  it('modoki_build names a dirty ASSET path instead of the old fixed create_entity sentence', async () => {
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: {
+          unsavedChanges: true,
+          unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/glow.mat.json'], dirtyScenes: [] },
+        },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toMatch(/\/assets\/glow\.mat\.json/);
+    // The negative half is what makes this bite: the OLD fixed cause must be gone.
+    expect(why).not.toMatch(/create_entity/);
+  });
+
+  it('modoki_build falls back to the old generic wording when the renderer omits unsavedCauses', async () => {
+    // An older/mismatched renderer answers `unsavedChanges:true` with no `unsavedCauses` field —
+    // this must still refuse (unknown-cause is not "clean"), just without naming a cause list
+    // that isn't there.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? { status: 200, body: { unsavedChanges: true } } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+  });
+});
+
 describe('unsaved-work gate: an editor that CANNOT be checked (the fail-open regression)', () => {
   // Each of these used to read as "clean, proceed".
   const UNKNOWN_STATES: { label: string; reply: { status?: number; body?: unknown } }[] = [

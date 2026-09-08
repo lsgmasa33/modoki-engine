@@ -2,7 +2,12 @@
  *  the GUID asset-reference rule. Pure module, no world needed. */
 
 import { describe, it, expect } from 'vitest';
-import { validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict, makeAssetRefResolver } from '../../src/runtime/loaders/sceneValidation';
+import {
+  validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict,
+  makeAssetRefResolver, lineHeightUnitWarnings, LINE_HEIGHT_MULTIPLIER_CEILING,
+  collectEntryKindUses, entryBankWarnings, entryPrefabRootWarnings, type EntryKindUse,
+  collapsedNewlineWarnings,
+} from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 
@@ -622,9 +627,12 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor 
   it('echoes the value WITH its unit, so the reader can find the field', () => {
     expect(validateSceneData(band('bottom-stretch', { width: 90, widthUnit: '%' })).warnings[0])
       .toMatch(/authored 90%$/);
-    // A missing unit means px (the trait default), not a bare number.
+    // ⚠️ A missing unit means '%' — `widthUnit` DEFAULTS to '%' and a scene save strips a field
+    // equal to its default. This line asserted `90px` until #757's close-out; it was pinning a
+    // falsehood, and the same wrong fallback was reporting 10 live false positives across
+    // games/ + demos/ (see the absent-unit describe block below).
     expect(validateSceneData(band('bottom-stretch', { width: 90 })).warnings[0])
-      .toMatch(/authored 90px$/);
+      .toMatch(/authored 90%$/);
   });
 
   it('names the top/bottom offsets for an inert height', () => {
@@ -867,3 +875,552 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor,
     expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
   });
 });
+
+
+/** Issue #757 — the margin half of the same class. `applyAnchorStyle` clears all four UIElement
+ *  margins on ANY anchored element, so an authored value is discarded. A scene read as JSON gets
+ *  the same signal the Inspector gate now gives. Schema omitted for the same reason as #16's
+ *  block: the check is cross-trait and independent of the field-type pass. */
+describe('validateSceneData — UIElement margin inert under any UIAnchor (#757)', () => {
+  const box = (anchor: string | null, el: Record<string, unknown>) => scene([
+    { id: 1, name: 'Panel', traits: anchor === null ? { UIElement: el } : { UIElement: el, UIAnchor: { anchor } } },
+  ]);
+
+  it('warns on an authored margin under an anchor', () => {
+    const res = validateSceneData(box('center', { marginTop: 20 }));
+    expect(res.warnings.join('\n')).toMatch(/UIElement\.marginTop is inert.*'center'.*all four margins.*20%/s);
+  });
+
+  it('⭐ warns under a NON-stretching anchor too — the difference from the size rule', () => {
+    // isSizeInert only fires on a stretched axis; margin dies under every mode. A test using only
+    // 'stretch' would pass against a wrongly per-mode predicate, so this pins a plain corner anchor.
+    expect(validateSceneData(box('top-left', { marginLeft: 8 })).warnings.join('\n'))
+      .toMatch(/marginLeft is inert/);
+    expect(validateSceneData(box('bottom-right', { marginBottom: 8 })).warnings.join('\n'))
+      .toMatch(/marginBottom is inert/);
+  });
+
+  it('reports all four sides independently', () => {
+    const res = validateSceneData(box('stretch', { marginTop: 1, marginRight: 2, marginBottom: 3, marginLeft: 4 }));
+    const joined = res.warnings.join('\n');
+    for (const k of ['marginTop', 'marginRight', 'marginBottom', 'marginLeft']) {
+      expect(joined).toMatch(new RegExp(`UIElement\\.${k} is inert`));
+    }
+  });
+
+  it('echoes the value WITH its unit, and an ABSENT unit means % — the trait default', () => {
+    expect(validateSceneData(box('center', { marginTop: 5, marginTopUnit: '%' })).warnings[0])
+      .toMatch(/5% is discarded$/);
+    expect(validateSceneData(box('center', { marginTop: 5, marginTopUnit: 'px' })).warnings[0])
+      .toMatch(/5px is discarded$/);
+    // ⚠️ `marginTopUnit` defaults to '%' and a scene save STRIPS a field equal to its default, so
+    // the absent-unit case is the COMMON on-disk shape for a percentage — not a px shorthand. An
+    // earlier cut of this test asserted `5px` here and was pinning a falsehood.
+    expect(validateSceneData(box('center', { marginTop: 5 })).warnings[0])
+      .toMatch(/5% is discarded$/);
+  });
+
+  it('stays SILENT on a zero margin — the defaults are 0, so reporting them buries the real ones', () => {
+    // Same noise-budget rule that excludes `0`/`100%` from the size warning. Every anchored element
+    // in the repo carries four zero margins; warning on them would produce hundreds of findings.
+    expect(validateSceneData(box('center', { marginTop: 0, marginLeft: 0 })).warnings).toEqual([]);
+  });
+
+  it('stays silent with NO anchor — flow layout is where margin actually works', () => {
+    expect(validateSceneData(box(null, { marginTop: 20 })).warnings).toEqual([]);
+  });
+});
+
+
+/** #757 close-out — the unit fallback the margin work inherited from the size check was wrong, and
+ *  it was firing on shipping scenes. Every `UIElement` length unit defaults to '%'
+ *  (`runtime/traits/UIElement.ts`), and a scene save strips a field equal to its trait default, so
+ *  an ABSENT unit means '%'. Reading it as 'px' made `isNeutralSize` miss `width: 100`.
+ *
+ *  MEASURED over the real corpus: 10 warnings across 143 tracked scene/prefab files before the fix,
+ *  0 after — `HUD`/`Chrome Buttons`/`MenuIconBar`/`AdBannerSlot` (games/court), `StatusRoot` +
+ *  `HeartsRoot` x2 (games/sling), `HudLine`/`AdBannerSlot` (games/wordweave), `Title`
+ *  (demos/particle-demo). All ten were `100` with no unit, i.e. a full-bleed 100% box the editor
+ *  itself writes. */
+describe('validateSceneData — an absent length unit means % , not px (#757 close-out)', () => {
+  const band = (anchor: string, el: Record<string, unknown>) => scene([
+    { id: 1, name: 'Band', traits: { UIElement: el, UIAnchor: { anchor } } },
+  ]);
+
+  it('⭐ width 100 with NO unit is neutral (100%) and must NOT warn — the 10 false positives', () => {
+    expect(validateSceneData(band('top-stretch', { width: 100 })).warnings).toEqual([]);
+  });
+
+  it('an explicit 100% is neutral too — unchanged behaviour', () => {
+    expect(validateSceneData(band('top-stretch', { width: 100, widthUnit: '%' })).warnings).toEqual([]);
+  });
+
+  it('⭐ but an explicit 100px is NOT neutral, and must still warn', () => {
+    // The discriminating pair: the fix must not turn "absent means %" into "100 is always fine".
+    const res = validateSceneData(band('top-stretch', { width: 100, widthUnit: 'px' }));
+    expect(res.warnings.join('\n')).toMatch(/width is inert.*100px/s);
+  });
+
+  it('⭐ a genuine finding still fires — 90 with no unit is 90%, not neutral', () => {
+    // Proof the fix suppresses only the neutral case. This is the shape the noise budget exists to
+    // FIND (court's NarrationBand was the original), and it must survive.
+    const res = validateSceneData(band('bottom-stretch', { width: 90 }));
+    expect(res.warnings.join('\n')).toMatch(/width is inert.*authored 90%/s);
+  });
+
+  it('0 stays neutral whatever the unit', () => {
+    expect(validateSceneData(band('top-stretch', { width: 0 })).warnings).toEqual([]);
+    expect(validateSceneData(band('top-stretch', { width: 0, widthUnit: 'px' })).warnings).toEqual([]);
+  });
+});
+
+
+/** #757 close-out — the prefab-instance OVERRIDE mirror for margin. The size mirror has had its own
+ *  block since #35; the margin one shipped without cover, so these pin the three branches review
+ *  named: the `prefabUel` fallback when only the unit is overridden, the `anchorFromPrefab` message
+ *  arm, and the `0` exclusion for an override that CANCELS a prefab margin. */
+describe('validateSceneData — margin inert on a prefab-instance override (#757)', () => {
+  const P = 'c3d4e5f6-1111-2222-3333-444455556666';
+
+  const instance = (overrides: Record<string, unknown>) => scene([
+    {
+      id: 1,
+      name: 'Instance',
+      traits: { PrefabInstance: { source: P, localId: 1, rootInstanceId: 1 } },
+      overrides,
+    },
+  ]);
+
+  const prefabWith = (entityTraits: Record<string, unknown>) => ({
+    id: P, version: 1, name: 'Prefab', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: entityTraits }],
+  });
+
+  it('warns on a margin the OVERRIDE introduces, with the anchor coming from the prefab', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({ UIAnchor: { anchor: 'center' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginTop is inert.*'center'.*from its prefab, localId 1.*overridden 12px/s);
+  });
+
+  it('warns with NO resolver when anchor AND margin are in the same override group', () => {
+    const res = validateSceneData(instance({
+      1: { UIAnchor: { anchor: 'top-left' }, UIElement: { marginLeft: 6, marginLeftUnit: 'px' } },
+    }));
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginLeft is inert/);
+    expect(res.warnings.join('\n')).not.toMatch(/from its prefab/);
+  });
+
+  it('stays silent with NO resolver passed (conservative silence)', () => {
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }));
+    expect(res.warnings.filter((w) => /marginTop is inert/.test(w))).toEqual([]);
+  });
+
+  it('reads the VALUE from the prefab when the override touches only the unit', () => {
+    // The `v = prefabUel?.[key]` fallback: overriding marginTopUnit alone still makes the prefab's
+    // own value inert, and the message must quote that value rather than skipping the field.
+    const getPrefab: PrefabResolver = () => prefabWith({ UIElement: { marginTop: 7 }, UIAnchor: { anchor: 'top-left' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[1\]\.UIElement\.marginTop is inert.*7px/s);
+  });
+
+  it('⭐ an override setting a margin to 0 to CANCEL a prefab margin stays silent', () => {
+    // Zeroing is how an author opts OUT. Warning there would tell them off for doing the one thing
+    // that actually works.
+    const getPrefab: PrefabResolver = () => prefabWith({ UIElement: { marginTop: 9 }, UIAnchor: { anchor: 'center' } });
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 0 } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).not.toMatch(/marginTop is inert/);
+  });
+
+  it('stays silent when the instance is not anchored at all', () => {
+    const getPrefab: PrefabResolver = () => prefabWith({});
+    const res = validateSceneData(instance({ 1: { UIElement: { marginTop: 12, marginTopUnit: 'px' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).not.toMatch(/marginTop is inert/);
+  });
+});
+
+/** #809 — `UIElement.lineHeight` is emitted in PIXELS, but was long documented (and authored) as a
+ *  multiplier. `lineHeightUnitWarnings` fires on a plausible-multiplier value; the negative side
+ *  matters more than the positive one, because the whole point of the flat ceiling (rather than a
+ *  comparison against `fontSize`) is to survive real shipping content that a naive heuristic would
+ *  flag. */
+/** #676 — an authored newline the DOM collapses on the plain text path.
+ *
+ *  The two SKIP cases are the load-bearing half: `UINode` sets `white-space: pre-wrap` on the
+ *  `AutoFitText` and `AnimatedText` spans (`autoFitText`, or the `TextAnimation` trait), so a
+ *  newline there is honoured and authoring one is correct. Warning on those would be a false
+ *  positive on legitimate multi-line text, which is the failure that teaches a reader to ignore
+ *  the message — worse than the miss it prevents. `maxLines` is NOT one of the two: it clamps
+ *  height only and sets no `white-space` of its own, so a newline under it still collapses. */
+describe('collapsedNewlineWarnings (#676)', () => {
+  const el = (uel: Record<string, unknown>, rest: Record<string, unknown> = {}) =>
+    ({ UIElement: uel, ...rest });
+
+  it('warns on a multi-line text on the plain path, naming the line count', () => {
+    const out = collapsedNewlineWarnings(el({ text: 'a\nb\nc' }), 'E');
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/E\.UIElement\.text authors 3 lines/);
+    expect(out[0]).toMatch(/render as one run-on paragraph/);
+    // The message must point at the sanctioned fix, not at preserving the whitespace.
+    expect(out[0]).toMatch(/sibling text elements/);
+    expect(out[0]).toMatch(/do not add white-space/);
+  });
+
+  it('does NOT warn on single-line text, empty text, or a missing UIElement', () => {
+    expect(collapsedNewlineWarnings(el({ text: 'one line' }), 'E')).toEqual([]);
+    expect(collapsedNewlineWarnings(el({ text: '' }), 'E')).toEqual([]);
+    expect(collapsedNewlineWarnings(el({}), 'E')).toEqual([]);
+    expect(collapsedNewlineWarnings({}, 'E')).toEqual([]);
+    expect(collapsedNewlineWarnings(null, 'E')).toEqual([]);
+  });
+
+  it('does NOT warn when the text reaches a pre-wrap span — autoFitText', () => {
+    expect(collapsedNewlineWarnings(el({ text: 'a\nb', autoFitText: true }), 'E')).toEqual([]);
+  });
+
+  it('DOES warn on a positive maxLines — it clamps height, not whitespace (F2)', () => {
+    // `maxLines` is NOT a pre-wrap path: UINode's `maxLines > 0` branch sets no `white-space` of
+    // its own, so a newline collapses on it exactly like the plain path, whatever the value.
+    expect(collapsedNewlineWarnings(el({ text: 'a\nb', maxLines: 2 }), 'E')).toHaveLength(1);
+    expect(collapsedNewlineWarnings(el({ text: 'a\nb', maxLines: 0 }), 'E')).toHaveLength(1);
+  });
+
+  it('does NOT warn when the entity carries a TextAnimation', () => {
+    expect(collapsedNewlineWarnings(el({ text: 'a\nb' }, { TextAnimation: { effect: 'typewriter' } }), 'E')).toEqual([]);
+  });
+});
+
+describe('lineHeightUnitWarnings (#809)', () => {
+  const el = (fields: Record<string, unknown>) => ({ UIElement: fields });
+
+  it('fires on 1.4, naming the value and the pixel consequence', () => {
+    const out = lineHeightUnitWarnings(el({ lineHeight: 1.4 }), "entity 'X'");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/entity 'X'\.UIElement\.lineHeight is 1\.4, which looks like a MULTIPLIER/);
+    expect(out[0]).toMatch(/PIXELS.*1\.4px line box.*wrapped lines overlap/);
+  });
+
+  it('fires on 1.5 too', () => {
+    expect(lineHeightUnitWarnings(el({ lineHeight: 1.5 }), 'X')).toHaveLength(1);
+  });
+
+  it('with a positive fontSize, appends the suggested pixel equivalent', () => {
+    const out = lineHeightUnitWarnings(el({ lineHeight: 1.4, fontSize: 15 }), 'X');
+    expect(out[0]).toMatch(/For fontSize 15 the equivalent is 21\.$/);
+  });
+
+  it('omits the suggestion when fontSize is absent, zero, or not a number', () => {
+    expect(lineHeightUnitWarnings(el({ lineHeight: 1.4 }), 'X')[0]).not.toMatch(/For fontSize/);
+    expect(lineHeightUnitWarnings(el({ lineHeight: 1.4, fontSize: 0 }), 'X')[0]).not.toMatch(/For fontSize/);
+    expect(lineHeightUnitWarnings(el({ lineHeight: 1.4, fontSize: '15' }), 'X')[0]).not.toMatch(/For fontSize/);
+  });
+
+  it('does not fire on 0 — the authored "auto" sentinel', () => {
+    expect(lineHeightUnitWarnings(el({ lineHeight: 0 }), 'X')).toEqual([]);
+  });
+
+  it('does not fire at the ceiling boundary — exclusive (>=, not >)', () => {
+    expect(lineHeightUnitWarnings(el({ lineHeight: 4 }), 'X')).toEqual([]);
+    expect(lineHeightUnitWarnings(el({ lineHeight: LINE_HEIGHT_MULTIPLIER_CEILING }), 'X')).toEqual([]);
+  });
+
+  it('does not fire on real pixel line heights above the ceiling', () => {
+    for (const lh of [18, 19, 20, 21, 27]) {
+      expect(lineHeightUnitWarnings(el({ lineHeight: lh }), 'X')).toEqual([]);
+    }
+  });
+
+  it('⭐ does not fire on Court\'s real shapes — the regression that killed the fontSize-comparison heuristic', () => {
+    // NarrationText: lineHeight 18 against fontSize 17. RefusalText: lineHeight 19 against
+    // fontSize 19. The originally-proposed `lineHeight < fontSize` shape had ~1px of headroom on
+    // exactly these two and would flip to a false positive under `<=`.
+    expect(lineHeightUnitWarnings(el({ lineHeight: 18, fontSize: 17 }), 'NarrationText')).toEqual([]);
+    expect(lineHeightUnitWarnings(el({ lineHeight: 19, fontSize: 19 }), 'RefusalText')).toEqual([]);
+  });
+
+  it('does not fire on a negative value — not this check\'s business', () => {
+    expect(lineHeightUnitWarnings(el({ lineHeight: -5 }), 'X')).toEqual([]);
+  });
+
+  it('no UIElement / no lineHeight / a non-number lineHeight: no warnings, no throw', () => {
+    expect(() => lineHeightUnitWarnings(null, 'X')).not.toThrow();
+    expect(lineHeightUnitWarnings(null, 'X')).toEqual([]);
+    expect(lineHeightUnitWarnings(undefined, 'X')).toEqual([]);
+    expect(lineHeightUnitWarnings({}, 'X')).toEqual([]);
+    expect(lineHeightUnitWarnings(el({}), 'X')).toEqual([]);
+    expect(lineHeightUnitWarnings(el({ lineHeight: '1.4' }), 'X')).toEqual([]);
+  });
+});
+
+/** #671 — resolving every `UIEntries` view -> entry-prefab edge from a scene. Pure parse over the
+ *  bank; the delegation flags are the part worth pinning precisely, because they flip which half
+ *  of `entryPrefabRootWarnings` below is even allowed to fire. */
+describe('collectEntryKindUses (#671)', () => {
+  const GUID_A = 'e5f6a7b8-1111-2222-3333-444455556666';
+  const GUID_B = 'f6a7b8c9-1111-2222-3333-444455556666';
+  const bank = (...kinds: { name: string; prefab: string }[]) => JSON.stringify(kinds);
+
+  /** F4 — `entriesSystem.ts`'s `driveView` only ever reads `kinds[0]` (`prefabRootSize`,
+   *  `ensurePool`, `applySlots`), so a bank's kinds `[1..]` are parsed but never actually spawned.
+   *  Emitting a use per kind would claim kind `[1]`'s root is pinned every tick when the runtime
+   *  never touches it at all. */
+  it('a view with two kinds yields ONE use, for the first kind', () => {
+    const entities = [{ name: 'LevelScroll', traits: { UIEntries: { prefabs: bank(
+      { name: 'page', prefab: GUID_A }, { name: 'ad', prefab: GUID_B },
+    ) } } }];
+    const uses = collectEntryKindUses(entities, (_e, i) => `view[${i}]`);
+    expect(uses).toHaveLength(1);
+    expect(uses[0]).toMatchObject({ viewLabel: 'view[0]', kindName: 'page', prefabGuid: GUID_A });
+  });
+
+  it('entryWidth/entryHeight of 0 or ABSENT delegates; a non-zero value does not', () => {
+    const withView = (extra: Record<string, unknown>) => collectEntryKindUses(
+      [{ traits: { UIEntries: { prefabs: bank({ name: 'k', prefab: GUID_A }), ...extra } } }],
+      () => 'v',
+    )[0];
+    expect(withView({}).delegatesWidth).toBe(true); // absent
+    expect(withView({}).delegatesHeight).toBe(true); // absent
+    expect(withView({ entryWidth: 0 }).delegatesWidth).toBe(true);
+    expect(withView({ entryHeight: 0 }).delegatesHeight).toBe(true);
+    expect(withView({ entryWidth: 120 }).delegatesWidth).toBe(false);
+    expect(withView({ entryHeight: 80 }).delegatesHeight).toBe(false);
+  });
+
+  it('a UIEntries serialized as the tag shape (`true`) yields nothing', () => {
+    expect(collectEntryKindUses([{ traits: { UIEntries: true } }], () => 'v')).toEqual([]);
+  });
+
+  it('an empty or absent bank yields nothing', () => {
+    expect(collectEntryKindUses([{ traits: { UIEntries: { prefabs: '' } } }], () => 'v')).toEqual([]);
+    expect(collectEntryKindUses([{ traits: { UIEntries: {} } }], () => 'v')).toEqual([]);
+    expect(collectEntryKindUses([{ traits: {} }], () => 'v')).toEqual([]);
+    expect(collectEntryKindUses([{}], () => 'v')).toEqual([]);
+  });
+
+  it('malformed bank JSON yields nothing and does not throw', () => {
+    const entities = [{ traits: { UIEntries: { prefabs: '{not json' } } }];
+    expect(() => collectEntryKindUses(entities, () => 'v')).not.toThrow();
+    expect(collectEntryKindUses(entities, () => 'v')).toEqual([]);
+  });
+});
+
+/** #671 — the `UIEntries.prefabs` bank's own JSON integrity: every failure shape
+ *  `parseEntryPrefabs` silently drops, surfaced instead. */
+describe('entryBankWarnings (#671)', () => {
+  const GUID_A = 'a7b8c9d0-1111-2222-3333-444455556666';
+  /** A DIFFERENT guid, used to build a manifest that does not contain `GUID_A`. */
+  const GUID_B = 'b8c9d0e1-1111-2222-3333-444455556666';
+  const traits = (prefabs: unknown) => ({ UIEntries: { prefabs } });
+
+  it('the bank is not a string', () => {
+    const out = entryBankWarnings(traits(42), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs must be a JSON string, got number/);
+  });
+
+  it('the bank is not valid JSON', () => {
+    const out = entryBankWarnings(traits('{not json'), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs is not valid JSON — the whole entry bank is dropped/);
+  });
+
+  it('the bank is not a JSON array', () => {
+    const out = entryBankWarnings(traits('{}'), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs must be a JSON ARRAY of \{name, prefab\}/);
+  });
+
+  it('an entry that is not an object', () => {
+    const out = entryBankWarnings(traits(JSON.stringify([42])), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs\[0\] is not an object and is silently dropped/);
+  });
+
+  it('an entry missing its name', () => {
+    const out = entryBankWarnings(traits(JSON.stringify([{ prefab: GUID_A }])), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs\[0\]\.name is missing or empty/);
+  });
+
+  it('an entry missing its prefab', () => {
+    const out = entryBankWarnings(traits(JSON.stringify([{ name: 'k' }])), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs\[0\]\.prefab is missing or empty/);
+  });
+
+  it('a prefab that is not a GUID', () => {
+    const out = entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: 'nope' }])), 'V');
+    expect(out.join('\n')).toMatch(/V\.UIEntries\.prefabs\[0\]\.prefab must be a prefab GUID, got 'nope'/);
+    expect(out.join('\n')).not.toMatch(/asset PATH/);
+  });
+
+  it('a prefab authored as an internal asset PATH is called out explicitly', () => {
+    const out = entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: '/games/x/y.prefab.json' }])), 'V');
+    expect(out.join('\n')).toMatch(/must be a prefab GUID.*\(an asset PATH — use the prefab's GUID\)/);
+  });
+
+  it('a clean bank produces no warnings', () => {
+    expect(entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: GUID_A }])), 'V')).toEqual([]);
+  });
+
+  it('an absent or empty bank, or no UIEntries at all, produces no warnings', () => {
+    expect(entryBankWarnings({ UIEntries: {} }, 'V')).toEqual([]);
+    expect(entryBankWarnings(traits(''), 'V')).toEqual([]);
+    expect(entryBankWarnings({}, 'V')).toEqual([]);
+    expect(entryBankWarnings(null, 'V')).toEqual([]);
+  });
+
+  describe('assetExists resolver', () => {
+    it('a GUID the resolver confirms present produces no warning', () => {
+      const resolver = makeAssetRefResolver([GUID_A]);
+      expect(entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: GUID_A }])), 'V', resolver))
+        .toEqual([]);
+    });
+
+    /** ⚠️ These two exist because the first cut of this arm was DEAD CODE: it read
+     *  `if (assetExists && !assetExists(prefab))`, and `AssetRefResolver` returns
+     *  `'ok' | 'missing' | 'case-mismatch'` — three non-empty strings, all truthy — so the
+     *  negation was false for every possible verdict and the warning could never fire. Nothing
+     *  caught it except asking for the NEGATIVE case, which is the general lesson: a test suite
+     *  that only proves a guard REJECTS bad input never proves it ACCEPTS the case it was built
+     *  for. Keep both branches asserted separately; a single "it warns somehow" test would pass
+     *  again on a resolver that collapsed the two verdicts. */
+    it("a GUID the resolver reports 'missing' warns that the pool never spawns", () => {
+      const resolver = makeAssetRefResolver([GUID_B]);
+      const out = entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: GUID_A }])), 'V', resolver);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatch(/is a well-formed GUID but no asset in the manifest has it/);
+      expect(out[0]).toMatch(/this kind's pool never spawns/);
+    });
+
+    it("a GUID that differs only in CASE gets the case-mismatch message, not the deleted one", () => {
+      const resolver = makeAssetRefResolver([GUID_A.toUpperCase()]);
+      const out = entryBankWarnings(traits(JSON.stringify([{ name: 'k', prefab: GUID_A }])), 'V', resolver);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatch(/matches a manifest asset only when letter case is ignored/);
+      // The distinction is the point: telling this author the asset was "deleted or never
+      // imported" sends them hunting a file that is right there.
+      expect(out[0]).not.toMatch(/deleted or never imported/);
+    });
+  });
+});
+
+/** #671 — the entry-PREFAB-ROOT half: what a pooled row's authored box looks like once
+ *  `entriesSystem`'s per-tick pin has been applied to it. The conditional size rule (delegated vs
+ *  not) is the part worth the most scrutiny — it is the whole reason this needs the view/prefab
+ *  EDGE rather than a standalone per-prefab rule. */
+describe('entryPrefabRootWarnings (#671)', () => {
+  const use = (delegatesWidth: boolean, delegatesHeight: boolean): EntryKindUse => ({
+    viewLabel: "entity 'LevelScroll'", kindName: 'page',
+    prefabGuid: 'b8c9d0e1-1111-2222-3333-444455556666', delegatesWidth, delegatesHeight,
+  });
+  const root = (el: Record<string, unknown>) => ({ UIElement: el });
+
+  it('a non-zero marginBottom on the root warns, ALWAYS discarded regardless of delegation', () => {
+    const out = entryPrefabRootWarnings(use(true, true), root({ marginBottom: 8 }), 'entry prefab X');
+    expect(out.join('\n')).toMatch(/entry prefab X\.UIElement\.marginBottom is inert/);
+    expect(out.join('\n')).toMatch(/used as entry kind 'page' by entity 'LevelScroll'/);
+    expect(out.join('\n')).toMatch(/margin pinned to 0 every tick — the authored 8 is discarded/);
+  });
+
+  it('isVisible:false warns; isVisible:true does not', () => {
+    expect(entryPrefabRootWarnings(use(false, false), root({ isVisible: false }), 'X').join('\n'))
+      .toMatch(/UIElement\.isVisible is inert/);
+    expect(entryPrefabRootWarnings(use(false, false), root({ isVisible: true }), 'X')).toEqual([]);
+  });
+
+  it('minWidth/maxWidth/minHeight/maxHeight/flexShrink warn when non-zero', () => {
+    for (const field of ['minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'flexShrink']) {
+      const out = entryPrefabRootWarnings(use(true, true), root({ [field]: 3 }), 'X');
+      expect(out.join('\n')).toMatch(new RegExp(`UIElement\\.${field} is inert`));
+    }
+  });
+
+  /** F3 — `flexShrink`'s trait DEFAULT (1) is not its pin (0), so `v === 0` alone falsely warns
+   *  on an entry prefab root that never touched the field. Given the live schema (the same one
+   *  `agentBridge`/`editorBackendRouter` push in production), an authored `flexShrink: 1` must be
+   *  read as "untouched" and NOT warned about, while a genuinely authored `flexShrink: 2` still
+   *  does. */
+  it('flexShrink at its trait DEFAULT (1) does not warn when the schema is known; a real override does', () => {
+    const uiElementSchema: SceneSchema = {
+      traits: { UIElement: { category: 'component', fields: { flexShrink: { type: 'number', default: 1 } } } },
+    };
+    expect(entryPrefabRootWarnings(use(true, true), root({ flexShrink: 1 }), 'X', uiElementSchema))
+      .toEqual([]);
+    const out = entryPrefabRootWarnings(use(true, true), root({ flexShrink: 2 }), 'X', uiElementSchema);
+    expect(out.join('\n')).toMatch(/UIElement\.flexShrink is inert/);
+  });
+
+  it('width on a DELEGATED axis does NOT warn — the view genuinely reads it', () => {
+    expect(entryPrefabRootWarnings(use(true, false), root({ width: 90, widthUnit: '%' }), 'X'))
+      .toEqual([]);
+  });
+
+  it('width on a NON-delegated axis DOES warn', () => {
+    const out = entryPrefabRootWarnings(use(false, false), root({ width: 90, widthUnit: '%' }), 'X');
+    expect(out.join('\n')).toMatch(/UIElement\.width is inert.*non-zero entryWidth.*authored 90%.*discarded.*Set entryWidth to 0/);
+  });
+
+  it('100% and 0 stay neutral on a non-delegated axis too (isNeutralSize) — real full-bleed roots', () => {
+    expect(entryPrefabRootWarnings(use(false, false), root({ width: 100, widthUnit: '%' }), 'X')).toEqual([]);
+    expect(entryPrefabRootWarnings(use(false, false), root({ width: 0 }), 'X')).toEqual([]);
+    expect(entryPrefabRootWarnings(use(false, false), root({ height: 100, heightUnit: '%' }), 'X')).toEqual([]);
+  });
+
+  it('axes are independent: delegating width but not height warns about height only', () => {
+    const out = entryPrefabRootWarnings(
+      use(true, false), root({ width: 90, widthUnit: '%', height: 40, heightUnit: '%' }), 'X',
+    );
+    expect(out.join('\n')).not.toMatch(/UIElement\.width is inert/);
+    expect(out.join('\n')).toMatch(/UIElement\.height is inert/);
+  });
+
+  it('no rootTraits, or a root with no UIElement: no warnings, no throw', () => {
+    expect(entryPrefabRootWarnings(use(false, false), null, 'X')).toEqual([]);
+    expect(entryPrefabRootWarnings(use(false, false), {}, 'X')).toEqual([]);
+  });
+});
+
+/** #671 — the JOIN itself, exercised through `validateSceneData`: a `UIEntries` view plus a
+ *  `getPrefab` resolver must reach `entryPrefabRootWarnings` for the prefab it actually uses. */
+describe('validateSceneData — entry-kind pass (#671)', () => {
+  const PREFAB_GUID = 'c9d0e1f2-1111-2222-3333-444455556666';
+  const prefabWithMargin = {
+    id: PREFAB_GUID, version: 1, name: 'EntryPrefab', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { marginBottom: 8 } } }],
+  };
+  const bank = JSON.stringify([{ name: 'page', prefab: PREFAB_GUID }]);
+  const sceneWithView = (name: string, extra: Record<string, unknown> = {}) => (
+    { id: 1, name, traits: { UIEntries: { prefabs: bank, ...extra } } }
+  );
+
+  it('warns through the full scene pass when a getPrefab resolver is supplied', () => {
+    const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? prefabWithMargin : undefined);
+    const res = validateSceneData(scene([sceneWithView('LevelScroll')]), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/entry prefab '.*'\.UIElement\.marginBottom is inert/);
+    expect(res.warnings.join('\n')).toMatch(/entry kind 'page'/);
+  });
+
+  it('stays silent with NO getPrefab — the BYOD path', () => {
+    const res = validateSceneData(scene([sceneWithView('LevelScroll')]));
+    expect(res.warnings.filter((w) => /entry kind/.test(w))).toEqual([]);
+  });
+
+  it('de-dupes: two views pointing at the same prefab with the same delegation flags produce ONE warning', () => {
+    const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? prefabWithMargin : undefined);
+    const res = validateSceneData(scene([
+      sceneWithView('ScrollA'),
+      { id: 2, name: 'ScrollB', traits: { UIEntries: { prefabs: bank } } },
+    ]), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /marginBottom is inert/.test(w))).toHaveLength(1);
+  });
+
+  it('different delegation flags for the SAME prefab are NOT merged by the de-dupe key', () => {
+    const prefabWide = {
+      id: PREFAB_GUID, version: 1, name: 'EntryPrefab', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 90, widthUnit: '%' } } }],
+    };
+    const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? prefabWide : undefined);
+    const res = validateSceneData(scene([
+      // Delegates width (entryWidth: 0) — the prefab's own width is genuinely read, no warning.
+      { id: 1, name: 'ScrollDelegates', traits: { UIEntries: { prefabs: bank, entryWidth: 0 } } },
+      // Does not delegate — the authored 90% is discarded, warns.
+      { id: 2, name: 'ScrollFixed', traits: { UIEntries: { prefabs: bank, entryWidth: 120 } } },
+    ]), undefined, getPrefab);
+    expect(res.warnings.filter((w) => /UIElement\.width is inert/.test(w))).toHaveLength(1);
+  });
+});
+

@@ -21,6 +21,7 @@ import { BakedFontProvider, type FontProvider } from '../rendering/text/fontProv
 import { DynamicFontProvider, dynamicConfigFromSettings } from '../rendering/text/dynamicFontProvider';
 import { disposeMsdfGenerator } from '../rendering/text/msdfGenerate';
 import { markTextDirty } from '../rendering/text/textDirty';
+import { createTeardownToken } from '../core/liveness';
 
 type SceneId = number;
 
@@ -28,12 +29,15 @@ const providers = new Map<string, FontProvider>();                   // guid →
 const loadPromises = new Map<string, Promise<FontProvider | null>>(); // guid → in-flight load
 const owners = new Map<string, Set<SceneId>>();                      // guid → owning scenes
 const unknownSeen = new Set<string>();                               // warn-once for bad guids
-// Bumped whenever a font is released/disposed. An in-flight acquire captures the
-// value and refuses to cache its result if it changed (or the owner vanished) —
-// otherwise a fetch that resolves AFTER its scene was released re-inserts an
-// owner-less provider that releaseFontsForScene can never reclaim (leak). Mirrors
-// audioBufferCache's generation guard.
-let generation = 0;
+// Teardown liveness — PER-KEY (#856): invalidateFont and releaseFontsForScene's per-guid drop each
+// invalidate only THAT guid's key, so an unrelated font's in-flight acquire started around the same
+// time is not superseded. This matters because `ensureFontLoaded` is called per frame from
+// `Scene2D.tsx` and `scene3DSync.ts`, so a live unrelated acquire genuinely can be in flight at a
+// scene swap. An in-flight acquire captures its own guid's key and refuses to cache its result if
+// it changed (or the owner vanished) — otherwise a fetch that resolves AFTER its scene was released
+// re-inserts an owner-less provider that releaseFontsForScene can never reclaim (leak). Full
+// teardown (`disposeAllFonts`) still invalidates wholesale. Mirrors audioBufferCache's liveness guard.
+const liveness = createTeardownToken();
 
 function addOwner(guid: string, sceneId: SceneId): void {
   let set = owners.get(guid);
@@ -89,7 +93,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
   // actually breaks the font then produces no console line at all.
   unknownSeen.delete(guid);
 
-  const gen = generation;
+  const stillLive = liveness.capture(guid);
   const promise = (async (): Promise<FontProvider | null> => {
     try {
       // Dynamic (path B): generate glyphs at runtime from real outlines — the pinned
@@ -110,7 +114,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
         const res = await fetch(urls.metricsUrl);
         if (res.ok) {
           const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));
-          if (gen !== generation || !owners.has(guid)) return null;
+          if (!stillLive() || !owners.has(guid)) return null;
           provider = DynamicFontProvider.fromBaked(
             guid, atlas, urls.atlasUrl,
             // Deferred: not fetched at all unless a miss happens.
@@ -127,7 +131,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
           const fontRes = await fetch(urls.fontUrl);
           if (!fontRes.ok) throw new Error(`font fetch ${fontRes.status}`);
           const bytes = new Uint8Array(await fontRes.arrayBuffer());
-          if (gen !== generation || !owners.has(guid)) return null;
+          if (!stillLive() || !owners.has(guid)) return null;
           provider = await DynamicFontProvider.create(guid, bytes, dynamicConfigFromSettings(fontBlock));
         }
       } else {
@@ -140,11 +144,11 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
       // The scene that requested this may have been released while the fetch/gen was
       // in flight — don't re-insert an owner-less provider (unreclaimable leak).
       if (!provider) return null;
-      if (gen !== generation || !owners.has(guid)) { provider.dispose(); return null; }
+      if (!stillLive() || !owners.has(guid)) { provider.dispose(); return null; }
       providers.set(guid, provider);
       // Text that was waiting on this font can now lay out — nudge dirty-gated
       // renderers (Scene2D) to repaint. (Scene3D re-queries every frame anyway.)
-      markTextDirty();
+      markTextDirty(guid);
       return provider;
     } catch (e) {
       console.warn(`[fontAtlasLoader] failed to load font ${guid}:`, e);
@@ -174,15 +178,15 @@ export function getLoadedFont(guid: string): FontProvider | undefined {
 
 /** Evict the live provider for a font whose settings changed (mode flip / re-bake),
  *  KEEPING its scene ownership so the next `ensureFontLoaded`/render re-acquires it
- *  with the new manifest block. Bumps `generation` (kills any in-flight load) + marks
+ *  with the new manifest block. Invalidates liveness (kills any in-flight load) + marks
  *  text dirty so dirty-gated renderers repaint. Wired to manifest font-changes below. */
 export function invalidateFont(guid: string): void {
   const p = providers.get(guid);
   if (p) p.dispose();
   providers.delete(guid);
   loadPromises.delete(guid);
-  generation++;
-  markTextDirty();
+  liveness.invalidateKey(guid);
+  markTextDirty(guid);
 }
 // Re-acquire on any Font-Inspector mode flip or re-bake (no editor restart needed).
 onFontInvalidated(invalidateFont);
@@ -199,7 +203,7 @@ export function releaseFontsForScene(sceneId: SceneId): void {
       providers.get(guid)?.dispose();
       providers.delete(guid);
       loadPromises.delete(guid);
-      generation++; // invalidate any in-flight acquire for this guid
+      liveness.invalidateKey(guid); // invalidate any in-flight acquire for this guid
     }
   }
 }
@@ -213,7 +217,7 @@ export function disposeAllFonts(): void {
   loadPromises.clear();
   owners.clear();
   unknownSeen.clear();
-  generation++; // invalidate every in-flight acquire
+  liveness.invalidateAll(); // invalidate every in-flight acquire
   void disposeMsdfGenerator();
 }
 

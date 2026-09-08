@@ -9,8 +9,8 @@
 
 import type { PrefabFile } from './prefab';
 import { serializePrefab, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, type SerializedEntity } from './serialize';
-import { swapHistory } from '../undo/undoManager';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
@@ -20,6 +20,8 @@ import { getRunMode } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 
 /** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
  *  save path can locate it after the loader reassigns ECS ids. Lives only in the
@@ -239,12 +241,17 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
-    if (!res.ok) { console.error(`[PrefabEdit] failed to fetch ${asset.path}`); return; }
-    prefab = await res.json();
+    prefab = await parseAssetJson(res, asset.path) as PrefabFile;
   } catch (e) {
     console.error('[PrefabEdit] fetch failed:', e);
     return;
   }
+  // This is a RAW fetch, not routed through getPrefabSource — that helper already runs this
+  // migration (structured walk, see uiAnchorZIndexMigration.ts) on every load, but this path
+  // bypasses it entirely, so it must run here too BEFORE setPrefabCache below, or the
+  // un-migrated object poisons every later getPrefabSource read of this same guid for the
+  // rest of the session.
+  for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
   const guid = prefab.id ?? getGuidForPath(asset.path) ?? asset.path;
   // Seed the editor prefab cache so override/apply paths resolve without a refetch,
   // and preload any nested children into the SAME (editor) cache — serializePrefab's
@@ -365,6 +372,12 @@ export async function savePrefabEdit(): Promise<boolean> {
     name: previous.name,
   });
   if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return false; }
+  // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
+  // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
+  // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
+  // saved baseline without it ever being written; see markSceneSaved's doc comment for why that is
+  // data loss and not a cosmetic flag (#573).
+  const savedAtEditVersion = getEditVersion();
   const ok = await writePrefabFile(editingPrefab.guid, prefab);
   if (!ok) return false;
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the
@@ -381,7 +394,7 @@ export async function savePrefabEdit(): Promise<boolean> {
   // was stale when it was byte-identical to the live world. Reported by the owner — "I think I
   // saved it before you said it's stale, maybe we have a bug" — and confirmed by diffing the file
   // against the world rather than by trusting the flag, which is the only way to see it.
-  markSceneSaved();
+  markSceneSaved(savedAtEditVersion);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return true;
 }
@@ -396,7 +409,13 @@ export async function savePrefabEdit(): Promise<boolean> {
  *  stuck in a prefab-edit mode with no prefab world). */
 export async function exitPrefabEditing(): Promise<string | null> {
   const { prefabReturnScenePath, closePrefabEditor } = useEditorStore.getState();
-  const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('modoki-last-scene') : null;
+  // #478: was the UNSCOPED `modoki-last-scene` key — global across every project sharing this
+  // origin, so a boot with no scene loaded still held the PREVIOUS project's path and this would
+  // try to load it (a cross-project path that resolves to nothing). Read the same per-project key
+  // `setCurrentScenePath` writes (scene/serialize.ts) instead.
+  const stored = typeof localStorage !== 'undefined'
+    ? localStorage.getItem(lastSceneKey(getScenePersistenceProject()))
+    : null;
   // ⚠️ A synthetic `/__prefab-edit__/…` path is not a FILE — loading it 404s ("no asset at … the
   // dev server answered with index.html") and strands the editor in the prefab world with no scene.
   // `resolveReturnScene` keeps one out of the store in the first place; this skips it whichever

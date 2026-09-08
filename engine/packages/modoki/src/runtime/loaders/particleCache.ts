@@ -9,8 +9,10 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
+import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
+import { createTeardownToken } from '../core/liveness';
+import { classifyFormatVersion } from '../core/formatVersion';
 
 const cache = new Map<string, ParticleEffectDef>();
 const loading = new Map<string, Promise<void>>();
@@ -18,10 +20,17 @@ const failed = new Set<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
-// Bumped on clearParticleCache() to invalidate in-flight fetches (mirrors
-// meshTemplateCache's cacheGeneration). A fetch that resolves after a scene
-// swap must not repopulate the cache or re-register a stale guid→path mapping.
-let generation = 0;
+/** Teardown liveness, captured per PATH before each load and re-checked after. A fetch that
+ *  resolves after a scene swap must not repopulate the cache or re-register a stale guid→path
+ *  mapping (mirrors meshTemplateCache's cacheGeneration).
+ *
+ *  `invalidateAll()` is `clearParticleCache`'s (the whole cache is gone). A per-key
+ *  `invalidateParticleEffect` must NOT refuse an in-flight load of a DIFFERENT key — this cache is
+ *  driven by the editor's file watcher, so an author saving one effect would otherwise make a
+ *  concurrent load of an unrelated effect silently drop it — so it calls `invalidateKey` alone.
+ *  Cleared wholesale by `clearParticleCache`, so the per-key map cannot outgrow the cache it
+ *  shadows. */
+const liveness = createTeardownToken<string>();
 
 /** Migrate a legacy collision config (infinite horizontal plane at `planeY`, no `shape`)
  *  to the explicit `plane` collider so old assets upgrade on their next save. */
@@ -60,7 +69,15 @@ export function normalizeParticleDef(json: Partial<ParticleEffectDef>): Particle
     shape: { ...d.shape, ...(json.shape ?? {}) },
     render: { ...d.render, ...(json.render ?? {}) },
     collision: migrateCollision(json.collision),
-    version: 1,
+    // ⚠️ Deliberately NO `version:` key here. A later key wins in an object spread, so a
+    // trailing `version: 1` used to overwrite whatever `...json` carried — re-stamping the
+    // in-memory def to `1` on EVERY load, and on every `setParticleEffect` call (which never
+    // touched disk at all). The fix is the ORDER, not a new mechanism: `...d` (this build's
+    // default, `PARTICLE_FORMAT_VERSION`) applies first and `...json` applies after, so a
+    // stored version wins when the document has one and only a versionless legacy/fresh doc
+    // falls back to the default (docs/format-versioning.md § 2b: "never echo back what you
+    // read" for a WRITER — this is a READER, and the in-memory def must report what the file
+    // said, not what this build would write).
   };
 
   // ── clamp invariants ──
@@ -118,18 +135,39 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
   // caller had already decided to answer with a refusal.
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
-    const gen = generation; // capture to detect a cache clear during the async load
+    const stillLive = liveness.capture(path); // detects a cache clear or per-key invalidation during the async load
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        // A scene swap (clearParticleCache) happened mid-flight: drop the result
-        // so we don't repopulate a stale path or re-register an old guid→path.
-        if (gen !== generation) return;
+        // A scene swap (clearParticleCache) or a per-key invalidation of THIS path happened
+        // mid-flight: drop the result so we don't repopulate a stale path or re-register an
+        // old guid→path.
+        if (!stillLive()) return;
         // An editor live-preview edit (setParticleEffect) landed while we were
         // fetching: it already seeded the cache, so don't clobber it with disk.
         if (cache.has(path)) return;
+        // Format-version REFUSAL (docs/format-versioning.md § 2b-bis): `.particle.json` is a
+        // machine-generated sidecar, not player data, so a `too-new`/`unreadable` document is
+        // REFUSE, not PRESERVE — do not cache it (so `getParticleEffect` keeps answering `null`)
+        // and never let `normalizeParticleDef` re-stamp this build's version over bytes it could
+        // not fully read.
+        const verdict = classifyFormatVersion(json, PARTICLE_FORMAT_VERSION);
+        if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+          // console.error, not .warn: a "still loading" null and a "refused, permanently" null
+          // are indistinguishable to every caller (particle systems do `if (!def) return; //
+          // still loading, retry next frame`), so this log line is the ONLY place the two are
+          // told apart. A `.warn` here would read exactly like the slow-load case it is not.
+          console.error(
+            verdict.kind === 'too-new'
+              ? `[particleCache] refusing ${path}: format version ${verdict.version} is newer than ` +
+                `this build's PARTICLE_FORMAT_VERSION (${PARTICLE_FORMAT_VERSION}) — not caching it.`
+              : `[particleCache] refusing ${path}: version field is unreadable (${verdict.reason}) — not caching it.`,
+          );
+          failed.add(path);
+          return;
+        }
         // Self-register guid → path (same pattern as meshTemplateCache) so a
         // later ref to this effect by guid resolves even if it wasn't in the
         // pre-loaded manifest (e.g. a freshly created effect in the editor).
@@ -138,7 +176,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         cache.set(path, normalizeParticleDef(json as Partial<ParticleEffectDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (stillLive()) failed.add(path);
         console.warn(`[particleCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -169,16 +207,22 @@ export function setParticleEffect(refOrPath: string, def: ParticleEffectDef): vo
 export function invalidateParticleEffect(refOrPath: string): void {
   const path = particleCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `invalidateAll()`, which is `clearParticleCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one effect must not also refuse an in-flight load of a
+  // DIFFERENT effect.
+  liveness.invalidateKey(path);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
 }
 
 /** Drop ALL cached effect defs (e.g. on scene swap / full resource disposal).
- *  Bumps the generation so any in-flight fetch discards its result instead of
+ *  Invalidates liveness so any in-flight fetch discards its result instead of
  *  repopulating the cache. Particle defs are plain data — nothing to GPU-dispose. */
 export function clearParticleCache(): void {
-  generation++;
+  liveness.invalidateAll();
   cache.clear();
   loading.clear();
   failed.clear();

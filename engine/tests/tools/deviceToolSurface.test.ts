@@ -6,9 +6,9 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, DEVICE_STUB_BACKEND, type DeviceSurface } from './deviceSurface';
+import { readScannedSource } from '@modoki/engine/testing';
 
 let surface: DeviceSurface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -84,7 +84,7 @@ describe('S2.39 — the device server knows WHICH editor it is driving', () => {
   it('the banner text the tools actually emit is the one the tests assert on', () => {
     // A guard against the class of bug above: a test asserting a string no code produces is
     // indistinguishable from a passing test. Pin the two together.
-    const src = readFileSync(join(__dirname, '../../tools/shared/identity.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../tools/shared/identity.ts')).code;
     expect(src).toContain('WRONG EDITOR');
   });
 });

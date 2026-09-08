@@ -75,6 +75,10 @@ import {
   invalidateParticleEffect,
   invalidateSpriteAnim,
   invalidateRig2D,
+  invalidateAnimSet,
+  invalidateMaterial,
+  invalidateShader,
+  fireDirtyListeners,
   findEntityByGuid,
   getCachedPrefab,
   getAllAssets,
@@ -90,6 +94,10 @@ import {
   getTimeline,
   getSpriteAnim,
   getRig2D,
+  getAnimSet,
+  getSpriteMaterialProgram,
+  isGuid,
+  getGuidForPath,
   startInputWatch,
   stopInputWatch,
   clearInputPresses,
@@ -106,8 +114,15 @@ import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { readConsoleSource } from './consoleSource';
+import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
+import { makeSchemaPusher } from './schemaPusher';
+// Single-sourced with the HOST side (`mcp-tools.ts`'s `device_step` tool, which must derive this
+// SAME default when a caller omits `timeoutMs`) — see `engine/tools/shared/simStepTiming.ts`
+// (#822). A VALUE import from `tools/shared`, not `import type`: see that file's docblock for why
+// this is a deliberate exception to the app→tools/shared "types only" convention.
+import { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
@@ -116,6 +131,7 @@ import {
   setGpuTimingEnabled, resetGpuTimings,
   collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
+  getFrameLoopHealth,
 } from '@modoki/engine/runtime';
 import {
   listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, type AgentToolDef,
@@ -227,69 +243,61 @@ function parseWhere(
   return { pred };
 }
 
-// ── Console capture (dev) ── a ring buffer of recent console messages so an
-// agent/tooling can read editor errors + warnings via the curl-able
-// /api/console-logs (backed by the 'console-logs' op below) — no devtools or
-// MCP attach needed. Capped; cleared on reload.
+// ── Console capture ── the ONE shared engine console ring (#596/#597 Stage 3a), read here for
+// an agent/tooling to reach via the curl-able /api/console-logs (backed by the 'console-logs' op
+// below) — no devtools or MCP attach needed.
 interface ConsoleEntry { level: 'log' | 'warn' | 'error'; ts: number; text: string }
 interface ConsoleLogsParams { level?: 'log' | 'warn' | 'error'; limit?: number; since?: number }
-const CONSOLE_BUFFER_MAX = 500;
-const consoleBuffer: ConsoleEntry[] = [];
-let consoleHooked = false;
 
-/** Wrap console.* into the ring. Called by `initAgentBridge`; exported so a test can populate
- *  the buffer without standing up the whole bridge (jsdom has neither HMR nor the Electron
- *  bridge, so `initAgentBridge` returns early). Idempotent. */
+/** UNTIL STAGE 3a this wrapped `console.log/warn/error` into a private `consoleBuffer` and
+ *  registered its OWN `window` `error`/`unhandledrejection` listeners — a SECOND capture,
+ *  duplicating the shared ring `installConsoleRing.ts` installs eagerly, and (once Stage 2 made
+ *  both feed that one ring) a SECOND ring entry for every uncaught error, alongside the one
+ *  `deviceConsoleCapture.ts` recorded. Both private captures are gone; the shared ring is the only
+ *  wrapper and `./uncaughtCapture.ts` (registered from `installConsoleRing.ts`'s gate) is the only
+ *  uncaught-error listener, anywhere in the app.
+ *
+ *  This function no longer decides when capture starts — that used to be the boot hole: capture
+ *  began only once `initAgentBridge()` ran (after `if (!hot && !bridge) return`), measured at
+ *  ~1.16s into boot, missing App.tsx's module eval at nav+276ms and React's mount at nav+305ms. The
+ *  eager, superset-gated `installConsoleRing.ts` import closes that hole regardless of whether this
+ *  function is ever called. Kept only as a shim so its existing callers (`initAgentBridge`, below,
+ *  and `ringBufferSeams.test.ts`) still work: it just makes sure the shared ring is installed, for a
+ *  test that imports this module directly without going through `main.tsx`'s eager import. */
 export function installConsoleCapture(): void {
-  if (consoleHooked) return;
-  consoleHooked = true;
-  for (const level of ['log', 'warn', 'error'] as const) {
-    const original = console[level].bind(console);
-    console[level] = (...args: unknown[]) => {
-      try {
-        const text = args.map((a) =>
-          typeof a === 'string' ? a
-            : a instanceof Error ? (a.stack || a.message)
-              : (() => { try { return JSON.stringify(a); } catch { return String(a); } })(),
-        ).join(' ');
-        consoleBuffer.push({ level, ts: Date.now(), text });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* never let capture break logging */ }
-      original(...args);
-    };
-  }
-  // Also capture uncaught errors + unhandled promise rejections — a failed dynamic
-  // import or a throw deep in scene/resource loading never reaches console.*, so
-  // tooling (/api/console-logs) would otherwise see a silent stall. Recorded at
-  // 'error' level with the source URL so the failing module is identifiable.
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', (e) => {
-      try {
-        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
-        consoleBuffer.push({ level: 'error', ts: Date.now(), text: `[uncaught] ${msg}${where}` });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* ignore */ }
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      try {
-        const r = (e as PromiseRejectionEvent).reason;
-        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
-        consoleBuffer.push({ level: 'error', ts: Date.now(), text: `[unhandledrejection] ${msg}` });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* ignore */ }
-    });
-  }
+  installConsoleRing();
+}
+
+/** Project the shared ring into this module's `ConsoleEntry` shape.
+ *
+ *  `readConsoleSource()` is preferred when set: #157's seam (`consoleSource.ts`) is STILL how the
+ *  DEVICE ring reaches `diagnose` — do not delete it thinking it's dead, and do not read this
+ *  function as its replacement. It degrades to `null` when nobody registered a source, which is the
+ *  ordinary case for a PACKAGED (non-dev) editor: `installDeviceConsoleCapture()`'s narrower gate
+ *  never fires there even though the shared ring itself does (`installConsoleRing.ts`'s gate
+ *  includes `__MODOKI_EDITOR__`) — so this function is the fallback that keeps `/api/console-logs`
+ *  non-empty in exactly that build. */
+function ringEntriesAsConsoleEntries(): ConsoleEntry[] {
+  return getConsoleRingEntries().map((e) => ({
+    // The ring carries 'info' as a distinct level; this reader's vocabulary has three ('log' /
+    // 'warn' / 'error') and 'info' must never leak into /api/console-logs, diagnose, or the MCP
+    // contract — fold it into 'log' rather than dropping the entry.
+    level: e.level === 'info' ? 'log' : e.level,
+    // EPOCH, not the ring's own monotonic `mono` — `since=`/`ts` comparisons below and in `diagnose`
+    // are wall-clock windows. `performance.timeOrigin` is the epoch instant `performance.now()`'s
+    // zero point measures from; this arithmetic belongs here, in the unscanned app layer, not in
+    // the engine's determinism-guarded `runtime/**` (see `consoleRing.ts`'s own doc comment).
+    ts: Math.round(performance.timeOrigin + e.mono),
+    text: e.args.join(' '),
+  }));
 }
 
 function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; total: number } {
-  // Read whatever surface ACTUALLY captured (#157). `consoleHooked` is the honest test: it is true
-  // exactly when `installConsoleCapture()` ran, i.e. when this module's own buffer is the live one
-  // (editor, and dev). On a shipped device build `initAgentBridge()` returns before that call, so
-  // the buffer is permanently empty and the device's own ring — published through `consoleSource`
-  // — is the real one. Preferring the native buffer whenever it is hooked keeps the editor path
-  // byte-identical, including the uncaught-error entries only it records.
-  let logs: ConsoleEntry[] = consoleHooked ? consoleBuffer : (readConsoleSource() ?? consoleBuffer);
+  // #596/#597 Stage 3a: `consoleBuffer`/`consoleHooked` are gone — the shared ring is the only
+  // capture, everywhere, so there is no longer a "which buffer is live" question to answer. See
+  // `ringEntriesAsConsoleEntries`'s own doc comment for why `readConsoleSource()` is still tried
+  // first.
+  let logs: ConsoleEntry[] = readConsoleSource() ?? ringEntriesAsConsoleEntries();
   if (p.level) logs = logs.filter((e) => e.level === p.level);
   if (p.since != null) logs = logs.filter((e) => e.ts > p.since!);
   const total = logs.length;
@@ -336,6 +344,29 @@ export function sceneReloadSource(env: { hasBridge: boolean; hasHot: boolean }):
   return null;
 }
 
+/** A staleness note for a FRAME-FED read — worldTransforms, screen bounds, hit regions, a physics
+ *  query, the profiler, a watch sample. Every one of these is only as fresh as the frame the loop
+ *  last actually ran, and a dead rAF chain returns last-live-frame data with nothing saying so
+ *  (#682). Appended to the op's EXISTING `warnings` array rather than a new payload shape.
+ *
+ *  Same "healthy means silent" inclusion rule as the editor's `frameLoopFields()`
+ *  (`agentEditorOps.ts`): silent while `status==='running' && recovered===0`.
+ *  `getFrameLoopHealth()` already carries a ready-to-read `.detail` for the two cases that matter
+ *  most — `'idle'` (this was NEVER computed, not merely stale — the loop has never pumped a frame)
+ *  and `'stalled'` (this is the last frame that ran, N ms ago) — so this reuses it rather than
+ *  re-deriving the same facts twice. */
+function frameStalenessWarning(what: string): string | null {
+  const h = getFrameLoopHealth();
+  if (h.status === 'running' && h.recovered === 0) return null;
+  if (h.detail) return `${what}: ${h.detail}`;
+  // 'hidden' (benign — an occluded window — and carries no `.detail`) or 'running' just after a
+  // stall recovered: still worth saying, since either can mean this read spans a gap the caller
+  // has no other way to see.
+  return `${what}: the frame loop is ${h.status}` +
+    (h.recovered > 0 ? ` (recovered from a stall ${h.recovered} time(s) this session)` : '') +
+    ' — this may not be from the CURRENT frame.';
+}
+
 /** Build a plain-JSON dump of the live ECS world — the "verify without a
  *  screenshot" payload. Reuses `getAllEntities` (which already returns the trait
  *  names present per entity), resolving each name to its meta via a map built
@@ -348,6 +379,16 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
   const readTrait = params.full ? readTraitDataFull : readTraitData;
   const warnings: string[] = [];
+  // #682: `world`/`bounds` are FRAME-FED — `worldTransforms` is written by
+  // transformPropagationSystem, a frame callback, so both enrichers are only as fresh as the last
+  // frame the loop actually ran. The `world` guard below (`worldTransforms.get(info.id)`) used to
+  // be a SILENT omission either way: a loop that ran and then died returns last-live-frame values
+  // as current with nothing saying so, and a loop that never ran drops the key with no explanation
+  // at all (indistinguishable from "this entity has no computed world transform").
+  if (params.world || params.bounds) {
+    const w = frameStalenessWarning('world/bounds');
+    if (w) warnings.push(w);
+  }
   const all = getAllEntities();
   // Resource entities are mesh/material/prefab/env holders AND world-singleton
   // config traits (Time, Physics2D/3D, NPRPostFX). They clutter the DEFAULT
@@ -586,7 +627,8 @@ registerAgentOp('scene-state', (params) => {
 registerAgentOp('render-scene', (params) => renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts));
 // Summary-first at the OP, never in `dumpConsoleLogs` — `diagnose` (below) reads that
 // producer directly for its error list, and a default tail there would silently drop errors
-// from `modoki_diagnose` with no failing test. The ring holds 500 entries (~20–27k tokens);
+// from `modoki_diagnose` with no failing test. The shared ring holds 1000 entries in the editor
+// (`installConsoleRing.ts`'s `capacity`, #596/#597 Stage 3a — was a private 500-entry buffer);
 // a bare read returns the last 50 plus a per-level histogram of the whole window.
 registerAgentOp('console-logs', (params) => {
   const p = (params ?? {}) as ConsoleLogsParams;
@@ -607,6 +649,12 @@ registerAgentOp('console-logs', (params) => {
     total: r.total,
     ringTotal: ring.length,
     byLevel,
+    // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
+    // and `logs`/`ring` above concatenate the two halves with nothing marking the seam. `dropped`
+    // is how many tail entries were evicted between them; non-zero means an agent reading `logs`
+    // is looking at boot plus a recent window with a real gap in between, not a continuous log. See
+    // `getConsoleRingDropped`'s own doc comment (consoleRing.ts).
+    dropped: getConsoleRingDropped(),
     ...(r.truncated ? { truncated: true, hint: tailHint('console entries', r.items.length, r.total, ', or narrow with level=/since=') } : {}),
   };
 });
@@ -870,12 +918,21 @@ registerAgentOp('layout-bounds', (params) => {
   // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (ids, ints)
   // from the PRODUCER, so it is unaffected either way — but keep the rounding here regardless.
   const p = (params ?? {}) as LayoutBoundsParams & { precision?: number };
-  return roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision));
+  const result = roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision)) as Record<string, unknown>;
+  // #682: every rect here is FRAME-FED (a registered bounds provider runs at render time).
+  const w = frameStalenessWarning('layout bounds');
+  return w ? { ...result, warnings: [w] } : result;
 });
 
 // ── Enact Phase 2: numeric handle geometry — WHERE the draggable handles are in the
 // Canvas2D/SVG authoring editors, so `drag-handle`/`tap-handle` can aim without pixels. ──
-registerAgentOp('enact-handles', (params) => computeHandles((params ?? {}) as HandlesDumpParams));
+registerAgentOp('enact-handles', (params) => {
+  const result = computeHandles((params ?? {}) as HandlesDumpParams) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): the same frame-fed projection as `layout-bounds` — a Canvas2D
+  // provider's handle geometry is only as fresh as the last frame it actually ran on.
+  const w = frameStalenessWarning('enact handles');
+  return w ? { ...result, warnings: [w] } : result;
+});
 
 // Editor CHROME joins the same registry, so `tap_handle` drives a panel button with no new
 // input tool. Registered once here rather than per-panel: it is one DOM walk over
@@ -894,7 +951,14 @@ import.meta.hot?.dispose(() => unregisterChromeHandles());
 // ── Selector-aware input: resolve a CSS selector to a live viewport point (+ who is
 // actually on top of it) so the trusted-input host routes can aim without a round-trip
 // race. Renderer-side because only the renderer has the DOM. ──
-registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?? {}) as DomPointSpec));
+registerAgentOp('resolve-dom-point', (params) => {
+  const result = resolveDomPointReport((params ?? {}) as DomPointSpec) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): this is one of the values the TRUSTED CDP/WDA routes aim from
+  // (`resolveAimViaDevice` → `resolve-aim` → here for a selector aim) — the same frame-fed
+  // projection as `layout-bounds`/`hit-regions`, so it gets the same staleness note.
+  const w = frameStalenessWarning('resolve dom point');
+  return w ? { ...result, warnings: [w] } : result;
+});
 // #261 — consulted ONLY when an aim is about to be refused, to tell a transient (the dock is
 // mid-move) from a real one. Registered here rather than in agentEditorOps.ts because it needs
 // nothing from `editor/`: §9's rule is that an op reaching only the DOM belongs where BOTH
@@ -905,7 +969,14 @@ registerAgentOp('layout-settling', () => layoutSettleReport());
 // entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in
 // an earlier round-trip. Renderer-side because only the renderer holds the camera, the
 // PixiJS bounds, and the DOM. ──
-registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((params ?? {}) as EntityPointSpec));
+registerAgentOp('resolve-entity-point', (params) => {
+  const result = resolveEntityPointReport((params ?? {}) as EntityPointSpec) as unknown as Record<string, unknown>;
+  // #682 close-out (LOW 6): a 2D/3D entity's rect comes from the same registered bounds
+  // providers `layout-bounds` reads (`collectScreenBounds`) — frame-fed, and one of the values
+  // the TRUSTED routes aim from — so it gets the same staleness note.
+  const w = frameStalenessWarning('resolve entity point');
+  return w ? { ...result, warnings: [w] } : result;
+});
 
 // ── Can trusted input actually be DELIVERED to this window right now? ──
 // Chromium DROPS every `sendInputEvent` while the window is OCCLUDED (another app fully covers
@@ -919,10 +990,22 @@ registerAgentOp('resolve-entity-point', (params) => resolveEntityPointReport((pa
 // `hasFocus` is the WEAKER sibling and is reported rather than refused: with the window visible
 // but not OS-focused, input DOES arrive, but Chromium fires no focus/blur/focusin/focusout, so
 // anything the editor does on a focus event silently does not happen.
-registerAgentOp('input-deliverability', () => ({
-  visibilityState: document.visibilityState,
-  hasFocus: document.hasFocus(),
-}));
+//
+// `frameLoop` (#682 close-out, HIGH 1): reused by `editorBackendRouter.ts`'s device-input
+// dispatch as the ONE round trip every CDP-routable method (tap/drag/press-key/hover/scroll)
+// makes before a transport is chosen — `handleResolveAim` alone cannot cover `press-key`, which
+// has no coordinates to resolve and so never round-trips through the page at all. Reported here,
+// not refused: this op only answers "can input be delivered right now", it dispatches nothing
+// itself, so a stalled loop is a FACT for the caller to act on rather than something for this op
+// to refuse.
+registerAgentOp('input-deliverability', () => {
+  const h = getFrameLoopHealth();
+  return {
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+    frameLoop: { status: h.status, unrecoverable: h.unrecoverable, detail: h.detail, msSinceLastFrame: h.msSinceLastFrame },
+  };
+});
 
 // ── Phase F: structured render/scene health (causes, not a black screenshot) ──
 // Only errors inside this window gate `ok` (F14): a stale load-time / prior-scene error otherwise
@@ -1009,6 +1092,11 @@ registerAgentOp('profiler', (raw: unknown) => {
       const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
       // Sorted by cost, so the interesting frames come first regardless of when they happened.
       const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
+      // #682: `captureFrame` is called from inside `runFrame` (a frame callback) — a dead loop
+      // simply stops appending, so a capture that ran and then died reports its last frames as
+      // current with nothing saying so. Reported ONLY while still `capturing` — a capture the
+      // caller already `capture-stop`ped is expected to be frozen, not stale.
+      const w = cap.capturing ? frameStalenessWarning('profiler capture') : null;
       return {
         capturing: cap.capturing,
         frameCount: cap.frames.length,
@@ -1019,6 +1107,7 @@ registerAgentOp('profiler', (raw: unknown) => {
           // Only the costly branches — a full tree per frame is what blows the budget.
           top: flattenTree(f.tree).sort((a, b) => b.selfMs - a.selfMs).slice(0, 6),
         })),
+        ...(w ? { warnings: [w] } : {}),
       };
     }
     // P7 — GPU timestamp queries. Separate actions rather than a flag on `read` because enabling
@@ -1089,8 +1178,14 @@ registerAgentOp('profiler', (raw: unknown) => {
       // exists for the deliberate case (re-arming across a scene swap).
       return { reset: true };
     case 'read':
-    default:
-      return readPerfProfile({ markers: Number(params.markers ?? 12) });
+    default: {
+      const result = readPerfProfile({ markers: Number(params.markers ?? 12) }) as Record<string, unknown>;
+      // #682: `frame`/`gpu`/`restBreakdown` are all sampled from frames that actually ran — a dead
+      // loop stops filling the ring and this would otherwise report the last healthy reading
+      // forever with nothing saying so.
+      const w = frameStalenessWarning('profiler');
+      return w ? { ...result, warnings: [w] } : result;
+    }
   }
 });
 
@@ -1124,14 +1219,21 @@ registerAgentOp('watch-read', (params) => {
   // `roundFloats` COPIES, which matters here: `readWatch` hands back the LIVE `samples` arrays
   // that WatchTab renders. Rounding in place would degrade the human's sparkline.
   if (!out?.ok || !Array.isArray(out.series)) return out;
-  if (p.samples) return roundFloats(out, sig);
+  // #682: a watch samples the live world once per frame — a dead loop simply stops recording, and
+  // every stat here (first/last/min/max/delta/settled) is only as fresh as the last sample taken.
+  const staleness = frameStalenessWarning('watch');
+  if (p.samples) {
+    const rounded = roundFloats(out, sig) as Record<string, unknown>;
+    return staleness ? { ...rounded, warnings: [staleness] } : rounded;
+  }
   const totalSamples = out.series.reduce((n, s) => n + (typeof s.count === 'number' ? s.count : 0), 0);
-  return roundFloats({
+  const rounded = roundFloats({
     ...out,
     series: out.series.map(({ samples: _samples, ...rest }) => rest),
     totalSamples,
     hint: `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
-  }, sig);
+  }, sig) as Record<string, unknown>;
+  return staleness ? { ...rounded, warnings: [staleness] } : rounded;
 });
 registerAgentOp('watch-list', () => listWatches());
 registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string })?.id));
@@ -1253,6 +1355,9 @@ registerAgentOp('hit-regions', (raw: unknown) => {
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
   }
+  // #682: hit-test geometry is FRAME-FED (computed inside the hit-test from the live world).
+  const staleness = frameStalenessWarning('hit regions');
+  if (staleness) result.warnings = [staleness];
   return roundFloats(result, resolvePrecision(p.precision));
 });
 
@@ -1347,6 +1452,12 @@ registerAgentOp('scene-query', (params) => {
     return v as number[];
   };
 
+  // #682: a physics query reads the CURRENT Rapier world, which the physics system — a frame
+  // callback — is what actually advances. A dead loop freezes it mid-scene and this query would
+  // silently report a hit/miss against wherever things were when frames stopped.
+  const staleness = frameStalenessWarning('scene query');
+  const warningsField = staleness ? { warnings: [staleness] } : {};
+
   // ── point: the pick/hit-test query. Its result shape is deliberately DIFFERENT ──
   if (p.kind === 'point') {
     const pt = vec(p.point, 'point');
@@ -1356,7 +1467,7 @@ registerAgentOp('scene-query', (params) => {
     // impact point, no surface normal and no distance; padding those with zeros would make a
     // `distance:0` here mean something different from a `distance:0` on a raycast, which is
     // exactly the drift that rule exists to stop.
-    return { ok: true, kind: 'point', dim: p.dim, point: pt, hit: id == null ? null : queryHitRef(id) };
+    return { ok: true, kind: 'point', dim: p.dim, point: pt, hit: id == null ? null : queryHitRef(id), ...warningsField };
   }
 
   const origin = vec(p.origin, 'origin');
@@ -1413,7 +1524,7 @@ registerAgentOp('scene-query', (params) => {
 
   // 3. Everything that could have produced a false `null` is ruled out, so THIS null is a real
   //    miss and can be reported as one.
-  const base = { ok: true as const, kind: p.kind, dim: p.dim, origin, direction: dir };
+  const base = { ok: true as const, kind: p.kind, dim: p.dim, origin, direction: dir, ...warningsField };
   if (!raw) return { ...base, hit: null };
   const point = is2d ? [raw.x, raw.y] : [raw.x, raw.y, raw.z as number];
   const normal = is2d ? [raw.nx, raw.ny] : [raw.nx, raw.ny, raw.nz as number];
@@ -1475,14 +1586,32 @@ registerAgentOp('player-prefs-read', (params) => {
     // Summary-first (§6): the INDEX by default, a value only when a key is named.
     return {
       ok: true, namespace, totalCount: keys.length, keys,
-      pendingWrites: keys.filter((k) => PlayerPrefs.hasPendingWrite(k)),
+      // The authoritative pending set AT A STABLE POINT, NOT `keys.filter(hasPendingWrite)` — a
+      // key can be pending and simultaneously ABSENT from `keys` (a DELETE the backend rejected:
+      // `PlayerPrefs.delete` removes it from the cache immediately, so `keys` never has it). So
+      // this list can legitimately contain a key this same response's `keys` array does not —
+      // that's the point, not a bug. ⚠️ It no longer under-reports mid-drain (#559): this op does
+      // not flush, but `pendingKeys()` now reports writes a drain has taken and not yet settled, so
+      // an in-flight write appears here rather than reading as landed. This op is the ONE caller
+      // whose behaviour that changed — every other reader samples after an awaited flush — and the
+      // change is strictly toward truth. The old comment told an agent debugging a money path to
+      // distrust exactly the list it can now rely on.
+      pendingWrites: PlayerPrefs.pendingKeys().sort(),
     };
   }
   // A key that is genuinely absent is an ANSWER, not a refusal — we looked, and it is not there.
   // `present` carries that explicitly rather than leaving it to be inferred from a missing
   // `value`, which is indistinguishable from a key holding JSON `null`.
   if (!PlayerPrefs.has(p.key)) {
-    return { ok: true, namespace, key: p.key, present: false, totalCount: keys.length, keys };
+    return {
+      ok: true, namespace, key: p.key, present: false, totalCount: keys.length, keys,
+      // A key absent from the cache can still be DIRTY. That does NOT prove a rejection — an
+      // ordinary debounced delete (still inside its 150ms window, never yet sent to the backend)
+      // has the identical signature. What it proves is that the durable remove has not been
+      // ACCEPTED yet, so the key may still be on disk. `present: false` alone would report it as
+      // durably gone (#422's own failure shape, on the branch an agent uses to verify a single key).
+      pendingWrite: PlayerPrefs.hasPendingWrite(p.key),
+    };
   }
   return {
     ok: true, namespace, key: p.key, present: true,
@@ -1502,16 +1631,90 @@ registerAgentOp('player-prefs-write', async (params) => {
   }
   const refusal = prefsUnhydrated();
   if (refusal) return refusal;
+  // Distinct from `prefsUnhydrated()` above: `isHydrated()` stays `true` for the whole swap
+  // window (it's truthfully describing the OUTGOING store — see `doInit`'s doc comment in
+  // playerPrefs.ts). ALL FOUR actions are refused here, `flush` included (#438 round 5 — a round
+  // 4 `flush` exemption reasoned that draining the outgoing store is "harmless", but a `flush`
+  // that is still draining when the install runs settles AFTER the swap: `PlayerPrefs.pendingKeys()`
+  // read below would then answer against the INCOMING (already-empty) namespace, so a write that
+  // never landed anywhere reports `{ok:true, flushed:true, pendingWrites:[]}` — a false success by
+  // construction, not a harmless drain. A `set`/`delete`/`clear` has the same problem one layer up:
+  // even where the write itself durably lands in the OUTGOING backend, this op cannot truthfully
+  // report so once the swap has moved the namespace out from under it. Reads are left alone (see
+  // `player-prefs-read` above) because a read during the window answers truthfully about the
+  // outgoing store — there is nothing for it to settle across.
+  if (PlayerPrefs.isSwapInFlight()) {
+    return {
+      ok: false,
+      code: 'NOT_AVAILABLE_HERE',
+      error: 'A game/namespace swap is in progress (PlayerPrefs.init() is mid-flight) — a ' +
+        `${p.action} right now could settle AFTER the swap installs the incoming namespace, so ` +
+        'this op cannot truthfully report where (or whether) it landed.',
+      hint: 'Retry once the swap finishes (isSwapInFlight() returns false).',
+    };
+  }
+  // Captured HERE, before this op's own internal `await`s (flush/clear below) — not re-read at
+  // reply time. If a swap starts DURING one of those awaits (a separate, later `init()` call),
+  // the write already in flight resolves against whatever `drain()` captured as its OWN
+  // `batchNamespace`/`batchBackend` locals at the moment it started — i.e. THIS namespace, not
+  // whatever `PlayerPrefs.namespace()` would report afterward. Re-reading it after the await
+  // would name the wrong (incoming) namespace for a write that actually landed in this one.
   const namespace = PlayerPrefs.namespace();
+  // Captured alongside `namespace`, same reasoning — see `swapGeneration()`'s doc comment in
+  // playerPrefs.ts. `isSwapInFlight()` above is a SAMPLE taken at entry; a swap that starts (and
+  // possibly finishes) during one of this op's own `await PlayerPrefs.flush()` calls below is
+  // invisible to a re-sampled `isSwapInFlight()` if it also closes before this op resumes, so the
+  // generation counter is what actually catches it (#454 C).
+  const swapGen = PlayerPrefs.swapGeneration();
+  // Called after every internal `await PlayerPrefs.flush()` below, right before the
+  // `pendingKeys()`/`hasPendingWrite()` readback that follows it — a swap that lands mid-await
+  // means that readback would answer against the INCOMING namespace, not the one this op is
+  // reporting about. `isSwapInFlight()` is checked too (not just the generation) so a swap that
+  // is STILL open when this op resumes is caught by the cheaper, more direct signal; the
+  // generation check is what catches the swap that already opened AND closed inside the await.
+  // The issue (#454) names only the `flush` action, but `clear`/`delete`/`set` have the exact
+  // same shape of bug at their own flush sites — a single shared helper called at every one of
+  // them is less error-prone than reimplementing this check per call site.
+  //
+  // This check is deliberately CONSERVATIVE — it fires whenever a swap started during the
+  // await, including cases where the readback would in fact still have been truthful (the swap
+  // may be parked behind this op's own `writeChain` and not yet installed). Over-reporting
+  // "unknown" is the safe direction; claiming a durability we could not observe is not.
+  //
+  // Unlike the entry-time `isSwapInFlight()` refusal above, this fires AFTER the mutation has
+  // already happened — the cache write landed, and the durable write was at least attempted
+  // against `namespace`. So it does NOT return `NOT_AVAILABLE_HERE` (which at entry truthfully
+  // means "nothing was done"; here it would mean "everything was done, I just won't tell you" —
+  // worse than the false success it replaced, since a caller retrying a `delete` whose durable
+  // remove already landed would then get `NOT_FOUND: nothing was deleted` and conclude its
+  // delete never happened). Instead it reports `PARTIAL` with `durability:'unknown'` — the
+  // shape `contracts.ts` already defines for "the cache change happened, the durable outcome
+  // could not be confirmed" — merging in whichever facts THIS action already knows are true.
+  const swapUnverifiableAfterFlush = (known: Record<string, unknown>) =>
+    (PlayerPrefs.swapGeneration() !== swapGen || PlayerPrefs.isSwapInFlight())
+      ? {
+          ok: false as const,
+          code: 'PARTIAL' as const,
+          namespace,
+          ...known,
+          durability: 'unknown' as const,
+          error: `a game/namespace swap STARTED while this op was awaiting its own flush (it may or may not have completed) — the write was applied to the live cache and its durable write was attempted against "${namespace}", but the pending-write readback that decides this reply can no longer be trusted to answer for "${namespace}", so whether the backend ACCEPTED it is unknown`,
+          hint: `Treat this as durability-unknown, NOT as a failure — do not simply retry, since the same op against the incoming namespace would report on a different store. Once the swap has settled, "${namespace}" is only inspectable by re-opening the game that owns it.`,
+        }
+      : null;
 
   if (p.action === 'flush') {
     await PlayerPrefs.flush();
+    const swapUnverifiable = swapUnverifiableAfterFlush({ flushed: true });
+    if (swapUnverifiable) return swapUnverifiable;
     // A flush that RESOLVES is not a flush that landed: `drain()` catches a rejected backend write,
     // re-queues the key into `dirty`, and settles fulfilled so later writes are not poisoned —
     // while `cache` keeps the value, so `get()` still returns it. Re-reading the pending set is the
     // only way to see it, so reporting a clean `ok:true` here would be a false success by
-    // construction.
-    const stillPending = PlayerPrefs.keys().filter((k) => PlayerPrefs.hasPendingWrite(k));
+    // construction. Must be `PlayerPrefs.pendingKeys()`, not `keys().filter(hasPendingWrite)` — a
+    // rejected DELETE leaves the key dirty but removes it from `cache` (and so from `keys()`) in the
+    // same call, so the cache-derived filter structurally cannot see it.
+    const stillPending = PlayerPrefs.pendingKeys().sort();
     if (stillPending.length > 0) {
       return {
         ok: false, code: 'PARTIAL', namespace, pendingWrites: stillPending,
@@ -1543,6 +1746,37 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.clear();
     await PlayerPrefs.flush();
+    const clearSwapUnverifiable = swapUnverifiableAfterFlush({ cleared: keys.length, keys });
+    if (clearSwapUnverifiable) return clearSwapUnverifiable;
+    // Same rejection possibility as `flush`/`set`/`delete` — a clear queues every key as a delete,
+    // and any of those backend.remove() calls can be rejected (quota, native I/O) and re-queued.
+    const stillPending = PlayerPrefs.pendingKeys().sort();
+    // `stillPending` is the whole dirty set, which can include a key that was ALREADY pending before
+    // this clear ran (an earlier rejected delete) — that key is not one this clear enumerated, and
+    // attributing it here produced "REJECTED for 2 of them" against `cleared: 1`.
+    const failed = stillPending.filter((k) => keys.includes(k));
+    const alsoPending = stillPending.filter((k) => !keys.includes(k));
+    if (stillPending.length > 0) {
+      // `alsoPending`'s state pre-dates this clear, but this clear's own `await flush()` above
+      // retried every dirty key (including these) — so if one is still pending here, THIS call's
+      // retry was rejected again, not merely "not caused by it".
+      const alsoPendingClause = alsoPending.length > 0
+        ? ` (${alsoPending.join(', ')} — already pending before this clear ran, and this call's ` +
+          `flush retried ${alsoPending.length === 1 ? 'it' : 'them'} and ` +
+          `${alsoPending.length === 1 ? 'was' : 'were'} rejected again)`
+        : '';
+      // "the backend accepted the durable remove for all of them" is false whenever `alsoPending`
+      // fired alongside an empty `failed` — this clause only speaks for the keys THIS clear
+      // enumerated, which `failed` (not `stillPending`) tracks.
+      const failedClause = failed.length > 0
+        ? `the backend REJECTED the durable remove for ${failed.length} of them: ${failed.join(', ')} — the on-disk state for ${failed.length === 1 ? 'it is' : 'them is'} unchanged from before this call`
+        : 'every key this clear enumerated was durably removed';
+      return {
+        ok: false, code: 'PARTIAL', namespace, cleared: keys.length, keys, pendingWrites: stillPending,
+        error: `clear removed ${keys.length} key(s) from the live cache but ${failedClause}${alsoPendingClause}`,
+        hint: 'A rejected write keeps the key out of the cache but not off disk. Retry with player-prefs-write action:\'flush\' once the underlying issue (quota, I/O) clears.',
+      };
+    }
     return { ok: true, namespace, cleared: keys.length, keys };
   }
 
@@ -1554,7 +1788,39 @@ registerAgentOp('player-prefs-write', async (params) => {
     // A no-op is a failure when the caller asked for a change (§5) — and the refusal is more
     // useful than the no-op would have been, because a delete that hits nothing is almost always
     // a mistyped key and the real ones are right here.
-    if (!PlayerPrefs.has(p.key)) {
+    // #630 review finding 4 — a PROTECTED key also reads as absent from `has()` (deliberately —
+    // see its doc comment), but it is not missing: it holds a save this build could not read, and
+    // `set()`'s own refusal message tells the caller to `PlayerPrefs.delete(key)` first to clear
+    // it. Without this check that escape hatch is unreachable from the agent surface — `has()`
+    // says the key isn't there, so the delete falls straight into NOT_FOUND below, and the only
+    // way left to clear a protected key is `action:'clear'`, which wipes the whole namespace.
+    // `PlayerPrefs.delete()` itself already treats a protected key like any other (it drops the
+    // protection unconditionally), so falling through to the ordinary delete path below is correct.
+    if (!PlayerPrefs.has(p.key) && !PlayerPrefs.isProtected(p.key)) {
+      // A key absent from the cache but still DIRTY is not a missing key — but it is NOT proof of
+      // a rejection either. `PlayerPrefs.delete()` does `cache.delete; dirty.add; scheduleFlush()`
+      // on a 150ms debounce, so an ordinary in-flight delete (the game's own `PlayerPrefs.delete()`,
+      // or a prior call to this op before its own flush lands) has the IDENTICAL signature — dirty,
+      // absent from cache, nothing yet sent to the backend. Flushing settles which one this is, and
+      // if it was merely debounced, it also completes the removal this delete call asked for.
+      if (PlayerPrefs.hasPendingWrite(p.key)) {
+        await PlayerPrefs.flush();
+        const deleteNoopSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key, deleted: true, alreadyRemoved: true });
+        if (deleteNoopSwapUnverifiable) return deleteNoopSwapUnverifiable;
+        if (PlayerPrefs.hasPendingWrite(p.key)) {
+          return {
+            ok: false, code: 'PARTIAL', namespace, key: p.key, deleted: true, saved: false,
+            // Same symmetry as the PARTIAL below: "still on disk" would be false for a key whose
+            // only prior write was itself a rejected SET.
+            error: `'${p.key}' was already out of the live cache from an earlier delete, and the backend REJECTED its durable remove — the on-disk state is unchanged from before this call`,
+            hint: "The cache removal already happened, so a second delete cannot help. Retry the durable remove with action:'flush' once the underlying issue (quota, I/O) clears.",
+          };
+        }
+        return {
+          ok: true, namespace, key: p.key, deleted: true, saved: true, alreadyRemoved: true,
+          note: `'${p.key}' had already been removed from the live cache by an earlier delete whose durable write was still pending (the game's own delete, or a prior call); this call flushed it, so it is now durably removed`,
+        };
+      }
       const keys = [...PlayerPrefs.keys()].sort();
       return {
         ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,
@@ -1564,6 +1830,23 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.delete(p.key);
     await PlayerPrefs.flush();
+    const deleteSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key, deleted: true });
+    if (deleteSwapUnverifiable) return deleteSwapUnverifiable;
+    // Mirrors the `set` path's check below. `deleted: true` stays true even in the PARTIAL shape —
+    // the cache removal DID happen, `get()`/`has()` on this key now behave as if it's gone. It's
+    // `saved` that's false: the durable remove was rejected, so the key is still on disk and will
+    // come back on the next launch. That asymmetry is the honest report.
+    if (PlayerPrefs.hasPendingWrite(p.key)) {
+      return {
+        ok: false, code: 'PARTIAL', namespace, key: p.key, deleted: true, saved: false,
+        // "Still on disk" would be false for a key whose only prior write was itself a rejected
+        // SET — it was never durably written in the first place. State it symmetrically instead:
+        // the durable remove failed, so whatever was on disk before this call (if anything) is
+        // unchanged.
+        error: `'${p.key}' was removed from the live cache but the backend REJECTED the durable remove (quota, or a native I/O error) — the on-disk state is unchanged from before this call`,
+        hint: "Retry the durable remove with action:'flush'. A second delete cannot help — the cache removal already happened, so it reports this same PARTIAL rather than removing anything.",
+      };
+    }
     return { ok: true, namespace, key: p.key, deleted: true, saved: true };
   }
 
@@ -1575,16 +1858,28 @@ registerAgentOp('player-prefs-write', async (params) => {
     };
   }
   PlayerPrefs.set(p.key, p.value as JsonValue);
-  // `set()` SKIPS a value it cannot serialize (it warns and returns), so a bare ok:true would be a
-  // false success for exactly the inputs most likely to be wrong. The wire is JSON so this should
-  // be unreachable — assert it rather than assume it.
+  // `set()` SKIPS a value in TWO distinct cases, both leaving `has()` false: a value it cannot
+  // serialize (it warns and returns), and — #630 review finding 5 — a key PROTECTED by a save
+  // this build could not read (it refuses to clobber it and returns). The wire is JSON, so the
+  // non-serializable case should be unreachable — asserted here rather than assumed — but the
+  // protected case is very much reachable, and reporting it as "rejected as non-JSON-serializable"
+  // states a false cause authoritatively. Distinguish them with `isProtected` instead.
   if (!PlayerPrefs.has(p.key)) {
+    if (PlayerPrefs.isProtected(p.key)) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', namespace, key: p.key,
+        error: `'${p.key}' holds a save written by a newer build that this build cannot read, so the write was refused rather than overwriting it`,
+        hint: `call player-prefs-write action:'delete' key:'${p.key}' first if overwriting it is intentional`,
+      };
+    }
     return { ok: false, code: 'REFUSED_BY_OP', namespace, key: p.key, error: `the value for '${p.key}' was rejected as non-JSON-serializable and NOT stored` };
   }
   // Flush rather than leaving the 150ms debounce running: an agent's next act is usually to verify
   // or to move on, and a debounced write that a reload or a scene swap eats would look like the
   // set never happened. The flush also surfaces a backend rejection, which the debounce would hide.
   await PlayerPrefs.flush();
+  const setSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key });
+  if (setSwapUnverifiable) return setSwapUnverifiable;
   const pending = PlayerPrefs.hasPendingWrite(p.key);
   if (pending) {
     return {
@@ -1612,13 +1907,21 @@ registerAgentOp('set-timescale', (params) => {
 // See docs/mcp-tool-conventions.md §9.
 /** Guess an asset-def kind from its filename. The suffixes are the project's own convention
  *  (docs/doc-conventions.md), not a heuristic. Exported so the EDITOR op reuses it instead of
- *  keeping a second copy (#166 P7 — the duplication class §9 warns about). */
-export function inferAssetDefType(path: string): 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d' | null {
+ *  keeping a second copy (#166 P7 — the duplication class §9 warns about).
+ *
+ *  #842b widened this to all 8 `ASSET_SCHEMA_TYPES` — `/api/asset-write` already accepted
+ *  material/shader/animset, but this function (and `read-asset-def`, which infers its `type`
+ *  from it when the caller doesn't pass one) only recognized 5, so an agent could WRITE a
+ *  material/shader/animset and never read it back to verify. */
+export function inferAssetDefType(path: string): 'material' | 'particle' | 'animation' | 'spriteanim' | 'timeline' | 'rig2d' | 'shader' | 'animset' | null {
+  if (path.endsWith('.mat.json')) return 'material';
   if (path.endsWith('.particle.json')) return 'particle';
   if (path.endsWith('.anim.json')) return 'animation';
   if (path.endsWith('.timeline.json')) return 'timeline';
   if (path.endsWith('.spriteanim.json')) return 'spriteanim';
   if (path.endsWith('.rig2d.json')) return 'rig2d';
+  if (path.endsWith('.shader.json')) return 'shader';
+  if (path.endsWith('.animset.json')) return 'animset';
   return null;
 }
 
@@ -1637,12 +1940,23 @@ registerAgentOp('read-asset-def', (params) => {
     return {
       ok: false,
       error: `cannot tell what kind of asset '${path}' is — pass type explicitly.`,
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'],
+      options: ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'],
     };
   }
   // PEEK, don't load. The plain getters treat a miss as "not loaded YET" and kick off a background
   // fetch, so asking about an absent asset would queue a load that can only fail and log into the
   // console — for a question this op then refuses anyway.
+  if (kind === 'material') {
+    // material is NOT genuinely peekable, on this surface either — `materialCache`
+    // (meshTemplateCache.ts) holds only the BUILT `THREE.Material` once `fetchMaterial` parses the
+    // `.mat.json`; the raw JSON is never retained live. Refuse explicitly rather than falling into
+    // the generic "unsupported type" branch below, and say why + what to do instead.
+    return {
+      ok: false,
+      error: "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
+      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+    };
+  }
   const peek = { load: false } as const;
   const def =
     kind === 'particle' ? getParticleEffect(path, peek)
@@ -1650,9 +1964,27 @@ registerAgentOp('read-asset-def', (params) => {
     : kind === 'timeline' ? getTimeline(path, peek)
     : kind === 'spriteanim' ? getSpriteAnim(path, peek)
     : kind === 'rig2d' ? getRig2D(path, peek)
+    // shader — `getSpriteMaterialProgram` is a bare `Map.get`, no fetch side effect on a miss, so
+    // it's exactly as peekable as the `{load:false}` getters above despite the different signature.
+    // It's keyed by GUID (whatever `Renderable.material` carried when the program compiled), not by
+    // path, so a path-shaped `path` has to be turned into a guid first via the manifest's reverse
+    // lookup. `.manifest` is the authored `.shader.json` doc itself — the compiled GL/GPU program
+    // alongside it is not part of the answer.
+    : kind === 'shader' ? (() => {
+        const guid = isGuid(path) ? path : getGuidForPath(path);
+        const program = guid ? getSpriteMaterialProgram(guid) : undefined;
+        return program ? program.manifest : null;
+      })()
+    // animset — `getAnimSet` now takes the same `{load:false}` peek option as its siblings above,
+    // so a miss reports null without fetching or sticky-poisoning `failed`.
+    : kind === 'animset' ? getAnimSet(path, peek)
     : undefined;
   if (def === undefined) {
-    return { ok: false, error: `unsupported type '${kind}'.`, options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d'] };
+    return {
+      ok: false,
+      error: `unsupported type '${kind}'.`,
+      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+    };
   }
   if (def === null) {
     // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no live
@@ -1677,35 +2009,77 @@ registerAgentOp('load-scene', async (params) => {
     };
   }
   const before = sceneManager.getCurrent()?.path ?? null;
+  const loading = sceneManager.loadScene(p.path);
+  // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
+  // first await (SceneManager.ts:286-288) — so reading it here, between the call and the await,
+  // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
+  const myId = sceneManager.getNext()?.id ?? null;
   try {
-    await sceneManager.loadScene(p.path);
+    await loading;
   } catch (e) {
-    return { ok: false, error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The previous scene is still loaded.`, current: sceneManager.getCurrent()?.path ?? null };
+    const cur = sceneManager.getCurrent();
+    if (cur?.path === before) {
+      return { ok: false, error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The previous scene is still loaded.`, current: cur?.path ?? null };
+    }
+    // A DIFFERENT load's world got swapped in while this one was failing — "the previous scene is
+    // still loaded" would be false right next to `current` naming a third scene.
+    return {
+      ok: false,
+      error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The active scene is now "${cur?.path ?? 'null'}" — the previous scene is NOT what is loaded, because another load swapped it in while this one was failing.`,
+      current: cur?.path ?? null,
+    };
   }
-  const after = sceneManager.getCurrent()?.path ?? null;
-  // loadScene resolves void, so "did it work?" is only answerable by looking. A path that does not
-  // exist would otherwise resolve quietly and report a swap that never happened (conventions §0).
+  const cur = sceneManager.getCurrent();
+  const after = cur?.path ?? null;
+  if (myId !== null && cur !== null) {
+    if (cur.id === myId) {
+      // Our load won the swap — unchanged success reply.
+      return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+    }
+    // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
+    // (sceneManager.ts:286), so only an id GREATER than ours is evidence that a LATER load won
+    // the swap. A different-but-SMALLER id means nothing newer ever installed and our own load
+    // simply never became primary — and reporting THAT as "a later scene load won" would assert
+    // from evidence that only says "the current id is not mine", which is the same shape of
+    // over-claim this fix exists to remove. That case falls through to the original path check
+    // below and keeps its original message. (A genuinely bad path throws at sceneManager.ts:325
+    // and is answered by the catch above; this is belt-and-braces for any resolve-without-
+    // installing path, which is what the original `after !== p.path` check was written for.)
+    if (cur.id > myId) {
+      // Superseded. `loadScene` still resolved successfully for us (sceneManager.ts:896, "a
+      // superseded load skips straight to resolving"), so this is not our load failing and it
+      // says nothing about whether `p.path` exists.
+      if (cur.path === p.path) {
+        // The same requested path won, so the caller's requested end state IS true — just not
+        // because of THIS op's load. `entityCount` is deliberately omitted: it would be a live
+        // read of a world this op did not load.
+        return {
+          ok: true, current: after, previous: before,
+          note: `a concurrent load of "${p.path}" won the swap — this op's own load was superseded, but the requested scene is active.`,
+        };
+      }
+      return {
+        ok: false,
+        superseded: true,
+        current: after,
+        previous: before,
+        error: `load-scene for "${p.path}" was superseded — a LATER scene load won the swap, and "${after ?? 'null'}" is now the active scene. This op's own load did not fail; this says nothing about whether "${p.path}" exists in this build.`,
+      };
+    }
+  }
+  // Reached when `myId` could not be read (`getNext()` already cleared by the time we looked), or
+  // when our load resolved without ever becoming primary and nothing newer installed either. The
+  // original path comparison is the only check that does not depend on `myId` — message unchanged.
   if (after !== p.path) {
     return { ok: false, error: `load-scene did not switch to "${p.path}" — the active scene is ${after ?? 'null'}. Check the path exists in this build.`, current: after, previous: before };
   }
   return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
 });
 
-export const SIM_STEP_MAX_TIMEOUT_MS = 20000;
-
-/** The default budget for `sim-step`, DERIVED from the frame count rather than flat.
- *
- *  A flat default could not cover the op's own documented maximum: 600 frames is ~10s at 60fps and
- *  ~20s at 30fps, so `sim-step {frames:600}` — the max the same handler advertises — timed out
- *  against its own budget every time. Two limits sized independently with no cross-check is how a
- *  feature fails on its headline call.
- *
- *  Exported so the arithmetic is unit-testable: pinning it through the op itself would mean waiting
- *  out a real timeout (4.5s+ per assertion), which is why the flat-default regression survived a
- *  mutation check until this was extracted. */
-export function simStepDefaultTimeout(frames: number): number {
-  return Math.min(SIM_STEP_MAX_TIMEOUT_MS, Math.max(3000, frames * 40 + 500));
-}
+// SIM_STEP_MAX_TIMEOUT_MS / simStepDefaultTimeout are imported at the top of this file (from
+// `tools/shared/simStepTiming.ts`, #822) and re-exported here so existing importers of this
+// module (e.g. `liveLifecycleOps.test.ts`) are unaffected by the move.
+export { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout };
 
 // ── Sim control (#166 P3) — step an exact number of FRAMES on the device.
 //
@@ -1745,6 +2119,23 @@ registerAgentOp('sim-step', (params) => {
       done = true;
       clearTimeout(timer);
       unregisterFrameCallback(key);
+      if (getCurrentWorld() !== world) {
+        // A scene load swapped in a DIFFERENT world mid-step and destroyed this one (the two-world
+        // atomic swap). Querying it further — getTime/setTimeScale below both do a koota
+        // query/queryFirst — can throw on a destroyed world, and a throw here would skip `resolve`
+        // entirely: the op would never reply at all (#486 finding B). So: touch `world` no further.
+        resolve({
+          ok: false,
+          worldReplaced: true,
+          stepped: seen, requested: frames,
+          error: `the world was REPLACED during this step — a scene load swapped it out and destroyed `
+            + `it, so this step's numbers cannot be attributed to the world it started on. "stepped" `
+            + `(${seen}) counts frames the frame driver ran GLOBALLY, including the incoming world's `
+            + `frames, not frames run on the destroyed one. Nothing was left unfrozen: the only world `
+            + `this op unfroze is the one that was destroyed, so the live world's timeScale is untouched.`,
+        });
+        return;
+      }
       setTimeScale(world, 0);   // ALWAYS re-freeze, including on the timeout path
       const advancedMs = Math.round((elapsedOf() - startElapsed) * 1000);
       if (timedOut) {
@@ -1761,7 +2152,12 @@ registerAgentOp('sim-step', (params) => {
     };
     const timer = setTimeout(() => finish(true), timeoutMs);
     // Priority 100: after ECS and both renderers, so a frame is counted only once its work is done.
-    registerFrameCallback(key, () => { if (++seen >= frames) finish(false); }, 100);
+    registerFrameCallback(key, () => {
+      // Bail out immediately on a world swap rather than burning the rest of the timeout budget —
+      // this is what turns a 20s wait into an honest answer on the very frame the swap happens.
+      if (getCurrentWorld() !== world) { finish(false); return; }
+      if (++seen >= frames) finish(false);
+    }, 100);
     setTimeScale(world, scale);
   });
 });
@@ -1799,7 +2195,7 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
 
 /**
  * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
@@ -1824,6 +2220,17 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
   particle: invalidateParticleEffect,
   spriteanim: invalidateSpriteAnim,
   rig2d: invalidateRig2D,
+  // Sixth, and a different shape from the five: `invalidateAnimSet` was never callerless — the
+  // Inspector's AnimSetAssetView drives it — so only EXTERNAL writes were unserved. That is why
+  // `liveReloadKinds.test.ts` stayed green through it: `animset` was missing from BOTH unions, so
+  // the cross-check agreed with itself. `invalidatorsAreReachable.test.ts` asks from the other end.
+  animset: invalidateAnimSet,
+  // Seventh and eighth (#842): `material`/`shader` were agent-writable (`/api/asset-write` covers
+  // all 8 ASSET_SCHEMA_TYPES) and Inspector-parkable, but absent from LiveReloadKind entirely, so
+  // `classifySceneChange` fell through to `null` for both — no broadcast, ever, so an external
+  // write never invalidated the cache and a stale parked edit was never dropped at the next save.
+  material: invalidateMaterial,
+  shader: invalidateShader,
 };
 
 /** The file on disk for `urlPath` just changed, so its cached def is being dropped — any
@@ -1854,7 +2261,7 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
 
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind }): Promise<void> {
+async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }): Promise<void> {
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
   // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
@@ -1863,7 +2270,21 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   const invalidateCachedAsset = ASSET_CACHE_INVALIDATORS[msg.kind];
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
-    await dropParkedWriteFor(msg.urlPath);
+    // ⚠️ Only when THIS asset's own file changed. `viaSibling` says the broadcast was raised by a
+    // SIBLING write — today a `.glsl`/`.wgsl` shader body remapped to its `.shader.json`
+    // descriptor (#857) — and then `dropParkedWriteFor`'s premise ("the file on disk is now
+    // authoritative") is simply false: the descriptor on disk is untouched, so a parked Inspector
+    // edit for it is not stale and must survive. Dropping it here discarded exactly the edit the
+    // author was iterating on — declare a uniform in the Shader Inspector, save the `.wgsl` you
+    // added it to, lose the declaration — which is the very loop #857 exists to enable. The cache
+    // invalidation above still runs either way; only the parked-write discard is conditional.
+    if (!msg.viaSibling) await dropParkedWriteFor(msg.urlPath);
+    // The invalidation above is otherwise invisible while the sim is stopped: Scene2D's idle
+    // dirty-gate skips the whole frame unless something wakes it, so the viewport would keep
+    // showing pre-edit pixels forever. Firing the shared dirty signal wakes EVERY subscribed
+    // surface (Scene2D.tsx, Scene3D.tsx, SceneView.tsx, editor/store/canvas2DDirty.ts,
+    // runtime/ui/uiTreeStore.ts) for all eight kinds in the table above, not just material/shader.
+    fireDirtyListeners();
     return;
   }
   const current = sceneManager.getCurrent()?.path;
@@ -1949,22 +2370,6 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   }
 }
 
-/** Push the trait-registry schema via `send`, retrying until the registry is
- *  populated (app trait registration may not have run yet). Returns a starter. */
-function makeSchemaPusher(send: (schema: ReturnType<typeof buildSceneSchema>) => void) {
-  let tries = 0;
-  const pushOnce = (): boolean => {
-    try {
-      const schema = buildSceneSchema();
-      if (Object.keys(schema.traits).length === 0) return false; // not ready yet
-      send(schema);
-      return true;
-    } catch { return false; }
-  };
-  const tick = () => { if (pushOnce() || tries++ > 40) return; setTimeout(tick, 200); };
-  return { start: () => { tries = 0; tick(); }, pushOnce };
-}
-
 export function initAgentBridge(): void {
   const hot = import.meta.hot;
   const bridge = (window as unknown as { __modokiElectron?: { bridge?: ElectronBridge } }).__modokiElectron?.bridge;
@@ -1973,15 +2378,18 @@ export function initAgentBridge(): void {
   const reloadSource = sceneReloadSource({ hasBridge: !!bridge, hasHot: !!hot });
   if (!hot && !bridge) return;
 
-  // Capture console output ASAP so /api/console-logs can surface editor errors
-  // (e.g. failed scene/mesh loads) without a devtools attach.
+  // Belt-and-suspenders: the shared ring is already installed by `installConsoleRing.ts`'s eager
+  // import by the time this runs (#596/#597 Stage 3a) — this call is now a thin shim, kept so
+  // `/api/console-logs` still has something to fall back on if that ever changes.
   installConsoleCapture();
 
   // ── Electron: also serve the main-hosted backend over IPC (ELECTRON_PLAN
   //    Phase 2). Schema push + request answering are required so main's backend
-  //    can type-check and run /api/scene-state. Under dev the page is Vite-served,
-  //    so scene-reload + manifest stay on the live HMR socket below (avoids a
-  //    double reload); in a packaged build (no `hot`) main drives those too. ──
+  //    can type-check and run /api/scene-state. Scene reload is driven off this
+  //    bridge whenever it exists (dev or packaged — see sceneReloadSource, which
+  //    avoids a double reload against Vite's own HMR socket below); manifest
+  //    updates are ALSO driven off this bridge whenever it exists (#503 — see the
+  //    `manifest-updated` handler below for why dev is included). ──
   if (bridge) {
     const pusher = makeSchemaPusher((schema) => bridge.send('schema', schema));
     pusher.start();
@@ -1994,16 +2402,32 @@ export function initAgentBridge(): void {
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See
     // sceneReloadSource for why the Vite HMR path must NOT also drive reloads here.
     if (reloadSource === 'bridge') {
-      bridge.on('scene-changed', (data) => { void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind }); });
-    }
-    if (!hot) {
-      // Packaged build (no Vite HMR): main also drives manifest updates. In dev,
-      // init.ts handles Vite's `asset-manifest-updated` instead — don't double up.
-      bridge.on('manifest-updated', (data) => {
-        try { loadManifestJson(data as Parameters<typeof loadManifestJson>[0]); }
-        catch (e) { console.warn('[agentBridge] manifest update failed:', e); }
+      bridge.on('scene-changed', (data) => {
+        void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean });
       });
     }
+    // Registered whenever the Electron bridge exists — dev included (#503). Unlike
+    // scene reloads above, this one is NOT `if (!hot)`-gated: `/api/create-asset`
+    // (and friends) is served by MAIN's backend, so main's `rebuildManifest()`
+    // broadcast reaches this renderer ONLY over this IPC channel. In dev, Vite's
+    // own chokidar watcher eventually notices the same file and fires
+    // `asset-manifest-updated` (handled in init.ts), but that copy is ~1s late
+    // (debounce + FS latency) — long enough for an agent's very next
+    // `particle-set`/`anim-set-clip`/`timeline-set` call to bounce off a stale
+    // `pathToGuid` map with "no asset exists at <path>". Staying on this channel
+    // in dev closes that window instead of waiting on Vite's slower copy.
+    //
+    // Must stay ADDITIVE (no `{ prune: true }`): `createEditor.tsx` loads WITH
+    // prune as the sole authority that a missing guid means a DELETED asset: a
+    // second, possibly-stale IPC payload treated as a full rescan could delete a
+    // guid that was only briefly absent from IT, not from the project. Loaded
+    // additively (as here, and in init.ts), a late/stale payload can at worst
+    // transiently re-add a just-deleted guid, which the next pruning load from
+    // Vite corrects — never the other way around.
+    bridge.on('manifest-updated', (data) => {
+      try { loadManifestJson(data as Parameters<typeof loadManifestJson>[0]); }
+      catch (e) { console.warn('[agentBridge] manifest update failed:', e); }
+    });
   }
 
   if (!hot) return;
@@ -2016,7 +2440,10 @@ export function initAgentBridge(): void {
   const pusher = makeSchemaPusher((schema) => { hot.send('modoki:schema', schema); schemaPushed = true; });
   pusher.start();
   hot.on('vite:afterUpdate', () => { schemaPushed = false; pusher.start(); });
-  hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start(); });
+  // Reconnect (server restart drops the dev server's cache): force a resend even if the
+  // trait set is unchanged — a plain start() would find the same signature already sent
+  // and send nothing, leaving the freshly-restarted server with no schema at all.
+  hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start({ force: true }); });
 
   // 2. Answer request ops from the dev server.
   hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {
@@ -2030,6 +2457,6 @@ export function initAgentBridge(): void {
   //    here too would double-reload AND bounce the scene on the editor's own writes
   //    (Vite's guard is never marked from this renderer). See sceneReloadSource.
   if (reloadSource === 'vite') {
-    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind }) => { void handleSceneChanged(msg); });
+    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }) => { void handleSceneChanged(msg); });
   }
 }

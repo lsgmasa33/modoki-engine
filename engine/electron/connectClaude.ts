@@ -16,6 +16,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWriteFileSync } from './atomicWrite';
 import { checkToken } from './instanceToken';
+// The ONE 'same directory?' comparison (#869) — this file donated its body.
+import { samePath } from '../scripts/pathIdentity.mjs';
 
 export interface McpServerEntry {
   command: string;
@@ -301,23 +303,15 @@ function definesModoki(file: string): boolean {
 
 const isFsRoot = (d: string): boolean => path.dirname(d) === d;
 
-/** Canonicalize for COMPARISON: resolve symlinks (macOS `/var` → `/private/var`, and a
- *  symlinked $HOME) and case-fold where the filesystem is case-insensitive. The $HOME
- *  write boundary was a raw `===` on `os.homedir()`, so any of those mismatches silently
- *  turned the guard off — and the guard is the only thing standing between us and writing
- *  a machine-wide `$HOME/.mcp.json`. A boundary that fails OPEN must not depend on the
- *  home path happening to be spelled the same way twice. */
-function canonical(p: string): string {
-  let out = path.resolve(p);
-  try {
-    out = fs.realpathSync.native(out);
-  } catch {
-    /* doesn't exist yet — resolve() is the best we can do */
-  }
-  return process.platform === 'darwin' || process.platform === 'win32' ? out.toLowerCase() : out;
-}
-
-const samePath = (a: string, b: string): boolean => canonical(a) === canonical(b);
+/* The `canonical` / `samePath` pair that used to live here is now
+ * `engine/scripts/pathIdentity.mjs`, imported above (#869) — same behaviour, one implementation.
+ *
+ * It moved rather than being deleted because it was the STRONGEST of the seven hand-rolled copies
+ * of this comparison in the repo, and #869 promoted it to the shared one. What it was protecting
+ * is worth keeping in view here: the $HOME write boundary was a raw `===` on `os.homedir()`, so a
+ * symlinked $HOME (or macOS `/var` → `/private/var`) silently turned the guard off — and that
+ * guard is the only thing between us and writing a machine-wide `$HOME/.mcp.json`. A boundary
+ * that fails OPEN must not depend on the home path being spelled the same way twice. */
 
 /**
  * The git root at-or-above `dir`, or null.

@@ -21,8 +21,8 @@
  *
  * ── What this can and cannot reach ──
  * It intercepts the Bash tool of a Claude Code session in this repo, and nothing else. A human's own
- * terminal, the editor backend's own spawns, and other agent CLIs (Codex, Cursor, Antigravity — none
- * of which have a PreToolUse equivalent) all bypass it. `engine/scripts/device.mjs` is the universal
+ * terminal, the editor backend's own spawns, and any non-Claude tooling (nothing else here has a
+ * PreToolUse equivalent) all bypass it. `engine/scripts/device.mjs` is the universal
  * path for those; this hook is the one that closes the case #285 was filed about.
  *
  * It never reaches a Modoki USER: `.claude/` is excluded from the OSS snapshot
@@ -46,9 +46,9 @@
  * misses those is worse than the ~40 ms it saves, because the gap is invisible.
  */
 
-import fs, { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { listClaims } from './deviceClaimsStore.mjs';
+import { readFileSync } from 'node:fs';
+import { listClaims, sameClone } from './deviceClaimsStore.mjs';
+import { canonicalPath } from './pathIdentity.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 
 /** Cheap pre-filter: does this command even mention a tool that can touch a phone? Deliberately
@@ -90,19 +90,23 @@ function readStdin() {
  *  clone look like a stranger and refuse its own device. */
 function thisClone(payload) {
   const raw = process.env.CLAUDE_PROJECT_DIR || payload?.cwd || process.cwd();
-  // realpath, not merely resolve: `device.mjs` records the claim under the REAL path (it resolves
-  // the repo root through `fs.realpathSync`), so on a symlinked checkout — or with
-  // CLAUDE_PROJECT_DIR pointed at a non-canonical path — a `path.resolve` here would produce a
-  // different string for the same directory and this clone would be refused its OWN device. Falls
-  // back to `resolve` when the path does not exist, since a refusal must never depend on a stat.
-  try { return fs.realpathSync(path.resolve(raw)); } catch { return path.resolve(raw); }
+  // realpath, not merely resolve: `device.mjs` records the claim under the REAL path, so on a
+  // symlinked checkout — or with CLAUDE_PROJECT_DIR pointed at a non-canonical path — a
+  // `path.resolve` here would produce a different string for the same directory and this clone
+  // would be refused its OWN device. Falls back to `resolve` when the path does not exist, since a
+  // refusal must never depend on a stat.
+  //
+  // #881: this was `canonicalPath`'s body, hand-rolled on the JS `fs.realpathSync` walk — which
+  // resolves symlinks (the case the comment above was written for) but neither `subst` nor
+  // drive-letter case. The shared one uses `.native` and gets all three.
+  return canonicalPath(raw);
 }
 
 function heldByThisClone(claim, clone) {
-  // Same normalisation on both sides — see `thisClone`.
-  let held;
-  try { held = fs.realpathSync(path.resolve(claim.clone)); } catch { held = path.resolve(claim.clone); }
-  return held === clone;
+  // (#865) Was a hand-rolled copy of the same normalisation. `sameClone` IS that comparison, plus
+  // the qualification gate this copy never had: an unqualified stored `clone` resolved onto this
+  // process's cwd and read as MINE, so the hook waved through a phone a sibling clone held.
+  return sameClone(claim.clone, clone);
 }
 
 const CLAIM_HINT = (id) => `Claim it first: \`npm run device:claim ${id}\` (or connect it in the `

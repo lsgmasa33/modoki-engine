@@ -29,6 +29,67 @@ that is how the ~110s figure above went stale.
 Warm is the honest figure to quote: `typecheck`/`lint` cache into the gitignored
 `node_modules/.tmp` (65f5f840), so a COLD clone pays ~55s more on those two.
 
+### The two lanes share ONE working tree — a test must not leave a linted file in it
+
+⚠️ **A test that writes a linted-extension file (`.ts/.tsx/.js/.mjs/.cjs`) into a non-ignored
+directory can take the gate red from the other lane, with zero failing tests.** The lanes are
+concurrent over one checkout, so the app lane's writes land under lane 2's `lint` while it is
+enumerating. **ESLint is the reader that DIES** — it treats a stat-then-read mismatch as **fatal,
+not skippable** (`ENOENT … readAndVerifyFile`, exit 2), and it is the only reader that fails the
+gate from the OTHER lane.
+
+⚠️ **It is not the only exposed reader, and a fix aimed only at it is not a fix.** Two guards in
+the APP lane also enumerate by extension and then read, so they race the writer *within* one lane,
+across `fileParallelism` workers:
+
+- `buildWebCallSites.test.ts` — `repoFiles({ under: engine/, match: /\.(ts|mjs|sh)$/ })` at MODULE
+  scope, read through `readScannedSource`, which does **not** catch. An ENOENT there throws during
+  vitest COLLECTION. `repoCorpus.test.ts` names this file as the hazard its own probe was moved to
+  avoid.
+- `noNulBytesInSource.test.ts` — its `SOURCE_EXT` includes `.cjs` and it walks the whole repo. It
+  survives only because its read sits in a `try { … } catch { continue }`.
+
+`tsc` is a third reader, but a narrower one than it looks: no tsconfig sets `allowJs`, so a
+transient `.cjs` is invisible to it, and a transient **`.ts`** is picked up only inside the three
+root programs' `include` sets: `engine/app`, `engine/electron`, `engine/tests`, `games`, `demos`
+(plus `engine/vite.config.ts` by name). A stray `.ts` under `engine/scripts/` or `engine/plugins/` is in no
+program at all, which is exactly the directory `buildWebCallSites` scans and where this repo has
+already been bitten. Do not reach for `tsc` as a safety net there.
+
+**Two failures, not one, and a fix for either alone leaves the other:**
+
+| | trigger | symptom |
+|---|---|---|
+| mid-flight | the other lane is globbing while the file exists | `[FAIL] <lane>` with **no failing test underneath** — indistinguishable at a glance from a real failure, and the documented "re-run quiet before believing a red" reflex costs a full gate cycle |
+| stranded | a SIGINT / crash / failed pack skips the cleanup | the artifact is **linted** on every later run, red until someone deletes it by hand |
+
+**The rule: any transient artifact written into the tree is declared in BOTH `.gitignore` and the
+`ignores` list in `engine/eslint.config.js`, as the same glob.** Those are two lists that must
+agree, and #879 was exactly them disagreeing — `.gitignore` knew about `engine/vite.config.cjs`
+and not the test probe beside it; ESLint's list knew about neither. That is the **fourth** time
+this list has cost a red gate (`ads/` — 33,482 errors from one interrupted playable build;
+`subgame-dist/` — 1,657; `.claude/worktrees/` — 36, in code not even on the branch), which is why
+the entries there each carry the lesson in prose — and why the seam itself is filed as **#885**
+rather than left as a fifth comment asking the next author to remember. Gitignoring is also what
+keeps an artifact out of every `repoFiles()` corpus — see
+[Corpus production](#corpus-production-the-one-enumerator-these-guards-share), which enumerates
+with `git ls-files --others --exclude-standard`.
+
+**Prefer not writing into the tree at all.** Almost every test here uses `mkdtemp`; the handful
+that cannot each say why in place. `packagedViteConfig.test.ts` genuinely cannot — the bundle
+collapses the plugin graph into one file whose modules locate themselves via `__dirname`, so it
+must load from inside `engine/`. `repoCorpus.test.ts` shows the other way out when the location is
+forced: put the probe where **no reader's filter reaches it** (repo root, `.tmp`), which is where
+its own comment says it moved after living under `engine/scripts/`. ⚠️ That comment describes the
+hazard **prospectively** — *"a flake seam this test creates for its neighbours"* — so treat it as a
+reasoned relocation, not as a recorded flake; no such failure was observed.
+
+`engine/tests/architecture/ignoreListsAgree.test.ts` pins the two `vite.config*.cjs`
+producers by asking the real resolvers (`ESLint#isPathIgnored`, `git check-ignore`) and by deriving
+the filenames from the producers' own source, so renaming one goes red instead of silently
+reopening the hole. ⚠️ **It pins those two, not the class** — a new test writing some other linted
+extension into a linted directory reopens this with the guard green. That is what this rule is for.
+
 ### The Windows clone
 
 The Windows clone was **~10 min** at the old shape (2026-08-04): 608s, of which the app-tests
@@ -309,6 +370,275 @@ helpers; orchestration that resists extraction): [editor.md](./editor.md) § Pan
 ## Test structure
 
 Tests live under `engine/tests/` and `engine/packages/modoki/tests/`, split by subsystem; `ls`
-them rather than trusting a listing here. Run a subset by path:
-`npx vitest run --config engine/vite.config.ts <path>` (the `--config` is required — without it a
-game's tests fail with `__MODOKI_MODULE_RENDER2D__ is not defined`).
+them rather than trusting a listing here. **The two trees are separate vitest projects, and which
+one a path lives in decides how you run it:**
+
+```bash
+npx vitest run --config engine/vite.config.ts <path>   # engine/tests/** and games'/demos' tests
+npm --prefix engine/packages/modoki test -- <path>     # engine/packages/modoki/tests/**
+```
+
+The `--config` on the first is required — without it a game's tests fail with
+`__MODOKI_MODULE_RENDER2D__ is not defined`.
+
+⚠️ **Pointing the root config at a package test finds NOTHING and exits 0** — `engine/vite.config.ts`
+carries `exclude: ['**/node_modules/**', 'packages/**', '**/release/**']`, so
+`npx vitest run --config engine/vite.config.ts engine/packages/modoki/tests/video/` prints
+`No test files found` and reads as "the file is broken" rather than "wrong runner". Both suites run
+under `npm run verify`, so this only bites while iterating on one file — which is exactly when a
+silent empty run is most expensive. Surfaced by the #426 review, which lost a pass to it.
+
+### Corpus production: the ONE enumerator these guards share
+
+A guard that scans source first has to decide **which files**. Before #799/#771/#805 every one
+answered that itself, and each answered a different part of it wrong — the ROOT, the enumeration
+SOURCE, the EXCLUSION set, the separator NORMALISATION, and whether to pin NON-VACUITY. **Every
+omission fails OPEN**, because the dominant shape here collects offenders and asserts the list is
+empty, and an under-enumerated corpus satisfies that. A guard scanning nothing is indistinguishable
+from a clean repo.
+
+⚠️ **Never hand-roll a corpus. Import `repoFiles` from `engine/scripts/repoCorpus.mjs`.** Enforced
+by `engine/tests/architecture/corpusProducerIsShared.test.ts`, which forbids a direct `git ls-files`
+spawn and a hand-rolled recursive `readdir` walker. It lives in `engine/scripts/` rather than
+`engine/tests/helpers/` because the plain-`.mjs` build scripts must import it too — the same `.ts`
+barrier that forced `pathPosix.mjs` to exist (see [windows.md](windows.md) § Paths).
+
+⚠️ **A source-scanning guard needs BOTH shared halves, and they answer different questions.**
+`repoFiles()` decides *which files* are in the corpus; `readScannedSource()` (next section) decides
+*how each one is read*. Landed independently by two clones — #799/#771/#805 and #812 — and
+`corpusProducerIsShared.test.ts` is right to call itself `commentStripperIsShared.test.ts`'s
+structural twin one mechanism over. A guard using only the first enumerates the right files and can
+still be satisfied by a comment in one of them; a guard using only the second reads each file
+correctly and can still be blind to half the corpus. The shape to copy:
+
+```ts
+for (const { abs, rel } of repoFiles({ under: SRC_DIR, match: /\.tsx?$/, floor: 400 })) {
+  const { code } = readScannedSource(abs);   // enumerate with one, read with the other
+}
+```
+
+```js
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+// `rel` is git's own repo-relative POSIX path; `abs` is joined FROM it.
+const files = repoFiles({ under: SRC_DIR, match: /\.tsx?$/, floor: 400 });
+```
+
+What it settles once, and why each one is load-bearing:
+
+- **`rel` is git's output verbatim** — already POSIX on every platform. Joining TO an absolute path
+  is safe; the round-trip BACK via `path.relative` is the hazard, and it is what
+  [windows.md](windows.md) § Paths records eight instances of. `under` accepts an absolute path
+  precisely so no caller needs that round-trip.
+- **`-z`, always.** Without it git C-quotes and octal-escapes non-ASCII paths, and this repo has 18.
+- **`execFileSync` with argv, never `execSync` with a shell string** — `cmd.exe` does not strip
+  quotes, so a quoted pathspec matches nothing. This was live in `migrate-assets.mjs`: measured 0
+  files where the same argv unquoted found 69, with the failure swallowed by a `catch`.
+- **Two separate aborts.** A git *throw* cannot be caught by an empty-result check, and a
+  zero-file listing is always fatal regardless of the caller's floor.
+- **`floor` is REQUIRED**, so the author must answer "how few files means my enumeration is broken
+  rather than my repo clean?". `floor: 0` is a legitimate answer — it throws, so at MODULE scope it
+  fails vitest *collection* rather than skipping — and then the real pin belongs in a `skipIf`-gated
+  test. `engine/tests/assets/prefabInertSize.test.ts` is the worked example.
+- **`includeUntracked` defaults to true.** A file you just wrote and have not staged is exactly when
+  a guard is most useful; pass `false` only when the guard's subject is genuinely what is COMMITTED.
+
+⚠️ **Its ledger is load-bearing, and that is the part to preserve.** Every `EXEMPT` entry must
+*currently* be flagged, so migrating a producer makes its entry stale and turns the gate RED until
+the entry is deleted — the list cannot rot into decoration the way a path-keyed allowlist did in
+#578. For the same reason the detectors' aliveness pins are SYNTHETIC: a floor on how many real
+offenders survive counts down to zero as the migration succeeds, which is a countdown, not a pin.
+
+⚠️ **Scope: the guard reads `engine/tests/**` and `engine/scripts/**` only.** 15 producers live
+outside it — including five guards in the `engine/packages/modoki/tests` project and
+`scripts/scan-publish-safety.mjs` — tracked as **#814**. A green run is not "none exist".
+
+### Source-scanning guards, and the ONE comment scanner they share
+
+A large family of guards works by reading source off disk and asserting that a forbidden pattern
+does not appear — `determinismGuard` (no raw `performance.now()` in `runtime/**`), `reapScoping`
+(no unscoped `pkill`), `posixPathGuard`, `assetJsonGuard`, `inputSourceGuard`, `ktx2CapsGuard`,
+Court's `sharedPredicates` and `palette`, and others. Every one of them must strip comments first,
+because these files' own prose explains the very hazard being guarded and an unstripped scan
+matches its own documentation.
+
+⚠️ **Never write a comment stripper. Import `@modoki/engine/testing`.** Enforced by
+`engine/tests/architecture/commentStripperIsShared.test.ts`, which fails on a hand-rolled stripper
+in any test file — a rule this repo states but does not enforce is how twelve copies accumulated,
+and how the first sweep for #419 still missed sixteen more.
+(`engine/packages/modoki/tests/helpers/sourceScanner.ts`.) Inside that package use the relative
+path; from `engine/tests/**` and from a game's tests use the package subpath — a game may not
+reach outside its own folder by relative path (`assets/gamePortability.test.ts`).
+
+⚠️ **Do not read the file yourself either — `readScannedSource` is the entry point (#812).** One
+scanner was never the whole rule: sixteen guards imported nothing and matched
+`fs.readFileSync(…, 'utf8')` output directly, and enforcing the rule turned up twenty-one more —
+the class was 37 files, not the 16 the report enumerated. Remembering to strip is exactly what nobody does, so the READ is what got routed.
+
+```ts
+import { readScannedSource } from '@modoki/engine/testing';
+const { raw, code } = readScannedSource(absPath);   // strips by EXTENSION, runs assertScanIsSane
+expect(code).toMatch(/…/);                          // match on `code`; `raw` only to scan prose
+```
+
+It picks a stripper by extension — js · braces (C-family, no regex literals, and where `.pbxproj`
+lands: Xcode writes `/* Name */` annotations denser than anything else the guards scan) · swift ·
+shell · yaml (`#`, the same rule — a workflow guard is defeatable by a comment exactly as a script
+guard is) · jsonc — and **REFUSES an extension it has no stripper for** rather than falling back to
+raw text, because falling back is the defect. A guard scanning Markdown or a storyboard declares
+`{ comments: 'include', reason }`, which makes the exemption a sentence somebody wrote instead of a
+silent default.
+
+⚠️ **Before registering a language, read the CONSUMER's pattern — a "comment" a guard MATCHES is
+data, not noise.** `.pbxproj` was briefly routed to the C-family stripper because Xcode annotations
+are the densest comments in the repo. They are, and `pbxprojObjectIds`' regex matches them *as
+syntax* (`^\t\t<id>(optional annotation) = {`), so blanking them cut the object ids that guard
+inspects from **43 to 1** while it stayed green under a `> 0` floor. `.pbxproj` is now deliberately
+unregistered so the reader refuses it and the caller has to decide. The general lesson is the one
+in `sourceScanner.ts`'s docblock; the general defence is a non-vacuity floor that can tell 43 from
+1, which `> 0` cannot.
+
+⚠️ **Stripping is not universally right, and that is why the opt-out exists.** `docCitations` scans
+comments on purpose (a citation living in a docblock is exactly what it exists to catch), and
+`editorStoreActionsReachable` states that any textual reference counts — strip either and you DEFEAT
+it. `fontSourceShipped` is the mixed case that shows the shape: eight of its assertions are about
+code, and one asserts that a RATIONALE is documented, where the comment IS the subject. The reader
+hands back both views from one read, so it keeps `code` for the eight and `raw` for the one, named
+`SRC` and `SRC_WITH_PROSE` so reaching for prose stays a deliberate act rather than the default.
+
+**Both halves are enforced by `commentStripperIsShared.test.ts`** — no hand-rolled stripper
+anywhere, no raw read of repo source, and no `.raw` without a declared reason, across
+`engine/tests/**`, `engine/packages/modoki/tests/**` **and every `games/<id>/tests` and
+`demos/<id>/tests`**.
+
+⚠️ **`.raw` is enforced because it was a silent bypass.** `comments: 'include'` throws without a
+`reason`; `readScannedSource(p).raw` returns the identical unstripped text and required nothing,
+and the rule matched only `readFileSync` — so a `.raw` scan was invisible to it. It was live in
+`mcpRegistry`, the migration's own worked example, with two call sites matching CODE against raw
+text. `.raw` now has to come from a read that declared the opt-out.
+
+⚠️ **The scope was narrowed twice and both narrowings were wrong, which is the whole lesson
+(#812 → #816).** First to `engine/tests/architecture/`, then — after widening — to "both vitest
+projects", which still left out `games/<id>/tests`: not a third project (Court's suite runs under
+`engine/vite.config.ts`), and already enumerated by the *other* rule in the same file. Three real
+source-scanning guards were reading raw there, two of them scanning `games/court/runtime/systems.ts`
+— the file where #411's comment defect was found LIVE.
+
+⚠️ **On the first narrowing:** The argument was that of 1,234 test files only ~113 carry a raw utf8
+read, and almost all of those read back a fixture the test itself just wrote — so a repo-wide rule
+would need a ~55-entry allowlist, which is the same fail-open hole one level up. True about the
+FILES, wrong about the RULE: the exclusions already discriminate a fixture read from a source scan
+by what it *is* (wrapped in `JSON.parse`, wrapped in `stripComments`, or a Markdown path), so the
+directory was standing in for a test that had already been written. Widening the roots needed **no
+allowlist at all** and found **28 more real source-scanning guards** — in `assets`, `editor`,
+`electron`, `plugins`, `tools` and the package suite, i.e. every root the narrowing had excused.
+
+The generalisable bit: **a scope restriction is a claim about where a defect can occur.** If the
+rule's own exclusions can tell the classes apart, the restriction is buying nothing and hiding
+whatever sits outside it.
+
+### The second half of that rule: a scope bound ships with an assertion, or it is a comment
+
+**A comment naming a hole is not a guard over it** (#830, 2026-09-06). Applying the rule above to
+the rest of the repo found **ten more** guards whose declared scope was narrower than the claim in
+their own docblock — and the striking part is that most of them *said so*. `corpusProducerIsShared`
+called its own scope "a real hole, not a tidy boundary"; `chromeTagging` had an `HONEST SCOPE` note;
+`mcpErrorCodes` recorded which directory it never scanned. Every one of those admissions was
+accurate, and every one was inert. Prose does not fail a build.
+
+⚠️ **The sharpest version — and the one to look for first — is a self-check that filters the
+hand-list BY ITSELF.** Four sites independently wrote it. `clonePortHardcoding.test.ts` is the
+clearest:
+
+```ts
+const resolvesBinary = SPAWNERS.filter(existsSync).filter(hasMarker);
+expect(resolvesBinary.sort()).toEqual([...SPAWNERS].sort());
+```
+
+under a comment claiming the set was *"found by the marker … rather than by a hand-listed set, so a
+NEW spawner is covered the day it is written"*. It can detect a **deleted** entry and never an
+**added** one — and the population is the thing that grows. Four unlisted spawners were sitting
+outside it.
+
+**The fix has three shapes, and picking the wrong one is how the defect returns:**
+
+| Shape | When | Example |
+|---|---|---|
+| **Derive** — delete the list | the subject is enumerable by a marker, or the type checker can enumerate it | `NumberField.dataUiId` made REQUIRED, so `tsc` names every call site (#772) |
+| **Widen + migrate** | the scope is a directory bound, so there is no list to assert | `corpusProducerIsShared`'s `under` → the repo (#814) |
+| **Assert completeness** | the list must stay, so make its gap RED | `assertDeclaredListIsComplete` (#830) |
+
+`engine/tests/helpers/declaredList.ts` is the shared helper for the third: *enumerate the population
+by its marker, assert the hand-list equals it*, with a reasoned exemption ledger whose every row
+must CURRENTLY be flagged. `testFilesAreCollected.test.ts` is the older, hand-written instance of
+the same idea and is worth reading as the reference.
+
+⚠️ **The marker is the judgement; the helper only makes the comparison honest.** A marker that is
+subtly too narrow re-creates the defect one level down with every test still green. Two ways that
+actually happened while writing this:
+
+- **A marker only meets its population once you widen the scope.** `clonePortHardcoding`'s
+  "derives a per-clone port" check tested for `clonePort.mjs` alone, while `CLAUDE.md` names
+  `editorPorts.mjs` as the primary derivation. Both `launch-editor.sh` and `test-packaged.sh`
+  derive correctly and would have FAILED it — the narrowness was invisible until the list grew to
+  include them.
+- **Comment-stripping silently changes a population.** A marker run over `readScannedSource(…).code`
+  cannot see a mention that lives in a docblock, so `packagedAppPaths.d.mts` dropped out of its own
+  population and `launch-editor.sh`'s `clonePort` references (all comments) did not count.
+
+**And the honest limit is part of the fix.** Where a marker cannot reach file granularity, say so in
+the guard rather than implying otherwise: `courtSweepScope.test.ts` asserts coverage at BARREL level
+because Court's tests import the runtime barrel 104 times, and per-file coverage would resolve to
+watching all of `src/runtime` — which `courtAuthored.mjs` rules out as making the gate a no-op. A
+guard whose scope claim is wider than its reach is the defect this whole section is about, so a
+guard that states its own reach is not hedging.
+
+⚠️ **Both directions of this defect are fail-OPEN, and the second one is the easy one to miss.** A
+**forbidden**-pattern guard goes green because a comment HID the offender. A **required**-pattern
+guard goes green because a comment SATISFIED the match — so the real call site can be deleted and
+nothing fails. Measured example of the second: `devStopEditorCarveOut` asserts `stopDevServer.mjs`
+tests for `--configLoader runner`, and that file's own explanatory comment matched the regex on its
+own.
+
+```ts
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+const stripped = stripComments(raw);          // or { regexLiterals: false } for non-JS source
+assertScanIsSane(raw, stripped, 'file.ts');   // BEFORE any count is trusted
+```
+
+The lower-level `stripComments` stays exported for source you already hold as a string — a sliced
+function body, shader text, a value that never came off disk.
+
+**Why this is a correctness rule and not a tidiness one (#419).** Twenty-eight guards each carried
+a private stripper, and every one was built the same broken way: strip block comments with a lazy
+regex, then line comments. A `/*` sequence inside a **line** comment opens a phantom block that
+runs to the next real terminator, and everything between is **deleted**. Measured: a line comment
+in `runtime/rendering/Scene3D.tsx` writes the glob `runtime/**`, which hid 82 lines — 22 of them
+`import` statements — from `determinismGuard`. Mutation-proved both directions: a
+`performance.now()` planted inside that window left the guard green; the same line outside it
+failed.
+
+⚠️ **Every failure mode of a comment stripper LOWERS what the scan can see, and these are
+forbidden-pattern guards — so a lower count is a PASS.** They fail silent and green, which is the
+only direction that matters. Hence the two rules: one scanner (the multiplicity is what let one
+copy be fixed twice, in #411 and #418, while eleven copies of the original bug carried on), and
+`assertScanIsSane` at every call site, because a guard whose own instrument can delete the code it
+inspects is not a guard.
+
+⚠️ **`strings: 'blank'` is a different function, and it is PARSER-driven for a reason.**
+`stripCommentsAndStrings` blanks string and template literal content as well, for a guard hunting a
+value that can hide in prose either way (Court's bare-hex sweep). It uses TypeScript's own tokens
+rather than the character scanner because a scanner cannot tell a quote or backtick in **JSX text**
+from a string delimiter: one stray backtick in JSX prose blanked six following lines of real code,
+including a `0xff0000` constant, and the hex guard reported nothing. It therefore requires source
+TypeScript can parse and throws otherwise — reach for `stripComments` on anything else (shader
+text, a sliced function body, `.mjs`).
+
+The scanner is a five-state machine (code / line / block / string / regex literal) that is
+**length- and line-preserving**, so a reported line number still addresses the real file and a
+parser's token offsets over the raw source address the stripped string directly. That last property
+is what `findDamagedCodeTokens` / `assertEveryCodeTokenSurvives` rest on: TypeScript parses the raw
+file and every non-comment leaf token must be byte-identical in the stripped output. Its own test
+sweeps all of `src/runtime/**` with that oracle (~340 ms) as a **forward** guard — it needs nobody
+to have thought of the next hazard first. The crafted snippets in that test are the only
+*regression* cover, with a measured matrix of which snippet catches which scanner defect; real
+fixture files strip byte-identically under most of them and can tell nothing apart.

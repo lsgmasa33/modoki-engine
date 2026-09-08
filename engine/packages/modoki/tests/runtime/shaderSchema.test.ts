@@ -2,6 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { coerceParamValue, mergeParamDefaults, fetchShaderManifest, type ShaderParamSchema } from '../../src/runtime/loaders/shaderSchema';
+import { shaderBodyPath, shaderManifestPathForBody } from '../../src/runtime/core/shaderSchema';
 import { completeResponse } from '../stubs/assetResponse';
 
 describe('coerceParamValue', () => {
@@ -55,6 +56,35 @@ describe('mergeParamDefaults', () => {
   it('handles undefined values object', () => {
     const merged = mergeParamDefaults(schema, undefined);
     expect(merged).toEqual({ rimColor: 0x00ffff, power: 2.5, glow: false });
+  });
+});
+
+describe('shaderBodyPath / shaderManifestPathForBody (#857)', () => {
+  it('shaderBodyPath derives the sibling body from a .shader.json manifest path', () => {
+    expect(shaderBodyPath('/games/x/assets/shaders/holo.shader.json', 'glsl')).toBe('/games/x/assets/shaders/holo.glsl');
+    expect(shaderBodyPath('/games/x/assets/shaders/holo.shader.json', 'wgsl')).toBe('/games/x/assets/shaders/holo.wgsl');
+  });
+
+  it('shaderManifestPathForBody maps a body back to its sibling descriptor', () => {
+    expect(shaderManifestPathForBody('/games/x/assets/shaders/holo.glsl')).toBe('/games/x/assets/shaders/holo.shader.json');
+    expect(shaderManifestPathForBody('/games/x/assets/shaders/holo.wgsl')).toBe('/games/x/assets/shaders/holo.shader.json');
+  });
+
+  it('is case-insensitive, matching shaderBodyPath\'s existing regex convention', () => {
+    expect(shaderManifestPathForBody('/games/x/assets/shaders/HOLO.GLSL')).toBe('/games/x/assets/shaders/HOLO.shader.json');
+    expect(shaderManifestPathForBody('/games/x/assets/shaders/HOLO.WGSL')).toBe('/games/x/assets/shaders/HOLO.shader.json');
+  });
+
+  it('returns null for a non-body extension', () => {
+    expect(shaderManifestPathForBody('/games/x/assets/shaders/holo.shader.json')).toBeNull();
+    expect(shaderManifestPathForBody('/games/x/assets/textures/sand.png')).toBeNull();
+  });
+
+  it('round-trips with shaderBodyPath for both backends', () => {
+    const manifestPath = '/games/x/assets/shaders/holo.shader.json';
+    for (const ext of ['glsl', 'wgsl'] as const) {
+      expect(shaderManifestPathForBody(shaderBodyPath(manifestPath, ext))).toBe(manifestPath);
+    }
   });
 });
 

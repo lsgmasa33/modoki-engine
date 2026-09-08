@@ -18,12 +18,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const mainTsx = readFileSync(resolve(repoRoot, 'engine/app/main.tsx'), 'utf8');
+const mainTsx = readScannedSource(resolve(repoRoot, 'engine/app/main.tsx')).code;
 
 describe('a playable ad refuses the boot ramp probe', () => {
   it('⭐ main.tsx sets the flag from __MODOKI_PLAYABLE__, negated', () => {

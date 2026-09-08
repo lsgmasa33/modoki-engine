@@ -57,6 +57,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Restore here, not at the end of a test body: a spy on THREE.Material.prototype installed by
+  // a test that then FAILS would otherwise survive into every later test in this file and make
+  // their dispose counts nonsense — which is exactly what happened while mutation-checking #863.
+  vi.restoreAllMocks();
   disposeAllCachedResources();
   clearManifest();
   vi.unstubAllGlobals();
@@ -142,22 +146,31 @@ describe('invalidateMaterial retires instead of destroying', () => {
     expect(disp).toHaveBeenCalledTimes(1);
   });
 
-  it('an invalidate mid-flight retires the losing load instead of orphaning it', async () => {
+  it('an invalidate mid-flight discards the losing load outright, instead of writing then retiring it (#863)', async () => {
     // `fetchMaterial` dedupes on `materialLoadPromises` alone, and `invalidateMaterial` clears
-    // that entry — so an in-flight fetch stops deduping a second one and BOTH reach
-    // `materialCache.set`. Orphaned, the loser is unreachable to the cache, to the sweep and to
-    // `disposeAllCachedResources`, leaking the material AND every shared-texture ref it holds.
-    // Twin of the same defect in `fetchEnvironment` (#315).
+    // that entry — so an in-flight fetch stops deduping a second one and, BEFORE #863, both
+    // reached `materialCache.set`, with the SECOND writer retiring whichever the FIRST one left
+    // behind. #863 gave `fetchMaterial` its own PER-KEY liveness capture, so the invalidated
+    // (first) fetch's own guard now discards it before it ever reaches the cache — there is
+    // nothing left to retire. (Twin of the same defect in `fetchEnvironment` — see
+    // `environmentInvalidationRetires.test.ts`'s sibling test, and `environmentInvalidateKeyRace.test.ts` for #863's own coverage.)
+    const disposeSpy = vi.spyOn(THREE.Material.prototype, 'dispose');
     resolveMaterial(MAT_GUID);              // fetch #1, deliberately NOT awaited
-    invalidateMaterial(MAT_PATH);           // clears the in-flight promise
+    invalidateMaterial(MAT_PATH);           // clears the in-flight promise AND its liveness capture
     resolveMaterial(MAT_GUID);              // fetch #2 starts alongside it
     await settle();
 
     const cached = resolveMaterial(MAT_GUID)!;
-    expect(cached, 'one of the two loads must occupy the cache').toBeTruthy();
-    const retired = [...retiredMaterials3D()];
-    expect(retired.length, 'the loser is retired, not orphaned').toBe(1);
-    expect(retired[0]).not.toBe(cached);
+    expect(cached, 'the surviving (post-invalidate) load must occupy the cache').toBeTruthy();
+    // FAILS pre-#863: that version left ONE material retired (the discarded-then-overwritten
+    // loser) instead of zero.
+    expect(retiredMaterials3D().size, 'the loser was discarded outright, not retired').toBe(0);
+    // ⚠️ The next assertion is what keeps this test honest, and it is why the retired-set check
+    // above cannot stand alone: an EMPTY retired set is also exactly what a LEAK looks like —
+    // orphaned, unreachable to `materialCache`, to the sweep and to `disposeAllCachedResources`.
+    // Not-leaking is the property this test was written for (#315/#317), so #863 narrowing the
+    // race must not quietly downgrade it to "the set is empty". Prove the loser was FREED.
+    expect(disposeSpy, 'the discarded loser must be freed, not orphaned').toHaveBeenCalled();
   });
 
   it('backs off once a retiree is legitimately PINNED, instead of traversing every surface forever', async () => {

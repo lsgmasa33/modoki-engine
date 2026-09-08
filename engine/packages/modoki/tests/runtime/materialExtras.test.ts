@@ -19,6 +19,7 @@ import { cloneDerived } from '../../src/runtime/rendering/derivedMaterials';
 import {
   MATERIAL_EXTRAS_KEY, readMaterialExtras, materialExtrasAreJsonSafe,
 } from '../../src/runtime/rendering/materialExtras';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
 type Extras = THREE.MeshStandardMaterial & { nprColorPreserve: number; lineColor: THREE.Color };
 const mat = () => new THREE.MeshStandardMaterial() as unknown as Extras;
@@ -138,11 +139,14 @@ describe('the accessors must be installed BEFORE anything writes them (#351 revi
   it('meshTemplateCache installs the accessors before writing either property', async () => {
     // A source guard, deliberately: the real ordering lives in an async material-load path that a
     // unit test cannot stage without a renderer, and the failure is SILENT (a value that reads
-    // back fine locally and vanishes on the next clone). Comments are stripped first — otherwise
-    // this passes on the explanatory comment beside the call rather than on the call.
-    const src = (await import('node:fs')).readFileSync(
+    // back fine locally and vanishes on the next clone). Comments are stripped first (shared
+    // scanner, #419) — otherwise this passes on the explanatory comment beside the call rather
+    // than on the call.
+    const rawSrc = (await import('node:fs')).readFileSync(
       new URL('../../src/runtime/loaders/meshTemplateCache.ts', import.meta.url), 'utf8',
-    ).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    );
+    const src = stripComments(rawSrc);
+    assertScanIsSane(rawSrc, src, 'runtime/loaders/meshTemplateCache.ts');
     const install = src.indexOf('ensureLineColorOnMaterials()');
     const writeLine = src.indexOf('.lineColor = new THREE.Color(');
     const writePreserve = src.indexOf('.nprColorPreserve = data.nprColorPreserve');

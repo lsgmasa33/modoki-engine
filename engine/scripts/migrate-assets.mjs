@@ -19,8 +19,8 @@
  * Usage:  node engine/scripts/migrate-assets.mjs [--dry]
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
 import path from 'node:path';
+import { repoFiles } from './repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
 const DRY = process.argv.includes('--dry');
@@ -65,21 +65,33 @@ function renameRenderableActiveToVisible(node) {
  *  it mutated the tree. Append future migrations here. */
 const TRANSFORMS = [renameRenderableActiveToVisible];
 
-// ── Discover files (tracked, via git) ──────────────────────────────────────────────
+// ── Discover files (via the shared git-backed enumerator, repoCorpus.mjs) ──────────
 // Game assets only. The e2e fixtures (engine/tests/e2e/fixtures/*.json) are hand-authored
 // with compact one-line trait objects, so they are migrated by hand to preserve that
 // formatting (a re-serialize would expand every object). They're also upgraded at load by
 // loadSceneFile's migration chain, so tests pass regardless.
-const patterns = [
-  'games/*/runtime/**/scenes/*.json',     // scenes
-  'games/*/runtime/**/*.prefab.json',     // prefabs
-];
-const files = new Set();
-for (const pat of patterns) {
-  let out = '';
-  try { out = execSync(`git ls-files '${pat}'`, { cwd: REPO_ROOT, encoding: 'utf8' }); } catch { /* none */ }
-  for (const f of out.split('\n').map((s) => s.trim()).filter(Boolean)) files.add(f);
-}
+//
+// This used to be `execSync(`git ls-files '${pat}'`)` — a shell STRING, not an argv array.
+// execSync spawns cmd.exe on Windows, which does not strip single quotes, so the quoted
+// pathspec reached git literally and matched nothing; the `catch { /* none */ }` then
+// swallowed the failure and every run below silently rewrote 0 files while reporting
+// success. MEASURED on this clone: quoted → 0 files, unquoted → 69. repoFiles() uses
+// execFileSync with an argv array, so there is no shell in the loop to mis-parse a quote.
+//
+// The two globs are expressed as `under: 'games'` (git-filtered, cheap) plus a `match`
+// regex carrying the rest of each pattern verbatim — `repoFiles()` has no glob support, so
+// this is the direct translation, not a loosening of what each pattern reaches.
+const scenes = repoFiles({
+  under: 'games',
+  match: /^games\/[^/]+\/runtime\/.*\/scenes\/[^/]+\.json$/,
+  floor: 20, // measured 45 today; the floor is far under that so only a broken match/under can trip it
+});
+const prefabs = repoFiles({
+  under: 'games',
+  match: /^games\/[^/]+\/runtime\/.*\.prefab\.json$/,
+  floor: 20, // measured 58 today
+});
+const files = new Set([...scenes, ...prefabs].map(({ rel }) => rel));
 
 let rewritten = 0, bumped = 0;
 for (const rel of [...files].sort()) {
@@ -98,9 +110,14 @@ for (const rel of [...files].sort()) {
   if (isScene && json.version !== SCENE_FORMAT_VERSION) { json.version = SCENE_FORMAT_VERSION; didBump = true; }
 
   if (changed || didBump) {
-    // Match the editor's writer (serialize.ts / vite-asset-scanner.ts): 2-space indent,
-    // NO trailing newline — otherwise the next in-editor save churns the file back.
-    if (!DRY) writeFileSync(abs, JSON.stringify(json, null, 2));
+    // Match the editor's writer: 2-space indent AND a trailing newline — otherwise the next
+    // in-editor save churns the file back. This used to omit the newline for scenes/prefabs
+    // because the client-side writer (`editor/scene/serialize.ts`) emitted none — #835 moved
+    // that writer onto the same `jsonFileBody`/`assetJsonBytes` byte shape every other asset
+    // document uses, so this script no longer needs a scene/prefab exception to agree with it.
+    // Kept as a literal rather than an import of `assetJsonBytes` because this is .mjs and that
+    // module is .ts — the same keep-in-sync split as PROJECT_ROOT_DIRS.
+    if (!DRY) writeFileSync(abs, JSON.stringify(json, null, 2) + '\n');
     rewritten++;
     if (didBump) bumped++;
     console.log(`${DRY ? 'would migrate' : 'migrated'}${changed ? ' (fields)' : ''}${didBump ? ` (v→${SCENE_FORMAT_VERSION})` : ''}: ${rel}`);

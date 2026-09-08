@@ -49,6 +49,14 @@ export const seekSteps = (fromTime: number, toTime: number): number =>
 import type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient } from '../core/curves';
 export type { MinMax, RGB, CurvePoint, Curve, ColorStop, AlphaStop, Gradient };
 
+/** The `.particle.json` format version this build writes/understands (docs/format-versioning.md
+ *  § 5). Never a literal — a reader compares against THIS constant, via
+ *  `runtime/core/formatVersion.ts`'s `classifyFormatVersion`. This module is the format's owner
+ *  (it declares `ParticleEffectDef` + `defaultParticleEffect()`) and is safe to import from the
+ *  runtime, the editor, and the Node build plugins alike (it pulls in only `../core/curves` and
+ *  `../core/spriteFrames`). */
+export const PARTICLE_FORMAT_VERSION = 1;
+
 export type EmitterShapeType = 'point' | 'cone' | 'sphere' | 'box' | 'circle' | 'cylinder' | 'polyline';
 
 export interface EmitterShape {
@@ -201,6 +209,23 @@ export interface TrailConfig {
   segments: number;
 }
 
+/** The trail segment count both the simulator and the line geometry must agree on.
+ *  Floored because a fractional value makes the simulator's `seg * 3` stride fractional,
+ *  and a fractional TypedArray index is silently DROPPED rather than throwing (#693). */
+export function resolveTrailSegments(segments: number | undefined): number {
+  return Math.max(2, Math.floor(segments ?? 8));
+}
+
+/** The sprite-sheet tile count both the SIMULATOR and every renderer must agree on. Floored for
+ *  the same reason as {@link resolveTrailSegments}: the simulator turns `tilesX * tilesY` into a
+ *  frame INDEX, and every consumer maps that index onto an integer grid — so a fractional count
+ *  makes the producer emit an index for a cell no consumer built (#693 sweep). The loader's
+ *  `normalizeParticleDef` also floors these, but only when the field is present and only on the
+ *  load path, so a def built in a test or written through an agent op can still reach here raw. */
+export function resolveTiles(tiles: number | undefined): number {
+  return Math.max(1, Math.floor(tiles ?? 1));
+}
+
 /**
  * A nested effect spawned in response to a parent particle's lifecycle event.
  * On each matching event the parent fires a burst of `count` child particles at
@@ -287,7 +312,9 @@ export interface RenderConfig {
  * assets keep loading.
  */
 export interface ParticleEffectDef {
-  version: 1;
+  /** Read-back document — the bytes may have been written by a newer build, so this must
+   *  not pin a literal (#734, #784). */
+  version: number;
   /** Stable asset GUID, stored in-file (same convention as mesh/material/prefab/scene
    *  `id`). Lets scenes + sub-emitters reference this effect by GUID so the reference
    *  survives the file being moved/renamed. Assigned on first save if absent. */
@@ -460,26 +487,43 @@ import { spriteIndexFromStep } from '../core/spriteFrames';
 
 /**
  * Signature of the render fields that require a backend rebuild (mesh/material/buffers)
- * when changed — shared by both backends' `setDef` so they agree on what's "structural".
- * Backend-specific extras (trails/sub-emitters on CPU; force/collision presence on GPU)
- * are compared separately by each backend on top of this.
+ * when changed — shared by all three backends' `setDef` so they agree on what's "structural".
+ * Backend-specific extras (trails/sub-emitters on CPU; force/collision presence on GPU) are
+ * compared separately by each backend on top of this.
+ *
+ * `aspect`/`anchor`/`offset` are deliberately EXCLUDED (#769) — they reach every backend
+ * through a single quad-vertex-position computation (`resolveQuadShift`/`computeQuadCorners`
+ * in `spriteBillboard.ts`) and change nothing else a rebuild would otherwise redo (buffer
+ * sizes, materials, compute kernels). See {@link renderQuadKey} for the field split those four
+ * moved to, applied in place instead of forcing a rebuild.
  */
-export function renderStructuralKey(def: ParticleEffectDef): string {
+export function renderBuildKey(def: ParticleEffectDef): string {
   const r = def.render;
   return [
     def.maxParticles,
     r.blend,
     r.mode ?? 'billboard',
-    r.aspect ?? 1,
-    r.anchor ?? 'center',
-    r.offset?.[0] ?? 0,
-    r.offset?.[1] ?? 0,
     r.meshPrimitive ?? 'box',
     r.meshLit ?? false,
-    r.tilesX ?? 1,
-    r.tilesY ?? 1,
+    // RESOLVED, not raw (#693 sweep): the renderers build an integer grid, so 2.0 and 2.4 are the
+    // same sheet — comparing the raw values forces a full rebuild that emits identical geometry.
+    resolveTiles(r.tilesX),
+    resolveTiles(r.tilesY),
     r.softParticles ?? false,
   ].join('|');
+}
+
+/**
+ * Signature of the four billboard-quad fields (#769) that move a particle's sprite in place
+ * — `aspect`, `anchor`, and the two `offset` components. All four resolve to nothing but the
+ * 12 vertex-position floats of a 4-vertex quad (`uv`/`index` are invariant under them), so a
+ * change here is applied by rewriting that attribute in place — no rebuild, no lost sim state.
+ * Each backend's `setDef` compares this alongside {@link renderBuildKey}: unchanged build key
+ * + changed quad key means "call the in-place applier", never a rebuild.
+ */
+export function renderQuadKey(def: ParticleEffectDef): string {
+  const r = def.render;
+  return [r.aspect ?? 1, r.anchor ?? 'center', r.offset?.[0] ?? 0, r.offset?.[1] ?? 0].join('|');
 }
 
 /** Max force fields the GPU compute kernel unrolls. Effects with more must run on
@@ -508,7 +552,7 @@ export function gpuDefSupported(def: ParticleEffectDef): boolean {
 /** A sensible default effect (a small upward spray) — used when creating new assets. */
 export function defaultParticleEffect(): ParticleEffectDef {
   return {
-    version: 1,
+    version: PARTICLE_FORMAT_VERSION,
     name: 'New Effect',
     duration: 5,
     looping: true,

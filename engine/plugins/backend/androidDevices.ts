@@ -387,3 +387,80 @@ export function resolveBuildAndroidSerial(
 export function adbArgs(serial: string | undefined, args: string[]): string[] {
   return serial ? ['-s', serial, ...args] : args;
 }
+
+/** Should a lease's hardware be handed to an ANDROID host-side op (system logs / crash reports)?
+ *
+ *  The exact mirror of `leaseForIosOps` (goIosDevice.ts), and it exists for the same reason on the
+ *  opposite platform (#732). `deviceConnection.deviceHardware()` is platform-AGNOSTIC — it answers
+ *  for whatever is leased. Feeding an iOS lease's `deviceModel` (a `ProductType` like
+ *  `'iPhone18,4'`) into the adb model comparison below hands it a value that can never match any
+ *  attached Android's `model:`/friendly name, so a handset that IS attached and answering reads as
+ *  a genuine mismatch and the op refuses — naming the iPhone as the reason no Android qualifies.
+ *
+ *  ⚠️ A null/unresolved platform is treated as NOT Android, exactly as the iOS side treats it as
+ *  not iOS: "not confirmed Android" is never "assume Android". This matters because
+ *  `devicePlatform()` swallows its own errors and returns null, so null conflates "an old bridge
+ *  that has no platform" with "the ask failed" — neither is evidence. The cost of the strict read
+ *  is small: a lease that cannot prove it is Android simply falls through to the ordinary project
+ *  pin / single-attached / refuse ladder, which still refuses loudly when the choice is ambiguous.
+ *
+ *  ⚠️ **TRI-STATE, and the third state is load-bearing.** `undefined` = no Android lease may speak
+ *  here; `null` = an Android lease that reported no model; a string = the model to match. Collapsing
+ *  the first two would hand a non-Android lease the single-attached shortcut that belongs only to an
+ *  Android one. `leaseForIosOps` needs only two states because `pickGoIosDevice` draws that same
+ *  distinction internally instead. */
+export function leaseForAndroidOps(platform: string | null | undefined, model: string | null | undefined): string | null | undefined {
+  return platform === 'android' ? (model ?? null) : undefined;
+}
+
+/** What the host-side adb ops should target, as a pure decision — the I/O (listing devices, asking
+ *  the lease) stays with the caller, the same split as `pickHostSidePlatform`/`pickGoIosDevice`.
+ *
+ *  `unleased` is not a failure: it means no ANDROID lease had anything to say, so the caller should
+ *  fall through to its ordinary ladder (project pin → the only attached device → a refusal naming
+ *  every candidate, #149). Modelled as a third outcome rather than folded into `error` because the
+ *  two are acted on differently, and an earlier version of this logic lived inline in the router
+ *  where that distinction was an `if` nobody could test.
+ *
+ *  ⚠️ A WIFI lease carries NO serial — `target.serial` is set only on the `useAdb` path — so "there
+ *  is a lease" does not mean "we know which handset". Falling straight through to the build
+ *  resolver would then read logs off whichever OTHER phone happens to be on USB, labelled as if it
+ *  were the leased one: the same silent wrong-device answer #670 fixed on the iOS half. So when a
+ *  lease is live but serial-less, disambiguate by the hardware MODEL it reports, and refuse rather
+ *  than guess. Gate that model with `leaseForAndroidOps` FIRST (#732) — before that gate existed,
+ *  an iOS lease reached this comparison and made it refuse about an Android that was plugged in. */
+export function pickHostSideAndroidSerial(o: {
+  /** The lease's adb serial, when it has one. Android by construction — `target.serial` is only
+   *  ever set on the `useAdb` path — so this is deliberately NOT platform-gated: `devicePlatform()`
+   *  can be null for a perfectly good adb lease, and dropping the serial there would be a
+   *  regression, not a fix. */
+  leaseSerial?: string;
+  /** The lease's platform EXACTLY as `devicePlatform()` reported it — raw, not pre-judged. Null
+   *  when nothing is leased. Gating happens in here (via `leaseForAndroidOps`) rather than in the
+   *  caller ON PURPOSE: the caller is an I/O-shaped router closure that no test can reach, and a
+   *  gate computed out there is a gate nothing covers — which is how #732 survived #670. */
+  leasePlatform?: string | null;
+  /** The lease's reported model exactly as `deviceHardware()` gave it — platform-AGNOSTIC, so it
+   *  may well be an iOS `ProductType`. Do not pre-filter it; that is this function's job. */
+  leaseModel?: string | null;
+  /** Attached + usable Android devices, with friendly names resolved. */
+  attached: AndroidDevice[];
+}): { serial: string } | { error: string } | { unleased: true } {
+  if (o.leaseSerial) return { serial: o.leaseSerial };
+  // ⚠️ ONE gate, and `leaseForAndroidOps` is it. An earlier cut of this function ALSO had an inline
+  // `if (o.leasePlatform !== 'android') return { unleased: true }` here, which made the shared
+  // helper dead code: deleting its platform check entirely left every test green, because the
+  // inline copy was doing all the work. Two gates for one decision is how the live one gets
+  // "simplified" away later, so the helper answers both questions — is there an Android lease at
+  // all, and what model does it report — and nothing restates the condition.
+  //
+  // `undefined` (not null) distinguishes "no Android lease" from "an Android lease reporting no
+  // model": the latter still earns the single-attached shortcut below, the former must not.
+  const lease = leaseForAndroidOps(o.leasePlatform, o.leaseModel);
+  if (lease === undefined) return { unleased: true };
+  const model = lease;
+  const hits = model ? o.attached.filter((d) => d.model === model || d.name === model) : [];
+  if (hits.length === 1) return { serial: hits[0].serial };
+  if (o.attached.length === 1 && !model) return { serial: o.attached[0].serial };
+  return { error: `the lease is over WiFi, so it names no adb serial${model ? ` (device model ${model})` : ''} — attached: ${o.attached.map((d) => `${d.serial}${d.name ? ` (${d.name})` : ''}`).join(', ') || 'none'}. Reconnect over adb, or pin device.androidDeviceId in Project Settings.` };
+}

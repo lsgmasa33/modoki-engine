@@ -111,12 +111,16 @@ export function clearCapture(): void {
   stoppedByCap = false;
 }
 
-/** Serialise the capture. Plain JSON on purpose — see the module header. */
+/** Serialise the capture. Plain JSON on purpose — see the module header.
+ *
+ *  No `version` field (#784): this is a pure sink with one consumer — a `Blob` download in
+ *  ProfilerTab — and nothing in the repo reads a written capture back (no file loader, no
+ *  `JSON.parse` of one). A version here would guard nothing and only claim to
+ *  (docs/format-versioning.md § 1). */
 export function exportCapture(): {
-  version: 1;
   frameCount: number;
   stoppedByCap: boolean;
   frames: CapturedFrame[];
 } {
-  return { version: 1, frameCount: frames.length, stoppedByCap, frames };
+  return { frameCount: frames.length, stoppedByCap, frames };
 }

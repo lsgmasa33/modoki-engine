@@ -12,7 +12,7 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
@@ -21,6 +21,7 @@ import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { isTextAsset } from './assetUndo';
+import { flushPendingMetaFor } from '../scene/pendingMeta';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -161,25 +162,101 @@ export function planRename(
 
 // ── Backend-IO wrappers (shared by Assets + Hierarchy) ───────────────
 
-/** Write a text or base64-encoded file via /api/write-file. */
-export async function writeAssetFile(filePath: string, content: string, encoding?: 'base64'): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content, encoding }),
-    });
-    return res.ok;
-  } catch { return false; }
+/** Write a text or base64-encoded file via /api/write-file. Re-exported from `editorBackend` —
+ *  the ONE client write wrapper (#835) — so the many existing `from './assetOps'` importers
+ *  (assetUndo.ts, createRegisteredAsset.ts, scene/skinPrefab.ts, Assets.tsx) need no change. */
+export { writeAssetFile };
+
+/** Split a completed delete into what ACTUALLY went and what is still on disk (#884) — the
+ *  DECISION, in `.ts` so it is testable without mounting the panel (CLAUDE.md § Panels).
+ *
+ *  Everything the panel does after a delete has to be keyed on `went`, not on what it asked for:
+ *  a file the OS refused is still there, so its row must stay listed, its editor must stay bound,
+ *  and undo must not offer to restore it. `/api/delete-asset` draws exactly this line for its own
+ *  half of the repair; before this the panel undid that care by passing the full requested list to
+ *  every step.
+ *
+ *  ⚠️ `removed` drops an asset whose OWN file went even if a SIDECAR of it was refused. The asset
+ *  is gone; keeping its row listed because a `.meta.local.json` survived would be the mirror
+ *  defect — a row pointing at nothing. The stray sidecar is named in the report the caller builds
+ *  from `failed`, and the next scan reconciles it.
+ *
+ *  ⚠️ Returns only what a caller USES. An earlier draft also returned `stillOnDisk` (the refused
+ *  paths), which nothing read — `Assets.tsx` reports straight off `del.failed` — and the docblock
+ *  claimed it was "reported", which was a claim about a field with no consumer. */
+export function planDeleteOutcome(
+  requested: string[], assetPaths: string[], failed: string[],
+): { went: string[]; removed: string[] } {
+  const refused = new Set(failed);
+  return {
+    went: requested.filter((p) => !refused.has(p)),
+    removed: assetPaths.filter((p) => !refused.has(p)),
+  };
 }
 
-/** Trash ONE asset via /api/delete-asset. */
+/** What to tell the human about a delete the OS refused (#884) — the DECISION, kept out of
+ *  `Assets.tsx` so it can be unit-tested (CLAUDE.md: a panel's decisions live in a plain `.ts`
+ *  module beside it). Returns `null` when there is nothing to report.
+ *
+ *  Two levels, matching the policy `undo/undoFailure.ts` already wrote down for #308: a failure
+ *  the human CAUSED and can FIX is worth interrupting them for. A locked file, a denied ACL or a
+ *  file open in another tool is exactly that — they can close the handle and delete again — so
+ *  this earns a toast, not just a console line nobody is looking at.
+ *
+ *  `toast` is short and names basenames (a full asset url does not fit a toast and the basename is
+ *  what the human sees in the panel); `detail` carries the full paths for the console, which is the
+ *  only hand-recovery record they get. */
+export function describeRefusedDeletes(
+  failed: string[],
+  opts: { trashed: number },
+): { toast: string; detail: string } | null {
+  if (failed.length === 0) return null;
+  const base = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+  const NAMED = 3;
+  const names = failed.slice(0, NAMED).map(base).join(', ')
+    + (failed.length > NAMED ? `, +${failed.length - NAMED} more` : '');
+  const n = `${failed.length} file${failed.length === 1 ? '' : 's'}`;
+  // ⚠️ The denominator is what was really THERE (`trashed` + refused), not what was requested.
+  // `deletionPathsFor` deliberately asks for maybe-absent sidecars — `.meta.local.json` is
+  // gitignored and usually not on disk — so a requested-count denominator reports "Moved 1 of 3"
+  // for one texture whose primary was locked, when only two files ever existed.
+  const total = opts.trashed + failed.length;
+  // "Moved 3 of 5" only makes sense when something moved; a total refusal says so plainly rather
+  // than reporting "moved 0 of 5", which reads as a count that might tick up on a retry.
+  //
+  // ⚠️ "still on disk", never "still listed". A refused SIDECAR is not listed at all — the asset
+  // scanner classifies `.meta.json`/`.meta.local.json` as null (`vite-asset-scanner.ts`), so they
+  // have no row to stay in — and its asset's row is gone either way, since `planDeleteOutcome`
+  // removes a row whose own file went. On-disk is the claim that is true for both.
+  const toast = opts.trashed > 0
+    ? `Moved ${opts.trashed} of ${total} to the Trash — ${names} could not be moved and ${failed.length === 1 ? 'is' : 'are'} still on disk`
+    : `Could not move ${n} to the Trash — ${names} ${failed.length === 1 ? 'is' : 'are'} still on disk`;
+  return { toast, detail: failed.join(', ') };
+}
+
+/** Trash ONE asset via /api/delete-asset.
+ *
+ *  ⚠️ **The boolean is the OUTCOME, not the HTTP status** (#884). It used to be plain `res.ok`,
+ *  and a path the OS refused answers **HTTP 200** — so a delete that deleted nothing returned
+ *  `true`, and every caller that carefully checks this boolean (the seven #308 undo/redo closures,
+ *  the Assets folder delete) was checking the wrong thing. The route now says `ok:false` in the
+ *  body for that case; this reads it.
+ *
+ *  A boolean is still the right model HERE, unlike `deleteAssetFiles` below: with ONE path there
+ *  is no partial outcome to describe — it went or it did not. */
 export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: assetPath }),
     });
-    return res.ok;
+    if (!res.ok) return false;
+    // An unparseable body is not a failed delete — the trash already happened, and the old
+    // boolean assumed exactly that for every call. Only an explicit `ok:false` is a refusal.
+    try {
+      const body = await res.json() as { ok?: unknown };
+      return body?.ok !== false;
+    } catch { return true; }
   } catch { return false; }
 }
 
@@ -190,7 +267,24 @@ export async function deleteAssetFile(assetPath: string): Promise<boolean> {
  *  "asked to trash" and "trashed" routinely differ and only the backend knows
  *  by how much. Discarding that distinction is what let an undo failure name
  *  files that never existed (#291). */
-export type DeleteFilesResult = { ok: boolean; trashed: number; missing: string[] };
+export type DeleteFilesResult = {
+  ok: boolean;
+  trashed: number;
+  missing: string[];
+  /** Paths the OS REFUSED to trash — a locked file, a denied ACL, a >260-char path — reported in
+   *  the same strings the caller passed in, so they can be compared directly against the request
+   *  (#884). These files are STILL ON DISK: a caller must not drop their rows, must not unbind an
+   *  editor from them, and must not offer to "restore" them.
+   *
+   *  ⚠️ Non-empty with `ok:true` means a PARTIAL delete — the rest of the batch did go. `ok:false`
+   *  with a non-empty `failed` means NONE of it went. Both are worth reporting to the human, so
+   *  read `failed` before branching on `ok`, not after.
+   *
+   *  ⚠️ **win32 only today.** darwin's `osascript` and Linux's `trash-put` are single invocations
+   *  that throw as a whole, so their refusal arrives as `ok:false` with `failed` EMPTY. An empty
+   *  `failed` is therefore not evidence that every path went — check `ok` for that. */
+  failed: string[];
+};
 
 /** Trash MANY paths in a single request → ONE OS-trash invocation → one trash
  *  sound (vs. one chime per file when each path was its own POST). The backend
@@ -198,35 +292,61 @@ export type DeleteFilesResult = { ok: boolean; trashed: number; missing: string[
  *  sidecars is safe — and it REPORTS those in `missing`, which is the only way
  *  a caller can tell an absent sidecar from a file it failed to save. */
 export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
-  if (paths.length === 0) return { ok: true, trashed: 0, missing: [] };
+  if (paths.length === 0) return { ok: true, trashed: 0, missing: [], failed: [] };
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     });
-    if (!res.ok) return { ok: false, trashed: 0, missing: [] };
+    if (!res.ok) return { ok: false, trashed: 0, missing: [], failed: [] };
     // A body we cannot parse is not a failed delete — the trash already happened.
     // Fall back to "everything we asked for was trashed", which is what the old
     // boolean return assumed for every call.
+    //
+    // ⚠️ That optimism is deliberate and must NOT be flipped to pessimistic now that `failed`
+    // exists: an unparseable body says nothing about which paths went, and guessing "all of them
+    // failed" would make a working delete report phantom survivors on every unreadable reply.
     try {
       const body = await res.json() as Partial<DeleteFilesResult>;
       return {
-        ok: true,
+        // ⚠️ Read the BODY's verdict, not just the HTTP status (#884). This used to be a
+        // hardcoded `true`, so a 200 saying `ok:false` — the route's answer when the OS refused
+        // every path — arrived here as a clean success.
+        ok: body?.ok !== false,
         trashed: typeof body?.trashed === 'number' ? body.trashed : paths.length,
         missing: Array.isArray(body?.missing) ? body.missing : [],
+        failed: Array.isArray(body?.failed) ? body.failed.filter((p): p is string => typeof p === 'string') : [],
       };
-    } catch { return { ok: true, trashed: paths.length, missing: [] }; }
-  } catch { return { ok: false, trashed: 0, missing: [] }; }
+    } catch { return { ok: true, trashed: paths.length, missing: [], failed: [] }; }
+  } catch { return { ok: false, trashed: 0, missing: [], failed: [] }; }
 }
 
 /** Copy an asset to a new path; the backend regenerates the GUID so the
- *  duplicate doesn't collide with the original in the manifest. */
+ *  duplicate doesn't collide with the original in the manifest.
+ *
+ *  ⚠️ **Flushes a parked import-settings edit for the SOURCE first** (#882). `duplicateAssetFile`
+ *  in the backend seeds the copy's `.meta.json` from the source's file, so without this the
+ *  duplicate is born with the PRE-EDIT settings while the panel shows the newer ones — and since
+ *  the route now refuses on a park, without it the panel's Duplicate would simply fail, returning
+ *  `false` with the reason discarded and nothing shown to the human.
+ *
+ *  Flushing rather than forcing, and rather than refusing, is the same call
+ *  `assetViews/reimport.ts` already makes: the human clicked Duplicate on this asset, and that
+ *  click is consent to persist their own edit — which an AGENT does not have, which is why the
+ *  agent path keeps the refusal and `force`. */
 export async function duplicateAssetFile(from: string, to: string): Promise<boolean> {
   try {
+    await flushPendingMetaFor(from);
     const res = await backendFetch('/api/duplicate-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to }),
     });
+    if (!res.ok) {
+      // The refusal body carries WHY (§5), and this used to throw it away — a Duplicate that
+      // failed with nothing said anywhere.
+      const detail = await res.text().catch(() => '');
+      console.error(`[Assets] duplicate ${from} → ${to} failed: ${res.status} ${detail.slice(0, 400)}`);
+    }
     return res.ok;
   } catch { return false; }
 }
@@ -317,7 +437,7 @@ export async function createPrefabFromEntity(
   const prefab = serializePrefab(entityId);
   if (!prefab) return null;
   warnInertPrefabSizes(prefab, savePath);
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   if (!(await writeAssetFile(savePath, content))) return null;
 
   // Register the prefab's GUID↔path first so tagEntityTreeAsInstance stores the

@@ -228,7 +228,10 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'dynamic import.\n\n' +
       'NOT modoki_persistence, which is the EDITOR\'s scene/asset save mode and is unrelated — ' +
       'that name collision is the confusion this description exists to stop.\n\n' +
-      'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`; pass ' +
+      'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`. ' +
+      '`pendingWrites` is NOT a subset of `keys` — a key can be pending and absent from `keys` (a ' +
+      'delete whose durable remove has not been accepted yet — rejected, or merely still ' +
+      'debounced), so it may still be on disk. Pass ' +
       '`key` to get that key\'s `value`. Every reply names the `namespace` it read, and you should ' +
       'check it: the same game has SEPARATE stores depending on where it runs. The editor ' +
       'deliberately hydrates `<gameId>@editor` so playtest saves cannot reach a shipped build\'s ' +
@@ -262,7 +265,13 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'still shows it while nothing survives a restart. Such a write is reported as PARTIAL, never ' +
       'as success.\n\n' +
       'An un-hydrated store refuses every action, writes included: a set before PlayerPrefs.init() ' +
-      'lands in a throwaway in-memory cache that init() then CLEARS.',
+      'lands in a throwaway in-memory cache that init() then CLEARS.\n\n' +
+      'ALL FOUR actions, flush included, are refused while a game/namespace swap is in flight ' +
+      '(PlayerPrefs.isSwapInFlight()) — a write or flush that is still settling when the install ' +
+      'runs can land in (or answer about) the OUTGOING namespace after this op has already moved ' +
+      'on, so it cannot truthfully report where or whether it landed; retry once the swap ' +
+      'finishes. modoki_player_prefs reads are NOT refused during the same window — a read ' +
+      'answers truthfully about the (still fully hydrated) outgoing store.',
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),

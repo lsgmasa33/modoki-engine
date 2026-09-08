@@ -49,6 +49,7 @@ async function setup() {
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
@@ -65,7 +66,7 @@ async function setup() {
   const prototype = makePrototype();
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn(() => ({ prototype, animations: [] })),
-    ensureRiggedModelLoaded: vi.fn(),
+    ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
 
   const { createWorld } = await import('koota');

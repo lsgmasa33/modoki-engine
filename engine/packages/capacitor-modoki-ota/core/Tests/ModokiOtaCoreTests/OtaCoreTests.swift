@@ -26,6 +26,7 @@ final class OtaCoreTests: XCTestCase {
   static let vectorFiles = [
     "test-vectors/ota-golden-vectors.json",
     "test-vectors/ota-gate-vectors-phase3.json",
+    "test-vectors/ota-subgame-vectors-553.json",
   ]
 
   /// The vector files declare `constants` — and until this was added, NOTHING read them, so the
@@ -102,7 +103,10 @@ final class OtaCoreTests: XCTestCase {
       bootAttempts: intMap(obj, "bootAttempts"),
       confirmedBoots: intMap(obj, "confirmedBoots"),
       rejected: stringListMap(obj, "rejected"),
-      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String
+      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String,
+      // Absent (no vector fixture sets this yet) parses as 0 — same "never seen anything"
+      // contract OtaCore.parseState follows (#571).
+      highestSeenSeq: (obj["highestSeenSeq"] as? Int) ?? (obj["highestSeenSeq"] as? NSNumber)?.intValue ?? 0
     )
   }
 
@@ -163,7 +167,35 @@ final class OtaCoreTests: XCTestCase {
 
       case "confirm":
         let state = OtaCore.parseState(stateJSONString)
-        let resultState = OtaCore.confirm(state: state, name: bundle)
+        // `version` is absent in every Phase 1 vector (the shell's unversioned confirm) and
+        // present in the #553 ones — the SAME call must serve both, so the back-compat path
+        // is exercised by the existing corpus rather than asserted separately.
+        let resultState = OtaCore.confirm(state: state, name: bundle, version: raw["version"] as? String)
+        assertStateMatches(resultState, expect["state"] as? [String: Any], name)
+
+      case "loadFailed":
+        let state = OtaCore.parseState(stateJSONString)
+        let dispositionRaw = raw["disposition"] as! String
+        guard let disposition = OtaLoadFailure(rawValue: dispositionRaw) else {
+          XCTFail("\(name): unknown disposition \(dispositionRaw)"); continue
+        }
+        let (target, resultState) = OtaCore.loadFailed(
+          state: state, name: bundle, version: raw["version"] as! String,
+          disposition: disposition, folderExists: folderExists
+        )
+        let expectTarget = expect["target"] as! [String: Any]
+        switch expectTarget["kind"] as! String {
+        case "embedded":
+          XCTAssertEqual(target, .embedded, "\(name): expected embedded target")
+        case "version":
+          XCTAssertEqual(
+            target,
+            .version(name: expectTarget["name"] as! String, version: expectTarget["version"] as! String),
+            "\(name): target mismatch"
+          )
+        default:
+          XCTFail("\(name): unknown expect.target.kind")
+        }
         assertStateMatches(resultState, expect["state"] as? [String: Any], name)
 
       case "resetForNewBinary":
@@ -176,5 +208,182 @@ final class OtaCoreTests: XCTestCase {
         XCTFail("\(name): unknown op \(op)")
       }
     }
+  }
+
+  // MARK: - Stage verification (#556)
+
+  /// Its OWN loader, deliberately separate from `loadVectors()` — the file it reads has a
+  /// different shape (`expected`/`actual`/`expect`, no `op`/`bundle`/`state`, no
+  /// `constants` block) and is NOT part of `vectorFiles`; see that file's header comment.
+  func loadStageVerifyVectors() -> [[String: Any]] {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent() // OtaCoreTests.swift -> ModokiOtaCoreTests/
+      .deletingLastPathComponent() // -> Tests/
+      .deletingLastPathComponent() // -> core/
+      .deletingLastPathComponent() // -> package root
+    let data = try! Data(contentsOf: packageRoot.appendingPathComponent("test-vectors/ota-stage-verify-vectors.json"))
+    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    return obj["scenarios"] as! [[String: Any]]
+  }
+
+  func testStageVerifyVectors() {
+    let scenarios = loadStageVerifyVectors()
+    XCTAssertGreaterThan(scenarios.count, 0, "ota-stage-verify-vectors.json: no scenarios — this test would check nothing")
+    for raw in scenarios {
+      let name = raw["name"] as! String
+      let expected = stringMap(raw, "expected")
+      let actual = stringMap(raw, "actual")
+      let expect = raw["expect"] as! [String: Any]
+      let result = OtaCore.verifyStagedFiles(expected: expected, actual: actual)
+      switch expect["kind"] as! String {
+      case "ok":
+        XCTAssertEqual(result, .ok, "\(name)")
+      case "missing":
+        XCTAssertEqual(result, .missing(path: expect["path"] as! String), "\(name)")
+      case "unexpected":
+        XCTAssertEqual(result, .unexpected(path: expect["path"] as! String), "\(name)")
+      case "hashMismatch":
+        XCTAssertEqual(
+          result,
+          .hashMismatch(path: expect["path"] as! String, expected: expect["expectedHash"] as! String, actual: expect["actualHash"] as! String),
+          "\(name)"
+        )
+      default:
+        XCTFail("\(name): unknown expect.kind \(expect["kind"] ?? "nil")")
+      }
+    }
+  }
+
+  // MARK: - Prune (#563)
+
+  /// Its OWN loader, deliberately separate from `loadVectors()` — the file it reads has a
+  /// different shape (`state`/`bundle`/`onDisk`/`expect.prune`, no `op`, no `constants`
+  /// block) and is NOT part of `vectorFiles`; see that file's header comment.
+  func loadPruneVectors() -> [[String: Any]] {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent() // OtaCoreTests.swift -> ModokiOtaCoreTests/
+      .deletingLastPathComponent() // -> Tests/
+      .deletingLastPathComponent() // -> core/
+      .deletingLastPathComponent() // -> package root
+    let data = try! Data(contentsOf: packageRoot.appendingPathComponent("test-vectors/ota-prune-vectors.json"))
+    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    return obj["scenarios"] as! [[String: Any]]
+  }
+
+  func testPruneVectors() {
+    let scenarios = loadPruneVectors()
+    XCTAssertGreaterThan(scenarios.count, 0, "ota-prune-vectors.json: no scenarios — this test would check nothing")
+    for raw in scenarios {
+      let name = raw["name"] as! String
+      let bundle = raw["bundle"] as! String
+      let onDisk = raw["onDisk"] as! [String]
+      let expect = raw["expect"] as! [String: Any]
+      let expectedPrune = expect["prune"] as! [String]
+
+      let stateRaw = raw["state"]
+      let state: OtaState?
+      if stateRaw == nil || stateRaw is NSNull {
+        state = nil
+      } else {
+        state = stateFromVectorJSON(stateRaw as! [String: Any])
+      }
+
+      let result = OtaCore.pruneVersions(state: state, name: bundle, onDisk: onDisk)
+      XCTAssertEqual(result, expectedPrune, "\(name): prune mismatch")
+    }
+  }
+
+  // MARK: - Bundles to prune (F2)
+
+  /// Its OWN loader, deliberately separate from `loadVectors()` — the file it reads has a
+  /// different shape (`state`/`shellName`/`expect.bundlesToPrune`, no `op`, no `constants`
+  /// block) and is NOT part of `vectorFiles`; see that file's header comment.
+  func loadBundlesToPruneVectors() -> [[String: Any]] {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent() // OtaCoreTests.swift -> ModokiOtaCoreTests/
+      .deletingLastPathComponent() // -> Tests/
+      .deletingLastPathComponent() // -> core/
+      .deletingLastPathComponent() // -> package root
+    let data = try! Data(contentsOf: packageRoot.appendingPathComponent("test-vectors/ota-bundles-to-prune-vectors.json"))
+    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    return obj["scenarios"] as! [[String: Any]]
+  }
+
+  func testBundlesToPruneVectors() {
+    let scenarios = loadBundlesToPruneVectors()
+    XCTAssertGreaterThan(scenarios.count, 0, "ota-bundles-to-prune-vectors.json: no scenarios — this test would check nothing")
+    for raw in scenarios {
+      let name = raw["name"] as! String
+      let shellName = raw["shellName"] as! String
+      let expect = raw["expect"] as! [String: Any]
+      let expected = expect["bundlesToPrune"] as! [String]
+
+      let stateRaw = raw["state"]
+      let state: OtaState?
+      if stateRaw == nil || stateRaw is NSNull {
+        state = nil
+      } else {
+        state = stateFromVectorJSON(stateRaw as! [String: Any])
+      }
+
+      let result = OtaCore.bundlesToPrune(state: state, shellName: shellName)
+      XCTAssertEqual(result, expected, "\(name): bundlesToPrune mismatch")
+    }
+  }
+
+  // MARK: - Anti-rollback (#571)
+
+  func testRecordSeqStartsFromNilState() {
+    let result = OtaCore.recordSeq(nil, seq: 5)
+    XCTAssertEqual(result.highestSeenSeq, 5)
+  }
+
+  func testRecordSeqAdvancesTheHighWaterMark() {
+    let state = OtaState(highestSeenSeq: 3)
+    let result = OtaCore.recordSeq(state, seq: 7)
+    XCTAssertEqual(result.highestSeenSeq, 7)
+  }
+
+  func testRecordSeqNeverRegresses() {
+    // The whole point: a call with a LOWER seq than what's already recorded must not move
+    // the high-water mark backwards — that would reopen the exact replay window it exists
+    // to close.
+    let state = OtaState(highestSeenSeq: 10)
+    let result = OtaCore.recordSeq(state, seq: 3)
+    XCTAssertEqual(result.highestSeenSeq, 10)
+  }
+
+  func testRecordSeqPreservesEveryOtherField() {
+    let state = OtaState(active: ["shell": "v1"], pending: ["shell": "v2"], rejected: ["shell": ["v0"]], highestSeenSeq: 1)
+    let result = OtaCore.recordSeq(state, seq: 9)
+    XCTAssertEqual(result.active, ["shell": "v1"])
+    XCTAssertEqual(result.pending, ["shell": "v2"])
+    XCTAssertEqual(result.rejected, ["shell": ["v0"]])
+    XCTAssertEqual(result.highestSeenSeq, 9)
+  }
+
+  func testHighestSeenSeqSurvivesSerializeParseRoundTrip() {
+    let state = OtaState(highestSeenSeq: 42)
+    let json = OtaCore.serialize(state)
+    let parsed = OtaCore.parseState(json)
+    XCTAssertEqual(parsed?.highestSeenSeq, 42)
+  }
+
+  func testHighestSeenSeqDefaultsToZeroWhenAbsentFromStateJSON() {
+    // A state.json written by a pre-#571 binary has no key at all — must parse as 0, not
+    // crash and not nil out the whole state (same contract every other new field follows).
+    let json = "{\"active\":{\"shell\":\"v1\"}}"
+    let parsed = OtaCore.parseState(json)
+    XCTAssertEqual(parsed?.highestSeenSeq, 0)
+  }
+
+  func testResetForNewBinaryPreservesHighestSeenSeq() {
+    // Mirrors `rejected`'s survival across a binary reset — see resetForNewBinary's doc
+    // comment: this is a fact about which release.json documents this DEVICE has already
+    // seen, not a reference to a snapshot a fresh binary invalidates.
+    let state = OtaState(active: ["shell": "v1"], lastSeenBinaryVersion: "1", highestSeenSeq: 12)
+    let result = OtaCore.resetForNewBinary(state, currentBinaryVersion: "2")
+    XCTAssertEqual(result?.highestSeenSeq, 12)
+    XCTAssertEqual(result?.active, [:]) // sanity: this branch DOES wipe active/pending as designed
   }
 }

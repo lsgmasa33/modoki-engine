@@ -23,6 +23,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 export const RUNTIME_ROOT = path.join(REPO_ROOT, 'engine/packages/modoki/src/runtime');
@@ -47,14 +49,12 @@ export interface ImportEdge {
   valueOnly: boolean;
 }
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(full, out);
-    else if (/\.tsx?$/.test(entry.name)) out.push(full);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `RUNTIME_ROOT`, as absolute paths — via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 540 measured today. */
+function walk(dir: string): string[] {
+  return repoFiles({
+    under: dir, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 400,
+  }).map(({ abs }) => abs);
 }
 
 /** Node id for a file: its top-level subfolder under RUNTIME_ROOT, or (for a file directly at
@@ -167,7 +167,16 @@ function resolveSpecifier(fromFile: string, specifier: string): string | null {
 export function buildRuntimeGraph(): ImportEdge[] {
   const edges: ImportEdge[] = [];
   for (const file of walk(RUNTIME_ROOT)) {
-    const src = fs.readFileSync(file, 'utf8');
+    // ⚠️ **Comments blanked before the statements are parsed (#812).** `parseFromStatements` is a
+    // regex over text, so a doc comment SHOWING an import example is indistinguishable from a real
+    // one — and a comment holding a RELATIVE specifier injects a phantom cross-folder edge. This
+    // graph feeds `noNewCycles` and `barrelSurface`, both frozen baselines, so that lands not as a
+    // red build you investigate but as a new cycle whose cheapest fix is adding it to
+    // `cycles-baseline.json` — permanently enshrining a cycle that does not exist.
+    // Two runtime files already hold an import in prose (`ui/storeHooks.ts`,
+    // `storage/playerPrefs.ts`); both happen to use the bare `@modoki/engine/runtime`, which the
+    // `.`-prefix filter below drops. The next one to be written relatively is the live bug.
+    const src = readScannedSource(file).code;
     const fromNode = nodeIdFor(file);
     const fromFile = path.relative(REPO_ROOT, file).replace(/\\/g, '/');
     for (const { specifier, valueOnly } of parseFromStatements(src)) {

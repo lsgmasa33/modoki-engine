@@ -18,6 +18,24 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { HotLike } from '../../app/debug/hmrStaleness';
 
+// Type-only reference (not a value import) — keeps this test file, like the module it covers,
+// free of a runtime `@modoki/engine` binding.
+type UnsavedCauses = import('../../app/debug/hmrStaleness').UnsavedCauses;
+
+// A `vi.hoisted` mock, not a plain `vi.fn()` inside the factory: this file's `beforeEach` calls
+// `vi.resetModules()` per test (each test gets a fresh `hmrStaleness` module instance so
+// `status` doesn't leak between tests — see below), and a factory-local `vi.fn()` would be
+// RE-CREATED on every reset, plus `journal()`'s dynamic `import('@modoki/engine/editor')` and
+// this file's own import of the same specifier were observed to resolve to two DIFFERENT module
+// instances under that reset (same class of bug as "an /@fs import gives a second module
+// instance" — see the engine memory notes). Holding the one mock outside the factory sidesteps
+// both: there is exactly one `editorEmitMock` for the whole file, cleared per test.
+const { editorEmitMock } = vi.hoisted(() => ({ editorEmitMock: vi.fn() }));
+vi.mock('@modoki/engine/editor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@modoki/engine/editor')>();
+  return { ...actual, editorEmit: editorEmitMock };
+});
+
 // `status` is module-level and deliberately STICKY for the life of a page (an agent reading
 // get_editor_state later must still learn that work was dropped). That is right in
 // production — initHmrStaleness runs once per page load — but it would leak between tests,
@@ -59,6 +77,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(async () => {
   vi.resetModules();
+  editorEmitMock.mockClear();
   ({ initHmrStaleness, getHmrStatus } = await import('../../app/debug/hmrStaleness'));
   vi.useFakeTimers({ shouldAdvanceTime: true });
   reload = vi.fn();
@@ -92,7 +111,7 @@ describe('game code changed — clean scene', () => {
 describe('game code changed — dirty scene', () => {
   it('does NOT reload during the grace window, and warns that work will be lost', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -105,7 +124,7 @@ describe('game code changed — dirty scene', () => {
 
   it('takes the loss when the countdown expires, and records it for the next page', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -121,7 +140,7 @@ describe('game code changed — dirty scene', () => {
     // Saving is an advertised response to the banner, so this is the COMMON case — and
     // recording a discard that never happened would poison the exact signal agents are
     // told to trust. The flag must be re-read at reload time, not captured 5s earlier.
-    let dirty = true;
+    let dirty: UnsavedCauses | false = { sceneDirty: true };
     const hot = fakeHot();
     initHmrStaleness(hot, () => dirty);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
@@ -138,7 +157,7 @@ describe('game code changed — dirty scene', () => {
 
   it('"Reload now" discards immediately', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -151,7 +170,7 @@ describe('game code changed — dirty scene', () => {
 
   it('"Cancel" keeps the edits, skips the reload, and marks the editor STALE', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -189,7 +208,7 @@ describe('reporting a discard the PREVIOUS page took', () => {
 
 describe('no hot context (a shipped game build)', () => {
   it('is completely inert', async () => {
-    initHmrStaleness(undefined, () => true);
+    initHmrStaleness(undefined, () => ({ sceneDirty: true }));
     await settle();
     expect(reload).not.toHaveBeenCalled();
     expect(banner()).toBeNull();
@@ -214,7 +233,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
 
   it('warns before discarding unsaved scene work, naming the shader edit', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/npr/edgeNodes.ts' });
     await settle();
 
@@ -231,7 +250,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
 
   it('Cancel marks the editor STALE — measurements from it are not to be trusted', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => true);
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/PostFXStack.ts' });
     await settle();
 
@@ -249,5 +268,97 @@ describe('shader code changed (postfx/npr TSL)', () => {
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
     expect(reload).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #850 — the countdown named a fixed cause ("unsaved scene changes") written when the scene was
+// the only thing that COULD be unsaved. Since #831/#845, a parked asset/base-scene/import-setting
+// edit sets the same flag with `sceneDirty: false`, so the fixed string was already wrong before
+// this fix. These tests pin the correction: the message is BUILT from whatever `unsavedChangeCauses()`
+// (the real shape, mirrored here as `UnsavedCauses`) actually reports, not hand-listed.
+describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
+  it('names a parked asset edit and does NOT say "scene" when the scene itself is clean', async () => {
+    const hot = fakeHot();
+    // sceneDirty is false: only a parked asset edit (e.g. a material saved to the dirty-asset
+    // registry, not disk) is pending. Mutating a careless fix's cause-check to `sceneDirty:
+    // true` here would falsely turn this red — see the mutation-check note in the report.
+    initHmrStaleness(hot, () => ({ sceneDirty: false, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }));
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain('asset edit');
+    // The negative half is what makes the mutation check bite (#844 precedent) — a fix that
+    // renders the OLD fixed string alongside the new cause would still pass the positive half.
+    expect(bannerText()).not.toContain('scene');
+  });
+
+  it('names BOTH causes when the scene AND a parked asset edit are dirty', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }));
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain('unsaved scene changes');
+    expect(bannerText()).toContain('asset edit');
+  });
+
+  it('the !hmr.discarded-unsaved journal event carries the cause', async () => {
+    // Pre-warm the module `journal()` dynamically imports. `vi.resetModules()` (beforeEach)
+    // forces a full cold re-transform of the editor barrel on the FIRST import each test,
+    // which can take real wall-clock time a fixed `setTimeout(0)` settle() cannot reliably
+    // outlast — awaiting it here first means `journal()`'s own import resolves same-tick.
+    await import('@modoki/engine/editor');
+
+    // The event fires on the NEXT page's boot (§0 — "report a loss the PREVIOUS page took"),
+    // reading the record the discarding page left in sessionStorage — same setup as "reporting
+    // a discard the PREVIOUS page took" above, but now with a `causes` payload to check.
+    sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({
+      file: '/g/a.ts', at: 1, causes: { dirtyAssetPaths: ['games/x/materials/foo.mat.json'] },
+    }));
+
+    initHmrStaleness(fakeHot(), () => false);
+    await settle();
+
+    expect(editorEmitMock).toHaveBeenCalledWith('!hmr.discarded-unsaved', {
+      file: '/g/a.ts',
+      causes: { dirtyAssetPaths: ['games/x/materials/foo.mat.json'] },
+    });
+  });
+
+  it('a cause this module has never seen still appears in the message, unedited', async () => {
+    // The whole point: `unsavedChangeCauses()` growing a SIXTH field must not require touching
+    // hmrStaleness.ts. This probe reports a key CAUSE_LABELS has no entry for — proving the
+    // enumeration is real, not a longer hand-written list that happens to cover five keys today.
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ aBrandNewFutureCause: true }));
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    // Humanized fallback (camelCase → spaced words), not a silent drop and not a raw key dump.
+    expect(bannerText()).toContain('a brand new future cause');
+  });
+});
+
+describe('layering — this module has no direct editor-state import (#850)', () => {
+  it('imports @modoki/engine only via the guarded dynamic import, never statically', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const src = fs.readFileSync(
+      path.join(__dirname, '../../app/debug/hmrStaleness.ts'),
+      'utf8',
+    );
+
+    // Positive control: the dynamic imports must actually be present in the source — a check
+    // that would pass just as well against a file importing nothing proves nothing.
+    const dynamicImports = src.match(/import\(['"]@modoki\/engine\/editor['"]\)/g) ?? [];
+    expect(dynamicImports.length).toBeGreaterThan(0);
+
+    // The actual guard: no static `import ... from '@modoki/engine...'` line anywhere.
+    const staticImportLines = src
+      .split('\n')
+      .filter((line) => /^\s*import\b/.test(line) && !/^\s*import\(/.test(line));
+    for (const line of staticImportLines) {
+      expect(line).not.toMatch(/@modoki\/engine/);
+    }
   });
 });

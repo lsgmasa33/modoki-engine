@@ -16,6 +16,8 @@
  *  Mirrors `screenBounds.ts`'s registration pattern exactly: providers register on
  *  mount, unregister on unmount; a provider that throws is skipped. */
 
+import { onWorldSwap } from '../core/ecs/world';
+
 /** One draggable/clickable handle in an authoring editor, in viewport CSS px. */
 export interface InteractionHandle {
   /** Stable id UNIQUE across all providers — namespace it by editor+kind+index, e.g.
@@ -81,8 +83,13 @@ export function registerHandleProvider(fn: HandleProvider): () => void {
 }
 
 /** Ids already reported as duplicated, so the warning fires once per id rather than on
- *  every `modoki_handles` poll. */
+ *  every `modoki_handles` poll. NOT keyed by entity id — handle ids are hand-authored
+ *  editor+kind+index strings, not koota entities — so this has no id-recycling hazard, but it
+ *  had NO clear at all (#738): it grows forever across a session and a handle id that warned in
+ *  one scene stays silently suppressed in a later one that happens to reuse the same id. Clear
+ *  it on world swap, like `hitRegions.ts`'s twin. */
 const warnedDuplicates = new Set<string>();
+onWorldSwap(() => { warnedDuplicates.clear(); });
 
 /** Providers already reported as throwing, so the error fires once per provider rather than on
  *  every `modoki_handles` poll. */

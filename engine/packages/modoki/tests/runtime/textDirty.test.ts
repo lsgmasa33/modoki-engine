@@ -36,4 +36,22 @@ describe('textDirty', () => {
     markTextDirty();
     expect(n).toBe(1); // no further fire after unsubscribe
   });
+
+  // #696 — per-font attribution: a font's glyph load/regen should only invalidate
+  // TEXT ON THAT FONT, not every text mesh in the scene.
+  it('an attributed mark bumps only that font\'s version, leaving other fonts unchanged', () => {
+    const beforeA = getTextDirtyVersion('fontA');
+    const beforeB = getTextDirtyVersion('fontB');
+    markTextDirty('fontA');
+    expect(getTextDirtyVersion('fontA')).toBe(beforeA + 1);
+    expect(getTextDirtyVersion('fontB')).toBe(beforeB); // unrelated font untouched
+  });
+
+  it('an un-attributed mark bumps every font\'s version (the safety fallback)', () => {
+    const beforeA = getTextDirtyVersion('fontA');
+    const beforeB = getTextDirtyVersion('fontB');
+    markTextDirty(); // no fontId — caller can't name one
+    expect(getTextDirtyVersion('fontA')).toBe(beforeA + 1);
+    expect(getTextDirtyVersion('fontB')).toBe(beforeB + 1);
+  });
 });

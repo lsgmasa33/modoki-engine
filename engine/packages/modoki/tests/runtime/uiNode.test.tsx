@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
 import { render, fireEvent, cleanup } from '@testing-library/react';
+import { createWorld } from 'koota';
 
 // vi.mock is hoisted above imports — declare the spies via vi.hoisted so the factories
 // can close over them without a TDZ error.
@@ -55,11 +56,16 @@ vi.mock('../../src/runtime/video/UIVideoMount', () => ({
     }),
 }));
 
-import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
+import {
+  UINode, cssVal, hexToRgba, hexToColor,
+  DEFAULT_TOGGLE_TRACK_WIDTH, DEFAULT_TOGGLE_TRACK_HEIGHT, toggleKnobFloor, droppedTextStyleFields,
+} from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
 import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
+import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo } from '../../src/runtime/ui/pressOrigin';
 import { isPaintOpaque } from '../../src/editor/panels/uiPreviewPick';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 afterEach(() => {
   cleanup();
@@ -75,7 +81,7 @@ afterEach(() => {
 /** A complete UINodeData with neutral defaults; override per test. */
 function makeNode(over: Partial<UINodeData> = {}): UINodeData {
   return {
-    entityId: 1, guid: 'g1',
+    entityId: 1, guid: 'g1', generation: 0,
     width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
     flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'flex-start', alignItems: 'stretch',
     gap: 0, gapUnit: 'px', flexGrow: 0, flexShrink: 1,
@@ -86,9 +92,11 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, rotation: 0, scale: 1, overflow: 'visible', isVisible: true, pointerThrough: false,
+    swallowClicks: false,
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
+    autoFitText: false, fontSizeMin: 0,
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
@@ -156,6 +164,75 @@ describe('UINode fontFamily is emitted on containers, not only on text nodes', (
 
   it('an unauthored family is left alone, so the inherited one wins', () => {
     const { container } = render(<UINode node={makeNode({ text: 'hi', fontFamily: '' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toBe('');
+  });
+});
+
+/** `inheritedFontFamily` — a form control (`input`/`range`) does NOT inherit `font-family` from
+ *  its DOM ancestors (#803): the browser's UA stylesheet gives it its own explicit default, which
+ *  beats plain CSS inheritance. So the font every `div` picks up through the cascade would
+ *  otherwise miss form controls entirely — the same class of bug as #803, one element type over.
+ *
+ *  The prop carries the font this node WOULD inherit: each level passes
+ *  `node.fontFamily || inherited` down, so it is the nearest declaring ancestor's value, falling
+ *  back to the scene-wide `UISettings` default `UIRenderer` puts on the shared container. It is
+ *  deliberately NOT the scene default itself — see the nested case below. A `div` never needs it
+ *  (the real cascade already gives it the same answer), so only input/range read it. */
+describe('UINode inheritedFontFamily — the inherited font reaches form controls too (#803)', () => {
+  it('an <input> with no authored fontFamily falls back to inheritedFontFamily', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
+  });
+
+  it('an authored fontFamily still wins over inheritedFontFamily on an <input>', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: 'Geologica' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Geologica');
+    expect(container.querySelector('input')!.style.fontFamily).not.toContain('Varela Round');
+  });
+
+  it('a RANGE with no authored fontFamily falls back to inheritedFontFamily too', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'range', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
+  });
+
+  /** The chess/llm-test case: neither game authors a scene font, so `inheritedFontFamily` is `''`
+   *  and this MUST leave `fontFamily` absent, not fall back to `inherit` — an unconditional
+   *  `inherit` was rejected specifically because it would visibly change these two games'
+   *  inputs from the platform's form font to `body`'s `system-ui` for no reason either asked
+   *  for. Asserted as ABSENT (empty string on a CSSStyleDeclaration), not merely falsy. */
+  it('an empty inheritedFontFamily leaves fontFamily unset on an <input> — no accidental "inherit"', () => {
+    const { container } = render(
+      <UINode node={makeNode({ elementType: 'input', fontFamily: '' })} storeState={{}} inheritedFontFamily="" />,
+    );
+    expect(container.querySelector('input')!.style.fontFamily).toBe('');
+  });
+
+  /** The prop must track the CASCADE, not jump to the scene default. A modal ROOT authoring its
+   *  own `fontFamily` is the case that separates them: every `div` inside that modal renders in
+   *  the modal's font, so an `<input>` handed the SCENE default instead would be the only element
+   *  in the dialog in a different typeface. Caught in review before it could ship — the first
+   *  version passed the raw store value straight down. */
+  it('a nested <input> gets its ANCESTOR\u2019s font, not the scene-wide default', () => {
+    const input = makeNode({ entityId: 2, guid: 'g2', elementType: 'input', fontFamily: '' });
+    const modalRoot = makeNode({ fontFamily: 'Geologica', children: [input] });
+    const { container } = render(
+      <UINode node={modalRoot} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
+    const el = container.querySelector('input')!;
+    expect(el.style.fontFamily).toContain('Geologica');
+    expect(el.style.fontFamily).not.toContain('Varela Round');
+  });
+
+  it('a div (not a form control) ignores inheritedFontFamily — it already inherits via CSS', () => {
+    const { container } = render(
+      <UINode node={makeNode({ text: 'hi', fontFamily: '' })} storeState={{}} inheritedFontFamily="Varela Round" />,
+    );
     expect((container.firstElementChild as HTMLElement).style.fontFamily).toBe('');
   });
 });
@@ -327,6 +404,120 @@ describe('UINode pointerThrough', () => {
   });
 });
 
+// ── swallowClicks (#728) ──
+// "Stop the tap here, but I am not a button" — split out of `isInteractive` so a container can
+// consume a click without paying for a fake button binding (the click cue + the 300ms input lock).
+describe('UINode swallowClicks (#728)', () => {
+  it('takes the pointer so it can receive the click at all', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.style.pointerEvents).toBe('auto');
+  });
+
+  it('does NOT show a pointer cursor — it is not a button', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.style.cursor).not.toBe('pointer');
+  });
+
+  it('is stamped with the press-origin marker, so #664 protects it too', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    expect(el.hasAttribute(UI_PRESS_ORIGIN_ATTR)).toBe(true);
+  });
+
+  it('a real click binding alongside swallowClicks still gets the pointer cursor AND still runs — redundant, not lost', () => {
+    // The combination is not a trap like pointerThrough+swallowClicks: an interactive node's
+    // handler already calls stopPropagation unconditionally before anything else, so the tap is
+    // swallowed either way. `swallowClicks` here asks for nothing the binding doesn't already do.
+    const node = makeNode({
+      swallowClicks: true,
+      action: { bindings: [{ event: 'click', kind: 'call', action: 'x' }] },
+    } as Partial<UINodeData>);
+    const el = renderNode(node);
+    expect(el.style.cursor).toBe('pointer');
+    fireEvent.click(el);
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'click', { selfGuid: 'g1' });
+  });
+
+  it('pointerThrough wins when both are authored — that combination is an authoring error', () => {
+    const el = renderNode(makeNode({ swallowClicks: true, pointerThrough: true }));
+    expect(el.style.pointerEvents).toBe('none');
+  });
+
+  it('pointerThrough wins for a click STARTING ON A DESCENDANT too — the half CSS cannot express', () => {
+    // ⚠️ The assertion above is true under BOTH hypotheses and therefore proves nothing on its
+    // own: `pointer-events: none` is set by the `pointerThrough` block either way. This is the
+    // distinguishing observation, and until #728's close-out it FAILED.
+    //
+    // `pointer-events: none` stops the band being hit-tested; it does not take the band out of
+    // the event path of a click that starts on a descendant with `auto` — exactly the shape
+    // `pointerThrough` is FOR (a decorative panel over something that must stay tappable). So the
+    // band's React onClick still fires for that click, and an ungated swallow would stop it.
+    const onBehind = vi.fn();
+    const child = makeNode({ entityId: 2, guid: 'g2', overflow: 'scroll' });
+    const band = makeNode({ pointerThrough: true, swallowClicks: true, children: [child] });
+    const { container } = render(
+      <div onClick={onBehind}>
+        <UINode node={band} storeState={{}} />
+      </div>,
+    );
+    const bandEl = container.querySelector('[data-entity-id="1"]') as HTMLElement;
+    const childEl = container.querySelector('[data-entity-id="2"]') as HTMLElement;
+    expect(bandEl.style.pointerEvents, 'fixture: the band is transparent').toBe('none');
+    expect(childEl.style.pointerEvents, 'fixture: a scroll child is forced back to auto').toBe('auto');
+
+    fireEvent.click(childEl);
+
+    expect(onBehind, 'the band must NOT swallow a click that began on its auto descendant — '
+      + 'that is the pointer-blocker passthrough bug pointerThrough exists to prevent')
+      .toHaveBeenCalledTimes(1);
+    expect(bandEl.hasAttribute(UI_PRESS_ORIGIN_ATTR),
+      'and it must not become a press-origin boundary either — a press starting inside it and '
+      + 'released on a real interactive ancestor would make pressBelongsTo(ancestor) false and '
+      + 'silently kill that ancestor\'s binding').toBe(false);
+  });
+
+  it('clicking it does NOT call applyBindings — a swallow is not a button', () => {
+    const el = renderNode(makeNode({ swallowClicks: true }));
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('stops the click from reaching an ancestor', () => {
+    const onAncestorClick = vi.fn();
+    const node = makeNode({ swallowClicks: true });
+    const { container } = render(
+      <div onClick={onAncestorClick}>
+        <UINode node={node} storeState={{}} />
+      </div>,
+    );
+    const el = container.querySelector('[data-entity-id]') as HTMLElement;
+    fireEvent.click(el);
+    expect(onAncestorClick).not.toHaveBeenCalled();
+  });
+
+  it('clears the press-origin pair on click — a pure swallow stops propagation WITHOUT consulting pressBelongsTo, so it must clear the pair itself (mirrors pressOrigin.test.ts\'s #defect-B)', () => {
+    const dispose = installPressOriginTracking(document);
+    try {
+      // renderNode already mounts into a container RTL appends to document.body, so `el` is
+      // already reachable from document-level listeners without moving it there.
+      const el = renderNode(makeNode({ swallowClicks: true }));
+      // A real press+release landing on the swallow node.
+      el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, pointerId: 1 }));
+      el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, isPrimary: true, pointerId: 1 }));
+      fireEvent.click(el);
+      // If the pair were left uncleared, it would sit there for a LATER, unrelated click to
+      // misread. Consult pressBelongsTo against an unrelated element with no new pointer events:
+      // cleared → fails open (true); left dangling → the stale pair's closest() lookup misses
+      // this unrelated element and wrongly reports false.
+      const unrelated = document.createElement('div');
+      document.body.appendChild(unrelated);
+      expect(pressBelongsTo(unrelated)).toBe(true);
+      unrelated.remove();
+    } finally {
+      dispose();
+    }
+  });
+});
+
 // ── gapUnit ──
 // `gap` was the only length on UIElement with no unit. A wrap-based grid whose ITEMS scale (vh)
 // while its GAPS do not has a viewport size below which an item silently reflows onto the next
@@ -397,19 +588,310 @@ describe('UINode text rendering', () => {
     // width/color above is the observable signal that the stroke branch ran.
   });
 
-  it('single-line ellipsis: overflow hidden + nowrap + text-overflow ellipsis', () => {
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DEFECT (#725). It asserted the three properties on the
+  // HOST — but the host is ALWAYS `display: flex` (`text-overflow` never applies to a flex
+  // container), so `text-overflow: ellipsis` there painted nothing while `getComputedStyle` went
+  // on reporting it as set. The fix moves all three onto the same inner wrapper #655 already
+  // mounts for the clamp, with the host left untouched.
+  it('single-line ellipsis (#725): lives on the wrapper, not the flex host', () => {
     const el = renderNode(makeNode({ text: 'long', textOverflow: 'ellipsis', maxLines: 0 }));
-    expect(el.style.overflow).toBe('hidden');
-    expect(el.style.whiteSpace).toBe('nowrap');
-    expect(el.style.textOverflow).toBe('ellipsis');
+    // The host stays a plain flex container — nothing ellipsis-related leaks onto it.
+    expect(el.style.display).toBe('flex');
+    expect(el.style.overflow).toBe('visible'); // node.overflow default — untouched by this fix
+    expect(el.style.whiteSpace).toBe('');
+    expect(el.style.textOverflow).toBe('');
+
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.overflow).toBe('hidden');
+    expect(clamp!.style.whiteSpace).toBe('nowrap');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
+    // The wrapper must be able to STRETCH to fill the host for the ellipsis to ever engage
+    // (`shrinkWrapAlign` must not be spread in here — see the code comment) — `maxWidth: 100%`
+    // caps it even when the host authors a non-stretch `alignItems`.
+    expect(clamp!.style.maxWidth).toBe('100%');
   });
 
-  it('multi-line clamp: -webkit-line-clamp + display:-webkit-box', () => {
-    const el = renderNode(makeNode({ text: 'long', maxLines: 3, textOverflow: 'ellipsis' }));
-    expect(el.style.display).toBe('-webkit-box');
-    expect(styleAttr(el)).toMatch(/-webkit-line-clamp:\s*3/);
-    expect(el.style.overflow).toBe('hidden');
+  it('single-line ellipsis (#725): the wrapper style is identical in a row host, where the bug bit', () => {
+    // The default `column` host with `alignItems: 'stretch'` already fills the box width, which
+    // is why this shipped invisibly — nothing exercises the failing (non-stretch/row) axis. This
+    // pins that the emitted style does not depend on flexDirection; the real geometry is verified
+    // live in `editor-ui-autofit.spec.ts`.
+    const el = renderNode(makeNode({
+      text: 'long', textOverflow: 'ellipsis', maxLines: 0, flexDirection: 'row',
+    }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.maxWidth).toBe('100%');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
+  });
+
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DEFECT (#655). It asserted the clamp on the HOST —
+  // `el.style.display === '-webkit-box'` — which is exactly what killed every flex property
+  // authored on the same entity, because `-webkit-box` is not a flex container. The old
+  // assertion was not wrong about what the code did; it was wrong about what the code should do,
+  // and it would have gone red on the fix, which is the shape a test defending a bug always has.
+  // The clamp now lives on an inner wrapper and the host stays a flex container.
+  it('multi-line clamp: -webkit-line-clamp on an INNER WRAPPER, host stays display:flex', () => {
+    const el = renderNode(makeNode({
+      text: 'long', maxLines: 3, textOverflow: 'ellipsis',
+      justifyContent: 'center', alignItems: 'center', gap: 24, flexDirection: 'row',
+    }));
+    // The host keeps every flex property the author set. Before the fix these were still
+    // REPORTED by getComputedStyle while doing nothing — "an unwired field is a lie with a
+    // tooltip" — so asserting they survive is the whole point.
+    expect(el.style.display).toBe('flex');
+    expect(el.style.justifyContent).toBe('center');
+    expect(el.style.alignItems).toBe('center');
+    expect(el.style.flexDirection).toBe('row');
+
+    const clamp = el.querySelector('div[style*="-webkit-box"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('-webkit-box');
+    expect(styleAttr(clamp!)).toMatch(/-webkit-line-clamp:\s*3/);
+    expect(clamp!.style.overflow).toBe('hidden');
+    expect(clamp!.style.textOverflow).toBe('ellipsis');
     // (`-webkit-box-orient: vertical` is also set but jsdom drops it on serialization.)
+  });
+
+  // #656 — `clip` is the field's DEFAULT and was unhonourable: `-webkit-line-clamp` paints its
+  // own ellipsis unconditionally and never consults `text-overflow`. demos/postfx-demo's
+  // "Caption" (maxLines: 1, textOverflow untouched) is a live instance — it renders an ellipsis
+  // nobody asked for.
+  it('multi-line clamp with the DEFAULT clip: a height cap, and NO ellipsis anywhere', () => {
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }));  // textOverflow defaults to 'clip'
+    const clamp = el.querySelector('div[style*="max-height"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.overflow).toBe('hidden');
+    // The mechanism must NOT be -webkit-box: that is what forces the ellipsis.
+    expect(clamp!.style.display).not.toBe('-webkit-box');
+    expect(styleAttr(clamp!)).not.toMatch(/-webkit-line-clamp/);
+    expect(clamp!.style.textOverflow).toBe('');
+    // No authored lineHeight -> the `lh` unit, which is the element's own line box.
+    expect(styleAttr(clamp!)).toMatch(/max-height:\s*2lh/);
+  });
+
+  it('an authored lineHeight caps in PX — same number, no dependence on `lh` support', () => {
+    // lineHeight is authored in pixels here (UINode emits it as px), so the cap is exact and
+    // does not need the `lh` unit at all — which matters because `lh` lands exactly on this
+    // repo's iOS 16.4 floor.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 3, lineHeight: 20 }));
+    const clamp = el.querySelector('div[style*="max-height"]') as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    expect(clamp!.style.maxHeight).toBe('60px');
+  });
+
+  it('no wrapper at all when maxLines is 0 — the DOM shape is unchanged for ordinary text', () => {
+    // The blast-radius guard. This change alters the DOM every game's UI text renders into, so
+    // the wrapper must exist ONLY for elements that actually clamp.
+    const el = renderNode(makeNode({ text: 'plain' }));
+    // ⚠️ Assert the text is a DIRECT text-node child, not merely that no clamp-styled div
+    // exists. The weaker version passed under mutation: making the wrapper unconditional
+    // renders `<div style={undefined}>`, which carries neither `max-height` nor `-webkit-box`,
+    // so a selector-based check sails past it while `isPaintOpaque`'s direct-child test — the
+    // thing that actually breaks — has already been defeated. This is the assertion that
+    // encodes the real invariant.
+    const directText = Array.from(el.childNodes)
+      .some((n) => n.nodeType === Node.TEXT_NODE && (n.textContent || '').trim() === 'plain');
+    expect(directText).toBe(true);
+    expect(el.querySelector('div[style*="max-height"]')).toBeNull();
+    expect(el.querySelector('div[style*="-webkit-box"]')).toBeNull();
+  });
+
+  // ⚠️ FINDINGS FROM THE CLOSE-OUT REVIEW. Each of these pins a defect the first version of the
+  // change actually had, or a wiring that no test could see.
+  // ⚠️ THIS TEST'S OLD EXPECTATION WAS THE DOCUMENTED LIMITATION (#727), not the defect itself —
+  // the `lh` cap resolves against the WRAPPER's authored font size, while `AutoFitText` writes a
+  // shrunk `font-size` onto its own inner span one level down (host 42px, span floored at 16px:
+  // `max-height: 1lh` on the wrapper = 48px against an 18px line box, i.e. 2.67 lines rendered
+  // where 1 was authored). The old fallback (`-webkit-line-clamp` on the wrapper) sidestepped
+  // that by counting line boxes instead — correct line count, but it paints an ellipsis `clip`
+  // explicitly asked not to have. The fix moves the cap to the span AutoFitText itself resizes.
+  it('autoFitText + clip (#727): the cap moves to the span AutoFitText resizes, not the wrapper', () => {
+    const el = renderNode(makeNode({ text: 'long', maxLines: 1, autoFitText: true, fontSize: 42, fontSizeMin: 16 }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp).not.toBeNull();
+    // The wrapper itself now carries no cap of its own — it can't; see the code comment on why.
+    expect(clamp!.style.display).toBe('block');
+    expect(clamp!.style.maxHeight).toBe('');
+    expect(clamp!.style.display).not.toBe('-webkit-box');
+    expect(styleAttr(clamp!)).not.toMatch(/-webkit-line-clamp/);
+
+    // The cap lands on AutoFitText's own span instead — `lh` there resolves against the size
+    // `fit()` actually wrote to THIS element, so it tracks a shrink exactly instead of over- or
+    // under-capping. No ellipsis anywhere: `clip` is finally honoured in this combination.
+    const span = clamp!.querySelector('span') as HTMLElement | null;
+    expect(span).not.toBeNull();
+    expect(span!.style.overflow).toBe('hidden');
+    expect(styleAttr(span!)).toMatch(/max-height:\s*1lh/);
+    expect(styleAttr(span!)).not.toMatch(/-webkit-line-clamp/);
+  });
+
+  it('an authored lineHeight keeps the px cap even under autoFitText', () => {
+    // A px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall
+    // whatever the font does — the cap is exact and the fallback above is not needed.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2, lineHeight: 20, autoFitText: true, fontSize: 42, fontSizeMin: 16 }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.maxHeight).toBe('40px');
+    expect(clamp!.style.display).toBe('block');
+  });
+
+  it('the clamp wrapper carries textAlign across, because it can shrink-wrap in a row host', () => {
+    // #657's bug class, one element over: the wrapper is a flex item, so in a `row` host it
+    // shrink-wraps and `text-align` has nothing left to centre. Measured pre-fix on a 400px row
+    // host: wrapper x=0 w=149 (flush left) vs x~125 when the clamp lived on the host.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2, textAlign: 'center' }));
+    const clamp = el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(clamp!.style.marginInline).toBe('auto');
+    // left must add nothing — text that was never mispositioned must not move.
+    const left = renderNode(makeNode({ text: 'long', maxLines: 2, textAlign: 'left' }));
+    const lc = left.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(lc!.style.marginInline).toBe('');
+  });
+
+  it('uiVisualsHidden mounts no clamp wrapper — an empty marked div would claim paint it lacks', () => {
+    // ⚠️ MUST drive `uiVisualsHidden`, not author `text: ''`. An earlier version of this test did
+    // the latter and was VACUOUS: with no text the `if (text)` block never runs, `clampStyle` is
+    // never built, and the assertion holds with or without the guard it claims to pin. Mutation
+    // proved it — removing `text &&` left the whole suite green. `uiVisualsHidden` is the real
+    // trigger because it blanks `text` AFTER clampStyle is built, which is the only way to reach
+    // "clamped, but nothing to show".
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }), { uiVisualsHidden: true });
+    expect(el.querySelector(`div[${UI_PAINT_ATTR}="text"]`)).toBeNull();
+    // Sanity that the fixture reaches the branch at all: the same node WITHOUT the flag has one.
+    const shown = renderNode(makeNode({ text: 'long', maxLines: 2 }));
+    expect(shown.querySelector(`div[${UI_PAINT_ATTR}="text"]`)).not.toBeNull();
+  });
+
+  it('a rainbow TextAnimation reaches the DOM shrink-wrapped AND aligned (#657 wiring)', () => {
+    // The wiring `uiTextAnimation(node.textAnim, node.textAlign)` was pinned by NOTHING: the
+    // uiTextAnimation unit test reads the returned object, so deleting the second argument in
+    // UINode failed no test, and `width: fit-content` reaching the DOM was unpinned the same way.
+    const el = renderNode(makeNode({
+      text: 'SCORE', textAlign: 'center',
+      textAnim: { effect: 'rainbow', speed: 1, amplitude: 0, frequency: 1, loop: true, fadeIn: true },
+    }));
+    const span = el.querySelector(`span[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+    expect(span).not.toBeNull();
+    expect(span!.style.width).toBe('fit-content');
+    expect(span!.style.marginInline).toBe('auto');
+  });
+
+  it('the clamp wrapper carries the paint marker, so a clamped label stays clickable', () => {
+    // `isPaintOpaque` (editor/panels/uiPreviewPick.ts) credits an entity with paint via a DIRECT
+    // text-node child. A bare string moved inside the wrapper is no longer direct, so without
+    // the marker a clamped label reads as purely decorative and a SceneView click falls through
+    // to whatever sits behind it. The marker's nearest `[data-entity-id]` ancestor is the host,
+    // which is the question that check actually asks.
+    const el = renderNode(makeNode({ text: 'long', maxLines: 2 }));
+    const marked = el.querySelector('div[data-ui-paint]') as HTMLElement | null;
+    expect(marked).not.toBeNull();
+    expect(marked!.closest('[data-entity-id]')).toBe(el);
+  });
+
+  // ── The no-wrapper path (#742) ──
+  describe('the no-wrapper path (#742): textAlign on a shrink-wrapped bare string', () => {
+    const clampDiv = (el: HTMLElement) => el.querySelector(`div[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+
+    it('mounts for center in a column host with non-stretch alignItems, carrying marginInline:auto', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('mounts for right in a column host with non-stretch alignItems, carrying marginLeft:auto', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'right', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginLeft).toBe('auto');
+    });
+
+    it('mounts for center in a ROW host even under the default alignItems:stretch — stretch never reaches the main axis', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'stretch', flexDirection: 'row',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('mounts for the DEGENERATE combination Court/Wordweave actually author: center + alignItems:center', () => {
+      // This is the zero-pixel-change case the brief cares about most: `align-items: center`
+      // already centres the shrink-wrapped box exactly where `text-align: center` would put the
+      // glyphs, so the wrapper mounts but changes no geometry. jsdom can't measure layout — the
+      // e2e spec is the guard that actually verifies "unchanged"; this only pins that the wrapper
+      // mounts (so the fix is live) and carries the expected margin.
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'center', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.style.marginInline).toBe('auto');
+    });
+
+    it('does NOT mount for the default stretch column box — text-align already works there', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'stretch', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('does NOT mount for textAlign:left, even under a shrink-wrapping alignItems — shrinkWrapAlign(left) is a no-op', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'left', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('does NOT mount when autoFitText is set — AutoFitText mounts its own span/handling', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+        autoFitText: true, fontSize: 20,
+      }));
+      expect(clampDiv(el)).toBeNull();
+      expect(el.querySelector(`span[${UI_PAINT_ATTR}="text"]`)).not.toBeNull();
+    });
+
+    it('does NOT mount when a textAnim actually resolves — AnimatedText carries shrinkWrapAlign itself', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+        textAnim: { effect: 'rainbow', speed: 1, amplitude: 0, frequency: 1, loop: true, fadeIn: true },
+      } as Partial<UINodeData>));
+      expect(clampDiv(el)).toBeNull();
+      const span = el.querySelector(`span[${UI_PAINT_ATTR}="text"]`) as HTMLElement | null;
+      expect(span).not.toBeNull();
+      expect(span!.style.marginInline).toBe('auto');
+    });
+
+    it('does NOT mount when already clamped (maxLines > 0) — the existing clamp wrapper owns the alignment there', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column', maxLines: 2,
+      }));
+      // Exactly one marked wrapper, not two competing ones.
+      expect(el.querySelectorAll(`[${UI_PAINT_ATTR}="text"]`).length).toBe(1);
+    });
+
+    it('does NOT mount for empty text', () => {
+      const el = renderNode(makeNode({
+        text: '', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      expect(clampDiv(el)).toBeNull();
+    });
+
+    it('the mounted wrapper carries the paint marker, so a shrink-wrapped label stays clickable', () => {
+      const el = renderNode(makeNode({
+        text: 'plain', textAlign: 'center', alignItems: 'flex-start', flexDirection: 'column',
+      }));
+      const clamp = clampDiv(el);
+      expect(clamp).not.toBeNull();
+      expect(clamp!.closest('[data-entity-id]')).toBe(el);
+    });
   });
 });
 
@@ -513,6 +995,93 @@ describe('UINode image path (F3)', () => {
     expect(span).not.toBeNull();
     expect(span?.textContent).toBe('Score: 12');
     expect(isPaintOpaque(el)).toBe(true);
+  });
+
+  // #337 close-out: `AutoFitText` (#614) is a FOURTH wrapper that pulls the text out of the
+  // host's direct children, same shape as the `NineSliceImage`/`AnimatedText` tests above. This
+  // is the test whose absence let the regression through — a mutation check that stripped the
+  // marker from `AutoFitText`'s span left `npm run verify` fully green.
+  it('a real UINode host with autoFitText is opaque, via the REAL AutoFitText marker', () => {
+    const el = renderNode(makeNode({ text: 'Fit Me', autoFitText: true, fontSize: 40, fontSizeMin: 10 }));
+    const span = el.querySelector(`[${UI_PAINT_ATTR}="text"]`);
+    expect(span).not.toBeNull();
+    expect(span?.textContent).toBe('Fit Me');
+    expect(isPaintOpaque(el)).toBe(true);
+  });
+});
+
+// ── AutoFitText DOM wiring (#614) ──
+// jsdom reports every rect as 0x0, so the actual SHRINK decision (`fitFontSizePx`) is unit-tested
+// pure in tests/ui/autoFitText.test.ts — what's testable here, through the REAL DOM component, is
+// the WIRING around it: whether `fit()` re-runs when it should, and the ORDER it measures in.
+describe('UINode AutoFitText DOM wiring (#614)', () => {
+  // Regression: `fit()`'s own `useCallback` deps used to be `[fontSize, fontSizeMin]` only, and
+  // the rendered TEXT was in neither that list nor anything else that calls `fit()` — so a
+  // `{storeField}` template or a localised string re-rendering with new text never re-measured,
+  // and the font size (and `nowrap`) stayed pinned to whatever the FIRST string fit. jsdom
+  // reports every rect as 0x0 (see the file header), so the shrunk SIZE isn't assertable here —
+  // but `fit()` calls `getComputedStyle` exactly twice per completed pass (once for the parent's
+  // `availablePx` via `contentWidthOf`, once for the span's own `authoredPx`), so counting those
+  // calls is an exact, DOM-observable proxy for "how many times did fit() run".
+  it('re-fits when the rendered text changes, even though fontSize/fontSizeMin do not', () => {
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    const before = spy.mock.calls.length;
+    const { rerender } = render(
+      <UINode node={makeNode({ text: 'SHORT', autoFitText: true, fontSize: 40, fontSizeMin: 10 })} storeState={{}} />,
+    );
+    const afterMount = spy.mock.calls.length - before;
+    expect(afterMount).toBeGreaterThan(0);
+    expect(afterMount % 2).toBe(0); // whole fit() passes only, never a half pass
+
+    rerender(
+      <UINode node={makeNode({ text: 'A MUCH LONGER STRING THAT WOULD OVERFLOW ITS BOX', autoFitText: true, fontSize: 40, fontSizeMin: 10 })} storeState={{}} />,
+    );
+    const afterTextChange = spy.mock.calls.length - before - afterMount;
+    // Without the fix this is 0 — `fit`'s memoized reference never changes when only `text`
+    // differs (its deps were `[fontSize, fontSizeMin]`), so the layout effect (deps: `[fit]`)
+    // never re-runs and `fit()` is never called again.
+    expect(afterTextChange).toBeGreaterThan(0);
+
+    spy.mockRestore();
+  });
+
+  // FIX 3a: `availablePx` (the parent's content width) must be read BEFORE this span ever
+  // touches its own `style` — in particular before `width: max-content` is written. `UIElement.
+  // width` defaults to 0 (auto), so a content-sized parent (the DEFAULT case) would otherwise be
+  // measured AFTER the max-content scaffold inflated it to the text's own natural width, making
+  // `naturalPx === availablePx` and the fit always conclude "it fits". Pinned by CALL ORDER
+  // (jsdom's rects are all 0x0, so the VALUES can't tell old code from new): the first `DIV` in
+  // the `getBoundingClientRect` call log is the parent (`contentWidthOf`), the first `SPAN` is
+  // the span's own natural-width read — and the parent must come first.
+  it('measures the parent (availablePx) before writing the max-content scaffold to the span', () => {
+    const calls: string[] = [];
+    const spy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      calls.push(this.tagName);
+      return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+
+    renderNode(makeNode({ text: 'Label', autoFitText: true, fontSize: 24, fontSizeMin: 8 }));
+    spy.mockRestore();
+
+    const relevant = calls.filter((tag) => tag === 'DIV' || tag === 'SPAN');
+    expect(relevant.length).toBeGreaterThanOrEqual(2);
+    expect(relevant[0]).toBe('DIV');  // the parent's availablePx — read first
+    expect(relevant[1]).toBe('SPAN'); // the span's own naturalPx — read second, after the scaffold
+  });
+
+  // FIX 3b: "auto-fit may only ever change the rendering when it is ACTIVELY SHRINKING" — every
+  // other outcome must render IDENTICALLY to `autoFitText: false`, i.e. `pre-wrap`, never
+  // `nowrap`. jsdom reports every rect as 0x0, so `fitFontSizePx` always hits its "nothing was
+  // measurable, never guess" guard: `shrunk: false, fits: true` — this is EXACTLY the branch the
+  // invariant is about (a bad/unmeasurable reading must cost at most a missed shrink, never an
+  // overflowing `nowrap` line it isn't entitled to). Pre-fix, the span was born `nowrap` and only
+  // ever flipped to `pre-wrap` on the floor path, so this always-unmeasurable-in-jsdom outcome
+  // left `nowrap` standing.
+  it('never leaves nowrap standing when nothing was actually shrunk (jsdom is always the unmeasurable case)', () => {
+    const el = renderNode(makeNode({ text: 'Whatever', autoFitText: true, fontSize: 24, fontSizeMin: 8 }));
+    const span = el.querySelector('span') as HTMLSpanElement;
+    expect(span).not.toBeNull();
+    expect(span.style.whiteSpace).toBe('pre-wrap');
   });
 });
 
@@ -701,7 +1270,9 @@ describe('UINode input branch', () => {
     expect(input.value).toBe('Ada');
 
     fireEvent.change(input, { target: { value: 'Bob' } });
-    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 'Bob' });
+    // continuous: true — a controlled text input's 'change' fires once per keystroke, so it
+    // must not take (or be blocked by) the global input lock (#466), or characters get dropped.
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 'Bob', continuous: true });
 
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'submit', expect.objectContaining({ selfGuid: 'g1' }));
@@ -734,7 +1305,9 @@ describe('UINode range branch', () => {
     expect(input.step).toBe('2');
 
     fireEvent.change(input, { target: { value: '8' } });
-    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 8 });
+    // continuous: true — a range slider's 'change' fires per pixel of drag, so it must not
+    // take (or be blocked by) the global input lock (#466). See bindings/uiInputLock.test.ts.
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 8, continuous: true });
   });
 
   it('clamps a non-finite stored value to rangeMin', () => {
@@ -843,7 +1416,7 @@ describe('UINode toggle branch', () => {
     const node = makeNode({
       guid: 'tg-drop', toggle: toggle({ value: false }),
       action: { bindings: [{ event: 'change', kind: 'set' } as never] },
-      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
       children: [makeNode({ guid: 'tg-drop-kid' })],
     });
     try {
@@ -924,7 +1497,7 @@ describe('UINode toggle branch', () => {
 // ── canvas2D branch ──
 describe('UINode canvas2D branch', () => {
   it('runtime mounts the pooled Canvas2DMount with the entityId', async () => {
-    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     // Canvas2DMount is a flag-gated lazy import (so a 3D-only build DCEs PixiJS), so it
     // mounts asynchronously via Suspense — await it rather than expecting it synchronously.
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
@@ -938,7 +1511,7 @@ describe('UINode canvas2D branch', () => {
     // the editor SceneView viewport, which sizes itself / uses device presets. The prop
     // defaults to false, so this is the call site that has to opt in — if it stops passing
     // applyWebSizeMode, `max` silently goes back to doing nothing on the 2D layer.
-    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('canvas2dmount')).getAttribute('data-web-size-mode')).toBe('true');
   });
@@ -947,7 +1520,7 @@ describe('UINode canvas2D branch', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const node = makeNode({
       entityId: 12, elementType: 'input',
-      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' },
+      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 },
     });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 12'));
@@ -971,7 +1544,7 @@ describe('UINode canvas2D branch', () => {
     // exactly Court's shape.
     const node = makeNode({
       entityId: 25, hasVideo: true,
-      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' },
+      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 },
     });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('uivideomount')).getAttribute('data-entity-id')).toBe('25');
@@ -1021,14 +1594,14 @@ describe('UINode canvas2D branch', () => {
 
   it('does NOT warn for a plain Canvas2D (elementType div)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 
   it('editor uses the injected renderCanvas2D instead of Canvas2DMount', () => {
-    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH' } });
+    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
     const renderCanvas2D = vi.fn((id: number) => <div data-testid="injected" data-id={id} />);
     const { getByTestId, queryByTestId } = render(
       <UINode node={node} storeState={{}} onSelectEntity={vi.fn()} renderCanvas2D={renderCanvas2D} />,
@@ -1072,7 +1645,7 @@ function anchor(over: Partial<NonNullable<UINodeData['anchor']>> = {}): NonNulla
   return {
     anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
     bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-    pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0, ...over,
+    pivotX: 0, pivotY: 0, safeArea: false, ...over,
   };
 }
 
@@ -1135,11 +1708,612 @@ describe('UIElement.rotation (#234)', () => {
       anchor: {
         anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
         bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-        pivotX: 0.5, pivotY: 0.5, safeArea: false, zIndex: 0,
+        pivotX: 0.5, pivotY: 0.5, safeArea: false,
       },
     });
     const el = render(<UINode node={node} storeState={{}} />).container.firstElementChild as HTMLElement;
     expect(el.style.transform).toBe('translate(-50%, -50%) rotate(-4deg)');
     expect(el.style.transformOrigin).toBe('50% 50%');
+  });
+});
+
+// ── #744: the knob used to collapse to zero when the track's height was unset (the DEFAULT
+// authoring shape) — a `min-*` floor on both the track and the knob fixes it. ──
+describe('UIToggle default-size fallback (#744)', () => {
+  it('toggleKnobFloor is pure arithmetic: DEFAULT_TOGGLE_TRACK_HEIGHT minus twice the inset, clamped at 0', () => {
+    expect(toggleKnobFloor(2)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT - 2 * 2);
+    expect(toggleKnobFloor(3)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT - 2 * 3);
+    expect(toggleKnobFloor(0)).toBe(DEFAULT_TOGGLE_TRACK_HEIGHT);
+    // An inset large enough to eat the whole track clamps at 0 rather than going negative.
+    expect(toggleKnobFloor(50)).toBe(0);
+  });
+
+  // The regression test that matters: render with the track height UNSET (width/height 0 — the
+  // DEFAULT authoring shape, since UIElement.height defaults to 0/auto). Testing against Court's
+  // authored 56×32 toggle instead would reproduce the ACCIDENT (a size that happened to be
+  // authored), not the bug (nothing sizes the track when nothing was authored).
+  it('an unsized toggle (width/height 0, the default) still gets a definite track and a non-zero knob floor', () => {
+    const node = makeNode({ guid: 'tg-744-1', width: 0, height: 0, toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.minWidth).toBe(`${DEFAULT_TOGGLE_TRACK_WIDTH}px`);
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+    const knob = track.firstElementChild as HTMLElement;
+    const floor = toggleKnobFloor(node.toggle!.knobInset);
+    expect(floor).toBeGreaterThan(0);
+    expect(knob.style.minWidth).toBe(`${floor}px`);
+    expect(knob.style.minHeight).toBe(`${floor}px`);
+  });
+
+  it('an AUTHORED size still wins: width/height size the box, and no fallback min is added', () => {
+    const node = makeNode({ guid: 'tg-744-2', width: 56, height: 32, toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.width).toBe('56px');
+    expect(track.style.height).toBe('32px');
+    // Skipped on a SIZED axis, not merely out-competed by it. A `min-*` can still RAISE a
+    // definite size smaller than itself, so leaving it on would clamp any authored toggle under
+    // 44×24 up to the fallback — the reverse of "the author's value wins".
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+  });
+
+  // ⚠️ The live case this guards: `entriesSystem` pins a pooled UIEntries row root to a definite
+  // `entryW`/`entryH` in px every tick, AND pins its min/max size fields to 0, because "a min/max
+  // constraint overrides the definite width/height from INSIDE the border box". A fallback
+  // invented in UINode is invisible to that block's `warnAuthoredOverride`, so on an entry
+  // smaller than 44×24 it would silently reintroduce exactly the desync the pin prevents.
+  it('adds no fallback min on any DEFINITE size smaller than the fallback (the pooled-row shape)', () => {
+    // ⚠️ Named for what it MEASURES. It drives the definite-size branch with an authored width
+    // and height rather than through `entriesSystem`, so it does not cross the pooled-row seam: if
+    // that system ever pinned the entry size in `%` instead of px, or stopped pinning width, the
+    // defect above reopens and this test stays green. An integration test through
+    // entriesSystem → uiTreeStore → UINode is the one that would catch that.
+    const track = renderNode(makeNode({ guid: 'tg-744-4', width: 30, height: 16, toggle: toggle() }));
+    expect(track.style.width).toBe('30px');
+    expect(track.style.height).toBe('16px');
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+    // The knob's own floor goes with it — on a 16px track a 20px floor would push the knob
+    // outside its own capsule.
+    expect((track.firstElementChild as HTMLElement).style.minHeight).toBe('');
+  });
+
+  // An anchor-stretched axis is sized by its two offsets, and `applyAnchorStyle` CLEARS the CSS
+  // size to let that happen — so the axis reads as unsized from here while being anything but.
+  // `isSizeInert` is the shared predicate (Inspector + scene validator use the same one).
+  it('adds no fallback min on an anchor-stretched axis, whose cleared CSS size is not "unsized"', () => {
+    const anchor = { anchor: 'stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false };
+    const track = renderNode(makeNode({ guid: 'tg-744-5', width: 0, height: 0, anchor, toggle: toggle() }));
+    expect(track.style.position).toBe('absolute');
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe('');
+  });
+
+  // ⚠️ A `%` size is the INDETERMINATE case, not a definite one — `height: 100%` against an
+  // indefinite containing block resolves to `auto` exactly like an unset height, so treating it as
+  // "already sized" would switch the fallback off in the one shape it exists for.
+  it('a PERCENTAGE height does not count as sized — the fallback still applies', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-7', width: 0, height: 100, heightUnit: '%', toggle: toggle() }));
+    expect(track.style.height).toBe('100%');
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  // ⚠️ CSS resolves `min-*` ABOVE `max-*`, so an unclamped floor would render a 24px track under
+  // an authored 16px cap — the fallback beating the authored surface, which is the exact failure
+  // this whole change exists to remove.
+  it('the fallback is CLAMPED to an authored px maxHeight rather than overriding it', () => {
+    const node = makeNode({ guid: 'tg-744-8', width: 0, height: 0, maxHeight: 16, maxHeightUnit: 'px', toggle: toggle() });
+    const track = renderNode(node);
+    expect(track.style.minHeight).toBe('16px');
+    // The knob's floor derives from the track's EFFECTIVE floor, so a cap shrinks both together.
+    expect((track.firstElementChild as HTMLElement).style.minHeight)
+      .toBe(`${toggleKnobFloor(node.toggle!.knobInset, 16)}px`);
+  });
+
+  // ⚠️ The knob is square with `flexShrink: 0`, so it must fit the track's content box on BOTH
+  // axes. Deriving its floor from the height alone let an authored `maxWidth` shrink the track
+  // while the knob kept an 18px floor — spilling 4px past the capsule with `justify-content`'s
+  // flip in NEGATIVE slack, so the two states became indistinguishable. Nothing covered the width
+  // axis; only maxHeight was tested.
+  it('an authored px maxWidth shrinks the KNOB too, so it still fits inside the capsule', () => {
+    const node = makeNode({ guid: 'tg-744-10', width: 0, height: 0, maxWidth: 20, maxWidthUnit: 'px', toggle: toggle() });
+    const track = renderNode(node);
+    const inset = node.toggle!.knobInset;
+    const knobFloor = parseFloat((track.firstElementChild as HTMLElement).style.minWidth);
+    expect(track.style.minWidth).toBe('20px');
+    // The floor must fit the content box the cap leaves: 20 - 2*inset.
+    expect(knobFloor).toBeLessThanOrEqual(20 - 2 * inset);
+    expect(knobFloor).toBe(toggleKnobFloor(inset, 20));
+  });
+
+  it('a NON-px cap is left alone — it cannot be compared here, and guessing beats nothing badly', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-9', width: 0, height: 0, maxHeight: 50, maxHeightUnit: '%', toggle: toggle() }));
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  it('a HALF-stretched anchor still gets the fallback on its live axis only', () => {
+    // `top-stretch` stretches X and leaves Y live (see STRETCH_X/STRETCH_Y), so width is sized by
+    // the offsets and height is not — the fallback must land on exactly one of them.
+    const anchor = { anchor: 'top-stretch' as const, top: 0, topUnit: 'px', right: 0, rightUnit: 'px', bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px', pivotX: 0, pivotY: 0, safeArea: false };
+    const track = renderNode(makeNode({ guid: 'tg-744-6', width: 0, height: 0, anchor, toggle: toggle() }));
+    expect(track.style.minWidth).toBe('');
+    expect(track.style.minHeight).toBe(`${DEFAULT_TOGGLE_TRACK_HEIGHT}px`);
+  });
+
+  // ⚠️ Pinned because a previous attempt at this fix replaced `height: 100%` with
+  // `align-self: stretch` and that was MEASURED (headless Chromium) to leave the knob 0px WIDE:
+  // a flex item's main size resolves BEFORE cross-axis stretching, so `aspect-ratio` has no
+  // definite cross size yet to derive a width from. Half-fixed and still invisible — do not
+  // re-try it.
+  it('the knob keeps height:100% + aspect-ratio:1/1 — the fix depends on both', () => {
+    const track = renderNode(makeNode({ guid: 'tg-744-3', toggle: toggle() }));
+    const knob = track.firstElementChild as HTMLElement;
+    expect(knob.style.height).toBe('100%');
+    expect(knob.style.aspectRatio).toBe('1 / 1');
+  });
+});
+
+/** A minimal `UIScrollView` trait for the DOM tests below — only the fields `useScrollView` and
+ *  `scrollViewStyle` read. Matches the shape built by `uiTreeStore.ts` (see `UITreeStore.test.ts`'s
+ *  own `SCROLL` const for the sibling of this helper that skips the `wheel` field). */
+function scrollTrait(over: Partial<NonNullable<UINodeData['scroll']>> = {}): NonNullable<UINodeData['scroll']> {
+  return {
+    axis: 'y', snap: 'none', snapStop: 'always', overscroll: 'auto', scrollbar: 'auto', wheel: 'native',
+    scrollToX: -1, scrollToY: -1, scrollToBehavior: '', scrollBehavior: 'smooth',
+    ...over,
+  };
+}
+
+// ── #743: a UIScrollView on an `overflow: 'visible'` element — the one value that establishes no
+// scroll container — now warns once per entity instead of silently doing nothing, and the
+// cross-axis pin that used to half-work it is gated off any non-scrolling box. `'hidden'` warns
+// NOT AT ALL: it is a scroll container with no scrolling UI, which scrollTo still drives. ──
+describe('UIScrollView inert-trait DEV warning (#743)', () => {
+  it('warns when overflow is visible', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-1', overflow: 'visible', scroll: scrollTrait() }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('[UIScrollView]');
+      expect(warn.mock.calls[0][0]).toContain("'visible'");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // (The `overflow: 'hidden'` case deliberately does NOT warn — it is a scroll container with no
+  //  scrolling UI, so the trait is not inert there. Covered by the pair further down.)
+
+  it('does NOT warn when overflow is scroll — the trait actually does something', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-3', overflow: 'scroll', scroll: scrollTrait() }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does NOT warn when there is no scroll trait at all', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-4', overflow: 'visible' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('dedupes per guid: rendering the same guid twice warns once', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const node = makeNode({ guid: 'sv-5', overflow: 'visible', scroll: scrollTrait() });
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // The actual #743 defect: on a non-scrolling box the cross-axis pin used to promote the
+  // author's `visible` axis to `auto` (one CSS axis set to `hidden` computes the other from
+  // `visible` to `auto`) — gone now that the pin is gated on `overflow === 'scroll'`.
+  it('the cross-axis pin is GONE from a non-scrolling box', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const el = renderNode(makeNode({ guid: 'sv-6', overflow: 'visible', scroll: scrollTrait({ axis: 'x' }) }));
+      expect(styleAttr(el)).not.toMatch(/overflow-y:\s*hidden/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // ⚠️ `overflow: 'hidden'` is NOT inert and must NOT warn — it establishes a scroll CONTAINER
+  // with no scrolling UI, so `pendingScrollTo`/`scrollTo` still drive it and snap/overscroll still
+  // apply. That is a real design (a scrollToEntry- or button-driven pager that deliberately
+  // suppresses finger-dragging), and the remedy the warning prescribes would re-enable the drag
+  // its author suppressed on purpose.
+  it('does NOT warn on overflow hidden — a scrollToEntry-driven pager is a legitimate design', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'sv-hidden-ok', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start' }) }));
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('[UIScrollView]');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a hidden box still gets the motion fields it can actually honour', () => {
+    // The corollary of the test above: these are emitted above `scrollViewStyle`'s early return
+    // and genuinely apply to a scroll container, which is why calling them inert was wrong.
+    const el = renderNode(makeNode({ guid: 'sv-hidden-2', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start', overscroll: 'contain' }) }));
+    expect(styleAttr(el)).toMatch(/scroll-snap-type:\s*x mandatory/);
+    expect(styleAttr(el)).toMatch(/overscroll-behavior:\s*contain/);
+  });
+
+  it('the cross-axis pin still fires on a box that actually scrolls', () => {
+    const el = renderNode(makeNode({ guid: 'sv-7', overflow: 'scroll', scroll: scrollTrait({ axis: 'x' }) }));
+    expect(styleAttr(el)).toMatch(/overflow-y:\s*hidden/);
+  });
+});
+
+/** All text-style fields at their default (see `makeNode`'s own defaults) — override per case. */
+function textStyleDefaults(over: Partial<Parameters<typeof droppedTextStyleFields>[0]> = {}): Parameters<typeof droppedTextStyleFields>[0] {
+  return {
+    textAlign: 'left', lineHeight: 0, letterSpacing: 0, fontStyle: 'normal', textOverflow: 'clip', maxLines: 0,
+    textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0, textStrokeWidth: 0,
+    // ⚠️ `fontSize: 16`, NOT 0. `uiTreeStore` normalises `fontSize: ui.fontSize || 16`, so 0 is a
+    // value the projection cannot hand this function — a fixture using it made an impossible
+    // input look like the default and hid a warning that fired on every slider.
+    fontFamily: '', fontSize: 16, fontWeight: 'normal', textOpacity: 1,
+    ...over,
+  };
+}
+
+// ── #745: authored `text` is dropped on four element shapes (Canvas2D, toggle, input, range)
+// with no warning before this fix — the styling still lands, so the element LOOKS like a text
+// node in devtools while painting nothing. ──
+describe('droppedTextStyleFields (#745)', () => {
+  it('all defaults → nothing reported', () => {
+    expect(droppedTextStyleFields(textStyleDefaults(), 'input')).toEqual([]);
+  });
+
+  it('reports each field individually once the author moves it off default', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textAlign: 'center' }), 'input')).toContain('textAlign');
+    expect(droppedTextStyleFields(textStyleDefaults({ maxLines: 2 }), 'input')).toContain('maxLines');
+    expect(droppedTextStyleFields(textStyleDefaults({ fontStyle: 'italic' }), 'input')).toContain('fontStyle');
+    expect(droppedTextStyleFields(textStyleDefaults({ lineHeight: 20 }), 'input')).toContain('lineHeight');
+    expect(droppedTextStyleFields(textStyleDefaults({ letterSpacing: 2 }), 'input')).toContain('letterSpacing');
+    expect(droppedTextStyleFields(textStyleDefaults({ textOverflow: 'ellipsis' }), 'input')).toContain('textOverflow');
+  });
+
+  it('the two gated groups report by their GATE, one entry each — not field-by-field', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowOffsetX: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowOffsetY: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textShadowBlur: 3 }), 'input')).toEqual(['textShadow*']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textStrokeWidth: 3 }), 'input')).toEqual(['textStroke*']);
+  });
+
+  // ⚠️ The two control branches do NOT drop the same set, and assuming they did made this warning
+  // lie: the `input` branch re-emits fontFamily/fontSize/fontWeight/color, the `range` branch
+  // re-emits NONE of them (its only style write is `accentColor` from `textColor`). An author who
+  // set a font size on a slider, saw nothing, and read a warning calling fontSize honoured would
+  // have been sent away from the actual cause.
+  it('a RANGE additionally drops the font fields an input re-emits — but NOT fontFamily', () => {
+    const authored = textStyleDefaults({ fontFamily: 'Varela Round', fontSize: 40, fontWeight: '700' });
+    expect(droppedTextStyleFields(authored, 'input')).toEqual([]);
+    // `fontFamily` is emitted near the top of UINode, above the branch split, so it reaches a
+    // range like every other node — reporting it would be the same false claim in the other
+    // direction. See the render test below, which is what actually pins this.
+    expect(droppedTextStyleFields(authored, 'range')).toEqual(['fontSize', 'fontWeight']);
+  });
+
+  // ⚠️ The regression that matters most: `uiTreeStore` normalises `fontSize: ui.fontSize || 16`,
+  // so `UINodeData.fontSize` is NEVER falsy in production. A truthiness test therefore fired on
+  // EVERY slider in every project and named a field its author never touched — the exact "sent
+  // away from the cause" failure these warnings exist to prevent. `textStyleDefaults` used to set
+  // `fontSize: 0`, a value the projection cannot produce, which is why nothing caught it.
+  it('a default RANGE reports NOTHING — fontSize 16 is the default, not an authored value', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ fontSize: 16 }), 'range')).toEqual([]);
+    expect(droppedTextStyleFields(textStyleDefaults({ fontSize: 40 }), 'range')).toEqual(['fontSize']);
+  });
+
+  it('a RANGE drops textOpacity but NOT textColor — the colour survives as accentColor, its alpha does not', () => {
+    expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 0.5 }), 'range')).toEqual(['textOpacity']);
+    expect(droppedTextStyleFields(textStyleDefaults({ textOpacity: 1 }), 'range')).toEqual([]);
+  });
+});
+
+// ⚠️ **RENDER tests, not pure-helper ones — this is the guard that was missing.** The pure tests
+// above assert the author's MODEL of the range branch; two false claims shipped because nothing
+// compared that model to what the branch actually emits. These render a real `<input type=range>`
+// and check the DOM against the reported list, so a change to either side breaks them.
+describe('the range branch\'s real emissions vs what the warning reports (#745)', () => {
+  const renderRange = (over: Partial<UINodeData> = {}) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const el = renderNode(makeNode({ elementType: 'range', ...over } as Partial<UINodeData>));
+      const warned = warn.mock.calls.flat().join(' ');
+      // ⚠️ Only the REPORTED list, not the whole message. The message's "what is honoured" clause
+      // names `accentColor (from textColor)`, so a substring check over the full string reads
+      // `textColor` as reported when it says the opposite — asserting on the prose, not the finding.
+      const reported = /authors ([^,]+(?:, [^,]+)*), which an elementType/.exec(warned)?.[1] ?? '';
+      return { el, warned, reported };
+    } finally { warn.mockRestore(); }
+  };
+
+  it('a DEFAULT range warns nothing at all', () => {
+    // Pre-fix this emitted "authors fontSize" on every slider in every scene, once per entity per
+    // world load, naming a field nobody touched.
+    const { warned } = renderRange({ guid: 'rng-1' });
+    expect(warned).not.toContain('[UINode]');
+  });
+
+  it('fontFamily REACHES the range, so it is not reported as dropped', () => {
+    const { el, reported } = renderRange({ guid: 'rng-2', fontFamily: 'Varela Round' });
+    expect(styleAttr(el)).toContain('Varela Round');   // the DOM half
+    expect(reported).not.toContain('fontFamily');      // the report half — the two must agree
+  });
+
+  it('fontSize does NOT reach the range, and IS reported', () => {
+    const { el, reported } = renderRange({ guid: 'rng-3', fontSize: 40 });
+    expect(styleAttr(el)).not.toMatch(/font-size:\s*40px/);
+    expect(reported).toContain('fontSize');
+  });
+
+  it('textColor reaches it as accentColor — so the colour is honoured and only its alpha is reported', () => {
+    const { el, reported } = renderRange({ guid: 'rng-4', textColor: 0xff0000, textOpacity: 0.5 });
+    expect(styleAttr(el)).toMatch(/accent-color/);
+    expect(reported).toBe('textOpacity');
+  });
+});
+
+describe('dropped-text DEV warnings (#745)', () => {
+  it('text on an <input> warns, naming inputBinding as where its value actually comes from', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-1', elementType: 'input', text: 'hi' }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('[UINode]');
+      expect(msgs).toContain('inputBinding');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a toggle warns, naming the track and knob it draws instead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-2', text: 'hi', toggle: toggle() }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('track');
+      expect(msgs).toContain('knob');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a canvas2D node warns, naming the canvas it draws instead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({
+        guid: 'dt-3', text: 'hi',
+        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
+      }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('canvas');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('text on a plain div does NOT warn — the normal case stays silent', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-4', text: 'hi', elementType: 'div' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an <input> with a dropped text-STYLE field (no text) warns and names the field', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-5', elementType: 'input', text: '', textAlign: 'center' }));
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('textAlign');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an <input> with every text-style field at its default does NOT warn', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderNode(makeNode({ guid: 'dt-6', elementType: 'input', text: '' }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('the guid path still de-duplicates: same guid warns once for a dropped text-style field', () => {
+    // The corollary of the #759 fix below — qualifying the guid-LESS fallback with generation
+    // must not accidentally make the (far more common) guid-bearing path re-warn every frame.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const node = makeNode({ guid: 'dts-dedupe', elementType: 'input', text: '', textAlign: 'center' });
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+      renderNode(node);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// ── #759: the entityId fallback key must survive koota's id recycling ──
+//
+// All four warn-once Sets above key their guid-less fallback on `node.guid || String(node.entityId)`
+// pre-fix. koota recycles entity ids (LIFO free list), so a guid-less (runtime-spawned) UI entity
+// that despawns and a NEW, unrelated one that respawns within the SAME world can inherit the dead
+// entity's id — and an id-only warn-once silently suppressed the newcomer's genuine warning
+// forever. The fix qualifies the fallback with `node.generation` (`uiTreeStore.ts`'s buildTree
+// reads `entity.generation()`), exactly as #738 did for `lengthUnitWarningKey`.
+//
+// These use a REAL koota world (not `makeNode`'s hand-picked ids) so `entity.id()`,
+// `entity.generation()` and `entity.valueOf()` are the genuine koota mechanics — a recycling test
+// built on hand-picked ids would only prove the fix READS a generation field, not that a real
+// recycled id is actually disambiguated by it.
+describe('warn-once fallback key survives entity id recycling (#759)', () => {
+  it('sanity: DEV is genuinely truthy here, else every test below would pass vacuously', () => {
+    expect(import.meta.env?.DEV).toBeTruthy();
+  });
+
+  const _worlds: ReturnType<typeof createWorld>[] = [];
+  function newWorld() {
+    const w = createWorld();
+    _worlds.push(w);
+    return w;
+  }
+  afterEach(() => {
+    for (const w of _worlds.splice(0)) w.destroy();
+  });
+
+  /** Build a guid-less UINodeData carrying a REAL koota entity's id+generation, with `shape`
+   *  merged in last so it can complete whatever this warning needs. */
+  function nodeForEntity(entity: { id(): number; generation(): number }, shape: Partial<UINodeData>): UINodeData {
+    return makeNode({ guid: '', entityId: entity.id(), generation: entity.generation(), ...shape });
+  }
+
+  it('warnInertScrollView re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { overflow: 'visible', scroll: scrollTrait() }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      // Precondition: the id really was reused, but the packed entity differs — fail loudly
+      // rather than pass vacuously if koota's free list stops being LIFO.
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { overflow: 'visible', scroll: scrollTrait() }));
+      // B's OWN genuine warning must fire — an id-only warn-once would suppress it.
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDroppedText re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { elementType: 'input', text: 'hi' }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { elementType: 'input', text: 'hi' }));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDroppedTextStyle re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { elementType: 'input', text: '', textAlign: 'center' }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { elementType: 'input', text: '', textAlign: 'center' }));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warnDeadToggle re-fires for a NEW entity that inherits a recycled id', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const world = newWorld();
+      const a = world.spawn();
+      renderNode(nodeForEntity(a, { toggle: toggle({ value: false }) }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+
+      renderNode(nodeForEntity(b, { toggle: toggle({ value: false }) }));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// #838: this file never mocks `core/ecs/world` (the koota worlds above are real, tracked and
+// destroyed), so a REAL `setCurrentWorld` swap reaches the four `onWorldSwap(...)` registrations
+// at the top of UINode.tsx directly — no capture needed. The #759 suite just above proves each
+// warn-once Set's WITHIN-world recycling key; this proves the ACROSS-world clear those comments
+// say the recycling key does not subsume.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap clears all four warn-once caches, so each warning can fire again', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const deadToggle = makeNode({ guid: 'w838-toggle', toggle: toggle({ value: false }) });
+      const inertScroll = makeNode({ guid: 'w838-scroll', overflow: 'visible', scroll: scrollTrait() });
+      const droppedText = makeNode({ guid: 'w838-text', elementType: 'input', text: 'hi' });
+      const droppedTextStyleNode = makeNode({ guid: 'w838-style', elementType: 'input', text: '', textAlign: 'center' });
+
+      const renderAll = () => {
+        renderNode(deadToggle); cleanup();
+        renderNode(inertScroll); cleanup();
+        renderNode(droppedText); cleanup();
+        renderNode(droppedTextStyleNode); cleanup();
+      };
+
+      renderAll();
+      expect(warn).toHaveBeenCalledTimes(4);
+
+      // Precondition: without a swap, warn-once dedups every one of the four on a re-render.
+      renderAll();
+      expect(warn, 'precondition: warn-once dedups without a swap').toHaveBeenCalledTimes(4);
+
+      setCurrentWorld(createWorld()); // the REAL swap path — must fire all four production listeners
+
+      renderAll();
+      expect(warn, 'each warn-once cache was cleared by the swap, so the SAME guid warns again')
+        .toHaveBeenCalledTimes(8);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

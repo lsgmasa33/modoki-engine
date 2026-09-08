@@ -1,6 +1,6 @@
 /** Audio playback backend — a thin layer over the Web Audio API.
  *
- *  Graph:  source → sourceGain(volume) → [panner if spatial] → busGain → masterGain → destination
+ *  Graph:  source → sourceGain(volume) → [panner if spatial] → busGain → masterGain → mute → destination
  *  Buses:  master · music · sfx · ui   (music/sfx/ui feed master; 'master' IS masterGain)
  *
  *  Two source kinds, chosen per-clip by the asset's `loadType`:

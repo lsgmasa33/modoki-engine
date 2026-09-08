@@ -31,18 +31,26 @@ const L1_FOLDERS = ['traits'];
 /** L2 subsystems. `physics` + `zones` are new — P6 dissolved the transitional `systems/`
  *  bucket into these (and the other feature folders below); `systems/` no longer exists. */
 const L2_FOLDERS = [
-  'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
-  'skinning', 'storage', 'timeline', 'ui', 'zones',
+  'account', 'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
+  'skinning', 'storage', 'sync', 'timeline', 'ui', 'zones',
 ];
 const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];
 
-/** D4 (docs/architecture-layers.md "## Settled decisions"): these three files
- *  physically sit in `rendering/` (L2) but are reclassified L3 by the owner — they compose scene
- *  data + loaders + subsystems into a rendered frame, not a reusable L2 subsystem. Reclassified
- *  in place (NOT moved) to keep `engine/app/App.tsx`'s deep import of `rendering/Scene3D`
- *  untouched; verified nothing in any OTHER runtime L2 folder imports these three, so this
- *  creates zero new violations elsewhere. */
-const L3_RECLASSIFIED_FILES = ['rendering/Scene2D.tsx', 'rendering/Scene3D.tsx', 'rendering/scene3DSync.ts'];
+/** D4 (docs/architecture-layers.md "## Settled decisions"): these files physically sit in
+ *  `rendering/` (L2) but are reclassified L3 by the owner — they compose scene data + loaders +
+ *  subsystems into a rendered frame, not a reusable L2 subsystem. Reclassified in place (NOT
+ *  moved) to keep `engine/app/App.tsx`'s deep import of `rendering/Scene3D` untouched; verified
+ *  nothing in any OTHER runtime L2 folder imports these, so this creates zero new violations
+ *  elsewhere.
+ *
+ *  `rendering/envPmrem.ts` (#739) joined the set for the same reason: it registers itself with
+ *  `loaders/meshTemplateCache.ts`'s (L3) env-dispose hook registry at module scope
+ *  (`registerEnvDisposeHook('envPmrem', disposeEnvDerivedFor)`) so a 2D-only build — which never imports this
+ *  file — never pulls in `three/webgpu`. That registration is an L3 edge on a file that otherwise
+ *  reads like ordinary L2 rendering code. */
+const L3_RECLASSIFIED_FILES = [
+  'rendering/Scene2D.tsx', 'rendering/Scene3D.tsx', 'rendering/scene3DSync.ts', 'rendering/envPmrem.ts',
+];
 
 /** Declared, one-directional L2→L2 exceptions (rationale in docs/architecture-layers.md).
  *  Within L2 there is an implicit tier order — producers (animation/skinning/particles/audio/…)
@@ -190,6 +198,14 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      // Sub-game bundle output (games/<id>/subgame-dist/, `engine/scripts/build-subgame.mjs`).
+      // Gitignored, but `**/dist/**` does not match it — so running the DOCUMENTED sub-game
+      // build (docs/ota-subgame-modules.md § 2) left 1657 lint errors in the tree, almost all
+      // of them from vendored basis/ktx transcoder blobs, and took `npm run verify` red for
+      // anyone who had ever built one. Exactly the failure the `ads/` entry below already warns
+      // about: this list has to agree with .gitignore or the gate breaks for a reason nobody
+      // wrote down. Found during #553's close-out, by building a sub-game for a device test.
+      '**/subgame-dist/**',
       '**/node_modules/**',
       // Project scaffold template — copied to new projects with placeholder tokens
       // substituted; not part of the engine build graph (also out of tsconfig).
@@ -232,6 +248,30 @@ export default tseslint.config(
       // red with 36 errors in code nobody on this branch had touched, and since lint is a
       // `verify` leg that is the whole local gate going red for a directory that is not source.
       '**/.claude/**',
+      // Transient CJS Vite configs that land in `engine/` — the ONLY two things that ever write a
+      // linted extension into a linted directory here, and both are gitignored siblings of this
+      // entry. `.cjs` is a linted extension (see the `files` glob below), so without this ESLint
+      // both LINTS a stranded one and, worse, dies on one that is mid-flight.
+      //
+      //   - `engine/vite.config.cjs` — `stage-vite-config.cjs` emits it at beforePack and
+      //     `clean-vite-config.cjs` removes it at afterPack; a pack that FAILS or is interrupted
+      //     in between strands the whole esbuild-bundled plugin graph in the source tree, and
+      //     `npm run lint` is then red in that clone until somebody deletes it by hand. The same
+      //     shape as the `**/ads/**` and `**/subgame-dist/**` entries above.
+      //   - `engine/vite.config.__packagedtest-<pid>.cjs` — `packagedViteConfig.test.ts` writes
+      //     the same bundle here (it must load from inside `engine/`: the collapsed graph locates
+      //     its modules via `__dirname`) and removes it in a `finally`. That test runs in the APP
+      //     lane while `verify`'s OTHER lane is running lint over one shared working tree, so
+      //     ESLint stats the probe and then reads it after the `finally` has gone:
+      //     `ENOENT … readAndVerifyFile`, which ESLint treats as fatal, not skippable. The gate
+      //     goes red reporting zero test failures (#879).
+      //
+      // Both names, one glob — because this list has to agree with .gitignore (the lesson two
+      // entries up), and they disagreeing about WHICH of the two is transient is the actual bug.
+      // Deliberately narrow: `engine/vite.config.ts`, the real config, must stay linted, and
+      // `engine/tests/architecture/ignoreListsAgree.test.ts` pins that it does — and pins this
+      // whole list against .gitignore, which is the drift that keeps costing red gates (#885).
+      'engine/vite.config*.cjs',
     ],
   },
   // Base JS + TS recommended for every source file.

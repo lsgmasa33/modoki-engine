@@ -17,6 +17,11 @@ import { PrefabInstance } from '../../src/runtime/traits/PrefabInstance';
 
 let testWorld: ReturnType<typeof createWorld>;
 const idIndex = new Map<number, any>();
+// Captured `onWorldSwap` registrations, rather than dropped with a bare no-op, so a test can
+// invoke the REAL production listener(s) and prove they are actually wired (#838). Every listener
+// registered at module load by anything this file imports lands here — entriesSystem.ts's own
+// viewStates-clearing callback among them.
+const worldSwapListeners: Array<() => void> = [];
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
@@ -25,7 +30,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   // Mirrors the real one: destroys exactly ONE entity and does NOT cascade — which is precisely
   // what `releaseViewPool` has to compensate for by walking the subtree itself.
   destroyEntity: (e: any) => { idIndex.delete(e.id()); e.destroy(); },
-  onWorldSwap: () => {},
+  onWorldSwap: (fn: () => void) => { worldSwapListeners.push(fn); return () => {}; },
   findEntityById: (id: number) => idIndex.get(id),
   findEntityByGuid: (guid: string) => {
     let found: any;
@@ -62,15 +67,17 @@ const ENTRY_H = 120;
 const VIEWPORT = 600;
 const PREFAB = 'prefab-guid-1';
 
-/** A fake entry prefab: a root UIElement plus one named child, spawned directly. */
-function makeProvider() {
+/** A fake entry prefab: a root UIElement plus one named child, spawned directly.
+ *  `rootOverrides` lets a test author extra UIElement fields on the root — e.g. a margin, to
+ *  check the system zeroes it (#651). */
+function makeProvider(rootOverrides: Record<string, unknown> = {}) {
   const spawned: number[] = [];
   return {
     spawned,
     isCached: () => true,
-    rootSize: () => ({ width: 0, height: ENTRY_H }),
+    rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: ENTRY_H, heightUnit: 'px' as const }),
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
-      const root = world.spawn(UIElement({ height: ENTRY_H }), RenderableUI(),
+      const root = world.spawn(UIElement({ height: ENTRY_H, ...rootOverrides }), RenderableUI(),
         PrefabInstance({ source: PREFAB, localId: 1 }),
         EntityAttributes({ name: 'Entry', parentId: opts.parentId, guid: opts.guidSeed }));
       idIndex.set(root.id(), root);
@@ -84,12 +91,12 @@ function makeProvider() {
   };
 }
 
-async function setup(entries: Partial<Record<string, unknown>> = {}, scroll = 0) {
+async function setup(entries: Partial<Record<string, unknown>> = {}, scroll = 0, rootOverrides: Record<string, unknown> = {}) {
   const sys = await import('../../src/runtime/ui/entriesSystem');
   const src = await import('../../src/runtime/ui/entrySource');
   sys.resetEntriesSystem();
   src.clearEntrySources();
-  const provider = makeProvider();
+  const provider = makeProvider(rootOverrides);
   sys.setEntryPrefabProvider(provider);
 
   const view = testWorld.spawn(
@@ -140,6 +147,203 @@ describe('entriesSystem', () => {
     expect(content.paddingBottomUnit).toBe('px');
     expect(content.paddingTop % ENTRY_H).toBe(0);
     expect(content.paddingTop).toBeGreaterThan(0);
+  });
+
+  // #651 — computeAxisWindow solves the whole scroll geometry from `stride = entrySize + gap`
+  // alone. A margin authored on the entry prefab's root sits OUTSIDE that box, so the real
+  // on-screen stride would silently gain a term the model never carries. The system must
+  // zero the root's margin the same way it already pins width/height/flexShrink.
+  it('zeroes a margin authored on the entry prefab root, so it cannot desync the stride model', async () => {
+    const { sys } = await setup({}, 0, { marginTop: 4, marginRight: 8, marginBottom: 4, marginLeft: 8 });
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    expect(entryRoot.marginTop).toBe(0);
+    expect(entryRoot.marginRight).toBe(0);
+    expect(entryRoot.marginBottom).toBe(0);
+    expect(entryRoot.marginLeft).toBe(0);
+  });
+
+  // #651 B1 sibling: minWidth/maxWidth/minHeight/maxHeight override the pinned px width/height
+  // from INSIDE the border box, the same desync as an authored margin from outside it — and
+  // were missed the first time round.
+  it('zeroes a maxWidth authored on the entry prefab root, so it cannot desync the stride model', async () => {
+    const { sys } = await setup({}, 0, { maxWidth: 60 });
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    expect(entryRoot.maxWidth).toBe(0);
+  });
+
+  it('warns ONCE per entity+field when an authored min/max override is discarded, not every tick', async () => {
+    // The fixture pools several entries (see the first test's 8), and EVERY one of them carries
+    // the same authored override — so "once" here means once PER ENTITY, not one line total.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src, provider } = await setup({}, 0, { maxWidth: 60 });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = () => warn.mock.calls.filter(c => String(c[0]).includes('maxWidth'));
+    const afterFirstTick = named().length;
+    expect(afterFirstTick).toBe(provider.spawned.length);   // one line per pooled entity, not per tick
+    expect(String(named()[0][0])).toContain('Entry');        // names the offending entity
+
+    // The pin already self-corrects the value every tick, so running MORE ticks with nothing
+    // re-authored proves nothing about the guard by itself — the real test is to put the override
+    // BACK on every pooled root, exactly what a live Inspector edit while playing would do, and
+    // confirm the GUARD (not the self-correction) is what keeps the count from climbing again.
+    sys.entriesSystem(testWorld);
+    expect(named().length, 'no growth from an idle tick').toBe(afterFirstTick);
+
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a]: any[], e: any) => {
+      if (a.name === 'Entry') e.set(UIElement, { ...(e.get(UIElement) as any), maxWidth: 60 });
+    });
+    sys.entriesSystem(testWorld);
+    expect(named().length, 're-authoring the SAME override must not re-warn').toBe(afterFirstTick);
+  });
+
+  // #761 — the six fields pinned in TOTAL SILENCE before this: width/widthUnit/height/heightUnit
+  // (pinned to the scroll view's resolved box, not a constant), flexShrink (pinned to 0, but its
+  // trait default is 1) and isVisible (pinned to the slot's live state, not a constant).
+  it('pins width/height and their units to the resolved size, in px', async () => {
+    const { sys } = await setup();
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    // entryWidth: 100% of the 360px viewport; entryHeight: 0 (authored 0 => read from the
+    // prefab root, ENTRY_H).
+    expect(entryRoot.width).toBe(360);
+    expect(entryRoot.widthUnit).toBe('px');
+    expect(entryRoot.height).toBe(ENTRY_H);
+    expect(entryRoot.heightUnit).toBe('px');
+  });
+
+  it('pins flexShrink to 0 even though UIElement.flexShrink defaults to 1', async () => {
+    const { sys } = await setup();
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    expect(entryRoot.flexShrink).toBe(0);
+  });
+
+  it('pins isVisible to the slot\'s live state, not a constant', async () => {
+    // The pool never shrinks (#651): spawn it full-size against 1000 rows, then shrink the DATA
+    // under it. The slots the smaller plan no longer covers must PARK (isVisible -> false) while
+    // the rest stay live (isVisible -> true) — both values in the same tick, from one pin.
+    const { sys, src, view } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 3, epoch: 1 });
+    sys.entriesSystem(testWorld);
+    const seen: { live: boolean; visible: boolean }[] = [];
+    testWorld.query(UIEntry, UIElement).updateEach(([e, ui]: any[]) => seen.push({ live: e.live, visible: ui.isVisible }));
+    expect(seen.some(s => s.live)).toBe(true);
+    expect(seen.some(s => !s.live)).toBe(true);
+    for (const s of seen) expect(s.visible).toBe(s.live);
+  });
+
+  it('warns once when an authored PX width differs from BOTH the resolved pin and the trait default', async () => {
+    // ⚠️ Only a `px`-unit authored value is a real trap here (#762-review) — a `%` (or
+    // `vw`/`vh`/`vmin`/`vmax`) value is the documented contract the scroll view resolves, and
+    // must NOT warn (see the neutral-percent test below, which pins that down). This test
+    // therefore authors `widthUnit: 'px'` explicitly rather than leaving it at the trait default
+    // ('%'), which is what an earlier version of this test did — encoding the exact false
+    // positive the review found (5 of 6 committed entry-prefab roots tripping the warning purely
+    // for authoring the documented `%` shape).
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src, provider } = await setup({}, 0, { width: 200, widthUnit: 'px' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = () => warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+    expect(named().length).toBe(provider.spawned.length);
+    // width/widthUnit fold into ONE line per axis, naming the authored unit too.
+    expect(String(named()[0][0])).toContain('UIElement.width=200px');
+    expect(String(named()[0][0])).toContain('pins width to 360px');
+  });
+
+  it('stays SILENT for an authored PERCENT width, even though the raw number differs from the resolved pin', async () => {
+    // The canonical pager shape (#762-review): `width: 100, widthUnit: '%'` on the entry prefab
+    // root, matching `entryWidth: 100%` on the view. The raw numbers (100 vs. the resolved 360px)
+    // will always differ — that comparison is meaningless across units, and warning on it fired
+    // on 5 of the 6 committed entry-prefab roots in the repo.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup({}, 0, { width: 100, widthUnit: '%' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+    expect(named).toHaveLength(0);
+  });
+
+  it('warns once when an authored isVisible=false differs from a LIVE slot\'s pin', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // scroll 0 with 1000 rows: every pooled slot in the fixture's window is live, so every one
+    // of them carries the authored override and every one should warn.
+    const { sys, src, provider } = await setup({}, 0, { isVisible: false });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = () => warn.mock.calls.filter(c => String(c[0]).includes('UIElement.isVisible='));
+    expect(named().length).toBe(provider.spawned.length);
+    expect(String(named()[0][0])).toContain('UIElement.isVisible=false');
+  });
+
+  it('warns once when an authored flexShrink differs from both the 0 pin and the 1 default', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src, provider } = await setup({}, 0, { flexShrink: 3 });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = () => warn.mock.calls.filter(c => String(c[0]).includes('UIElement.flexShrink='));
+    expect(named().length).toBe(provider.spawned.length);
+  });
+
+  it('stays SILENT for a row left at its trait defaults — no false positives on the untouched case', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup(); // no rootOverrides — every field is at its UIElement default
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const pooledWarnings = warn.mock.calls.filter(c => String(c[0]).includes('pooled UIEntries root'));
+    expect(pooledWarnings).toHaveLength(0);
+  });
+
+  it('stays SILENT for a slot PARKED while its isVisible still reads the true default', async () => {
+    // The trap the naive `cur !== pinned` rule falls into: a parked slot's pin is `false`, but a
+    // slot the author never touched still reads `true` (the trait default) — that must not read
+    // as an authored override just because it happens on the tick the slot parks.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src, view } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    warn.mockClear();
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 3, epoch: 1 });
+    sys.entriesSystem(testWorld);
+    const isVisibleWarnings = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.isVisible='));
+    expect(isVisibleWarnings).toHaveLength(0);
+  });
+
+  it('pins exactly the field set uiAuthoring.POOLED_ROW_PINNED_FIELDS names — the #761 drift guard', async () => {
+    const { POOLED_ROW_PINNED_FIELDS } = await import('../../src/runtime/ui/uiAuthoring');
+    const overrides: Record<string, unknown> = {};
+    for (const f of POOLED_ROW_PINNED_FIELDS) {
+      overrides[f] = f === 'isVisible' ? false : f.endsWith('Unit') ? '%' : 999;
+    }
+    const { sys, src } = await setup({}, 0, overrides);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    // If entriesSystem's own pin ever drops a field this constant still names (or the constant
+    // grows one the pin does not write), the corresponding override survives untouched here.
+    for (const f of POOLED_ROW_PINNED_FIELDS) {
+      expect(entryRoot[f], `'${f}' was not corrected — pin and POOLED_ROW_PINNED_FIELDS have drifted`).not.toBe(overrides[f]);
+    }
   });
 
   it('asks the resolver for the DATA coordinate and writes what it answers', async () => {
@@ -607,7 +811,7 @@ describe('entriesSystem', () => {
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');
     src.registerEntrySource('test.rows', () => ({ members: {} }));
-    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, height: 0 }), spawnInstance: () => 0 });
+    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), spawnInstance: () => 0 });
 
     api.scrollToEntry('view-guid', { y: 42 });
     sys.entriesSystem(testWorld);
@@ -649,12 +853,16 @@ describe('entriesSystem', () => {
   // every one of them reads the prefab FILE, and the file was well-formed. The console was empty.
 
   /** A provider that is cached only once `cached.value` flips — the transient/permanent seam. */
-  function stubProvider(cached: { value: boolean }, size = { width: 0, height: ENTRY_H }) {
+  function stubProvider(
+    cached: { value: boolean },
+    size: { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } =
+      { width: 0, widthUnit: 'px', height: ENTRY_H, heightUnit: 'px' },
+  ) {
     const spawns: string[] = [];
     return {
       spawns,
       isCached: () => cached.value,
-      rootSize: () => (cached.value ? size : { width: 0, height: 0 }),
+      rootSize: () => (cached.value ? size : { width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       spawnInstance: (_w: any, guid: string) => { spawns.push(guid); return 0; },
     };
   }
@@ -922,5 +1130,37 @@ describe('entriesSystem — focus on recycle', () => {
     sys.entriesSystem(testWorld);
 
     expect(focus.focusedGuid()).toBe('');
+  });
+});
+
+// #838: this suite mocks `core/ecs/world` wholesale — `onWorldSwap` is only a re-export of
+// `worldRegistry`'s, so the mock severs the real listener Set and a `setCurrentWorld` here would
+// fire nothing. CAPTURE-AND-INVOKE instead: the mock above hands back whatever the module
+// (entriesSystem.ts, imported via `setup()`) registers at module load.
+describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset hook', () => {
+  it('a real world swap resets the per-view uncached-tick counter (viewStates)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // entryHeight: 0 -> the ZERO-PLAN entrance (see the #363 tests above): tickUncachedPrefab
+    // still runs every tick even though the plan is empty, so no pooled entities are needed here.
+    const { sys, src } = await setup({ entryHeight: 0, entryHeightUnit: 'px' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider({
+      isCached: () => false,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      spawnInstance: () => 0,
+    });
+
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);   // under the 120-tick warn threshold
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+
+    expect(worldSwapListeners.length, 'onWorldSwap must have been called at module load').toBeGreaterThan(0);
+    for (const l of worldSwapListeners) l();   // the REAL world-swap path — must reset viewStates
+
+    // If the counter were NOT reset, these 100 more ticks would total 200 and cross the 120-tick
+    // threshold partway through — warning falsely about a prefab that has only been uncached for
+    // 100 ticks since the swap.
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+    warn.mockRestore();
   });
 });

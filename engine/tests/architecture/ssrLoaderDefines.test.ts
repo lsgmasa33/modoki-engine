@@ -24,9 +24,9 @@
  *  assertions on purpose: importing either module would stand up a Vite server. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -34,7 +34,7 @@ const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
  *  cover all of them — derived from the config rather than hardcoded, so a NEW module flag
  *  is caught here the day it is added instead of the next time someone re-imports a model. */
 function flagsFromViteConfig(): string[] {
-  const src = fs.readFileSync(path.join(ENGINE_ROOT, 'vite.config.ts'), 'utf8');
+  const src = readScannedSource(path.join(ENGINE_ROOT, 'vite.config.ts')).code;
   const found = [...src.matchAll(/__MODOKI_MODULE_[A-Z0-9]+__/g)].map((m) => m[0]);
   return [...new Set(found)];
 }
@@ -54,7 +54,7 @@ describe('Stage-A SSR loaders define the module flags', () => {
 
   for (const { label, file } of LOADERS) {
     it(`${label} defines every __MODOKI_MODULE_*__ flag`, () => {
-      const src = fs.readFileSync(path.join(ENGINE_ROOT, file), 'utf8');
+      const src = readScannedSource(path.join(ENGINE_ROOT, file)).code;
       const missing = flags.filter((f) => !src.includes(f));
       expect(missing, `${file} is missing ${missing.join(', ')} — a postprocessor loaded through `
         + 'it will throw ReferenceError and Stage A will silently bake a PASSTHROUGH '
@@ -67,7 +67,7 @@ describe('Stage-A SSR loaders define the module flags', () => {
     // this guard's premise changes — fail loudly so the reasoning gets re-read, not silently
     // keep asserting a requirement that no longer applies.
     for (const { file } of LOADERS) {
-      const src = fs.readFileSync(path.join(ENGINE_ROOT, file), 'utf8');
+      const src = readScannedSource(path.join(ENGINE_ROOT, file)).code;
       expect(src, `${file}`).toMatch(/configFile:\s*false/);
     }
   });

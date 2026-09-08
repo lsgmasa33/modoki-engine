@@ -10,9 +10,10 @@ import { registerCreatableAsset } from './creatableAssets';
 import { defaultAnimationClip } from '../../runtime/animation/types';
 import { defaultParticleEffect } from '../../runtime/particles/types';
 import { defaultAssetData } from '../../runtime/assets/assetSchemas';
+import { defaultAtlasSource } from '../../runtime/loaders/spriteAtlas';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { newScene, saveScene, setCurrentScenePath } from '../scene/serialize';
+import { newScene, saveScene, NewSceneRefusedError } from '../scene/serialize';
 import { useEditorStore } from '../store/editorStore';
 
 export function registerBuiltinCreatableAssets(): void {
@@ -29,9 +30,20 @@ export function registerBuiltinCreatableAssets(): void {
     // newScene(), persisted via saveScene() — this replaces the old File → New Scene
     // flow. Dialog first so a cancel leaves the current world untouched.
     create: async (path) => {
-      newScene();
+      // `newScene(path)` sets the editor path itself, BEFORE the world swap it now performs
+      // (#853) — the swap's listeners read it synchronously, so it cannot be set after.
+      // A refusal (prefab-edit) is the human's to see: `runCreate` does not surface a throw,
+      // so it is caught and toasted here rather than becoming an unhandled rejection.
+      try {
+        await newScene(path);
+      } catch (e) {
+        if (e instanceof NewSceneRefusedError) {
+          useEditorStore.getState().showToast(e.message, 'warn');
+          return;
+        }
+        throw e;
+      }
       useEditorStore.getState().selectEntity(null);
-      setCurrentScenePath(path);
       await saveScene();
     },
   });
@@ -100,12 +112,9 @@ export function registerBuiltinCreatableAssets(): void {
     assetType: 'rig2d',
     prompt: 'Create 2D Rig',
     order: 5,
-    // Seeds a single `root` bone + empty mesh (same minimal shape as the Skin Editor's
-    // own "New Rig").
-    body: (guid) => ({
-      id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
-      mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [],
-    }),
+    // Seed comes from the shared `defaultRig2DFile` via `defaultAssetData`, so the MCP
+    // `create-asset` route and this button cannot disagree.
+    body: (guid) => ({ id: guid, ...(defaultAssetData('rig2d') as Record<string, unknown>) }),
     onCreated: ({ path, name }) => useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name }),
   });
 
@@ -129,7 +138,7 @@ export function registerBuiltinCreatableAssets(): void {
     assetType: 'atlas',
     prompt: 'Create Sprite Atlas',
     order: 7,
-    body: (guid) => ({ id: guid, version: 1, members: [], pageSize: 1024, padding: 2, extrude: 1 }),
+    body: (guid) => ({ id: guid, ...defaultAtlasSource() }),
     onCreated: ({ path, name }) => useEditorStore.getState().selectAsset({ path, type: 'atlas', name }),
   });
 }

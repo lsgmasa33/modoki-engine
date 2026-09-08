@@ -3,19 +3,15 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Actions, type TabNode } from 'flexlayout-react';
-import { computeVisibleRange, clampScrollTop } from './consoleVirtualization';
+import { computeVisibleRange, clampScrollTop, findGapMarkerIndex } from './consoleVirtualization';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { onStructureDirtyCoalesced } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentFPS } from '../../runtime/rendering/frameDriver';
 import {
-  installConsoleCapture, setOnNewLog, logBuffer, getLogIdCounter, bumpLogIdCounter,
+  getEditorLogs, clearEditorLogs, setOnNewLog, getEditorLogsVersion,
+  getEditorLogsDropped, getEditorLogsBootPrefixCount,
   type LogEntry,
 } from '../consoleCapture';
-
-// The capture is installed at editor launch (see createEditor → installConsoleCapture).
-// Calling it again here is idempotent and covers any standalone Console mount.
-installConsoleCapture();
-
 
 // Total row height used for virtualization math. Rows are single-line (the full
 // message + stack live in the detail pane), so every row is the same height:
@@ -23,6 +19,14 @@ installConsoleCapture();
 const ROW_LINE = 18;
 const ROW_HEIGHT = ROW_LINE + 3;
 const levelColor = { log: '#888', warn: '#f39c12', error: '#e74c3c' };
+
+// F2 (#626/#633 adversarial review): a virtualized ROW, either a real log entry or the synthetic
+// gap-disclosure marker inserted at the pinned/tail seam — see `displayRows` below. Modeling the
+// marker as a real row (not an overlay drawn on top) is what lets it participate correctly in the
+// existing uniform-row-height virtualization math instead of needing a second, parallel one.
+type DisplayRow =
+  | { kind: 'entry'; entry: LogEntry }
+  | { kind: 'gap'; dropped: number };
 
 export default function Console({ node }: { node?: TabNode } = {}) {
   const [version, setVersion] = useState(0); // bump to trigger re-render
@@ -52,7 +56,7 @@ export default function Console({ node }: { node?: TabNode } = {}) {
 
   // Log updates — callback fires on each new console.log/warn/error
   useEffect(() => {
-    setOnNewLog(() => setVersion(getLogIdCounter()));
+    setOnNewLog(() => setVersion(getEditorLogsVersion()));
     return () => { setOnNewLog(null); };
   }, []);
 
@@ -139,9 +143,9 @@ export default function Console({ node }: { node?: TabNode } = {}) {
   }, [node]);
 
   const clearLogs = () => {
-    logBuffer.length = 0;
+    clearEditorLogs();
     setSelectedId(null); setCopied(false);
-    setVersion(bumpLogIdCounter());
+    setVersion(getEditorLogsVersion());
     setAutoScroll(true);
     // Reset scroll to the top — the list is now empty, so a leftover large
     // scrollTop would window past the (now zero) content and render blank. (F3)
@@ -149,22 +153,62 @@ export default function Console({ node }: { node?: TabNode } = {}) {
     if (containerRef.current) containerRef.current.scrollTop = 0;
   };
 
+  // The shared ring, projected once per render — reused below instead of calling
+  // getEditorLogs() again at each of the three sites that used to read `logBuffer`.
+  const logs = getEditorLogs();
+
   // Filter logs by level and text. Memoized so it recomputes only when the log set
   // (version), the text filter, or the level set actually changes — NOT on every
-  // scroll/resize/selection re-render. `logBuffer` is mutated in place, so `version`
-  // (bumped per new log / on clear) is the correct invalidation key. (panels F4)
+  // scroll/resize/selection re-render. `version` (bumped per new log / on clear) is
+  // the correct invalidation key — `logs` is deliberately NOT a dependency: it is a
+  // fresh array on every render, but its CONTENT is fully determined by `version`
+  // (the only two things that change the ring's content — a new log, or a clear —
+  // are exactly the two things that bump it), so listing it would defeat the memo
+  // and re-filter on every scroll/resize/selection re-render instead. (panels F4)
   const filterLower = filter.toLowerCase();
   const filteredLogs = useMemo(
-    () => logBuffer.filter(e =>
+    () => logs.filter(e =>
       showLevels.has(e.level) && (!filterLower || e.message.toLowerCase().includes(filterLower))
     ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `logs` deliberately omitted, see comment above
     [version, filterLower, showLevels],
   );
 
-  const selectedEntry = selectedId == null ? null : (logBuffer.find(e => e.id === selectedId) ?? null);
+  const selectedEntry = selectedId == null ? null : (logs.find(e => e.id === selectedId) ?? null);
 
-  // Virtualization: rows are uniform-height (ROW_HEIGHT), so offsets are O(1).
-  const totalRows = filteredLogs.length;
+  // F2 (#626/#633 adversarial review): the ring's own doc comment (`getConsoleRingDropped`) calls
+  // this "THE DISCLOSURE THAT MATTERS" — once the ring wraps, `[pinned] ++ [tail]` is DISCONTIGUOUS,
+  // and rendering it as one unbroken list silently implies the app logged nothing across the gap
+  // (measured: the toolbar's own `n/total` counter can read a healthy `1000/1000` while the ring is
+  // discontiguous underneath it). `ConsoleTab.tsx` (the in-game debug menu's twin of this panel)
+  // draws a separator at the seam; this inserts the SAME disclosure as a synthetic ROW at the seam
+  // instead of an overlay, so it participates correctly in the virtualization below rather than
+  // needing a second, parallel layout pass. The seam-finding itself is `findGapMarkerIndex`
+  // (`consoleVirtualization.ts`, unit-tested there) — a panel's DECISIONS belong in a plain `.ts`
+  // module, not this `.tsx`, per `docs/editor.md` § Panels.
+  //
+  // ⚠️ COVERS the pinned/tail seam only — NOT closed by a Clear. `clearEditorLogs()` advances a
+  // per-consumer watermark past whatever was visible at Clear time, which can be past the ENTIRE
+  // pinned prefix; once every surviving row's `id` is already `> bootPrefixCount`, there is no
+  // pinned-side survivor for the seam check to pair with, so `findGapMarkerIndex` correctly (not a
+  // bug in itself) returns "no marker" — even though the ring can go on silently evicting the NEW
+  // tail forever afterward. Concrete: capacity 1000 / bootPrefix 128, log 2000, Clear, log 2000
+  // more — the panel shows seq 3129-4000; the 1128 lines logged AFTER the user's own Clear (seq
+  // 2001-3128) were evicted with no marker and no clue, and the toolbar reads a healthy `872/872`.
+  // `ConsoleTab.tsx` has the identical limitation — a deliberate PARITY choice between the two
+  // projections, not a gap either owes a fix for today. See `consoleVirtualization.test.ts`'s
+  // "post-Clear" case, which pins this exact scenario rather than leaving it implied.
+  const displayRows = useMemo<DisplayRow[]>(() => {
+    const rows: DisplayRow[] = filteredLogs.map((entry) => ({ kind: 'entry', entry }));
+    const dropped = getEditorLogsDropped();
+    const gapIdx = findGapMarkerIndex(filteredLogs, getEditorLogsBootPrefixCount(), dropped);
+    if (gapIdx !== -1) rows.splice(gapIdx, 0, { kind: 'gap', dropped });
+    return rows;
+  }, [filteredLogs]);
+
+  // Virtualization: rows are uniform-height (ROW_HEIGHT), so offsets are O(1). `displayRows`, not
+  // `filteredLogs` — the gap marker (when present) is one MORE row to lay out.
+  const totalRows = displayRows.length;
 
   // When the filtered set shrinks (Clear, or a text/level filter that drops the
   // match count below the current scroll offset), a stale large scrollTop would
@@ -180,7 +224,7 @@ export default function Console({ node }: { node?: TabNode } = {}) {
   }, [totalRows, viewHeight, scrollTop]);
 
   const { startIdx, endIdx, topSpacer, bottomSpacer } = computeVisibleRange(scrollTop, viewHeight, totalRows, ROW_HEIGHT);
-  const visibleLogs = filteredLogs.slice(startIdx, endIdx);
+  const visibleRows = displayRows.slice(startIdx, endIdx);
 
   const toggleLevel = useCallback((level: LogEntry['level']) => {
     const next = new Set(showLevels);
@@ -236,7 +280,9 @@ export default function Console({ node }: { node?: TabNode } = {}) {
           }}
         />
         <span style={{ color: '#555', fontSize: '11px' }}>
-          {totalRows}/{logBuffer.length}
+          {/* Entry counts, not row counts — `totalRows` (below) also counts the F2 gap marker
+              row, which is not a log line. */}
+          {filteredLogs.length}/{logs.length}
         </span>
         {!autoScroll && (
           <button onClick={() => { setAutoScroll(true); }} style={btnStyle}>
@@ -257,7 +303,18 @@ export default function Console({ node }: { node?: TabNode } = {}) {
       >
         {/* Top spacer for rows above viewport */}
         <div style={{ height: topSpacer }} />
-        {visibleLogs.map((entry) => {
+        {visibleRows.map((row) => {
+          // F2: the gap-disclosure marker — see `displayRows` above. Same ROW_HEIGHT as a log
+          // row (uniform-height virtualization requires it), styled after ConsoleTab.tsx's own
+          // gap separator rather than inventing a new presentation.
+          if (row.kind === 'gap') {
+            return (
+              <div key="gap-marker" style={gapRowStyle}>
+                — {row.dropped} earlier {row.dropped === 1 ? 'entry' : 'entries'} dropped —
+              </div>
+            );
+          }
+          const entry = row.entry;
           const isSelected = entry.id === selectedId;
           return (
             <div
@@ -356,4 +413,17 @@ const toggleBtnStyle: React.CSSProperties = {
   background: 'none', border: '1px solid #444',
   cursor: 'pointer', padding: 0, borderRadius: 3, fontSize: '9px',
   fontFamily: 'monospace', fontWeight: 'bold', lineHeight: 1,
+};
+
+// F2: the gap-disclosure row — same shape as ConsoleTab.tsx's `gapStyle`, adapted to this panel's
+// palette. Fixed at ROW_HEIGHT so it lays out like any other virtualized row — same overflow
+// containment as an entry row (`:320`, `whiteSpace`/`overflow`/`textOverflow`), which this row
+// needs just as much: dock the panel narrow enough and the "— N earlier entries dropped —" text
+// wraps to a second line inside this fixed-height box and overflows into the row below.
+const gapRowStyle: React.CSSProperties = {
+  height: ROW_HEIGHT, boxSizing: 'border-box',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  color: '#555', fontStyle: 'italic', fontSize: '10px',
+  borderBottom: '1px solid #1e1e30',
+  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
 };

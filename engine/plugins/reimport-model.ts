@@ -161,7 +161,6 @@ export const modelReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
       projectRoot: ctx.projectRoot, sourceUrlPath, absSource: absPath, settings: texSettings,
     });
     if (typeof meta.id !== 'string') meta.id = randomUUID();
-    meta.version = 2;
     // Single-variant modelCache: the rigged runtime loads processedPath whole
     // (no LOD). lodPaths has just the one entry so the dev/build copy loops that
     // iterate lodPaths handle it uniformly.
@@ -192,7 +191,6 @@ export const modelReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
   });
 
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   meta.model = settings;
   meta.modelCache = {
     hash: result.hash,

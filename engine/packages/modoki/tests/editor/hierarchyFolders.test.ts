@@ -41,7 +41,12 @@ describe('buildHierarchyFolders', () => {
     ];
     const { folders, ungrouped } = buildHierarchyFolders(roots);
     expect(folders.map((f) => f.name)).toEqual(['Env', 'Lights']); // alphabetical
-    expect(folders[1].roots.map((r) => r.id)).toEqual([1, 3]);
+    // Roots inside a folder follow `compareSiblings` — sortOrder, then guid, then name —
+    // the SAME rule the scene file is written with (#500). These two tie at sortOrder 0
+    // with no guid, so the name decides: 'Fill' (id 3) before 'Sun' (id 1). This asserted
+    // [1, 3] while the tiebreak was the ecs id, which made the panel's order depend on
+    // load history and disagree with the file.
+    expect(folders[1].roots.map((r) => r.id)).toEqual([3, 1]);
     expect(ungrouped.map((r) => r.id)).toEqual([2]);
   });
 

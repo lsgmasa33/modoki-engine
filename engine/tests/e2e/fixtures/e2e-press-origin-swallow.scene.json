@@ -1,0 +1,45 @@
+{
+  "id": "e2e-press-origin-swal-0000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Scrim",
+      "guid": "e2e00000-0000-4000-8000-000000000201",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 100, "height": 100, "widthUnit": "%", "heightUnit": "%", "backgroundOpacity": 0.8, "backgroundColor": 1118481, "text": "", "fontSize": 16, "textColor": 16777215 },
+        "UIAction": {
+          "bindings": [
+            { "event": "click", "kind": "set", "target": "", "component": "UIElement", "property": "text", "value": "DISMISSED" }
+          ]
+        },
+        "EntityAttributes": { "name": "Scrim", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Panel",
+      "guid": "e2e00000-0000-4000-8000-000000000202",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 50, "height": 50, "widthUnit": "%", "heightUnit": "%", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "", "fontSize": 16, "textColor": 16777215, "swallowClicks": true },
+        "UIAnchor": { "anchor": "center", "pivotX": 0.5, "pivotY": 0.5, "safeArea": false },
+        "EntityAttributes": { "name": "Panel", "isActive": true, "sortOrder": 0, "parentId": 1, "layer": "ui" }
+      }
+    },
+    {
+      "id": 3,
+      "name": "PanelChild",
+      "guid": "e2e00000-0000-4000-8000-000000000203",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 90, "height": 90, "widthUnit": "%", "heightUnit": "%", "backgroundOpacity": 0, "backgroundColor": 16777215, "text": "", "fontSize": 16, "textColor": 16777215 },
+        "UIAnchor": { "anchor": "center", "pivotX": 0.5, "pivotY": 0.5, "safeArea": false },
+        "EntityAttributes": { "name": "PanelChild", "isActive": true, "sortOrder": 0, "parentId": 2, "layer": "ui" }
+      }
+    }
+  ]
+}

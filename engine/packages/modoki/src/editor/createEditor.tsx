@@ -23,16 +23,17 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey } from './scene/serialize';
+import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey, type SceneLoadOutcome } from './scene/serialize';
+import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
+import { setEditorProjectScope } from './projectScopedKey';
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
 import { registerBuiltinCreatableAssets } from './panels/builtinCreatableAssets';
 import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid, getAllAssets } from '../runtime/loaders/assetManifest';
 import { backendFetch } from './backend/editorBackend';
 import { rendererReady } from '../runtime/loaders/textureResolver';
 import { rendererInitFailedPromise, getRendererProgress, hasViewportBegunInit } from '../runtime/core/activeRenderer';
-import { installConsoleCapture } from './consoleCapture';
 import { useEditorStore } from './store/editorStore';
 import { assetSetSignature } from './assetSetSignature';
 
@@ -219,10 +220,10 @@ export async function canonicalBootScenePath(
  *  collaborators — exported for unit testing. */
 export async function loadFirstScene(
   candidates: string[],
-  deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<boolean> },
+  deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<SceneLoadOutcome> },
 ): Promise<string | null> {
   // A candidate that THROWS must not abort the fallback chain. `load` rejects (it
-  // does not merely return false) whenever the host serves something that isn't the
+  // does not merely resolve 'failed') whenever the host serves something that isn't the
   // scene JSON — most commonly the dev server's SPA index.html fallback, which makes
   // JSON.parse throw `Unexpected token '<'`. That escaped this loop, so the very
   // fallback the loop exists to provide never ran and editor boot died on the first
@@ -230,13 +231,41 @@ export async function loadFirstScene(
   // on a DIFFERENT Windows drive — Vite's html-fallback middleware refuses such
   // paths (vitejs/vite#12816, closed as not-planned), so it 404s to index.html while
   // the project's own `/assets/...` candidate right behind it would have loaded.
-  const tryLoad = async (p: string): Promise<boolean> => {
+  const tryLoad = async (p: string): Promise<SceneLoadOutcome> => {
     try {
       return await deps.load(p);
     } catch (err) {
+      // This 'failed' is synthesized here, not produced by `serialize.ts`'s `loadScene` (which
+      // never throws past its own catch-all) — so it does NOT set `_lastLoadFailureMessage`,
+      // and `getLastSceneLoadFailureMessage()` will not reflect it. That's fine today: nothing
+      // reads the getter from this boot-time fallback walk, and the next candidate is tried
+      // regardless. Named exception in the getter's own docblock (#784 phase C adversarial
+      // review, finding 5) — read that before wiring a caller here to the getter.
       console.warn(`[Editor] Scene at ${p} failed to load, trying next fallback…`, err);
-      return false;
+      return 'failed';
     }
+  };
+  // A load reported 'superseded' by ANOTHER load winning the swap first (e.g. an agent/menu
+  // open racing this boot walk) must STOP the candidate loop, not continue to the next
+  // candidate — continuing would load a THIRD scene over whichever one actually won.
+  //
+  // ⚠️ It returns the scene that ACTUALLY won, not `null`. `null` means "no candidate loaded" to
+  // this function's caller, and that caller answers it by running `config.initWorld()` (or
+  // spawning an empty camera scene) and calling `setCurrentScenePath(candidates[last])` — which
+  // on a supersede would destroy the world the winning load just installed and then name a scene
+  // that is not loaded. That is strictly worse than the reporting bug this whole change is about,
+  // so a supersede must resolve to a truthful non-null path whenever one exists. `null` survives
+  // only for the genuine "nothing is loaded at all" case, which is exactly when `initWorld` IS
+  // the right answer. Read from `sceneManager` rather than `getCurrentScenePath()`: the editor's
+  // tracked path is written by the winner's own tail and can still be the pre-swap value at this
+  // instant, and naming a stale scene here would be the same class of untruth as the bug.
+  const onSuperseded = (candidate: string): string | null => {
+    const active = sceneManager.getCurrent()?.path ?? null;
+    console.info(
+      `[Editor] Scene load for ${candidate} was superseded by another load; `
+      + `"${active ?? 'null'}" is the scene that actually won.`,
+    );
+    return active;
   };
   for (const candidate of candidates) {
     // Canonicalization is best-effort: fall back to the raw candidate if it throws.
@@ -246,8 +275,14 @@ export async function loadFirstScene(
     } catch {
       // canonical is already `candidate` (the declaration default).
     }
-    if (await tryLoad(canonical)) return canonical;
-    if (canonical !== candidate && (await tryLoad(candidate))) return candidate;
+    const canonicalOutcome = await tryLoad(canonical);
+    if (canonicalOutcome === 'loaded') return canonical;
+    if (canonicalOutcome === 'superseded') return onSuperseded(canonical);
+    if (canonical !== candidate) {
+      const rawOutcome = await tryLoad(candidate);
+      if (rawOutcome === 'loaded') return candidate;
+      if (rawOutcome === 'superseded') return onSuperseded(candidate);
+    }
     console.warn(`[Editor] Scene not found at ${candidate}, trying next fallback…`);
   }
   // EVERY candidate missed — that IS a real failure, and it is the only one worth an `error`.
@@ -580,10 +615,10 @@ export function getExtraMenusVersion(): number { return _reg.extraMenusVersion; 
 export function getProjectSettings() { return _reg.projectSettings; }
 
 export function createEditor(options: EditorOptions): React.ComponentType {
-  // Capture console output + uncaught errors/rejections at the VERY START of
-  // editor launch, before any lazy panel bundle (incl. Console) loads — so no
-  // early-init log or error is missed. Idempotent.
-  installConsoleCapture();
+  // Console capture used to be installed HERE (idempotently, so a standalone Console mount was
+  // covered too). It no longer is: the shared console ring (#626) starts eagerly from
+  // `engine/app/installConsoleRing.ts`, a side-effect import above `App.tsx` in `main.tsx` — long
+  // before `createEditor()` is ever called — so there is nothing left for this function to install.
 
   // Register game config
   setGameConfig(options.config);
@@ -614,6 +649,16 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   // Animation, …). Idempotent — safe if createEditor() ever runs twice in a session.
   registerBuiltinCreatableAssets();
 
+  // Scope the editor's "what was I last editing" localStorage memories to this project: one
+  // origin serves every project in a clone, and asset URLs carry no project segment, so an
+  // unscoped key re-opens project A's rig/clip into project B — where it hits the dev server's
+  // SPA fallback and reports a present, valid file as broken (#473, the root cause behind #460).
+  // Same treatment `setScenePersistenceProject` gives scenes.
+  //
+  // Placed first for readability, NOT because anything downstream requires it: every consumer
+  // resolves its key per read/write, so ordering against the register calls below is not an
+  // invariant and must not be relied on as one (`projectScopedKey`'s own header says why).
+  setEditorProjectScope(options.config.name);
   // Subscribe to world swaps to restore the editor's selection across scene loads
   registerSelectionRestore();
   // Mirror the open animation clip to localStorage (restored below once the scene loads).
@@ -744,10 +789,9 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       // `--scene` override: setCurrentScenePath fires first with the OVERRIDE's path, so the
       // prior value has to be put back explicitly rather than just left alone.
       //
-      // Only the PER-PROJECT key is restored. The unscoped legacy `modoki-last-scene` is a
-      // "scene currently open" proxy for SceneView's prefab-return and devTestBridge, so it must
-      // keep tracking the scene actually loaded — rewinding that one would send prefab-return to
-      // a scene the user is not in.
+      // Only the PER-PROJECT key is restored (#478: the unscoped `modoki-last-scene` this
+      // comment used to carve out for SceneView's prefab-return and devTestBridge is gone —
+      // both now read the scoped key too, so there is nothing else to keep in sync here).
       const cameFromOverride = resolvedOverride != null && (loadedPath === resolvedOverride || loadedPath === canonicalOverride);
       if (cameFromOverride) {
         if (lastScene) localStorage.setItem(LAST_SCENE_KEY, lastScene);

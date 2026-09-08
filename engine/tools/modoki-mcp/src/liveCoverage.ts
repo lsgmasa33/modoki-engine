@@ -43,7 +43,13 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
   'modoki_hit_regions', 'modoki_profiler',
-  'modoki_game_view_device', 'modoki_animation_view_mode',
+  'modoki_set_game_view_device', 'modoki_set_animation_view_mode',
+  // UC14 (#872): read the sidecar, write it back unchanged, verify it survived — and assert the
+  // reply does NOT say `editorConnected:false`, which is the live proof that the park gate's
+  // renderer probe is actually wired. Its REFUSAL side is not smoke-coverable (parking an
+  // import-settings edit is a human Inspector gesture with no agent equivalent) and is
+  // hand-verified instead; the case says so.
+  'modoki_write_asset_meta',
 ];
 
 /** MUTATING tools no live tier reaches, each with the reason it cannot be swept.
@@ -70,9 +76,9 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_anim_add_key: 'edits a live animation clip',
   modoki_timeline_set: 'replaces a live timeline',
   modoki_timeline_add_clip: 'edits a live timeline',
-  modoki_collider_edit: 'enters a viewport sub-mode the human is not in',
-  modoki_gizmo: "changes the human's gizmo mode mid-session",
-  modoki_scene_view_mode: "switches the human's viewport mode",
+  modoki_set_collider_edit: 'enters a viewport sub-mode the human is not in',
+  modoki_set_gizmo: "changes the human's gizmo mode mid-session",
+  modoki_set_scene_view_mode: "switches the human's viewport mode",
   modoki_open_particle_editor: "opens a panel over the human's layout",
   modoki_open_sprite_editor: "opens a panel over the human's layout",
   modoki_open_nine_slice_editor: "opens a panel over the human's layout",
@@ -107,7 +113,8 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   // SMOKE-COVERABLE (create -> verify -> clean up, exactly what create_asset/delete_asset already
   // do), so these belong in COVERED_BY_SMOKE once a case exists. Listed rather than claimed,
   // because an entry in COVERED_BY_SMOKE asserts that a real case is there and none is yet.
-  modoki_write_asset_meta: "REPLACES an asset's .meta.json import settings in the human's project; a wrong sidecar changes how the asset converts. SMOKE-COVERABLE — read the sidecar, write it back unchanged, verify",
+  // ⚠️ ONE of the four has moved (`modoki_write_asset_meta` → COVERED_BY_SMOKE, UC14, #872). The
+  // other three are still listed rather than claimed, which is the honest state — not an oversight.
   modoki_duplicate_asset: 'writes a new asset file into the project. SMOKE-COVERABLE — duplicate, verify via list_assets, delete_asset',
   modoki_move_asset: "renames a file in the human's project. SMOKE-COVERABLE — move to a probe path, verify, move back",
   modoki_create_folder: 'creates a folder in the project. SMOKE-COVERABLE — create, verify, remove',

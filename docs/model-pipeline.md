@@ -1,6 +1,10 @@
 # Model Import & LOD
 
 > Status: **shipped (v1)**.
+> The converter-parameter surface came from `docs/plans/asset-inspector-plan.md` (Phases 1-4b
+> landed; its Phase 5 "Docs + polish" did not, and the tracker was deleted with it open —
+> `git log --diff-filter=D` over that path recovers it). The texture half of that plan is in
+> [textures.md](./textures.md).
 
 How modoki turns a source `.glb` into runtime-ready meshes, materials, and a
 baked level-of-detail (LOD) chain. See also [Architecture](./architecture.md),

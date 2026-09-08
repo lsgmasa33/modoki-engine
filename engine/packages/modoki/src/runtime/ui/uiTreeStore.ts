@@ -17,8 +17,10 @@ import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
+import { UISettings } from '../traits/UISettings';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
+import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -26,6 +28,13 @@ import type { AnchorMode } from '../traits/UIAnchor';
 export interface UINodeData {
   entityId: number;
   guid: string;
+  /** koota's generation for `entityId` at the time this node was built (#759/#738). Exists so a
+   *  consumer can build a recycle-safe warn-once key (`entityId:generation`) without reaching back
+   *  into the world — koota recycles ids, so `entityId` alone is not stable identity within one
+   *  world. Compared automatically by `nodesEqual` (it's a plain scalar, see `_scalarKeys` below):
+   *  a recycled id now fails equality and gets a fresh object ref, which is correct — it costs one
+   *  extra scalar compare per node. */
+  generation: number;
   // ── Layout ──
   width: number; height: number;
   widthUnit: string; heightUnit: string;
@@ -42,7 +51,7 @@ export interface UINodeData {
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
   alignSelf: string; zIndex: number; rotation: number; scale: number;
-  overflow: string; isVisible: boolean; pointerThrough: boolean;
+  overflow: string; isVisible: boolean; pointerThrough: boolean; swallowClicks: boolean;
   scrollbarStyle: string; scrollbarThumbColor: number; scrollbarTrackColor: number;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
@@ -55,6 +64,9 @@ export interface UINodeData {
    *  than in `UINode` so the DOM layer stays a pure style writer and the precedence lives in
    *  exactly one place (`ui/fontFamilyRef.ts`). */
   fontFamily: string; fontSize: number; fontSizeUnit: string; fontWeight: string; fontStyle: string;
+  /** Shrink-only auto-fit (#614) — see `UIElement.autoFitText`/`fontSizeMin` and
+   *  `ui/autoFitText.ts` for the fit math. `fontSizeMin` is in `fontSizeUnit`, same as `fontSize`. */
+  autoFitText: boolean; fontSizeMin: number;
   textColor: number; textOpacity: number; textAlign: string;
   lineHeight: number; letterSpacing: number; letterSpacingUnit: string;
   textShadowColor: number; textShadowOpacity: number; textShadowOffsetX: number; textShadowOffsetY: number; textShadowBlur: number;
@@ -79,8 +91,8 @@ export interface UINodeData {
   // already a union) and the layout modules (whose switches have no `default`), so
   // widening here would hand an unrecognised mode straight through to a silently
   // unpositioned element.
-  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
-  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
+  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean };
+  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string; maxReferenceWidth: number };
   /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
    *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
    *  and its absence has to survive `_scalarKeys` being derived from whichever node
@@ -106,6 +118,16 @@ export interface UINodeData {
   /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
    *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
   isEntry?: boolean;
+  /** True when this node IS a virtualized view (it carries `UIEntries`), as opposed to being one
+   *  of its pooled rows.
+   *
+   *  ⚠️ Read by `useScrollAnchoring`, which must not touch such a box: a virtualized view holds
+   *  every row under one `__uiEntriesContent` wrapper whose `offsetTop` never moves (the offset
+   *  rides as PADDING inside it), so anchoring to it degrades into restoring the raw number
+   *  while the browser's own anchoring has been switched off — a regression. Published as a
+   *  trait fact rather than inferred from the child count, because a count is a proxy that one
+   *  authored header child silently breaks. */
+  isEntriesView?: boolean;
   /** `scroll-snap-align` + `scroll-snap-stop`, stamped by the enclosing scroll view.
    *
    *  ⚠️ It rides the NODE rather than being applied by the scroll view's own element because
@@ -124,10 +146,17 @@ export interface UINodeData {
 
 interface UITreeState {
   tree: UINodeData[];
+  /** The scene-wide default DOM `font-family` (#803), resolved from the `UISettings` singleton
+   *  through the SAME precedence helper a per-node `fontFamily` uses (`resolveUIFontFamily`).
+   *  Applied to the ONE container every UI root lives inside — see `UIRenderer` — so it reaches
+   *  every root by ordinary CSS inheritance instead of needing to be re-authored on each root's
+   *  own `UIElement`. `''` when no `UISettings` entity exists, or both its font fields are empty. */
+  rootFontFamily: string;
 }
 
 export const useUITreeStore = create<UITreeState>(() => ({
   tree: [],
+  rootFontFamily: '',
 }));
 
 // ── Dirty flag (core/uiDirty.ts owns the state — see the import above) ──
@@ -136,7 +165,9 @@ export const useUITreeStore = create<UITreeState>(() => ({
 let _initialized = false;
 function ensureInitialized() {
   if (_initialized) return;
-  _initialized = true;
+  // Latch AFTER registration: if a listener call below throws (e.g. a test mocking
+  // core/ecs/world without `onWorldSwap`), a latch set first would leave nothing registered
+  // and every later call would silently no-op.
   // Wire the dirty callback into entityUtils so writeTraitField/deleteEntity trigger rebuilds.
   // F5 (intentionally NOT gated to UI-trait writes): this fires on ANY helper-API trait
   // write — a 3D transform, a 2D sprite, anything — which over-invalidates in the editor
@@ -157,8 +188,10 @@ function ensureInitialized() {
     // dangling GUID and independently needs the diagnostic (#231).
     resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
-    useUITreeStore.setState({ tree: [] });
+    _warnedLengthUnitMismatches.clear();
+    useUITreeStore.setState({ tree: [], rootFontFamily: '' });
   });
+  _initialized = true;
 }
 
 // ── Tree builder (extracted from old useUIEntities) ──
@@ -167,6 +200,32 @@ function ensureInitialized() {
 const _nodes = new Map<number, UINodeData>();
 const _parentMap = new Map<number, number>();
 const _sortMap = new Map<number, number>();
+
+/** Warned-once guard for `lengthUnitWarning` (#529/#549). This projection re-runs on
+ *  every UI-dirty rebuild, so this dedupes; the key is entity+generation+field+UNITS
+ *  (see `lengthUnitWarningKey`), not the offending values — a resize drag rewrites the
+ *  values on every pointermove, so keying on them re-warned hundreds of times mid-drag.
+ *
+ *  Keyed with `generation()` (#738), not id alone — koota recycles entity ids, so a
+ *  despawn+respawn within one world hands a new, unrelated UI entity the dead one's id,
+ *  and an id-only warn-once would silently suppress that newcomer's genuine warning
+ *  forever. `generation()` narrows that WITHIN-world hole to koota's 256-generation wrap
+ *  (`GENERATION_BITS = 8`) — the 257th incarnation of a recycled id re-inherits the
+ *  1st's warn-once entry, but that is a dev-only missed warning once per 256 recycles,
+ *  not the every-respawn collision #738 fixed.
+ *
+ *  ⚠️ This is ALSO world-local — a fresh world restarts both id and generation from
+ *  zero, so `id 2 / gen 0` in a second world would otherwise collide with the first.
+ *  Generation does NOT make the `onWorldSwap` clear below redundant — it closes the
+ *  ACROSS-world hole that generation cannot. Cleared on world swap, same as `_prevById`.
+ *
+ *  A latent seam worth flagging, not chasing: `entriesSystem`'s `releaseViewPool`
+ *  destroys and respawns a view's whole entity pool on hide/show (its own comment
+ *  measures 809 entities for Court's level selector), so with generation in the key a
+ *  pooled entry carrying a length-unit mismatch would re-warn on every open. A scan of
+ *  all 746 `UIElement` blocks across `games/**` and `demos/**` scenes/prefabs found ZERO
+ *  instances of the suspect pattern today, so this is a latent seam, not a live defect. */
+const _warnedLengthUnitMismatches = new Set<string>();
 
 // Previous frame's emitted nodes, keyed by entityId. buildTree reconciles the
 // freshly-built tree against this so an entity whose data (and whole subtree) is
@@ -236,7 +295,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any, _entriesMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -252,6 +311,7 @@ function cacheTraits() {
   _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
   _scrollMeta = allTraits.find(m => m.name === 'UIScrollView');
   _entryMeta = allTraits.find(m => m.name === 'UIEntry');
+  _entriesMeta = allTraits.find(m => m.name === 'UIEntries');
   _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
@@ -337,6 +397,7 @@ function buildTree(world: World): UINodeData[] | null {
       const node: UINodeData = {
         entityId: id,
         guid: '',
+        generation: entity.generation(),
         width: ui.width, height: ui.height,
         widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,
@@ -360,6 +421,7 @@ function buildTree(world: World): UINodeData[] | null {
         scale: ui.scale ?? 1,
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
+        swallowClicks: ui.swallowClicks === true,
         scrollbarStyle: ui.scrollbarStyle || 'auto',
         scrollbarThumbColor: ui.scrollbarThumbColor ?? 0x888888,
         scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,
@@ -380,6 +442,7 @@ function buildTree(world: World): UINodeData[] | null {
         borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
         fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
+        autoFitText: ui.autoFitText === true, fontSizeMin: ui.fontSizeMin || 0,
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
         lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',
@@ -443,12 +506,12 @@ function buildTree(world: World): UINodeData[] | null {
           bottom: anc.bottom || 0, bottomUnit: anc.bottomUnit || 'px',
           left: anc.left || 0, leftUnit: anc.leftUnit || 'px',
           pivotX: anc.pivotX || 0, pivotY: anc.pivotY || 0,
-          safeArea: anc.safeArea, zIndex: anc.zIndex,
+          safeArea: anc.safeArea,
         };
       }
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
         const c = entity.get(_canvas2dMeta.trait) as any;
-        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode };
+        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode, maxReferenceWidth: c.maxReferenceWidth };
       }
       if (_toggleMeta && entity.has(_toggleMeta.trait)) {
         const t = entity.get(_toggleMeta.trait) as any;
@@ -468,6 +531,8 @@ function buildTree(world: World): UINodeData[] | null {
       // way to avoid. Inert today (UIEntry is added once and never removed), and a landmine the
       // moment it is not.
       node.isEntry = !!(_entryMeta && entity.has(_entryMeta.trait));
+      // Same ALWAYS-written rule as `isEntry` directly above, and for the same `_scalarKeys` reason.
+      node.isEntriesView = !!(_entriesMeta && entity.has(_entriesMeta.trait));
       if (_scrollMeta && entity.has(_scrollMeta.trait)) {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {
@@ -496,11 +561,36 @@ function buildTree(world: World): UINodeData[] | null {
 
       _nodes.set(id, node);
 
+      let attr: any;
       if (_attrMeta && entity.has(_attrMeta.trait)) {
-        const attr = entity.get(_attrMeta.trait) as any;
+        attr = entity.get(_attrMeta.trait) as any;
         node.guid = attr.guid || '';
         _parentMap.set(id, attr.parentId || 0);
         _sortMap.set(id, attr.sortOrder || 0);
+      }
+
+      // #529/#549: width/height default their unit to '%' while minWidth/maxWidth/
+      // minHeight/maxHeight default theirs to 'px' — a relative size clamped by an
+      // unauthored-unit min/max most likely meant to clamp in the SAME relative unit
+      // and instead clamped to a few pixels (Court's `RulesClose`). Deliberately done
+      // HERE, in the tree-build pass, and not in UINode's render: a node inside a
+      // hidden subtree never reaches UINode at all — an `isVisible:false` ancestor's
+      // CHILDREN still get a node built here (this loop skips only `deactivatedEntities`,
+      // per the comment above — `isVisible` hides only that one element's own
+      // renderable) — but UINode's `!node.isVisible` early-return means a render-time
+      // check would silently miss every element inside a closed dialog. That's the
+      // exact #529 case: the How-to-Play dialog is closed until a player opens it. Only
+      // `node` is needed here, not EntityAttributes — kept outside the `attr` block above
+      // so an element that never got attributes still gets checked, falling back to the
+      // raw entity id for its label.
+      if (import.meta.env?.DEV) {
+        for (const suspect of findLengthUnitSuspects(node)) {
+          const key = lengthUnitWarningKey(id, entity.generation(), suspect);
+          if (!_warnedLengthUnitMismatches.has(key)) {
+            _warnedLengthUnitMismatches.add(key);
+            console.warn(formatLengthUnitWarning(attr?.name || node.guid || String(id), suspect));
+          }
+        }
       }
     },
   );
@@ -587,5 +677,11 @@ export function uiTreeProjection(world: World) {
   const tree = buildTree(world);
   if (tree === null) return;
   clearUIDirty();
-  useUITreeStore.setState({ tree });
+  // Scene-wide default font (#803) — read fresh each rebuild, same as `readLockWindow` reads
+  // `UISettings` fresh in bindings.ts: caching it would go stale across a world swap, and this
+  // only runs when the tree is already dirty, so it costs one extra `queryFirst` per rebuild,
+  // not per frame.
+  const settings = world.queryFirst(UISettings)?.get(UISettings);
+  const rootFontFamily = resolveUIFontFamily(settings?.fontFamily, settings?.systemFont, 'UISettings');
+  useUITreeStore.setState({ tree, rootFontFamily });
 }

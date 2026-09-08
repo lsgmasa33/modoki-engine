@@ -43,6 +43,13 @@ export function getFontTexture(provider: FontProvider, page = 0): THREE.Texture 
         const t = cache.get(key);
         if (t) { t.dispose(); cache.delete(key); }
       });
+      // ⚠️ NO destroyed-check here, and that is deliberate — do NOT port the Pixi twin's
+      // `if (created.destroyed) return null` from `fontTexturePixi.ts` (#481). This has the same
+      // SHAPE (cache, register a disposer that can run synchronously on an already-disposed
+      // provider, return the texture) and none of the hazard: THREE exposes no `.destroyed` /
+      // `.disposed` flag at all, and `dispose()` only emits the event that makes WebGLRenderer
+      // drop its cached WebGLTexture — `.image` survives, so the next bind RE-UPLOADS. Adding a
+      // null-return here would blank text that renders correctly today.
     }
     if (uploadedVersion.get(tex) !== provider.atlasVersion) {
       tex.needsUpdate = true;

@@ -1,11 +1,22 @@
-/** Register all traits and name transforms. Call once at startup.
- *  Game-specific postprocessors are registered via GameDefinition.registerPostprocessors(). */
+/** Register all traits and name transforms. Call once per app LIFETIME.
+ *  Game-specific postprocessors are registered via GameDefinition.registerPostprocessors().
+ *
+ *  ⚠️ THERE IS DELIBERATELY NO `teardownAll()` — one was built under #534 and removed once the
+ *  measurement was in. Every end-of-lifetime in this architecture is a REALM DEATH, not a teardown:
+ *  the OS kills the process on mobile, the tab closes on web, restart/OTA go through
+ *  `location.reload()`, and even the editor's project switch is a `webContents.reload()`
+ *  (`engine/electron/main.ts`). None of those leave a realm behind for a teardown to tidy, so the
+ *  latch below is once-only and nothing clears it. Reasoning: `docs/managers-and-systems.md`.
+ *  In-session leaks (scene swaps, editor world swaps) are a different problem with its own
+ *  disposers — that is where teardown code belongs here. */
 
 import projectConfig from 'virtual:modoki-project-config';
 import { registerAllTraits } from './registerTraits';
 import { setNameTransform } from '@modoki/engine/runtime';
 import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerQualityControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings, getEffectiveTargetFps } from '@modoki/engine/runtime';
 
+/** Once-only latch: the app-scoped registration above happens once per REALM, and nothing clears
+ *  this. That is deliberate (#534) — see the header note. */
 let registered = false;
 
 export function registerAll() {
@@ -68,3 +79,4 @@ export function registerAll() {
     setNameTransform(config.nameTransform);
   }
 }
+

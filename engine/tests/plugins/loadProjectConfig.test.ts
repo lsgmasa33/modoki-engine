@@ -421,6 +421,56 @@ describe('pruneProjectConfig (the file stays MINIMAL — only what the project c
     expect(out.build.appleTeamId).toBe('ABCDE12345');
   });
 
+  it('#821: carries through a top-level section this build does not know about, unchanged', () => {
+    // `mergeProjectConfig` only ever emits the sections it knows (app/content/build/…), so a
+    // section a NEWER branch added — here "experimental" — is simply absent from `resolved`.
+    // Without the carry-through, prune had nothing to compare it against and dropped it on
+    // the next Apply, deleting it from the committed file.
+    const onDisk = { app: { appName: 'Court' }, experimental: { foo: 1 } };
+    const resolved = mergeProjectConfig(onDisk as never);
+    expect((resolved as unknown as Record<string, unknown>).experimental).toBeUndefined(); // this build can't see it
+    const pruned = pruneProjectConfig(resolved as never, onDisk, DEFAULT_PROJECT_CONFIG as never) as
+      { experimental?: unknown };
+    expect(pruned.experimental).toEqual({ foo: 1 }); // …but the file keeps it, untouched
+  });
+
+  it('#821: a restored unknown section keeps its ON-DISK position, not appended (a no-op save stays a no-op diff)', () => {
+    const onDisk = { app: { appName: 'Court' }, experimental: { foo: 1 }, ota: { enabled: true, bundleName: 'x' } };
+    const resolved = mergeProjectConfig(onDisk as never);
+    const pruned = pruneProjectConfig(resolved as never, onDisk, DEFAULT_PROJECT_CONFIG as never);
+    expect(Object.keys(pruned)).toEqual(['app', 'experimental', 'ota']);
+  });
+
+  it('#821: rendering.three.tiers (REPLACE_WHOLESALE) still loses a removed tier through the ' +
+     'full patch→merge→prune pipeline, unaffected by the top-level carry-through', () => {
+    const onDisk = { rendering: { three: { tiers: { mid: { ibl: true }, low: { ibl: false } } } } };
+    // Mirrors the Remove-tier button: by the time this reaches prune, REPLACE_WHOLESALE has
+    // already dropped `low` from the patched/resolved config (see the deepMergeConfigPatch
+    // tests above) — `low` is "deliberately removed", not "a section this build never knew".
+    const patched = deepMergeConfigPatch(onDisk, { rendering: { three: { tiers: { mid: { ibl: true } } } } }) as typeof onDisk;
+    const resolved = mergeProjectConfig(patched as never);
+    const pruned = pruneProjectConfig(resolved as never, onDisk, DEFAULT_PROJECT_CONFIG as never) as typeof onDisk;
+    expect('low' in pruned.rendering.three.tiers).toBe(false);
+    expect(pruned.rendering.three.tiers).toEqual({ mid: { ibl: true } });
+  });
+
+  it('#821 INVARIANT: the carry-through never applies INSIDE the recursion, however deep — ' +
+     'a nested key resolved dropped stays dropped, even though onDisk still has it', () => {
+    // Synthetic and deliberately NOT tied to any one real section: this is the general
+    // structural guarantee (rendering.three.tiers happens to satisfy it today only because its
+    // own default is absent, so it never even enters the recursive branch — see the test
+    // above). Hand-build a shape where the recursive branch IS entered and a subkey is simply
+    // missing from `resolved` — same as `rendering.three.tiers.low` being wholesale-dropped —
+    // and confirm prune does not resurrect it from `onDisk`.
+    const defaults = { section: { keep: 'default', removable: 'default' } };
+    const onDisk = { section: { keep: 'diskValue', removable: 'diskValue' } };
+    const resolved = { section: { keep: 'diskValue' } }; // `removable` deliberately absent
+    const pruned = pruneProjectConfig(resolved as never, onDisk as never, defaults as never) as
+      { section: Record<string, unknown> };
+    expect('removable' in pruned.section).toBe(false);
+    expect(pruned.section).toEqual({ keep: 'diskValue' });
+  });
+
   it('INVARIANT: pruning never changes what the project resolves to', () => {
     // The one assertion that catches every prune bug in one line.
     for (const onDisk of [

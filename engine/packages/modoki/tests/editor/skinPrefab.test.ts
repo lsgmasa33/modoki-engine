@@ -58,6 +58,7 @@ vi.mock('../../src/editor/undo/undoFailure', () => ({
 }));
 
 import { makeRigPrefabAsset } from '../../src/editor/scene/skinPrefab';
+import { jsonFileBody } from '../../src/editor/backend/editorBackend';
 
 const RIG_BONES = [{ x: 0, y: 0, rot: 0, name: 'root', parent: -1 }];
 
@@ -162,7 +163,7 @@ describe('makeRigPrefabAsset undo/redo — success paths', () => {
     await action.redo();
 
     expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/new3.prefab.json', JSON.stringify(prefab, null, 2));
+    expect(writeAssetFileSpy).toHaveBeenCalledWith('/new3.prefab.json', jsonFileBody(prefab));
     expect(registerAssetSpy).toHaveBeenCalledWith('g-new', '/new3.prefab.json', 'prefab');
     expect(setPrefabCacheSpy).toHaveBeenCalledWith('g-new', prefab);
   });
@@ -219,7 +220,7 @@ describe('makeRigPrefabAsset undo/redo — success paths', () => {
     await action.redo();
 
     expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', JSON.stringify(newPrefab, null, 2));
+    expect(writeAssetFileSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', jsonFileBody(newPrefab));
     expect(registerAssetSpy).toHaveBeenCalledWith('g-existing', '/rigs/existing.prefab.json', 'prefab');
     expect(setPrefabCacheSpy).toHaveBeenCalledWith('g-existing', newPrefab);
   });

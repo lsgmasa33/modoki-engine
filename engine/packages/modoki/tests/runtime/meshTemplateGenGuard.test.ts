@@ -98,4 +98,60 @@ describe('loadModelTemplates — cacheGeneration guard (F11)', () => {
     expect(h.pending[0].geoDispose).toHaveBeenCalled();
     expect(h.pending[0].matDispose).toHaveBeenCalled();
   });
+
+  // #863: `invalidateModel` (an editor re-import) used to bump ONLY the module-wide generation
+  // (never — it didn't touch cacheToken at all), so a load carrying the PRE-import bytes that
+  // resolved after the re-import re-cached the stale template on top of the fresh one. Distinct
+  // from the two tests above: those cover the FULL-teardown path (`disposeAllCachedResources`,
+  // which already bumped `cacheToken` wholesale); this one is the PER-KEY path that had no
+  // liveness check at all before #863.
+  it('drops + disposes the stale load when invalidateModel evicts the SAME path mid-load, not just on full teardown', async () => {
+    const cache = await import('../../src/runtime/loaders/meshTemplateCache');
+    const p = cache.loadModelTemplates(ISLAND, undefined, 'none');
+    await waitForLoaderImport();
+    expect(h.pending).toHaveLength(1);
+
+    // A re-import lands while the OLD parse is still in flight — a per-key evict, not a full
+    // disposeAllCachedResources.
+    cache.invalidateModel(ISLAND);
+
+    h.pending[0].fire(); // the pre-invalidation bytes resolve AFTER the evict
+    await p;
+
+    // FAILS before #863: the stale load would re-populate the cache with the old template.
+    expect(cache.getTemplatesForModel(ISLAND).size).toBe(0);
+    expect(h.pending[0].geoDispose).toHaveBeenCalled();
+    expect(h.pending[0].matDispose).toHaveBeenCalled();
+  });
+
+  it('an invalidateModel on an UNRELATED path does not refuse this path\'s in-flight load (per-key, not module-wide)', async () => {
+    const cache = await import('../../src/runtime/loaders/meshTemplateCache');
+    const p = cache.loadModelTemplates(ISLAND, undefined, 'none');
+    await waitForLoaderImport();
+    expect(h.pending).toHaveLength(1);
+
+    cache.invalidateModel('/other-model.glb'); // unrelated path — must not supersede ISLAND's load
+
+    h.pending[0].fire();
+    await p;
+
+    expect(cache.getTemplatesForModel(ISLAND).size).toBe(1); // promoted, not refused
+    expect(h.pending[0].geoDispose).not.toHaveBeenCalled();
+  });
+
+  it('a full teardown still supersedes even an UNRELATED in-flight load (invalidateAll wins over any per-key state)', async () => {
+    const cache = await import('../../src/runtime/loaders/meshTemplateCache');
+    const p = cache.loadModelTemplates(ISLAND, undefined, 'none');
+    await waitForLoaderImport();
+    expect(h.pending).toHaveLength(1);
+
+    cache.disposeAllCachedResources(); // full teardown — must drop ISLAND's load too, no invalidateModel(ISLAND) call at all
+
+    h.pending[0].fire();
+    await p;
+
+    expect(cache.getTemplatesForModel(ISLAND).size).toBe(0);
+    expect(h.pending[0].geoDispose).toHaveBeenCalled();
+    expect(h.pending[0].matDispose).toHaveBeenCalled();
+  });
 });

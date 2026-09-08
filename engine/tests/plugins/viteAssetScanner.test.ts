@@ -9,7 +9,6 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import fsSync from 'node:fs';
 import pathMod from 'node:path';
 import path from 'path';
 import fs from 'fs';
@@ -18,13 +17,14 @@ import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
-  isUnderAssetRoot,
+  isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
-  otaPublishBundleNameAllowed, otaSigningKeyRefusal, isGcloudObjectNotFoundError,
+  otaPublishBundleNameAllowed, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
+import { readScannedSource } from '@modoki/engine/testing';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -70,6 +70,15 @@ describe('detectType', () => {
   });
   it('classifies a .hdr as an environment asset', () => {
     expect(detectType('/games/x/assets/env/studio.hdr', '.hdr')).toBe('environment');
+  });
+  /** `.obj`/`.dae` → 'model' is the whole premise `selectedAssetTypeFor.test.ts` mocks — that
+   *  test only asserts what the Inspector does GIVEN a 'model' type, it never asserts the
+   *  scanner actually produces one. Without this pin, dropping `.obj`/`.dae` from EXT_TYPE
+   *  would make `selectedAssetTypeFor` silently return 'unknown' and the Assets panel's
+   *  source-model badge would go dead, with every existing test staying green (#423). */
+  it('classifies .obj and .dae as source models (selectedAssetTypeFor depends on this)', () => {
+    expect(detectType('/games/x/assets/models/chair.obj', '.obj')).toBe('model');
+    expect(detectType('/games/x/assets/models/chair.dae', '.dae')).toBe('model');
   });
   /** Regression: `.meta.local.json` (the gitignored machine-local byte-stats half of the
    *  sidecar split — see meta-sidecar.ts) does NOT end with `.meta.json`, so before #54's
@@ -164,8 +173,28 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
     expect(detectType('/games/x/assets/config/settings.json', '.json')).toBeNull();
     expect(classifySceneChange('/games/x/assets/config/settings.json')).toBeNull();
   });
-  it('does NOT broadcast typed sibling assets with no runtime cache (.mat/.mesh)', () => {
-    expect(classifySceneChange('/games/x/assets/materials/metal.mat.json')).toBeNull();
+  // ⚠️ THIS TEST WAS DEFENDING THE BUG (#842). It asserted `.mat.json` classifies as null on the
+  // stated grounds that materials have "no runtime cache". That premise was false when it was
+  // written — `invalidateMaterial` (meshTemplateCache.ts) has existed throughout, and materials
+  // are exactly as cached as the kinds below. The consequence was the whole of #842's member 1: no
+  // broadcast for a `.mat.json` meant `dropParkedWriteFor` could never fire for one, so once #831
+  // made the Material Inspector PARK its edits, a stale parked doc silently overwrote a newer file
+  // at the next Cmd+S. A green test asserting the defect is intended is what stopped anyone
+  // re-checking. Same shape as `reimportNotify.test.ts` asserting the old model|texture filter on
+  // the false premise that an audio clip is "not a GPU cache the renderer keys by path"
+  // (docs/editor.md § "The asset Inspector", rule 5) — twice now, so the lesson is the pattern, not
+  // the instance: a test whose NAME states a reason is only as good as the reason.
+  it("broadcasts a .mat.json as 'material' — it IS cached (#842)", () => {
+    expect(classifySceneChange('/games/x/assets/materials/metal.mat.json')).toBe('material');
+  });
+  it("broadcasts a .shader.json as 'shader' — spriteMaterialCache holds it by GUID (#842)", () => {
+    expect(classifySceneChange('/games/x/assets/shaders/holo.shader.json')).toBe('shader');
+  });
+  // `.mesh.json` genuinely does not broadcast, but note the REASON is not "no cache" either —
+  // `meshAssetCache` exists. It is that no mesh doc is agent-writable or parkable
+  // (`mesh` is not in ASSET_SCHEMA_TYPES), so nothing can park a stale one or edit it live. If a
+  // mesh ever becomes writable, this line is the one that has to move with it.
+  it('does NOT broadcast a .mesh.json — not writable, so nothing can go stale live', () => {
     expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBeNull();
   });
   // Cache-invalidation kinds: NOT a scene reload (that would discard unsaved work) — the
@@ -203,6 +232,87 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
     for (const { type, sample, kind } of CACHED_ASSET_TYPES) {
       expect(classifySceneChange(sample), `${type} must broadcast a cache-invalidation kind`).toBe(kind);
     }
+  });
+});
+
+/** The watcher's shader-BODY remap (#857): editing the `.glsl`/`.wgsl` file an author
+ *  actually iterates on (`ShaderAssetView.tsx` tells them to edit it) used to broadcast
+ *  NOTHING, because `onChange` gated the whole `modoki:scene-changed` path on the changed
+ *  file's own extension being `.json`. `pathToClassifyForChange` is the extracted piece of
+ *  `onChange` that decides which path to classify — the file itself for `.json`, or the
+ *  sibling `.shader.json` descriptor for a body (when it exists on disk) — tested directly
+ *  per this file's own module doc, since the surrounding Vite plugin/watcher wiring isn't
+ *  testable without a mocked server. */
+describe('pathToClassifyForChange (shader body → descriptor remap, #857)', () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-shader-remap-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('a .glsl body with a sibling descriptor remaps to the descriptor, classified as shader', () => {
+    const manifestPath = path.join(tmpDir, 'holo.shader.json');
+    const bodyPath = path.join(tmpDir, 'holo.glsl');
+    fs.writeFileSync(manifestPath, '{"params":{}}');
+    fs.writeFileSync(bodyPath, 'vec4 main() { return vec4(1.0); }');
+
+    const target = pathToClassifyForChange(bodyPath);
+    expect(target).toBe(manifestPath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('shader');
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: tmpDir }];
+    expect(absToAssetUrl(target!, roots)).toBe('/games/x/assets/holo.shader.json');
+  });
+
+  it('same for a .wgsl body', () => {
+    const manifestPath = path.join(tmpDir, 'holo.shader.json');
+    const bodyPath = path.join(tmpDir, 'holo.wgsl');
+    fs.writeFileSync(manifestPath, '{"params":{}}');
+    fs.writeFileSync(bodyPath, 'fn main() -> vec4<f32> { return vec4<f32>(1.0); }');
+
+    const target = pathToClassifyForChange(bodyPath);
+    expect(target).toBe(manifestPath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('shader');
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: tmpDir }];
+    expect(absToAssetUrl(target!, roots)).toBe('/games/x/assets/holo.shader.json');
+  });
+
+  it('a .glsl body with NO sibling descriptor yields no target — not a shader change', () => {
+    const bodyPath = path.join(tmpDir, 'orphan.glsl');
+    fs.writeFileSync(bodyPath, 'vec4 main() { return vec4(1.0); }');
+    expect(pathToClassifyForChange(bodyPath)).toBeNull();
+  });
+
+  it('leaves .json changes unaffected — a .scene.json still classifies as scene', () => {
+    const scenePath = path.join(tmpDir, 'main.scene.json');
+    fs.writeFileSync(scenePath, '{"entities":[]}');
+    const target = pathToClassifyForChange(scenePath);
+    expect(target).toBe(scenePath);
+    expect(classifySceneChange(target!.split(path.sep).join('/'))).toBe('scene');
+  });
+});
+
+describe('absToAssetUrl \u2014 NFC normalization (#857)', () => {
+  it("normalizes an NFD-decomposed path to NFC, matching scanDir's own normalization", () => {
+    // '\u00e9' as NFD (bare 'e' U+0065 + combining acute accent U+0301, TWO codepoints) vs
+    // NFC (single precomposed U+00E9 codepoint, ONE codepoint) -- macOS stores non-ASCII
+    // filenames as NFD on disk. Built from explicit \u escapes (not a literal accented
+    // character in the source) so the byte sequence can't be silently re-normalized by an
+    // editor/tool somewhere in the authoring pipeline.
+    const nfd = 'caf\u0065\u0301.glsl'; // c, a, f, e, COMBINING ACUTE ACCENT
+    const nfc = 'caf\u00e9.glsl'; // c, a, f, LATIN SMALL LETTER E WITH ACUTE
+    // Guard: if this ever ran on a system that handed us NFC already, the rest of the test
+    // would pass by accident.
+    expect(nfd).not.toBe(nfc);
+    expect(nfd.normalize('NFC')).toBe(nfc);
+
+    const roots: AssetRoot[] = [{ urlPrefix: '/games/x/assets', absDir: '/project/assets' }];
+    const url = absToAssetUrl(path.join('/project/assets', nfd), roots);
+    expect(url).toBe(`/games/x/assets/${nfc}`);
+    expect(url).not.toBe(`/games/x/assets/${nfd}`);
   });
 });
 
@@ -1217,6 +1327,15 @@ describe('classifySceneChange — animation (C7)', () => {
     expect(classifySceneChange('/games/x/assets/prefabs/tree.prefab.json')).toBe('prefab');
   });
 
+  it("broadcasts an .animset.json as 'animset' — the EXTERNAL-write half of #74's sixth instance", () => {
+    // `invalidateAnimSet` was never callerless (the Inspector's AnimSetAssetView drives it), so
+    // an animset edited in the editor always invalidated. What was dead was every write from
+    // OUTSIDE: `modoki_write_asset`, or the user's own Claude Code editing the file directly —
+    // this function had no case, so the verdict fell through to null and nothing was broadcast,
+    // and `animSetCache` served the pre-edit clip params (speed/loop/fade) forever.
+    expect(classifySceneChange('/games/x/assets/models/rig.animset.json')).toBe('animset');
+  });
+
   it('does not mistake a sibling animation-ish asset for a clip', () => {
     // .animset.json / .spriteanim.json are different types with their own caches — a wrong
     // 'animation' here would invalidate a clip that was never loaded (harmless) but a wrong
@@ -1236,10 +1355,11 @@ describe('classifySceneChange — animation (C7)', () => {
  * where it mattered. Duplicated logic rots; one function cannot.
  */
 describe('the Electron watcher must not re-implement classifySceneChange', () => {
-  const src = fsSync.readFileSync(
-    pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'), 'utf8',
-  );
-  const code = src.split('\n').map((l) => (/^\s*(\/\/|\*|\/\*)/.test(l) ? '' : l)).join('\n');
+  const src = readScannedSource(
+    pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'),
+  ).code;
+  // Already stripped at the read (#816) — this line filter matched nothing.
+  const code = src;
 
   it('calls the shared classifier', () => {
     expect(code).toMatch(/classifySceneChange\(/);
@@ -1324,21 +1444,135 @@ describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
   });
 });
 
-describe('isGcloudObjectNotFoundError (version-collision preflight)', () => {
-  it('recognizes the "not found: 404" form (gcloud storage cat on a missing object)', () => {
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) gs://bucket/x not found: 404.')).toBe(true);
+// #577: the /api/ota/publish route used to run its OWN version-collision check by manifest
+// EXISTENCE (a `gcloud storage cat .../manifest.json` preflight), and — running before
+// ota-publish.mjs's content-based check — that weaker guard short-circuited the stronger
+// one, permanently burning a version string for a publish that died after upload but
+// produced IDENTICAL bytes on retry. The route is an SSE handler that is not exported, so
+// this asserts against the route's source text directly. Deliberately brittle: it isolates
+// the handler body with stable anchors and fails LOUDLY (not vacuously) if either anchor
+// goes missing, so the test cannot silently stop checking anything.
+describe('/api/ota/publish route has no collision guard of its own (#577)', () => {
+  const source = readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code;
+  const START_ANCHOR = "req.url === '/api/ota/publish'";
+  const END_ANCHOR = '})().finally(otaRelease.onPipelineEnd);';
+
+  /** The route is an SSE handler, not an exported function, so the only reachable check is
+   *  on its source text. Throws rather than returning empty when an anchor moves — a
+   *  region this cannot find must fail the suite, never silently shrink to nothing. */
+  const routeBody = (): string => {
+    const startIdx = source.indexOf(START_ANCHOR);
+    const endIdx = source.indexOf(END_ANCHOR);
+    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+      throw new Error(
+        `#577 regression test: could not isolate the /api/ota/publish handler in ` +
+        `vite-asset-scanner.ts (start anchor ${JSON.stringify(START_ANCHOR)} ` +
+        `${startIdx === -1 ? 'MISSING' : 'ok'}, end anchor ${JSON.stringify(END_ANCHOR)} ` +
+        `${endIdx === -1 ? 'MISSING' : endIdx <= startIdx ? 'BEFORE START' : 'ok'}). The route was ` +
+        `moved or reworded. Re-point the anchors, then confirm the assertions below still cover ` +
+        `the intended region before trusting a green run.`,
+      );
+    }
+    return source.slice(startIdx, endIdx + END_ANCHOR.length);
+  };
+
+  /** Comment lines removed so the assertions below are about CODE only. Without this the
+   *  guard forbids DESCRIBING itself: a maintainer writing "do not re-add the `gcloud
+   *  storage cat .../manifest.json` preflight here" would turn the suite red with a message
+   *  telling them the code does the thing their comment says not to do — in a repo whose
+   *  convention is heavy explanatory comments, that lands fast. Deliberately conservative:
+   *  only lines whose trimmed form OPENS a comment are dropped, never a trailing `//` on a
+   *  line of code, because `'https://…'` inside a real call would take the code with it and
+   *  turn a false positive into a false NEGATIVE — the direction that actually costs.
+   *
+   *  Two known edges, neither worth code today (both checked against this file's real style):
+   *  a block comment whose continuation lines do NOT start with `*` keeps those lines, so
+   *  describing the preflight in that style still turns this red — fails SAFE, just noisy.
+   *  A line that opens `/*` and closes it before real code (`/* c8 ignore next *​/ execFile…`)
+   *  is dropped whole and WOULD evade both assertions — that is the false-negative shape to
+   *  watch; `^\s*\/\*.*\*\/\s*\S` currently matches nowhere in the plugin sources. */
+  const routeCode = (): string => routeBody()
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
+    .join('\n');
+
+  it('isolates the route handler body between stable start/end anchors', () => {
+    expect(routeBody().length).toBeGreaterThan(0);
+    // The strip must not eat the body whole — a `routeCode()` of nothing would pass every
+    // assertion below for the wrong reason.
+    expect(routeCode()).toContain('ota-publish.mjs');
   });
 
-  it('recognizes the "matched no objects or files" form', () => {
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\ngs://bucket/x')).toBe(true);
+  // ⚠️ Scope, stated honestly: this catches a re-add written INLINE in this route. It cannot
+  // see a guard hidden behind a helper — `engine/plugins/backend/gcloud.ts` already exists as
+  // the shared home for exactly this kind of call, and a preflight written as
+  // `if (await readGcsJson(bucket, …))` would put no matching text in this region at all.
+  // Nothing structural can cover that; the real defence there is the Step 3 comment and the
+  // #577 Gotchas entry in docs/ota-updates.md.
+  //
+  // Two order-independent assertions rather than one ordered regex, because the deleted code
+  // built `manifestPath` on a line ABOVE its `execFileSync('gcloud', […])` — a single
+  // `gcloud → storage → cat → manifest.json` pattern does NOT match the very code this
+  // guards against (verified by running one over the pre-fix source). A guard that only
+  // catches re-adds shaped like its own mutation test is not a guard.
+  it('never names a versioned manifest.json — nothing here may reason about one', () => {
+    expect(
+      routeCode().includes('manifest.json'),
+      '#577: the /api/ota/publish route must not reference a bundle manifest at all. It used to ' +
+      'build `bundles/<name>/<version>/manifest.json` for an EXISTENCE-based collision preflight ' +
+      'that ran BEFORE ota-publish.mjs and short-circuited that script\'s CONTENT-based guard, ' +
+      'permanently refusing a legitimate identical-bytes retry through the editor dialog and the ' +
+      'MCP tool. ota-publish.mjs is the single source of truth — see the Step 3 comment in the ' +
+      'route for why a guard here would just re-implement the script.',
+    ).toBe(false);
   });
 
-  it('does NOT treat an auth/network error as "not found" — the ambiguity fix', () => {
-    // Before this fix, ANY gcloud failure (including these) was silently treated as "no
-    // collision, proceed" — letting a publish past the guard meant to catch a version a
-    // device already rejected. See ota-updates.md's Gotchas.
-    expect(isGcloudObjectNotFoundError('ERROR: You do not currently have an active account selected.')).toBe(false);
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) HTTPError 403: Permission denied')).toBe(false);
-    expect(isGcloudObjectNotFoundError('')).toBe(false);
+  it('never reads bucket objects — not via `cat`, `ls`, or `objects describe`', () => {
+    // `cat` is how the removed preflight worked, but existence is just as readable with
+    // `storage ls <version-prefix>/` or `storage objects describe`, and a re-add would
+    // plausibly reach for either — so all three are refused. Matches the arg-array form
+    // (`'storage', 'cat'`) and a bash-string form alike. The CORS step's legitimate
+    // `gcloud storage buckets update` must NOT be flagged; the baseline run proves it isn't.
+    const objectRead = /['"`\s]storage['"`,\s]+['"`]?(cat|ls|objects['"`,\s]+['"`]?describe)\b/i;
+    expect(
+      objectRead.test(routeCode()),
+      '#577: the /api/ota/publish route must not read bucket objects to decide anything. ' +
+      'An existence-only collision preflight (`gcloud storage cat`, or an `ls`/`objects ' +
+      'describe` standing in for it) ran BEFORE ota-publish.mjs and short-circuited its ' +
+      'content-based guard. Reading an object here to gate the publish reintroduces a second ' +
+      'guard that races the one in ota-publish.mjs — and the two drifting IS the bug. ' +
+      '(Setting CORS via `gcloud storage buckets update` is fine and is not matched.)',
+    ).toBe(false);
+  });
+});
+
+
+
+describe('isSiblingRaisedChange — a body write must not discard the descriptor\'s parked edit (#857 close-out)', () => {
+  const DESC = '/games/g/assets/shaders/holo.shader.json';
+  const BODY = '/games/g/assets/shaders/holo.wgsl';
+
+  it('a body write is sibling-raised, so the parked descriptor edit survives', () => {
+    expect(isSiblingRaisedChange(BODY, DESC, undefined)).toBe(true);
+  });
+
+  it('a write to the descriptor itself is NOT sibling-raised — disk really is authoritative', () => {
+    expect(isSiblingRaisedChange(DESC, DESC, undefined)).toBe(false);
+  });
+
+  it('a direct descriptor write ANYWHERE in the debounce window wins over earlier body writes', () => {
+    // foo.wgsl, then foo.glsl, then foo.shader.json — all collapse onto ONE urlPath. The parked
+    // edit IS stale after that last one, so the AND must fall to false and stay there.
+    let flag = isSiblingRaisedChange(BODY, DESC, undefined);
+    expect(flag).toBe(true);
+    flag = isSiblingRaisedChange('/games/g/assets/shaders/holo.glsl', DESC, flag);
+    expect(flag, 'two body writes are still sibling-raised').toBe(true);
+    flag = isSiblingRaisedChange(DESC, DESC, flag);
+    expect(flag, 'the direct write flips it').toBe(false);
+  });
+
+  it('once flipped by a direct write, a later body write in the same window cannot flip it back', () => {
+    const afterDirect = isSiblingRaisedChange(DESC, DESC, undefined);
+    expect(isSiblingRaisedChange(BODY, DESC, afterDirect)).toBe(false);
   });
 });

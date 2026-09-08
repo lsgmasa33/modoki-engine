@@ -74,13 +74,14 @@ The producers — `computeLayoutBounds()`, `readWatch()`, `journalEvents()`, `re
 `computeHandles()`, `dumpSceneState()` — are **not** private to the agent surface. The editor's own
 Debug Menu UI and diagnostics consume them, at full fidelity, in-process:
 
-- `engine/app/debug/diagnose.ts:72` calls `computeLayoutBounds()` with no params and reads
-  `.offScreen`. A counts-only *producer* would make `offScreen` undefined → `.length` throws →
-  `engine/tests/framework/diagnose.test.ts` goes red and `modoki_diagnose` breaks in the field.
-- `engine/app/debug/WatchTab.tsx:71,89` calls `readWatch(id)` with no flags and renders
+- `engine/app/debug/diagnose.ts`'s `computeDiagnostics` calls `computeLayoutBounds()` with no
+  params and reads `.offScreen`. A counts-only *producer* would make `offScreen` undefined →
+  `.length` throws → `engine/tests/framework/diagnose.test.ts` goes red and `modoki_diagnose`
+  breaks in the field.
+- `engine/app/debug/WatchTab.tsx`'s `WatchCard` calls `readWatch(id)` with no flags and renders
   `s.samples.map(x => x.value)` into a `Sparkline`. A stats-only *producer* would blank the human's
   sparkline.
-- `JournalTab.tsx:27-29` calls `journalEvents()` and tail-slices it itself.
+- `JournalTab.tsx`'s `JournalTab` calls `journalEvents()` and tail-slices it itself.
 - `engine/tests/electron/handlesDump.test.ts` and `engine/packages/modoki/tests/runtime/journal.test.ts`
   assert on full producer output.
 
@@ -92,7 +93,7 @@ itself as a test failure until an editor panel goes blank.
 
 A corollary, learned adversarially:
 
-> **A byte cap must never mid-slice JSON.** `engine/tools/modoki-mcp/test-smoke.mjs:28` does
+> **A byte cap must never mid-slice JSON.** `engine/tools/modoki-mcp/test-smoke.mjs` does
 > `JSON.parse(text(state))` on a `get_scene_state` result, and the model (the real consumer) parses
 > the text too. A naive `text.slice(0, 60_000)` yields unparseable garbage. When a payload exceeds
 > the cap, the system returns a **valid JSON envelope** describing the elision, never a truncated
@@ -169,21 +170,22 @@ with a default `limit` and a `hint`:
     { "id": 12, "guid": "…", "name": "Island", "parentId": null, "layer": "3d",
       "traits": ["Transform", "Renderable3D", "ModelSource"] }
   ],
-  "hint": "Names-only index. Drill down: full=1 (all field values), trait=Transform, id=N, name=<substr>, where=\"Transform.y > 3\", limit=N."
+  "hint": "Index only — trait NAMES, no values. Drill down: full=1 (all field values), trait=<Trait>, id=<n>, name=<substr>, where=\"Transform.y > 3\". Enrichers: world=1, bounds=1, contacts=1, resources=1."
 }
 ```
 
 Measured **~40,123 → 5,938 tokens**. The 135 × (36-char GUID + trait-name array) dominates, which is
 why it isn't smaller. `full=1` / `trait=` / `id=` / `name=` / `where=` return the curated dump with
-field values — they are all in the producer's `targeted` set (`agentBridge.ts:260`), so any targeted
-query returns values. An untargeted `full=1` now exceeds the compaction cap and returns the elision
-envelope + hint — correct, but it means "give me literally everything" is no longer one call; use
-`trait=`/`id=`/`limit=`.
+field values — they are all in the producer's `targeted` set (`agentBridge.ts`'s `dumpSceneState`),
+so any targeted query returns values. An untargeted `full=1` now exceeds the compaction cap and
+returns the elision envelope + hint — correct, but it means "give me literally everything" is no
+longer one call; use `trait=`/`id=`/`limit=`.
 
 The default `limit` applies only when the caller passed none, so an explicit `limit:100000` still
 wins. Implemented at the **route/tool boundary**, not in `dumpSceneState()`:
-`engine/electron/main.ts:638-642` (`captureGesture`'s Watch sampler) calls the `scene-state` op with
-`trait:'Transform'` — targeted, so it keeps values regardless, and the producer is untouched.
+`engine/electron/main.ts`'s `/api/capture-gesture` route (`captureGesture`'s Watch sampler)
+calls the `scene-state` op with `trait:'Transform'` — targeted, so it keeps values regardless,
+and the producer is untouched.
 
 ### `get_layout_bounds` — counts-first, `overlaps` opt-in
 
@@ -205,16 +207,17 @@ Measured **73,849 → 68 tokens.** The bare call still reports `overlapsCount` (
 survives, only the serialized pairs are gone. `overlaps=1` costs ~19,350 tok, `layer=3d` ~18,772.
 
 - `entities[]` is returned only when `ids` or `layer` is passed, with a `limit`.
-- `overlaps[]` is returned only behind `overlaps:true`, and the O(n²) pair loop
-  (`layoutDump.ts:100-107`) is **guarded** so the default doesn't pay to compute 2,625 pairs it then
-  discards. That double-loop otherwise emits more characters than all 241 rects combined.
-- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts:72` reads `.offScreen` off a
-  no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete instance of the
-  architectural rule: summarize at the route, and `diagnose.ts`, which calls the producer
-  in-process, never notices. `agentBridge.ts:280` (the `scene-state?bounds=1` enricher) passes
-  `ids`, so it keeps its rects.
-- `zeroSize` aggregate is included (each `LayoutEntry.zeroSize` was already computed per entry at
-  `layoutDump.ts:21,51,64`; only the aggregate was missing).
+- `overlaps[]` is returned only behind `overlaps:true`, and the O(n²) pair loop inside
+  `layoutDump.ts`'s `computeLayoutBounds` is **guarded** so the default doesn't pay to compute
+  2,625 pairs it then discards. That double-loop otherwise emits more characters than all 241
+  rects combined.
+- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
+  `.offScreen` off a no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete
+  instance of the architectural rule: summarize at the route, and `diagnose.ts`, which calls the
+  producer in-process, never notices. `agentBridge.ts`'s `dumpSceneState` (the `scene-state?bounds=1`
+  enricher) passes `ids`, so it keeps its rects.
+- `zeroSize` aggregate is included (each `LayoutEntry.zeroSize` was already computed per entry
+  inside `layoutDump.ts`'s `computeLayoutBounds`; only the aggregate was missing).
 
 ### `list_assets` / `list_traits` — index-first with real filters
 
@@ -231,7 +234,8 @@ Both were flat full dumps of things the agent almost never needs in full.
 ```
 
 `folder` (path prefix) and `name` (substring) filters are available, and the `type` filter is
-applied **server-side** (previously it fetched all 320 and filtered in `index.ts:310-315`).
+applied **server-side** — in `summarizeAssets` (`engine/tools/modoki-mcp/src/summarize.ts`), called
+from `modoki_list_assets` in `engine/tools/modoki-mcp/src/tools/scene.ts`.
 
 **`list_traits`** (10,703 → ~200 tokens) defaults to trait **names** only; `name=<Trait>` fetches
 one trait's full field schema. The usage pattern is: know what exists, then fetch one schema before
@@ -295,35 +299,69 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` over the 500-entry `consoleBuffer` (`agentBridge.ts:153`) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry → **20–27k tok** |
-| `watch` (`read`) | `readWatch()` — `WatchTab.tsx:89` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
-| `journal` | `journalEvents()` — cap `10_000` (`journal.ts:58`) — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
-| `editor_journal` | `readEditorJournal()` — cap `2000` (`editorJournal.ts:36`) | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
-| `handles` | `computeHandles()` — `inputRoutes.ts:168` calls the OP to resolve `tap_handle` | **the HTTP router**, not the op | `byEditor`/`byKind` counts unless `editor`/`kind`/`ids` | 374 B/keyframe-handle → **56k–187k tok** (2,000-key Dopesheet) |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
+| `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
+| `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
+| `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
+| `handles` | `computeHandles()` — `inputRoutes.ts`'s `/api/input/tap-handle` route calls the OP to resolve `tap_handle` | **the HTTP router**, not the op | `byEditor`/`byKind` counts unless `editor`/`kind`/`ids` | 374 B/keyframe-handle → **56k–187k tok** (2,000-key Dopesheet) |
 
-**`handles` is the one whose seam is NOT the op.** `engine/electron/inputRoutes.ts:168` calls
-`requestRenderer('enact-handles', {ids:[id]})` to turn a handle id into coordinates for trusted
-input — it is an in-process consumer *of the op itself*. Summarizing there would break `tap_handle`,
-so the router is the agent's boundary and the op stays an internal service.
+**`handles` is the one whose seam is NOT the op.** `engine/electron/inputRoutes.ts`'s
+`/api/input/tap-handle` route calls `requestRenderer('enact-handles', {ids:[id]})` to turn a
+handle id into coordinates for trusted input — it is an in-process consumer *of the op itself*.
+Summarizing there would break `tap_handle`, so the router is the agent's boundary and the op
+stays an internal service.
 
-The buffer caps are: `journal` `MAX_EVENTS = 10_000` (`journal.ts:58`), `editor_journal` `2000`
-(`editorJournal.ts:36`), the agent console ring `CONSOLE_BUFFER_MAX = 500` (`agentBridge.ts:153`),
-`watch` `maxSamples` default `600` per (entity,field) series × `DEFAULT_MAX_SERIES = 512`
-(`watch.ts:191`, `:55`). Bounded, yes — but a `watch` on `Transform` across a populated scene has a
-ceiling in the millions of tokens, which is exactly why the boundary defaults to stats-only.
+The buffer caps are: `journal` `MAX_EVENTS = 10_000` (`journal.ts`), `editor_journal` `2000`
+(`editorJournal.ts`'s own `MAX_EVENTS`), the shared console ring 1000 in the editor / 512 on a
+debug device build (`installConsoleRing.ts`; `agentBridge.ts`'s old `CONSOLE_BUFFER_MAX = 500`
+no longer exists), `watch` `maxSamples` default `600` per (entity,field) series ×
+`DEFAULT_MAX_SERIES = 512` (`watch.ts`). Bounded, yes — but a `watch` on `Transform` across a
+populated scene has a ceiling in the millions of tokens, which is exactly why the boundary
+defaults to stats-only.
 
-Note on the console producer: the real backing store is `dumpConsoleLogs` over `agentBridge.ts`'s
-500-entry `consoleBuffer`. Two *other* console buffers — the native game-debug TCP bridge
-(`bridge.ts`, cap 200) and the editor Debug Menu's `ConsoleTab` capture (`consoleCapture.ts`, cap
-300) — do NOT back `/api/console-logs`; the 500-entry ring is why the measured ceiling is ~20–27k
-tokens, not the ~8–12k a 200/300 cap would imply.
+Note on the console producer, **rewritten by #596/#597** — the old note described three separate
+console buffers (agentBridge's 500, the TCP bridge's 200, the debug menu's 300) and said only the
+first backed `/api/console-logs`. There are no longer three. `runtime/core/consoleRing.ts` is the
+ONE CAPTURE RING for app + runtime — not the only code anywhere that touches `console.*` (see the
+caveat two paragraphs down), but the only thing any agent-facing reader draws from: agentBridge,
+`deviceConsoleCapture` and `runtime/debug` are all projections of it, so `get_console_logs`,
+`device_console_logs`, `diagnose` and the in-game Console tab now read the same entries. (The editor
+Console panel's `logBuffer`, cap 1000, is still its own wrapper — editor-only, and it backs no agent
+surface; #626.)
+
+⚠️ **Three OTHER `console.*` wrappers exist, permanently or temporarily, for reasons unrelated to
+agent tooling — naming them so a future `grep`-for-`console.warn =` isn't surprised.**
+`runtime/core/globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error`/`console.warn`
+PERMANENTLY to mirror both to Crashlytics. `runtime/core/warnSuppress.ts`'s
+`beginSuppressRapierInitWarning` and `editor/scene/warnFilter.ts`'s `withWarnFilter` each wrap
+`console.warn` TEMPORARILY — ref-counted around a Rapier init call, and scoped to one
+`renderer.render` call, respectively — to swallow one specific known-noisy line (a Rapier
+deprecation warning; Three.js r183 WebGPU's `'Light node not found'`) for the duration of that one
+call. None of the three is a capture ring, none feeds `runtime/core/consoleRing.ts`, and no agent
+surface reads any of them — they exist entirely outside the "one ring" story above.
+
+⚠️ **~162 B/entry was measured before two later changes and is no longer reliable in either
+direction — treat the 40–54k-token line above as an order-of-magnitude ceiling, not a precise
+figure.** What IS still known: the cap is **1000** entries in the editor / 512 on a debug device
+build, read from `installConsoleRing.ts`'s source rather than re-measured live, and the first 128 of
+those are a pinned boot prefix eviction never touches (a device debug build's 512 matches the 200+300
+it replaced). What is NOT re-measured is bytes/entry, and it now pulls in both directions from where
+~162 B/entry was taken: the ring captures `console.info` for the first time (entries the old
+three-level buffers never saw at all, typically short one-liners — pulling the average DOWN), while a
+separate fix restores full `Error.stack` traces to `console.error(err)` entries (flattened to `{}` in
+between, now large again, as they were before that regression — pulling the average UP). Neither
+effect has been re-measured against the current ring, so the honest statement is: cap and pinned
+prefix are measured facts from source, ~162 B/entry is a stale measurement, and 40–54k tokens is a
+derivation from a figure now known to be wrong in an unknown direction. The one thing unaffected: the
+*default* response is still the last 50 entries, so this ceiling only matters for an explicit large
+`limit`, not routine reads.
 
 ## Fixed bugs (historical, for context)
 
 These were the concrete waste sources, now resolved:
 
 - **Every scene edit echoed the entire scene file back.**
-  `engine/plugins/backend/editorBackendRouter.ts:505` returned
+  `engine/plugins/backend/editorBackendRouter.ts`'s `/api/scene-mutate` route returned
   `scene: changed > 0 ? scene : undefined`. A `setTrait` always changes something, so it always
   echoed — **~10,166 tokens per call**; a ten-edit loop burned ~100k tokens of pure echo. Worse, the
   echoed object was the pre-expansion scene *file*, not the live world, so it wasn't even the
@@ -334,9 +372,9 @@ These were the concrete waste sources, now resolved:
   ~10,166 → ~50 tokens.
 
 - **`device_screenshot` inlined a full-resolution base64 image even when `savePath` was given.**
-  `engine/tools/game-debug-mcp/src/mcp-tools.ts:309-362` wrote the file, opened Preview, *and*
-  returned the blob (iOS `drawHierarchy` captures at ~1800px). It now returns path + dimensions as
-  text and inlines the image only on an explicit `inline:true`, matching modoki's own
+  `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s `device_screenshot` tool wrote the file, opened
+  Preview, *and* returned the blob (iOS `drawHierarchy` captures at ~1800px). It now returns path +
+  dimensions as text and inlines the image only on an explicit `inline:true`, matching modoki's own
   `capture_viewport` / `render_scene` / `render_sequence`, which return file paths. **Coordinate
   contract caveat:** the tool's info text says "use these pixel coordinates for
   `device_tap`/`device_drag`" — if a future size fix ever downscales the returned image, the reported
@@ -345,14 +383,17 @@ These were the concrete waste sources, now resolved:
   of throwing, and brought both `tools/` packages under `npm run verify` typecheck (neither was
   before).
 
-- **`list_assets`'s `type` filter was applied client-side**, after fetching all 320 assets
-  (`index.ts:310-315`). Moved server-side alongside the new `folder`/`name` filters.
+- **`list_assets`'s `type` filter was applied client-side**, after fetching all 320 assets (once
+  in `index.ts`; the tools split into `src/tools/*.ts` since, so it's now `summarizeAssets` in
+  `engine/tools/modoki-mcp/src/summarize.ts`, called from `modoki_list_assets` in
+  `engine/tools/modoki-mcp/src/tools/scene.ts`). Moved server-side alongside the new `folder`/`name`
+  filters.
 
 **Not a bug — `enact-handles`'s `editor` filter.** `?editor=chrome` once returned byte-identical
 output to the unfiltered call, which looked like a silently-ignored filter. It isn't: the filter is
-applied server-side (`interactionHandles.ts:103-105`); the bytes matched only because all 19 handles
-present happened to be chrome. Proven live: `?editor=skin` → 0, `?kind=drag` → 0. Recorded so the
-next reader doesn't re-chase it.
+applied server-side (`interactionHandles.ts`'s `collectHandles`); the bytes matched only because
+all 19 handles present happened to be chrome. Proven live: `?editor=skin` → 0, `?kind=drag` → 0.
+Recorded so the next reader doesn't re-chase it.
 
 Also verified during the work: `device_console_logs`/`device_native_logs` are NOT unbounded — both
 default to `limit:50`. And `device_screencap` is a temp FILENAME
@@ -369,6 +410,145 @@ default shape, (b) the drill-down params, (c) a size warning where the full dump
 
 The governing principle, so a newly added tool inherits it: **summary first, drill down on demand;
 producers stay full-fidelity, boundaries summarize.**
+
+## Definition surface — paid on every request, not just the big ones
+
+Everything above budgets **responses**. Nothing budgeted the tool **definitions** themselves —
+`tools/list`'s advertised schema — until #456, and that surface is paid on **every single request**
+a session makes, not once per session like a response.
+
+**Method** (re-run 2026-08-31 to close out #456's review): drive `npx tsx src/index.ts` from
+`engine/tools/modoki-mcp` over stdio via the `@modelcontextprotocol/sdk` `StdioClientTransport` +
+`Client.listTools()`, with `MODOKI_BACKEND=http://127.0.0.1:1` (`listTools` never touches the
+backend). Size = `JSON.stringify(result.tools).length`.
+
+| | chars | ~tok at chars/4 |
+|---|---|---|
+| `tools/list`, 105 tools, before the trim | 198,643 | ~49.7k |
+| `tools/list`, 105 tools, after the trim | 190,319 | ~47.6k |
+
+Three independent measurements of the "after" figure landed within 0.06% of each other (190,213 /
+190,319 / 190,329) — different serialization boundaries around the same payload, not disagreement
+about the surface. 190,319 is this doc's number of record; re-derive it with the method above rather
+than trusting any of the three by eye.
+
+⚠️ Same caveat as "How the numbers were measured" above: **no BPE tokenizer is installed on this
+machine**, and that section's own measurements show chars/4 **understating** a brace/quote-heavy
+JSON payload by 27–38%. Treat every figure here as a **floor**, not the real cost.
+
+**~14,372 chars of duplicated entity/point-spec prose REMAIN, and only ~1,800 of it is the PRICE of
+the no-`$ref` rule** — the rest is NOT recoverable by touching `makeEntitySpec`. Counted as: every
+description string belonging to `makeEntitySpec()`/`makePointSpec()` (`src/shapes.ts`) that appears
+2+ times on the surface, weighted by `(copies − 1) × length`. The entity spec is used at 6 call
+sites — `modoki_tap`, `modoki_pointer`, `modoki_hover`, `modoki_scroll`, and `modoki_drag` TWICE
+(`from` and `to`) — and `zodToJsonSchema` is invoked **per tool**, so it can only dedupe schema
+reused BY REFERENCE *within one tool's own shape*; it has no visibility across tools at all. That
+means **5 of those 6 copies are cross-tool inlining**, inherent to per-tool JSON-Schema
+serialization and unaffected by whether `makeEntitySpec` is a factory or a shared `const` — turning
+it into a `const` would not merge them, because there is no single schema object shared across
+`modoki_tap` and `modoki_drag` for `zod-to-json-schema` to recognize. Only the 6th copy —
+`modoki_drag`'s `to` duplicating its own `from`, both inside the SAME tool via `makePointSpec` — is
+what a shared `const` would actually collapse, and that is priced at ~1,800 chars below. So: ~1,800
+chars is the no-`$ref` rule's real cost; the remaining ~12,500 is cross-tool duplication a shared
+const cannot touch.
+
+**`makeEntitySpec()` in `engine/tools/modoki-mcp/src/shapes.ts` is a factory function, not a shared
+`const` schema, for a correctness reason, not a byte-savings one.** `zod-to-json-schema` dedupes a
+by-reference (shared-object) schema WITHIN one tool's shape into a `$ref`, which broke `modoki_dnd`
+(see the comment at `src/shapes.ts` and the guard `engine/tests/tools/mcpSchemaNoRef.test.ts`) — a
+client that does not resolve JSON-Schema `$ref` saw an untyped field and mis-encoded it. That is why
+nobody should "optimize" the factory into a shared const, independent of what it would or would not
+save in bytes.
+
+**Declined: a briefer `entity` description for `modoki_drag`'s `to` endpoint.** Only `modoki_drag`
+pays the entity-spec blob TWICE — once for `from`, once for `to` — via `makePointSpec`. Giving `to`
+a shorter description than `from` would save ~1,800 chars. Declined: it would add a second
+entity-spec shape to `shapes.ts` that a future tool could reach for wrongly — the same class of
+cleverness the `$ref`-avoidance comment above already warns against. One entity-spec shape, always
+the same wording, is worth more than 1,800 chars.
+
+## Definition surface under tool deferral (measured 2026-08-31)
+
+The section above states the definition surface is *"paid on every request rather than once per
+session."* **In Claude Code that premise is now false.** All 148 `modoki_*` + `device_*` tools
+arrive **deferred** — the client advertises names only and fetches a tool's schema on demand via
+tool search (the API's `defer_loading` + `tool_search_tool_*` mechanism). Schemas are appended when
+fetched, not swapped, so fetching one does not invalidate the cache.
+
+**Measured floor:** the 148 names cost **4,665 chars (~1.5-2.3k tokens)** against a **248,755-char**
+full surface (`modoki` 190,718 across 105 tools + `game-debug` 58,037 across 43). A session using
+ten tools pays roughly 9k, not 90k.
+
+⚠️ **This argument lost its load-bearing half on 2026-09-06 (#793).** The pin was justified here by
+the *non-deferring* clients — Cursor and Codex CLI, which were handed the byte-identical 3-server set
+by a generator that no longer exists, and were not known to defer. Support for them was removed.
+
+**The pin stays, and NOT because everything defers now.** Claude Code is the only client whose
+deferral has been *measured*; it is not the only client. **Claude Desktop's Chat tab** talks to the
+same `modoki` MCP server — the public guide (`site/docs/guide/ai-assistants.md`) walks a user
+through wiring it into `claude_desktop_config.json` — and nobody has measured whether it defers. So
+the un-measured non-deferring client is not hypothetical, it is documented and shipped. On top of
+that, deferral is client-side behaviour nobody here controls or tests, so an un-pinned surface is
+one client release away from being paid in full again.
+
+⚠️ **If the pin is ever re-examined, measure Desktop Chat first** — re-examining it on "the only
+client defers" would be reasoning from a premise this section has never established.
+
+**Method + caveat:** measured with the same `StdioClientTransport` + `Client.listTools()` recipe as
+the section above; `chars/4` understates these payloads by 27-38% per that section's own finding, so
+the ~85-100k full-surface figure is an estimate with a stated method, not a measurement. No BPE
+tokenizer is installed on this machine and `count_tokens` is a billed API call.
+
+Issue #475. The larger cost is `tools/list` **churn** — the `tools` block renders first in the
+cache prefix, so changing it invalidates tools + system + the whole message history — not the
+surface's size. Measured 2026-08-31: opening a project added 7 `court_*` tools to a live session's
+list and closing it removed them, so **every open, close and project swap costs one invalidation**.
+(The *reload* flap is by contrast rare — two sub-second route outages per game-code edit against a
+5 s poll, and only about 1-in-10 of those lands on a poll at all.)
+
+**The reload flap's fix:** `engine/tools/modoki-mcp/src/gameTools.ts` polls `/api/game-tools` and
+reconciled wholesale (`removeAll()` then re-register) on the first bad answer. That now requires
+**3 consecutive misses**, through **both** doors a reload can take. The first pass guarded only the
+*unreachable* door (non-200 / non-object body) — measured to barely fire: 138 polls across two
+forced reloads produced **zero** non-200s. The door a reload actually uses is a 200 carrying an
+empty tool list (`{"version":0,"tools":[]}`) — the agent bridge answers before the game's `setup()`
+re-registers its tools. Both doors now share the same grace, so a spurious teardown (which costs a
+whole conversation's cache) doesn't fire on a sub-second blip.
+
+**Declined, and why, so none of these get re-proposed:**
+- **`$defs`/`$ref` dedup of the shared aim shapes.** Forbidden by conventions §1 and guarded by
+  `mcpSchemaNoRef.test.ts` — a shared-object schema gets collapsed to a bare `$ref` with no `type`,
+  which a client that doesn't resolve `$ref` mis-encodes. Moot besides: ~12.5k of the ~14.4k
+  duplicated chars is *cross-tool* inlining (the `entity` spec repeated across `modoki_tap`,
+  `modoki_drag`, etc.) — `zod-to-json-schema` runs per tool and cannot dedupe across tools no matter
+  how the shape is authored.
+- **`MODOKI_MCP_PROFILE=core|full`** (a slim tool set for non-deferring clients). No beneficiary:
+  every Claude surface defers — main session AND subagents, confirmed by a probe subagent quoting
+  its own system-reminder — and the owner uses no non-deferring client. Would also have weakened
+  three real guards: the contract↔registry totality check (both directions), `liveCoverage.test.ts`'s
+  swept/smoke/listed totality, and the size ledger's shrink floor.
+- **The stable-pair redesign** (`modoki_game_tools` + `modoki_game_tool_call`, mirroring
+  `game-debug`'s discover/invoke pair, so opening/closing a project never changes `tools/list` at
+  all). The frequent transition (the reload flap) was already fixed above; what's left is the
+  deliberate one — a human opening/closing a project, observed ~4× in a long session. Its saving
+  can't be sized from inside a session (no access to `cache_read_input_tokens`), and the pair would
+  cost real discoverability (a name like `court_load_level` is visible today; behind the pair an
+  agent must ask before it knows there's anything to ask about). Declined in favour of the free
+  behavioural fix in CLAUDE.md § Editor ("don't churn the editor"). **Reopens if project swaps rise
+  to ~10+ per session.**
+- **The `open_*_editor` and view-mode tool merges.** §7-legal (identical `kind`/`method`/`route`),
+  but deferral inverts the benefit: the tool *name* is the whole interface when nothing else is
+  loaded ([mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a), so five self-describing
+  `open_*` names carry more free information than one
+  generic `open_editor` whose mode enum costs a round-trip to discover. The view-mode group is also
+  incoherent on its own terms — three different `mode` enums, and `set_game_view_device` isn't a
+  view mode at all.
+- **Trimming descriptions for size.** Under deferral a description is paid only when its schema is
+  fetched, so shrinking it saves near-nothing — and conventions §11 already says a description "is
+  read far more often than this file."
+
+See [mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a for the tool-name audit this same work
+produced.
 
 ## Open / deferred
 

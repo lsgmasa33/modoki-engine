@@ -78,6 +78,102 @@ discipline as `animationSystem` and `zoneTriggerCore`).
 - **The sim isn't running** (stopped/paused editor, `timeScale = 0`) — `getSimDelta` returns 0, so
   the whole system is inert. See below.
 
+### Muting a track
+
+`muted` is re-read every frame (not a read-once authored field), and it means the track **contributes
+nothing** — for a stateful track that means its effect is reconciled **OFF immediately**, the instant
+the flag flips, matching what the editor scrub already does. `applyDirectorFrame` detects the FLIP
+(mute is not a time edge, so `crossed()` can't express it) via a small memo keyed on
+`(world epoch, root id + generation, timeline GUID, track id)` and fires the off-edge right then,
+not at the clip's authored end.
+
+⚠️ **"Immediately" means "on the Director's next applied frame", which is not the same as "now".**
+`applyDirectorFrame` only runs for a Director that clears PASS 1 — playing, not paused, active in
+the hierarchy, and not a slaved child whose parent's clip has ended. Mute a control track on a
+Director in any of those states and the spawned prefab stays in the world until playback resumes.
+That is the issue's headline harm surviving in exactly the state a shipped game is most likely to be
+in when a flag is toggled from script, so if you mute from code, do not treat it as a despawn.
+
+Per track kind:
+
+- **`control` (prefab)** — muting despawns the tracked instance immediately; unmuting mid-span
+  respawns it if the playhead is still inside the clip (agrees with `previewControlAt`'s scrub
+  reconcile, which has always worked this way).
+- **`control` (particle, with a `duration`)** — muting pauses the emitter immediately; unmuting
+  mid-span restarts it. A duration-less impulse clip has no off state either way.
+- **`video`** — muting pauses immediately (the same dispatch the clip's own end makes). **Unmuting
+  does NOT restart the clip** — deliberately asymmetric with the control track: a video is a playback
+  with a *position*, not a presence, so restarting it mid-span would show the wrong part of the
+  cutscene, and there's no scrub twin here to disagree with (`previewControlAt` only reconciles
+  `control` tracks).
+- **`signal` / `audio` / `animation`** — these are stateless IMPULSES (a marker dispatch, a one-shot
+  cue, an `engine.playClip` trigger); there is nothing to turn off, so muting has no off-edge and
+  unmuting fires no retroactive catch-up for an edge the playhead already passed.
+- **`control` (subdirector)** — unchanged, and NOT the same case as above: muting a subdirector track
+  means the *parent* stops driving the child, so the child runs free on its own clock instead of
+  freezing (see the sub-director section below). This was already correct and already documented.
+
+**`applyTimelineState`'s pose path is now PER-TYPE, not a blanket `if (track.muted) continue`** —
+that changed with #452. A keyframe `animation` track keeps the blanket skip: a pose has no stored
+*base* to restore, so "contributes nothing" has no off value, and this is the right answer on its
+merits (not scope leftover). An `activation` track DOES have a natural base — the entity's authored
+`EntityAttributes.isActive` — so it is still processed while muted, to reconcile that base back in.
+
+**Muting an activation track hands the entity back to its authored `isActive`** (#452), completing
+#446's "a muted track contributes nothing" contract for the one track kind #446 had to skip. Every
+activation track in one timeline's `def.tracks` is swept into a per-TARGET decision before any of
+them writes `isActive` — the sweep completing before any write is what makes the captured base
+authoritative, not the absence of other writers.
+
+**Only a track that actually DRIVES the entity captures a base — an unmuted one.** A track authored
+`muted:true` from the start never drives the entity, so it must never capture and must never hand
+anything back either: nothing was ever captured, so there is nothing to restore (mirroring the mute
+memo's own absent/false distinction). Capturing on sight regardless of mute state was tried and was
+wrong — it let a track that never drove the entity license a hand-back it had no business making.
+
+**The capturing pass OWNS the base, and only that owner hands it back.** The base is keyed on world
+epoch + the resolved target entity's id + generation, plus the owning Director+timeline
+(`rootId:rootGeneration:def.id`) recorded alongside the value. `EntityAttributes.isActive` is not
+exclusively written by one track — a second activation track on the same target, a second Director,
+or game code can all write it too — so a bare per-target key is not enough: without the owner, a
+MUTED track on one Director could restore a base an UNMUTED track on a *different* Director is
+actively driving, because both resolve to the same target entity. A non-owner's muted track leaves
+the entry alone rather than deleting it, so the real owner still finds it.
+
+**"An unmuted track always wins over a muted one, regardless of track order" holds WITHIN one
+timeline's `def.tracks`** — that is where the per-target sweep-then-decide runs. Across two
+Directors it does not automatically hold: each runs its own `applyTimelineState` pass, and the
+owner guard above is what keeps one Director's mute from reaching into another's.
+
+**Residual, pre-existing ambiguity, not something #452 introduced:** if two Directors both drive one
+entity's activation while unmuted, and the OWNER Director is then muted, its hand-back can still
+race the other Director's write for a frame — which one poses last inside that frame decides.
+Contested multi-Director activation on one entity was already undefined at HEAD (each Director
+writes its own `desired` every frame with no defined ordering between Directors), so this is that
+same ambiguity surfacing at a mute boundary, not a new defect.
+
+**#452 also changed WHEN the self-deactivation warning fires** (owner, 2026-08-30). An activation
+track pointing at its own Director switches that Director off, which freezes it permanently — the
+engine warns once and emits `@timeline-selfdeact` so the soft-lock is never silent. That check now
+runs ONCE per target against the winning `desired` (the last unmuted track) instead of once per
+track. The only observable difference: where two unmuted tracks both target the Director root and an
+earlier one says OFF while a later one says ON, the old code warned and the new code does not — the
+entity never actually ends up deactivated there, so the warning described a freeze that never
+happened. It now fires exactly when the soft-lock is real. Deliberate: a warning that cries wolf is
+one that gets ignored.
+
+**This is an editor-scrub authoring toggle in practice, not a shipped-build lever** (owner,
+2026-08-30) — which is why it does not carry the shipped-build warning the control-track section
+above does. An author flips `muted` while scrubbing a cutscene in the Timeline panel; it is not a
+runtime feature-flag pattern the way muting a control track from script might be.
+
+One nested-timeline note: if Director A's activation track had deactivated Director B's entity,
+MUTING A's track reactivates B — the hand-back restores B's authored `isActive` — and B **resumes
+from wherever its playhead FROZE**, not from where it would be had it kept running (see "DISABLE"
+above: deactivation freezes, it does not stop). This is accepted, not a bug. In the editor it is
+additionally a non-issue in practice: `timelinePreview.ts` snapshots and reverts the whole world on
+preview stop, so the frozen-resume is a preview artifact there, not persisted state.
+
 ### Determinism (headless-verifiable)
 
 The playhead advances on **`getSimDelta`** (raw × `timeScale`, `0` when the sim isn't running), so
@@ -210,6 +306,56 @@ scene reload — the cache is the only stale thing, and reloading would discard 
 Covers external writes (MCP `write_asset`, a plain file edit); the editor's own Timeline panel
 already seeded the cache directly via `setTimeline`. Same defect, and same fix, as the animation
 clip cache.
+
+### The live-reload broadcast contract, in general (not just timeline)
+
+The mechanism above — `classifySceneChange` classifies a changed file, the dev-server broadcasts a
+`modoki:scene-changed` message, and the renderer looks the kind up in a table to decide what to
+invalidate — is shared by every watched asset-def kind (`animation`, `timeline`, `particle`,
+`spriteanim`, `rig2d`, `animset`, `material`, `shader`), not just timelines. This is the fullest
+write-up of it because timeline was the instance that first got it fully documented; the contract
+itself has no other single home, so record it here and link to it rather than re-explaining it
+per-kind.
+
+**Producer and consumer are two separate unions, kept in sync BY HAND, and they cannot share a
+type.** The producer is `LiveReloadKind` + `classifySceneChange` in
+`engine/plugins/vite-asset-scanner.ts`; the consumer is `SceneChangedKind` +
+`ASSET_CACHE_INVALIDATORS` in `engine/app/debug/agentBridge.ts`. They can't import a shared type
+because the plugin is a Node module (it runs inside Vite) and the app's tsconfig carries no Node
+types — so the consumer redeclares the union with a "keep the two in sync" comment instead.
+`engine/tests/architecture/liveReloadKinds.test.ts` is the guard that stands in for the compiler
+here, and it asks **three independent questions**, not one:
+
+1. Do the producer and consumer unions have identical members, and does `classifySceneChange`
+   only ever return a member of that union?
+2. Does every member of the union have either an explicit `type === '<kind>'` branch in
+   `classifySceneChange` (so it can actually be produced) and either a scene-reload kind or an
+   `ASSET_CACHE_INVALIDATORS` entry (so it is actually handled)?
+3. **(added in #842)** Does every agent-writable/parkable `AssetSchemaType` appear in
+   `LiveReloadKind` **at all**?
+
+That third question exists because the first two both start from `PRODUCER`/`CONSUMER` and only
+ever compare the two sides to each other — **they can agree with each other on a set that is
+narrower than what the rest of the system actually reads and writes, and neither notices.** That
+is exactly how #831 grew the agent-writable/parkable set from 5 `AssetSchemaType`s to 8
+(`material`/`shader` joining the Inspector's parking surfaces) while every check in this file
+stayed green: `material` and `shader` were absent from `LiveReloadKind` itself, not just from a
+branch inside it, so the producer and consumer had nothing to disagree about. `material` did get
+partial coverage from a different guard (`invalidatorsAreReachable.test.ts`, because
+`invalidateMaterial` already had a real Inspector caller) the way `animset` did before it — but
+that guard checks reachability of an invalidator function, not whether the broadcast that would
+call it ever fires, so it could not catch this class either. Only question 3 can.
+
+**An invalidation with no redraw is invisible.** Before this session's close-out, `handleSceneChanged`
+invalidated the relevant cache and returned without waking any render gate. With Play stopped,
+`Scene2D`'s idle dirty-gate (`Scene2D.tsx`, the `if (!isSimRunning() && !this._externalDirty && …)
+return;` check) skips the ECS scan and the render entirely unless something else wakes it — so the
+viewport kept showing pre-edit pixels indefinitely, which is the exact symptom the invalidator
+table exists to prevent, just one step further down the pipeline. `handleSceneChanged` now calls
+the shared `fireDirtyListeners()` after invalidating, which wakes every subscribed surface
+(`Scene2D.tsx`, `Scene3D.tsx`, `SceneView.tsx`, `editor/store/canvas2DDirty.ts`,
+`runtime/ui/uiTreeStore.ts`). This had been true — and silent — for all eight kinds in the table,
+not only the two (`material`/`shader`) added alongside it.
 
 ## Editor panel
 

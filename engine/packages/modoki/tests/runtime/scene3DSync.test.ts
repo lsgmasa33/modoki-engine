@@ -15,13 +15,18 @@ afterEach(() => {
 /** Mock the heavy module-level deps scene3DSync imports so the module can be
  *  loaded in the node test env without a real ECS world / DOM. */
 function mockSceneSyncDeps() {
+  // 'DEFAULT deps route the merge through the SCENE-SCOPED acquire...' below doMocks
+  // `SceneManager` to a fixed scene id and doMock survives `resetModules()` — restore
+  // the real module here so every test using this shared setup after that one still
+  // gets the real `getCurrentSceneId()` instead of the stale fixed id.
+  vi.doMock('../../src/runtime/scene/SceneManager', async (orig: () => Promise<unknown>) => await orig());
   vi.doMock('../../src/runtime/traits', () => ({
     Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {}, Tint: {},
     SkinnedModel: {}, SkeletalAnimator: {}, AnimationLibrary: {}, BoneAttachment: {},
   }));
   vi.doMock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
   vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
@@ -30,6 +35,7 @@ function mockSceneSyncDeps() {
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(), resolveMaterialForMesh: vi.fn(),
     resolveMaterial: vi.fn(), getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     onModelInvalidated: vi.fn(), getMeshAsset: vi.fn(),
@@ -92,6 +98,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -130,6 +137,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -182,6 +190,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -222,6 +231,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -316,6 +326,7 @@ describe('scene3DSync', () => {
         deactivatedEntities: new Set(),
       }));
       vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
         resolveMeshTemplate: vi.fn(),
         resolveMaterialForMesh: vi.fn(),
         resolveMaterial: vi.fn(),
@@ -392,6 +403,51 @@ describe('scene3DSync', () => {
       await expect(makeWebGPURenderer(container)).rejects.toThrow('gl init failed');
       expect(instances).toHaveLength(1); // no second attempt
       expect(instances[0].forceWebGL).toBe(true);
+    });
+
+    // Phase 3 of #590 (docs/rendering.md): the shared GL/GPU-context
+    // counter (`core/gpuContextTracking.ts`) must be noted exactly once per renderer that
+    // actually reaches a live state — never for a fallback attempt that was disposed before it
+    // got there, and never twice for the same context on a repeated `dispose()`.
+    describe('GPU-context tracking (Phase 3 of #590)', () => {
+      it('counts the SUCCESSFUL renderer only — the disposed, failed WebGPU attempt is never paired', async () => {
+        const { instances } = rendererMock.state;
+        rendererMock.state.initFor = (forceWebGL) =>
+          forceWebGL ? Promise.resolve() : Promise.reject(new Error('webgpu init failed'));
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => true }));
+        mockSceneSyncDeps();
+
+        const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+        const container: any = { clientWidth: 800, clientHeight: 600, appendChild: vi.fn() };
+
+        expect(liveGpuContextCount()).toBe(0);
+        const r: any = await makeWebGPURenderer(container);
+        expect(instances).toHaveLength(2); // the failed WebGPU attempt + the working WebGL2 one
+        // A careless version of this pairing would note BOTH attempts created (or note the
+        // create before knowing which one survives) and read 2 here instead of 1.
+        expect(liveGpuContextCount()).toBe(1);
+
+        r.dispose();
+        expect(liveGpuContextCount()).toBe(0);
+        // A repeated dispose() must not decrement a second time — the counter would go negative
+        // (or, since it floors at zero, silently under-count the NEXT context created).
+        r.dispose();
+        expect(liveGpuContextCount()).toBe(0);
+      });
+
+      it('never notes a context for a renderer whose init failed outright (no fallback to try)', async () => {
+        rendererMock.state.initFor = () => Promise.reject(new Error('gl init failed'));
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => false }));
+        mockSceneSyncDeps();
+
+        const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+        const container: any = { clientWidth: 800, clientHeight: 600, appendChild: vi.fn() };
+
+        await expect(makeWebGPURenderer(container)).rejects.toThrow('gl init failed');
+        expect(liveGpuContextCount()).toBe(0);
+      });
     });
 
     /** #56: the FIRST buffer must already honour `max`. The clamp used to live only in
@@ -605,6 +661,25 @@ describe('scene3DSync', () => {
       warn.mockRestore();
     });
 
+    it('re-warns for the same modelRef:clip after a world swap (#738 group B)', async () => {
+      // `_warnedMissingClip` had NO world-swap clear at all — a clip name that warned in one
+      // scene stayed silently suppressed forever after, including for an unrelated model that
+      // happens to reuse the same modelRef:clip pair in a later scene.
+      mockSceneSyncDeps();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { driveAnimator } = await import('../../src/runtime/rendering/scene3DSync');
+      const { setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+      const { createWorld } = await import('koota');
+      const entry = entryWith(['Idle']);
+      driveAnimator(entry, anim('Nonexistent'));
+      driveAnimator(entry, anim('Nonexistent'));
+      expect(warn).toHaveBeenCalledTimes(1);
+      setCurrentWorld(createWorld()); // world swap — should reset the warn-once memory
+      driveAnimator(entry, anim('Nonexistent'));
+      expect(warn).toHaveBeenCalledTimes(2);
+      warn.mockRestore();
+    });
+
     it('does NOT warn while the rig has no clips yet (library still loading)', async () => {
       // A bare rig that gets its clips from an AnimationLibrary has an empty action
       // set for the first frames until the library's source GLB lazy-loads + merges.
@@ -756,14 +831,14 @@ describe('scene3DSync', () => {
       sets?: Record<string, { source?: string } | null>;
       rigs?: Record<string, { prototype: any; animations: any[] } | undefined>;
     }) {
-      const ensureRiggedModelLoaded = vi.fn();
+      const lazyAcquireRiggedModel = vi.fn();
       const retargetClip = vi.fn((_t: any, _s: any, c: any) => ({ ...c, retargeted: true }));
       return {
-        ensureRiggedModelLoaded, retargetClip,
+        lazyAcquireRiggedModel, retargetClip,
         deps: {
           getAnimSet: (ref: string) => (opts.sets?.[ref] ?? null),
           getRiggedModel: (ref: string) => opts.rigs?.[ref],
-          ensureRiggedModelLoaded, retargetClip,
+          lazyAcquireRiggedModel, retargetClip,
         },
       };
     }
@@ -799,15 +874,73 @@ describe('scene3DSync', () => {
       mockSceneSyncDeps();
       const { mergeAnimationLibrary } = await import('../../src/runtime/rendering/scene3DSync');
       const entry = makeEntry([]);
-      // Frame 1: animset loaded but GLB not yet → ensureRiggedModelLoaded called, no merge.
+      // Frame 1: animset loaded but GLB not yet → lazyAcquireRiggedModel called, no merge.
       const ld = makeDeps({ sets: { setA: { source: 'lib.glb' } }, rigs: { 'lib.glb': undefined } });
       mergeAnimationLibrary(entry, { animSets: ['setA'] }, ld.deps);
-      expect(ld.ensureRiggedModelLoaded).toHaveBeenCalledWith('lib.glb');
+      expect(ld.lazyAcquireRiggedModel).toHaveBeenCalledWith('lib.glb');
       expect(entry.actions.size).toBe(0);
       // Frame 2: GLB now loaded → clips merge.
       const ready = makeDeps({ sets: { setA: { source: 'lib.glb' } }, rigs: { 'lib.glb': { prototype: {}, animations: [clip('Dance')] } } });
       mergeAnimationLibrary(entry, { animSets: ['setA'] }, ready.deps);
       expect(entry.actions.has('Dance')).toBe(true);
+    });
+
+    it('DEFAULT deps route the merge through the SCENE-SCOPED acquire, not the editor pin (#747)', async () => {
+      // Deliberately NOT reusing mockSceneSyncDeps() here — mergeAnimationLibrary's
+      // DEFAULT_LIBRARY_DEPS only needs traits + riggedModelCache + animSetCache +
+      // SceneManager, and this test cares about exactly WHICH riggedModelCache
+      // exports got bound, so it registers each mock exactly once.
+      vi.doMock('../../src/runtime/traits', () => ({
+        Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {}, Tint: {},
+        SkinnedModel: {}, SkeletalAnimator: {}, AnimationLibrary: {}, BoneAttachment: {},
+      }));
+      vi.doMock('../../src/runtime/core/traits/EntityAttributes', () => ({ EntityAttributes: {} }));
+      vi.doMock('three/examples/jsm/utils/SkeletonUtils.js', () => ({ clone: vi.fn(), retargetClip: vi.fn() }));
+      vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
+      vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
+      vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+        worldTransforms: new Map(), deactivatedEntities: new Set(),
+      }));
+      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
+        resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(), resolveMaterialForMesh: vi.fn(),
+        resolveMaterial: vi.fn(), getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+        onModelInvalidated: vi.fn(), getMeshAsset: vi.fn(),
+      }));
+      vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+      vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
+      vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
+        setActiveRenderer: vi.fn(), loadTexture3D: vi.fn(), releaseTexture3D: vi.fn(),
+        onRendererReady: (fn: () => void) => fn(),
+      }));
+      const ensureRiggedModelLoaded = vi.fn();      // the editor session pin — must NOT fire
+      const ensureRiggedModelLoadedFor = vi.fn();   // the scene-scoped acquire — must fire
+      vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
+        getRiggedModel: vi.fn(() => undefined), // "not loaded yet" branch
+        ensureRiggedModelLoaded, ensureRiggedModelLoadedFor,
+      }));
+      vi.doMock('../../src/runtime/loaders/animSetCache', () => ({
+        ANIMSET_DEFAULTS: { speed: 1, loop: true, fadeDuration: 0 },
+        getAnimSet: (ref: string) => (ref === 'setA' ? { source: 'lib.glb' } : null),
+        resolveAnimSetParams: () => ({ speed: 1, loop: true, fadeDuration: 0 }),
+      }));
+      // Only import from SceneManager scene3DSync uses is getCurrentSceneId.
+      vi.doMock('../../src/runtime/scene/SceneManager', () => ({ getCurrentSceneId: () => 7 }));
+
+      const { mergeAnimationLibrary } = await import('../../src/runtime/rendering/scene3DSync');
+      const entry = makeEntry([]);
+      mergeAnimationLibrary(entry, { animSets: ['setA'] }); // no deps arg → DEFAULT_LIBRARY_DEPS
+      expect(ensureRiggedModelLoadedFor).toHaveBeenCalledWith(7, 'lib.glb');
+      expect(ensureRiggedModelLoaded).not.toHaveBeenCalled();
+    });
+
+    // Declared right after the SceneManager doMock above (which never restores it) —
+    // if `mockSceneSyncDeps()` didn't restore the real module too, `getCurrentSceneId()`
+    // would still read 7 here instead of the real (undefined, no scene loaded) value.
+    it('a LATER test sees the REAL SceneManager, proving the doMock above does not leak', async () => {
+      mockSceneSyncDeps();
+      const { getCurrentSceneId } = await import('../../src/runtime/scene/SceneManager');
+      expect(getCurrentSceneId()).toBeUndefined();
     });
 
     it('is idempotent: a merged source binds its clips exactly once', async () => {
@@ -873,7 +1006,7 @@ describe('scene3DSync', () => {
       const deps = {
         getAnimSet: () => ({ source: 'lib.glb' }),
         getRiggedModel: () => ({ prototype: { traverse: (cb: any) => cb(skinnedMesh) }, animations: [clip('Dance')] }),
-        ensureRiggedModelLoaded: vi.fn(),
+        lazyAcquireRiggedModel: vi.fn(),
         retargetClip: vi.fn(() => ({ name: 'x', tracks: [{ name: '.bones[joint1].quaternion' }, { name: '.bones[joint0].scale' }] })),
       } as any;
       mergeAnimationLibrary(entry, { animSets: ['setA'], retarget: true }, deps);
@@ -896,7 +1029,7 @@ describe('scene3DSync', () => {
       const deps = {
         getAnimSet: () => ({ source: 'lib.glb' }),
         getRiggedModel: () => ({ prototype: { traverse: (cb: any) => cb(skinnedMesh) }, animations: [srcClip] }),
-        ensureRiggedModelLoaded: vi.fn(),
+        lazyAcquireRiggedModel: vi.fn(),
         // Mimic retargetClip: emits only a quaternion track; the scale is DROPPED.
         retargetClip: vi.fn(() => ({ name: 'x', tracks: [{ name: '.bones[joint0].quaternion' }], resetDuration: vi.fn() })),
       } as any;
@@ -1093,7 +1226,9 @@ describe('scene3DSync', () => {
     // -call (so the observer always detects it), all within a tiny drift-free band.
     async function loadHelper() {
       mockSceneSyncDeps();
-      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({}));
+      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
+      }));
       vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
       vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
       const THREE = await import('three');
@@ -1132,6 +1267,191 @@ describe('scene3DSync', () => {
       scene.add(new THREE.Mesh(new THREE.BoxGeometry(), basic));
       expect(() => refreshEnvIntensityObserver(scene)).not.toThrow();
       expect((basic as unknown as { envMapIntensity?: number }).envMapIntensity).toBeUndefined();
+    });
+  });
+
+  // #477: an owned material must be freed only once a replacement is actually assigned to
+  // every target that held it — never while a mesh still in the scene points at it. Driven
+  // through the REAL ECS world, THREE objects, and material cache (like
+  // materialCloneInvalidation.test.ts), because a mocked resolveMaterial can't distinguish
+  // "not yet resolved" from "resolved to the same reference" the way the real async load can.
+  describe('syncMaterial owned-material lifecycle (#477)', () => {
+    const MAT_GUID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const MAT_PATH = '/games/g/assets/mat/rock.mat.json';
+    const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+
+    async function loadReal() {
+      // Earlier describes in this file `vi.doMock` several specifiers we need for real here
+      // (meshTemplateCache, traits, primitives, …) — `vi.doMock` outlives `vi.resetModules()`,
+      // so without this a later test picks up a stub {} module instead of the real one.
+      vi.doUnmock('../../src/runtime/loaders/meshTemplateCache');
+      vi.doUnmock('../../src/runtime/loaders/primitives');
+      vi.doUnmock('../../src/runtime/rendering/renderUtils');
+      vi.doUnmock('../../src/runtime/traits');
+      vi.doUnmock('../../src/runtime/core/traits/EntityAttributes');
+      vi.doUnmock('../../src/runtime/core/ecs/transformPropagationSystem');
+      vi.doUnmock('../../src/runtime/loaders/riggedModelCache');
+      vi.doUnmock('../../src/runtime/loaders/textureResolver');
+      vi.doUnmock('../../src/three/traits/Light');
+      vi.doUnmock('../../src/three/traits/Environment');
+      vi.doUnmock('three/examples/jsm/utils/SkeletonUtils.js');
+      const THREE = await import('three');
+      const { createWorld } = await import('koota');
+      const { clearManifest, registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+      const { resolveMaterial, disposeAllCachedResources } = await import('../../src/runtime/loaders/meshTemplateCache');
+      const { Transform, Renderable3D, Renderable3DPrimitive } = await import('../../src/runtime/traits');
+      const { createRenderState, syncRenderables, syncSceneRenderables3D } = await import('../../src/runtime/rendering/scene3DSync');
+      const { retiredDerivedMaterials } = await import('../../src/runtime/rendering/derivedMaterials');
+      return {
+        THREE, createWorld, clearManifest, registerAsset, resolveMaterial, disposeAllCachedResources,
+        Transform, Renderable3D, Renderable3DPrimitive, createRenderState, syncRenderables, syncSceneRenderables3D,
+        retiredDerivedMaterials,
+      };
+    }
+
+    function stubMaterialFetch(mod: Awaited<ReturnType<typeof loadReal>>) {
+      mod.clearManifest();
+      mod.registerAsset(MAT_GUID, MAT_PATH, 'material');
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true, status: 200, statusText: 'OK',
+        text: async () => JSON.stringify({ version: 1, id: MAT_GUID, type: 'pbr' }),
+      } as never)));
+    }
+
+    it('does not free the owned default material while its replacement has not resolved yet', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      mod.syncRenderables(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Assign a material GUID whose async load has not landed yet — resolveMaterial
+      // (called internally by syncMaterial) returns undefined this tick.
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncRenderables(world, scene, state);
+
+      expect(mesh.material, 'still the original — nothing to replace it with yet').toBe(oldMat);
+      expect(disp, 'must not dispose a material still bound to a live mesh').not.toHaveBeenCalled();
+      // Ownership moves OUT of `ownedMaterials` and into the retirement queue the moment it is
+      // kept alive unresolved (#477 fix) — not because it leaked, but so a later FOREIGN rebind
+      // (applyLightMask, materialInstanceSystem) that never revisits syncMaterial still gets it
+      // freed by the per-frame sweep. Assert it moved, not that it vanished.
+      expect(state.ownedMaterials.has(oldMat), 'no longer owned directly — handed to the sweep').toBe(false);
+      expect(mod.retiredDerivedMaterials().has(oldMat), 'tracked in the retirement queue instead').toBe(true);
+    });
+
+    it('frees it once the async load lands and a real replacement is assigned (no leak)', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      // syncSceneRenderables3D, not the bare syncRenderables — production wiring always runs
+      // the per-frame sweep at the end of a full sync, and once a still-bound owned material is
+      // handed to the retirement queue (#477 fix) the sweep is the ONLY thing that frees it.
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncSceneRenderables3D(world, scene, state); // unresolved — kept alive, per the previous test
+
+      // Discriminating frame-1 check: without the fix this frame would already have disposed
+      // (or reassigned away from) the old material even though nothing replaced it yet.
+      expect(mesh.material, 'frame 1: still the old material — nothing to replace it with').toBe(oldMat);
+      expect(disp, 'frame 1: must not have disposed yet').not.toHaveBeenCalled();
+
+      await settle();
+      mod.syncSceneRenderables3D(world, scene, state); // polling branch: the load has landed
+
+      const newMat = mod.resolveMaterial(MAT_GUID)!;
+      expect(mesh.material, 'now bound to the resolved replacement').toBe(newMat);
+      expect(disp, 'freed exactly once, now that nothing binds it').toHaveBeenCalledTimes(1);
+      expect(state.ownedMaterials.has(oldMat), 'no leak — untracked once freed').toBe(false);
+    });
+
+    // The "ordinary path" case (a `.mat.json` already resolved BEFORE the GUID is assigned, so
+    // `newMat` is available synchronously on the same frame) was dropped from this block: it
+    // disposes-then-reassigns within one tick either way, so it cannot discriminate pre-fix from
+    // post-fix code — the bug this block guards against only shows up when a replacement is
+    // NOT yet available. Keeping a test that passes regardless is exactly the weak-test failure
+    // mode this rewrite is fixing; the two tests below cover the frames that DO differ.
+
+    it('an owned material orphaned by a foreign rebind (applyLightMask, materialInstanceSystem) is freed by the sweep, not leaked (#477 defect)', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Assign a material GUID whose async load has not landed yet — syncMaterial keeps the
+      // owned default bound (nothing to replace it with) and, per the fix, hands it to the
+      // retirement queue rather than trusting the polling branch (which never runs again for
+      // this entity once something else rebinds the mesh below).
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncSceneRenderables3D(world, scene, state);
+      expect(mesh.material, 'still the owned default this frame').toBe(oldMat);
+      expect(disp, 'not disposed while still bound').not.toHaveBeenCalled();
+
+      // Simulate a FOREIGN rebind in the same frame family — exactly what applyLightMask does
+      // to a masked entity's mesh, and what materialInstanceSystem does once its own GUID
+      // resolves: it assigns `t.material` directly, without going through syncMaterial at all.
+      const foreign = new mod.THREE.MeshStandardMaterial();
+      mesh.material = foreign;
+
+      // The sweep (run at the end of syncSceneRenderables3D) should now see nothing bound to
+      // `oldMat` and free it — pre-fix, `oldMat` was left un-freed in `ownedMaterials` and
+      // untracked anywhere else, so nothing ever came back for it.
+      mod.syncSceneRenderables3D(world, scene, state);
+
+      expect(disp, 'the orphaned owned material is freed by the sweep').toHaveBeenCalledTimes(1);
+      expect(state.ownedMaterials.has(oldMat), 'no longer tracked as owned').toBe(false);
+    });
+
+    it('a primitive recreate (size change) retires its discarded owned material instead of leaking it', async () => {
+      const mod = await loadReal();
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      // No material ref — the inline default material is owned, same as the other cases above.
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', size: 1, material: '' }));
+
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Forces the recreate branch: geometry is rebuilt, the old mesh (and the material bound to
+      // it) is discarded, and nothing else in the scene points at `oldMat` afterward.
+      e.set(mod.Renderable3DPrimitive, { size: 2 });
+      mod.syncSceneRenderables3D(world, scene, state);
+
+      const newMesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      expect(newMesh, 'a fresh mesh was created').not.toBe(mesh);
+      expect(state.ownedMaterials.has(oldMat), 'the discarded material is no longer tracked as owned').toBe(false);
+
+      // One more frame for the retirement sweep to actually free it (mirrors the foreign-rebind
+      // case above — retiring hands it to the sweep, it doesn't dispose inline).
+      mod.syncSceneRenderables3D(world, scene, state);
+      expect(disp, 'the discarded material is freed by the sweep, not leaked').toHaveBeenCalledTimes(1);
     });
   });
 });

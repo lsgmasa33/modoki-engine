@@ -35,9 +35,11 @@ let _unsubSwap: (() => void) | null = null;
 /** Lazily wire up ECS dirty listeners. Call once on mount. */
 export function ensureCanvas2DListeners() {
   if (_initialized) return;
-  _initialized = true;
+  // Latch AFTER registration: a throw here (e.g. a mocked module missing onWorldSwap) must
+  // not leave this permanently true with nothing registered.
   _unsubDirty = addDirtyListener(mark2DDirty);
   _unsubSwap = onWorldSwap(mark2DDirty);
+  _initialized = true;
 }
 
 // HMR cleanup: unsubscribe so a hot-reloaded module doesn't leave an orphan

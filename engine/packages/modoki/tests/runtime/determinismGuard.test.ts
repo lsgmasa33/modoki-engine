@@ -11,9 +11,11 @@
  *  exception with a documented reason, not a silent pass. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
+import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/runtime');
 
@@ -47,24 +49,27 @@ const ALLOW_UNSEEDED_GUID = new Set<string>([
 ]);
 
 function tsFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) out.push(...tsFiles(full));
-    else if (/\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name)) out.push(full);
-  }
-  return out;
+  return repoFiles({
+    under: dir,
+    match: (rel) => /\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel),
+    floor: 400,
+  }).map(({ abs }) => abs);
 }
 
-/** Strip block + line comments so a `performance.now()` mention in prose doesn't
- *  trip the guard — only real call sites count. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-}
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
 
-const FILES = tsFiles(RUNTIME).map((f) => ({ rel: relative(RUNTIME, f).replace(/\\/g, '/'), code: stripComments(readFileSync(f, 'utf8')) }));
+const FILES = tsFiles(RUNTIME).map((f) => {
+  const raw = readFileSync(f, 'utf8');
+  return { rel: relative(RUNTIME, f).replace(/\\/g, '/'), raw, code: stripComments(raw) };
+});
 
 describe('determinism guard (Phase 0)', () => {
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    for (const f of FILES) assertScanIsSane(f.raw, f.code, f.rel);
+  });
+
   it('no direct wall-clock outside the allowlist', () => {
     const offenders = FILES
       .filter((f) => /\b(performance\.now|Date\.now)\s*\(/.test(f.code))

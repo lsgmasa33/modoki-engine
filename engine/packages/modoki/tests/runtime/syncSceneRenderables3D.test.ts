@@ -17,6 +17,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
 const SRC = join(fileURLToPath(new URL('.', import.meta.url)), '../../src');
 
@@ -27,12 +28,7 @@ const rigs = vi.hoisted(() => ({ byRef: new Map<string, unknown>() }));
 const ensureSpy = vi.hoisted(() => ({ fn: undefined as undefined | ((ref: string) => void) }));
 const inval = vi.hoisted(() => ({ listener: undefined as undefined | ((p: string, t: Set<string>) => void), assets: new Map<string, { model: string }>() }));
 
-/** Strip block + line comments so a function name mentioned in prose (this
- *  subsystem documents the divergence heavily) doesn't count as a call site —
- *  mirrors determinismGuard.test.ts. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-}
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
 
 function countCalls(code: string, fn: string): number {
   return (code.match(new RegExp(`\\b${fn}\\s*\\(`, 'g')) ?? []).length;
@@ -53,15 +49,18 @@ async function setup() {
     resolveMaterial: vi.fn(() => ({ uuid: 'm', color: { setHex: vi.fn() }, nprColorPreserve: 0, dispose: vi.fn() })),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
-    retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
     retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
+  }));
+  vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+    getEnvPMREMTexture: vi.fn(), getEnvCubeTexture: vi.fn(), sourceForEnvDerived: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
   // No real GLB fetch for the skeletal path: rig "not loaded" → skinned sync
   // skips the entity (exercises the trio without IO).
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
 
   const { createWorld } = await import('koota');
@@ -132,8 +131,17 @@ describe('syncSceneRenderables3D — functional', () => {
 // ── 2. Structural anti-drift guard ─────────────────────────────────────────
 
 describe('syncSceneRenderables3D — orchestrators route through the shared helper (F1 anti-drift)', () => {
-  const scene3D = stripComments(readFileSync(join(SRC, 'runtime/rendering/Scene3D.tsx'), 'utf8'));
-  const sceneView = stripComments(readFileSync(join(SRC, 'editor/panels/SceneView.tsx'), 'utf8'));
+  const scene3DRaw = readFileSync(join(SRC, 'runtime/rendering/Scene3D.tsx'), 'utf8');
+  const sceneViewRaw = readFileSync(join(SRC, 'editor/panels/SceneView.tsx'), 'utf8');
+  const scene3D = stripComments(scene3DRaw);
+  const sceneView = stripComments(sceneViewRaw);
+
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    assertScanIsSane(scene3DRaw, scene3D, 'runtime/rendering/Scene3D.tsx');
+    assertScanIsSane(sceneViewRaw, sceneView, 'editor/panels/SceneView.tsx');
+  });
 
   it('Scene3D uses the helper in BOTH renderFrame and the offscreen capture', () => {
     expect(countCalls(scene3D, 'syncSceneRenderables3D')).toBeGreaterThanOrEqual(2);
@@ -287,6 +295,12 @@ describe('syncSkinnedModels — lifecycle', () => {
   // riggedModelCache mock hands back per model ref (doMock is not hoisted, so its
   // factory closes over these holders, resolved at import time).
   async function setupSkinned() {
+    // A later test in this describe (`routes the SkinnedModel.model pin through the
+    // SCENE-SCOPED acquire...`) doMocks `SceneManager` to a fixed scene id and doMock
+    // survives `resetModules()` — restore the real module here so every OTHER test in
+    // this describe still gets the real `getCurrentSceneId() === undefined`, matching
+    // the "deliberately mocks NO SceneManager" comment below.
+    vi.doMock('../../src/runtime/scene/SceneManager', async (orig: () => Promise<unknown>) => await orig());
     vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
     vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
     vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
@@ -300,6 +314,9 @@ describe('syncSkinnedModels — lifecycle', () => {
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
     }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), getEnvCubeTexture: vi.fn(), sourceForEnvDerived: vi.fn(),
+    }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
     const ensure = vi.fn((ref: string) => { void ref; });
@@ -307,6 +324,15 @@ describe('syncSkinnedModels — lifecycle', () => {
     vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
       getRiggedModel: vi.fn((ref: string) => rigs.byRef.get(ref)),
       ensureRiggedModelLoaded: ensure,
+      // This suite deliberately mocks NO `SceneManager`, so `getCurrentSceneId()` really
+      // is undefined and `lazyAcquireRiggedModel` takes the no-scene FALLBACK to the
+      // editor pin (the spy above) — that is the case this suite exercises. It is NOT
+      // the normal path: see 'routes the SkinnedModel.model pin through the SCENE-SCOPED
+      // acquire...' below, which mocks a real current scene and covers the #747 primary
+      // call site (scene3DSync.ts's `lazyAcquireRiggedModel` call in `syncSkinnedModels`).
+      // This sibling export exists only to satisfy the import binding here — never
+      // expected to be called in THIS suite.
+      ensureRiggedModelLoadedFor: vi.fn(),
     }));
     const { createWorld } = await import('koota');
     const traits = await import('../../src/runtime/traits');
@@ -356,6 +382,69 @@ describe('syncSkinnedModels — lifecycle', () => {
 
     expect(state.skinned.size).toBe(0);
     expect(ensureSpy.fn).toHaveBeenCalledWith('pending.glb');
+  });
+
+  it('routes the SkinnedModel.model pin through the SCENE-SCOPED acquire when a scene is loaded (#747 primary call site)', async () => {
+    // Unlike the sibling test above (no scene loaded → exercises the fallback), this
+    // mocks a real current scene so the `syncSkinnedModels` → `lazyAcquireRiggedModel`
+    // call at scene3DSync.ts's "kick a SCENE-SCOPED lazy load" site takes its NORMAL
+    // path: own the model with the current scene, not the editor session pin. This is
+    // the call site #747 is actually about — it fires for every skinned entity whose
+    // manifest acquire hasn't resolved yet.
+    vi.doMock('../../src/three/traits/Light', () => ({ Light: {} }));
+    vi.doMock('../../src/three/traits/Environment', () => ({ Environment: {} }));
+    vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
+      worldTransforms: new Map(), deactivatedEntities: new Set(),
+    }));
+    vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+      resolveMeshTemplate: vi.fn(), resolveMaterialForMesh: vi.fn(), resolveMaterial: vi.fn(),
+      getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
+      onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), getEnvCubeTexture: vi.fn(), sourceForEnvDerived: vi.fn(),
+    }));
+    vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
+    vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
+    const ensureFor = vi.fn();     // the scene-scoped acquire — must fire
+    const ensure = vi.fn();        // the editor session pin — must NOT fire
+    vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
+      getRiggedModel: vi.fn(() => undefined), // "not loaded yet" branch
+      ensureRiggedModelLoaded: ensure,
+      ensureRiggedModelLoadedFor: ensureFor,
+    }));
+    vi.doMock('../../src/runtime/scene/SceneManager', () => ({ getCurrentSceneId: () => 7 }));
+
+    const { createWorld } = await import('koota');
+    const traits = await import('../../src/runtime/traits');
+    const sync = await import('../../src/runtime/rendering/scene3DSync');
+    const T = await import('three');
+    const { Transform, SkinnedModel } = traits;
+    const world = createWorld();
+    world.spawn(Transform(), SkinnedModel({ model: 'pending.glb', isVisible: true }));
+    const state = sync.createRenderState();
+
+    sync.syncSkinnedModels(world, new T.Scene(), state);
+
+    expect(ensureFor).toHaveBeenCalledWith(7, 'pending.glb');
+    expect(ensure).not.toHaveBeenCalled();
+    world.destroy(); // release the koota world id — this file is already near the process cap
+  });
+
+  // Declared straight after the SceneManager doMock above (which never restores it) —
+  // if `setupSkinned()` didn't restore the real module too, `getCurrentSceneId()` would
+  // still read 7 here and this would wrongly take the scene-scoped path.
+  it('still takes the no-scene fallback in a LATER test, proving the SceneManager mock above does not leak', async () => {
+    const { world, traits, sync, T } = await setupSkinned();
+    const { Transform, SkinnedModel } = traits;
+    world.spawn(Transform(), SkinnedModel({ model: 'pending.glb', isVisible: true }));
+    const state = sync.createRenderState();
+    sync.syncSkinnedModels(world, new T.Scene(), state);
+
+    expect(ensureSpy.fn).toHaveBeenCalledWith('pending.glb'); // editor-pin fallback fired
+    world.destroy(); // release the koota world id — this file is already near the process cap
   });
 
   it('rebuilds the entry when the model ref changes (old disposed, new clone added)', async () => {
@@ -418,6 +507,13 @@ describe('attachInvalidationListener — re-import eviction', () => {
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: (cb: (p: string, t: Set<string>) => void) => { inval.listener = cb; return () => { inval.listener = undefined; }; },
       getMeshAsset: (ref: string) => inval.assets.get(ref),
+      // #719: the listener reads the invalidated model's templates to know which materials
+      // `invalidateModel` will actually dispose. Empty here — this fixture asserts EVICTION,
+      // not variant retirement (that has its own file, invalidationVariantRetire.test.ts).
+      getTemplatesForModel: () => new Map(),
+    }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), getEnvCubeTexture: vi.fn(), sourceForEnvDerived: vi.fn(),
     }));
     // resolveRef is identity here (asset.model already a path) so targets.has matches.
     vi.doMock('../../src/runtime/loaders/assetManifest', () => ({ resolveRef: (r: string) => r, onFontInvalidated: () => () => {} }));
@@ -499,10 +595,13 @@ describe('syncEnvironment — cached branch is change-gated', () => {
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
       retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
     }));
+    vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+      getEnvPMREMTexture: vi.fn(), getEnvCubeTexture: vi.fn(), sourceForEnvDerived: vi.fn(),
+    }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
     vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-      getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+      getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
     }));
     const { createWorld } = await import('koota');
     const { Environment } = await import('../../src/three/traits/Environment');

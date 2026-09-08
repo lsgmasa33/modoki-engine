@@ -26,14 +26,34 @@ function cached(prefabGuid: string): CachedPrefab | null {
   return (getCachedPrefab(prefabGuid) as CachedPrefab | null) ?? null;
 }
 
+/** The unit a prefab root's `UIElement` length ACTUALLY has, narrowed to the two units
+ *  `resolveEntrySize` understands (matching `en.entryWidthUnit`/`entryHeightUnit`, which are
+ *  themselves typed `'px' | '%'` at the `entriesSystem.ts` call site).
+ *
+ *  ⚠️ **An absent unit means `'%'`, not `'px'`.** Every `UIElement` length unit defaults to `'%'`
+ *  (`runtime/traits/UIElement.ts`) and a scene/prefab save strips a field equal to its default, so
+ *  a bare number with no unit key is the common on-disk shape for a percentage — mirrors
+ *  `unitOrDefault` in `sceneValidation.ts`. Only an explicit `'px'` reads as px. */
+function rootUnit(unit: unknown): 'px' | '%' {
+  return unit === 'px' ? 'px' : '%';
+}
+
 export const entryPrefabProvider: EntryPrefabProvider = {
   rootSize(prefabGuid) {
     const prefab = cached(prefabGuid);
-    if (!prefab?.entities?.length) return { width: 0, height: 0 };
+    // No cached prefab yet: 0 in either unit is the same 0, but `'px'` is the honest label —
+    // there is no authored unit to report.
+    if (!prefab?.entities?.length) return { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
     const rootLocal = prefab.rootLocalId ?? prefab.entities[0].localId;
     const root = prefab.entities.find(e => e.localId === rootLocal) ?? prefab.entities[0];
-    const ui = root.traits?.['UIElement'] as { width?: number; height?: number } | undefined;
-    return { width: ui?.width ?? 0, height: ui?.height ?? 0 };
+    const ui = root.traits?.['UIElement'] as
+      { width?: number; height?: number; widthUnit?: string; heightUnit?: string } | undefined;
+    return {
+      width: ui?.width ?? 0,
+      widthUnit: rootUnit(ui?.widthUnit),
+      height: ui?.height ?? 0,
+      heightUnit: rootUnit(ui?.heightUnit),
+    };
   },
   // ⚠️ "Cached" means SPAWNABLE, which is a hair stricter than `spawnInstance`'s own guard and
   // deliberately so. That guard is `!prefab?.entities`, and `[]` is truthy — so a prefab file

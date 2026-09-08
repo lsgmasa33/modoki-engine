@@ -88,17 +88,25 @@ vi.mock('../../src/runtime/traits', () => ({
   SkinnedMeshRenderer: traitFactory('SkinnedMeshRenderer'),
   SkeletalAnimator: traitFactory('SkeletalAnimator'),
   Bone: traitFactory('Bone'),
+  // #784 phase C2b: modelImport.ts stamps these onto every mesh/material asset it writes. A
+  // mocked module with no export would silently hand back `undefined`, breaking loudly here
+  // since vitest's automock validation rejects an unmocked-but-imported named export.
+  MESH_FORMAT_VERSION: 1, MATERIAL_FORMAT_VERSION: 1,
 }));
 
 // Backend IO: record meta + file writes; everything else is a soft no-op.
 let writtenMeta: any[] = [];
 let writtenFiles: any[] = [];
 const mockFetch = vi.fn(async (url: string, opts?: any) => {
-  if (url.startsWith('/api/read-meta')) return { ok: false } as any;       // no prior sidecar
+  // ⚠️ A MISSING SIDECAR IS A 200 WITH `{}` — the route (`editorBackendRouter.ts`'s
+  // `/api/read-meta`) 404s only when the ASSET FILE is absent; an asset with no sidecar gets
+  // `readMetaSidecar`'s `{}` at 200. Answering non-ok here says "the read FAILED", which since
+  // #880 aborts the import rather than minting a guid over an id this editor could not read.
+  if (url.startsWith('/api/read-meta')) return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as any;   // no prior sidecar
   if (url === '/api/write-meta') { writtenMeta.push(JSON.parse(opts.body)); return { ok: true } as any; }
   if (url === '/api/write-file') { writtenFiles.push(JSON.parse(opts.body)); return { ok: true } as any; }
-  if (url === '/api/reimport') return { ok: true, json: async () => ({}) } as any;
-  return { ok: true, json: async () => ({}) } as any;
+  if (url === '/api/reimport') return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
+  return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
 });
 vi.stubGlobal('fetch', mockFetch);
 
@@ -213,11 +221,11 @@ describe('importModel — rigged (SkinnedModel) path', () => {
     // readExistingId / readExistingMaterial reuse it instead of minting fresh.
     writtenFiles = []; writtenMeta = [];
     mockFetch.mockImplementation(async (url: string, opts?: any) => {
-      if (url.startsWith('/api/read-meta')) return { ok: false } as any;
+      if (url.startsWith('/api/read-meta')) return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as any;  // no sidecar = 200 + {}, see above
       if (url === '/api/write-meta') { writtenMeta.push(JSON.parse(opts.body)); return { ok: true } as any; }
       if (url === '/api/write-file') { writtenFiles.push(JSON.parse(opts.body)); return { ok: true } as any; }
-      if (url === matPath) return { ok: true, json: async () => ({ id: firstId }) } as any;
-      return { ok: true, json: async () => ({}) } as any;
+      if (url === matPath) return { ok: true, json: async () => ({ id: firstId }), text: async () => JSON.stringify({ id: firstId }) } as any;
+      return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
     });
 
     await importModel('/games/x/assets/hero.glb', 'hero');

@@ -18,7 +18,8 @@ vi.mock('electron', () => ({
   },
 }));
 
-import { installAppMenu } from '../../electron/projects';
+import fs from 'node:fs';
+import { installAppMenu, addRecentProject, setRecentsScope } from '../../electron/projects';
 
 function buildWithZoom() {
   const onZoom = vi.fn();
@@ -129,5 +130,58 @@ describe('View-menu zoom items', () => {
     (zoomOut!.click as () => void)();
     (actual!.click as () => void)();
     expect(onZoom.mock.calls.map((c) => c[0])).toEqual(['in', 'out', 'reset']);
+  });
+});
+
+/** The Open Recent ✓ marker — a #869 instance the architecture guard structurally cannot see.
+ *
+ *  ⚠️ The guard bans `path.resolve(x) === y`; this was `p === opts.currentRoot`, the
+ *  assign-first-compare-later form, which escapes a line regex entirely (close-out review found
+ *  three live instances of that shape). `p` comes from `getRecentProjects()` — one of the two
+ *  untrusted spelling sources #869 names — so a differently-cased recents entry left the ✓ off
+ *  the project that IS open. That compounds: the user cannot see it is already open, clicks it,
+ *  and `onOpenRecent`'s matching `!==` then re-runs a full `setProject` on it. */
+describe('installAppMenu — Open Recent marks the OPEN project (#869)', () => {
+  const recentsOf = () => {
+    const file = (cap.tpl ?? []).find((m) => m.label === 'File');
+    const items = (file?.submenu ?? []) as Electron.MenuItemConstructorOptions[];
+    const openRecent = items.find((i) => i.label === 'Open Recent');
+    return (openRecent?.submenu ?? []) as Electron.MenuItemConstructorOptions[];
+  };
+
+  it('ticks a recents entry that is the open project spelled differently', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tick-'));
+    try {
+      setRecentsScope('test-scope');
+      addRecentProject(dir);
+      const flipped = process.platform === 'win32'
+        ? (dir[0] === dir[0].toLowerCase() ? dir[0].toUpperCase() : dir[0].toLowerCase()) + dir.slice(1)
+        : dir;
+      installAppMenu({
+        currentRoot: flipped,
+        onNewProject() {}, onOpenProject() {}, onOpenRecent() {},
+      });
+      const labels = recentsOf().map((i) => String(i.label));
+      expect(labels.length, 'premise: the recents entry is present').toBeGreaterThan(0);
+      expect(labels.some((l) => l.startsWith('✓'))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT tick a recents entry that is a different project', () => {
+    // The inverse, or the fix would be "always tick everything".
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tick-'));
+    try {
+      const a = path.join(base, 'proj-a');
+      const b = path.join(base, 'proj-b');
+      fs.mkdirSync(a); fs.mkdirSync(b);
+      setRecentsScope('test-scope-2');
+      addRecentProject(a);
+      installAppMenu({ currentRoot: b, onNewProject() {}, onOpenProject() {}, onOpenRecent() {} });
+      expect(recentsOf().map((i) => String(i.label)).some((l) => l.startsWith('✓'))).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });

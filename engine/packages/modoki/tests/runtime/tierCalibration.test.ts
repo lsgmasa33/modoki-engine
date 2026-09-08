@@ -15,6 +15,10 @@ vi.mock('../../src/runtime/core/frameProfiler', async (orig) => {
 });
 vi.mock('../../src/runtime/core/activeRenderer', () => ({
   getActiveRenderer: () => mockRenderer,
+  // frameDriver.ts subscribes to this UNCONDITIONALLY at module load (the GPU-fault latch for
+  // #590 defect 3/6) — an incomplete mock throws "No onRendererLost export" the moment anything
+  // here transitively imports frameDriver, whether or not the test ever touches the stall path.
+  onRendererLost: () => () => {},
 }));
 // ⭐ EVERY TEST BELOW ASSUMES SOMEBODY IS PLAYING, and that assumption is now explicit rather
 // than accidental. Calibration refuses to judge an IDLE window (owner, 2026-08-20): a phone

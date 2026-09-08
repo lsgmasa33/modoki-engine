@@ -13,13 +13,215 @@
       // exports a trait this build lacks (the cross-branch skew that white-screened
       // the editor) — the error can fire before OR after React mounts, and it isn't a
       // render error an ErrorBoundary can catch. This inline handler (registered before
-      // the module script) watches for module-load errors and, if #root is STILL empty
-      // a beat later (the app never rendered), swaps the blank page for an actionable
-      // message. The debounce avoids false positives from a transient mid-mount error.
+      // the module script) watches for ANY uncaught error/rejection and, if #root is
+      // STILL empty a beat later (the app never rendered), swaps the blank page for an
+      // actionable message. It used to gate on the error's MESSAGE TEXT looking like a
+      // module-load failure, which missed most ways a module can throw during
+      // evaluation (#823) — see `consider()` below for why that gate is gone. The
+      // debounce avoids false positives from a transient mid-mount error.
       (function () {
         var shown = false, scheduled = false;
-        function isLoadError(msg) {
-          return /does not provide an export|Failed to fetch dynamically imported|Importing a module script failed|error loading dynamically imported|Unable to resolve|Cannot find module|SyntaxError|Unexpected (token|identifier|end)/i.test(msg || '');
+        // Early error buffer (#636). Same reasoning as the #633 console shim just below, applied to
+        // `window` `error`/`unhandledrejection` instead of `console.*`: rolldown inlines main.tsx's
+        // side-effect imports (installGlobalErrorHandlers among them) into the entry chunk's BODY,
+        // which runs after every static import — so a throw during module evaluation anywhere in
+        // App.tsx's graph fires before that listener exists and is never mirrored to Crashlytics.
+        // This script's OWN listeners (below) are registered at HTML parse time, before any of that
+        // — the earliest thing in the page that can see it — so they buffer every error here too.
+        //
+        // `installGlobalErrorHandlers` (runtime/core/globalErrors.ts) DRAINS this and DISARMS it
+        // (`done = true`) — a single drain, and a buffer separate from `__MODOKI_EARLY_CONSOLE__`
+        // below (the two do not interact). That drain only runs on a boot that reaches it: a throw
+        // fatal enough that `installGlobalErrorHandlers` itself never executes leaves this buffer
+        // populated but never reported — that failed-boot case is #825, not something this closes.
+        //
+        // ⚠️ `error`/`reason` are stored BY REFERENCE — no clone, no stringify. Object identity is
+        // load-bearing: globalErrors.ts's de-dup `WeakSet` keys on the exact object, and a copy would
+        // let one fault file two Crashlytics issues.
+        //
+        // This buffers EVERY error unconditionally — buffering is invisible and cheap, so telemetry
+        // gets full coverage even on a boot where `consider()` below decides the fallback screen
+        // must not fire (an app that already rendered, or one still mid-mount).
+        var earlyErrors = { entries: [], done: false, dropped: 0 };
+        globalThis.__MODOKI_EARLY_ERRORS__ = earlyErrors;
+        // MUST stay AT MOST `MAX_PER_BURST_WINDOW` (globalErrors.ts, currently 30) minus 2 — that is
+        // NO SLACK, not headroom: the drain (`drainEarlyErrors`) fires every buffered entry through
+        // that SAME shared rate limiter synchronously, in one burst window, and a `[reload]`
+        // breadcrumb can ALREADY have spent one slot before the drain even starts
+        // (installGlobalErrorHandlers, on a reload boot) — plus the drain's own "N dropped (early
+        // buffer cap)" breadcrumb needs a slot too, or it is silently refused right when it is the
+        // one thing making the cap honest. At the current 28/30, a full buffer on a reload boot fills
+        // the window to EXACTLY 30/30 — the first real `console.warn` in the following ≤5s is
+        // refused. This file cannot import that constant (a plain inline `<script>`, no bundler), so
+        // the two must be kept in sync BY HAND — `globalErrors.test.ts`'s "early error buffer drain
+        // (#636)" describe block (NOT `earlyErrorBuffer.test.ts`, which only exercises this buffer's
+        // OWN cap/drop logic, never the shared limiter) pins that the dropped-count breadcrumb still
+        // gets through at this cap; `earlyErrorBuffer.test.ts` separately asserts this literal never
+        // exceeds `MAX_PER_BURST_WINDOW - 2`.
+        var EARLY_ERROR_CAP = 28;
+        // Cross-boot replay of a boot-killing fault (#825). `drainEarlyErrors()`
+        // (runtime/core/globalErrors.ts) only runs from `installGlobalErrorHandlers`, which lives
+        // in the very module graph that just failed to evaluate — a throw fatal enough to reach
+        // the fallback screen below means THIS boot's buffer is never drained by anything, ever.
+        // Stashing it to `localStorage` — survives to the NEXT launch, unlike the
+        // `sessionStorage` `tryAutoReloadOnce` uses above for its own, deliberately different,
+        // purpose — is the only way a fault like that ever reaches Crashlytics at all.
+        var STASH_KEY = 'modoki-boot-stash'; /* modoki:stash-const STASH_KEY */
+        var STASH_VERSION = 2; /* modoki:stash-const STASH_VERSION */
+        // ⚠️ LOAD-BEARING, not headroom. The replay on the NEXT boot
+        // (`replayStashedEarlyErrors()`, globalErrors.ts) runs right after that boot's OWN
+        // `drainEarlyErrors()` — both feed the SAME shared rate limiter (`MAX_PER_BURST_WINDOW` =
+        // 30) in one synchronous burst. `EARLY_ERROR_CAP` (28) is already sized to nearly consume
+        // that window by itself, so stashing up to that same cap could put ~56 events through one
+        // window and silently refuse most of them — including the "N dropped" breadcrumbs that
+        // are supposed to make both caps honest. A boot-killing module-eval throw fires one fault,
+        // occasionally a handful — 8 is generous for that shape and leaves the limiter's budget
+        // intact for whatever this boot's own buffer needs it for.
+        // `earlyErrorBuffer.test.ts` separately pins the actual bound: this literal plus the
+        // drain's own two breadcrumb slots (a possible `[reload]` breadcrumb, the "N dropped"
+        // breadcrumb) must stay within a THIRD of `MAX_PER_BURST_WINDOW`, not the arithmetic
+        // leftover (`MAX_PER_BURST_WINDOW` minus those two slots, which permits 28). A cross-boot
+        // replay is a GUEST in the replaying boot's budget — the arithmetic worst case would let a
+        // previous boot's stash consume the entire window and leave the live boot unable to report
+        // its own, so the test deliberately holds this to a fraction instead.
+        var STASH_MAX_ENTRIES = 6; /* modoki:stash-const REPLAY_ENTRY_CAP */
+        var STASH_MAX_MESSAGE = 500; /* modoki:stash-const STASH_MAX_MESSAGE */
+        var STASH_MAX_STACK = 2000; /* modoki:stash-const STASH_MAX_STACK */
+        var STASH_MAX_CONSOLE_CHARS = 2000; /* modoki:stash-const STASH_MAX_CONSOLE_CHARS */
+        // How many trailing console lines to carry as crash context (#859). Mirrors
+        // bootStash.ts's CONSOLE_TAIL_LINES (injected at build time, like the others); bounded also by
+        // STASH_MAX_CONSOLE_CHARS above, which is the bound that actually keeps localStorage honest.
+        var CONSOLE_TAIL_LINES = 40; /* modoki:stash-const CONSOLE_TAIL_LINES */
+        function earlyErrorNow() {
+          try { return performance.now(); } catch (_) { return 0; }
+        }
+        function bufferEarlyError(entry) {
+          try {
+            if (earlyErrors.done) return;
+            if (earlyErrors.entries.length < EARLY_ERROR_CAP) earlyErrors.entries.push(entry);
+            else earlyErrors.dropped++;
+          } catch (_) { /* never let the guard itself throw */ }
+        }
+        // Read a property defensively — `obj` (an early-buffered `error`/`reason`) can be a
+        // non-object, a string, or a value with a getter that throws; any of those must degrade to
+        // `undefined` rather than take `stashEarlyErrors()` down with it.
+        function safeProp(obj, key) {
+          try { return obj !== null && typeof obj === 'object' ? obj[key] : undefined; } catch (_) { return undefined; }
+        }
+        function safeStashString(v) {
+          try { return String(v); } catch (_) { return ''; }
+        }
+        // Derive the human-readable message for one buffered entry (a real `Error`'s own
+        // `.message`, else a stringified rejection reason, else the raw `ErrorEvent.message`, else
+        // '') — shared by `stashEarlyErrors()` below (its persisted `message` field) and
+        // `consider()`'s post-#823 detail selection further down, so the two stay ONE
+        // implementation rather than a second copy that could drift.
+        function deriveEntryMessage(it) {
+          try {
+            var isRejection = it.kind === 'unhandledrejection';
+            var carried = isRejection ? it.reason : it.error;
+            var msg = safeProp(carried, 'message');
+            if (typeof msg !== 'string') msg = isRejection ? safeStashString(carried) : safeProp(it, 'message');
+            if (typeof msg !== 'string') msg = '';
+            return msg;
+          } catch (_) { return ''; }
+        }
+        // The run-up to the crash (#859): the LAST `CONSOLE_TAIL_LINES` lines the early-console shim
+        // buffered, joined into ONE string. Not `entries` — one breadcrumb, because the shared burst
+        // limiter is 30 events wide and a line-per-event replay could not fit any division of it
+        // (see `runtime/core/bootStash.ts`'s CONSOLE_CONTEXT_SLOT).
+        //
+        // ⚠️ This is the ONLY window where the shim is the right source. Once `installConsoleRing()`
+        // has run it DRAINS this buffer and the ring holds the lines instead — `globalErrors.ts`
+        // reads them from there for its own window. Measured 2026-09-07: that other window covers
+        // the whole of `App.tsx`'s import graph, i.e. most of a failing boot.
+        //
+        // The shim is STRIPPED from any build with no console-ring consumer
+        // (`plugins/earlyConsoleShim.ts`), so `__MODOKI_EARLY_CONSOLE__` is legitimately absent in a
+        // release build — return '' and let the fault stash without a tail rather than failing.
+        //
+        // Args are stringified here with a plain guarded `String(a)`, NOT `consoleRing.ts`'s
+        // `stringifyArg`. That is deliberate and is the one place this file duplicates formatting:
+        // the shim buffers LIVE argument references, and a reference cannot survive a JSON round
+        // trip unformatted, so the choice is a dumber formatter here or no tail at all.
+        function collectEarlyConsoleTail() {
+          try {
+            var st = globalThis.__MODOKI_EARLY_CONSOLE__;
+            if (!st || !st.entries || !st.entries.length) return '';
+            var list = st.entries;
+            var from = list.length > CONSOLE_TAIL_LINES ? list.length - CONSOLE_TAIL_LINES : 0;
+            var out = [];
+            for (var i = from; i < list.length; i++) {
+              try {
+                var rec = list[i] || [];
+                var args = rec[1] || [];
+                var parts = [];
+                for (var j = 0; j < args.length; j++) {
+                  try { parts.push(String(args[j])); } catch (_) { parts.push('<unprintable>'); }
+                }
+                out.push(String(rec[0]) + ': ' + parts.join(' '));
+              } catch (_) { /* one bad line must not cost the whole tail */ }
+            }
+            var joined = out.join('\n');
+            // Trim the HEAD when over budget: the lines closest to the fault are the ones that
+            // explain it, so an over-long tail loses its oldest lines, never its newest.
+            return joined.length > STASH_MAX_CONSOLE_CHARS ? joined.slice(-STASH_MAX_CONSOLE_CHARS) : joined;
+          } catch (_) { return ''; }
+        }
+        // Serialize the buffer to `localStorage` as DATA, not pre-formatted prose — `globalErrors.ts`
+        // owns the formatting via its own `describe()`, and a second copy of that here would drift.
+        function stashEarlyErrors() {
+          try {
+            // Once `installGlobalErrorHandlers()` has drained this buffer, `done` is true and
+            // `entries` is already empty — writing a stash here would carry `earlyErrors.dropped`'s
+            // STALE count (that field is never zeroed by the drain, see `globalErrors.ts`) into a
+            // stash with zero entries, which the NEXT boot's `replayStashedEarlyErrors()` then
+            // reports as its own "dropped (stash cap)" breadcrumb — a lie, attributing an
+            // already-reported drop to a cap this stash never hit. Bail before writing anything.
+            //
+            // ⚠️ THE SCOPE GAP THIS USED TO EXPOSE IS NOW CLOSED (#860/#861). A boot where the
+            // installer DID run but the crashlytics sink never registered loses its queued reports
+            // the same way — this guard cannot reach that case, because `done` is already true here
+            // and the queue is module state in `globalErrors.ts`. That module now persists its own
+            // queue to the SAME envelope (`runtime/core/bootStash.ts`), so the family is covered
+            // from both sides. Measured 2026-09-07: that other window is the WIDE one — the whole
+            // of `App.tsx`'s import graph lands there, not here.
+            if (earlyErrors.done) return;
+            var list = earlyErrors.entries;
+            var keep = list.length > STASH_MAX_ENTRIES ? list.slice(0, STASH_MAX_ENTRIES) : list;
+            // Entries this cap drops, PLUS the ones `bufferEarlyError`'s own cap already dropped —
+            // both are "never reached Crashlytics", so both belong in one honest count.
+            var stashDropped = (list.length - keep.length) + earlyErrors.dropped;
+            var entries = [];
+            for (var i = 0; i < keep.length; i++) {
+              var it = keep[i] || {};
+              var isRejection = it.kind === 'unhandledrejection';
+              var carried = isRejection ? it.reason : it.error;
+              var msg = deriveEntryMessage(it);
+              var entry = {
+                kind: it.kind,
+                message: msg.length > STASH_MAX_MESSAGE ? msg.slice(0, STASH_MAX_MESSAGE) : msg,
+                ts: it.ts,
+              };
+              var stack = safeProp(carried, 'stack');
+              if (stack) {
+                var stackStr = safeStashString(stack);
+                if (stackStr) entry.stack = stackStr.slice(0, STASH_MAX_STACK);
+              }
+              if (!isRejection) {
+                if (it.filename) entry.filename = it.filename;
+                if (it.lineno !== undefined) entry.lineno = it.lineno;
+                if (it.colno !== undefined) entry.colno = it.colno;
+              }
+              entries.push(entry);
+            }
+            var payload = {
+              v: STASH_VERSION, ts: Date.now(), dropped: stashDropped, entries: entries,
+            };
+            var tail = collectEarlyConsoleTail();
+            if (tail) payload.console = tail;
+            localStorage.setItem(STASH_KEY, JSON.stringify(payload));
+          } catch (_) { /* private mode, quota exceeded, or a hostile buffered value — never let the guard itself throw */ }
         }
         // The RELOAD-RECOVERABLE subset: a packaged editor optimizes @modoki/engine, and
         // opening a project can make Vite re-optimize mid-session (a game imports a subpath
@@ -68,7 +270,15 @@
         function consider(msg) {
           try {
             if (shown || scheduled) return;
-            if (!isLoadError(msg)) return;
+            // #823: no message-shape gate here. This used to bail unless `msg` matched
+            // `isLoadError`'s pattern list — which only covers module-RESOLUTION failures (a bad
+            // specifier, a stale chunk hash) and missed every other way a module can throw during
+            // EVALUATION, so a boot-killing `TypeError` (e.g. a trait this build doesn't export)
+            // left the page blank with no fallback screen. Any error now qualifies; the two checks
+            // below are what actually establish fatality, and neither cares what the error SAYS:
+            // `!root || root.childElementCount > 0` (an app that rendered is never fatal, whatever
+            // threw before or after) and the 1400ms re-check just below (an app still mid-mount is
+            // never fatal either).
             var root = document.getElementById('root');
             if (!root || root.childElementCount > 0) return; // app already rendered → not fatal
             // Recover transparently from a mid-session dep re-optimize before falling back
@@ -80,14 +290,115 @@
               var r = document.getElementById('root');
               if (shown || !r || r.childElementCount > 0) return; // recovered
               shown = true;
-              renderFallback(msg);
+              // #823 (detail selection): this timer is scheduled on the FIRST error to arrive, but
+              // it fires 1400ms later — long enough for MORE errors to buffer before the screen
+              // actually renders, including a common, harmless one (e.g. `ResizeObserver loop
+              // limit exceeded`) racing ahead of the real boot-killer. Scheduling early on the
+              // first error is still correct — the fallback screen must fire as soon as fatality is
+              // confirmed — but WHICH error's text to show has to be decided now, from everything
+              // buffered by this point, not frozen at the moment this timer was set up. Prefer the
+              // FIRST entry whose carried value is an object with a real `.stack` (a module-eval
+              // throw always has one; a ResizeObserver notification typically does not) — the
+              // earliest stacked throw in a dead boot is the root cause, and a LATER stacked error
+              // is usually a cascade symptom of it (e.g. a failed dynamic import of a module the
+              // first throw prevented from ever registering) — picking the LAST one used to surface
+              // the symptom instead of the cause (#823 close-out review). Else fall back to the
+              // original `msg` this timer captured — that's already the FIRST error's own message
+              // (the first error is what claimed the `scheduled` latch), so it stays consistent with
+              // preferring the root cause; there is no "else last entry's message" rung, because that
+              // would silently reintroduce the last-wins bias this fix removes. `deriveEntryMessage`
+              // is the same derivation `stashEarlyErrors()` uses for its persisted `message` field —
+              // one implementation, not a third copy. Never let this throw; on any failure, fall
+              // back to `msg`.
+              var detail = msg;
+              try {
+                var entries = earlyErrors.entries;
+                var target = null;
+                for (var i = 0; i < entries.length; i++) {
+                  var candidate = entries[i];
+                  var carried = candidate.kind === 'unhandledrejection' ? candidate.reason : candidate.error;
+                  if (carried !== null && typeof carried === 'object' && safeProp(carried, 'stack')) { target = candidate; break; }
+                }
+                // A derived detail is only an IMPROVEMENT on `msg`, never a replacement to be taken
+                // on faith — `deriveEntryMessage` can legitimately return '' (the carried value has a
+                // stack but no string `.message`) or '[object Object]' (a rejection reason that's a
+                // plain object stringified with no `.message`), and in both of those `msg` is still
+                // the better value. Only adopt the derived detail when it actually beats `msg`.
+                var d = target ? deriveEntryMessage(target) : '';
+                if (d && d !== '[object Object]') detail = d;
+              } catch (_) { detail = msg; }
+              // #825: THIS is the moment the boot is confirmed dead — the same condition that is
+              // about to show the fallback screen is exactly when `installGlobalErrorHandlers` is
+              // now known to have never run, so nothing else will ever drain `earlyErrors`. Stash
+              // it before rendering, so the next launch's `replayStashedEarlyErrors()` can replay it.
+              stashEarlyErrors();
+              renderFallback(detail);
             }, 1400);
           } catch (_) { /* never let the guard itself throw */ }
         }
-        window.addEventListener('error', function (e) { consider(e && (e.message || (e.error && e.error.message))); });
-        window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; consider(r && (r.message || String(r))); });
+        window.addEventListener('error', function (e) {
+          bufferEarlyError({
+            kind: 'error',
+            error: e && e.error,
+            message: e && e.message,
+            filename: e && e.filename,
+            lineno: e && e.lineno,
+            colno: e && e.colno,
+            ts: earlyErrorNow(),
+          });
+          consider(e && (e.message || (e.error && e.error.message)));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          bufferEarlyError({ kind: 'unhandledrejection', reason: e && e.reason, ts: earlyErrorNow() });
+          var r = e && e.reason; consider(r && (r.message || String(r)));
+        });
       })();
     </script>
+    <!-- modoki:early-console:start -->
+    <script>
+      // Early console capture (#633). The ONE thing that cannot be outrun by chunk emission:
+      // rolldown inlines main.tsx's side-effect imports into the entry chunk's BODY, which by ES
+      // semantics runs after every static import — so `installConsoleRing`'s carefully chosen
+      // position above `./App.tsx` buys nothing in a bundled build, and a top-level log in a
+      // game's own module graph is lost. Measured on a --target web build of games/sling.
+      //
+      // This records raw args into a bounded array and forwards. `installConsoleRing()` DRAINS it
+      // (runtime/core/consoleRing.ts) and DISARMS it.
+      //
+      // ⚠️ IT MUST NEVER RESTORE THE ORIGINAL console.* — by drain time `installGlobalErrorHandlers`
+      // has already wrapped AROUND this shim, so reassigning console.* would clobber that wrapper
+      // and silently kill Crashlytics console reporting. Disarm (stop recording, keep forwarding)
+      // is the only safe teardown.
+      //
+      // Stripped from any build where the ring is not installed — see engine/plugins/earlyConsoleShim.ts.
+      (function () {
+        var CAP = 256;
+        var now = function () {
+          try { return performance.now(); } catch (_) { return 0; }
+        };
+        var state = { entries: [], done: false, dropped: 0 };
+        globalThis.__MODOKI_EARLY_CONSOLE__ = state;
+        var levels = ['log', 'info', 'warn', 'error'];
+        for (var i = 0; i < levels.length; i++) {
+          (function (lvl) {
+            var real = console[lvl];
+            if (typeof real !== 'function') return;
+            console[lvl] = function () {
+              if (!state.done) {
+                // The timestamp is taken HERE, not at drain time. The ring stamps `mono` when it
+                // records, so without this every buffered boot line would carry the DRAIN moment
+                // and the boot-timing table this ring exists to produce (#591's nav+ms figures)
+                // would be uniformly wrong while looking perfectly plausible.
+                if (state.entries.length < CAP) state.entries.push([lvl, Array.prototype.slice.call(arguments), now()]);
+                else state.dropped++;
+              }
+              return real.apply(console, arguments);
+            };
+          })(levels[i]);
+        }
+      })();
+    </script>
+    <!-- modoki:early-console:end -->
   </head>
   <body>
     <div id="root"></div>

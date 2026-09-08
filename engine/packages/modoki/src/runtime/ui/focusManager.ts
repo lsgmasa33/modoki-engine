@@ -168,6 +168,8 @@ export function pickInDirection(
 let _worldSwapHooked = false;
 export function ensureFocusWorldSwapHook(): void {
   if (_worldSwapHooked) return;
-  _worldSwapHooked = true;
+  // Latch AFTER registration: an onWorldSwap throw (e.g. a test mock missing it) must not
+  // leave this permanently true with no listener registered.
   onWorldSwap(() => resetFocus());
+  _worldSwapHooked = true;
 }

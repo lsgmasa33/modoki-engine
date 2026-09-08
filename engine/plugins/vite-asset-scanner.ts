@@ -17,13 +17,18 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
+import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
-import { acquireBuild, releasePolicy } from './backend/buildLock';
+import { acquireBuildSlot, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
+// From the standalone zero-import file, NOT assetManifest.ts — that module transitively
+// imports assetFetch.ts/assetUrl.ts (browser-only globals), which would drag DOM/vite-client
+// requirements into this Node-context plugin's typecheck (tsconfig.node.json has neither).
+import { ASSET_MANIFEST_VERSION } from '../packages/modoki/src/runtime/loaders/assetManifestVersion';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
 import { atlasReimportHandler } from './reimport-atlas';
@@ -33,7 +38,15 @@ import { environmentReimportHandler } from './reimport-environment';
 import { convertFont } from './font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from './font-cache';
 import { resolveFontSettings, FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX, type FontImportSettings, type FontManifestBlock, type FontCacheInfo } from '../packages/modoki/src/runtime/core/fontSettings';
-import { readMetaSidecar } from './meta-sidecar';
+import { shaderManifestPathForBody } from '../packages/modoki/src/runtime/core/shaderSchema';
+import {
+  readMetaSidecar,
+  assertSidecarWritable,
+  quarantineCorruptSidecar,
+  salvageSidecarId,
+  CORRUPT_SIDECAR_SUFFIX,
+  SIDECAR_FORMAT_VERSION,
+} from './meta-sidecar';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
@@ -63,9 +76,9 @@ import { resolveModelSettings, lodUrlSuffix, type ModelImportSettings, type Mode
 import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/runtime/loaders/spriteSheet';
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
-import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
+import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
-import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
+import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
 import {
@@ -75,7 +88,7 @@ import {
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
-import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
+import { ensureCapacitorDeps, scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
@@ -230,18 +243,40 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
     // Binary (or non-object ID-bearing JSON): read sidecar
     const sidecar = absPath + '.meta.json';
     if (!fs.existsSync(sidecar)) return undefined;
-    const meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8'));
-    return isGuidShape(meta?.id) ? meta.id : undefined;
+    const text = fs.readFileSync(sidecar, 'utf-8');
+    try {
+      const meta = JSON.parse(text);
+      return isGuidShape(meta?.id) ? meta.id : undefined;
+    } catch {
+      // ⚠️ The sidecar does not parse (merge-conflict markers — #778). Returning `undefined` here
+      // is what makes `buildManifest`'s heal pass mint a BRAND-NEW guid, dangling every existing
+      // scene/prefab reference to this asset. A conflict wraps only the conflicting hunk, so the
+      // `"id"` line is almost always intact and readable textually — recover it rather than
+      // treating a damaged file as an un-stamped one. Returns undefined if the id ITSELF
+      // conflicts, where minting is the honest outcome.
+      return salvageSidecarId(text);
+    }
   } catch {
     return undefined;
   }
 }
 
 /** Atomic write: tmp file + rename. Same pattern as `plugins/meta-sidecar.ts`,
- *  inlined to avoid a circular import with this module. */
+ *  inlined here because this writer handles documents other than sidecars
+ *  (JSON-asset `id` stamping) — not to avoid a circular import; this module
+ *  already imports from `meta-sidecar.ts` above.
+ *
+ *  ⚠️ **The BYTES come from `assetJsonBytes`, not from a local `JSON.stringify` (#831).** This
+ *  writer used to spell them out itself and so emitted no trailing newline, which made it the
+ *  one surviving way for an asset doc to lose one after the router's writer was fixed. It is not
+ *  a rare path: an asset written without an `id` is HEALED here ~150ms later — a guid is minted
+ *  and the file rewritten — so every newly created JSON asset went out through this line.
+ *  Measured live, and only live: the router's own route wrote the newline correctly and this
+ *  overwrote it milliseconds afterwards, so the request looked right and the file was wrong.
+ *  `meta-sidecar.ts:334` already appends its own; this now shares the router's one definition. */
 function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(json, null, 2));
+  fs.writeFileSync(tmp, assetJsonBytes(json));
   fs.renameSync(tmp, absPath);
 }
 
@@ -301,11 +336,47 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
       // sidecar branch below instead of silently no-op'ing via JSON.stringify.
     }
     const sidecar = absPath + '.meta.json';
-    let meta: Record<string, unknown> = { version: 2 };
+    // ⚠️ This path writes through the LOCAL `writeJsonAtomic` below, NOT through
+    // `writeMetaSidecar` — so it does not inherit that function's too-new refusal and
+    // has to make the same check itself (#734). `writeMetaSidecar` is the choke point for
+    // MOST sidecar writes, but several writers bypass it and each must carry the stamp +
+    // refusal itself — see docs/format-versioning.md § 2b. Refused explicitly rather
+    // than by letting the throw hit the outer `catch { return false }`, which would
+    // report the same `false` as an ordinary write failure and say nothing.
+    try {
+      assertSidecarWritable(absPath);
+    } catch (e) {
+      console.warn(`[assets] not stamping a GUID into ${sidecar}: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+    // ⚠️ An unparsable sidecar is MOVED ASIDE, never silently replaced (#778). This branch
+    // used to `catch { /* recreate */ }` and write `{id: guid}` over the whole document —
+    // discarding the texture import settings and every hand-drawn sprite slice (each with its
+    // OWN GUID that scenes reference), re-minting the asset's GUID so every existing ref
+    // dangled, and returning `true`. None of that is recoverable from the source image, and a
+    // reimport does not bring it back: it regenerates the files listed under `generated`, not
+    // the authored state beside them.
+    // Warned explicitly rather than left to the outer `catch { return false }`. That catch DOES
+    // do the safe thing — the throw happens before any write, so the damaged bytes survive — but
+    // it reports the same bare `false` as an ordinary write failure and says nothing, which is
+    // the identical "refused, and nobody can tell why" complaint the `assertSidecarWritable`
+    // block above exists to avoid.
+    try {
+      quarantineCorruptSidecar(absPath);
+    } catch (e) {
+      console.warn(`[assets] not stamping a GUID into ${sidecar}: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+    let meta: Record<string, unknown> = {};
     if (fs.existsSync(sidecar)) {
+      // Parses by construction now — anything that did not was just quarantined away.
       try { meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { /* recreate */ }
     }
     meta.id = guid;
+    // This writer does not route through `writeMetaSidecar`, so it must stamp
+    // as well as refuse — refusing alone (above) yields an unstamped document,
+    // which is the same downgrade-risk defect (#734) wearing a different face.
+    meta.version = SIDECAR_FORMAT_VERSION;
     writeJsonAtomic(sidecar, meta);
     return true;
   } catch {
@@ -360,7 +431,18 @@ export function detectType(relPath: string, ext: string): string | null {
   // must be listed explicitly: it does NOT end with `.meta.json`, so it used to fall
   // through to the `.json` catch-all below and get classified as a SCENE, which minted a
   // GUID into it and registered it in the manifest as a scene.
-  if (relPath.endsWith('.meta.json') || relPath.endsWith('.meta.local.json')) return null;
+  // The quarantined half (`<asset>.meta.json.corrupt`, #778) is listed for a WEAKER reason, and
+  // the distinction matters: its extension is `.corrupt`, so the `.json` branch below is never
+  // entered and the final `EXT_TYPE[ext] || null` already returns null. Deleting this clause
+  // changes nothing today — it is explicit belt-and-braces against a future `EXT_TYPE` entry,
+  // not the mechanism keeping the file out of the scan. (Claimed as load-bearing when first
+  // written; measured otherwise — a bare `.corrupt` path, which this clause does not match,
+  // classifies as null too.)
+  if (
+    relPath.endsWith('.meta.json') ||
+    relPath.endsWith('.meta.local.json') ||
+    relPath.endsWith('.meta.json' + CORRUPT_SIDECAR_SUFFIX)
+  ) return null;
   // Committed UltraHDR variant (`<src>.hdr~ultrahdr.jpg`) — a DERIVED file next to its
   // source HDR, NOT a standalone texture asset. Exclude it from the scan (else it'd be
   // classified `.jpg` → texture and get its own meta/manifest entry).
@@ -397,7 +479,7 @@ export function detectType(relPath: string, ext: string): string | null {
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
  *  world; 'animation', 'timeline' and 'particle' only invalidate their asset cache (reloading
  *  the scene would be wrong — and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d';
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -433,8 +515,72 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // document and the round-trip reverts the file that was just written.
   if (type === 'spriteanim') return 'spriteanim';
   if (type === 'rig2d') return 'rig2d';
+  // `.animset.json` — the SIXTH, and NOT the same shape as the five above, which is why it
+  // survived the guard they left behind. `invalidateAnimSet` is not an orphan: the Inspector's
+  // own `AnimSetAssetView` drives it through `assetViews/persist.ts`. So an animset edited IN
+  // THE EDITOR has always invalidated correctly, and only the EXTERNAL-write half was dead —
+  // `modoki_write_asset`, or the user's own Claude Code editing the file with a plain Write,
+  // which is the headline case this whole broadcast exists for. The cache then kept the
+  // pre-edit clip params (speed/loop/fade) and the skinned model went on playing them.
+  //
+  // ⚠️ `liveReloadKinds.test.ts` could not catch this one: it cross-checks the PRODUCER union
+  // against the CONSUMER union, and `animset` was absent from BOTH, so the two agreed with each
+  // other while agreeing on the wrong set. `invalidatorsAreReachable.test.ts` is the guard that
+  // closes that blind spot, by asking the question from the invalidator's end instead.
+  if (type === 'animset') return 'animset';
+  // `.material.json` / `.shader.json` — agent-writable (`/api/asset-write` covers all 8
+  // ASSET_SCHEMA_TYPES) and parkable in the Inspector, but absent from this function until #842:
+  // an external write fell through to `return null` — no broadcast, so `dropParkedWriteFor` never
+  // ran (a stale parked material edit could clobber a newer on-disk write at Cmd+S) and no cache
+  // invalidation ever fired for an agent shader write.
+  if (type === 'material') return 'material';
+  if (type === 'shader') return 'shader';
   if (type === 'scene') return 'scene';
   return null;
+}
+
+/** For a changed file under an asset root, resolve the path `onChange` should actually
+ *  classify: the file itself for `.json`; for a shader BODY (`.glsl`/`.wgsl`) — deliberately
+ *  NOT a manifest asset itself (`assetTypeClassifier.ts`), but the file `ShaderAssetView.tsx`
+ *  tells authors to edit — its sibling `.shader.json` descriptor, PROVIDED that descriptor
+ *  exists on disk (a body with no descriptor is not a shader change). Returns null for a
+ *  body with no descriptor, or for a change to anything else — `onChange`'s
+ *  `scheduleRebuild()` still runs unconditionally in that case; only the classify + broadcast
+ *  are gated on this. (#857)
+ *
+ *  Pure aside from the fs check, so — per this file's own module doc — it's exported and
+ *  tested directly rather than through a mocked Vite server. */
+export function pathToClassifyForChange(file: string): string | null {
+  if (path.extname(file).toLowerCase() === '.json') return file;
+  const manifestPath = shaderManifestPathForBody(file);
+  return manifestPath && fs.existsSync(manifestPath) ? manifestPath : null;
+}
+
+/** Did THIS broadcast's urlPath get raised by a write to a SIBLING rather than to its own file?
+ *  Today the only such case is a `.glsl`/`.wgsl` shader body remapped to its `.shader.json`
+ *  descriptor (#857).
+ *
+ *  It matters downstream, not here: `agentBridge`'s `dropParkedWriteFor` discards an unsaved
+ *  parked Inspector edit on the grounds that "the file on disk is now authoritative". That is true
+ *  when the descriptor itself was rewritten and FALSE when only its body sibling was — and
+ *  discarding then throws away exactly the edit the author is iterating on (declare a uniform in
+ *  the Shader Inspector, save the `.wgsl` you added it to, lose the declaration), which is the very
+ *  loop #857 exists to enable.
+ *
+ *  `prev` is the flag already accumulated for this urlPath in the current debounce window, and the
+ *  rule is an AND: a DIRECT write to the descriptor anywhere in the window makes the drop correct
+ *  again, so it wins. Absent `prev` (the first change in the window) starts permissive.
+ *
+ *  ⚠️ Lives here, called by BOTH watchers, deliberately. The Vite plugin and
+ *  `engine/electron/assetBackend.ts` have drifted four times, every time through a rule one of
+ *  them re-implemented — the classifier, then the extension gate. This is that rule's third
+ *  chance to become a fifth drift, and it does not get one. */
+export function isSiblingRaisedChange(
+  changedFile: string,
+  classifiedTarget: string,
+  prev: boolean | undefined,
+): boolean {
+  return classifiedTarget !== changedFile && (prev ?? true);
 }
 
 /** True if `url` targets one of the SSE routes (which own their own streaming
@@ -494,32 +640,11 @@ export function otaPublishBundleNameAllowed(requestedBundleName: string, project
   return requestedBundleName === projectOtaBundleName;
 }
 
-/** Why an OTA publish must be REFUSED on the signing key, or null when the key is usable.
- *
- *  `keyPublicKey` is the public half of `build/ota-keys/<name>.json`; `projectPublicKey` is
- *  `project.config.json` `ota.publicKey`, the value baked into the SHIPPED BINARY and the only key
- *  `verifyReleaseSignature` accepts. The preflight used to check merely that the key FILE existed
- *  (independent review, 2026-07-30), so publishing with a non-matching key produced a well-formed,
- *  signed release that every installed app silently refused while the tool reported success — and
- *  `/api/ota/status` then confirmed the version as live. Pure, so the invariant is unit-testable
- *  without gcloud, a bucket, or a real publish (the same reason its two siblings here are pure). */
-export function otaSigningKeyRefusal(
-  keyPublicKey: string | null | undefined,
-  projectPublicKey: string | null | undefined,
-): 'no-key-public-half' | 'project-public-key-empty' | 'mismatch' | null {
-  if (!keyPublicKey) return 'no-key-public-half';
-  if (!projectPublicKey) return 'project-public-key-empty';
-  return keyPublicKey === projectPublicKey ? null : 'mismatch';
-}
-
-/** Classifies a `gcloud storage cat`/`objects describe` failure's stderr: only a genuine
- *  "this object doesn't exist" is safe to treat as "no collision, proceed" — see
- *  ota-updates.md's Gotchas for why treating EVERY gcloud failure (including a transient
- *  auth/network error) as "no collision" was a real gap. Pure — extracted so the
- *  classification itself is unit-testable independent of ever calling gcloud. */
-export function isGcloudObjectNotFoundError(stderr: string): boolean {
-  return /not found: 404|matched no objects or files/i.test(stderr);
-}
+// otaSigningKeyRefusal moved to engine/scripts/ota/publishGuards.mjs (#582) — it now runs in
+// TWO places (this route's own early check below, and ota-publish.mjs itself, the by-hand path
+// this route's refusal message sends a human to), so it lives once and both import it.
+export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
+import { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
 
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
@@ -1068,7 +1193,7 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
     }
   }
 
-  return { version: 2, assets: items.map((it) => it.entry), folders };
+  return { version: ASSET_MANIFEST_VERSION, assets: items.map((it) => it.entry), folders };
 }
 
 /** Resolve the engine built-in assets dir (/modoki/assets) from the first
@@ -1162,7 +1287,11 @@ export function absToAssetUrl(absPath: string, roots: AssetRoot[]): string | nul
   for (const root of roots) {
     const rel = path.relative(root.absDir, absPath);
     if (rel === '' || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) continue;
-    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/');
+    // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
+    // filename with non-ASCII characters is stored NFD on disk, and without this the two
+    // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
+    // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
+    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
   }
   return null;
 }
@@ -1252,9 +1381,19 @@ export function assetScannerPlugin(): Plugin {
    *  see isGameCodeFile. */
   let gameCodeRoot: string | null = null;
   /** Cached manifest, rebuilt on file changes. Avoids re-scanning on every fetch. */
-  let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: 2, assets: [], folders: [] };
+  let cachedManifest: { version: 2; assets: AssetEntry[]; folders: string[] } = { version: ASSET_MANIFEST_VERSION, assets: [], folders: [] };
   /** Server reference so the watcher can push HMR updates. */
-  let viteServer: { ws: { send: (m: object) => void } } | null = null;
+  // `clients` is READ, not just `send` (see `requestBrowser`'s no-client fast reject): an empty set
+  // is the only PROOF this side has that nobody is listening, and without it the caller is left
+  // with a timeout, which is ambiguous by design. Optional because a future Vite could stop
+  // exposing it — the guard then skips and the behaviour is what it was before.
+  //
+  // ONE type, used by the declaration AND the assignment cast below. They were written separately
+  // and the cast kept the old `{ ws: { send } }` shape, which still compiled (the narrower type is
+  // assignable) while telling the next reader `clients` was not there — the field the guard is
+  // built on. A shared alias makes that impossible rather than tidy.
+  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number } } };
+  let viteServer: ViteServerRef | null = null;
 
   // ── Agent bridge state (dev-only AI/tooling helpers) ──
   // The live trait-registry schema, pushed by the browser over the HMR socket
@@ -1287,6 +1426,24 @@ export function assetScannerPlugin(): Plugin {
    *  on timeout (no app open / no agent bridge connected). */
   function requestBrowser(op: string, params: unknown, timeoutMs = 3000): Promise<unknown> {
     if (!viteServer) return Promise.reject(new Error('dev server websocket not ready'));
+    // ⚠️ **A TIMEOUT and "nobody is listening" are different answers, and only this side can tell
+    // them apart.** With no page open, `ws.send` succeeds into the void and every relay call waited
+    // out its full budget before rejecting with a timeout — which callers must treat as AMBIGUOUS
+    // (`isRelayTimeout`: on Electron a timeout can only mean an attached-but-busy renderer, so it
+    // is never safe to read as "no renderer"). That cost the sidecar park gate its headless path:
+    // a dev server with no page open would have refused every `/api/reimport` with NO_RENDERER,
+    // because it could not prove nothing was parked (#872/#882). The client count PROVES it, so
+    // reject definitively and immediately instead — and the wording is one `isRelayTransportFailure`
+    // already matches, so both hosts' classifiers pick it up without a new string to keep in step.
+    //
+    // It also removes a real cost the move repair documents: three callers loop, and a 10-file cut
+    // with no page open spent its whole budget per file discovering the same thing.
+    //
+    // Optional-chained on purpose: if a future Vite stops exposing `clients`, this guard skips and
+    // the behaviour is exactly what it was before — a timeout — rather than a crash.
+    if (viteServer.ws?.clients?.size === 0) {
+      return Promise.reject(new Error(`no renderer connected to the dev server (op '${op}' was not delivered)`));
+    }
     return browserRequests.request((id) => {
       viteServer!.ws.send({ type: 'custom', event: 'modoki:request', data: { id, op, params } });
     }, timeoutMs);
@@ -1338,7 +1495,7 @@ export function assetScannerPlugin(): Plugin {
       if (isGameCodeFile(ctx.file, gameCodeRoot, assetRoots)) {
         if (viteServer) {
           // The RENDERER decides whether to reload now or surface a banner — an
-          // unconditional reload would silently destroy unsaved scene edits (there is no
+          // unconditional reload would silently destroy unsaved work of any kind (#850 — there is no
           // beforeunload guard anywhere). See app/debug/hmrStaleness.ts.
           try { viteServer.ws.send({ type: 'custom', event: 'modoki:game-code-changed', data: { file: ctx.file } }); }
           catch { /* ws not ready */ }
@@ -1348,7 +1505,7 @@ export function assetScannerPlugin(): Plugin {
       // Engine SHADER GRAPH (postfx/npr TSL): same "only a reload can apply this" situation as
       // game code, for a different reason — the old node graph is already baked into a compiled
       // pipeline. Reuses the SAME renderer-decides handshake, so a shader edit can't silently
-      // destroy unsaved scene edits either. See isShaderGraphFile + app/debug/hmrStaleness.ts.
+      // destroy unsaved work either. See isShaderGraphFile + app/debug/hmrStaleness.ts.
       if (isShaderGraphFile(ctx.file)) {
         if (viteServer) {
           try { viteServer.ws.send({ type: 'custom', event: 'modoki:shader-code-changed', data: { file: ctx.file } }); }
@@ -1410,7 +1567,7 @@ export function assetScannerPlugin(): Plugin {
     configureServer(server) {
       // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
       reclaimStaleDeviceStateAtStartup();
-      viteServer = server as unknown as { ws: { send: (m: object) => void } };
+      viteServer = server as unknown as ViteServerRef;
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve
       // pending requestBrowser() promises when the browser replies. (See
@@ -1438,15 +1595,22 @@ export function assetScannerPlugin(): Plugin {
       let pendingRebuild: NodeJS.Timeout | null = null;
       // Scene/prefab files edited since the last flush → broadcast to the browser
       // so it hot-reloads the active scene (app/debug/agentBridge.ts).
-      const pendingSceneChanges = new Map<string, LiveReloadKind>();
+      // `viaSibling` = this urlPath's OWN file did not change; a SIBLING did (today: a
+      // `.glsl`/`.wgsl` body remapped to its `.shader.json` descriptor, #857). The consumer needs
+      // it because `dropParkedWriteFor` discards an unsaved parked edit on the grounds that "the
+      // file on disk is now authoritative" — true when the descriptor itself was rewritten, FALSE
+      // when only its body sibling was, and discarding then throws away exactly the Inspector edit
+      // the author was iterating on. Collapsing several changes in one debounce window ANDs the
+      // flag, so a direct write to the descriptor in the same window wins and the drop still happens.
+      const pendingSceneChanges = new Map<string, { kind: LiveReloadKind; viaSibling: boolean }>();
       const flushPending = () => {
         pendingRebuild = null;
         rebuildManifest();
         // Broadcast after the manifest rebuild so guid→path changes are already
         // live on the client before it re-loads the scene.
         if (pendingSceneChanges.size && viteServer) {
-          for (const [urlPath, kind] of pendingSceneChanges) {
-            try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind } }); }
+          for (const [urlPath, { kind, viaSibling }] of pendingSceneChanges) {
+            try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind, viaSibling } }); }
             catch { /* ws not ready */ }
           }
           pendingSceneChanges.clear();
@@ -1461,15 +1625,29 @@ export function assetScannerPlugin(): Plugin {
         if (!isUnderAssetRoot(file, assetRoots)) return;
         // Classify via the same detector the scanner uses — new scenes are
         // `.scene.json`; a plain `.json` under a `scenes/` dir is the legacy fallback (#54).
-        if (path.extname(file).toLowerCase() === '.json' && !isEditorWrite(file, () => hashFileSync(file))) {
-          const rel = file.split(path.sep).join('/');
+        // A shader BODY (.glsl/.wgsl) is the file an author actually edits, so it remaps to
+        // its sibling `.shader.json` descriptor before classifying (#857) — `target` is that
+        // descriptor for a body (when it exists on disk), the file itself for `.json`, or
+        // null for anything else (a body with no descriptor is not a shader change).
+        const target = pathToClassifyForChange(file);
+        // isEditorWrite is checked against `file` (the BODY actually written), never
+        // `target` (the remapped descriptor) — it's a content-hash guard, and hashing the
+        // wrong file would defeat it.
+        if (target && !isEditorWrite(file, () => hashFileSync(file))) {
+          const rel = target.split(path.sep).join('/');
           // classifySceneChange just forwards detectType's verdict for 'scene' now that
           // the catch-all is gone (#54) — every 'scene' is positively identified (suffix
           // or legacy /scenes/ dir), so no further gating is needed. 'prefab' always broadcasts.
           const kind = classifySceneChange(rel);
           if (kind) {
-            const urlPath = absToAssetUrl(file, assetRoots);
-            if (urlPath) pendingSceneChanges.set(urlPath, kind);
+            const urlPath = absToAssetUrl(target, assetRoots);
+            // Editing both `foo.glsl` and `foo.wgsl` inside one debounce window both remap to
+            // the SAME descriptor path, so `pendingSceneChanges` (keyed by urlPath) collapses
+            // them into ONE broadcast for `foo.shader.json` — intended.
+            if (urlPath) {
+              const viaSibling = isSiblingRaisedChange(file, target, pendingSceneChanges.get(urlPath)?.viaSibling);
+              pendingSceneChanges.set(urlPath, { kind, viaSibling });
+            }
           }
         }
         scheduleRebuild();
@@ -1661,13 +1839,17 @@ export function assetScannerPlugin(): Plugin {
           const buildCwd = editorRoot || projectRoot;
           const nativeDir = path.join(projectRoot, platform);
 
-          // The SAME slot /api/build and /api/ota/publish take (#173 close-out). The scaffold runs
-          // the identical `build-web.mjs --target native` into the identical `<project>/dist`
-          // (addNativeTarget.ts), and additionally `npm install`s and `cap add`s into the project —
-          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules or leaves a
-          // half-written ios/ that this route's own `existsSync(nativeDir)` gate then reads as
-          // "already scaffolded". Nothing deduped two calls for the same platform before this.
-          const scaffoldSlot = acquireBuild(`${platform} native scaffold`);
+          // The SAME slot /api/build and /api/ota/publish take (#173 close-out), and — since #650
+          // — the SAME cross-process claim a CLI script (`add-native-targets.mjs`) takes too. The
+          // scaffold runs the identical `build-web.mjs --target native` into the identical
+          // `<project>/dist` (addNativeTarget.ts), and additionally `npm install`s and `cap add`s
+          // into the project — so racing a build corrupts dist, and racing ITSELF corrupts
+          // node_modules. Nothing deduped two calls for the same platform before this. This lock
+          // stops two scaffolds racing each other; it does nothing about ONE scaffold getting
+          // killed mid-`cap add` — that's #581, and the half-written folder it leaves behind is no
+          // longer read as "already scaffolded" (see isNativeTargetScaffolded + the repair step it
+          // drives in scaffoldNativeTarget, below).
+          const scaffoldSlot = acquireBuildSlot(`${platform} native scaffold`, projectRoot);
           if (!scaffoldSlot.ok) {
             send(`[native] ${scaffoldSlot.message}`);
             sendStatus(`FAILED:Another job is already running\n${scaffoldSlot.message}`);
@@ -1705,11 +1887,18 @@ export function assetScannerPlugin(): Plugin {
           (async () => {
             const TOTAL = 5;
             try {
-              if (fs.existsSync(nativeDir)) {
+              // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
+              // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
+              // for the platform's real project file. An incomplete folder falls through into
+              // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
+              if (isNativeTargetScaffolded(projectRoot, platform)) {
                 sendStatus(`FAILED:${platform}/ already exists`);
                 send(`This project already has a ${platform}/ folder — nothing to do.`);
                 res.end();
                 return;
+              }
+              if (fs.existsSync(nativeDir)) {
+                send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
               }
               // Progress is coarse-grained here (the shared helper streams its own
               // per-step `── label ──` lines); nudge the step bar around the phases.
@@ -1838,13 +2027,15 @@ export function assetScannerPlugin(): Plugin {
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* client disconnected */ } };
 
           // ONE build at a time (#173). #170's client guard covers the Build MENU; it cannot cover
-          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Taken
+          // `modoki_build`, which arrives here directly while a human's build is mid-flight. Nor can
+          // it cover a CLI script (`build-web.mjs`) running by hand in a terminal — closed by #650's
+          // cross-process claim, held ALONGSIDE the in-process slot by `acquireBuildSlot`. Taken
           // AFTER the SSE headers so the refusal reaches the client as a `FAILED:` status (the
           // route's convention for a deliberate refusal — a bare status is pushed into the log by
           // `consumeBuildStream` and then surfaces as "stream ended without a final status", i.e. an
           // actionable refusal disguised as a protocol anomaly), and BEFORE any config load or
           // preflight so a refused build does nothing at all.
-          const slot = acquireBuild(`${platform}${isRelease ? ' release' : ''} build`);
+          const slot = acquireBuildSlot(`${platform}${isRelease ? ' release' : ''} build`, projectRoot);
           if (!slot.ok) {
             send(`[build] ${slot.message}`);
             sendStatus(`FAILED:Another job is already running\n${slot.message}`);
@@ -2140,7 +2331,7 @@ export function assetScannerPlugin(): Plugin {
           const projectDist = path.join(projectRoot, 'dist');
           const otaEmbedStep: BuildStep | null = cfg.ota.enabled ? {
             label: 'Embedding OTA manifest...',
-            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi}`,
+            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi} --project ${JSON.stringify(projectRoot)}`,
             cwd: buildCwd,
           } : null;
           // Resolved once: `null` means the icons are already current for that platform,
@@ -2376,7 +2567,8 @@ export function assetScannerPlugin(): Plugin {
           // "Add Native Target" action) below, inside the SSE stream — then pause
           // if it surfaces a warning the user must act on (missing Firebase).
           const needsNativeScaffold =
-            (platform === 'ios' || platform === 'android') && !fs.existsSync(path.join(projectRoot, platform));
+            (platform === 'ios' || platform === 'android') &&
+            !isNativeTargetScaffolded(projectRoot, platform as NativePlatform);
 
           // iOS device builds need a target device: the xcodebuild -destination interpolates
           // the configured id (the devicectl install/launch steps interpolate the SEPARATE,
@@ -2604,7 +2796,11 @@ export function assetScannerPlugin(): Plugin {
             // Firebase config) so they can act before the build runs against it.
             if (needsNativeScaffold) {
               sendStatus(`Adding ${platform} target…`);
-              send(`\nThis project has no ${platform}/ folder yet — scaffolding it before building.`);
+              if (fs.existsSync(path.join(projectRoot, platform))) {
+                send(`\nFound an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it before building.`);
+              } else {
+                send(`\nThis project has no ${platform}/ folder yet — scaffolding it before building.`);
+              }
               let warnings: string[];
               try {
                 ({ warnings } = await scaffoldNativeTarget({ projectRoot, platform: platform as NativePlatform, buildCwd, cfg, send, runShell: runScaffoldShell }));
@@ -2731,6 +2927,38 @@ export function assetScannerPlugin(): Plugin {
                 }
                 writeVendorMarker(projectRoot, v.expectedVendor);
               }
+              // ⚠️ UNCONDITIONAL — outside the install `if` above, deliberately (#685). The state
+              // this catches is `node_modules` holding a PREVIOUS tarball's bytes while every
+              // other signal agrees the current one is installed: there `depHeal.changed` is
+              // false AND `v.needsInstall` is false, so the install block does nothing and `npm
+              // install` would report "up to date". A check gated on those flags could never fire
+              // in the one case it exists for.
+              //
+              // This MIRRORS `build-web.mjs`'s step 5. Keep the two in step: the editor's
+              // `/api/build` and the CLI `--target native` recipe are documented as equivalent
+              // (docs/build.md), and #148 is precisely what a divergence between them costs —
+              // a guard in only one path leaves the OTHER able to ship the previous native code.
+              //
+              // ⚠️ `verifyInstalledMatchesTarballResult` (#731): an unreadable `package.json` for
+              // THIS project must not read as "verified clean" — warn and keep going rather than
+              // silently skipping the check, matching build-web.mjs's own warn-not-throw call.
+              const { problems: stale, reason: staleCheckReason } = verifyInstalledMatchesTarballResult(projectRoot);
+              if (staleCheckReason === 'unreadable-package-json') {
+                send(describeUnreadablePackageJsonWarning(projectRoot));
+              }
+              if (stale.length) {
+                sendStatus('FAILED:stale node_modules');
+                send(`\nBuild failed — node_modules is STALE for ${stale.length} vendored plugin(s); this build would ship the WRONG native code (#685):`);
+                for (const problem of stale) send(`  • ${problem}`);
+                send(`\n⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES this state, writing the new resolved+integrity into both lockfiles without extracting, and a tree left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` will not fix it either.`);
+                send(`Repair, in order:`);
+                send(`  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")`);
+                send(`  2. (cd ${projectRoot} && npm install)   # a PLAIN install — it now re-resolves AND extracts`);
+                send(`  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json is ahead of the disk and nothing will re-extract:`);
+                send(`     (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`);
+                res.end();
+                return;
+              }
             }
             const total = steps.length;
             for (let i = 0; i < steps.length; i++) {
@@ -2809,14 +3037,21 @@ export function assetScannerPlugin(): Plugin {
         // work identically in a packaged Electron editor, not just this dev server. Only
         // the SSE publish pipeline below stays host-owned, same as /api/build.
 
-        // GET /api/ota/publish?version=v18&mandatory=1[&bundleName=][&key=][&bucket=] (SSE stream)
+        // GET /api/ota/publish?version=v18[&mandatory=1|0][&bundleName=][&key=][&bucket=] (SSE stream)
+        // `mandatory` is tri-state: 1 sets it, 0 clears it, omitted inherits the existing
+        // release's value (sticky — see ota-publish.mjs's own header comment).
         // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
         // for: build FRESH from the current project.config.json (never accept a stale
-        // pre-built dist/), refuse a version-string collision, verify/set bucket CORS.
+        // pre-built dist/), verify/set bucket CORS. The version-collision decision
+        // belongs to ota-publish.mjs alone, not this route (#577) — see Step 3 below.
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
           const version = url.searchParams.get('version');
-          const mandatory = url.searchParams.get('mandatory') === '1';
+          // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:
+          // "1" sets it, "0" clears it, absent inherits the existing release's value —
+          // `mandatoryParam` is `undefined` in that last case, distinct from `false`.
+          const mandatoryRaw = url.searchParams.get('mandatory');
+          const mandatoryParam = mandatoryRaw === '1' ? true : mandatoryRaw === '0' ? false : undefined;
           const keyName = url.searchParams.get('key') || 'default';
           const cfg = loadProjectConfig(projectRoot);
           const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
@@ -2873,6 +3108,14 @@ export function assetScannerPlugin(): Plugin {
           // and `/api/ota/status` then CONFIRMED the version as published. A release that no
           // device can install, reported as a successful ship, is the worst failure this route
           // has: it is remote, silent, and looks fine from here.
+          //
+          // #582: `ota-publish.mjs` (spawned below) now enforces this SAME refusal from the same
+          // pure `otaSigningKeyRefusal` — this is NOT the #577 duplicate-guard shape. #577's
+          // duplicate was a DIFFERENT decision procedure (existence vs content) that ran FIRST
+          // and refused a case the real guard allows. This is the identical pure function over
+          // the identical two inputs (the same key file, the same project.config.json), so it
+          // cannot refuse anything ota-publish.mjs would allow — it stays here only to return a
+          // clean HTTP 400 before the SSE stream opens and the multi-minute build starts.
           {
             let keyPub: string | null;
             try {
@@ -2915,14 +3158,16 @@ export function assetScannerPlugin(): Plugin {
           // `node: command not found`, i.e. the publish was impossible in the one build where the
           // editor is most likely to be used and the failure said nothing about why. (§9: the
           // build family should not have two different notions of "the environment a step runs in".)
-          // The SAME slot the build takes (#173 close-out). This route runs the byte-identical
-          // `build-web.mjs --target native` into the byte-identical `<project>/dist` as
-          // /api/build's web step — and then UPLOADS that dist. So a publish racing a build does not
-          // merely corrupt a local artifact: it ships the torn bundle to every installed device that
-          // checks for an update, with no review step in between. Strictly worse than the case the
-          // lock was written for, and reachable by one human doing two ordinary things in one window
-          // (start Build → iOS, then open Publish OTA while it runs).
-          const otaSlot = acquireBuild('OTA publish');
+          // The SAME slot the build takes (#173 close-out), and — since #650 — the SAME
+          // cross-process claim `ota-publish.mjs` takes when run by hand. This route runs the
+          // byte-identical `build-web.mjs --target native` into the byte-identical
+          // `<project>/dist` as /api/build's web step — and then UPLOADS that dist. So a publish
+          // racing a build does not merely corrupt a local artifact: it ships the torn bundle to
+          // every installed device that checks for an update, with no review step in between.
+          // Strictly worse than the case the lock was written for, and reachable by one human doing
+          // two ordinary things in one window (start Build → iOS, then open Publish OTA while it
+          // runs) — or one human running `ota-publish.mjs` by hand while either is happening.
+          const otaSlot = acquireBuildSlot('OTA publish', projectRoot);
           if (!otaSlot.ok) {
             send(`[ota] ${otaSlot.message}`);
             sendStatus(`FAILED:Another job is already running\n${otaSlot.message}`);
@@ -2966,48 +3211,23 @@ export function assetScannerPlugin(): Plugin {
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
 
-            // Step 2: refuse a version-string collision. release.json only tracks the
-            // CURRENT live version, not history, so check the versioned manifest object
-            // itself — a device that already rejected this version must never see it
-            // "successfully" republished with different bytes.
-            sendStatus('Checking for a version collision...');
-            const manifestPath = `${bucket}/bundles/${bundleName}/${version}/manifest.json`;
-            let manifestExists = false;
-            try {
-              execFileSync('gcloud', ['storage', 'cat', manifestPath], { env: gcloudEnv, stdio: ['ignore', 'ignore', 'pipe'] });
-              manifestExists = true;
-            } catch (e) {
-              // A missing object is the ONLY case that means "safe to proceed" — `gcloud
-              // storage cat` reports it as "not found: 404" or "matched no objects" on
-              // stderr. Anything else (auth expired, network blip, wrong bucket
-              // permissions) must NOT be silently treated as "no collision": that would
-              // let a publish proceed past the one guard that stops a device which
-              // already rejected this version string from being served it again under a
-              // "successful" republish. Fail loudly instead — the human re-runs once
-              // whatever's actually wrong (e.g. `gcloud auth login`) is fixed.
-              const stderr = (e as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
-              if (isGcloudObjectNotFoundError(stderr)) {
-                // manifestExists is already false (the declaration default).
-              } else {
-                sendStatus(`FAILED:Could not check for a version collision\n${stderr || (e instanceof Error ? e.message : String(e))}`);
-                res.end();
-                return;
-              }
-            }
-            if (aborted) return;
-            if (manifestExists) {
-              const m = version.match(/^v(\d+)$/);
-              const hint = m ? ` Try v${Number(m[1]) + 1}.` : '';
-              sendStatus(`FAILED:Version collision\n"${bundleName}@${version}" is already published under ${bucket}. Publishing again would silently never reach any device that already rejected these bytes once.${hint}`);
-              res.end();
-              return;
-            }
-
-            // Step 3: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
+            // Step 2: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
             // ignore CORS entirely, so nothing catches a missing policy until a real
             // WebView fetch() fails — and checkForUpdate reports that as the generic
             // no-release-for-bundle, i.e. silently). Non-fatal: a permissions error here
             // shouldn't block publishing, just gets logged as a warning.
+            // ⚠️ This write now happens before the collision check INSIDE ota-publish.mjs
+            // (Step 3) — the route itself has no such check; #577 deleted it, it was not
+            // reordered. So a publish about to be refused for a genuine version collision
+            // has already REPLACED the bucket's whole CORS config (`--cors-file` is not a
+            // merge) with the `origin:['*']` policy below, clobbering any hand-tuned origin
+            // list. Accepted, not an oversight — but note the reason is NOT that moving CORS
+            // below Step 3 is impossible: Step 3 returns early on `!publish.ok`, so a refused
+            // publish would simply never reach the write. The real cost of moving it is a
+            // window where a BRAND-NEW bucket serves the just-published release with no CORS
+            // until the write lands, and a device polling in that window sees the generic
+            // no-release-for-bundle — i.e. a silent failure on the first publish, traded for
+            // a recoverable config clobber on a refused one. Worth revisiting, not settled.
             sendStatus('Verifying bucket CORS...');
             const bucketRoot = bucket.match(/^gs:\/\/[^/]+/)?.[0];
             if (bucketRoot) {
@@ -3022,12 +3242,21 @@ export function assetScannerPlugin(): Plugin {
             }
             if (aborted) return;
 
-            // Step 4: the actual publish.
+            // Step 3: the actual publish. This route has NO version-collision guard of its
+            // own on purpose — `ota-publish.mjs` is the single source of truth for that
+            // decision, and it decides by manifest CONTENT (identical bytes → a legitimate
+            // retry of a publish that died after upload; different bytes → refuse). This
+            // route used to duplicate that check by manifest EXISTENCE and, running first,
+            // never let the content-based guard get reached — refusing exactly the
+            // identical-contents retry it exists to allow (#577). A guard here would have to
+            // recompute what THIS publish would produce (hash dist/, build the zip, build
+            // the manifest, canonicalize) to compare against — i.e. re-implement the script
+            // — and the two implementations drifting is this bug. Don't re-add it.
             sendStatus('Publishing...');
-            const mandatoryFlag = mandatory ? ' --mandatory' : '';
+            const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
             const publish = await runStep(
               'Publishing OTA bundle...',
-              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)}${mandatoryFlag}`,
+              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)} --project ${JSON.stringify(projectRoot)}${mandatoryFlag}`,
               buildCwd,
               gcloudEnv,
             );
@@ -3040,10 +3269,17 @@ export function assetScannerPlugin(): Plugin {
             // as success — and an OTA release is the one artifact you cannot quietly re-do.
             // (The misspelled-arg half of this is now caught by strict validation; this is the
             // half that needs the RESULT to be checkable.)
+            // `mandatory` is sticky now (inherited when the param is absent), so echo the
+            // INTENT this call passed — printing a resolved true/false here would print "false"
+            // for an inherit-and-stay-mandatory publish while the release stays mandatory, which
+            // is the exact silent-mismatch class this echo exists to prevent. ota-publish.mjs's
+            // own "Published ..." log line (above, in the streamed step output) carries the
+            // resulting effective value.
             sendStatus('DONE');
+            const mandatoryIntent = mandatoryParam === true ? 'set' : mandatoryParam === false ? 'cleared' : 'unchanged';
             send(
               `\n✅ Published — effective parameters: bundleName=${bundleName} version=${version} ` +
-              `mandatory=${mandatory ? 'true' : 'false'} key=${keyName} bucket=${bucket}. ` +
+              `mandatory=${mandatoryIntent} key=${keyName} bucket=${bucket}. ` +
               `Verify with modoki_ota_status.`,
             );
             res.end();

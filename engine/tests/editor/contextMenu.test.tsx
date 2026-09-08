@@ -60,4 +60,40 @@ describe('ContextMenu', () => {
     expect(screen.getByText('Create')).toBeTruthy();
     expect(screen.queryByText('should-not-show')).toBeNull();
   });
+
+  // #651 — the menu is `position: fixed; width: auto`, so measuring it while it sits at the
+  // requested click point makes it shrink-to-fit the viewport remainder to the right of that
+  // point, reading the AVAILABLE width as if it were the menu's natural width (jsdom can't see
+  // this itself — every rect is 0x0 there — so this asserts the seed the real bug depends on:
+  // the element must be measured at the origin, not at (x, y)).
+  it('measures the menu at the origin, not at the requested (x, y)', () => {
+    const items: ContextMenuItem[] = [{ label: 'Copy Component Values' }, { label: 'Paste Component Values' }];
+    let leftAtMeasureTime: string | undefined;
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (leftAtMeasureTime === undefined && this.classList.contains('context-menu')) {
+        leftAtMeasureTime = this.style.left;
+      }
+      return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+    });
+    // A spy on HTMLElement.prototype outlives this test if left unrestored on a failed
+    // assertion — every later element in the file would then measure 0x0, turning one real
+    // failure into a whole file of bogus ones. Restore is unconditional.
+    try {
+      render(<ContextMenu items={items} x={1380} y={100} onClose={vi.fn()} />);
+      expect(leftAtMeasureTime).toBe('0px');
+    } finally { rectSpy.mockRestore(); }
+  });
+
+  it('is visible once the post-measurement clamp has run (the hidden seed itself is not observable here — see comment below)', () => {
+    const items: ContextMenuItem[] = [{ label: 'Copy Component Values' }];
+    const { container } = render(<ContextMenu items={items} x={1380} y={100} onClose={vi.fn()} />);
+    // ⚠️ This proves NOTHING about the hidden seed, in either direction. `useLayoutEffect`
+    // flushes synchronously inside RTL's act()-wrapped render(), so by the time anything here
+    // can read `visibility` the clamp has already run — "seeded hidden, then shown" and "seeded
+    // visible, never touched" are indistinguishable from this assertion. What it DOES pin is the
+    // end state: the menu is not left stranded hidden if the clamp throws or bails. The seed
+    // itself is only observable from the spy test above, which reads it mid-measurement.
+    const menu = container.querySelector('.context-menu') as HTMLElement;
+    expect(menu.style.visibility).toBe('visible');
+  });
 });

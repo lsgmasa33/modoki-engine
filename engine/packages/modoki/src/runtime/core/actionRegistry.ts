@@ -44,7 +44,14 @@ export interface UIActionContext {
   emit: (type: string, payload?: unknown) => void;
 }
 
-export type UIActionHandler = (ctx: UIActionContext) => void;
+// Return value is normally IGNORED — a handler is written as `() => count++` as often as
+// a block, and `unknown` (not `void`) is what keeps that legal: TS's void-returning-function
+// exemption does not survive a union (`void | Promise<void>` would reject a non-void return),
+// while `unknown` accepts every return type by construction, exactly like the original `void`.
+// The one return value that DOES matter: a handler that returns a Promise holds the UI input
+// lock (#466, `applyBindings`/`trackLockPromise`) open until it settles — the async-purchase /
+// sign-in case. Detected at runtime by duck-typing `.then`, not by this static type.
+export type UIActionHandler = (ctx: UIActionContext) => unknown;
 
 /** A registered action: a handler plus an optional typed-argument schema. The
  *  bare-function form is shorthand for `{ handler }` (no declared params). */
@@ -92,7 +99,7 @@ export function getUIActionParams(name: string): Record<string, FieldHint> | und
  *  from a DOM event handler, never from a system tick / projection. On a missing
  *  handler it THROWS in dev — harmless out of a React event handler (React isolates
  *  the throw), but it would abort the whole frame if reached inside the pipeline. */
-export function dispatchUIAction(name: string, opts?: DispatchOptions) {
+export function dispatchUIAction(name: string, opts?: DispatchOptions): unknown {
   // Inert unless the game is actually running. In the editor's Stopped/Paused
   // states a button click must not fire game logic (Unity edit-mode semantics).
   if (!isSimRunning()) return;
@@ -111,7 +118,10 @@ export function dispatchUIAction(name: string, opts?: DispatchOptions) {
       if (attr.guid === opts.targetGuid) target = entity;
     });
   }
-  def.handler({ payload: opts?.payload, params: opts?.params, target, world, emit: (type, payload) => emitJournal(type, payload, world) });
+  // Returned so applyBindings' input lock (#466) can hold open until an async handler
+  // settles (duck-typed there, not by static type). Every other caller keeps discarding it,
+  // which is exactly what `unknown` allows.
+  return def.handler({ payload: opts?.payload, params: opts?.params, target, world, emit: (type, payload) => emitJournal(type, payload, world) });
 }
 
 export function getUIActionNames(): string[] {

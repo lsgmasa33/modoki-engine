@@ -65,7 +65,7 @@ export APPLE_TEAM_ID="<TEAMID>"   # the desktop-editor account's team id
 2. Export:
 
 ```bash
-export APPLE_API_KEY="/path/to/AuthKey_XXXX.p8"
+export APPLE_API_KEY="<path-to-AuthKey_XXXX.p8>"
 export APPLE_API_KEY_ID="XXXXXXXXXX"
 export APPLE_API_ISSUER="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 ```

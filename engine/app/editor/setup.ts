@@ -14,6 +14,7 @@ import {
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
 import { PlayerPrefs, selectDefaultBackend, setGameConfig, setPhysicsLayers } from '@modoki/engine/runtime';
+import { createSupersessionToken } from '@modoki/engine/runtime/core/liveness';
 import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import {
@@ -121,12 +122,12 @@ async function loadDeviceTarget(): Promise<void> {
  *  this the slower-but-older response lands last and overwrites the newer listing — the menu then
  *  shows devices that were correct two seconds ago. Only `deviceList` needs it: `deviceTarget` is
  *  re-read from disk, so a stale one cannot disagree with what the build will use. */
-let deviceListGeneration = 0;
+const deviceListEpoch = createSupersessionToken();
 
 async function refreshDeviceTargets(): Promise<void> {
-  const generation = ++deviceListGeneration;
+  const stillLive = deviceListEpoch.begin();
   const [list] = await Promise.all([fetchDeviceList(), loadDeviceTarget()]);
-  if (generation !== deviceListGeneration) return; // a newer refresh already answered
+  if (!stillLive()) return; // a newer refresh already answered
   deviceList = list;
   republishBuildMenu?.();
 }
@@ -279,10 +280,20 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   //     writing into the save a web build reads. `@editor` is a suffix the game's own namespace
   //     can never produce, so the two stores can't collide.
   if (chosenGameId) {
-    await PlayerPrefs.init({
+    const prefsInit = await PlayerPrefs.init({
       namespace: `${chosenGameId}@editor`,
       backend: selectDefaultBackend(),
     });
+    // `createGameEditor()` runs once per page load (memoized by `React.lazy`), so there is no
+    // "previous game" to name at this call site — File → Open Project reloads the page (see
+    // CLAUDE.md § Editor Hot Reload), so `PlayerPrefs` was never hydrated for another game in
+    // this process. Name the game being opened; that's the whole context this site has.
+    if (prefsInit.discardedPending.length > 0) {
+      console.error(
+        `[EditorApp] PlayerPrefs.init() discarded pending write(s) opening "${chosenGameId}" in the ` +
+          `editor: ${prefsInit.discardedPending.join(', ')}`,
+      );
+    }
   }
 
   // 2. setGameConfig before registerAll (which reads nameTransform).
@@ -477,6 +488,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               fields: [
                 { key: 'build.modules', label: 'Engine modules', type: 'module-toggles', help: 'which engine seams ship in the build — Auto detects from the included scenes; Off lets the bundler drop the whole module (smaller playable ads / web builds).' },
                 { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where the debug menu and the bridge are tree-shaken out entirely (nothing to connect to) and the journal stops recording. Always on in the editor/dev. Rebuild to apply.' },
+                { key: 'runtime.reloadAfterBackgroundMinutes', label: 'Reload after background (minutes)', type: 'number', placeholder: '0', help: 'Reload the app when resumed after this many minutes in the background. 0 = never. Only safe for games that persist their in-progress state — a game with no mid-level save loses the whole session. Capped at 1 minute whenever Debug build is on, so the behaviour can actually be tested; the value here is what ships. A reload is also declined outright while a purchase, sign-in or other in-flight work would be lost.' },
                 { key: 'build.textureTierVariants', label: 'Texture tier variants', type: 'select', options: labeled(TEXTURE_TIER_VARIANTS_MODES, {
                   auto: 'Auto (emit only when delivered over the wire)',
                   always: 'Always (also emit for a plain native package)',

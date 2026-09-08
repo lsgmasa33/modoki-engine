@@ -13,6 +13,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import {
   useBufferedValue, parseNumber, clampRange, Tooltip, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER,
 } from '../fields';
+import { metaCameFromFailedRead } from '../../scene/metaReadFallback';
 
 /** Single source of truth for the per-type color default (F11). White, not 0/black,
  *  so a newly-bound color `set`-value / un-set material color isn't a surprise
@@ -45,24 +46,101 @@ export function FieldLabel({ label, hint, style }: { label: string; hint?: Field
  *
  *  Resolves `true` when the write reached disk. Existing fire-and-forget callers can keep
  *  ignoring it — an unread promise is the old behaviour exactly. */
-export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
-  return backendFetch('/api/write-meta', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, meta }),
-  }).then(async (res) => {
+export interface MetaWriteResult {
+  ok: boolean;
+  /** The write was REFUSED because the file changed since the baseline was taken (HTTP 409,
+   *  #845 phase 2) — a different outcome from a failed write, and the caller must not retry it
+   *  blindly: retrying without re-reading is how the clobber the precondition prevents gets
+   *  reintroduced through the error path. */
+  conflict: boolean;
+  /** The server's sha256 of what it ACTUALLY wrote, for advancing a stale baseline. Absent on
+   *  failure, and absent from an older backend's reply — in which case a caller keeps its previous
+   *  baseline and its next write conflicts LOUDLY rather than proceeding against one nobody
+   *  vouched for (the rule `flushDirtyAssets` already follows). */
+  sha256?: string;
+  error?: string;
+}
+
+/** The conditional form — the one definition of the `/api/write-meta` POST.
+ *
+ *  `ifMatch` is the sha256 of the sidecar's bytes as this editor last saw them (see
+ *  `pendingMeta.ts`'s `baselines`). Omitted, the write is UNCONDITIONAL, which is exactly the
+ *  old behaviour and the right default for the eight explicit-action writers: they build their
+ *  document from a fresh read moments earlier and the human asked for the write. */
+export async function writeMetaConditional(path: string, meta: unknown, ifMatch?: string): Promise<MetaWriteResult> {
+  // ⚠️ WHERE A PANEL'S `.meta.json` WRITE IS REFUSED FOR PROVENANCE (#880). Every panel POST goes
+  // through this one helper, so guarding here covers all of them — the pending-registry flush, the
+  // explicit-action `writeMetaWholesale` callers, and the two modal editors that call
+  // `writeMetaOrWarn` directly. ⚠️ It does NOT cover `scene/modelImport.ts`, which posts the route
+  // raw and consumes the tag itself (aborting the import, because refusing its write would leave
+  // it spawning entities against a model whose guid it just failed to preserve). The review that added it found the tag consumed in three other
+  // places and NOT here, which is how `SpriteEditor`/`NineSliceEditor` came to be protected only
+  // by a hand-rolled `metaLoadedRef` each: a third modal editor copying their shape and omitting
+  // that line would have replaced a sidecar with an id-less document, silently.
+  //
+  // The write is WHOLESALE (`writeMetaSidecar` replaces the file), so a document built on a failed
+  // read costs the asset its GUID and dangles every scene/prefab reference to it. `parkMetaEdit`
+  // refuses the same document EARLIER — at edit time rather than save time — which is a better
+  // moment, not a duplicate of this.
+  if (metaCameFromFailedRead(meta)) {
+    console.error(
+      `[Inspector] refusing to write ${path} — this document was built on a FAILED .meta.json `
+      + 'read, so it has no GUID and the write would REPLACE the file: the scanner would mint a '
+      + 'fresh GUID and every scene/prefab reference to this asset would dangle. Reselect or '
+      + 'reopen the asset to re-read it, then retry.',
+    );
+    return { ok: false, conflict: false, error: 'the document was built on a failed .meta.json read' };
+  }
+  try {
+    const res = await backendFetch('/api/write-meta', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      // `rendererWrite` exempts this from the sidecar PARK GATE (#872). §8's REQUIRES_SAVE rule is
+      // an AGENT-surface rule and this route is shared: every caller of this helper loads through
+      // `readMetaPreferringPark` and calls `metaWrittenToDisk` afterwards, so the document being
+      // posted ALREADY CONTAINS the parked edit and this write is what legitimately retires it.
+      // Without the flag the gate refused a human's Sprite Editor save and `writeMetaConditional`
+      // misreported the 409 below as "the file changed on disk". The flag asserts something about
+      // the calling PROCESS — a renderer write is never blind to a registry it owns.
+      body: JSON.stringify({ path, meta, rendererWrite: true, ...(ifMatch !== undefined ? { ifMatch } : {}) }),
+    });
     if (!res.ok) {
-      console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${await res.text().catch(() => '')}`);
-      return false;
+      const text = await res.text().catch(() => '');
+      // A 409 is the precondition doing its job, not a malfunction — say so at a level that does
+      // not read as an error the user must report, and name the remedy.
+      if (res.status === 409) {
+        console.warn(`[Inspector] /api/write-meta REFUSED for ${path}: the file changed on disk since it was read. The edit is still pending — reopen the asset to see the current values.`);
+        return { ok: false, conflict: true, error: 'the .meta.json changed on disk since this edit was based on it' };
+      }
+      console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${text}`);
+      return { ok: false, conflict: false, error: `HTTP ${res.status}` };
     }
-    return true;
-  }).catch((e) => {
+    // ⚠️ `res.ok` means the write LANDED. Nothing that happens while extracting the baseline may
+    // downgrade that verdict — an exception here used to fall through to the outer `catch` and
+    // report a successful write as a FAILURE, which re-parks the entry, tells the human their save
+    // failed, and makes the retry 409 against the file this very call just advanced. The body is
+    // therefore read inside its own guard, and a missing/!unparsable one costs only the baseline
+    // (the caller then keeps its previous one and conflicts LOUDLY next time rather than writing
+    // against a hash nobody vouched for — the rule `flushDirtyAssets` already follows).
+    let sha256: string | undefined;
+    try {
+      const body = typeof res.json === 'function' ? await res.json() : null;
+      if (typeof body?.sha256 === 'string') sha256 = body.sha256;
+    } catch { /* no baseline from this reply; the write still landed */ }
+    return { ok: true, conflict: false, ...(sha256 !== undefined ? { sha256 } : {}) };
+  } catch (e) {
     console.error(`[Inspector] /api/write-meta network error for ${path}:`, e);
-    return false;
-  });
+    return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Boolean form, kept for the eight explicit-action writers that already branch on it. Collapses
+ *  `writeMetaConditional` — one fetch implementation, two shapes. */
+export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
+  return writeMetaConditional(path, meta).then((r) => r.ok);
 }
 
 export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false, dataUiId }: {
-  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId?: string;
+  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId: string;
 }) {
   // Enforce the hint's declared min/max on commit (previously display-only — see
   // BufferedNumberInput). Clamp in `parse` so a typed out-of-range value is capped.

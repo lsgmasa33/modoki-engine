@@ -26,7 +26,7 @@ interface GameViewProps {
 export default function GameView({ uiLayer }: GameViewProps) {
   const playState = useSyncExternalStore(onPlayStateChange, getPlayState);
   // The device preset + orientation live in the STORE, not in local state, so an agent can set
-  // them (`set-game-view-device` / `modoki_game_view_device`, #367) — the picker is a popup that
+  // them (`set-game-view-device` / `modoki_set_game_view_device`, #367) — the picker is a popup that
   // trusted input cannot operate, so a session's layout check used to measure whatever device the
   // human last left selected. Everything below reads them exactly as it read the useState pair.
   const preset = useEditorStore((s) => s.gameViewDevice);

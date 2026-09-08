@@ -167,7 +167,8 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
                       <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>value</span>
                       <div style={{ flex: 1, display: 'flex', alignItems: 'center' }}>
-                        <FieldValueWidget hint={valueHint} value={b.value} mixed={subMixed(i, 'value')} onChange={(v) => update(i, { value: v })} />
+                        <FieldValueWidget hint={valueHint} value={b.value} mixed={subMixed(i, 'value')} onChange={(v) => update(i, { value: v })}
+                          dataUiId={`uiActions.binding.${i}.value`} dataUiLabel={b.property || `binding ${i + 1}`} />
                       </div>
                     </div>
                   )}
@@ -193,7 +194,8 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                           <div style={{ flex: 1, display: 'flex', alignItems: 'center' }}>
                             {usingEventValue
                               ? <span style={{ color: '#5dade2', fontSize: '11px' }}>$value</span>
-                              : <FieldValueWidget hint={hint} value={params[k]} mixed={paramMixed(i, k)} onChange={(v) => setParam(k, v)} />}
+                              : <FieldValueWidget hint={hint} value={params[k]} mixed={paramMixed(i, k)} onChange={(v) => setParam(k, v)}
+                                  dataUiId={`uiActions.binding.${i}.param.${k}`} dataUiLabel={k} />}
                           </div>
                         </div>
                         {canUseEventValue && (
@@ -210,7 +212,8 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                       <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>payload</span>
                       <div style={{ flex: 1, display: 'flex', alignItems: 'center' }}>
                         <BufferedTextInput value={params.payload == null ? '' : String(params.payload)}
-                          onChange={(v) => setParam('payload', v)} style={{ ...inputStyle, flex: 1 }} placeholder="payload" />
+                          onChange={(v) => setParam('payload', v)} style={{ ...inputStyle, flex: 1 }} placeholder="payload"
+                          dataUiId={`uiActions.binding.${i}.payload`} dataUiLabel={`binding ${i + 1}`} />
                       </div>
                     </div>
                   )}

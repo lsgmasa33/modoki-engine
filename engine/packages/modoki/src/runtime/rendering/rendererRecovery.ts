@@ -53,6 +53,25 @@ export const DEFAULT_REBUILD_DELAY_MS = 250;
  *  that needs a moment gets ~250 + 500 + 1000 ms of it, and a genuinely dead device stops fast. */
 export const DEFAULT_MAX_REBUILD_ATTEMPTS = 3;
 
+/** How long a REBUILD's renderer bring-up may take before it counts as failed and REJECTS.
+ *
+ *  Lives here, with the rest of the shared rebuild policy, for the same reason the scheduler does:
+ *  the 2D pool and the 3D viewports must not disagree about when a rebuild has failed. It was two
+ *  constants for a while — `canvas2DPool`'s `APP_INIT_TIMEOUT_MS` and nothing at all on the 3D
+ *  side, which is #820 — and a hand-kept copy of a number in two files is exactly the shadow
+ *  constant this repo's single-source-of-truth rule exists to prevent.
+ *
+ *  ⚠️ This bounds REBUILDS, never a FIRST bring-up, and that asymmetry is measured rather than
+ *  stylistic. `canvas2DPool`'s own history records a rejecting 8s bound on a first init turning a
+ *  merely SLOW cold bring-up — 8.5s on a low-end GPU — into a permanent failure: the init
+ *  succeeded at 8.5s with nothing still listening. A first init therefore gets a WATCHDOG that
+ *  reports and waits; only a rebuild gets a bound that rejects, because a rebuild has
+ *  `rendererRecovery` behind it to retry with backoff, and an unbounded one latches `inFlight`
+ *  forever — no retry, no report, a surface black in silence.
+ *
+ *  Generous — a real bring-up on a slow phone is well under this — but FINITE. */
+export const REBUILD_BRINGUP_TIMEOUT_MS = 8000;
+
 /** Describe a rejection that is not an `Error` — the #156 reporting half.
  *
  *  The symptom this exists for: `[Scene3D] renderer rebuild after context loss FAILED … {}`. It is

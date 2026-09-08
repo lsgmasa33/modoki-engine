@@ -107,6 +107,48 @@ describe('resolveUIFontFamily — the warning is not silenced forever', () => {
   });
 });
 
+/** `authoredOn` — TWO traits carry a DOM font ref: `UIElement.fontFamily` (per element) and
+ *  `UISettings.fontFamily` (the scene-wide default, #803). The warning has to name the right one:
+ *  Court authors NO `UIElement` font at all now, so a warning saying `[UIElement]` sends the author
+ *  hunting through elements for a field none of them has. And the legacy branch's
+ *  "(pre-#231 authoring)" is a statement about history that is simply false of a field #803
+ *  created — a diagnostic that confidently misexplains is worse than a vague one. */
+describe('resolveUIFontFamily — the warning names the trait that authored the value (#803)', () => {
+  it('an unresolved UISettings ref is reported as [UISettings], not [UIElement]', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    domFontProvider.provide({ familyForGuid: () => undefined });
+    resolveUIFontFamily(FONT_GUID, '', 'UISettings');
+    const msg = String(warn.mock.calls[0]?.[0] ?? '');
+    expect(msg).toContain('[UISettings]');
+    expect(msg).not.toContain('[UIElement]');
+    warn.mockRestore();
+  });
+
+  it('defaults to [UIElement] when no trait is named — every existing 2-arg caller', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    domFontProvider.provide({ familyForGuid: () => undefined });
+    resolveUIFontFamily(FONT_GUID, '');
+    expect(String(warn.mock.calls[0]?.[0] ?? '')).toContain('[UIElement]');
+    warn.mockRestore();
+  });
+
+  it('does NOT blame pre-#231 authoring for a family name on UISettings — that field is younger', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    resolveUIFontFamily('Helvetica Neue', '', 'UISettings');
+    const msg = String(warn.mock.calls[0]?.[0] ?? '');
+    expect(msg).toContain('[UISettings]');
+    expect(msg).not.toContain('pre-#231');
+    warn.mockRestore();
+  });
+
+  it('still says pre-#231 for a family name on UIElement, where it is true', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    resolveUIFontFamily('Helvetica Neue', '', 'UIElement');
+    expect(String(warn.mock.calls[0]?.[0] ?? '')).toContain('pre-#231');
+    warn.mockRestore();
+  });
+});
+
 describe('resolveUIFontFamily — legacy family names (pre-#231)', () => {
   it('still renders a bare family name, warning once', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

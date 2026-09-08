@@ -82,12 +82,12 @@ describe('PanelErrorBoundary', () => {
     fireEvent.click(screen.getByText('Reload Panel'));
 
     fireEvent.click(screen.getByText('Reload Editor'));
-    expect(screen.getByText(/Unsaved scene edits are discarded/)).toBeTruthy();
+    expect(screen.getByText(/Unsaved scene and pending asset edits are discarded/)).toBeTruthy();
     expect(onReloadEditor).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText('Cancel'));
     expect(onReloadEditor).not.toHaveBeenCalled();
-    expect(screen.queryByText(/Unsaved scene edits are discarded/)).toBeNull();
+    expect(screen.queryByText(/Unsaved scene and pending asset edits are discarded/)).toBeNull();
 
     fireEvent.click(screen.getByText('Reload Editor'));
     fireEvent.click(screen.getByRole('button', { name: 'Reload Editor' }));

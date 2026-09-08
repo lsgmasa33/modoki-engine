@@ -34,7 +34,13 @@ import { retireVariantsOf } from './lightMaskVariants';
  *  base per entity, so we never dispose a clone that another mesh in the same pass still uses. */
 /** clone/base are a single Material OR a per-slot array (multi-material meshes). */
 type MatOrArray = THREE.Material | THREE.Material[];
-const clones = new Map<number, { clone: MatOrArray; base: MatOrArray }>();
+/** Keyed `${id}:${generation}` (#738), not the bare id — koota's free list is LIFO, so a
+ *  despawn+respawn hands a NEW entity the dead one's id, and an id-only key would let
+ *  `applyPropOverride`'s `entry.base === base` reuse test hand the newcomer the dead entity's
+ *  stale clone (and its already-driven overrides) when both happen to resolve the SAME material
+ *  GUID — same idiom as `_defaultBaseCache` in materialInstanceSystem.ts (#336). Closes it for 255
+ *  recycles of an id; koota's generation is 8-bit and wraps. */
+const clones = new Map<string, { clone: MatOrArray; base: MatOrArray }>();
 
 /** Dispose a material (or each slot), plus any per-instance texture the map-driver cloned for it. */
 function disposeOne(x: THREE.Material): void {
@@ -50,6 +56,11 @@ const disposeMat = (m: MatOrArray | undefined): void => {
 function disposeAll(): void {
   for (const { clone } of clones.values()) disposeMat(clone);
   clones.clear();
+  // Not entity-id-keyed (#738 group B) — `_unknownWarned` is keyed by prop TARGET NAME, so it
+  // has no id-recycling hazard, but it also has NO other clear anywhere: left alone it grows
+  // forever AND a target that warned in a previous scene stays silently suppressed in the next
+  // one. Clear it alongside the clones on the same world-swap boundary.
+  _unknownWarned.clear();
 }
 
 // Freed at the world-swap boundary (like Tint clones) — NOT on a single panel unmount,
@@ -72,9 +83,13 @@ export function resetMaterialInstanceClones(): void {
  *  Returns TRUE when this call (re)bound a clone — a fresh entity, a changed base, or a mesh that
  *  was still pointing at the shared material. The caller uses it to arm the SceneView's
  *  render-on-demand gate: the picture changes on a rebind even when the driven VALUE did not (see
- *  `rendering/materialDirty.ts`), so value comparison alone would miss the very first frame. */
-export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): boolean {
-  let entry = clones.get(id);
+ *  `rendering/materialDirty.ts`), so value comparison alone would miss the very first frame.
+ *
+ *  `gen` is the entity's koota generation — see the `clones` map doc comment for why the key must
+ *  carry it. */
+export function applyPropOverride(id: number, gen: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): boolean {
+  const key = `${id}:${gen}`;
+  let entry = clones.get(key);
   let old: MatOrArray | undefined;
   let rebound = false;
   if (!entry || entry.base !== base) {
@@ -95,7 +110,7 @@ export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrA
     entry = Array.isArray(base)
       ? { clone: base.map((m) => cloneDerived(m, m)), base }
       : { clone: cloneDerived(base, base), base };
-    clones.set(id, entry);
+    clones.set(key, entry);
     rebound = true;
   }
   for (const mesh of meshes) {

@@ -25,6 +25,7 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
   private errorMessage = '';
   private conversations = new Map<string, ChatEntry[]>();
   private nextConversationId = 0;
+  private disposed = false;
 
   async downloadModel(_options: { url: string; filename: string }): Promise<{ ok: boolean; path: string }> {
     // Web doesn't use native download — ModelDownloader.ts handles fetch + Cache API
@@ -48,16 +49,22 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
     try {
       // Lazy-load MediaPipe to avoid bundling it when not on web
       const { FilesetResolver, LlmInference } = await import('@mediapipe/tasks-genai');
+      if (this.disposed) {
+        return { ok: false };
+      }
 
       this.notifyListeners('loadProgress', { progress: 0.1 });
 
       const genai = await FilesetResolver.forGenAiTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai/wasm',
       );
+      if (this.disposed) {
+        return { ok: false };
+      }
 
       this.notifyListeners('loadProgress', { progress: 0.3 });
 
-      this.llm = await LlmInference.createFromOptions(genai, {
+      const engine = await LlmInference.createFromOptions(genai, {
         baseOptions: { modelAssetPath: options.modelPath },
         maxTokens: options.maxTokens ?? 1024,
         topK: options.topK ?? 40,
@@ -65,6 +72,15 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
         randomSeed: options.randomSeed ?? 0,
       });
 
+      if (this.disposed) {
+        // dispose() ran while createFromOptions() was in flight — this.llm is
+        // already null and nothing else will ever call close() on the engine
+        // we just created. Close it ourselves and do not publish it.
+        engine.close();
+        return { ok: false };
+      }
+
+      this.llm = engine;
       this.status = 'ready';
       this.notifyListeners('loadProgress', { progress: 1 });
       return { ok: true };
@@ -118,6 +134,12 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
       let fullResponse = '';
 
       const response = await this.llm.generateResponse(prompt, (partial: string, done: boolean) => {
+        // A callback is live from the moment it's registered, not from when
+        // the surrounding promise settles — dispose() can fire mid-stream.
+        if (this.disposed) {
+          return;
+        }
+
         // Detect if MediaPipe sends cumulative or individual tokens:
         // If partial starts with fullResponse, it's cumulative — extract delta.
         // Otherwise, partial IS the new token.
@@ -147,6 +169,13 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
         }
       });
 
+      if (this.disposed) {
+        // dispose() ran while generateResponse() was in flight — this.llm and
+        // this.conversations are already cleared; don't resurrect status or
+        // write into a history array that's no longer reachable from either.
+        return { ok: false };
+      }
+
       // Store assistant response in history
       const finalText = typeof response === 'string' ? response : fullResponse;
       history.push({ role: 'model', content: finalText });
@@ -168,6 +197,7 @@ export class LitertLmWeb extends WebPlugin implements LitertLmPlugin {
   }
 
   async dispose(): Promise<{ ok: boolean }> {
+    this.disposed = true;
     if (this.llm) {
       this.llm.close();
       this.llm = null;

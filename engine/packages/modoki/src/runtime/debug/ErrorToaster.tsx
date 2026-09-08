@@ -7,7 +7,7 @@
  *  forbids Date.now/performance.now/Math.random). */
 
 import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
-import { getConsoleEntries, getConsoleVersion, subscribeConsole } from './consoleCapture';
+import { getConsoleEntries, getConsoleErrorsSince, getConsoleVersion, subscribeConsole } from './consoleCapture';
 
 const TOAST_MS = 3000;
 const MAX_VISIBLE = 4;
@@ -24,16 +24,25 @@ export function ErrorToaster({ anchor }: { anchor: 'viewport' | 'container' }) {
   const timers = useRef<Map<number, number>>(new Map());
 
   // Watch the console stream for NEW error entries (skip pre-existing ones on mount).
+  //
+  // `getConsoleErrorsSince` (not `getConsoleEntries`) on the hot path — this effect re-runs on
+  // EVERY coalesced console burst, in EVERY debug build (mounted unconditionally by `DebugMenu.tsx`),
+  // and `getConsoleEntries()` used to rebuild + `.join(' ')` every entry in the WHOLE ring on every
+  // call just so this could filter it back down to the handful of errors it actually wants — see
+  // `getConsoleErrorsSince`'s own doc comment (#154's low-end budget). `lastSeen.current` tracks
+  // only the latest ERROR seq (not the ring's latest seq overall, of any level) — sufficient for
+  // "toast every new error once" and lets the mount baseline below stay a level-scoped read too.
   useEffect(() => {
-    const entries = getConsoleEntries();
-    const latestSeq = entries.length ? entries[entries.length - 1].seq : 0;
     if (lastSeen.current === null) {
-      lastSeen.current = latestSeq; // don't toast errors that predate mount
+      // Baseline at mount: the highest error seq that already exists, so pre-existing errors are
+      // never toasted. One full-ring read, but only HERE, once — not on every burst.
+      const existingErrors = getConsoleEntries().filter((e) => e.level === 'error');
+      lastSeen.current = existingErrors.length ? existingErrors[existingErrors.length - 1].seq : 0;
       return;
     }
-    const fresh = entries.filter((e) => e.level === 'error' && e.seq > (lastSeen.current ?? 0));
-    lastSeen.current = latestSeq;
+    const fresh = getConsoleErrorsSince(lastSeen.current);
     if (fresh.length === 0) return;
+    lastSeen.current = fresh[fresh.length - 1].seq;
 
     setToasts((prev) => [...prev, ...fresh.map((e) => ({ id: e.seq, text: e.text }))].slice(-MAX_VISIBLE));
     for (const e of fresh) {

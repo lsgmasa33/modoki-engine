@@ -61,6 +61,16 @@ export class CapacitorStoreBackend implements StoreBackend {
    *  driving a torn-down service. */
   private unsubscribe: (() => void) | null = null;
 
+  /** Set by `dispose()`, checked in the `addListener().then()` below.
+   *
+   *  `addListener` is a native bridge round-trip AWAY from the constructor, not synchronous with
+   *  it — so `dispose()` can run before that promise settles (a game swap during boot). Without
+   *  this flag `dispose()` would null a binding that is still `null`, and the resumed `then` would
+   *  go on to install an unsubscribe nobody will ever call: the native listener survives the swap
+   *  and every `purchasesUpdated` it fires from then on drives the module-level `reconcile()`
+   *  against whatever `cfg` is live now — exactly what `resetIap()` exists to prevent. */
+  private disposed = false;
+
   constructor(products: readonly IapProduct[]) {
     // The catalog is needed on THIS side because the platform calls are kind-dependent: Android
     // queries one-time products and subscriptions separately, and "finish" means consume for a
@@ -79,13 +89,30 @@ export class CapacitorStoreBackend implements StoreBackend {
     // idempotent, it re-derives entitlements too, and it asks the STORE what is outstanding instead
     // of trusting a payload that may be partial.
     void iap()
-      .addListener('purchasesUpdated', () => { void reconcile(); })
-      .then((h) => { this.unsubscribe = () => { void h.remove(); }; })
-      .catch(() => { /* no native plugin here — nothing to listen to */ });
+      // The native listener is LIVE from the moment `addListener` is invoked, not from when this
+      // promise settles — so a `purchasesUpdated` can arrive in the exact window `disposed` exists
+      // to close, before the `.then()` below even runs. Guarding only there (the handle-removal
+      // half) leaves this callback free to drive `reconcile()` against whatever `cfg` is live now,
+      // which is the same failure the flag was added to prevent. This check and the one below close
+      // two different halves of the same window: registration is live before the promise settles.
+      .addListener('purchasesUpdated', () => { if (this.disposed) return; void reconcile(); })
+      .then((h) => {
+        // dispose() may already have run while this bridge round-trip was in flight — see
+        // `disposed`'s doc comment. Remove the handle right here rather than merely skipping the
+        // store, or the native listener leaks for the life of the process.
+        if (this.disposed) { void h.remove(); return; }
+        this.unsubscribe = () => { void h.remove(); };
+      })
+      // Covers two cases: no native plugin here at all (`addListener()` itself rejects — nothing
+      // to listen to), and a SYNCHRONOUS throw from `h.remove()` above when disposed mid-flight.
+      // NOT a rejected promise from `h.remove()` — it is called `void`, so that would escape as
+      // an unhandled rejection rather than reach here; either way there is nothing left to clean up.
+      .catch(() => {});
   }
 
   /** Drop the listener. Called on teardown so a swapped-out game's backend goes quiet. */
   dispose(): void {
+    this.disposed = true;
     this.unsubscribe?.();
     this.unsubscribe = null;
   }

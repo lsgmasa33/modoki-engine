@@ -12,13 +12,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, cleanup, act, fireEvent } from '@testing-library/react';
 import {
-  installConsoleCapture, __resetConsoleCaptureForTest, subscribeConsole, getConsoleVersion,
+  __resetConsoleCaptureForTest, subscribeConsole, getConsoleVersion,
 } from '../../packages/modoki/src/runtime/debug/consoleCapture';
+import { installConsoleRing } from '../../packages/modoki/src/runtime/core/consoleRing';
 import { ErrorToaster } from '../../packages/modoki/src/runtime/debug/ErrorToaster';
 
 beforeEach(() => {
-  installConsoleCapture();
   __resetConsoleCaptureForTest();
+  installConsoleRing();
 });
 afterEach(() => {
   cleanup();

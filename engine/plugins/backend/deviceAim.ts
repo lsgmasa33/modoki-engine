@@ -85,6 +85,28 @@ export function decodeAimReply(raw: unknown): AimOutcome {
 
 /** Ask the PAGE to resolve an aim (selector / entity / screenshot pixels) to a CSS viewport point.
  *  `selKey`/`xKey`/`yKey` name the params, so a drag's two ends reuse the same call. */
+/** Caveat a trusted reply's aim label with what it actually is: **not** a verification.
+ *
+ *  `resolveAimViaDevice` is itself a round-trip to the device; the trusted dispatch that follows
+ *  (CDP `Input.dispatch*` / WDA) is a SECOND one. The label this wraps describes what was under the
+ *  point at RESOLVE time — potentially many frames before the input actually landed — and nothing
+ *  re-checks it against what was there at dispatch. A bare `@ button#foo` reads as "I hit this",
+ *  which is not what happened; this says what did.
+ *
+ *  This is #497, **accepted rather than fixed** (owner's call): closing the gap for real would mean
+ *  a second `resolveAimViaDevice` round-trip on every trusted tap/drag/hover/scroll, to catch a drift
+ *  that is rare in practice — the wrong trade. So the reply stops claiming a verification that never
+ *  happened, instead of buying one.
+ *
+ *  ⚠️ Do NOT reach for this on the SYNTHETIC path (`engine/app/debug/bridge.ts`'s
+ *  `handleHover`/`handleScroll`/`handleDrag`) — those genuinely DO re-check in-page (#486 finding C,
+ *  `4bcbc47ab`) and already say so with their own drift warning when the aim moved. Their silence
+ *  means verified; this caveat means not-verified. Wrapping their label too would make the honest
+ *  surface read exactly like the unverified one. */
+export function aimAsResolved(label: string): string {
+  return `${label} (aim as resolved; not re-checked at dispatch)`;
+}
+
 export async function resolveAimViaDevice(
   deps: AimProxyDeps,
   params: Record<string, unknown>,

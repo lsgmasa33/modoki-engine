@@ -4,8 +4,9 @@
  *  <img> (the browser can't decode Radiance .hdr). We load it with three's
  *  HDRLoader, tonemap a downsampled copy onto a <canvas>, and expose an exposure
  *  slider so the user can preview how bright the map is. The Import section exposes
- *  per-asset settings (format `hdr`/`ultrahdr` + max size) written to the `.meta.json`
- *  sidecar and applied via re-import, mirroring `TextureAssetView`. */
+ *  per-asset settings (format `hdr`/`ultrahdr` + max size) PARKED to the `.meta.json`
+ *  sidecar (#845 — Cmd+S is the write) and applied via re-import, mirroring
+ *  `TextureAssetView`. */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
@@ -14,12 +15,18 @@ import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
-import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
-import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { formatBytes, reimportBtnStyle } from './widgets';
 import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
+import {
+  parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
+  metaReadPathOf,
+} from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -34,6 +41,8 @@ function acesToneMap(x: number): number {
 }
 
 export function EnvironmentAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Decoded HDR pixel data (linear RGB, one float per channel) + native dims.
   const hdrRef = useRef<{ data: Float32Array | Uint16Array; type: number; w: number; h: number } | null>(null);
@@ -54,16 +63,20 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
   const reimportEpoch = useAssetInvalidationEpoch('environment', (p) => p === path);
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    setSettings(resolveEnvSettings(m as { environment?: Partial<EnvImportSettings> }));
+    setConverted(!!m.environmentCache);
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        setSettings(resolveEnvSettings(m as { environment?: Partial<EnvImportSettings> }));
-        setConverted(!!m.environmentCache);
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a settings edit here is PARKED, so disk still holds
+    // the PRE-edit doc until Cmd+S. `apply` flushes this path before it reimports/re-writes, so by
+    // the time this runs after one, nothing is parked here and this falls through to a fresh read.
+    return readMetaPreferringPark(path, { signal, reimportEpoch })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path, reimportEpoch]);
+  }, [path, reimportEpoch, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -74,16 +87,58 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   const update = useCallback((patch: Partial<EnvImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, environment: next };
+      const updatedMeta = { ...(meta ?? {}), environment: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
 
   const apply = useCallback(async () => {
+    // ⚠️ REFUSE BEFORE THE EXPENSIVE WORK, not after the write (#880 close-out review 3).
+    //
+    // The first version of this guard checked `writeMetaWholesale`'s return, which is the LAST
+    // step: by then `encodeUltraHDR` had run the WebGL gainmap encode and `/api/write-file` had
+    // committed a multi-MB `~ultrahdr.jpg` into the asset tree — so a refusal left that variant
+    // orphaned on disk with nothing in the sidecar pointing at it, and the re-read that followed
+    // snapped the format dropdown back to `hdr`, discarding the user's choice with no toast.
+    // It traded a visible sticky refusal for silent loss, which is worse.
+    //
+    // The answer is decidable here, before anything is spent: if this panel's document did not
+    // come from a read OF THIS PATH it has no `id`, and a wholesale write of it would cost the
+    // asset its GUID.
+    //
+    // ⚠️ **Ask the PROVENANCE question, not the tag question.** This guard read
+    // `metaCameFromFailedRead(meta)` for one release, and that predicate requires `doc !== null` —
+    // so it answered `false` for the one state where the panel has no document at all. A THROWN
+    // `/api/read-meta` (`loadMeta`'s `.catch(() => {})` swallows it, by design) leaves `meta` at
+    // `null`, every control here still live, and `{ ...(meta ?? {}) }` id-less: Apply then encoded
+    // the gainmap, committed `~ultrahdr.jpg`, and replaced the sidecar with a document carrying no
+    // GUID. That is #890's destruction reached through the one door #891's park-seam guard
+    // deliberately does not watch, and this was the only one of the four wholesale writers exposed
+    // to it — the other three ask "did a read land" (`metaLoadedRef`, an early return on `!ok`)
+    // rather than "is this the tagged fallback". `metaReadPathOf` IS that question, and it
+    // subsumes the tag: a `metaReadFallback()` document is unstamped too.
+    if (metaReadPathOf(meta) !== path) {
+      console.error(
+        `[Inspector] not converting ${path} — its .meta.json was never read successfully for this `
+        + 'asset, so writing the result would replace the file with a document missing its GUID. '
+        + 'Reselect the asset to re-read it, then retry.',
+      );
+      useEditorStore.getState().showToast(
+        `Cannot convert ${name} — its import settings could not be read, or have not loaded yet. `
+        + 'Reselect the asset to re-read it, then try again.',
+        'warn',
+      );
+      return;
+    }
     setImporting(true);
     try {
+      // #845: both branches below are about to read (the reimport route, off disk) or write (the
+      // ultrahdr route, a full-document merge) this sidecar — flush any still-parked settings edit
+      // first, or the branch would work from a stale doc and a leftover park would overwrite its
+      // own fresh write at the next Cmd+S. See pendingMeta.ts's header.
+      await flushPendingMetaFor(path);
       if (settings.format === 'ultrahdr') {
         // Browser-side gainmap encode (needs WebGL) → commit `~ultrahdr.jpg` next to
         // the source (the Node build can't regenerate it), then write the meta so the
@@ -97,9 +152,22 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         });
         if (!w.ok) { console.error('[Inspector] UltraHDR write failed'); return; }
         const hash = hashBytes(jpeg);
-        const updatedMeta = { ...(meta ?? {}), version: 2, environment: settings, environmentCache: { hash, bytes: jpeg.length } };
+        const updatedMeta = { ...(meta ?? {}), environment: settings, environmentCache: { hash, bytes: jpeg.length } };
         setMeta(updatedMeta);
-        await writeMetaOrWarn(path, updatedMeta);
+        // #874: the write AND the forget-on-success, in one call — see writeMetaWholesale.
+        //
+        // ⚠️ The result is CHECKED (#880 close-out review). Discarding it made a refused write —
+        // which is now a real outcome, since `writeMetaWholesale` refuses a document built on a
+        // failed read — look like a completed Apply: the status cleared, the asset list refreshed,
+        // and `~ultrahdr.jpg` sat on disk with nothing in the sidecar pointing at it, explained
+        // only by a `console.error`. `makeTexture2D` returns `false` to its caller and the two
+        // modal editors keep their dialog open; this was the one of the four that swallowed it.
+        // ⚠️ A failed write returns WITHOUT re-reading. The provenance case is refused at the top
+        // of this function now, so the only way to reach this branch is a genuine write failure
+        // (a dev-server blip) — and re-reading there would reseed `settings` from disk and throw
+        // away the user's dropdown choice for a reason that has nothing to do with it. Same rule
+        // the two modal editors follow by keeping their dialog open.
+        if (!await writeMetaWholesale(path, updatedMeta)) return;
       } else {
         // Node-side downscale (dependency-free) via the reimport handler.
         setImportStatus(true, `Downscaling ${name}...`);
@@ -235,7 +303,15 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       </div>
       <button
         data-ui-id="assetView.environment.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
-        disabled={importing}
+        // ⚠️ `meta === null` too, not just `importing`. Widening the guard below from the TAG
+        // question to the PROVENANCE question made it refuse one state it used to allow: the
+        // mount read still in flight, where the panel has no document YET. That refusal is
+        // correct for the UltraHDR branch (it would write the sidecar from a document it does
+        // not have) and needlessly conservative for the reimport one — but either way the
+        // honest answer is not to offer the button, because the remedy the toast names
+        // (reselect) is not the one that helps (wait). The guard stays as defence in depth:
+        // this is the UI, not the check.
+        disabled={importing || meta === null}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 4, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}
       >
@@ -265,6 +341,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
           </>
         );
       })()}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.environment.unsaved" />
     </>
   );
 }

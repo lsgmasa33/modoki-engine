@@ -13,13 +13,33 @@
  *  than hardcoding the string 'synthetic', so a value change alone (e.g. Phase 1 landing) cannot
  *  make these fail — only a REGRESSION in the reporting behaviour can. */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   handleTap, handleDrag, handlePointer, handlePressKey, handleHover, handleScroll, handleType,
   _resetHeldPointerForTests, INPUT_MECHANISM,
 } from '../../app/debug/bridge';
 
 const SUFFIX = ` [input:${INPUT_MECHANISM}]`;
+
+// #486 finding C: a `selector` aim resolves through `resolveAim` → dynamic import of `agentBridge`
+// → its `resolve-dom-point` op, which needs a live ECS world — out of scope for this file's
+// coordinate-aimed style (see the file header). Stub `runAgentOp` instead of standing up a world,
+// so a selector aim can be driven far enough to test the drift warning without touching anything
+// this suite otherwise avoids.
+vi.mock('../../app/debug/agentBridge', () => ({
+  runAgentOp: vi.fn(async (op: string, params?: Record<string, unknown>) => {
+    if (op === 'resolve-dom-point') {
+      const hit = mockResolveDomPoint;
+      return { ok: true, x: 5, y: 5, matched: hit, hitTarget: hit, occluded: false };
+    }
+    throw new Error(`deviceInputMechanism.test.ts: unexpected agent op ${op}(${JSON.stringify(params)})`);
+  }),
+}));
+
+// What the stubbed `resolve-dom-point` op reports as `hitTarget` — set per-test just before the
+// selector-aimed call, so each test controls what the resolution CLAIMED without touching the mock
+// factory (which vitest hoists above the rest of the file).
+let mockResolveDomPoint: string | null = null;
 
 beforeEach(() => {
   // jsdom does not implement `elementFromPoint` at all (no layout engine) — the bridge code calls
@@ -143,5 +163,58 @@ describe('device input mechanism — error/refusal replies never carry it (#32 P
     const r = await handleType({ text: 'hello' });
     expect(r.ok).toBe(false);
     expect(r.inputMechanism).toBeUndefined();
+  });
+});
+
+describe('#486 finding C — hover/scroll re-check their aim before reporting it', () => {
+  it('resolved hitTarget no longer matches the element at dispatch time: the reply still says ok AND names both elements', async () => {
+    mockResolveDomPoint = 'button#old'; // what the selector resolution CLAIMED was there
+    const movedIn = document.createElement('button'); // what is ACTUALLY there by dispatch time
+    movedIn.id = 'new';
+    document.body.appendChild(movedIn);
+    document.elementFromPoint = () => movedIn;
+
+    const r = await handleHover({ selector: '#old' });
+    expect(r).toMatch(/^ok \(hover button\)/);
+    expect(r.endsWith(SUFFIX)).toBe(true);
+    expect(r).toContain('CHANGED between resolving it and acting on it');
+    expect(r).toContain('resolved button#old');
+    expect(r).toContain('acted on button#new');
+  });
+
+  it('nothing moved: the reply is byte-identical to an ordinary hover — no phantom drift note', async () => {
+    mockResolveDomPoint = 'button#stable';
+    const el = document.createElement('button');
+    el.id = 'stable';
+    document.body.appendChild(el);
+    document.elementFromPoint = () => el; // same element the resolution named
+
+    const r = await handleHover({ selector: '#stable' });
+    expect(r).toBe(`ok (hover button) @ #stable→button#stable${SUFFIX}`);
+    expect(r).not.toContain('CHANGED');
+  });
+
+  it('scroll: a resolved target that is GONE at dispatch time is drift, not silence — the wheel went to the body fallback', async () => {
+    // The case the first cut skipped. `handleScroll` falls back to scrollingElement/body when
+    // nothing is under the point, and it used to suppress the drift check on that branch — so a
+    // selector aim whose element had vanished reported `@ #gone→div#gone` for a wheel that element
+    // never saw. A null hit is the LOUDEST drift for a selector aim, not an unremarkable fallback.
+    mockResolveDomPoint = 'div#gone';
+    document.elementFromPoint = () => null;
+
+    const r = await handleScroll({ selector: '#gone', dy: 100 });
+    expect(r).toMatch(/^ok \(scroll dx=0 dy=100\)/);   // the wheel DID land somewhere — not a refusal
+    expect(r).toContain('resolved div#gone');
+    expect(r).toContain('acted on nothing');
+  });
+
+  it('a pixel-coordinate aim makes no claim, so a moved element draws no drift note', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    document.elementFromPoint = () => el;
+
+    const r = await handleHover({ x: 5, y: 5 });
+    expect(r).toBe(`ok (hover div) @ css(5,5)${SUFFIX}`);
+    expect(r).not.toContain('CHANGED');
   });
 });

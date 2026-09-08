@@ -6,10 +6,10 @@
  *  perfectly healthy. Measured on the iPhone Air 2026-08-02; it cost about an hour. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { explainConnectFailure, DEVICE_PORT } from '../../plugins/backend/deviceConnection';
 import { parseBoundBridgePort } from '../../plugins/backend/deviceAndroidDiag';
+import { readScannedSource } from '@modoki/engine/testing';
 
 describe('explainConnectFailure', () => {
   it('explains the shared-port collision, and names both ways out', () => {
@@ -50,8 +50,8 @@ describe('explainConnectFailure', () => {
     const advice = explainConnectFailure('connect ECONNREFUSED 192.168.1.181:9095', DEVICE_PORT)!;
     expect(advice).toContain('port:<actual>');
 
-    const toolSrc = fs.readFileSync(
-      path.resolve(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts'), 'utf8');
+    const toolSrc = readScannedSource(
+      path.resolve(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
     const schema = toolSrc.slice(toolSrc.indexOf("tool('device_connect'"), toolSrc.indexOf('async ({ ip, useAdb'));
     expect(schema).toMatch(/\bport:\s*z\.number\(\)/);
     // …and that it is threaded through to the backend, not merely declared.

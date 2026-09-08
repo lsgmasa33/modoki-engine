@@ -31,9 +31,44 @@ console.log('list_traits → schemaAvailable:', tj.schemaAvailable, ' traitCount
 if (tj.traits) throw new Error('bare list_traits leaked full trait schemas');
 
 // ...and the drill-down returns exactly one schema.
+//
+// GUARDED, and the guard is load-bearing (#459). This file is ONE linear script with no top-level
+// catch, so an unguarded read here does not fail this case — it kills every case below it, and the
+// runner sees a stack trace instead of a verdict. That is not hypothetical: while #459 stands,
+// `list_traits` serves only the open project's GAME traits, `Transform` is absent, and this line
+// threw — silently taking with it the 13 call sites that are the ONLY live coverage of
+// `modoki_set_game_view_device` and `modoki_set_animation_view_mode` (both `COVERED_BY_SMOKE` in
+// `liveCoverage.ts`, hence deliberately excluded from the T3 sweep). The sweep still printed
+// `0 DEFECT`, so the surface looked verified when two tools had been exercised by nothing.
+// Skipping instead keeps the rest of the run alive and still fails the verdict (F12) — a skipped
+// case can never pass. Do NOT "simplify" this back to a bare read.
 const one = await client.callTool({ name: 'modoki_list_traits', arguments: { name: 'Transform' } });
 const oj = JSON.parse(text(one));
-console.log('list_traits(name=Transform) → fields:', Object.keys(oj.traits.Transform.fields || {}).join(','));
+const transformFields = oj?.traits?.Transform?.fields;
+// The bare call above is the independent witness: it already listed every trait name the pushed
+// schema carries. Only attribute a missing drill-down schema to #459 when Transform is genuinely
+// absent from THAT list — otherwise this is a different failure (a 400/isError envelope, or a
+// filter that returned {traits:{}} despite the bare call including Transform) and blaming #459
+// would point F12's remediation ("relaunch on games/3d-test") at the wrong fix.
+const bareTraitNames = Object.values(tj.byCategory || {}).flat();
+const transformInBareCall = bareTraitNames.includes('Transform');
+if (!transformFields) {
+  const reason = !transformInBareCall
+    ? `list_traits(name=Transform) returned no schema — bare list_traits reported traitCount=${tj.traitCount}`
+      + ` (${bareTraitNames.join(', ') || 'nothing'}). Engine traits missing from the pushed schema: see #459.`
+    : `list_traits(name=Transform) returned no schema even though the bare call listed Transform`
+      + ` among ${bareTraitNames.length} traits — drill-down failed for an UNKNOWN reason (not #459).`
+      + ` Raw response: ${text(one).slice(0, 200)}`;
+  skipped.push(`list_traits drill-down — ${reason}`);
+  console.log(`list_traits(name=Transform) SKIPPED — ${reason}`);
+} else {
+  // The case's own contract: the drill-down returns EXACTLY one schema, not "at least Transform".
+  const drillDownKeys = Object.keys(oj.traits);
+  if (drillDownKeys.length !== 1 || drillDownKeys[0] !== 'Transform') {
+    throw new Error(`list_traits(name=Transform) must return exactly {traits:{Transform}} — got keys [${drillDownKeys.join(', ')}]`);
+  }
+  console.log('list_traits(name=Transform) → fields:', Object.keys(transformFields).join(','));
+}
 
 // Every tool result must be parseable JSON — including a capped one, which is why the
 // size cap emits an `{elided:true}` envelope rather than slicing the blob (result.ts).
@@ -228,8 +263,21 @@ const PRECOND = {
     ok: Array.isArray(mountedSurfaces) && mountedSurfaces.includes('scene-view'),
     need: `the SceneView tab to be MOUNTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
   },
+  // `set_game_view_device`'s panelMounted/panelSize assertions are only meaningful with the Game
+  // tab MOUNTED — per agentEditorOps.ts, FlexLayout only mounts the SELECTED tab, so a layout with
+  // the Game tab closed or a re-docked layout with it unselected reports `panelMounted: false` and
+  // omits `panelSize` even for Free, which is correct behaviour, not a defect.
+  // ⚠️ MOUNTED IS NOT ENOUGH (#688). A Game tab that is selected but COLLAPSED to zero area — its
+  // splitter dragged flat, or another panel maximised over it — satisfies the `mountedSurfaces`
+  // check below and STILL omits `panelSize`, now with a `panelNote` saying so. That is also
+  // correct behaviour. The Free assertion further down cannot tell it apart from the stale-size
+  // regression it exists to catch, so it reads `panelNote` and says which one happened.
+  gameView: {
+    ok: Array.isArray(mountedSurfaces) && (mountedSurfaces.includes('game-2d') || mountedSurfaces.includes('game-3d')),
+    need: `the Game tab to be OPEN and SELECTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
+  },
 };
-const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'] };
+const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
 
 /** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
  *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end
@@ -243,7 +291,8 @@ function preconditionsFor(uc) {
   return false;
 }
 const canUC3 = preconditionsFor('UC3'), canUC5 = preconditionsFor('UC5'),
-      canUC6 = preconditionsFor('UC6'), canUC8 = preconditionsFor('UC8');
+      canUC6 = preconditionsFor('UC6'), canUC8 = preconditionsFor('UC8'),
+      canGameViewDevice = preconditionsFor('gameViewDevice');
 
 // ── Real use cases (plan Usability 1) ────────────────────────────────────────
 // Each of these is a workflow written the way an agent would naturally write it, and each one
@@ -888,6 +937,11 @@ await withCleanup(async () => {
   if (b.isError) throw new Error(`the 2-step create batch failed: ${text(b)}`);
   const guids = (JSON.parse(text(b)).steps ?? []).map((st) => st.result?.guid);
   if (guids.length !== 2 || guids.some((g) => !g)) throw new Error(`expected two created guids, got ${JSON.stringify(guids)}`);
+  // Assigned as soon as the guids are known to be real, NOT at the end of this function — cleanup
+  // "must undo exactly as many creates as landed, even when the check failed part-way" (see :79-81).
+  // A late assignment leaves `smokeGuids` at `[]` for every assertion below that throws, and the
+  // cleanup loop then runs zero times, leaking these entities into the human's live scene.
+  smokeGuids = guids;
   const alive = async () => {
     const out = [];
     for (const g of guids) {
@@ -910,7 +964,6 @@ await withCleanup(async () => {
   if (j(await alive()) !== 'true,false') throw new Error('redo is not per step either');
   await client.callTool({ name: 'modoki_history', arguments: { action: 'redo' } });
   if (j(await alive()) !== 'true,true') throw new Error('the second redo did not restore the second entity');
-  smokeGuids = guids;
   console.log('UC9 undo/redo inside a batch is PER STEP (2 creates, one undo removes one) ✓');
 }, async () => {
   // Undo both creates back off the stack — the scene ends as it started.
@@ -961,14 +1014,14 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
   });
 }
 
-// ── modoki_game_view_device (#367) ───────────────────────────────────────────
+// ── modoki_set_game_view_device (#367) ───────────────────────────────────────────
 // Smoke-covered rather than declared un-sweepable: the Game panel's preview size is editor-session
 // state, fully restorable, and nothing in the human's project changes. What only a live call can
 // prove is that `set-game-view-device` is on the /api/editor-action allowlist AND registered in the
 // renderer — a tool can be perfect on both static tiers and 400 on every call (modoki_prefab did,
 // for months). The read-back is asserted from modoki_get_editor_state, i.e. from a DIFFERENT route
 // than the write, so a setter that answered cheerfully without reaching the store would fail here.
-{
+if (canGameViewDevice) {
   const catalog = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_devices', arguments: {} })));
   if (!Array.isArray(catalog.presets) || catalog.presets.length === 0) throw new Error('game_view_devices returned no presets');
   if (!catalog.current || typeof catalog.current.device !== 'string') throw new Error('game_view_devices must report the CURRENT selection, not just the catalog');
@@ -979,7 +1032,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (!target) throw new Error('the catalog carries no non-Free preset to test with');
 
     const set = JSON.parse(text(await client.callTool({
-      name: 'modoki_game_view_device', arguments: { device: target.name, orientation: 'landscape' },
+      name: 'modoki_set_game_view_device', arguments: { device: target.name, orientation: 'landscape' },
     })));
     if (set.device !== target.name) throw new Error(`set did not resolve the named device: ${JSON.stringify(set)}`);
     // Landscape is a FLIP, not a catalog row — so the logical size must come back swapped. This is
@@ -1000,7 +1053,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // by whatever orientation the panel happened to be left in. Measured against a live editor
     // before this defaulted — it came back 480x640.
     const custom = JSON.parse(text(await client.callTool({
-      name: 'modoki_game_view_device', arguments: { logicalWidth: 640, logicalHeight: 480, dpr: 2 },
+      name: 'modoki_set_game_view_device', arguments: { logicalWidth: 640, logicalHeight: 480, dpr: 2 },
     })));
     if (custom.orientation !== 'portrait') throw new Error(`an explicit size must default to portrait so its numbers are literal, got ${custom.orientation}`);
     if (custom.logical.w !== 640 || custom.logical.h !== 480) throw new Error(`custom size did not take: ${JSON.stringify(custom.logical)}`);
@@ -1010,17 +1063,17 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (custom.safeAreaBasis !== 'custom-none') throw new Error(`a custom size must report safeAreaBasis:'custom-none', got ${custom.safeAreaBasis}`);
 
     // An unknown name is refused WITH the real list, never fuzzy-matched onto a nearby screen.
-    const unknown = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });
+    const unknown = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });
     if (!unknown.isError) throw new Error('an unknown device name must be refused, not fuzzy-matched');
     if (!/iPhone 16 Pro/.test(text(unknown))) throw new Error('the refusal must list the real preset names');
 
     // Two addresses at once is ambiguous — refused rather than resolved by precedence.
-    const both = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free', logicalWidth: 100, logicalHeight: 100 } });
+    const both = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'Free', logicalWidth: 100, logicalHeight: 100 } });
     if (!both.isError) throw new Error('device + an explicit size together must be refused as ambiguous');
 
     // A dpr that cannot round-trip is refused rather than silently rounded: the read-back derives
     // dpr from the ROUNDED physical size, so accepting this would answer a dpr nobody asked for.
-    const badDpr = await client.callTool({ name: 'modoki_game_view_device', arguments: { logicalWidth: 3, logicalHeight: 3, dpr: 0.5 } });
+    const badDpr = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { logicalWidth: 3, logicalHeight: 3, dpr: 0.5 } });
     if (!badDpr.isError) throw new Error('a dpr whose product is fractional must be refused, not rounded away');
 
     // The Game panel's mounted-ness is reported: the store accepts a device whether or not GameView
@@ -1033,8 +1086,19 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (custom.panelMounted !== true) throw new Error(`panelMounted must be true with the Game panel open — got ${custom.panelMounted}`);
     // Free reports the real measured panel area; a fixed device does not (its `logical` IS the size).
     if (custom.panelSize !== undefined) throw new Error('panelSize must be omitted for a fixed device — logical is the answer there');
-    const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free' } })));
+    const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'Free' } })));
     if (!freeBack.panelSize || !(freeBack.panelSize.w > 0) || !(freeBack.panelSize.h > 0)) {
+      // Distinguish the two reasons panelSize can be absent on Free, because they need opposite
+      // responses: a COLLAPSED panel is the operator's layout (open the splitter and re-run),
+      // while a missing panelSize with no note is the #688/stale-gameViewSize defect.
+      // ⚠️ This branch TRUSTS a note produced by the very code it is testing. The named
+      // stale-gameViewSize regression cannot reach here (it reports a present, positive
+      // panelSize), but a FUTURE defect that zeroes gameAreaSize on a visibly-open panel — the
+      // observer detaching, a store reset — would land here and be reported as an operator
+      // layout problem. If this fires and the panel looks fine on screen, disbelieve the note.
+      if (typeof freeBack.panelNote === 'string' && freeBack.panelNote.includes('COLLAPSED')) {
+        throw new Error(`the Game panel is mounted but COLLAPSED to zero area — give it room and re-run; this is a HARNESS precondition, not a tool defect. Note: ${freeBack.panelNote}`);
+      }
       throw new Error(`Free must report a MEASURED panelSize, not the device it just left: ${JSON.stringify(freeBack.panelSize)}`);
     }
     // The regression that matters: panelSize must not echo the phone we were just on.
@@ -1042,16 +1106,16 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
       throw new Error('panelSize returned the PREVIOUS device size — it is reading gameViewSize, not the measured area');
     }
 
-    console.log(`game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
+    console.log(`set_game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
   }, async () => {
     await client.callTool({
-      name: 'modoki_game_view_device',
+      name: 'modoki_set_game_view_device',
       arguments: { device: before.device === 'Custom' ? 'Free' : before.device, orientation: before.orientation },
     });
   });
 }
 
-// ── modoki_animation_view_mode (#369) ────────────────────────────────────────
+// ── modoki_set_animation_view_mode (#369) ────────────────────────────────────────
 // Smoke-covered, not declared un-sweepable: the Animation panel's view is editor-session state and
 // the case restores whatever it found. What only a live call proves is that
 // `set-animation-view-mode` is BOTH on the /api/editor-action allowlist and registered in the
@@ -1068,7 +1132,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // the store's setter early-returns on an unchanged value, so asserting the current value back
     // would be true whether or not the op reached it.
     const target = before === 'curves' ? 'dopesheet' : 'curves';
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: target } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: target } });
     // Read back through the OTHER route: the op returns its own state read, so asserting on its
     // reply alone cannot separate "reached the store" from "echoed the argument".
     const st1 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
@@ -1076,7 +1140,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
       throw new Error(`the view did not change: asked ${target}, editor-state says ${st1.animationViewMode}`);
     }
     // And back, so both arms are exercised rather than only the one that happened to differ.
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: before } });
     const st2 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
     if (st2.animationViewMode !== before) throw new Error(`the view did not switch back to ${before}`);
 
@@ -1086,15 +1150,15 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // route, which no tool call can reach — it is covered by the T1/T2 tiers, not here. Both exist
     // because the failure is silent either way: a typo'd mode that reports success leaves the caller
     // reading an empty `modoki_handles editor=curves` as "this clip has no tangents".
-    const bad = await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: 'curve' } });
+    const bad = await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: 'curve' } });
     if (!bad.isError) throw new Error("an unknown view mode must be refused, not ignored");
     // ...and the refusal must not have moved the view on its way out.
     const st3 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
     if (st3.animationViewMode !== before) throw new Error('a refused mode changed the view anyway');
 
-    console.log(`animation_view_mode switches dopesheet<->curves and refuses an unknown mode \u2713 (was ${before})`);
+    console.log(`set_animation_view_mode switches dopesheet<->curves and refuses an unknown mode \u2713 (was ${before})`);
   }, async () => {
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: before } });
   });
 }
 
@@ -1151,6 +1215,413 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
   }, async () => {
     await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-clear' } });
   });
+}
+
+// ── modoki_set_selection (#496) ───────────────────────────────────────────────
+// COVERED_BY_SMOKE claimed this was smoke-covered, but its only occurrence (the batch pre-flight
+// case near :977) is a step inside a batch asserted to be REFUSED before any step runs — that
+// step never EXECUTES. This is the first real, executing call.
+//
+// Gated on UC3's `cube` precondition — it already guarantees exactly one entity named 'cube' in
+// the open scene, and CUBE_GUID (captured in the precondition probe above) is a real guid to aim
+// at. There is no `name` param on this tool (that gap is exactly what UC8 found, see :302-303), so
+// aiming is by guid.
+if (canUC3) {
+  const before = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).selection;
+  await withCleanup(async () => {
+    await client.callTool({ name: 'modoki_set_selection', arguments: { guid: CUBE_GUID } });
+    // Read back through the OTHER route (get_editor_state), not the op's own reply — an op that
+    // echoes its argument back is not evidence it reached the store.
+    const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (st.selection?.entityId == null || !st.selection.entityIds?.length) {
+      throw new Error(`set_selection did not take: ${JSON.stringify(st.selection)}`);
+    }
+    // Confirm the SELECTED id really IS the cube, not merely that something got selected —
+    // resolve the cube's live id by guid (a different route again) and compare.
+    const cubeNow = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: CUBE_GUID } })));
+    const cubeId = (cubeNow.entities ?? [])[0]?.id;
+    if (cubeId == null || st.selection.entityId !== cubeId) {
+      throw new Error(`set_selection selected id ${st.selection.entityId}, but the cube's live id is ${cubeId}`);
+    }
+    console.log(`set_selection selects by guid, read back via get_editor_state ✓ (entityId: ${st.selection.entityId})`);
+  }, async () => {
+    // Restore exactly what was selected before — an asset selection, an entity selection, or
+    // nothing (a bare call CLEARS the selection, per the tool's own contract note). Checked, not
+    // ignored: if the previously-selected ids no longer resolve, the restore fails silently and
+    // the human's selection is left on the probe entity while the run still prints SMOKE OK.
+    let restore;
+    if (before?.asset) {
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { asset: before.asset } });
+    } else if (before?.entityIds?.length) {
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
+    } else {
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: {} });
+    }
+    if (restore.isError) {
+      console.warn(`  ⚠ set_selection cleanup failed to restore the prior selection: ${text(restore)}`);
+    }
+  });
+}
+
+// ── modoki_dispatch_action (#496) ─────────────────────────────────────────────
+// COVERED_BY_SMOKE claimed this was smoke-covered too, but there was no call site of any kind.
+// This is the first real one.
+//
+// ⚠️ Measured live, and load-bearing for this case's shape: dispatch-action refuses IDENTICALLY
+// whether the sim is STOPPED or the action name is bogus.
+//   stopped + real action ('haptics.toggle') → {"ok":false,"dispatched":false,"reason":"not
+//     playing — press Play first","simRunning":false}
+//   stopped + a bogus name                   → the BYTE-IDENTICAL refusal
+//   playing + real action                    → {"dispatched":true,"simRunning":true}
+//   playing + a bogus name                   → {"ok":false,"dispatched":false,"reason":"unknown
+//     action '…'","known":[...]}
+// So a stopped-only call proves NOTHING — it cannot tell a dead route from a stopped editor. This
+// case must run inside a PLAY window, where the two arms actually diverge. Do not "simplify" this
+// back to a stopped-only call.
+{
+  // Preconditions read through the SKIPPED mechanism, not a throw — this case is LAST in a linear
+  // script with no top-level catch, so a thrown precondition here would skip client.close() too.
+  const actions = JSON.parse(text(await client.callTool({ name: 'modoki_list_actions', arguments: {} })));
+  const missingActions = !Array.isArray(actions.actions) || actions.actions.length === 0;
+  // ENGINE-level actions, present regardless of which project is open.
+  const missingHaptics = !missingActions && !actions.actions.some((a) => a.name === 'haptics.toggle');
+  if (missingActions || missingHaptics) {
+    const reason = missingActions
+      ? `list_actions returned no actions: ${JSON.stringify(actions)}`
+      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`;
+    skipped.push(`dispatch_action — ${reason}`);
+    console.log(`dispatch_action SKIPPED — ${reason}`);
+  } else {
+    await withCleanup(async () => {
+      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
+
+      // `haptics.toggle` returns early (no-op) when the open scene authors no `HapticSettings`
+      // entity, which is the common case — so dispatching it twice usually changes nothing on
+      // disk or in the world. `dispatched:true` here proves the dispatch ROUTE and the Play gate
+      // (a stopped sim refuses identically to a bogus name — see below), not that state changed.
+      // The bogus-name arm below carries the real weight of this case.
+      for (let i = 0; i < 2; i++) {
+        const r = JSON.parse(text(await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } })));
+        if (r.dispatched !== true) throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${JSON.stringify(r)}`);
+      }
+
+      // The half that actually catches a dead route: an unknown name must be refused BY NAME, with a
+      // `known` list — not merely refused-somehow (a stopped-sim refusal would pass a bare isError
+      // check too, and would not distinguish this tool from one that 400s on every call).
+      const bogusRaw = await client.callTool({
+        name: 'modoki_dispatch_action', arguments: { name: 'modoki.smoke.definitelyNotARealAction' },
+      });
+      if (!bogusRaw.isError) throw new Error(`a bogus action name must be refused, not silently accepted: ${text(bogusRaw)}`);
+      const bogusErr = JSON.parse(text(bogusRaw)).error;
+      if (!/unknown action 'modoki\.smoke\.definitelyNotARealAction'/.test(bogusErr?.why ?? '')) {
+        throw new Error(`the refusal must NAME the unknown action, got: ${JSON.stringify(bogusErr)}`);
+      }
+      if (!Array.isArray(bogusErr?.got?.known) || bogusErr.got.known.length === 0) {
+        throw new Error(`the refusal must carry a \`known\` action list, got: ${JSON.stringify(bogusErr)}`);
+      }
+
+      console.log(`dispatch_action dispatches a real action while PLAYING and names an unknown one ✓ (${actions.actions.length} actions known)`);
+    }, async () => {
+      // stop reverts the world to its authored snapshot — nothing else here needs undoing.
+      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
+    });
+  }
+}
+
+// ── modoki_save_all (#496, reopened) ─────────────────────────────────────────
+// The third tool COVERED_BY_SMOKE claimed and nothing executed, and the worst of the three: it is
+// the ONLY route from a live edit to disk. Its two prior occurrences were both in UC7 — a step in
+// a batch the case asserts fails BEFORE reaching it, plus the assertion that it lands in `notRun`.
+// A grep-based guard cannot tell that from a real call site, which is how it survived the pass
+// that fixed set_selection and dispatch_action.
+//
+// ⚠️ WHY THIS SAVES TO AN EXPLICIT PROBE PATH, AND WHY THAT IS NOT A WEAKER TEST.
+// A bare `save_all` writes the LIVE WORLD over the open scene FILE — the human's committed
+// `games/<id>/assets/scenes/*.json`, in a working tree this harness must leave clean (CLAUDE.md
+// #18). Worse, it is unconditional: `saveScene` does not check the dirty flag, and the serializer
+// re-emits the whole file, so even a "no-op" save lands as a large diff (#500). The `path` param
+// exists precisely so a save can name its own target, so the case uses it: the ONLY files this
+// writes are two probes it created, and the human's scene is never opened for writing at all.
+//
+// ⚠️⚠️ AND WHY THE PROBE SCENE IS `/assets/mcp-smoke-save.json` — NOT `.scene.json`, and NOT in
+// the scenes folder. This is a scar, measured on the first green run of this case, which left
+// `games/3d-test/.../tropical-island.scene.json` MODIFIED with a brand-new `id`:
+//   a save-as writes the CURRENT scene's own guid into the new file, so the probe and the human's
+//   scene briefly share one guid. The dev asset scanner auto-HEALS a guid collision by keeping
+//   the lexicographically-first path's id and REWRITING the other file's (vite-asset-scanner.ts,
+//   `buildManifest(…, heal=true)`) — and `mcp-smoke-save` sorts before `tropical-island`, so the
+//   healer re-minted the guid of the committed scene. Every ref to that scene by guid would have
+//   broken, from a smoke test that reported OK.
+//   The fix is to keep the probe OUT of the manifest entirely: `detectType` classifies a plain
+//   `.json` as a scene only via the `.scene.json` suffix or the legacy `/scenes/` directory
+//   convention, so a plain `.json` elsewhere under the asset root is not an asset at all — no
+//   guid, nothing to collide with. `saveScene` writes whatever path it is handed, and
+//   `validate_scene` reads by path, so nothing else cares about the extension.
+//   Do NOT "tidy" this path to `/assets/scenes/mcp-smoke-save.scene.json`.
+//
+// It still exercises both halves of what `save-all` does, which is the whole point — but they are
+// observed with DIFFERENT strength, and the difference is worth knowing before trusting this case:
+//   • the SCENE serialize + write — verified FROM DISK via `modoki_validate_scene`, a different
+//     route that does `fs.readFileSync` + `JSON.parse` on the path. This one does not rest on the
+//     op's own word. (It proves existence + parseability, not content: a save that wrote `{}`
+//     would pass. The stale-probe precheck removes the "it was already there" escape.)
+//   • the PARKED-ASSET flush (`flushDirtyAssets`) — observed only through the editor's OWN
+//     bookkeeping (`savedAssets`, `dirtyAssetPaths`, `read_asset_def.unsaved`), because
+//     `read_asset_def` reads the LIVE CACHE by design and no route in the surface reads a particle
+//     def from disk. So a flush that cleared the registry and reported success while the bytes
+//     never landed would pass this half — narrower than it sounds (the realistic regression, the
+//     #259 "flush never runs at all", IS caught), but it is not a disk proof and must not be
+//     described as one.
+//
+// ⚠️ The save-as also repoints the human's scene GUID at the probe IN MEMORY: `saveScene` calls
+// `registerAsset(scene.id, <probe path>, 'scene')`, and `registerAsset` drops the old path→guid
+// entry. Nothing on disk changes (the probe carries no guid of its own — see above), and the
+// cleanup's `load_scene` re-registers the real path. But if that reload ever fails, the editor is
+// left with the human's scene guid resolving to a file this case is about to trash.
+{
+  const st0 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  // Both probes sit at fixed locations under the asset ROOT, which every project has, so this runs
+  // on whatever project is open without assuming a folder layout. The scene probe's location is
+  // load-bearing, not a convenience — see the warning above. Named `mcp-smoke-save` so a leftover
+  // is identifiable as this case's.
+  const SAVE_SCENE = '/assets/mcp-smoke-save.json';   // see the extension/folder warning above
+  const SAVE_PART = '/assets/particles/mcp-smoke-save.particle.json';
+
+  // Four preconditions, each of which is about NOT damaging the human's editor — reported through
+  // the SKIPPED mechanism (F12), never forced past.
+  const blockers = [];
+  if (!SCENE) blockers.push('no resolvable scenePathRef — there would be nothing to restore the editor to after the save-as re-points it');
+  // `pre` is the snapshot taken at the TOP of this run, not now: by this point the suite's own
+  // cases have left the live world dirty by design, so `st0.unsavedChanges` is expected to be true
+  // and says nothing about the human. What matters is that the editor was CLEAN when we arrived,
+  // because the cleanup below reloads the scene from disk and that discards the live world.
+  if (pre.unsavedChanges) blockers.push('the editor already had unsaved live-world changes when this run STARTED — the cleanup reload would destroy them');
+  // `saveScene` refuses outside 'stopped' (it would bake preview/runtime state into an authored
+  // file). A refusal here is the tool being right, and would read as save_all being broken.
+  if (st0.runMode !== 'stopped') blockers.push(`runMode is '${st0.runMode}', not 'stopped' — a save is correctly refused outside stopped`);
+  // `flushDirtyAssets` runs FIRST and unconditionally inside save-all, and it flushes EVERY parked
+  // doc — not just ours. If the human (or an earlier case) has one parked, this call would commit
+  // their pending edit to disk as a side effect. That is exactly the kind of write this harness
+  // must not make on their behalf.
+  const parkedAlready = (st0.dirtyAssetPaths ?? []).filter((p) => p !== SAVE_PART);
+  if (parkedAlready.length) blockers.push(`the editor has parked asset writes this save would flush to disk on the human's behalf: ${parkedAlready.join(', ')}`);
+
+  if (blockers.length) {
+    const reason = blockers.join('; ');
+    skipped.push(`save_all — ${reason}`);
+    console.log(`save_all SKIPPED — ${reason}`);
+  } else {
+    // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
+    // already be there. Same precheck UC10/UC11 make, for the same reason.
+    // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
+    // already be there. Each probe is checked through the route that can SEE it: the particle is a
+    // real asset (manifest), the probe scene deliberately is NOT (see above), so it is checked by
+    // the same from-disk read the assertion below uses.
+    // `isError` is NOT the same as "absent": /api/validate-scene answers 404 for a missing file but
+    // 500 for one that fails JSON.parse, so a TRUNCATED leftover from a killed run would otherwise
+    // read as a clean project. Only a not-found is proof there is nothing there.
+    const staleScene = await client.callTool({ name: 'modoki_validate_scene', arguments: { path: SAVE_SCENE } });
+    const staleWhy = staleScene.isError ? (JSON.parse(text(staleScene)).error?.why ?? '') : '';
+    if (!staleScene.isError || !/not found/i.test(staleWhy)) {
+      throw new Error(`save_all cannot run: something already exists at ${SAVE_SCENE} — a previous run left a probe behind. Trash it and re-run. (${staleScene.isError ? staleWhy.slice(0, 200) : 'it reads as a valid scene'})`);
+    }
+    const stale = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'particle', name: 'mcp-smoke-save' } })));
+    // A summarized reply has no `assets` key at all, and reading that absence as "nothing there"
+    // is the UC10 trap — so an unreadable answer is a failure, not a pass.
+    if (!Array.isArray(stale.assets)) {
+      throw new Error(`save_all precheck: list_assets returned no \`assets\` array (summarized? ${JSON.stringify(stale).slice(0, 200)}) — cannot tell a leftover probe from a clean project`);
+    }
+    if (stale.assets.length) {
+      throw new Error(`save_all cannot run: ${stale.assets.map((a) => a.path).join(', ')} already exists — a previous run left a probe behind. Trash it and re-run.`);
+    }
+    const made = JSON.parse(text(await client.callTool({ name: 'modoki_create_asset', arguments: { type: 'particle', path: SAVE_PART } })));
+    if (!made.ok) throw new Error(`save_all could not scaffold its probe particle: ${JSON.stringify(made).slice(0, 300)}`);
+    await withCleanup(async () => {
+      // The def comes from `modoki_asset_schema`, not from reading the file back. ⚠️ Measured:
+      // `read_asset_def` PEEKS the live cache and deliberately does not fetch, so a
+      // freshly-scaffolded asset nothing has loaded is a refusal ("not in the live particle
+      // cache") — correct behaviour, and it fails this case before it starts. `asset_schema`'s
+      // `example` is `defaultParticleEffect()`, the same generator `/api/create-asset` scaffolds
+      // from, so the def stays valid without this file hand-carrying a copy of the schema.
+      const schema = JSON.parse(text(await client.callTool({ name: 'modoki_asset_schema', arguments: { type: 'particle' } })));
+      if (!schema?.example) throw new Error(`save_all could not get a valid particle example: ${JSON.stringify(schema).slice(0, 300)}`);
+      // Carry the scaffolded GUID through: the parked def is what reaches disk, so dropping `id`
+      // would save the probe under a different identity than the one create_asset registered.
+      const probeDef = { ...schema.example, id: made.id, maxParticles: 496 };
+
+      // Park the write. `particle_set` must report `saved:false` — persistence is manual, and if
+      // the edit went straight to disk there would be nothing for save_all to flush and this case
+      // would be theatre (the UC6 assertion, made here because THIS case depends on it).
+      const r = await client.callTool({ name: 'modoki_particle_set', arguments: { path: SAVE_PART, def: probeDef } });
+      if (r.isError) throw new Error(`save_all: particle_set refused the probe write create_asset had just made: ${text(r).slice(0, 400)}`);
+      const parked = JSON.parse(text(r));
+      if (parked.saved !== false) throw new Error(`save_all: particle_set reported saved=${parked.saved} — the write must be PARKED for this case to have anything to flush`);
+      const dirty = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if (!(dirty.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all: the probe write did not park (dirtyAssetPaths=${JSON.stringify(dirty.dirtyAssetPaths)}) — nothing to flush`);
+      }
+      // Applying the def loaded it into the live cache, so the peek answers now — and it must say
+      // the write is UNSAVED. That is the state save_all has to change.
+      const pending = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: SAVE_PART } })));
+      if (pending?.unsaved !== true || pending?.def?.maxParticles !== 496) {
+        throw new Error(`save_all: the parked edit is not readable as pending: ${JSON.stringify(pending).slice(0, 300)}`);
+      }
+
+      // ── the call under test ──
+      const saved = JSON.parse(text(await client.callTool({ name: 'modoki_save_all', arguments: { path: SAVE_SCENE } })));
+      if (!saved.ok) throw new Error(`save_all did not report a write: ${JSON.stringify(saved).slice(0, 400)}`);
+      if (saved.scenePath !== SAVE_SCENE) throw new Error(`save_all wrote ${saved.scenePath}, not the path it was given (${SAVE_SCENE})`);
+      // The asset half is REPORTED — `savedAssets` is the only place a caller can see which parked
+      // docs a save committed, and it was added because `saved:false` had been the last word on a
+      // parked edit. A save that flushed it silently is a regression in its own right.
+      if (!(saved.savedAssets ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all did not name the flushed asset doc: savedAssets=${JSON.stringify(saved.savedAssets)}`);
+      }
+      // ⚠️ `path` REDIRECTS ONLY THE PRIMARY SCENE. After the primary saves, `saveAll` loops every
+      // OTHER loaded scene in the chain and writes each dirty one to ITS OWN real path
+      // (serialize.ts, the `extraSaved` loop) — so on a project whose open scene declares a
+      // `baseScene`, a base dirtied by an earlier case in this run reaches a COMMITTED file that
+      // no `path` argument can redirect.
+      //
+      // This is DETECTION, not prevention, and deliberately so: nothing in the tool surface
+      // exposes the loaded-scene chain (`readEditorState` reports `unsavedChanges` and
+      // `dirtyAssetPaths`, but no per-scene dirty list), so there is no precondition that could
+      // see it coming. `extraSaved` is precisely the "committed files this save also wrote"
+      // channel, and discarding it is what would turn real damage into a printed ✓. Fail loudly
+      // and NAME the files, so whoever hits it knows exactly what to restore.
+      if (saved.extraSaved?.length) {
+        const paths = saved.extraSaved.map((e) => e.path ?? e).join(', ');
+        throw new Error(
+          `save_all ALSO wrote ${saved.extraSaved.length} other loaded scene(s) to their own committed paths: ${paths}. `
+          + 'Those are real project files this case cannot redirect — check `git status` and restore them '
+          + '(git checkout -- <path>). Run the smoke on a project whose open scene has no base-scene chain.',
+        );
+      }
+
+      // Read back through OTHER routes — an op that echoes its own success is not evidence.
+      const after = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if ((after.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all left the probe parked: dirtyAssetPaths=${JSON.stringify(after.dirtyAssetPaths)}`);
+      }
+      if (after.unsavedChanges !== false) throw new Error(`save_all reported ok but the editor still has unsaved changes: ${JSON.stringify(after.unsavedChanges)}`);
+      if (after.scenePathRef !== SAVE_SCENE) throw new Error(`save_all did not re-point the scene at ${SAVE_SCENE} (now ${after.scenePathRef}) — the tool documents that "the scene keeps it for later saves"`);
+      // The asset's own view of itself, through the route the write tools point their callers at.
+      // `unsaved:true` here after a reported save is the exact silent-loss shape manual
+      // persistence exists to make visible.
+      const flushed = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: SAVE_PART } })));
+      if (flushed?.unsaved !== false) throw new Error(`save_all reported the asset flushed, but read_asset_def still calls it unsaved: ${JSON.stringify(flushed).slice(0, 300)}`);
+
+      // THE DISK PROOF, and the assertion this whole case exists for. Everything above is the
+      // editor's own account of itself; `/api/validate-scene` does `fs.existsSync` +
+      // `fs.readFileSync` + `JSON.parse` on the path (editorBackendRouter.ts) and 404s when the
+      // file is not there. So this is the one read that can tell a real write from a route that
+      // reports success and touches nothing — the `modoki_prefab` failure mode this issue is about.
+      const onDisk = await client.callTool({ name: 'modoki_validate_scene', arguments: { path: SAVE_SCENE } });
+      if (onDisk.isError) throw new Error(`save_all reported ok, but the file is NOT on disk — validate_scene could not read ${SAVE_SCENE}: ${text(onDisk)}`);
+      const vj = JSON.parse(text(onDisk));
+      if (vj.path !== SAVE_SCENE) throw new Error(`validate_scene answered about ${vj.path}, not ${SAVE_SCENE}`);
+      console.log(`save_all writes the scene to an explicit path (verified on disk) and flushes ${saved.savedAssets.length} parked asset doc(s) ✓`);
+    }, async () => {
+      // 1. Put the editor back on the human's scene FIRST, so it is never left pointing at a file
+      //    the next step deletes. Conditional: if the case failed before the save, the path was
+      //    never re-pointed and a reload would only discard live state for nothing — and it would
+      //    be REFUSED anyway, since the suite leaves the world dirty by design.
+      const now = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if (now.scenePathRef === SAVE_SCENE) {
+        const back = JSON.parse(text(await client.callTool({ name: 'modoki_load_scene', arguments: { path: SCENE } })));
+        const restored = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+        if (restored.scenePathRef !== SCENE) {
+          throw new Error(`save_all failed to restore the human's scene ${SCENE} (now ${restored.scenePathRef}): ${JSON.stringify(back).slice(0, 300)}`);
+        }
+        console.log('save_all restores the original scene ✓');
+      }
+      // 2. Drop any parked write still outstanding (the case failed between particle_set and the
+      //    save), so the next save_all by anyone does not commit it — the UC6 lesson.
+      if ((now.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        await client.callTool({ name: 'modoki_discard_asset_edits', arguments: { paths: [SAVE_PART] } });
+      }
+      // 3. Trash both probes. `delete_asset` on an absent path is `trashed:0`, not an error, so
+      //    this is safe on every failure path.
+      const sweptRaw = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [SAVE_SCENE, SAVE_PART] } });
+      // A REFUSED delete must fail the run. `trashed > 0` alone is silently false on an error
+      // envelope (403 outside allowed dirs, 500 from a throwing moveToTrash), which would end the
+      // suite at `SMOKE OK` with both probes still in the human's project — and the NEXT run would
+      // then blame its own precheck on "a previous run", pointing at the wrong run.
+      if (sweptRaw.isError) throw new Error(`save_all could not trash its probes — they are STILL in the project (${SAVE_SCENE}, ${SAVE_PART}): ${text(sweptRaw).slice(0, 300)}`);
+      const swept = JSON.parse(text(sweptRaw));
+      if (swept.trashed > 0) console.log(`save_all trashed its ${swept.trashed} probe file(s) ✓`);
+    });
+  }
+}
+
+// UC14 — the .meta.json ROUND TRIP, and the live proof that the park gate reaches the renderer
+// (#872/#882).
+//
+// `modoki_write_asset_meta` sat in LIVE_UNCOVERED with a reason that argued for its own removal
+// ("SMOKE-COVERABLE — read the sidecar, write it back unchanged, verify") and no case. It writes a
+// real file in the human's project, which is the bar for that ledger — but written back UNCHANGED
+// it is a no-op on disk, so the case costs nothing and buys the one thing only a live call proves.
+//
+// ⚠️ **The `editorConnected` assertion is the load-bearing half, not the round trip.** The write
+// now asks the renderer whether a human's Inspector import-settings edit is parked, and answers
+// `editorConnected:false` when no renderer answered at all — including when the `resolve-meta-park`
+// op is not registered ("unknown agent op" classifies as a definitively-absent renderer, correctly:
+// a runtime with no editor ops has no registry either). An editor IS attached while this suite
+// runs, so `editorConnected:false` here means the probe did not reach the op — the gate silently
+// degraded to the unguarded write this work replaced. That is precisely the class `npm test` cannot
+// see and `modoki_prefab` hid in for months.
+//
+// The REFUSAL side is deliberately not here: parking an import-settings edit is a human Inspector
+// gesture with no agent equivalent, so no case in this suite can create one. It is hand-verified
+// against a live editor instead, and that limitation is stated rather than left to be discovered.
+const uc14Assets = JSON.parse(text(await client.callTool({
+  name: 'modoki_list_assets', arguments: { type: 'texture', limit: 5 },
+})));
+const uc14Path = uc14Assets?.assets?.[0]?.path;
+if (!uc14Path) {
+  skipped.push('UC14 (.meta.json round trip) — the open project has no texture asset to read a sidecar from');
+} else {
+  const before = JSON.parse(text(await client.callTool({
+    name: 'modoki_get_asset_meta', arguments: { path: uc14Path },
+  })));
+  if (!before.ok) throw new Error(`UC14 could not read the sidecar for ${uc14Path}: ${JSON.stringify(before).slice(0, 300)}`);
+  if (before.unsaved === true) {
+    // A human has an unsaved edit parked for this asset. Writing here would be exactly the
+    // destruction this work exists to prevent, so the case declines rather than "handling" it.
+    skipped.push(`UC14 (.meta.json round trip) — ${uc14Path} has a PARKED Inspector edit; refusing to write over a human's unsaved work`);
+  } else {
+    const wrote = JSON.parse(text(await client.callTool({
+      name: 'modoki_write_asset_meta', arguments: { path: uc14Path, meta: before.meta },
+    })));
+    if (!wrote.ok || typeof wrote.sha256 !== 'string') {
+      throw new Error(`UC14 write_asset_meta did not report a written sidecar: ${JSON.stringify(wrote).slice(0, 300)}`);
+    }
+    if (wrote.editorConnected === false) {
+      throw new Error(
+        'UC14 the write reported editorConnected:false while an editor IS attached — the '
+        + 'resolve-meta-park probe did not reach the renderer, so the park gate is inert and this '
+        + `write was unguarded. Reply: ${JSON.stringify(wrote).slice(0, 300)}`,
+      );
+    }
+    if (wrote.discardedParked) throw new Error(`UC14 discarded a parked edit it never asked to: ${JSON.stringify(wrote)}`);
+    const after = JSON.parse(text(await client.callTool({
+      name: 'modoki_get_asset_meta', arguments: { path: uc14Path },
+    })));
+    // Unchanged in, unchanged out. `readMetaSidecar` merges the gitignored `.meta.local.json` cache
+    // blocks back in and `writeMetaSidecar` splits them out again, so a round trip that is NOT
+    // stable means one of those two halves has drifted — which would silently rewrite every
+    // sidecar an agent touches.
+    if (JSON.stringify(after.meta) !== JSON.stringify(before.meta)) {
+      throw new Error(
+        `UC14 the sidecar for ${uc14Path} did not survive an unchanged round trip.\n  before: `
+        + `${JSON.stringify(before.meta).slice(0, 300)}\n  after:  ${JSON.stringify(after.meta).slice(0, 300)}`,
+      );
+    }
+    if (after.source !== 'disk' || after.unsaved !== false) {
+      throw new Error(`UC14 left a parked edit behind: source=${after.source} unsaved=${after.unsaved}`);
+    }
+    console.log(`UC14 ${uc14Path} sidecar read → written back unchanged → identical, park gate reached the renderer ✓`);
+  }
 }
 
 await client.close();

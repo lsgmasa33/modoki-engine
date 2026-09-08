@@ -10,30 +10,45 @@ import { inputStyle, BufferedNumberInput } from '../fields';
 import { AssetRefField } from '../AssetRefField';
 import { ColorField, NumberField, DropdownField, DEFAULT_COLOR } from './widgets';
 import { clampNum, persistAssetEdit, useAssetViewRefresher, invalidateMaterialFile } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
+import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { MaterialPreview } from '../MaterialPreview';
 
 /** One inspector widget for a shader param, dispatched by its schema type. When
  *  `mixed` (multi-select, values differ across the selection) the widget shows a
  *  non-committal placeholder; picking a value broadcasts it to all. */
-export function ParamField({ name, param, value, onChange, mixed = false }: {
+export function ParamField({ name, param, value, onChange, mixed = false, idPrefix }: {
   name: string; param: ShaderParam; value: unknown; onChange: (v: unknown) => void; mixed?: boolean;
+  /** Namespace for this field's `data-ui-id`, WITHOUT a trailing dot — e.g.
+   *  `assetView.material.param`. REQUIRED, so the type checker enumerates every caller.
+   *
+   *  ⚠️ This was hardcoded to `assetView.material.param.${name}` and two of the three callers were
+   *  wrong (#830 review). `ShaderAssetView` renders one ParamField per shader param with the
+   *  LITERAL `name="default"`, so a shader with N float params emitted N elements all carrying
+   *  `assetView.material.param.default` — `modoki_tap` drives whichever the DOM ordered first, and
+   *  the correctly-namespaced `assetView.shader.param.<key>.min|max|step` siblings sat right beside
+   *  them. `MaterialBatchView` emitted the `material` namespace while its own fields are
+   *  `materialBatch`. There is no duplicate-`data-ui-id` guard anywhere, so nothing caught it. */
+  idPrefix: string;
 }) {
   const label = param.label || name;
   switch (param.type) {
     case 'texture':
-      return <AssetRefField label={label} value={(value as string) ?? ''} onChange={onChange} accept={['.png', '.jpg', '.jpeg', '.webp']} mixed={mixed} />;
+      return <AssetRefField label={label} value={(value as string) ?? ''} onChange={onChange} accept={['.png', '.jpg', '.jpeg', '.webp']} mixed={mixed}
+        dataUiId={`${idPrefix}.${name}`} dataUiLabel={label} />;
     case 'color':
       return <ColorField label={label} value={(value as number) ?? (param.default as number) ?? DEFAULT_COLOR} onChange={onChange} mixed={mixed} />;
     case 'bool':
       return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
           <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{label}</span>
-          <input data-ui-id={`assetView.material.param.${name}`} data-ui-kind="toggle" data-ui-label={label} data-ui-state={mixed ? 'mixed' : value ? 'checked' : 'unchecked'} type="checkbox" checked={mixed ? false : !!value} ref={(el) => { if (el) el.indeterminate = mixed; }} onChange={e => onChange(e.target.checked)} />
+          <input data-ui-id={`${idPrefix}.${name}`} data-ui-kind="toggle" data-ui-label={label} data-ui-state={mixed ? 'mixed' : value ? 'checked' : 'unchecked'} type="checkbox" checked={mixed ? false : !!value} ref={(el) => { if (el) el.indeterminate = mixed; }} onChange={e => onChange(e.target.checked)} />
         </div>
       );
     case 'float':
       return <NumberField label={label} value={(value as number) ?? (param.default as number) ?? 0}
-        step={param.step ?? 0.01} wide mixed={mixed} onChange={v => onChange(clampNum(v, param.min, param.max))} />;
+        step={param.step ?? 0.01} wide mixed={mixed} onChange={v => onChange(clampNum(v, param.min, param.max))}
+        dataUiId={`${idPrefix}.${name}`} />;
     default: {
       const n = param.type === 'vec2' ? 2 : param.type === 'vec3' ? 3 : 4;
       const arr = Array.isArray(value) ? (value as number[]) : ((param.default as number[]) ?? new Array(n).fill(0));
@@ -44,7 +59,8 @@ export function ParamField({ name, param, value, onChange, mixed = false }: {
             {Array.from({ length: n }, (_, i) => (
               <BufferedNumberInput key={i} value={arr[i] ?? 0} step={param.step ?? 0.01} mixed={mixed}
                 onChange={c => { const next = arr.slice(0, n); while (next.length < n) next.push(0); next[i] = c; onChange(next); }}
-                style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+                style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+                dataUiId={`${idPrefix}.${name}.${i}`} dataUiLabel={label} />
             ))}
           </div>
         </div>
@@ -61,10 +77,19 @@ export function MaterialAssetView({ path }: { path: string }) {
   const [schemaLoading, setSchemaLoading] = useState(false);
 
   useEffect(() => {
+    // ⚠️ A parked (unsaved) edit is NOT on disk (#831), so fetching the file here would re-seed
+    // the panel — and, through the refresher, the live cache — with the PRE-edit document while
+    // the registry still holds the newer one. The panel then shows a document that disagrees with
+    // what Cmd+S would write, which `pendingAssetDoc`'s docblock calls the worst of the three
+    // states; it has been filed three times already (QA-CTX-0008 and two more). Ask the registry
+    // first, exactly as the five asset EDITORS do, and fall back to the file when nothing pends.
+    const parked = pendingAssetDoc(path, 'material');
+    if (parked) { setData(parked as Record<string, unknown>); return; }
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
-      .then(r => r.ok ? r.json() : null)
-      .then(setData)
+      .then(r => parseAssetJson(r, path))
+      .catch(e => { if (isMissingAsset(e)) return null; throw e; })
+      .then((data) => setData(data as Record<string, unknown> | null))
       .catch(e => { if (e.name !== 'AbortError') setData(null); });
     return () => ac.abort();
   }, [path]);
@@ -73,16 +98,24 @@ export function MaterialAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: Record<string, unknown>, label: string) => {
     const old = dataRef.current;
     if (!old) return;
-    persistAssetEdit(path, updated, invalidateMaterialFile);
+    persistAssetEdit(path, 'material', updated, invalidateMaterialFile);
     pushAction({
-      // Asset-FILE edit: persistAssetEdit already wrote it to disk, so there is nothing pending for
-      // the scene's edit-version to represent — the literal case this flag names. Without it, editing
-      // a material marked the SCENE dirty, which self-blocks the file-direct agent routes and makes
-      // modoki_build refuse over a file that is already saved.
+      // Asset-FILE edit: it changes a `.mat.json`, never a scene entity, so there is nothing for
+      // the SCENE's edit-version to represent — the literal case this flag names. Without it,
+      // editing a material marked the scene dirty, which is a different and wrong claim.
+      // ⚠️ It no longer stops the file-direct agent routes REFUSING, though: `hasUnsavedChanges()`
+      // folds in `hasDirtyAssets()`, so a parked material edit blocks `mutate_scene`/`modoki_build`
+      // whatever this flag says. Correct in itself (the edit IS unsaved) — and the refusal now
+      // names the real cause too (#844): `unsavedChangeCauses()` reports `dirtyAssetPaths`
+      // separately from `sceneDirty`, so a parked material edit is no longer blamed on the wrong one.
+      // ⚠️ The flag is still right; its old REASON is not. It used to read "persistAssetEdit
+      // already wrote it to disk", which stopped being true in #831 — the edit is now PARKED in
+      // the dirty-asset registry, not written. So this edit is genuinely pending, just not against
+      // the scene: `hasDirtyAssets()` is what represents it, and Cmd+S is what writes it.
       _isFileDirect: true,
       label,
-      undo: () => persistAssetEdit(path, old, invalidateMaterialFile),
-      redo: () => persistAssetEdit(path, updated, invalidateMaterialFile),
+      undo: () => persistAssetEdit(path, 'material', old, invalidateMaterialFile),
+      redo: () => persistAssetEdit(path, 'material', updated, invalidateMaterialFile),
     });
   }, [path]);
 
@@ -150,7 +183,8 @@ export function MaterialAssetView({ path }: { path: string }) {
   const IMG: string[] = ['.png', '.jpg', '.jpeg', '.webp'];
   const d = data as Record<string, unknown>;
   const texField = (field: string, label: string) => (
-    <AssetRefField label={label} value={(d[field] as string) ?? ''} onChange={(v) => writeField(field, v)} accept={IMG} />
+    <AssetRefField label={label} value={(d[field] as string) ?? ''} onChange={(v) => writeField(field, v)} accept={IMG}
+      dataUiId={`assetView.material.${field}`} dataUiLabel={label} />
   );
   const boolField = (field: string, label: string, dflt = false) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
@@ -180,16 +214,16 @@ export function MaterialAssetView({ path }: { path: string }) {
         <>
           {sectionHeader('Surface')}
           <ColorField label="Color" value={(data.color as number) ?? DEFAULT_COLOR} onChange={v => writeField('color', v)} />
-          {!isUnlit && <NumberField label="Roughness" value={(data.roughness as number) ?? 1} step={0.01} onChange={v => writeField('roughness', v)} wide />}
-          {!isUnlit && <NumberField label="Metalness" value={(data.metalness as number) ?? 0} step={0.01} onChange={v => writeField('metalness', v)} wide />}
+          {!isUnlit && <NumberField label="Roughness" value={(data.roughness as number) ?? 1} step={0.01} onChange={v => writeField('roughness', v)} wide dataUiId="assetView.material.roughness" />}
+          {!isUnlit && <NumberField label="Metalness" value={(data.metalness as number) ?? 0} step={0.01} onChange={v => writeField('metalness', v)} wide dataUiId="assetView.material.metalness" />}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
             <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Transparent</span>
             <input data-ui-id="assetView.material.transparent" data-ui-kind="toggle" data-ui-label="Transparent" data-ui-state={data.transparent ? 'checked' : 'unchecked'} type="checkbox" checked={!!data.transparent} onChange={e => writeField('transparent', e.target.checked)} />
           </div>
-          <NumberField label="Opacity" value={(data.opacity as number) ?? 1} step={0.01} onChange={v => writeField('opacity', v)} wide />
+          <NumberField label="Opacity" value={(data.opacity as number) ?? 1} step={0.01} onChange={v => writeField('opacity', v)} wide dataUiId="assetView.material.opacity" />
           <DropdownField label="Side" value={(data.side as string) ?? 'front'} options={['front', 'double', 'back']} onChange={v => writeField('side', v)} />
-          <NumberField label="Alpha Test" value={(data.alphaTest as number) ?? 0} step={0.01} onChange={v => writeField('alphaTest', v)} wide />
-          {!isUnlit && <NumberField label="Env Intensity" value={(data.envMapIntensity as number) ?? 1} step={0.1} onChange={v => writeField('envMapIntensity', v)} wide />}
+          <NumberField label="Alpha Test" value={(data.alphaTest as number) ?? 0} step={0.01} onChange={v => writeField('alphaTest', v)} wide dataUiId="assetView.material.alphaTest" />
+          {!isUnlit && <NumberField label="Env Intensity" value={(data.envMapIntensity as number) ?? 1} step={0.1} onChange={v => writeField('envMapIntensity', v)} wide dataUiId="assetView.material.envMapIntensity" />}
           {boolField('flipY', 'Flip Y')}
           {boolField('flatShading', 'Flat Shading')}
           {boolField('wireframe', 'Wireframe')}
@@ -197,7 +231,7 @@ export function MaterialAssetView({ path }: { path: string }) {
 
           {!isUnlit && sectionHeader('Emission')}
           {!isUnlit && <ColorField label="Emissive" value={(data.emissive as number) ?? 0} onChange={v => writeField('emissive', v)} />}
-          {!isUnlit && <NumberField label="Emissive Intensity" value={(data.emissiveIntensity as number) ?? 1} step={0.05} onChange={v => writeField('emissiveIntensity', v)} wide />}
+          {!isUnlit && <NumberField label="Emissive Intensity" value={(data.emissiveIntensity as number) ?? 1} step={0.05} onChange={v => writeField('emissiveIntensity', v)} wide dataUiId="assetView.material.emissiveIntensity" />}
 
           {sectionHeader('Maps')}
           {/* Tiling — UV repeat applied to ALL maps (higher = smaller/more tiles).
@@ -208,27 +242,27 @@ export function MaterialAssetView({ path }: { path: string }) {
             const ry = Array.isArray(tr) ? Number(tr[1]) || 1 : typeof tr === 'number' ? tr : 1;
             return (
               <>
-                <NumberField label="Tiling X" value={rx} step={0.1} wide onChange={v => writeField('textureRepeat', [Math.max(0.01, v), ry])} />
-                <NumberField label="Tiling Y" value={ry} step={0.1} wide onChange={v => writeField('textureRepeat', [rx, Math.max(0.01, v)])} />
+                <NumberField label="Tiling X" value={rx} step={0.1} wide onChange={v => writeField('textureRepeat', [Math.max(0.01, v), ry])} dataUiId="assetView.material.textureRepeat.x" />
+                <NumberField label="Tiling Y" value={ry} step={0.1} wide onChange={v => writeField('textureRepeat', [rx, Math.max(0.01, v)])} dataUiId="assetView.material.textureRepeat.y" />
               </>
             );
           })()}
           {texField('texture', 'Base Color')}
           {texField('alphaTexture', 'Alpha')}
           {!isUnlit && texField('normalTexture', 'Normal')}
-          {!isUnlit && <NumberField label="Normal Scale" value={(data.normalScale as number) ?? 1} step={0.05} onChange={v => writeField('normalScale', v)} wide />}
+          {!isUnlit && <NumberField label="Normal Scale" value={(data.normalScale as number) ?? 1} step={0.05} onChange={v => writeField('normalScale', v)} wide dataUiId="assetView.material.normalScale" />}
           {!isUnlit && texField('bumpTexture', 'Bump')}
-          {!isUnlit && <NumberField label="Bump Scale" value={(data.bumpScale as number) ?? 1} step={0.05} onChange={v => writeField('bumpScale', v)} wide />}
+          {!isUnlit && <NumberField label="Bump Scale" value={(data.bumpScale as number) ?? 1} step={0.05} onChange={v => writeField('bumpScale', v)} wide dataUiId="assetView.material.bumpScale" />}
           {!isUnlit && texField('roughnessTexture', 'Roughness')}
           {!isUnlit && texField('metalnessTexture', 'Metalness')}
           {!isUnlit && texField('emissiveTexture', 'Emissive')}
           {!isUnlit && texField('aoTexture', 'Ambient Occlusion')}
-          {!isUnlit && <NumberField label="AO Intensity" value={(data.aoMapIntensity as number) ?? 1} step={0.05} onChange={v => writeField('aoMapIntensity', v)} wide />}
+          {!isUnlit && <NumberField label="AO Intensity" value={(data.aoMapIntensity as number) ?? 1} step={0.05} onChange={v => writeField('aoMapIntensity', v)} wide dataUiId="assetView.material.aoMapIntensity" />}
           {!isUnlit && texField('lightTexture', 'Light Map')}
-          {!isUnlit && <NumberField label="Light Intensity" value={(data.lightMapIntensity as number) ?? 1} step={0.05} onChange={v => writeField('lightMapIntensity', v)} wide />}
+          {!isUnlit && <NumberField label="Light Intensity" value={(data.lightMapIntensity as number) ?? 1} step={0.05} onChange={v => writeField('lightMapIntensity', v)} wide dataUiId="assetView.material.lightMapIntensity" />}
           {!isUnlit && texField('displacementTexture', 'Displacement')}
-          {!isUnlit && <NumberField label="Displacement Scale" value={(data.displacementScale as number) ?? 1} step={0.01} onChange={v => writeField('displacementScale', v)} wide />}
-          {!isUnlit && <NumberField label="Displacement Bias" value={(data.displacementBias as number) ?? 0} step={0.01} onChange={v => writeField('displacementBias', v)} wide />}
+          {!isUnlit && <NumberField label="Displacement Scale" value={(data.displacementScale as number) ?? 1} step={0.01} onChange={v => writeField('displacementScale', v)} wide dataUiId="assetView.material.displacementScale" />}
+          {!isUnlit && <NumberField label="Displacement Bias" value={(data.displacementBias as number) ?? 0} step={0.01} onChange={v => writeField('displacementBias', v)} wide dataUiId="assetView.material.displacementBias" />}
           {!isUnlit && texField('envTexture', 'Environment (equirect)')}
         </>
       )}
@@ -238,7 +272,7 @@ export function MaterialAssetView({ path }: { path: string }) {
         <>
           {schema && Object.keys(schema).length > 0 ? (
             Object.entries(schema).map(([key, param]) => (
-              <ParamField key={key} name={key} param={param} value={params[key]} onChange={v => writeParam(key, v)} />
+              <ParamField key={key} name={key} param={param} value={params[key]} onChange={v => writeParam(key, v)} idPrefix="assetView.material.param" />
             ))
           ) : schemaLoading ? (
             <div style={{ color: '#666', fontSize: '11px', padding: '4px 0' }}>Loading shader parameters...</div>
@@ -255,7 +289,7 @@ export function MaterialAssetView({ path }: { path: string }) {
                     <input data-ui-id={`assetView.material.param.${key}`} data-ui-kind="toggle" data-ui-label={key} data-ui-state={v ? 'checked' : 'unchecked'} type="checkbox" checked={v} onChange={e => writeParam(key, e.target.checked)} />
                   </div>
                 ) : typeof v === 'number' ? (
-                  <NumberField key={key} label={key} value={v} step={0.01} onChange={nv => writeParam(key, nv)} wide />
+                  <NumberField key={key} label={key} value={v} step={0.01} onChange={nv => writeParam(key, nv)} wide dataUiId={`assetView.material.param.${key}`} />
                 ) : null
               )}
             </>
@@ -268,7 +302,7 @@ export function MaterialAssetView({ path }: { path: string }) {
           1 = keep the material's true color (outline still drawn). A file
           shader with colorPreserve:'alpha' overrides preserve per-pixel. */}
       <ColorField label="Line Color" value={(data.lineColor as number) ?? 0} onChange={v => writeField('lineColor', v)} />
-      <NumberField label="Color Preserve" value={(data.nprColorPreserve as number) ?? 0} step={0.05} wide onChange={v => writeField('nprColorPreserve', clampNum(v, 0, 1))} />
+      <NumberField label="Color Preserve" value={(data.nprColorPreserve as number) ?? 0} step={0.05} wide onChange={v => writeField('nprColorPreserve', clampNum(v, 0, 1))} dataUiId="assetView.material.nprColorPreserve" />
     </>
   );
 }

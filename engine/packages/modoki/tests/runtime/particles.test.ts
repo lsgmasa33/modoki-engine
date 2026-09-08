@@ -5,9 +5,12 @@ import * as THREE from 'three';
 import { CpuParticleSim, type ParticleOutputs, type TrailOutputs } from '../../src/runtime/particles/cpuSimulator';
 import { sampleCurve, sampleGradientColor, sampleGradientAlpha } from '../../src/runtime/core/curves';
 import { composeParticleMatrices } from '../../src/runtime/particles/meshMatrices';
-import { defaultParticleEffect, spriteFrameIndex, clampSimDt, MAX_SIM_DT, seekSteps, SEEK_MAX_STEPS, PREWARM_STEP, MAX_GPU_FORCES, gpuDefSupported, type ParticleEffectDef, type ForceField } from '../../src/runtime/particles/types';
+import { defaultParticleEffect, spriteFrameIndex, clampSimDt, MAX_SIM_DT, seekSteps, SEEK_MAX_STEPS, PREWARM_STEP, MAX_GPU_FORCES, gpuDefSupported, resolveTrailSegments, resolveTiles, type ParticleEffectDef, type ForceField, type RenderConfig } from '../../src/runtime/particles/types';
 import { resolveCollider, collide, type CollisionHit } from '../../src/runtime/particles/colliders';
 import { resolveShape, perpBasis } from '../../src/runtime/particles/emitterShapes';
+import { createTrail } from '../../src/runtime/particles/trailLines';
+
+const render = (over: Partial<RenderConfig> = {}): RenderConfig => ({ blend: 'normal', ...over }) as RenderConfig;
 
 function makeOutputs(max: number): ParticleOutputs {
   return {
@@ -739,6 +742,42 @@ describe('CpuParticleSim — sprite playback in render output', () => {
     for (let j = 0; j < sim.aliveCount; j++) distinct.add(out.frames[j]);
     expect(distinct.size).toBeGreaterThan(1); // not all locked to frame 0
   });
+
+  // #693: a fractional tilesX/tilesY (never floored by hand-built defs — the loader's
+  // normalizeParticleDef floors on the load path, but a def built directly like this one
+  // does not go through it) used to make the simulator compute a fractional tileCount and
+  // emit a non-integer/out-of-range frame index that no consumer's integer grid could show.
+  it('fractional tilesX still emits an integer frame inside the flat consumer grid', () => {
+    const { sim, out } = simWith({
+      maxParticles: 50,
+      emission: { rateOverTime: 500 },
+      render: { blend: 'additive', tilesX: 2.5, tilesY: 1, spriteMode: 'loop', spriteCycles: 1 },
+    });
+    const expectedTiles = resolveTiles(2.5) * resolveTiles(1); // = 2, the grid every consumer builds
+    for (let i = 0; i < 20; i++) {
+      sim.step(0.05); // advance t across several sheet cycles
+      for (let j = 0; j < sim.aliveCount; j++) {
+        expect(Number.isInteger(out.frames[j])).toBe(true);
+        expect(out.frames[j]).toBeGreaterThanOrEqual(0);
+        expect(out.frames[j]).toBeLessThan(expectedTiles);
+      }
+    }
+  });
+});
+
+describe('resolveTiles', () => {
+  it('floors a fractional tile count, matching what the flat/billboard/GPU consumers build', () => {
+    expect(resolveTiles(2.5)).toBe(2);
+  });
+
+  it('defaults to 1 tile when unset', () => {
+    expect(resolveTiles(undefined)).toBe(1);
+  });
+
+  it('clamps zero and negative counts up to 1', () => {
+    expect(resolveTiles(0)).toBe(1);
+    expect(resolveTiles(-3)).toBe(1);
+  });
 });
 
 describe('mesh particles — composeParticleMatrices', () => {
@@ -896,6 +935,58 @@ describe('particle trails', () => {
     for (let k = 0; k < sim.aliveCount * (SEG - 1) * 2 * 3; k++) {
       expect(Number.isFinite(trail.positions[k])).toBe(true);
     }
+  });
+
+  it('#693: a fractional trail.segments (e.g. 8.5) still seeds EVERY particle — including an ODD index', () => {
+    // Regression for #693: cpuSimulator used to build `trailSeg` from the raw (possibly
+    // fractional) authored value while trailLines.ts floored it, so `base = i * trailSeg * 3`
+    // landed on a non-integer index for odd `i` — a write TypedArrays silently DROP.
+    const seg = resolveTrailSegments(8.5); // == 8, the value BOTH producer and consumer must use
+    const def = {
+      ...defaultParticleEffect(),
+      maxParticles: 20,
+      // A box spawn (not 'point') gives each particle a distinct, non-zero spawn offset, so a
+      // dropped write (which leaves the typed array's default 0) is distinguishable from a
+      // correct one.
+      shape: { type: 'box' as const, size: [5, 5, 5] as [number, number, number] },
+      startSpeed: { min: 0, max: 0 },
+      startLifetime: { min: 100, max: 100 },
+      gravity: 0,
+      emission: { rateOverTime: 0, bursts: [{ time: 0, count: 5 }] },
+      trail: { enabled: true, segments: 8.5 },
+    } as ParticleEffectDef;
+    const out = makeOutputs(def.maxParticles);
+    const vPer = (seg - 1) * 2;
+    const trail: TrailOutputs = {
+      positions: new Float32Array(def.maxParticles * vPer * 3),
+      colors: new Float32Array(def.maxParticles * vPer * 3),
+    };
+    const sim = new CpuParticleSim(def, out, 42, trail);
+    sim.step(0.016); // fires the t=0 burst and seeds trail history at each particle's spawn point
+    expect(sim.aliveCount).toBe(5);
+
+    const hist = (sim as unknown as { trailHist: Float32Array }).trailHist;
+    let sawNonZero = false;
+    for (let i = 0; i < sim.aliveCount; i++) {
+      const base = i * seg * 3;
+      const ox = out.offsets[i * 3], oy = out.offsets[i * 3 + 1], oz = out.offsets[i * 3 + 2];
+      if (ox !== 0 || oy !== 0 || oz !== 0) sawNonZero = true;
+      expect(hist[base]).toBeCloseTo(ox, 5);
+      expect(hist[base + 1]).toBeCloseTo(oy, 5);
+      expect(hist[base + 2]).toBeCloseTo(oz, 5);
+    }
+    expect(sawNonZero).toBe(true); // guards against a degenerate all-zero spawn making the check vacuous
+  });
+
+  it('resolveTrailSegments and createTrail both derive 8 from an authored 8.5 (#693)', () => {
+    // ⚠️ The expected values here are HARDCODED on purpose. This test used to compute the stride
+    // from `resolveTrailSegments` and compare it to `createTrail`'s — but `createTrail` now CALLS
+    // `resolveTrailSegments`, so that compared the function to itself and passed both before and
+    // after the fix. Pinning the literal 8 is what makes the producer/consumer contract falsifiable:
+    // change the helper's rounding and this goes red.
+    expect(resolveTrailSegments(8.5)).toBe(8);
+    const lineTrail = createTrail(4, 8.5, render({ blend: 'normal' }));
+    expect(lineTrail.outputs.positions.length).toBe(4 * ((8 - 1) * 2) * 3); // maxParticles * vPer * 3
   });
 });
 

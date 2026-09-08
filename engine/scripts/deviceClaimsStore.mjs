@@ -84,6 +84,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// The ONE 'same directory?' comparison (#869).
+import { canonicalPath, samePath } from './pathIdentity.mjs';
 
 /** Where the claims live: beside `editor-launches.log`, machine-wide by design (see the header).
  *
@@ -257,7 +259,19 @@ function withLock(fn) {
     try {
       fs.mkdirSync(lock);
       break;
-    } catch {
+    } catch (e) {
+      // ONLY EEXIST means "another process holds the lock" — the contention this loop exists to
+      // wait out. Any other errno (EACCES/EROFS/ENOSPC) is a REAL failure, not contention:
+      // `fs.statSync(lock)` right below would then throw ENOENT (the lock dir was never created),
+      // its own catch would `continue`, and the loop would retry the identical failing `mkdirSync`
+      // forever — an unbounded synchronous spin that skips the deadline check entirely (same shape
+      // as `buildClaimsStore.mjs`'s own fix, which this mirrors). Fail loud instead, naming the
+      // path and the errno. Does NOT change the "give up and proceed unlocked" behaviour below for
+      // genuine EEXIST contention past the deadline — that divergence from buildClaimsStore.mjs is
+      // deliberate and untouched (see this function's own header).
+      if (e?.code !== 'EEXIST') {
+        throw new Error(`Could not create the device-claims lock directory (${lock}): ${e?.code ?? ''} ${e?.message ?? e}`.trim(), { cause: e });
+      }
       let age;
       try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; /* vanished — retry */ }
       if (age > LOCK_STALE_MS) { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ } continue; }
@@ -295,12 +309,19 @@ export function listClaims(opts = {}) {
  *      all legitimately re-claim within one session).
  *   2. `req.owner && existing.owner === req.owner` — the CLI reclaiming or refreshing its OWN
  *      claim by token, since a CLI invocation has no stable pid to match on (see `pid: 0` below).
- *   3. `existing.owner && existing.clone === (req.clone ?? process.cwd())` — this clone's EDITOR
+ *   3. `existing.owner && sameClone(existing.clone, req.clone ?? process.cwd())` — this clone's EDITOR
  *      taking over a claim its own CLI left behind, so a CLI claim followed by an MCP claim inside
  *      the SAME checkout does not self-deadlock. This matches on the clone ONLY for a claim that
  *      HAS an owner — i.e. only ever a CLI claim — so it loosens nothing for a pid-claim: two
  *      editors in one clone (`MODOKI_MULTI=1`) still refuse each other exactly as before, because
- *      neither of their claims carries an `owner`. */
+ *      neither of their claims carries an `owner`.
+ *
+ *  ⚠️ Case 3 compared with a raw `===` until the #865 close-out. That is the same "is this claim
+ *  mine?" question the other four sites ask, and it was missed by the sweep that fixed them —
+ *  so the self-deadlock this case exists to prevent was still reachable through any two
+ *  spellings of one directory: `device.mjs` writes a realpath'd `clone`, while the editor calls
+ *  `claimDevice` with no `clone` and takes `process.cwd()`, which differs under a junction, a
+ *  `subst`ed drive or a lower-case drive letter. */
 /** ⚠️ `req.clone` is TRUSTED by case 3 below, which hands a CLI-owned claim to any request whose
  *  clone matches. Every caller today supplies it from a trustworthy source (`device.mjs`'s resolved
  *  repo root, or the default `process.cwd()`), so no steal is reachable — but the moment a caller
@@ -309,7 +330,13 @@ export function listClaims(opts = {}) {
 function isSameHolder(existing, req) {
   if (!existing.owner && existing.pid === process.pid) return true;
   if (req.owner && existing.owner === req.owner) return true;
-  if (existing.owner && existing.clone === (req.clone ?? process.cwd())) return true;
+  // (#865 close-out) `sameClone`, not `===`. This is the FIFTH comparison answering "is this
+  // claim mine?", and the original sweep missed it — the commit that fixed the other four
+  // said "four copies". A raw `===` here self-deadlocks in exactly the way this docblock says
+  // it must not: `device.mjs` writes a realpathed `clone`, the editor calls `claimDevice` with
+  // no `clone` at all (so `process.cwd()`), and through a junction or a lower-case drive letter
+  // those are two spellings of one directory — the editor is then refused its own CLI claim.
+  if (existing.owner && sameClone(existing.clone, req.clone ?? process.cwd())) return true;
   return false;
 }
 
@@ -472,6 +499,82 @@ function installExitHook() {
   });
 }
 
+/** Is `p` rooted so that `path.resolve` can finish WITHOUT consulting `process.cwd()`? (#865)
+ *
+ *  Moved here from `buildClaimsStore.mjs` (#849 wrote it there) because this is the base module and
+ *  there are now five comparisons that need it. `buildClaimsStore` imports it back.
+ *
+ *  ⚠️ The UNC arm requires `//server/share`, not merely two leading separators, and that is the
+ *  whole of its correctness. `[\\/]{2}` alone admits `//`, `///`, `//a` and `///a/b`, none of
+ *  which are UNC: win32 `path.resolve` treats them as drive-relative and roots them on the CWD's
+ *  drive. Every value the server/share arm admits resolves identically from any cwd, and every
+ *  legitimate form is still admitted — `E:\x`, `E:/x`, `//server/share`, `\\server\share\x`, and
+ *  `\\?\C:\x` long paths. */
+export function isFullyQualified(p) {
+  if (typeof p !== 'string') return false;
+  return process.platform === 'win32'
+    ? /^([A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/])/.test(p)
+    : p.startsWith('/');
+}
+
+/** A clone path in the ONE spelling every claim comparison uses: realpath'd, `resolve` as fallback.
+ *
+ *  ⚠️ The realpath is load-bearing, not tidiness (#865). `device.mjs` records `clone: repoRoot` and
+ *  `findRepoRoot` realpaths it, so a comparison that only `resolve`s the OTHER side spells the same
+ *  directory two ways on any symlinked — or `subst`ed — checkout, and this clone is then refused its
+ *  OWN phone. `claim-guard.mjs` already documented that reasoning and did the realpath; the two
+ *  functions below did not, and `vite-asset-scanner.ts` calls them with no `clone` at all, so the
+ *  build path compared a bare `process.cwd()`. Falls back to `resolve` when the path does not
+ *  exist, because a refusal must never depend on a stat. */
+export function canonicalClonePath(p) {
+  // ⚠️ Now a thin alias for the SHARED canonicaliser (#869) — same behaviour, one implementation.
+  // The residue #865 left was never HERE: it was in `sameClone`, which compared these with `===`,
+  // so the drive-letter hole survived for a path that does not EXIST (`.native` throws there and
+  // this falls back to bare `resolve`). A stale `~/.modoki/device-claims.json` entry is precisely
+  // a non-existent path — the case this family is most often asked about. `samePath` case-folds
+  // at the COMPARISON, which is what closes it; this still returns the on-disk spelling, because
+  // callers put it in refusal messages a human reads.
+  //
+  // (#892) `samePath` now does more than fold there: it canonicalises in the longest EXISTING
+  // ancestor and re-appends the missing tail, so a stale claim written through a symlinked or
+  // `subst`ed checkout matches too. ⚠️ An earlier version of this comment added "and that changes
+  // nothing for `sameClone` below, because a new equality needs BOTH sides absent" — which is
+  // FALSE on a case-sensitive volume, where the fold can collide an existing path with a missing
+  // one reached through a symlink. See `pathIdentity.mjs`'s `CASE_INSENSITIVE` note: a widening of
+  // an accepted hazard, not a new one, but `sameClone` IS reachable by it.
+  //
+  // None of that changes why this alias exists: it must NOT be "simplified" into the comparison,
+  // because the two answer different questions — a spelling to show a human, versus a verdict.
+  //
+  // Retained as a named export rather than deleted: it is the vocabulary the claim family reads
+  // in ("a clone path in the ONE spelling"), and `sameClone` below is asymmetric in a way a bare
+  // `samePath` is not.
+  return canonicalPath(p);
+}
+
+/** Does STORED name the same clone as OWN? The one comparison behind every claim check. (#865)
+ *
+ *  Asymmetric on purpose: `own` is derived by this process (a cwd or a repo root) and is trusted;
+ *  `stored` came off disk and is not. An unqualified `stored` matches NOTHING rather than matching
+ *  the wrong thing — on win32 `path.isAbsolute('/Projects/modoki')` is `true` and `path.resolve`
+ *  re-roots it onto the cwd's drive, so `"."`, `""` and another platform's `/Projects/...` all
+ *  silently became "this clone" and the caller read someone else's claim as its own.
+ *
+ *  ⚠️ **Refusing is the chosen polarity** (owner, 2026-09-07). Every caller reads a false `true` as
+ *  "that claim is mine, go ahead", so an unrecognisable stored path now means "someone else's" and
+ *  the gate stops. The cost is accepted: a corrupt `~/.modoki/device-claims.json` can block this
+ *  clone's own builds until it is deleted by hand — self-evident, and one `rm` away — whereas the
+ *  fail-open direction silently drives a phone a sibling clone is holding.
+ *
+ *  ⚠️ That caveat used to read "Drive-letter CASE is still not normalised (`e:\x` !== `E:\x`)".
+ *  It is retired (#869): the comparison now case-folds, including for a path that does not
+ *  exist — which was the half #865 left open, because `.native` throws there and the fallback
+ *  was a bare `resolve`. A stale claim entry is exactly a non-existent path. */
+export function sameClone(stored, own) {
+  if (!isFullyQualified(stored)) return false;
+  return samePath(stored, own);
+}
+
 /** The refusal text. Names the clone, the branch, when, and the pid — every one of which is a
  *  different way for the human to find the session that is holding their phone.
  *
@@ -510,17 +613,20 @@ export function describeConflict(held, now = Date.now()) {
  *  other reader (#225: a dead-pid record holds nothing, and treating one as live would refuse a
  *  build against the developer's OWN unclaimed phone for no reason).
  *
- *  "Different clone" compares RESOLVED paths, not raw strings — the same comparison
- *  `heldByThisClone` (`claim-guard.mjs`) and the WiFi-claim filter (`device.mjs`) already make, so a
- *  trailing slash cannot make this clone look like a stranger and refuse its own phone.
+ *  "Different clone" is `sameClone` (#865) — the ONE comparison, now genuinely shared with
+ *  `heldByThisClone` (`claim-guard.mjs`), the WiFi-claim filter (`device.mjs`) and `ownAdbClaim`.
+ *  It was NOT shared when this comment first claimed it was: those were four hand-rolled copies
+ *  that had drifted into three different normalisations, and none of them gated on qualification.
+ *  A trailing slash still cannot make this clone look like a stranger; an unqualified stored path
+ *  now matches nothing rather than resolving onto this cwd and reading as MINE.
  *
  *  Returns the live `DeviceClaim` when the holder is foreign, else `null` — never throws, so a
  *  caller can drop it straight into a boolean/error branch without its own try/catch. */
 export function foreignClaimFor(deviceId, opts = {}) {
-  const clone = path.resolve(opts.clone ?? process.cwd());
+  const clone = canonicalClonePath(opts.clone ?? process.cwd());
   const held = listClaims(opts).find((c) => c.deviceId === deviceId);
   if (!held) return null;
-  return path.resolve(held.clone) === clone ? null : held;
+  return sameClone(held.clone, clone) ? null : held;
 }
 
 /** (#235 cross-process) The adb serial THIS clone currently holds a claim on, or `null`.
@@ -551,10 +657,27 @@ export function foreignClaimFor(deviceId, opts = {}) {
  *  Applied as a PREFERENCE by the caller, never a pin: `resolveBuildAndroidSerial` drops a claimed
  *  serial that is no longer attached, because a claim outlives a cable. */
 export function ownAdbClaim(opts = {}) {
-  const clone = path.resolve(opts.clone ?? process.cwd());
-  const mine = listClaims(opts).filter(
-    (c) => adbSerialOf(c.deviceId) !== undefined && path.resolve(c.clone) === clone,
-  );
+  const clone = canonicalClonePath(opts.clone ?? process.cwd());
+  const adb = listClaims(opts).filter((c) => adbSerialOf(c.deviceId) !== undefined);
+  // (#865) Ambiguity is decided BEFORE the clone filter, never after it. An unqualified stored
+  // `clone` matches nothing (`sameClone`), so filtering first would DROP the ambiguous record and
+  // turn "two candidates, refuse and name both" into a confident single pick — the #149 contract
+  // switched off by the very gate meant to harden it. If anything here is unrecognisable this
+  // function cannot answer, and not answering is what its own header already promises.
+  const unqualified = adb.filter((c) => !isFullyQualified(c.clone));
+  if (unqualified.length) {
+    // Without this warning the degradation is SILENT: the caller (`resolveBuildAndroidSerial`)
+    // never mentions the claims file, so the developer sees an ordinary "name a device"
+    // ambiguity refusal with no hint that one junk record is what removed the answer.
+    console.warn(
+      `[device-claims] ignoring this clone's adb claims: ${unqualified.length} record(s) in `
+      + `${claimsFile()} have a clone path that is not fully qualified `
+      + `(${unqualified.map((c) => `${c.deviceId} -> ${JSON.stringify(c.clone)}`).join(', ')}). `
+      + `Refusing to guess which phone this clone holds — fix or delete that file.`,
+    );
+    return null;
+  }
+  const mine = adb.filter((c) => sameClone(c.clone, clone));
   return mine.length === 1 ? mine[0] : null;
 }
 

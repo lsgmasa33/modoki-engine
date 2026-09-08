@@ -9,7 +9,7 @@
  *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
@@ -18,6 +18,9 @@ import { useHmrEpoch } from '../input/hmrEpoch';
 import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
   defaultAnimationClip, normalizeAnimationClip,
@@ -47,11 +50,13 @@ import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
 import {
   beginTimelinePreviewSession, hasTimelinePreviewSession,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
+import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
+import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 
 const COALESCE_MS = 500;
 const TRACK_LIST_MIN_W = 140;
@@ -88,11 +93,50 @@ export default function AnimationEditor() {
   const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingAnimationAsset);
   const nonce = useEditorStore((s) => s.animationEditNonce);
+  /** 'failed' = the file exists but could NOT be read (corrupt/truncated/conflict-markered JSON, a
+   *  dev-server 500, a network rejection). The load effect then leaves `editingAnimationClip`
+   *  null, and every editing surface below is gated on `clip`, so editing is disabled by
+   *  construction — the same shape ParticleEditor/AtlasAssetView use. A genuinely MISSING file is
+   *  NOT this: defaults are the correct content there (#896, and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingAnimationAsset');
+  }, []);
   const clip = useEditorStore((s) => s.editingAnimationClip);
   const rootId = useEditorStore((s) => s.animatorRootEntityId);
   const playhead = useEditorStore((s) => s.playheadTime);
   const recording = useEditorStore((s) => s.isRecording);
   const playing = useEditorStore((s) => s.isPreviewPlaying);
+  // See TimelineEditor's twin of this: one shared flag, two panels, so the preview runs only
+  // in the panel whose ▶ started it. null = unclaimed, keep the old any-panel behaviour.
+  const previewOwner = useEditorStore((s) => s.previewOwner);
   const selectedEntityId = useEditorStore((s) => s.selectedEntityId);
 
   // While recording, warn up-front if the selected entity isn't under this clip's
@@ -277,6 +321,8 @@ export default function AnimationEditor() {
     setSel(new Set());
     setSelectedTracks(new Set());
     setViewport(DEFAULT_VIEWPORT);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingAnimationClip;
@@ -287,7 +333,19 @@ export default function AnimationEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'animation')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'animation');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadAnimationClip } = useEditorStore.getState();
@@ -306,13 +364,16 @@ export default function AnimationEditor() {
       registerAsset(doc.id, asset.path, 'animation');
       adoptParkedDoc(asset.path, 'animation', doc);
       loadAnimationClip(doc);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeAnimationClip(json);
+        const loaded = normalizeAnimationClip(json as Partial<AnimationClipDef>);
         // The saved-baseline is the doc WITH the minted id, never an id-less twin: that trick
         // existed to make the autosave notice the new id and write it, and with the autosave gone
         // it would park a write merely for OPENING a legacy clip. The asset scanner already heals
@@ -322,7 +383,27 @@ export default function AnimationEditor() {
         savedMarkRef.current?.(loaded);
         loadAnimationClip(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[AnimationEditor] load failed, using default', e); const fb = defaultAnimationClip(newGuid(), asset.name); savedMarkRef.current?.(fb); loadAnimationClip(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896: this used to substitute `defaultAnimationClip(newGuid(), …)` on ANY failure and
+        // mark it as the SAVED baseline. The first edit then parked a full-replace write of that
+        // fabricated clip over the authored file — and because the fabrication carries a FRESH
+        // guid, `/api/asset-write`'s id-preservation branch (`!out.id && prevDoc?.id`) never fired:
+        // the file was replaced by a document wearing a DIFFERENT id, which the scanner's heal pass
+        // cannot flag because the document looks complete. Every scene/Animator reference to the
+        // old guid dangled, silently. A genuinely MISSING file is the one case where defaults ARE
+        // correct (a brand-new clip, or a stale ref) — that distinction is the whole verdict.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[AnimationEditor] load failed (asset missing), using default', e);
+          const fb = defaultAnimationClip(newGuid(), asset.name);
+          savedMarkRef.current?.(fb);
+          loadAnimationClip(fb);
+          return;
+        }
+        console.error(`[AnimationEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);
@@ -460,19 +541,46 @@ export default function AnimationEditor() {
     return () => clearPreviewSaveHandler(mine);
   }, [inPreview]);
 
+  // The CURRENT preview effect run's guard, or null while not previewing (#810 follow-up). Lets
+  // `registerModeOwnerDisplaced`'s callback — which fires OUTSIDE this effect's closure — stop
+  // THIS run's tick without touching the shared `isPreviewPlaying` flag. See previewLoopGuard.ts.
+  const previewLoopGuardRef = useRef<PreviewLoopGuard | null>(null);
+
+  // ── Displacement (#810): the Timeline panel taking the mode (▶ preview / a ruler scrub) ends
+  // OUR preview GLOBALLY — `RunMode` is single-valued — but nothing else tells this panel's rAF
+  // loop (just below, keyed `[playing, pose]`) to stop, and its tick body never consults
+  // `getRunMode()` either.
+  //
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Timeline panel
+  // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
+  // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
+  // itself: this panel enters first (no notify yet, nothing owned the mode), Timeline's async
+  // session-open resolves a microtask later and takes the mode, displacing us — and the first
+  // #810 pass's callback then killed the flag Timeline's own just-started preview was keyed on.
+  // Confirmed live in `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS
+  // run's guard is what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole
+  // lifetime, not gated on `playing` — a displacement can arrive between preview sessions just as
+  // easily as during one, and the callback is a no-op when no guard is live.
+  useEffect(() => registerModeOwnerDisplaced('animation', () => {
+    previewLoopGuardRef.current?.stop();
+  }), []);
+
   // ── Preview playback loop ──
   // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,
   // so it opens the same session and carries the `preview` run-mode. Without the run-mode a save
   // DURING playback passed the guard and baked whatever frame was on screen.
   useEffect(() => {
     if (!playing) return;
+    if (!panelDrivesPreview(playing, previewOwner, 'animation')) return; // the Timeline panel's ▶, not ours
     enterPreviewMode(true, 'animation');
     setInPreview(true);
     void beginTimelinePreviewSession(); // idempotent — a scrub before ▶ already holds the snapshot
-    let raf = 0;
+    const guard = createPreviewLoopGuard();
+    previewLoopGuardRef.current = guard;
     let last = performance.now();
     const tick = () => {
-      raf = requestAnimationFrame(tick);
+      if (guard.stopped) return; // displaced — do not reschedule (checked BEFORE scheduling)
+      guard.arm(requestAnimationFrame(tick));
       const now = performance.now();
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
@@ -482,9 +590,10 @@ export default function AnimationEditor() {
       useEditorStore.getState().setPlayhead(t);
       pose(cur, t);
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [playing, pose]);
+    guard.arm(requestAnimationFrame(tick));
+    // Release the ref only if it is still OURS — see the same note in TimelineEditor's cleanup.
+    return () => { guard.stop(); if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null; };
+  }, [playing, previewOwner, pose]);
 
   // Panel gone → revert the previewed pose and return the global run-mode to stopped (drops a
   // scrub this panel left set). Empty deps → runs only on real unmount. No-op during Play, and
@@ -546,7 +655,9 @@ export default function AnimationEditor() {
   useEffect(() => () => {
     const s = useEditorStore.getState();
     if (s.isRecording) s.setRecording(false);
-    if (s.isPreviewPlaying) s.setPreviewPlaying(false);
+    // Only if the preview is OURS (or unclaimed) — the flag is shared with the Timeline panel, so
+    // an unguarded clear stops ITS playback when this tab is closed. See `panelMayStopPreview`.
+    if (s.isPreviewPlaying && panelMayStopPreview(s.previewOwner, 'animation')) s.setPreviewPlaying(false);
   }, []);
 
   // ── Add Property (one or many) ──
@@ -882,7 +993,7 @@ export default function AnimationEditor() {
       register({ id: 'anim.valDownFine', keys: 'alt+ArrowDown', scope: S, when: hasKeys, run: () => nudgeValueSelected(-0.1) }),
       register({
         id: 'anim.togglePreview', keys: 'Space', scope: S, when: hasClip,
-        run: () => { const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying); },
+        run: () => { const s = useEditorStore.getState(); s.setPreviewPlaying(!s.isPreviewPlaying, 'animation'); },
       }),
       register({ id: 'anim.addKeyAll', keys: 'k', scope: S, when: hasClip, run: addKeyAll }),
       register({ id: 'anim.breakTangents', keys: 'b', scope: S, when: hasKeys, run: toggleBreakSelected }),
@@ -961,7 +1072,7 @@ export default function AnimationEditor() {
     if (!path) return;
     const guid = newGuid();
     const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(defaultAnimationClip(guid, name), null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(defaultAnimationClip(guid, name)));
     // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
     // is authoritative — drop any parked write for that path.
     if (ok) assetWrittenToDisk(path);
@@ -1001,13 +1112,30 @@ export default function AnimationEditor() {
 
   return (
     <div ref={rootRef} style={wrap}>
+      {loadState === 'failed' && (
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="animation.loadBanner"
+          onRetry={retryLoad}
+        />
+      )}
+      {/* #902: this load opened on an unsaved edit, not on the file. */}
+      {parkAdopted && (
+        <ParkAdoptedBanner
+          path={asset.path}
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="animation.parkAdopted"
+          onReload={retryLoad}
+          onKeep={() => setParkAdopted(false)}
+        />
+      )}
       {clip && (
         <AnimationToolbar
           clipName={clip.name} onRename={rename}
           frameRate={clip.frameRate} onSetFrameRate={setFrameRate}
           duration={clip.duration} onSetDuration={setDuration}
           loop={clip.loop} onToggleLoop={toggleLoop}
-          playing={playing} onTogglePlay={() => useEditorStore.getState().setPreviewPlaying(!playing)}
+          playing={playing} onTogglePlay={() => useEditorStore.getState().setPreviewPlaying(!playing, 'animation')}
           onStop={() => scrub(0)}
           recording={recording} onToggleRecord={() => useEditorStore.getState().setRecording(!recording)}
           playhead={playhead} onScrub={scrub}

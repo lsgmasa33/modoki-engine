@@ -19,13 +19,13 @@
  *  `engine/tests/plugins/buildStepShell.test.ts`, which spawns real processes. This guard
  *  only pins the CALL SITES to it. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const scannerPath = path.resolve(__dirname, '../../plugins/vite-asset-scanner.ts');
 
 describe('build children are killed as a process group (#176)', () => {
-  const src = fs.readFileSync(scannerPath, 'utf8');
+  const src = readScannedSource(scannerPath).code;
 
   it('no abort path signals the spawned pid directly', () => {
     // Matches `activeProc.kill(`, `activeProc?.kill(`, `proc.kill(` — the pre-#176 form.

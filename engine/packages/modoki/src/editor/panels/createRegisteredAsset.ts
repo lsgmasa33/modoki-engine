@@ -16,7 +16,7 @@
 import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { writeAssetFile } from './assetOps';
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, jsonFileBody } from '../backend/editorBackend';
 
 /** Strip the def's extension off a path to get the display name (mirrors `assetDisplayName`). */
 function displayName(path: string, ext: string): string {
@@ -112,7 +112,7 @@ export async function createRegisteredAsset(kind: string, path: string): Promise
   // against it would recreate the same mismatch from the other side.
   const registeredGuid = docId ?? guid;
 
-  const ok = await writeAssetFile(full, JSON.stringify(body, null, 2));
+  const ok = await writeAssetFile(full, jsonFileBody(body));
   if (!ok) {
     // A failed write that registered the guid anyway would leave the manifest pointing at a file
     // that is not there — resolvable, and dangling.

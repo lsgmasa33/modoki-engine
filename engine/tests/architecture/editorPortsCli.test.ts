@@ -20,8 +20,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   backendPortForClone,
   vitePortForBackend,
@@ -185,7 +185,7 @@ describe.skipIf(skip)('editorPorts.mjs CLI — the bash seam (#349)', () => {
 
     for (const { rel, varName, rootVar } of SCRIPTS) {
       it(`${rel} assigns a BARE port`, () => {
-        const src = readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+        const src = readScannedSource(path.join(REPO_ROOT, rel)).code;
         const line = src
           .split('\n')
           .find((l) => l.includes('editorPorts.mjs') && l.trimStart().startsWith(`${varName}=`));

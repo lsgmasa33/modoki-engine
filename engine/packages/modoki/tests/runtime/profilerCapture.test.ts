@@ -139,8 +139,8 @@ describe('profilerCapture — export', () => {
     startCapture();
     frame(5); frame(7);
     const exported = exportCapture();
-    expect(exported.version).toBe(1);
     expect(exported.frameCount).toBe(2);
+    expect('version' in exported).toBe(false);
     // Plain JSON on purpose — diffable, attachable to an issue, and readable by an agent, which
     // Unity's binary captures are not.
     const round = JSON.parse(JSON.stringify(exported));

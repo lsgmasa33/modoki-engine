@@ -28,6 +28,7 @@ import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseFontFilename } from '../packages/modoki/src/runtime/loaders/fontNaming.ts';
+import { repoFiles } from './repoCorpus.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -36,22 +37,23 @@ const WRITE = process.argv.includes('--write');
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGuid = (s) => typeof s === 'string' && GUID_RE.test(s);
 
-async function walkFiles(dir, pred, out = []) {
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      if (['node_modules', 'dist', '.cache', 'ios', 'android', 'ads'].includes(e.name)) continue;
-      await walkFiles(p, pred, out);
-    } else if (pred(p)) out.push(p);
-  }
-  return out;
+/** Every file under `<projectRel>` (a repo-relative POSIX path, e.g. `games/sling`) whose
+ *  git-relative path satisfies `match` — git-backed enumeration (#771/#799) replaces the
+ *  hand-rolled recursive walker. `ios`/`android` are excluded explicitly because they are TRACKED
+ *  native mirrors; `node_modules`/`dist`/`.cache`/`ads` need no entry at all, since every one of
+ *  them is gitignored and is therefore absent from the corpus for free. */
+function projectFiles(projectRel, match) {
+  return repoFiles({
+    under: projectRel,
+    match,
+    exclude: ['ios', 'android'],
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** family name (as the runtime derives it) → font asset GUID, from the `.meta.json` sidecars. */
-async function buildFamilyIndex(projectDir) {
-  const metas = await walkFiles(projectDir, (p) => /\.(ttf|otf|woff2?)\.meta\.json$/i.test(p));
+async function buildFamilyIndex(projectRel) {
+  const metas = projectFiles(projectRel, (rel) => /\.(ttf|otf|woff2?)\.meta\.json$/i.test(rel));
   const index = new Map();
   for (const meta of metas) {
     let json;
@@ -72,9 +74,9 @@ const unmatched = new Map();   // family → [file, …]
 for (const rootDir of ['games', 'demos']) {
   const projects = await readdir(join(ROOT, rootDir), { withFileTypes: true }).catch(() => []);
   for (const proj of projects.filter((d) => d.isDirectory())) {
-    const projectDir = join(ROOT, rootDir, proj.name);
-    const index = await buildFamilyIndex(projectDir);
-    const files = await walkFiles(projectDir, (p) => /\.(scene|prefab)\.json$/i.test(p));
+    const projectRel = `${rootDir}/${proj.name}`;
+    const index = await buildFamilyIndex(projectRel);
+    const files = projectFiles(projectRel, (rel) => /\.(scene|prefab)\.json$/i.test(rel));
 
     for (const file of files) {
       let json;

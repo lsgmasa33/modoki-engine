@@ -21,11 +21,16 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 /** Field names declared directly in `interface <name> { … }`, ignoring nested object literals
  *  (the `postFX` block declares its own inner keys, which are not tier fields). */
 function interfaceFields(file: string, name: string): string[] {
-  const src = fs.readFileSync(file, 'utf8');
+  const raw = fs.readFileSync(file, 'utf8');
+  // Comments stripped first (shared scanner, @modoki/engine/testing, #419) — only then is it
+  // safe to flatten nested `{...}` blocks down to top-level members.
+  const src = stripComments(raw);
+  assertScanIsSane(raw, src, file);
   const start = src.indexOf(`interface ${name} {`);
   expect(start, `${name} not found in ${file} — did it get renamed?`).toBeGreaterThan(-1);
   let depth = 0, i = src.indexOf('{', start), end = -1;
@@ -35,8 +40,8 @@ function interfaceFields(file: string, name: string): string[] {
   }
   expect(end, `unbalanced braces reading ${name}`).toBeGreaterThan(-1);
   const body = src.slice(src.indexOf('{', start) + 1, end);
-  // Strip nested blocks and comments so only top-level members remain.
-  const flat = body.replace(/\{[^{}]*\}/g, '{}').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+  // Strip nested blocks so only top-level members remain.
+  const flat = body.replace(/\{[^{}]*\}/g, '{}');
   return [...flat.matchAll(/^\s*(\w+)\s*[?:]/gm)].map((m) => m[1]).sort();
 }
 

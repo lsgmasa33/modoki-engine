@@ -806,6 +806,10 @@ function ToastNotice() {
       position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 10000,
       background: tint.bg, border: `1px solid ${tint.border}`, color: tint.fg,
       padding: '8px 16px', borderRadius: 6, fontFamily: 'monospace', fontSize: 12,
+      // pointerEvents MUST stay 'none': document.elementFromPoint ignores pointer-events:none,
+      // so 'auto' would make this an occluder for its whole 3500ms no-click-to-dismiss life —
+      // and a covered aim is a REFUSAL, blocking recovery from the very error the toast reports.
+      // Selectable error text needs hover-to-persist or a copy button, not this flip (#627).
       maxWidth: '70vw', boxShadow: '0 4px 16px rgba(0,0,0,0.4)', pointerEvents: 'none',
     }}>
       {toast.message}

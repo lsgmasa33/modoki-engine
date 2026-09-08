@@ -184,3 +184,57 @@ function defaultReply(req: StubRequest): StubReply | undefined {
 export function realRequests(s: Surface): StubRequest[] {
   return s.requests.filter((r) => r.path !== '/api/identity');
 }
+
+/** Recursively sums every `description` string and every PROPERTY name in a JSON-Schema-shaped
+ *  object. Extracted from `mcpRegistry.test.ts`'s definition-surface ledger (#456) so the walk
+ *  itself can be unit-tested directly — the ledger only ever drives it against the real 105-tool
+ *  surface, where a scan found `tuples:0, oneOf:0, not:0, patternProperties:0, $defs:0`: every
+ *  array-valued/`oneOf`/`not`/`patternProperties` branch below is currently DEAD CODE against real
+ *  traffic, so the ledger passing green proves nothing about whether those branches are correct.
+ *  See `mcpRegistry.test.ts`'s own describe block for tests that drive this on purpose-built
+ *  schemas instead.
+ *
+ *  `zodToJsonSchema` inlines a `.describe()` at EVERY depth (and at every use site, since
+ *  `makeEntitySpec()` is a factory — see shapes.ts), which is exactly what an agent is billed for
+ *  on the wire.
+ *
+ *  Deliberately walks only `properties`/`items`/`anyOf`/`oneOf`/`allOf`/`not`/
+ *  `additionalProperties`/`patternProperties`/`propertyNames`/`prefixItems` — the containers that
+ *  can hold a NESTED schema — rather than every JSON key, so structural JSON-Schema boilerplate
+ *  (`type`, `required`, `$schema`, `additionalProperties:false`) is not double-counted as if it
+ *  were authored prose. `items`/`oneOf`/`allOf`/`anyOf`/`prefixItems` can each be an ARRAY of
+ *  sub-schemas (e.g. `z.tuple()` emits `items` as an array) as well as a single schema object —
+ *  recurse into both shapes, or an array-valued container is silently invisible to this walk
+ *  (#456 — the sibling of the bug this ledger was fixed to remove, one level deeper). */
+export const sumSchemaBytes = (node: unknown): number => {
+  if (Array.isArray(node)) {
+    let bytes = 0;
+    for (const v of node) bytes += sumSchemaBytes(v);
+    return bytes;
+  }
+  if (!node || typeof node !== 'object') return 0;
+  const n = node as Record<string, unknown>;
+  let bytes = 0;
+  if (typeof n.description === 'string') bytes += n.description.length;
+  if (n.properties && typeof n.properties === 'object') {
+    for (const [key, value] of Object.entries(n.properties as Record<string, unknown>)) {
+      bytes += key.length + sumSchemaBytes(value);
+    }
+  }
+  if (n.patternProperties && typeof n.patternProperties === 'object') {
+    for (const [key, value] of Object.entries(n.patternProperties as Record<string, unknown>)) {
+      bytes += key.length + sumSchemaBytes(value);
+    }
+  }
+  if (n.items) bytes += sumSchemaBytes(n.items);
+  if (n.prefixItems) bytes += sumSchemaBytes(n.prefixItems);
+  if (n.anyOf) bytes += sumSchemaBytes(n.anyOf);
+  if (n.oneOf) bytes += sumSchemaBytes(n.oneOf);
+  if (n.allOf) bytes += sumSchemaBytes(n.allOf);
+  if (n.not) bytes += sumSchemaBytes(n.not);
+  if (n.propertyNames) bytes += sumSchemaBytes(n.propertyNames);
+  if (n.additionalProperties && typeof n.additionalProperties === 'object') {
+    bytes += sumSchemaBytes(n.additionalProperties);
+  }
+  return bytes;
+};

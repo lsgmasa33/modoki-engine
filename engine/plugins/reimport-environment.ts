@@ -18,7 +18,6 @@ export const environmentReimportHandler: ReimportHandler = async (sourceUrlPath,
     settings,
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   meta.environment = settings;
   meta.environmentCache = {
     hash: result.hash,

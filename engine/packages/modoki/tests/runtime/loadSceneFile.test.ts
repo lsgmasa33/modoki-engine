@@ -893,6 +893,81 @@ describe('loadSceneFile', () => {
       )).resolves.toBeUndefined();
     });
   });
+
+  // #784 phase C3 — the scene's disposition is REFUSE (owner's ruling, 2026-09-06): a
+  // too-new or unreadable format version must not be read, and must not be mutated either.
+  // Before this phase, `assignSyntheticEntityIds` and `stripLegacyCameraFrameShowGizmo` ran
+  // UNCONDITIONALLY ahead of the (then-advisory) forward-version warning, so a too-new
+  // document was mutated even though nothing "loaded" it. These tests assert the document
+  // survives byte-for-byte, not merely that the call throws — a throw alone would pass even
+  // without the reordering in loadSceneFile (see the mutation check in the close-out).
+  describe('too-new / unreadable format version (REFUSE, #784 phase C3)', () => {
+    it('refuses a too-new scene and does not mutate it', async () => {
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
+      const data = {
+        version: SCENE_FORMAT_VERSION + 7,
+        resources: [],
+        entities: [{
+          // No `id` — a genuine too-new file wouldn't have synthetic ids either; this also
+          // proves assignSyntheticEntityIds never ran (it would have backfilled one).
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'FromTheFuture', parentId: 0 } },
+        }],
+      };
+      const snapshot = JSON.parse(JSON.stringify(data));
+
+      await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+        .rejects.toThrow(SceneFormatRefusedError);
+
+      // Bytes untouched: version unchanged, no synthetic id backfilled, no entities spawned.
+      // (koota's createWorld() always carries one implicit entity — id 0 — so "no entities
+      // spawned" is baseline-1, not 0.)
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1);
+    });
+
+    it('refuses a non-numeric string version instead of loading it silently', async () => {
+      // The historical defect: `"20" >= N` coerces truthy in every migration guard AND in
+      // the old `typeof data.version === 'number'` forward-warning check excluded it — so a
+      // string version passed through every rung untouched and unwarned, while the two
+      // unconditional mutators below the ladder still ran. classifyFormatVersion's
+      // `non-numeric-version` verdict is what catches this now.
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
+      const data = {
+        version: '20' as unknown as number,
+        resources: [],
+        entities: [{
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Ghost', parentId: 0 } },
+        }],
+      };
+      const snapshot = JSON.parse(JSON.stringify(data));
+
+      await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+        .rejects.toThrow(SceneFormatRefusedError);
+
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1); // baseline only — see the comment above
+    });
+
+    it('still migrates a scene with an ABSENT version (deliberate exception — do not gate this)', async () => {
+      // `absent` is § 2a's "legacy or freshly created — readable" verdict. A genuinely
+      // pre-v3 scene has no `version` key at all and MUST still run the whole ladder; this
+      // guards that exception against a later "tidy-up" that folds it into the refusal.
+      const { loadSceneFile } = await getLoader();
+      const data: any = {
+        resources: [],
+        entities: [{
+          id: 1,
+          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Legacy', parentId: 0 } },
+        }],
+      };
+
+      await expect(loadSceneFile(data, { fetchPrefab: async () => null, loadModels: false }))
+        .resolves.toBeUndefined();
+
+      expect(data.version).toBe(SCENE_FORMAT_VERSION);
+      expect(testWorld.entities.length).toBe(2); // baseline (1) + the one spawned entity
+    });
+  });
 });
 
   describe('v5 → v6 migration (derive resources)', () => {
@@ -1003,6 +1078,8 @@ describe('collectResourceRefsFromEntities', () => {
   const MODEL_GUID = 'b1000000-0000-4000-8000-000000000010';
   const PREFAB_GUID = 'b1000000-0000-4000-8000-000000000011';
   const ENV_GUID = 'b1000000-0000-4000-8000-000000000012';
+  const AUDIO_GUID = 'b1000000-0000-4000-8000-000000000020';
+  const ANIM_CLIP_GUID = 'b1000000-0000-4000-8000-000000000021';
 
   it('collects Renderable3D mesh and material refs', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
@@ -1051,6 +1128,54 @@ describe('collectResourceRefsFromEntities', () => {
       { traits: { PrefabInstance: { source: PREFAB_GUID } } },
     ]);
     expect(refs).toContainEqual({ type: 'prefab', path: PREFAB_GUID });
+  });
+
+  it('collects AudioSource.clips bank refs', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { AudioSource: { clips: JSON.stringify([{ key: 'hit', ref: AUDIO_GUID }]) } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'audio', path: AUDIO_GUID });
+  });
+
+  // #731: parseClipBank's own never-throws contract collapses "no bank" and "malformed bank" into
+  // the same `[]` — this asserts the OBSERVABLE consequence loadSceneFile.ts now fixes: a corrupt
+  // bank still yields no refs (unchanged — the game plays silence, no acquire to make), but it is
+  // no longer SILENT about it.
+  it('warns (and still collects nothing) for a malformed AudioSource.clips bank, instead of failing silently', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const refs = collectResourceRefsFromEntities([
+        { traits: { AudioSource: { clips: '{ not valid json' } } },
+      ]);
+      expect(refs).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('malformed AudioSource.clips bank'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('collects Animator.clips bank refs', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { Animator: { clips: JSON.stringify([{ name: 'idle', clip: ANIM_CLIP_GUID }]) } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'animation', path: ANIM_CLIP_GUID });
+  });
+
+  it('warns (and still collects nothing) for a malformed Animator.clips bank, instead of failing silently', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const refs = collectResourceRefsFromEntities([
+        { traits: { Animator: { clips: '{ not valid json' } } },
+      ]);
+      expect(refs).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('malformed Animator.clips bank'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('collects Renderable2D sprite (texture) ref by GUID', async () => {
@@ -1174,6 +1299,21 @@ describe('collectResourceRefsFromEntities', () => {
       { traits: { UIElement: { imageSrc: '', fontFamily: 'Roboto' } } },
     ]);
     expect(refs).toEqual([]);
+  });
+
+  /** #803 — `UISettings.fontFamily` is the scene-wide DEFAULT DOM font (every UI root is a
+   *  SIBLING of every other, so a font authored only on one `UIElement` never reaches another
+   *  root's descendants). This is the REACHABILITY test: a scene whose ONLY font reference is
+   *  `UISettings.fontFamily` — no entity authors `UIElement.fontFamily` at all — must still
+   *  surface a `{type:'font-family', path:<guid>}` ref, or the asset is dropped from the
+   *  production build and the whole feature renders identically to the bug it fixes (#53,
+   *  "assets the build cannot see"). Mirrors the `UIElement.fontFamily` case just above. */
+  it('collects UISettings.fontFamily even when no UIElement authors one', async () => {
+    const { collectResourceRefsFromEntities } = await getLoader();
+    const refs = collectResourceRefsFromEntities([
+      { traits: { UISettings: { fontFamily: FONT_GUID } } },
+    ]);
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
   });
 
   it('collects ModelSource glbPath with postprocessor', async () => {
@@ -1728,6 +1868,189 @@ describe('migrateV11toV12 + assignSyntheticEntityIds (scene-loading.md, Phase 3)
     let found = false;
     testWorld.query(EntityAttributes).updateEach(([ea]: any[]) => { if ((ea as any).name === 'Solo') found = true; });
     expect(found).toBe(true);
+  });
+});
+
+describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
+  // UIAnchor.zIndex and UIElement.zIndex used to write the same CSS z-index onto the same
+  // DOM node, with the anchor value winning whenever it was truthy — so the anchor's value
+  // is what actually rendered, and the migration must carry that value forward.
+  it('a truthy UIAnchor.zIndex overwrites a sibling UIElement.zIndex and is then removed', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 15 },
+          UIElement: { zIndex: 0 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(15);
+  });
+
+  it('a value conflict resolves to the ANCHOR value (it is what rendered before this change)', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 1000 },
+          UIElement: { zIndex: 100 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(1000);
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  it('a falsy (0) UIAnchor.zIndex is dropped without touching UIElement.zIndex', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 0 },
+          UIElement: { zIndex: 42 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((data.entities[0].traits.UIElement as any).zIndex).toBe(42);
+  });
+
+  it('is idempotent — running it twice changes nothing further', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 7 },
+          UIElement: { zIndex: 0 },
+        },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    const once = JSON.parse(JSON.stringify(data));
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    expect(data).toEqual(once);
+  });
+
+  it('an entity with UIAnchor.zIndex but no UIElement trait does not crash and does not invent one', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: {
+          UIAnchor: { zIndex: 15 },
+          EntityAttributes: { name: 'X', parentId: 0 },
+        },
+      }],
+    };
+    await expect(loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false }))
+      .resolves.not.toThrow();
+    expect((data.entities[0].traits as any).UIElement).toBeUndefined();
+    expect((data.entities[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  // Close-out (#762 follow-up): the shallow `entry.traits`-only call used to miss THREE of the
+  // four locations a trait bag can live in — overrides[localId][UIAnchor], added[] subtrees, and
+  // nestedOverrides paths — exactly the gap `migrateV8toV9`'s `renameRenderableActiveToVisibleDeep`
+  // already had to solve one migration earlier. Mirrors that migration's own deep-helper test
+  // (`renameRenderableActiveToVisibleDeep`, above) location-for-location. A second review then
+  // found the shape-agnostic "deep" replacement for THAT gap dropped the value at every one of
+  // these locations whenever the override bag had no sibling UIElement key (the realistic shape
+  // — override bags are per-field diffs, see `migrateUIAnchorZIndexInOverrideBag`'s doc) — so this
+  // is now the structured walker, and the missing-sibling shape gets its own case below.
+  it('structured walker reaches UIAnchor.zIndex in traits / overrides / added / nestedOverrides', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      traits: { UIAnchor: { zIndex: 11 }, UIElement: { zIndex: 0 } },
+      overrides: { 5: { UIAnchor: { zIndex: 12 }, UIElement: { zIndex: 0 } } },
+      added: [{ traits: { UIAnchor: { zIndex: 13 }, UIElement: { zIndex: 0 } }, children: [] }],
+      nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 14 }, UIElement: { zIndex: 0 } } } },
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.traits.UIElement as any).zIndex).toBe(11);
+    expect((node.traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.overrides[5].UIElement as any).zIndex).toBe(12);
+    expect((node.overrides[5].UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.added[0].traits.UIElement as any).zIndex).toBe(13);
+    expect((node.added[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+    expect((node.nestedOverrides['3/7'][9].UIElement as any).zIndex).toBe(14);
+    expect((node.nestedOverrides['3/7'][9].UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  // The realistic override-bag shape, and the one the "deep" walker got wrong: a per-field diff
+  // that only touches UIAnchor (`captureInstanceOverrides` never writes a field an author never
+  // changed), so there is no sibling UIElement bag to fall back on. Unlike the trait-bag case
+  // above (skip — no rendered value to lose), an override CAN legitimately add a trait a member
+  // never had (`applyOverridesByRootInstance`'s added-trait branch), so the value must be carried
+  // by CREATING the UIElement bag, in every one of the three per-field-diff locations.
+  it('creates the UIElement bag when an override/added/nestedOverride diff has no UIElement sibling', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      overrides: { 5: { UIAnchor: { zIndex: 7 } } },
+      added: [{ traits: {}, children: [], overrides: { 6: { UIAnchor: { zIndex: 8 } } } }],
+      nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 9 } } } },
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.overrides[5] as any).UIElement.zIndex).toBe(7);
+    expect((node.overrides[5] as any).UIAnchor.zIndex).toBeUndefined();
+    expect((node.added[0].overrides![6] as any).UIElement.zIndex).toBe(8);
+    expect((node.added[0].overrides![6] as any).UIAnchor.zIndex).toBeUndefined();
+    expect((node.nestedOverrides['3/7'][9] as any).UIElement.zIndex).toBe(9);
+    expect((node.nestedOverrides['3/7'][9] as any).UIAnchor.zIndex).toBeUndefined();
+  });
+
+  // `added[]` nodes carry a recursive `children` tree (not just `added` — that's reserved for a
+  // node that is ITSELF a nested-prefab reference). The structured walker must descend into it.
+  it('descends into an added[] node\'s own children tree', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const node = {
+      added: [{
+        traits: {},
+        children: [{ traits: { UIAnchor: { zIndex: 20 }, UIElement: { zIndex: 0 } }, children: [] }],
+      }],
+    };
+    migrateUIAnchorZIndexStructured(node);
+    expect((node.added[0].children[0].traits.UIElement as any).zIndex).toBe(20);
+    expect((node.added[0].children[0].traits.UIAnchor as any).zIndex).toBeUndefined();
+  });
+
+  it('migrateV12toV13 (via loadSceneFile) reaches all four locations, not just top-level traits', async () => {
+    const { loadSceneFile } = await getLoader();
+    const data = {
+      version: 12,
+      entities: [{
+        id: 1,
+        traits: { UIAnchor: { zIndex: 11 }, UIElement: { zIndex: 0 }, EntityAttributes: { name: 'X', parentId: 0 } },
+        overrides: { 5: { UIAnchor: { zIndex: 12 }, UIElement: { zIndex: 0 } } },
+        added: [{ traits: { UIAnchor: { zIndex: 13 }, UIElement: { zIndex: 0 } }, children: [] }],
+        nestedOverrides: { '3/7': { 9: { UIAnchor: { zIndex: 14 }, UIElement: { zIndex: 0 } } } },
+      }],
+    };
+    await loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+    const entry = data.entities[0] as any;
+    expect(entry.traits.UIElement.zIndex).toBe(11);
+    expect(entry.traits.UIAnchor.zIndex).toBeUndefined();
+    expect(entry.overrides[5].UIElement.zIndex).toBe(12);
+    expect(entry.overrides[5].UIAnchor.zIndex).toBeUndefined();
+    expect(entry.added[0].traits.UIElement.zIndex).toBe(13);
+    expect(entry.added[0].traits.UIAnchor.zIndex).toBeUndefined();
+    expect(entry.nestedOverrides['3/7'][9].UIElement.zIndex).toBe(14);
+    expect(entry.nestedOverrides['3/7'][9].UIAnchor.zIndex).toBeUndefined();
+    expect(data.version).toBe(SCENE_FORMAT_VERSION);
   });
 });
 

@@ -35,8 +35,77 @@ it isn't active), then calls `setCurrentWorld()` to flip it in one statement.
 Renderers (`Scene3D`, `Scene2D`, and the `useUIEntities` selector) subscribe to
 `onWorldSwap` to flush their per-world caches the moment the swap happens.
 
-> koota caps total worlds at 16. `SceneManager` calls `oldWorld.destroy()`
+> koota caps total worlds at 16 (`WORLD_ID_BITS = 4`). `SceneManager` calls `oldWorld.destroy()`
 > after each swap to free the slot; without it the engine breaks after ~16 swaps.
+
+#### One destroy discipline, shared by all three promoters
+
+Three methods promote a world: `loadScene()`'s swap tail, `replaceWorldContent()`, and
+`unloadAll()`. Every one of them frees the world it replaced through the single private helper
+**`destroyWorldWhenSafe(outgoing, promoted)`** — extracted in #853, and `unloadAll` was brought
+inside it in #877 (until then it was the one promoter that leaked its slot: a bare `unloadAll()`
+loop, no scene loaded, exhausted the pool after 15 teardowns and threw on the 16th). #877's
+close-out sweep then found `replaceWorldContent` calling the helper with a **stale** argument,
+which is the second rule below.
+
+Two rules the helper's callers have to keep, both learned the expensive way:
+
+- **Read the outgoing world AT the promote — never a value captured before an await.** Both
+  `unloadAll` and `replaceWorldContent` capture an `oldWorld` at their head for the manager
+  disposes — which is the right argument for *those* (they want the world their managers ran
+  against) and the wrong one for the destroy. `replaceWorldContent`'s version of this is the
+  reachable one: two Create Scene gestures in quick succession both capture the same world. Neither
+  `unloadAll` nor `replaceWorldContent` refuses to start while another teardown is in flight
+  (`teardownInFlight` is a counter both bump, not a lock), so a second
+  teardown — or a second Create Scene — running inside those awaits captures the same world and its
+  tail frees it first. Reusing the head capture then frees that world twice and leaks the one
+  actually current — and koota's
+  `releaseWorldId` is **not idempotent**: for the top-of-cursor id it does `worldCursor--`, so a
+  double release hands one world id out to two live worlds. That is worse than the leak.
+  ⚠️ A racing `loadScene` is *not* the case to reason from, despite looking like the obvious one: its
+  last pre-swap checkpoint and its `setCurrentWorld` sit in one await-free stretch, so it cannot
+  commit a swap inside a teardown's awaits at all.
+- **Defer, don't destroy immediately.** The helper waits on `pendingManagerInits()` (bounded by
+  `WORLD_DESTROY_DEFER_MAX_MS`) because a manager's async `init()` holds `getCurrentWorld()` as its
+  `ctx.world`. On the teardown path this is not redundant with the disposes above it: those cover
+  scene- and game-scoped managers only, and an **app-scoped** manager is never disposed by
+  `unloadAll` at all — it activates at `registerManager` and stays active until unregister.
+
+### Replacing every entity IS a world swap
+
+**`setCurrentWorld` is the engine's only signal for "every entity you were holding is gone", so
+anything that replaces all world content must go through `SceneManager`** — even when no file is
+involved. That is what `replaceWorldContent(populate)` is for: `loadScene`'s mint → populate →
+promote → release → destroy tail with the file I/O removed. `newScene()` (Assets → Create Scene,
+and the `new_scene` agent op) is its only caller.
+
+The rule exists because `newScene()` used to delete and respawn **in place** (#853). It was the one
+path in the repo that replaced every entity without a swap, so all ~46 `onWorldSwap` subscribers
+were skipped — the Hierarchy's collapse restore and its per-scene folder state, SceneView's gizmo /
+outline / collider maps, the module-level 2D renderer's slot and last-render caches, and the
+Timeline's Director-root rebind. Each of those is *written* to defend against exactly this, and
+each was reached by a trigger that never fired.
+
+⚠️ **The damage is not "stale state", it is aliasing.** koota's `.id()` is a masked index — it
+carries neither generation nor world id — and the free list is **LIFO**. Measured against the
+installed koota: destroy 8 entities, and the next spawns take ids `8,7,6,5` then `4,3,2,1`. The
+reuse is *total and in reverse*, so the outgoing scene's per-id state lands exactly on the incoming
+scene's entities rather than merely going out of date.
+
+⚠️ **And the fix is not that ids stop colliding.** A fresh world hands out `1, 2, 3…` again, so they
+still can. What changes is that every holder is *told*. Tests on this path assert that state is
+cleared or rebuilt — never that id values differ.
+
+Two constraints on any future caller:
+
+- **Populate BEFORE promoting.** `aSceneSwapIsHappening()` is false on this path (nothing sets
+  `nextLoad`), so the Hierarchy's settle-wait does not apply — a swap fired against an empty world
+  lets its collapse restore latch an owner on a zero-length tree, which is #839 by another route.
+- **Never route through `unloadAll()`.** It is the shutdown path — it releases every loaded scene's
+  resources and resets the manager registry's active scope, neither of which a new-scene gesture
+  wants. It used to leak a world slot on top of that (#877, fixed): all three promoters now free the
+  world they replace through the one `destroyWorldWhenSafe` helper, so the 16-world cap is no longer
+  the argument here.
 
 ## Resource cache with refcounting
 
@@ -78,6 +147,35 @@ anything — a scene's resources stay resident until the scene changes. (Verifie
 per-entity `releaseModel`/`releaseMesh`/`releaseMaterial` calls outside the cache module
 itself.)
 
+⚠️ **`invalidateModel` disposes the GLB-EMBEDDED material and its textures, and the safety of that
+rests on an ORDERING plus a clone drain (#719).** The material is `mesh.material` straight off the
+GLTFLoader parse, so it is the model's own and nothing else owns it — but `Material.clone()` copies
+texture *references*, so any derived clone still alive would be left sampling freed textures.
+
+- **On a scene swap this is safe by ordering:** `SceneManager` fires `onWorldSwap` — which drains the
+  tint, MaterialInstance, light-mask and retired-derived caches — *strictly before*
+  `releaseAllForScene`.
+- **On a RE-IMPORT it is not.** The property that matters — not a list of call sites, which goes
+  stale on the next one added — is: **any caller of `invalidateModel` that is neither last-owner-gated
+  nor world-swapping**. Every editor re-import path is one, and nothing drains the clone caches for
+  them. `scene3DSync`'s invalidation listener therefore calls `retireVariantsOf` before the dispose.
+  It runs on that side because it is what knows *which objects are being evicted* — **not** for
+  layering reasons: `loaders/` is in `L3_FOLDERS` and `scene3DSync.ts` is in
+  `L3_RECLASSIFIED_FILES` (`engine/eslint.config.js`), so both are L3-unrestricted and either
+  direction would have been legal.
+- ⚠️ **It retires only materials `invalidateModel` will actually dispose**, not every material on an
+  evicted object. A mesh with a material override binds the shared cached `.mat.json`
+  (`resolveMaterialForMesh(...) || template.material`), which is never disposed here; retiring on
+  that base would delete variants belonging to other still-live entities sharing the override, and
+  each would re-mint a clone + pipeline and render **unlit** until it compiled.
+
+⚠️ **A `.processed.glb` template material usually carries NO textures at all**, because the importer
+extracts them into `.mat.json` + shared refcounted textures. So this fix is invisible on any model
+that went through the converter — measured on `games/3d-test`'s island: 114 templates, 11 materials,
+**zero** textures. It matters for GLBs that keep their embedded materials. Do not mistake a flat
+texture count after a swap for this fix working or failing; the scene-swap growth measured on that
+fixture is a *different*, still-undiagnosed leak (#739).
+
 **Transitive deps** (a `.mesh.json` → its `.glb` model + `.mat.json` material; a material → its
 textures) are acquired/released under the same `sceneId`, captured in a per-(scene,mesh) snapshot
 at acquire time so a mid-scene editor **re-import** (`invalidateModel`, which evicts cache
@@ -86,16 +184,101 @@ entries) can't strand an owner.
 **Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
 `clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
 
+### The mid-load release window (#488, #520, #552)
+
+`acquireModel`/`acquireMesh` both add the caller's `sceneId` owner **before** awaiting their load
+(`loadModelTemplates`/`fetchMeshAsset`), so the owner is visible to a concurrent
+`releaseAllForScene` while the load is still in flight. `releaseAllForScene` is synchronous, so it
+can land inside that await window, remove the owner it just saw, and dispose whatever was already
+cached — after which the resumed load repopulates the cache with owner-less geometry that nothing
+will ever release again (`invalidateModel` doesn't bump `cacheGeneration`, only wholesale teardown
+does, so `loadModelTemplates`'s generation guard doesn't catch this).
+
+Three sites were suspected under #488; only one was fixed then, and a fourth was found later
+(#552). **#520 then found the window was not specific to geometry** — the same shape existed for
+two more resource KINDS, and both are now fixed. What made it easy to miss: the `cacheGeneration` guards inside the loaders read as if they
+already covered this. They do not, and the comment on the GLB one said so in as many words ("teardown
+/ scene-swap") until #520 corrected it. **Only `disposeAllCachedResources` bumps that counter;
+`releaseAllForScene` never does.** So a generation check is not a substitute for an owner check, and
+a site that has only the former is unguarded.
+
+
+- **Fixed — `acquireModel`'s own window.** A post-await guard (mirroring `acquireMesh`'s existing
+  one) checks, after the load resolves: was *my* `sceneId` released while I was awaiting (`!has`),
+  and if so, is the owner set now completely empty (`!size`)? Both are required — `!has` alone
+  would invalidate a model a second, still-live scene shares (a keep-direction bug: dropping data a
+  live scene owns); `!size` alone would never distinguish "I was released but someone else still
+  holds it" from "I still hold it", though in `acquireModel`'s current position — the guard is the
+  function's last statement, nothing runs after it — the two conditions happen to evaluate to the
+  same boolean on every reachable path, since an empty owner set trivially implies the caller isn't
+  a member and a non-empty set containing the caller trivially implies the set is non-empty. Keep
+  both anyway: it's the same shape as `acquireMesh`'s established guard, and a future edit that adds
+  code after the check would restore the distinction. On a positive hit, the guard invalidates via
+  `invalidateModel`, which is the complete disposal answer (geometry, **the GLB-embedded material
+  and its textures**, cache entries, hierarchy cache, in-flight `loading` entries, dependent
+  `meshAssetCache` entries, LOD siblings, and it
+  broadcasts `emitAssetInvalidated` before disposing). Because the owner is added before the await,
+  every other concurrent `acquireModel` for the same path has *also* already added its owner by the
+  time this guard runs — so "is the owner set now empty" can never free something a live scene owns.
+  A per-scene `cacheGeneration` bump was considered and rejected: it would invalidate in-flight
+  loads belonging to other, unrelated live scenes.
+
+- **Fixed (#520) — `acquireMaterial` and `acquirePrefab`.** Same shape as `acquireModel`'s window
+  and the same `!has` + `!size` guard, so the reasoning above carries over unchanged. The one
+  difference worth knowing is the disposal answer: `acquireModel` calls `invalidateModel`, which
+  disposes; `acquireMaterial` calls **`invalidateMaterial`, which RETIRES** — it moves the instance
+  to `retiredMaterials` for the render sweep to free once no live surface binds it, rather than
+  disposing it where it stands. That is #317's rule, and it applies here for the same reason it
+  applies everywhere else: the outgoing scene can still be on screen for a frame or two after the
+  swap, and `disposeMaterial` would also release the material's shared textures out from under it.
+  `acquirePrefab` just deletes from `prefabCache` — parsed JSON, no GPU resource, and
+  `fetchPrefab`'s `finally` has already cleared `prefabLoadPromises` by the time the guard runs, so
+  there is no stale promise left to short-circuit the next fetch.
+
+- **Fixed (#552) — `acquireMesh`'s transitive model window.** `acquireMesh` adds its own MESH owner
+  before its await and guards that window. But it also transitively adds a MODEL owner — for the
+  `.glb` the mesh references — and then awaits `loadModelTemplates` for it. A release landing in
+  that inner window strands owner-less model geometry the same way site 2 could. It now carries the
+  same `!has` + `!size` guard as `acquireModel`, re-seating the LOD snapshot before `invalidateModel`
+  and deleting it after (the snapshot is what lets `invalidateModel` find LOD siblings without the
+  manifest; `releaseModelByPath` deletes it mid-await, and the pre-await re-seat at the top of the
+  block cannot restore it).
+
+  **This bullet said "won't-fix" until #552, on two arguments that did not survive being tested.**
+  The first was that the guard "would fire essentially never" because it must check whether the
+  GLOBAL owner set is empty rather than just this mesh's — but that global check IS `!size`, the
+  same condition `acquireModel` already uses, and a test that holds `loadModelTemplates` open and
+  releases the scene inside it fires the guard on the first try, on both the single-model and the
+  LOD path.
+
+  The second argument was that the leak self-heals: `loading` retains its resolved promise, so the
+  NEXT `acquireModel`/`acquireMesh` for that path re-adopts the owner-less entry under a fresh
+  `sceneId` instead of re-fetching. **That mechanism is real — but it bounds nothing on its own.**
+  It heals only a path that is acquired again; a model whose scene aborted mid-parse and is never
+  loaded again keeps its geometry resident for the process lifetime, freeable by nothing, because
+  `releaseAllForScene` iterates owner maps and there is no owner to find. "Bounded window" was true
+  of the paths that recur and false of the ones that do not, and the distinction is invisible in
+  `getResourceStats()`, which counts owners only — the leak reads as zero there, which is why it
+  went unmeasured for so long. Assert on residency (`getTemplatesForModel`, `getModelHierarchy`)
+  when testing this class.
+
+- **Working as designed — the F6 sync render-path resolver.** The synchronous render path resolves
+  a `meshAssetCache` entry directly (not through `acquire*`) to avoid re-fetching every frame; this
+  is deliberate (see the F6 comment at the resolver) and evicting an owner-less entry there would
+  make that path re-fetch on every frame it's asked to resolve one. Not a leak in the refcount
+  sense — the entry is content cache, not a GPU-resource owner — and closing it would regress F6's
+  reason for existing.
+
 ## Scene manifest format
 
-The current scene file version is **12** (`SceneFile.version`), stamped from
+The current scene file version is **13** (`SceneFile.version`), stamped from
 `SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; the `SceneFile` interface is
 defined in `editor/scene/serialize.ts`:
 
 ```ts
 interface SceneFile {
   id: string;             // stable UUID, written once, survives renames/moves
-  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 12)
+  version: number;        // stamped from SCENE_FORMAT_VERSION (currently 13)
   createdAt: string;      // preserved across saves, not regenerated — see "Entity-id
                            // stability on disk" below
   baseScene?: string;     // v10+: guid of a base scene this scene extends — see
@@ -110,25 +293,67 @@ stability on disk" below.
 
 ### The `entities` ARRAY ORDER is the Hierarchy's display order
 
-`serializeScene` writes parents before their children, siblings by `sortOrder`, with the
-**GUID** as the tiebreak and the name as a last resort (`orderedInfos` in `serialize.ts`).
-It used to follow live ECS-id order, which made a save churn: a delete+undo respawns the
-entity at a new id, so the next save emitted byte-identical data in a different array order
-(`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the authored intent —
-so this is purely about making a scene diff readable, and about letting "`git status` is
-clean" mean something after a save.
+Parents before their children, siblings by `sortOrder`, with the **GUID** as the tiebreak and
+the name as a last resort. It used to follow live ECS-id order, which made a save churn: a
+delete+undo respawns the entity at a new id, so the next save emitted byte-identical data in a
+different array order (`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the
+authored intent — so this is purely about making a scene diff readable, and about letting
+"`git status` is clean" mean something after a save.
 
-**The committed files have now been re-saved to match (`957fd9d7e`, #268), so a save no
-longer reorders anything.** They used to predate the fix, which made the FIRST save of any
-project rewrite its scene with a one-time contentless reorder; every project was opened and
-every scene loaded and saved through this serializer, and the 48 files that moved were
-verified against HEAD as parsed data keyed by guid — same entity set, no entity whose content
-differs, identical top-level fields, order only.
+**The rule lives in ONE place: `orderEntitiesForSave` in
+`runtime/core/ecs/entityOrder.ts`** (#500). `serializeScene` writes with it, `buildEntityTree`
+(the Hierarchy panel) sorts with it, and `engine/tests/assets/sceneEntityOrder.test.ts` asserts
+every committed scene file is already in it. ⚠️ **"Committed" is the guard's premise but not how
+it finds files** — it walks the filesystem under `games/`/`demos/` and subtracts
+`EXCLUDED_SEGMENTS`, so a gitignored BUILD-OUTPUT copy of a scene reads to it as an authored file.
+`/ads/` (the `--target playable` output) had to be added to that list after the gate went red on
+seven `games/3d-test/ads/**.scene.json` files git does not track — stale export copies of scenes
+the guard already checks at their authored path. Anything that emits a scene copy into a new
+directory needs the same entry, or every clone that has run that build gets a red gate while the
+hub, which has not, stays green. It is a leaf module precisely so the guard can
+share it — a test that re-implemented the sort would drift from what actually gets written, and
+then agree with itself while disagreeing with the editor.
 
-⚠️ **So a reorder diff is now a FINDING.** Nothing routine produces one any more, which
-inverts the old advice: don't read such a diff as expected churn, report it. Still true, and
-the reason the guid-keyed comparison is worth keeping in hand: don't treat a post-save
-`git status` as evidence of a *content* change without comparing as parsed data first.
+⚠️ **A reorder diff is a FINDING** — don't read one as expected churn, report it. And don't
+treat a post-save `git status` as evidence of a *content* change without comparing as parsed
+data first.
+
+⚠️ **A prefab-instance root's sort keys are NOT all in its scene entry** — this is the trap for
+anything that reasons about write order by reading the FILE (a guard, a normalizer script, a
+review):
+
+| key | plain entity | prefab-instance root |
+|---|---|---|
+| guid | `traits.EntityAttributes.guid` | **top-level `entry.guid`** — never baked into `EntityAttributes`, since it is never an override. The loader stamps it into the live world as a minimal `EntityAttributes({guid: entry.guid})`, and that is what `guidForId` reads back at save. |
+| sortOrder | `traits.EntityAttributes.sortOrder` | **the prefab template's root value, overridden by `entry.overrides[rootLocalId].EntityAttributes.sortOrder`.** A captured root's `EntityAttributes` on disk is minimal (`{parentId?, editorFolder?}`) — `sortOrder` is not written there at all. |
+
+Reading only `traits.EntityAttributes` scores every prefab root as guid `''` and `sortOrder` 0 —
+*self-consistently*, which is what makes it dangerous: a guard and a normalizer sharing the
+mistake AGREE with each other and both disagree with the editor. Both halves were got wrong
+while fixing #500. The `sortOrder` half reordered five scene files the editor had written
+correctly (`Warp.scene.json`'s `Mars_planet`, real `sortOrder` 91 via an override, moved from
+index 15 to index 3) and the guard then certified the damage as canonical.
+
+⚠️ **Content comparison cannot catch this.** A reorder is content-preserving by construction, so
+"same entity set, no entity whose content differs, identical top-level fields" stays true while
+the order is wrong. That check — the one this section used to recommend — proves the rewrite lost
+nothing; it says nothing about whether the new order is the one the editor will write. The only
+sound check is against the serializer's actual keys.
+
+### How the "already normalized" claim went stale
+
+#268 (`957fd9d7e`) re-saved 48 files, and this section then claimed a save no longer reorders
+anything. By #500 that was false again: `engine/templates/starter` and
+`engine/tests/fixtures/testbed` had drifted back out of order — so **every project scaffolded
+from the template shipped pre-armed with a whole-file diff** for whoever first opened and saved
+it. Court's was measured at 903 changed lines for a one-field edit.
+
+The lesson is not "re-normalize more carefully". A one-time sweep asserts a property at a moment
+in time and nothing holds it there; the files drifted back because nothing could notice. The
+guard test is what makes this section's claim checkable, so the next drift fails a gate instead
+of surfacing as a mystery diff months later. It **skips any file whose prefab keys it cannot
+resolve rather than assuming a value** — a guard that guesses an input is a wrong oracle, and a
+wrong oracle fails the file the editor just wrote correctly.
 
 **Three files were deliberately left un-normalized**, because their re-save is not order-only
 — `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains
@@ -309,9 +534,27 @@ Migrations chain in `loadSceneFile.ts` and run before any entity spawns:
   (and any future `FieldHint.entityId`-flagged field) is *written* — a GUID instead of
   a raw ecs id — not the shape of the data (see "Entity-id stability on disk")
 - `migrateV11toV12` — no-op passthrough; `serializeScene` stops writing the per-entity
-  `id` field entirely. This is the terminal step — it stamps `data.version =
-  SCENE_FORMAT_VERSION`, so bumping the constant without chaining a new migration
-  can't silently mislabel a freshly-migrated file as under-versioned
+  `id` field entirely
+- `migrateV12toV13` — `UIAnchor.zIndex` removed; a truthy value is carried onto
+  `UIElement.zIndex` (see `uiAnchorZIndexMigration.ts` for the carrier policy — it differs
+  between an entity's own `traits` and an override/added/nestedOverride diff bag), then the
+  anchor field is deleted unconditionally. Structured walk
+  (`migrateUIAnchorZIndexStructured`) — reaches `overrides[localId][UIAnchor]`, `added[]`
+  subtrees and `nestedOverrides` paths too, same as `migrateV8toV9`'s reach. **This is the
+  terminal step** — it stamps `data.version = SCENE_FORMAT_VERSION`, sourced from the
+  constant rather than a literal `13`, so a *correctly-extended* chain can't mislabel a
+  freshly-migrated file as under-versioned.
+  <br>⚠️ That guarantee depends on every future bump pairing the constant with a new
+  migration step guarded at the new number — it is a discipline the next migration has to
+  keep, not something this step enforces by itself. Bump `SCENE_FORMAT_VERSION` alone,
+  with no new step added, and this step's own `if (data.version >= 13) return;` guard means
+  a v13 file (this step's old terminal state) returns early and stays stamped `13` —
+  silently under-versioned against the new constant — while a v12-or-below file still runs
+  this step and gets stamped with the *new*, higher number despite receiving no migration
+  for the v13→new-number gap. The per-step guards on every migration above keep their
+  literal version numbers as intermediate "step done" markers for exactly this reason; only
+  the CURRENT terminal step's stamp follows the constant, and that stops being true the
+  moment a new terminal step is added without moving the stamp to it.
 
 ### Re-saving legacy scenes (the sha-churn migration)
 
@@ -723,11 +966,19 @@ Two consumers:
 ### Editor authoring surface
 
 - **Set the ref** — `editor/panels/assetViews/SceneAssetView.tsx`: select a scene in
-  Assets, set its base via an `AssetRefField` with an inline cycle warning. It writes
-  through `POST /api/scene-mutate`'s `setBaseScene` op (see "Scene-file mutation ops"
-  below), **not** the generic whole-file asset-write path — a scene file is also what
-  the live world serializes into, so a blind write from React state could race a
-  Play/Stop snapshot or an agent's concurrent mutate.
+  Assets, set its base via an `AssetRefField` with an inline cycle warning. ⚠️ **The edit is
+  MANUAL-SAVE as of #831** — it used to write the moment the field changed, which is the autosave
+  defect that issue is about, wearing a different route. Where it goes depends on whether this is
+  the scene the editor has OPEN:
+  - **the open scene** → `setCurrentBaseScene`, the module state `serializeScene` already emits
+    from, and Cmd+S writes it with the rest of the scene. (Before #831 that state was only ever set
+    at LOAD, so a base set here was overwritten by the stale value on the next save.)
+  - **any other scene** → parked in `editor/scene/pendingBaseScene.ts` and flushed by `saveAll`
+    through `POST /api/scene-mutate`'s `setBaseScene` op (see "Scene-file mutation ops" below),
+    **not** the generic whole-file asset-write path — a scene file is also what the live world
+    serializes into, so a blind write from React state could race a Play/Stop snapshot or an
+    agent's concurrent mutate. The flush runs LAST in `saveAll`, because that route refuses while
+    the editor reports unsaved work and these entries are part of that report.
 - **Hierarchy scene groups** — `editor/panels/Hierarchy.tsx` (grouping helper in
   `hierarchyFolders.ts`): base scenes render as collapsed-by-default "🔗 Base" header
   rows above the primary content, with a dirty dot when that base has unsaved edits. A
@@ -959,7 +1210,10 @@ Two consequences worth knowing:
 single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):
 
 1. **Cancel in-flight load** — aborts the previous preload and releases its
-   acquired resources (cancel-and-replace; only one preload runs at a time).
+   acquired resources (cancel-and-replace; only one preload runs **up to the atomic
+   swap** — step 8 clears `nextLoad`, so a load issued during a previous call's
+   post-swap tail (step 9) finds nothing to abort and runs concurrently with that
+   tail. See step 9 for what guards that window instead of `AbortController`.)
 2. **Resolve the chain** (`resolveSceneChain`) and diff it against the currently loaded
    chain: `kept` (carried), `toLoad` (spawned from file), `toDrop` (torn down).
 3. **Allocate** a fresh `SceneId` per `toLoad` entry + one `AbortController`.
@@ -978,8 +1232,125 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    `onWorldSwap`, which editor panels read `loadedScenes` from, so the rebuild must
    happen first or a base's Hierarchy label falls back to its raw guid. Then
    `releaseAllForScene(id)` for every `toDrop` scene id drops its refcounts; then
-   `oldWorld.destroy()` frees the koota slot.
-9. **Scene callbacks** (`registerSceneCallback`) fire for dynamic spawning.
+   `oldWorld.destroy()` frees the koota slot — deferred (not awaited) behind any
+   in-flight manager `init()` (`pendingManagerInits()`, #468) so a manager still
+   writing into the old world during its async init never writes into an
+   already-destroyed one.
+9. **Post-swap tail — guarded by `!postSwapSuperseded && this.primaryId === id`
+   (#542, see below).** Scene callbacks
+   (`registerSceneCallback`) fire for dynamic spawning, then this scene's managers
+   activate: the previous scene's (and, on a game change, the previous game's)
+   managers are disposed via `disposeActiveSceneManagers`/`disposeActiveGameManagers`,
+   then the new scene's/game's managers are activated via
+   `initSceneManagersFor`/`initGameManagersFor` (game-scoped only when the game
+   changed). **This whole re-activation half runs only while this load is BOTH still
+   the live primary (`this.primaryId === id`, #435) and not already known superseded
+   (`!postSwapSuperseded`, #542).** `fireSceneCallbacks` and
+   `init*ManagersFor` both read `getCurrentWorld()` internally, so a load superseded
+   mid-tail (see step 1) would otherwise rewrite the module-global
+   `activeScenePath`/`activeGameId` back to ITS OWN path and spawn manager entities
+   into the OTHER call's now-active world — unowned there, and never disposed. A
+   superseded load skips just this re-activation half of the tail; dispose/release/
+   destroy (below) still run unconditionally either way.
+
+   The guard is a `primaryId` comparison rather than the `AbortController` used by
+   the pre-swap checks above, because `nextLoad` (and the abort path with it) is
+   cleared at the swap in step 8 — past that point there is nothing left to signal
+   an abort through. `primaryId` is reassigned at every swap, so inequality alone is
+   the "superseded" signal.
+
+   **This guard closes only the SCENE-scoped half of the tail.** When the game did
+   NOT change, `gameChanged` is computed from `activeGameId`, which the superseded
+   load already wrote before reaching this guard — so the newer load also computes
+   `gameChanged === false` and skips both `disposeActiveGameManagers` and
+   `initGameManagersFor` for it. Nothing re-activates or awaits the superseded
+   load's game-scoped manager here. What no longer happens (#468): its `init()`
+   can no longer write into an already-destroyed world, because step 8's destroy
+   is deferred behind every in-flight manager init. What remains, deliberately,
+   not a bug: the manager stays `active` holding a world that is no longer
+   current — identical to the ordinary in-game-swap outcome, since game managers
+   survive in-game swaps by design.
+
+   **Teardown vs. a racing load — unload wins (#535).** `unloadAll()` is
+   authoritative: a `loadScene()` that races it must never win, and must never
+   silently resolve having actually lost. Two mechanisms cover the two ways a
+   teardown can race a load:
+   - **`teardownInFlight`** — a counter (not a boolean, so overlapping
+     `unloadAll()` calls can't clear each other's flag), incremented at
+     `unloadAll()`'s head before any await and decremented in a `finally` after
+     its tail. `loadScene()` checks it FIRST, before doing any work: if
+     non-zero, a teardown already owns the world and the load rejects
+     immediately with an `AbortError`.
+   - **`teardownGeneration`** — bumped at the same head. `loadScene()` captures
+     it at entry and compares the current value against the captured one at
+     every checkpoint, catching a teardown that starts (or starts and fully
+     settles) while the load is already mid-flight.
+
+   **Pre-swap and post-swap checkpoints are guarded differently, because past
+   the swap there is nothing left to abort through.** Before step 8, the
+   checkpoints go through `isSuperseded`, which can consult
+   `controller.signal.aborted` because the load is still `this.nextLoad` and
+   `unloadAll()` aborts it directly (step 1's mechanism). ⚠️ In fact, PRE-swap,
+   `controller.signal.aborted` is the ONLY arm of `isSuperseded` that can
+   currently fire — a pre-swap load always owns `this.nextLoad` (it relinquishes
+   that only at the swap, and a newer load aborts the controller before
+   overwriting it), so wherever the generation comparison could differ here, the
+   abort has already happened first. The generation half of `isSuperseded` is
+   kept as defence-in-depth for if that `nextLoad` invariant ever changes, not
+   because it is doing live work today (mutation-confirmed: gutting
+   `isSuperseded` to `return controller.signal.aborted;` leaves every lifecycle
+   test green). After the swap, `nextLoad` is cleared (see step 1's note above)
+   — the `AbortController` is no longer reachable by anything — so the four
+   post-swap checkpoints use `isPostSwapSuperseded` instead, which reads
+   `teardownInFlight` and `teardownGeneration` directly. THERE the generation
+   half is genuinely load-bearing, not redundant with the counter: it is the
+   only thing that catches an `unloadAll()` that starts AND fully completes
+   inside one of the post-swap awaits, by which point the counter is already
+   back at zero.
+
+   **A post-swap supersede latches and rejects at the end — the dispose/
+   release/destroy work above still runs unconditionally either way** (it acts
+   on the OLD world and path, which no newer load touches). What changes is
+   what the caller is told: the load rejects with an `AbortError` instead of
+   resolving, because the swap it thought it won has since been wiped by
+   `unloadAll()`'s own unconditional tail (below).
+
+   **`unloadAll()`'s tail stays unconditional** — that is the ruling, not an
+   oversight: teardown can never be undone by a load that raced in behind it.
+
+   **#542 — `primaryId === id` alone does not gate re-activation against a
+   MID-FLIGHT `unloadAll()`.** `unloadAll()` only nulls `primaryId` in its OWN
+   tail, after five awaits (see below) — so while it is still mid-flight,
+   `primaryId` keeps naming the load that is stuck here, and that load's outer
+   `if (this.primaryId === id)` guard alone still passes. Pre-fix, this let the
+   tail run `initGameManagersFor`/`initSceneManagersFor` for a load that
+   `isPostSwapSuperseded` had *already* flagged — both write their respective
+   module-global (`activeGameId`/`activeScenePath` in `managerRegistry.ts`)
+   **synchronously at their own head**, before any await. If that write landed
+   after `unloadAll()`'s own reset writes (`initGameManagersFor(null, '')` /
+   `initSceneManagersFor('')`, both driven through the same public surface —
+   see the `unloadAll()` note below), the module state was left pointing at a
+   scene/game that `unloadAll()` had already torn down and believed it had
+   reset — even though the racing load's own promise still correctly rejected
+   moments later via `isPostSwapSuperseded`. The fix adds `!postSwapSuperseded`
+   to both the outer guard and the inner one (right before
+   `initSceneManagersFor(path)`, since a teardown can start and flip the flag
+   during the `initGameManagersFor` await in between): a load already known to
+   be superseded now skips the re-activation writes entirely instead of
+   performing them and rejecting afterward. Reproduced deterministically in
+   `tests/runtime/sceneManagerUnloadAll.test.ts`'s "#542" describe block — a
+   three-manager interleaving (a scene-scoped manager shared by both the
+   load's and `unloadAll()`'s first `disposeActiveSceneManagers` call, a
+   game-scoped manager only the load activates, and a no-filter scene manager
+   only `unloadAll()`'s own `initSceneManagersFor('')` reactivates) that holds
+   the load back just long enough for `unloadAll()`'s `''` write to land first,
+   then releases the load to perform its own (pre-fix: stale) write. The
+   assertion is on the observable harm, not a private field:
+   `managerRegistry` exposes no `getActiveScenePath()`, so the test instead
+   registers a fresh scene-scoped manager filtered to the torn-down path and
+   asserts it does NOT self-activate (`registerManager`'s scope-'scene' branch
+   self-activates against the live `activeScenePath` — see
+   `docs/managers-and-systems.md`).
 
 On **failure or abort**, the staging world is destroyed and its resources released —
 the current scene (and its whole chain) is left completely untouched.
@@ -997,6 +1368,11 @@ scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on firs
 visit, restored when you return to a previously-open scene), rather than
 dropping undo globally.
 `unloadAll()` and `resetForTesting()` exist for shutdown + deterministic tests.
+`unloadAll()` is also the authoritative "unload wins" side of the #535 race
+described in step 9 above — it bumps `teardownInFlight`/`teardownGeneration` at
+its own head so any `loadScene()` racing it rejects rather than silently
+winning; `resetForTesting()` additionally resets both back to zero so a test
+run starts from a clean slate.
 
 ## Persistent entities
 
@@ -1026,7 +1402,7 @@ staging world. `SceneManager`:
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
    file copy, preventing duplicates.
 4. Respawns the snapshots into the staging world (tagged `version:
-   SCENE_FORMAT_VERSION`, currently 12, so migrations don't needlessly re-run).
+   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run).
 
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
@@ -1196,7 +1572,7 @@ Findings come from four passes:
    `space-console` alone) were checked by *nothing* — not for resolution, not even for
    GUID shape. A literal asset path in an override was as silent as a deleted one. Both
    call sites now go through one exported predicate, `refFieldWarnings`, for the reason
-   `inertSizeWarnings` gives right below it: an override group has the identical
+   `inertLayoutWarnings` gives right below it: an override group has the identical
    `{trait: {field: value}}` shape, and restating the rule per call site is how the
    exemptions (primitive sprite keywords, external URLs) drift apart. It runs **before**
    the inert-size check's `UIElement` early-continue — most override groups touch no
@@ -1223,7 +1599,29 @@ Findings come from four passes:
    that is `UIElement.width`/`height` on an axis the entity's `UIAnchor`
    stretches: the offsets size that axis and overwrite the authored value, so it
    is stored, displayed, and inert (the rule itself lives in
-   [ui-system.md](./ui-system.md); the shared predicate is `isSizeInert`).
+   [ui-system.md](./ui-system.md); the shared predicate is `isSizeInert`). The size arm
+   needs the anchor's MODE, so it only runs when `UIAnchor.anchor` is an authored string.
+   The same function also carries the margin arm (#757, `isElementMarginInert` — any
+   anchor, not just a stretching one). ⚠️ Unlike size, margin is **mode-independent** —
+   `anchorCss.ts` applies it unconditionally, whatever `UIAnchor.anchor` says, so this arm
+   runs off the mere PRESENCE of a `UIAnchor`, not off `anchor` surviving as an authored
+   string. That distinction matters because `UIAnchor`'s default mode is `'stretch'` and a
+   scene save strips any field equal to its trait default — so an entity on the default mode
+   has no `anchor` key at all, and gating this arm on the string (as the original #757
+   landing did) silently missed every one of them.
+
+   A THIRD arm used to live here too: `zIndex` (#762, `isElementZIndexShadowed` — a truthy
+   sibling `UIAnchor.zIndex` shadowed `UIElement.zIndex` entirely). `UIAnchor.zIndex` and
+   `UIElement.zIndex` wrote the same CSS `z-index` onto the same DOM node, so the anchor
+   field only ever duplicated the element field; it was removed and the two unified onto
+   `UIElement.zIndex` alone (scene format **v13**). `migrateV12toV13` in `loadSceneFile.ts`
+   carries a truthy old `UIAnchor.zIndex` onto `UIElement.zIndex` (the anchor's value is
+   what rendered, so it wins on a conflict), then drops the anchor field unconditionally.
+   Prefabs have no versioned migration ladder at all — `PREFAB_FORMAT_VERSION`
+   (`editor/scene/prefab.ts`) is a writer-only stamp nothing on the loading path inspects
+   — so the same fix runs unconditionally on every prefab load instead
+   (`uiAnchorZIndexMigration.ts`, shared by `meshTemplateCache.ts`'s `fetchPrefab` and the
+   editor's `getPrefabSource`).
 
    This pass is where a **noise budget** matters most, because unlike the passes
    above it flags data that is not malformed. Two values are excluded as neutral:
@@ -1254,7 +1652,7 @@ Findings come from four passes:
    guard (`engine/tests/assets/prefabInertSize.test.ts`) that also covers prefabs written by hand
    or by an agent — which no editor hook can see. `GET /api/validate-prefab?path=…` exposes the
    same check so an agent editing prefab JSON can verify its own edit. All four share the one
-   `inertSizeWarnings` predicate, so the rule and its noise budget cannot drift between them.
+   `inertLayoutWarnings` predicate, so the rule and its noise budget cannot drift between them.
 
    The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
    restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*
@@ -1309,8 +1707,9 @@ stability on disk" above) — they never round-trip to disk as-is.
 - **`removeEntity`** — deletes the entity plus its whole subtree (children found
   by `parentId`, GUID or legacy numeric).
 - **`setBaseScene`** — sets or clears a scene's top-level `baseScene` ref (see
-  [Base scenes](#base-scenes-nestable-cross-scene-persistence)); what
-  `SceneAssetView`'s Inspector field writes through.
+  [Base scenes](#base-scenes-nestable-cross-scene-persistence)); what `saveAll`'s
+  `flushPendingBaseScenes` writes through for a scene the editor has not loaded. Since #831 the
+  Inspector field does not call it directly — it parks, and the flush is the caller.
 
 `errors` are **hard** (entity not found, malformed op) — those ops are skipped;
 the caller decides whether to still write (the `/api/scene-mutate` endpoint only

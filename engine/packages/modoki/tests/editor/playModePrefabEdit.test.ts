@@ -26,6 +26,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     getCurrent: () => (currentPath === null ? null : { path: currentPath }),
     getLoadedScenes: () => new Map(),
+    // enterPlay consults this to refuse Play while a swap is pre-swap in flight (#573).
+    getNext: () => null,
     loadScene: (p: string, o: unknown) => loadScene(p, o as never),
   },
 }));
@@ -35,6 +37,10 @@ let filePath: string | null = null;
 vi.mock('../../src/editor/scene/serialize', () => ({
   serializeScene: async () => ({ version: 1, entities: [], resources: [] }),
   getCurrentScenePath: () => filePath,
+  // enterPlay samples this on both sides of its snapshot awaits, to cancel Play when a scene load
+  // lands in that window (#573). Constant here: these cases never load a scene mid-snapshot.
+  sceneLoadGeneration: () => 0,
+  isSceneLoadInFlight: () => false,
 }));
 
 vi.mock('../../src/editor/scene/timelinePreview', () => ({

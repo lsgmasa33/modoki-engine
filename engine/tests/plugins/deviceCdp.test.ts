@@ -6,6 +6,7 @@
  *  receiving a trusted touch) is out of scope for this file — see the plan doc. */
 
 import { describe, it, expect, vi } from 'vitest';
+import { aimAsResolved } from '../../plugins/backend/deviceAim';
 import {
   NO_SESSION_REASON,
   NOT_ROUTED_REASON,
@@ -520,5 +521,28 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       expect(() => resetDeviceCdpSession()).not.toThrow();
       expect(warn).toHaveBeenCalled();
     } finally { warn.mockRestore(); s.restore(); }
+  });
+});
+
+/** #497: the trusted routes report an aim that was resolved by a round trip TO THE DEVICE and is
+ *  never re-checked before the input lands, so the reply must not read as a verified hit. The owner
+ *  chose to reword rather than buy a second round-trip on every input — which makes the WORDING the
+ *  entire fix, and therefore the thing worth pinning.
+ *
+ *  ⚠️ The contrast is the point, not the sentence. The SYNTHETIC path (`app/debug/bridge.ts`) does
+ *  re-check in-page (#486 finding C) and says so with its own drift warning when the aim moved —
+ *  there, silence MEANS verified. Copying this caveat onto that surface, or deleting it from this
+ *  one, collapses a real distinction into noise; `deviceInputMechanism.test.ts` pins the other half
+ *  (`ok (hover div) @ css(5,5)` — no caveat). */
+describe('aimAsResolved — the trusted reply does not claim a verified hit (#497)', () => {
+  it('names the aim as RESOLVED, and says it was not re-checked', () => {
+    const out = aimAsResolved('#play→button#play');
+    expect(out).toContain('#play→button#play');       // the aim is still reported
+    expect(out).toMatch(/as resolved/);               // …as what it is
+    expect(out).toMatch(/not re-checked/);            // …and explicitly not verified at dispatch
+  });
+
+  it('wraps rather than replaces, so the label stays greppable', () => {
+    expect(aimAsResolved('x').startsWith('x')).toBe(true);
   });
 });

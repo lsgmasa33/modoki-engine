@@ -16,9 +16,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch } from '../backend/editorBackend';
-import { assetTypeFromPath } from './AssetRefField';
+import { selectedAssetTypeFor } from './AssetRefField';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
-import { hasUnsavedChanges } from '../scene/serialize';
+import { unsavedChangeCauses } from '../scene/serialize';
 import { formatChainStep, originBadge, type FindReferencesResultLike, type RefHitLike, type RefNodeLike } from './findReferencesFormat';
 
 const btn = (extra?: React.CSSProperties): React.CSSProperties => ({
@@ -31,6 +31,14 @@ const rowStyle: React.CSSProperties = {
   padding: '6px 10px', borderBottom: '1px solid #2a2a3a', fontSize: 11, cursor: 'pointer',
 };
 
+/** Name the pending asset docs in the staleness banner, capped so a long dirty list does not
+ *  blow out the dialog: first 3 by name, then "and N more". */
+function describeDirtyAssetPaths(paths: string[]): string {
+  const shown = paths.slice(0, 3).join(', ');
+  const rest = paths.length - 3;
+  return rest > 0 ? `${shown} and ${rest} more` : shown;
+}
+
 export default function FindReferencesDialog() {
   const info = useEditorStore((s) => s.findReferencesTarget);
   const close = useEditorStore((s) => s.closeFindReferences);
@@ -40,7 +48,7 @@ export default function FindReferencesDialog() {
   const [data, setData] = useState<FindReferencesResultLike | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stale, setStale] = useState(false);
+  const [causes, setCauses] = useState<ReturnType<typeof unsavedChangeCauses> | null>(null);
   // Why a result row did nothing when clicked. A dead click is its own small lie:
   // the user cannot tell "this row is not clickable" from "the editor ignored me".
   const [navNote, setNavNote] = useState<string | null>(null);
@@ -62,7 +70,7 @@ export default function FindReferencesDialog() {
     // Read live, not disk: a target the user just wired up but hasn't saved yet
     // would otherwise read as "0 references" — the exact wrong "unreferenced"
     // verdict this whole feature exists to prevent (see the CLAUDE.md invariant).
-    setStale(hasUnsavedChanges());
+    setCauses(unsavedChangeCauses());
     setNavNote(null);
     try {
       const res = await backendFetch(`/api/find-references?target=${encodeURIComponent(t)}`);
@@ -80,13 +88,13 @@ export default function FindReferencesDialog() {
   }, []);
 
   // The staleness banner asserts a PRESENT-TENSE fact ("there are unsaved edits"), and
-  // `hasUnsavedChanges()` is a pull function with no reactive signal behind it — so a
+  // `unsavedChangeCauses()` is a pull function with no reactive signal behind it — so a
   // user who reads the banner, saves, and comes back was still being warned about work
   // that no longer exists. Re-check on a light tick while the dialog is open; the read
-  // is three cheap comparisons (serialize.ts), not a scan.
+  // is a handful of cheap comparisons (serialize.ts), not a scan.
   useEffect(() => {
     if (!target) return;
-    const id = setInterval(() => setStale(hasUnsavedChanges()), 1000);
+    const id = setInterval(() => setCauses(unsavedChangeCauses()), 1000);
     return () => clearInterval(id);
   }, [target]);
 
@@ -99,7 +107,7 @@ export default function FindReferencesDialog() {
   const navigateTo = (node: RefNodeLike) => {
     setNavNote(null);
     if (node.kind === 'asset') {
-      selectAsset({ path: node.path, type: assetTypeFromPath(node.path), name: node.name });
+      selectAsset({ path: node.path, type: selectedAssetTypeFor(node.path), name: node.name });
       close();
       return;
     }
@@ -164,10 +172,16 @@ export default function FindReferencesDialog() {
           (a derived sprite, a slice, an atlas member).
         </div>
 
-        {stale && (
+        {causes && (causes.sceneDirty || causes.dirtyAssetPaths.length > 0) && (
           <div data-testid="find-references-stale" style={{ color: '#e0a030', fontSize: 11, marginBottom: 10, padding: '6px 8px', border: '1px solid #7a5a20', borderRadius: 4, background: '#2a2410' }}>
-            ⚠ This scan reads FILES ON DISK. There are unsaved live-world edits — a reference you
-            just wired up (or removed) may not show here yet. Save, then re-open this dialog.
+            ⚠ This scan reads FILES ON DISK.
+            {causes.sceneDirty && (
+              ' There are unsaved live-world edits — a reference you just wired up (or removed) may not show here yet.'
+            )}
+            {causes.dirtyAssetPaths.length > 0 && (
+              ` The scan could not see refs inside ${describeDirtyAssetPaths(causes.dirtyAssetPaths)}.`
+            )}
+            {' '}Save, then re-open this dialog.
           </div>
         )}
 

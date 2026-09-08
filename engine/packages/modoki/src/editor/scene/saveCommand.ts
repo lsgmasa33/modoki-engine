@@ -15,6 +15,8 @@
 
 import { saveAll, unsavedChangeCauses, type SaveResult } from './serialize';
 import { flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { flushPendingBaseScenes } from './pendingBaseScene';
+import { flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
@@ -26,6 +28,21 @@ import { getModeOwner } from './playMode';
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
   assets: FlushResult;
+  /** Pending `baseScene` refs written by this save (#831), if any were.
+   *
+   *  A SEPARATE field rather than folded into `assets`, because they fail for different reasons
+   *  and a caller acting on the failure needs to know which: an asset write is retried by saving
+   *  again, while a refused `setBaseScene` means the route's own unsaved-work or run-mode guard
+   *  turned it down. `toastForSave` still names both in one sentence — the human wants ONE answer
+   *  to "did my work save", not a taxonomy. */
+  baseScenes?: { saved: string[]; failed: Array<{ path: string; error: string }> };
+  /** Parked `.meta.json` import-settings edits (Inspector, #845) written by this save, if any.
+   *
+   *  ALWAYS attempted, same as `assets` — `/api/write-meta` carries no unsaved-work refusal, so
+   *  there is no branch of `runSaveAllOnce` that skips it. A separate field rather than folded
+   *  into `assets`, for the same reason `baseScenes` is: a sidecar is not an `ASSET_SCHEMA_TYPES`
+   *  document. */
+  importSettings?: MetaFlushResult;
   /** Which half the scene-shaped save targeted. `'assets'` = only parked asset docs were written:
    *  a preview envelope was open and the scene had nothing to write, so interrupting the preview
    *  would have bought churn and a flicker for no content. */
@@ -99,7 +116,12 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
   const preview = hasTimelinePreviewSession() ? getPreviewSaveHandler() : null;
   const needsAuthoredWorld = isEditingPrefab() || sceneNeedsWriting();
   if (preview && !needsAuthoredWorld) {
-    return { assets: await flushDirtyAssets(), target: 'assets' };
+    // Alongside `flushDirtyAssets` — not before or after it in any load-bearing sense (#845). See
+    // `pendingMeta.ts`'s header: `/api/write-meta` carries no unsaved-work refusal, so there is no
+    // ordering constraint here the way there is for the base-scene flush below.
+    const assets = await flushDirtyAssets();
+    const importSettings = await flushPendingMeta();
+    return { assets, ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}), target: 'assets' };
   }
   if (preview && previewHasAuthoredEdits()) {
     // ⚠️ DO NOT cycle here. Exiting restores the snapshot taken when the preview began, which would
@@ -151,6 +173,10 @@ async function runSaveTargets(): Promise<SaveOutcome> {
   // this branch never reaches `saveAll`'s own flush.
   if (isEditingPrefab()) {
     const assets = await flushDirtyAssets();
+    // Alongside `flushDirtyAssets`, for the same #845 reason as the branch above — this one never
+    // reaches `saveAll`'s own flush either, and `/api/write-meta` has no ordering constraint to
+    // respect relative to the prefab write below.
+    const importSettings = await flushPendingMeta();
     // `savePrefabEdit` owns the run-mode refusal itself (so the agent path inherits it too); this
     // reads the same condition ONLY to phrase the message — a bare `false` cannot tell "refused
     // because you are scrubbing" from "the prefab root was not found", and those need different
@@ -158,11 +184,26 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     const refused = !canEdit();
     const mode = { runMode: getRunMode(), owner: getModeOwner() };
     const prefabSaved = await savePrefabEdit();
-    return { assets, target: 'prefab', prefabSaved, ...(refused ? { prefabRefused: true, mode } : {}) };
+    // …and the pending base-scene refs, for the same #259 reason this branch already flushes
+    // parked asset docs: a `baseScene` set on a scene the editor never loaded has nothing to do
+    // with which world is open, and Cmd+S doing nothing for it is "the human pressed save and
+    // their edit did not save". AFTER `savePrefabEdit`, not before: `/api/scene-mutate` refuses
+    // while the editor reports unsaved work, and the prefab world's own edits are exactly that —
+    // running it first would refuse every ref against the save that is trying to persist it. Same
+    // ordering rule as `saveAll`'s, for the same reason.
+    const baseScenes = await flushPendingBaseScenes();
+    return {
+      assets, target: 'prefab', prefabSaved,
+      ...(baseScenes.saved.length || baseScenes.failed.length ? { baseScenes } : {}),
+      ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}),
+      ...(refused ? { prefabRefused: true, mode } : {}),
+    };
   }
   const scene = await saveAll({ allowDialog: true });
   return {
     assets: scene.assets ?? { saved: [], failed: [] },
+    ...(scene.baseScenes ? { baseScenes: scene.baseScenes } : {}),
+    ...(scene.importSettings ? { importSettings: scene.importSettings } : {}),
     target: 'scene',
     scene,
     // Sampled here, not in the toast: by the time a message renders the user may already have
@@ -181,13 +222,44 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
 
   // A failed asset write is reported first and always: it is pending work that stayed pending,
   // and the file it belongs to is named so the human knows which edit is still only in memory.
-  const failSuffix = assetFails.length
+  const baseFails = o.baseScenes?.failed ?? [];
+  const metaFails = o.importSettings?.failed ?? [];
+  // Split by REMEDY, not by severity: a conflict must not be retried blindly, a plain
+  // failure should be. `conflict` is set only by a 409 from the `ifMatch` precondition.
+  const metaConflicts = metaFails.filter((f) => f.conflict);
+  const metaPlainFails = metaFails.filter((f) => !f.conflict);
+  const failSuffix = (assetFails.length
     ? ` — ${assetFails.length} asset write(s) FAILED and are still unsaved: ${assetFails.map((f) => f.path).join(', ')}`
-    : '';
+    : '')
+    // Same rule for a refused base-scene ref (#831): it is pending work that stayed pending, and
+    // nothing else would have told the human. Its own clause rather than a shared count, because
+    // "asset write" is the wrong noun for a one-field scene mutation and a human chasing the wrong
+    // noun looks in the wrong panel.
+    + (baseFails.length
+      ? ` — ${baseFails.length} base-scene ref(s) FAILED and are still unsaved: ${baseFails.map((f) => f.path).join(', ')}`
+      : '')
+    // Same rule again for a rejected import-settings write (#845) — "asset write" is still the
+    // wrong noun (it names an ASSET_SCHEMA_TYPES document, not a `.meta.json` sidecar), and a
+    // human chasing that noun looks in the Assets panel rather than the Inspector.
+    // ⚠️ A CONFLICT is called out separately from a plain failure, because the two have OPPOSITE
+    // remedies and this sentence is what the human acts on. The house rule for a failed write is
+    // "press Save again" (`NineSliceEditor.save`'s dialog stays open saying exactly that) — and a
+    // conflicted write's baseline has just been dropped, so pressing Save again OVERWRITES the
+    // change somebody else made. Wording them identically turns the documented remedy into a
+    // silent clobber, which is the whole reason `MetaWriteResult.conflict` is carried this far.
+    + (metaConflicts.length
+      ? ` — ${metaConflicts.length} import-setting write(s) REFUSED: the file changed on disk since `
+        + `the edit was based on it (${metaConflicts.map((f) => f.path).join(', ')}). The edit is `
+        + `still pending — reopen the asset to see the current values. Saving again will OVERWRITE `
+        + `the newer file.`
+      : '')
+    + (metaPlainFails.length
+      ? ` — ${metaPlainFails.length} import-setting write(s) FAILED and are still unsaved: ${metaPlainFails.map((f) => f.path).join(', ')}`
+      : '');
   // A failed write is a WARNING in every branch, including the ones whose own outcome is benign.
   // A cancelled Save-As over a failed asset write was reporting 'info', so the sentence said FAILED
   // in a colour that says "nothing to see" — and colour is what gets read.
-  const worst = (k: 'success' | 'warn' | 'info') => (assetFails.length ? 'warn' : k);
+  const worst = (k: 'success' | 'warn' | 'info') => (assetFails.length || baseFails.length || metaFails.length ? 'warn' : k);
 
   if (o.target === 'assets') {
     // No scene half to report. Silence about it is the point: while authoring a clip the scene is

@@ -59,7 +59,15 @@ export function isImagePath(ref: string): boolean {
  *  loader WOULD happily load an `.mp4`, and that is precisely the trap: it mints its
  *  OWN `HTMLVideoElement`, giving a second decoder, a second autoplay negotiation and
  *  a second audio path for the clip `videoService` is already driving. The element is
- *  adopted instead (see `videoTextureSync2D`). */
+ *  adopted instead (see `videoTextureSync2D`).
+ *
+ *  ⚠️ The path-extension regex below duplicates `loaders/assetTypeClassifier.ts`'s
+ *  `BINARY_EXT_TYPE` video entries (`.mp4`/`.mov`/`.m4v`/`.webm`/`.mkv`), which is the
+ *  single source of truth for "what extension is a video". The duplication is forced,
+ *  not sloppy: this file is L0 `core/` and may import nothing (docs/architecture-layers.md),
+ *  while the classifier is L3 `loaders/`. So the list is kept honest by a TEST instead of
+ *  by an import — `tests/assets/assetPathPredicate.test.ts` fails if a video container is
+ *  added to the classifier and not here (or vice versa). */
 export function isVideoRef(ref: string): boolean {
   if (!ref) return false;
   if (isGuid(ref)) return textureProvider.get()?.getAssetType(ref) === 'video';

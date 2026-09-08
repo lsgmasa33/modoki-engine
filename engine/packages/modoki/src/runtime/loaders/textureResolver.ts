@@ -25,6 +25,7 @@ import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { createSupersessionToken, createTeardownToken } from '../core/liveness';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
 export type { ResolvedSprite } from '../core/textureProvider';
@@ -63,22 +64,42 @@ function getTextureLoader(): THREE.TextureLoader {
   return texLoader ?? (texLoader = new THREE.TextureLoader());
 }
 
+// A newer `setActiveRenderer` call must always win over an older one still in flight (a viewport
+// remount, an HMR reinit, a second viewport activating while the first's `getKTX2Loader()` await is
+// still pending) — supersession, not identity, because what matters is call ORDER: `detectedCaps`
+// is a single module-level value shared by every consumer, so even a same-object re-registration
+// must let the LATEST call's detection stand, not merely "a different renderer instance". Without
+// this a stale detection from an older call can land after the newer one and overwrite it — or
+// activate a renderer instance (`setActiveRendererHandle`) that a rebuild has already discarded.
+const setActiveRendererEpoch = createSupersessionToken();
+
 /** Register the active renderer so the KTX2Loader can detect which compressed
  *  formats the GPU supports. Must run after `renderer.init()` for WebGPU.
- *  Idempotent + cheap — safe to call from every renderer creation site. */
-export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<void> {
+ *  Idempotent + cheap — safe to call from every renderer creation site.
+ *
+ *  Returns a disposer (from `setActiveRendererHandle`) for the caller to invoke at viewport
+ *  teardown. A superseded call (either early-return below) registered nothing with
+ *  `activeRenderer.ts`, so it hands back a no-op disposer rather than `undefined` — the caller
+ *  always has *something* to store and call, without needing to know it was superseded. */
+export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<() => void> {
+  const stillLatest = setActiveRendererEpoch.begin();
   try {
     const loader = await getKTX2Loader();
+    if (!stillLatest()) return () => {}; // superseded — a newer call already owns `detectedCaps`
     loader.detectSupport(renderer as never);
     const cfg = (loader as unknown as { workerConfig?: { astcSupported?: boolean } }).workerConfig;
     detectedCaps = { astc: !!cfg?.astcSupported };
   } catch (e) {
     console.warn('[textureResolver] detectSupport failed:', e);
   }
-  setActiveRendererHandle(renderer);
+  // Re-check: the catch path above resumes from the same `await` with no further guard yet, so a
+  // superseded call must not activate its (possibly discarded) renderer either.
+  if (!stillLatest()) return () => {};
+  const dispose = setActiveRendererHandle(renderer);
   // A 3D renderer exists, so a GLB parse is likely imminent — start fetching the on-demand
   // loader chunks now rather than on the critical path of the first model load (#254).
   prewarmGlbLoaders();
+  return dispose;
 }
 
 /** Default delay before `ensureKtx2Caps` gives up waiting for a real viewport and stands up a
@@ -423,6 +444,17 @@ const texCache = new Map<string, TexCacheEntry>();
  *  decrement the NEW entry and dispose a texture that is very much in use. */
 const retired = new Map<THREE.Texture, TexCacheEntry>();
 
+/** Teardown liveness, invalidated wholesale by `disposeAllSharedTextures`. Exists because an
+ *  `invalidateTexture` eviction of a still-loading entry retires it lazily — the load's `.then`
+ *  runs whenever it resolves, which can be AFTER a full teardown has already cleared `retired`.
+ *  Without this, that late resolve would re-insert into the cleared map a texture nothing will
+ *  ever call `releaseTexture3D` on (its material is gone too) — worse than a stale entry, a GPU
+ *  leak invisible to `getSharedTextureStats()` right after the teardown that was supposed to
+ *  zero it.
+ *  ⚠️ `disposeAllSharedTextures` has no production caller today (only the `runtime/index.ts`
+ *  barrel re-export and tests) — this guards the MECHANISM, not an observed device leak. */
+const sharedTextureLiveness = createTeardownToken();
+
 function texCacheKey(url: string, isKtx: boolean, flipY?: boolean): string {
   // KTX2 is always bottom-origin (applyTextureSettings forces flipY=false), so flipY
   // doesn't differentiate the resulting texture there — keep those calls on ONE entry.
@@ -548,6 +580,9 @@ export function disposeAllSharedTextures(): void {
   // skipped them would leak exactly the textures an editor session re-imported.
   for (const t of retired.keys()) t.dispose();
   retired.clear();
+  // Invalidate AFTER clearing: any invalidateTexture eviction still in flight at this point
+  // must find liveness changed when it resolves (see the field's docblock).
+  sharedTextureLiveness.invalidateAll();
 }
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load
@@ -597,12 +632,22 @@ export function invalidateTexture(ref: string): void {
   // instance, and destroying it under the renderer is the use-after-free described on
   // `retired`. The last releaseTexture3D frees it — which arrives via disposeMaterial when the
   // material re-resolves, so the two invalidations are order-independent by construction.
+  const stillLive = sharedTextureLiveness.capture();
   for (const [key, entry] of texCache) {
     if (!urls.has(entry.url)) continue;
     texCache.delete(key);
     if (entry.texture) retired.set(entry.texture, entry);
-    // Still loading: retire it once it resolves, or its refs could never be freed.
-    else entry.promise.then((t) => { retired.set(t, entry); }).catch(() => { /* load failed — nothing to free */ });
+    // Still loading: retire it once it resolves, or its refs could never be freed. But if
+    // `disposeAllSharedTextures` runs a FULL teardown before this resolves, `retired` has
+    // already been cleared and disposed — a live session never calls that mid-scene (see its
+    // docblock), so no material can still be binding this texture, and re-inserting it here
+    // would resurrect an entry the teardown intentionally emptied with nothing left to ever
+    // free it (a straight GPU leak). Dispose it instead: exactly what the teardown would have
+    // done to it had the load finished in time.
+    else entry.promise.then((t) => {
+      if (!stillLive()) { t.dispose(); return; }
+      retired.set(t, entry);
+    }).catch(() => { /* load failed — nothing to free */ });
   }
   // THREE.Cache holds decoded image bytes only when Cache.enabled (it isn't, today);
   // evict for parity in case it's ever turned on.

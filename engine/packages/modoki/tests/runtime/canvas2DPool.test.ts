@@ -201,13 +201,47 @@ describe('canvas2DPool', () => {
   describe('live GPU-context count', () => {
     it('increments on init and drops to zero on destroyPool', async () => {
       const pool = await getModule();
-      expect(pool.liveCanvas2DContextCount()).toBe(0);
+      // Same module registry `getModule()` just populated (resetModules() ran in beforeEach, and
+      // canvas2DPool's own `noteGpuContextCreated`/`noteGpuContextDestroyed` calls write into
+      // THIS instance of gpuContextTracking) — a static top-of-file import would bind to a
+      // different instance and read a count that never moves.
+      const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+      expect(liveGpuContextCount()).toBe(0);
       const s1 = pool.allocate(1)!;
       const s2 = pool.allocate(2)!;
       await Promise.all([s1.ready, s2.ready]);
-      expect(pool.liveCanvas2DContextCount()).toBe(2);
+      expect(liveGpuContextCount()).toBe(2);
       pool.destroyPool();
-      expect(pool.liveCanvas2DContextCount()).toBe(0);
+      expect(liveGpuContextCount()).toBe(0);
+    });
+  });
+
+  // Phase 3 of #590 (docs/ios-gpu-memory.md): the GPU-memory report's per-slot
+  // byte attribution walks EXACTLY the slots this accessor returns.
+  describe('getSlotsForMemoryReport', () => {
+    it('is empty with no allocated slots', async () => {
+      const pool = await getModule();
+      expect(pool.getSlotsForMemoryReport()).toEqual([]);
+    });
+
+    it('returns one entry per live entity, with its entity id and container', async () => {
+      const pool = await getModule();
+      const s1 = pool.allocate(10)!;
+      const s2 = pool.allocate(20)!;
+      const slots = pool.getSlotsForMemoryReport();
+      expect(slots).toHaveLength(2);
+      expect(slots.map((s: any) => s.entityId).sort()).toEqual([10, 20]);
+      const forTen = slots.find((s: any) => s.entityId === 10)!;
+      expect(forTen.container).toBe(s1.container);
+      expect(slots.find((s: any) => s.entityId === 20)!.container).toBe(s2.container);
+    });
+
+    it('drops a slot once it is fully reclaimed', async () => {
+      const pool = await getModule();
+      pool.allocate(30);
+      expect(pool.getSlotsForMemoryReport()).toHaveLength(1);
+      pool.release(30); // no mount claim either, so this reclaims immediately
+      expect(pool.getSlotsForMemoryReport()).toEqual([]);
     });
   });
 
@@ -327,6 +361,33 @@ describe('canvas2DPool', () => {
       await s1.ready;
       (s1.app as { renderer: unknown }).renderer = null; // app destroyed out from under the slot
       expect(() => pool.renderAll()).not.toThrow();
+    });
+
+    it('a render that THREW is retried next frame even though nothing marked it dirty (#455)', async () => {
+      const pool = await getModule();
+      const s1 = pool.allocate(1)!;
+      s1.canvas.width = 320; s1.canvas.height = 480;
+      await s1.ready;
+      const render = s1.app.renderer.render as ReturnType<typeof vi.fn>;
+
+      // Baseline: a sized, initialized, allocated slot is SKIPPED when its entity isn't dirty.
+      pool.renderAll(new Set());
+      expect(render).not.toHaveBeenCalled();
+
+      // A dirty frame whose render throws — the throw must not escape renderAll.
+      render.mockImplementationOnce(() => { throw new TypeError("Cannot read properties of null (reading '0')"); });
+      expect(() => pool.renderAll(new Set([1]))).not.toThrow();
+      expect(render).toHaveBeenCalledTimes(1);
+
+      // The very next call, with the entity NOT in the dirty set, must still retry — the aborted
+      // render left the canvas blank and the failed attempt already consumed the dirty flag.
+      pool.renderAll(new Set());
+      expect(render).toHaveBeenCalledTimes(2);
+
+      // Once that retry succeeds, a following non-dirty call skips it again — not a permanent
+      // every-frame redraw.
+      pool.renderAll(new Set());
+      expect(render).toHaveBeenCalledTimes(2);
     });
 
     it('shrink spares an unclaimed slot whose canvas is still in the DOM (F6 guard)', async () => {

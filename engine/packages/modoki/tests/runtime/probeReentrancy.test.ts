@@ -148,3 +148,44 @@ describe('the in-flight guard survives overlapping probes', () => {
     expect(isProbeInFlight()).toBe(false);
   });
 });
+
+describe('resetProbeInFlightForTest scopes to a generation', () => {
+  it('a probe parked across the reset does not decrement the NEXT session\'s count', async () => {
+    // The bug: resetProbeInFlightForTest() sets probing = 0, but a probe from before the reset is
+    // still awaiting. When it resumes, its `finally` fires — and an ungenerationed guard would
+    // decrement the counter belonging to a probe that started AFTER the reset, dropping it to 0
+    // (or, unguarded, to -1) while that later probe is still running.
+    let releaseFirst!: () => void;
+    const first = withProbeInFlight(() => new Promise<void>((r) => { releaseFirst = r; }));
+    expect(isProbeInFlight()).toBe(true);
+
+    resetProbeInFlightForTest();
+
+    let releaseSecond!: () => void;
+    const second = withProbeInFlight(() => new Promise<void>((r) => { releaseSecond = r; }));
+    expect(isProbeInFlight()).toBe(true);
+
+    // Resolve the FIRST (pre-reset) probe and let its stale `finally` run.
+    releaseFirst();
+    await first;
+    // The whole point: the second session's in-flight probe must not have been touched.
+    expect(isProbeInFlight()).toBe(true);
+
+    releaseSecond();
+    await second;
+    expect(isProbeInFlight()).toBe(false);
+  });
+
+  it('does not leave the counter negative — a reset while parked, then a fresh probe still reports in-flight', async () => {
+    let releaseFirst!: () => void;
+    const first = withProbeInFlight(() => new Promise<void>((r) => { releaseFirst = r; }));
+    resetProbeInFlightForTest();
+    releaseFirst();
+    await first;
+
+    let sawInside = false;
+    await withProbeInFlight(async () => { sawInside = isProbeInFlight(); });
+    expect(sawInside).toBe(true);
+    expect(isProbeInFlight()).toBe(false);
+  });
+});

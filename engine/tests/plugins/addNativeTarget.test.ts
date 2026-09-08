@@ -4,7 +4,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, isPlausibleProjectDir } from '../../plugins/addNativeTarget';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
 import { mergeProjectConfig } from '../../project-config';
 
 let root: string;
@@ -116,6 +118,64 @@ describe('ensureCapacitorDeps', () => {
     const second = ensureCapacitorDeps(root, 'ios', editorRoot);
     expect(second.changed).toBe(false);
   });
+
+  // engine/tests/architecture/pinnedTransitiveDeps.test.ts requires every package.json that
+  // depends on @capacitor/cli to declare overrides.uuid — this scaffolder is the producer, so it
+  // must write the pin in the same call that adds @capacitor/cli, or a freshly-scaffolded project
+  // fails that guard on its very first commit.
+  it('pins overrides.uuid (^11.1.1) when it writes @capacitor/cli (docs/native-and-sdks.md § "Pinned transitive deps")', () => {
+    writePkg();
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.dependencies['@capacitor/cli']).toBeDefined();
+    expect(pkg.overrides).toEqual({ uuid: '^11.1.1' });
+  });
+
+  it('preserves an existing overrides block (and its unrelated keys) when adding the uuid pin', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'g',
+      dependencies: {},
+      overrides: { nanoid: '^3.3.17' },
+    }, null, 2) + '\n');
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.overrides).toEqual({ nanoid: '^3.3.17', uuid: '^11.1.1' });
+  });
+
+  it('does not clobber an already-set overrides.uuid pin', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'g',
+      dependencies: {},
+      overrides: { uuid: '^12.0.0' },
+    }, null, 2) + '\n');
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.overrides).toEqual({ uuid: '^12.0.0' });
+  });
+
+  // The case that separates "pin when we ADD the cli" from "pin whenever the cli is PRESENT": a
+  // manifest already carrying every dependency the heal wants, so the dependency loop changes
+  // NOTHING. Keyed on `addedCli` this heals nobody, and because the file write is gated on
+  // `changed`, the pin would be computed and then thrown away. In this repo the tree-wide guard
+  // makes an unpinned cli unreachable, but a project scaffolded from the public snapshot has no
+  // guard — nativeProjectDeps.test.ts's header is the standing warning that a heal running only on
+  // our machines cannot protect a stranger.
+  it('pins an EXISTING @capacitor/cli project that has no pin, even when no dependency changes', () => {
+    const full = {
+      '@capacitor/app': '^8.1.0', '@capacitor/cli': '^8.3.0', '@capacitor/core': '^8.3.0',
+      '@capacitor/haptics': '^8.0.2', '@capacitor/ios': '^8.3.0', '@capacitor/keyboard': '^8.0.3',
+      '@capacitor/preferences': '^8.0.1', '@capacitor/splash-screen': '^8.0.1',
+      'capacitor-game-debug': '*',
+    };
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'g', dependencies: full }, null, 2) + '\n');
+    const res = ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    // Reported as changed, and actually PERSISTED — the assertion that fails if `changed` is not
+    // set alongside the pin, which is the whole defect this case exists for.
+    expect(res.changed).toBe(true);
+    expect(pkg.overrides).toEqual({ uuid: '^11.1.1' });
+    expect(pkg.dependencies).toEqual(full); // no dependency was touched
+  });
 });
 
 describe('ensureCapacitorConfig', () => {
@@ -135,6 +195,241 @@ describe('ensureCapacitorConfig', () => {
     const r = ensureCapacitorConfig(root, cfg);
     expect(r.changed).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(root, 'capacitor.config.json'), 'utf8')).appId).toBe('keep.me');
+  });
+});
+
+describe('isNativeTargetScaffolded', () => {
+  it('is false when the platform folder does not exist at all', () => {
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
+  });
+
+  it('is false when the folder exists but is empty (killed at the very start of extraction)', () => {
+    fs.mkdirSync(path.join(root, 'ios', 'App'), { recursive: true });
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
+  });
+
+  it('is false when only the EARLY-archive file landed before the kill (#581 F1 — the bug this predicate exists to catch)', () => {
+    // project.pbxproj is entry 2/20 in the real iOS template; debug.xcconfig is entry 20/20.
+    // A kill straight after entry 2 leaves exactly this shape — the old single-marker predicate
+    // read it as "scaffolded" even though 18 of 20 template files never landed.
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), '// stub');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
+
+    // build.gradle is entry 3/52 in the real Android template; variables.gradle is entry 52/52.
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'android', 'app', 'build.gradle'), '// stub');
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
+  });
+
+  it('is true once both the early- and late-archive markers are present', () => {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'android', 'app', 'build.gradle'), '// stub');
+    fs.writeFileSync(path.join(root, 'android', 'variables.gradle'), '// stub');
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(true);
+  });
+});
+
+describe('isNativeTargetScaffolded markers match the real @capacitor/cli templates (#581)', () => {
+  // Loaded via createRequire, not a static `import 'tar'`, matching the existing pattern for this
+  // exact package elsewhere in the repo (engine/toolchain/index.ts) — this file is only ever run
+  // directly under vitest, never esbuild-bundled, but there's no reason to diverge from the
+  // established way this repo loads `tar`.
+  const require = createRequire(import.meta.url);
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+  function templateEntries(archiveName: string): string[] {
+    const tar = require('tar');
+    const entries: string[] = [];
+    tar.list({
+      file: path.join(repoRoot, 'node_modules', '@capacitor', 'cli', 'assets', archiveName),
+      sync: true,
+      onentry: (e: { path: string }) => entries.push(e.path),
+    });
+    return entries;
+  }
+
+  it('iOS SPM template: project.pbxproj is present, debug.xcconfig is the LAST entry', () => {
+    const entries = templateEntries('ios-spm-template.tar.gz');
+    expect(entries).toContain('App/App.xcodeproj/project.pbxproj');
+    expect(entries[entries.length - 1]).toBe('debug.xcconfig');
+  });
+
+  it('Android template: app/build.gradle is present, variables.gradle is the LAST entry', () => {
+    const entries = templateEntries('android-template.tar.gz');
+    expect(entries).toContain('app/build.gradle');
+    expect(entries[entries.length - 1]).toBe('variables.gradle');
+  });
+});
+
+describe('scaffoldNativeTarget repair (#581)', () => {
+  it('removes an incomplete platform folder before calling cap add, then proceeds', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    // Simulate a `cap add ios` killed right after the early-archive marker landed (#581 F1 shape).
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, 'stale — from an interrupted extraction');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
+
+    const sent: string[] = [];
+    const runShell = async (label: string, cmd: string) => {
+      sent.push(label);
+      if (cmd.startsWith('npx cap add')) {
+        // The real `cap add` would fatal here if the stale folder were still present —
+        // assert the repair step already cleared it before this runs.
+        expect(fs.existsSync(pbxproj)).toBe(false);
+        // Simulate a full, successful extraction (both markers) so isNativeTargetScaffolded
+        // reads true afterward.
+        fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+        fs.writeFileSync(pbxproj, '// stub');
+        fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+      }
+      return true;
+    };
+
+    const { warnings } = await scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg,
+      send: (m) => sent.push(m), runShell,
+    });
+
+    expect(warnings).toEqual([]);
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+    expect(sent.some((m) => /Removing incomplete/.test(m))).toBe(true);
+  });
+
+  it('refuses to delete an incomplete folder that contains a Firebase config file (#581 F2)', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, 'stale — extraction never finished');
+    const plist = path.join(root, 'ios', 'App', 'App', 'GoogleService-Info.plist');
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, 'real Firebase config — must survive');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
+
+    const runShell = async () => true; // must never be reached for the cap-add step
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+    })).rejects.toThrow(/GoogleService-Info\.plist/);
+
+    expect(fs.existsSync(plist)).toBe(true); // never deleted
+  });
+
+  it('does NOT touch a directory that already contains a complete target', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// real project file, keep me');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const marker = path.join(root, 'ios', 'App', 'App.xcodeproj', 'sentinel');
+    fs.writeFileSync(marker, 'must survive');
+
+    // Callers only invoke scaffoldNativeTarget when isNativeTargetScaffolded() is already false;
+    // this test still confirms the repair step itself won't wipe a directory that turns out to
+    // already be complete (e.g. a race), by asserting the sentinel file survives the run.
+    const runShell = async () => true;
+    await scaffoldNativeTarget({ projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell });
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it('removes an incomplete ANDROID platform folder before calling cap add, then proceeds', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const buildGradle = path.join(root, 'android', 'app', 'build.gradle');
+    fs.mkdirSync(path.dirname(buildGradle), { recursive: true });
+    fs.writeFileSync(buildGradle, 'stale — from an interrupted extraction');
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
+
+    const runShell = async (_label: string, cmd: string) => {
+      if (cmd.startsWith('npx cap add')) {
+        expect(fs.existsSync(buildGradle)).toBe(false);
+        fs.mkdirSync(path.dirname(buildGradle), { recursive: true });
+        fs.writeFileSync(buildGradle, '// stub');
+        fs.writeFileSync(path.join(root, 'android', 'variables.gradle'), '// stub');
+      }
+      return true;
+    };
+    const { warnings } = await scaffoldNativeTarget({
+      projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+    });
+    expect(warnings).toEqual([]);
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(true);
+  });
+
+  it('refuses to delete an incomplete ANDROID folder that contains google-services.json (#581 F2)', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const buildGradle = path.join(root, 'android', 'app', 'build.gradle');
+    fs.mkdirSync(path.dirname(buildGradle), { recursive: true });
+    fs.writeFileSync(buildGradle, 'stale');
+    const gsJson = path.join(root, 'android', 'app', 'google-services.json');
+    fs.writeFileSync(gsJson, 'real Firebase config — must survive');
+    expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
+
+    const runShell = async () => true;
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+    })).rejects.toThrow(/google-services\.json/);
+    expect(fs.existsSync(gsJson)).toBe(true);
+  });
+
+  it('force:true removes an ALREADY-COMPLETE target and regenerates it (#581 finding 1)', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, 'ORIGINAL — must be gone after force-regeneration');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), 'ORIGINAL');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true); // genuinely complete before this run
+
+    const sent: string[] = [];
+    const runShell = async (label: string, cmd: string) => {
+      sent.push(label);
+      if (cmd.startsWith('npx cap add')) {
+        expect(fs.existsSync(pbxproj)).toBe(false); // removed before cap add, even though it was complete
+        fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+        fs.writeFileSync(pbxproj, 'REGENERATED');
+        fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), 'REGENERATED');
+      }
+      return true;
+    };
+    await scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg,
+      send: (m) => sent.push(m), runShell, force: true,
+    });
+    expect(fs.readFileSync(pbxproj, 'utf8')).toBe('REGENERATED');
+    expect(sent.some((m) => /--force: removing existing/.test(m))).toBe(true);
+  });
+
+  it('force:true still refuses when a Firebase survivor is present, even on a complete target', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const plist = path.join(root, 'ios', 'App', 'App', 'GoogleService-Info.plist');
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, 'real Firebase config — must survive even under --force');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+    const runShell = async () => true; // must never be reached
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+    })).rejects.toThrow(/GoogleService-Info\.plist/);
+    expect(fs.existsSync(plist)).toBe(true);
+    expect(fs.existsSync(pbxproj)).toBe(true); // nothing touched
   });
 });
 

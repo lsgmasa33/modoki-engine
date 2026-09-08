@@ -39,7 +39,10 @@ attached to it. Parent/child relationships are expressed by
 ⚠️ **`entity.id()` is the INDEX, not the identity — never trust it across frames.** It masks the
 generation off the packed number, and so do `has()`/`get()`; only `isAlive()` checks it. koota's
 entity index is a **LIFO free list**, so a despawn immediately followed by a same-shape respawn
-reclaims the exact freed index. Any state that (a) is **held across frames/ticks** rather than
+reclaims the exact freed index. ⚠️ **In bulk the reuse is total and in REVERSE**, not occasional:
+measured against the installed koota (#853), destroying 8 entities and then spawning 8 hands back
+`8,7,6,5,4,3,2,1`. So "a collision is unlikely" is never an argument — replace a whole scene's
+worth of entities and every new one lands on an old one's id. Any state that (a) is **held across frames/ticks** rather than
 rebuilt from a query every call and (b) **trusts an `entity.id()` lookup as "still the same logical
 entity"** will hand a new entity the dead one's state. A `seen`-set sweep at the end of a pass is
 not a defence: a despawn+respawn landing BETWEEN two passes never gets one.
@@ -51,10 +54,73 @@ Two sanctioned fixes, and the choice is about who else holds the id:
   is also a public *addressing* contract other modules call you with. Used by
   `physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
   [physics-2d.md](physics-2d.md)), by `video/videoSystem.ts` (its `owner` map — #336; its ids reach
-  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), and by
+  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), by
   `rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
   "forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it
-  outlive its entity).
+  outlive its entity), and by `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered
+  `entityShaders` maps and its per-frame dirty map).
+
+⚠️ **A per-frame rebuild is not automatically the "revalidated" exemption below.** The broker's
+dirty map is cleared and refilled every frame and was still wrong, because the mark and the read sit
+on OPPOSITE SIDES of one frame: the driver marks at ECS priority 0, the 2D render pass reads at
+priority 20/40, and a despawn+respawn in between reads the dead entity's mark. The exemption needs
+the entry checked against something **recomputed from the live entity**, not merely written recently.
+
+⚠️ **"Store the generation" is only HALF the shape — the other half is REBUILDING on a mismatch,
+and omitting it is worse than the bug.** The rule above says *keep the id key and store the
+generation alongside it, **rebuilding on a mismatch***; `physics2DSystem` rebuilds the body, and
+`videoSystem` calls `forget(id)` before re-taking ownership. A guard that only *refuses* on a
+mismatch, with no producer re-stamping the entry for the newcomer, converts a transient wrong read
+into a **permanent** one — the newcomer is denied state it legitimately owns, forever, and the
+sweep that would normally clear the entry deliberately keeps it because the newcomer is live. That
+is what #848's first cut shipped: the broker's read was generation-checked while `Scene2D.tsx`
+wrote the stamp only when it BUILT a Mesh, so a respawn reusing the dead entity's slot was locked out
+of the Shader on screen. **When you add a generation check, find every producer, not just every
+consumer** — and the reuse/fast paths are producers even though they build nothing.
+
+⚠️ **Re-stamping restores ACCESS to a reused resource; it does not RESET that resource's state.**
+The two are separate, and #848 fixed only the first: a respawned 2D-material entity went on
+inheriting the dead one's uniform values, because they are seeded only on a build. Decide which you
+actually need, and say which one you implemented.
+
+⚠️ **"Rebuild on a mismatch" names the OBLIGATION, not the only way to discharge it.** There are
+two, and the choice is a real one:
+
+- **Rebuild** — throw the resource away and construct it for the newcomer. `physics2DSystem`
+  rebuilds the body; `videoSystem` calls `forget(id)` first. Resets everything by construction, so
+  it is the right default and the one to reach for when you are unsure what the resource holds.
+- **Reset in place** — keep the resource and restore the state a build would have given it. Correct
+  only when you can ENUMERATE what a build seeds and show the rest is already covered, so it costs
+  an argument the rebuild does not.
+
+#873 is the case that earns the second, and the reason is worth carrying: on that path *the rebuild
+is itself the leak*. Every `new Shader` mints two `UniformGroup`s with fresh `_resourceId`s, so
+Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn and is cleared only at
+renderer teardown (#699, live upstream, carried as #694 defect 5) — and recycled ids ARE the pooled
+respawn path, the last place to put unbounded growth. So `Scene2D.tsx`'s material pass re-seeds
+`matUniforms` from the program defaults instead, which is the shape #690 (`updateMtsdfPixiMetrics`)
+and #698 (the frame swap) already use in that file. The enumeration that licenses it is in
+`docs/rendering.md` § 2D custom materials.
+
+⚠️ **KEY THE RESET OFF THE THING BEING RESET.** #873's first cut keyed its uniform reset off
+`entityShaders` — the same map #848's ACCESS check uses — and that map's lifetime is strictly
+SHORTER than the resource it was standing in for: a per-frame purge drops the stamp on any frame the
+pass skips the entity, while the resource survives. Result: the reset read "no previous stamp" and
+skipped, permanently, in exactly the scenario it existed for. Caught in its own close-out review, and
+the corrected shape stamps the generation **on the slot that owns the Shader**. Generalised: when the
+guard and the payload live in two different containers, the guard is only as good as the SHORTER
+lifetime — so put the stamp next to the state it describes, and if you must key off something else,
+prove that thing cannot be dropped while the state survives.
+
+**State the invariant, not the mechanism.** "Re-seeds the uniforms" is an implementation note; *a
+respawn renders identically whether or not it reclaimed a dead entity's index* is the thing a test
+can pin and a later optimisation cannot quietly break.
+
+⚠️ **The choice can be forced by a map you do not own.** `sprite2DMaterialBroker` takes the second
+shape even though its maps look module-private, because `Scene2DRenderer` owns them and keys them in
+the same space as its `slots`/`activeIds`/`last*Render` maps, which one shared sweep deletes
+together — re-keying one of them to `entity.valueOf()` would silently desync that sweep. Ask who
+else *keys* the map, not just who calls you.
 
 Neither is needed for a cache whose every entry is **revalidated against a value recomputed this
 frame** — that is why `skinning/skin2DSystem.ts` is safe despite looking identical, and

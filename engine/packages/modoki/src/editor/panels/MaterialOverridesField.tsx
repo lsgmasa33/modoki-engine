@@ -15,6 +15,7 @@ import { type TraitMeta, getTraitByName } from '../../runtime/core/ecs/traitRegi
 import { writeTraitFieldPerEntityWithUndo as writeFieldPerEntity } from '../undo/entityActions';
 import type { MaterialParamOverride, MaterialParamSource } from '../../runtime/traits/MaterialInstance';
 import { resolveGuidToPath, resolveRef, isGuid } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { listShaderOptions, optionValueForMaterial, resolveShaderSchema } from '../shaderCatalog';
 import { BufferedTextInput, BufferedNumberInput, inputStyle } from './fields';
 import { FieldLabel, DropdownField } from './assetViews/widgets';
@@ -76,8 +77,10 @@ function useShaderUniforms(guid: string): { uniforms: string[]; textures: string
     const path = isGuid(guid) ? (resolveGuidToPath(guid) ?? resolveRef(guid)) : guid;
     if (!path) return;
     fetch(path)
-      .then((r) => (r.ok ? r.json() : null))
-      .then(async (data: Record<string, unknown> | null) => {
+      .then((r) => parseAssetJson(r, path))
+      .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
+      .then(async (json) => {
+        const data = json as Record<string, unknown> | null;
         if (!data || cancelled) return;
         // A 2D material GUID resolves to a `.shader.json` manifest DIRECTLY (the shader IS
         // the material), so its `params` are the uniform/texture names — no .mat.json indirection.
@@ -187,7 +190,8 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
               <span style={lblStyle}>target</span>
               <div style={{ flex: 1 }}>
                 <BufferedTextInput value={o.target || ''} onChange={(v) => update(i, () => ({ target: v }))}
-                  style={{ ...inputStyle, width: '100%' }} placeholder={kind === 'prop' ? 'e.g. opacity' : kind === 'texture' ? 'texture param name' : 'uniform name'} />
+                  style={{ ...inputStyle, width: '100%' }} placeholder={kind === 'prop' ? 'e.g. opacity' : kind === 'texture' ? 'texture param name' : 'uniform name'}
+                  dataUiId={`material.override.${i}.target`} dataUiLabel={o.target || `override ${i + 1}`} />
               </div>
             </div>
             <Suggestions options={suggestions} onPick={(v) => update(i, () => ({ target: v }))} />
@@ -196,7 +200,8 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
               // A texture override binds a sprite/texture GUID (accept:['sprite'] gives the picker),
               // overriding the param's manifest default for this instance — no source.
               <AssetRefField label="ref" value={o.ref || ''} accept={['sprite']} placeholder="sprite/texture"
-                onChange={(v) => update(i, () => ({ ref: v }))} />
+                onChange={(v) => update(i, () => ({ ref: v }))}
+                dataUiId={`material.override.${i}.ref`} dataUiLabel={o.target || `override ${i + 1}`} />
             ) : (<>
             <DropdownField label="source" value={srcType} options={SOURCE_OPTS}
               onChange={(v) => update(i, () => ({ source: defaultSource(v) }))} />
@@ -206,14 +211,15 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
                 <span style={lblStyle}>value</span>
                 <div style={{ flex: 1, display: 'flex' }}>
                   <FieldValueWidget hint={{ type: kind === 'prop' && COLOR_TARGETS.has(o.target) ? 'color' : 'number', step: 0.05 }}
-                    value={src.value} onChange={(v) => patchSource(i, { value: v })} />
+                    value={src.value} onChange={(v) => patchSource(i, { value: v })}
+                    dataUiId={`material.override.${i}.value`} dataUiLabel={o.target || `override ${i + 1}`} />
                 </div>
               </div>
             )}
 
             {srcType === 'time' && (<>
-              <NumRow label="speed" value={num(src.speed, 1)} step={0.05} onChange={(v) => patchSource(i, { speed: v })} />
-              <NumRow label="wrap (s)" value={num(src.wrap, 10000)} step={1} onChange={(v) => patchSource(i, { wrap: v })} />
+              <NumRow label="speed" value={num(src.speed, 1)} step={0.05} onChange={(v) => patchSource(i, { speed: v })} dataUiId={`material.override.${i}.speed`} dataUiLabel={o.target || `override ${i + 1}`} />
+              <NumRow label="wrap (s)" value={num(src.wrap, 10000)} step={1} onChange={(v) => patchSource(i, { wrap: v })} dataUiId={`material.override.${i}.wrap`} dataUiLabel={o.target || `override ${i + 1}`} />
               <DropdownField label="base" value={String(src.base || 'visual')} options={['visual', 'sim']}
                 onChange={(v) => patchSource(i, { base: v })} />
             </>)}
@@ -223,11 +229,12 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
                 <span style={lblStyle}>key</span>
                 <div style={{ flex: 1 }}>
                   <BufferedTextInput value={String(src.key || '')} onChange={(v) => patchSource(i, { key: v })}
-                    style={{ ...inputStyle, width: '100%' }} placeholder="read-source key" />
+                    style={{ ...inputStyle, width: '100%' }} placeholder="read-source key"
+                    dataUiId={`material.override.${i}.key`} dataUiLabel={o.target || `override ${i + 1}`} />
                 </div>
               </div>
-              <NumRow label="scale" value={num(src.scale, 1)} step={0.05} onChange={(v) => patchSource(i, { scale: v })} />
-              <NumRow label="default" value={num(src.default, 0)} step={0.05} onChange={(v) => patchSource(i, { default: v })} />
+              <NumRow label="scale" value={num(src.scale, 1)} step={0.05} onChange={(v) => patchSource(i, { scale: v })} dataUiId={`material.override.${i}.scale`} dataUiLabel={o.target || `override ${i + 1}`} />
+              <NumRow label="default" value={num(src.default, 0)} step={0.05} onChange={(v) => patchSource(i, { default: v })} dataUiId={`material.override.${i}.default`} dataUiLabel={o.target || `override ${i + 1}`} />
             </>)}
 
             {srcType === 'curve' && (
@@ -256,13 +263,15 @@ export function defaultSource(type: string): MaterialParamSource {
   }
 }
 
-/** A compact labelled number row. */
-function NumRow({ label, value, step, onChange }: { label: string; value: number; step: number; onChange: (v: number) => void }) {
+/** A compact labelled number row. `dataUiId`/`dataUiLabel` are caller-owned (this helper backs
+ *  4 rendered fields across the time/store source branches — see MaterialOverridesField).
+ *  `dataUiId` is REQUIRED (#724 close-out) — see the note on `AssetRefField`'s. */
+function NumRow({ label, value, step, onChange, dataUiId, dataUiLabel }: { label: string; value: number; step: number; onChange: (v: number) => void; dataUiId: string; dataUiLabel?: string }) {
   return (
     <div style={rowFlex}>
       <span style={lblStyle}>{label}</span>
       <div style={{ flex: 1, display: 'flex' }}>
-        <BufferedNumberInput value={value} step={step} onChange={onChange} style={{ ...inputStyle, flex: 1 }} />
+        <BufferedNumberInput value={value} step={step} onChange={onChange} style={{ ...inputStyle, flex: 1 }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
       </div>
     </div>
   );

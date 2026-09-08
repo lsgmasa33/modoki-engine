@@ -331,6 +331,7 @@ describe('buildTierResolveInput — the ONE input builder both boot and player A
     probeVerdictStore.provide({
       read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     const input = buildTierResolveInput(caps, 'auto');
     expect(input.probeClass).toBe('middle');
@@ -340,6 +341,7 @@ describe('buildTierResolveInput — the ONE input builder both boot and player A
     probeVerdictStore.provide({
       read: () => ({ fingerprint: 'v3|android|SM-OTHER||100', deviceClass: 'capable', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     const input = buildTierResolveInput(caps, 'auto');
     expect(input.probeClass).toBeUndefined();
@@ -349,6 +351,7 @@ describe('buildTierResolveInput — the ONE input builder both boot and player A
     probeVerdictStore.provide({
       read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     const input = buildTierResolveInput(caps, 'auto', { useProbe: false });
     expect(input.probeClass).toBeUndefined();
@@ -358,6 +361,7 @@ describe('buildTierResolveInput — the ONE input builder both boot and player A
     probeVerdictStore.provide({
       read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'weak', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     const input = buildTierResolveInput(caps, 'auto', { probeClass: 'capable' });
     expect(input.probeClass).toBe('capable');
@@ -381,6 +385,7 @@ describe('readCachedProbeVerdict', () => {
     probeVerdictStore.provide({
       read: () => ({ fingerprint: matchingFingerprint, deviceClass: 'capable', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     expect(readCachedProbeVerdict(caps)?.deviceClass).toBe('capable');
   });
@@ -398,6 +403,7 @@ describe('readCachedProbeVerdict', () => {
         final: true,
       }),
       write: () => {},
+      session: () => undefined,
     });
 
     const cached = readCachedProbeVerdict(caps);
@@ -1779,6 +1785,7 @@ describe('⭐ the cpu-limited licence, END TO END through the builder (#205)', (
         final: true,
       }),
       write: () => {},
+      session: () => undefined,
     });
 
     const resolved = resolveTier(buildTierResolveInput(caps, 'auto'));

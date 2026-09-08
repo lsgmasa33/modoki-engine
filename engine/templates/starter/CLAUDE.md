@@ -10,14 +10,6 @@ an `.mcp.json` for it (the AI panel shows exactly where). When the desktop edito
 project open, it exposes the tools below. **Prefer them over screenshots** — they read and
 mutate the *live* running engine, so they prove your edits actually took effect.
 
-**If you are Cursor, Codex CLI, or Antigravity CLI reading this as `AGENTS.md`:** there is no
-"Connect" flow for you yet — only Claude Code gets one wired automatically. If MCP tools
-below aren't available, either they were never configured for this project, or (Codex CLI
-specifically) this directory hasn't been trusted yet — Codex silently skips a project-scoped
-`.codex/config.toml`'s MCP servers until the human answers its trust prompt. Tell the human
-if tools seem to be missing rather than assuming they don't exist; don't guess at scene state
-from source alone (see the section below).
-
 ## The engine's own source is on this machine — read it when you need to
 
 This project depends on `@modoki/engine`, served live by the running **Modoki Editor** from

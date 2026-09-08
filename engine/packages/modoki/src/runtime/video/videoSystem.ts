@@ -24,7 +24,7 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { getPlayState } from '../core/playState';
 import { onWorldSwap } from '../core/ecs/world';
 import { playVideo, applyTimeScale, videoFadeGain, type VideoHandle } from './videoService';
-import { emitVideoStart, emitVideoEnd } from './VideoEvents';
+import { emitVideoStart, emitVideoEnd, emitVideoBlocked, type VideoEventPayload } from './VideoEvents';
 import { getTimeScale } from '../core/getTime';
 
 /** Live handle per entity, plus the clip it was created for (so a `clip` change is
@@ -34,14 +34,37 @@ interface Live {
   clip: string;
   /** True once `autoplay` has been honoured, so it fires once rather than every frame. */
   autoplayed: boolean;
-  /** `@video.start` is emitted on the first frame the clip actually plays — not at
-   *  handle creation, which can precede playback by a whole download. */
+  /** `@video.start` is emitted once the handle is OBSERVED playing — not at handle creation,
+   *  which can precede playback by a whole download, and not on the pass that merely ASKS the
+   *  clip to play. Guards one playback, not the `Live` entry's whole lifetime:
+   *  `seekEntityVideo` clears it on a rewind to 0, so a replayed clip (same GUID, same `Live`
+   *  entry) fires `@video.start` again. A mid-clip pause/resume or seek leaves it set —
+   *  that's the same playback continuing.
+   *
+   *  #431: `LiveVideoHandle.attemptPlay()` can have `element.play()` rejected by the autoplay
+   *  policy (it sets a private `blocked` flag), and `retryBlockedPlay()` later starts the real
+   *  playback entirely outside this system's reconcile — so latching this at REQUEST time (the
+   *  pass that calls `handle.play()`) announced a start for a cold-boot cutscene that never
+   *  rendered a frame, and never announced the real one once a gesture unblocked it. Fixed by
+   *  reading `handle.playing` BEFORE this pass's own `handle.play()` call: a request that is
+   *  about to succeed is only observed on the FOLLOWING pass (one frame later — the accepted
+   *  cost, see `videoSystem`'s comment at the call site), and a request that gets blocked is
+   *  never observed until it genuinely starts, however that happens. */
   startEmitted: boolean;
   /** `@video.end` is emitted from the RECONCILE, when the handle is first observed to have
    *  ended — not from the element's `ended` event. The event is a promptness hint that can be
    *  missed entirely (see `LiveVideoHandle.ended`); a game listening for `@video.end` to
-   *  advance a cutscene must not be able to hang on a lost DOM event. */
+   *  advance a cutscene must not be able to hang on a lost DOM event. Guards one observed end,
+   *  not the `Live` entry's whole lifetime: the reconcile re-arms it the moment `handle.ended`
+   *  goes false again, so a rewind-and-replay of the SAME clip fires `@video.end` again too. */
   endEmitted: boolean;
+  /** `@video.blocked` is announced ONCE per refused PLAY REQUEST, not once per frame — the
+   *  reconcile calls `play()` every frame while the trait says `playing`, so an unguarded report
+   *  would spam the console for the whole span. Cleared on either edge out of that state: the
+   *  handle unblocking (a gesture got it running), or `playing` going false (the span ended) —
+   *  see the reset beside `handle.pause()`. Both are needed, because a `pause()` leaves `blocked`
+   *  set, so the unblock edge alone never fires on a device that never receives a gesture. */
+  blockedReported: boolean;
 }
 
 /** A clip being downloaded before it can play. Tracked separately from `live` so the
@@ -185,6 +208,18 @@ export function videoSystem(world: World): void {
 
   const seen = new Set<number>();
 
+  // #432: collected here and flushed AFTER `updateEach` returns, rather than emitted inline.
+  // koota snapshots `vp` into a local before the callback runs and writes that snapshot back
+  // UNCONDITIONALLY once the callback returns — so a game handler's `entity.set(VideoPlayer,
+  // ...)`, called synchronously from an emit fired INSIDE the callback, would land during the
+  // callback only to be clobbered by koota's own post-callback write-back of the stale
+  // pre-callback snapshot. Deferring the call past `updateEach` puts it past that write-back
+  // too, so the handler's write is the last one and sticks. Declared per-call (not module
+  // scope) so it can't leak state across worlds or a re-entrant call.
+  const emits: Array<{ kind: 'start' | 'end'; payload: VideoEventPayload }> = [];
+  // Same #432 reason as `emits` above: deferred past `updateEach`'s post-callback write-back.
+  const blocked: VideoEventPayload[] = [];
+
   world.query(VideoPlayer).updateEach(([vp], entity) => {
     const id = entity.id();
     // A reclaimed index (see `owner`): purge the previous occupant's state before reading any of
@@ -289,7 +324,10 @@ export function videoSystem(world: World): void {
           live.get(id)?.handle.pause();
         },
       });
-      l = { handle, clip: vp.clip, autoplayed: false, startEmitted: false, endEmitted: false };
+      l = {
+        handle, clip: vp.clip, autoplayed: false, startEmitted: false, endEmitted: false,
+        blockedReported: false,
+      };
       live.set(id, l);
       // A bundled/streamed clip never downloads, so it is loaded by definition.
       // Without this it would report 0 forever and any bound progress bar would stick.
@@ -304,9 +342,54 @@ export function videoSystem(world: World): void {
     }
 
     if (vp.playing) {
+      // #447: a refused play request is otherwise COMPLETELY silent — post-#431 a blocked clip
+      // correctly emits no `@video.start`, and if a timeline pauses it at the span end it never
+      // emits `@video.end` either, so a cutscene that never played leaves no trace at all. Read
+      // BEFORE this pass's own `play()` for the same reason the start check is (see below): the
+      // flag is only set when the play PROMISE rejects, a microtask after `play()` returns.
+      if (l.handle.autoplayBlocked) {
+        if (!l.blockedReported) {
+          l.blockedReported = true;
+          console.warn(`[video] playback of clip ${vp.clip} was refused by the browser (autoplay policy) — it is waiting for a user gesture.`);
+          blocked.push({ entity: entityGuid, clip: vp.clip });
+        }
+      } else l.blockedReported = false;
+
+      // #431: the OBSERVED-playback check runs BEFORE `l.handle.play()` is called below, and
+      // that ordering is the fix, not incidental — resist "cleaning it up" into a single
+      // check-and-play. A real `element.play()` sets `element.paused = false` SYNCHRONOUSLY as
+      // part of its own algorithm and only rejects the returned promise LATER if the autoplay
+      // policy blocks it — so checking `handle.playing` AFTER calling `play()` would still
+      // read "playing" for one frame on a clip that is about to be blocked and render nothing.
+      // Checking before means a genuine, successful play request is only OBSERVED as started
+      // on the FOLLOWING reconcile pass (one frame later — accepted, see the callers this
+      // pushed a second pass onto), while a blocked one is never announced until the handle
+      // truly starts, however that happens (including via `retryBlockedPlay()`, which runs
+      // entirely outside this system on the next gesture-unlock sweep).
+      //
+      // `LiveVideoHandle.play()` early-returns on a finished clip (`if (this.ended) return;`),
+      // but the end-emit below re-arms `startEmitted` the moment `@video.end` fires — so
+      // `playing = true` on a still-ended clip with NO intervening seek would otherwise
+      // announce a start for a playback that can never happen: `play()` refuses to actually
+      // run it, so the announced start would never be followed by a single frame of real
+      // playback. `@video.start` means observed playback (#431), and closing that gap is what
+      // removed the cutscene hang #426 set out to fix. `handle.playing` already excludes an
+      // ended handle, but the explicit `!l.handle.ended` keeps that intent readable here too.
+      if (!l.startEmitted && !l.handle.ended && l.handle.playing) {
+        l.startEmitted = true;
+        emits.push({ kind: 'start', payload: { entity: entityGuid, clip: vp.clip } });
+      }
       l.handle.play();
-      if (!l.startEmitted) { l.startEmitted = true; emitVideoStart({ entity: entityGuid, clip: vp.clip }); }
-    } else l.handle.pause();
+    } else {
+      l.handle.pause();
+      // #447: re-arm on the way OUT of a play request too, not only when the handle unblocks.
+      // `pause()` does NOT clear `blocked` — only a SUCCESSFUL `attemptPlay` does — so on a
+      // device where no gesture ever arrives, `autoplayBlocked` stays true across the gap
+      // between two spans. Without this reset the latch set by the first refused span would
+      // still be set for the second, and every later cutscene on this entity would be silent:
+      // exactly the failure #447 exists to make findable.
+      l.blockedReported = false;
+    }
 
     // Live-applied fields. The end-fade is a MULTIPLIER computed from the element's own
     // clock, never a write back into `vp.volume` — that field is the authored target the
@@ -317,15 +400,40 @@ export function videoSystem(world: World): void {
     ));
     l.handle.setMuted(vp.muted);
     l.handle.setRate(vp.rate);
+    l.handle.setLoop(vp.loop);
+    l.handle.setTimeMode(vp.timeMode);
 
     // A finished non-looping clip: reflect it into the trait so game logic and the Inspector
     // see it stopped without polling the element, and journal `@video.end` exactly once.
     // Both keyed off `handle.ended`, which reads the ELEMENT rather than trusting the event.
     if (l.handle.ended) {
       if (vp.playing) vp.playing = false;
-      if (!l.endEmitted) { l.endEmitted = true; emitVideoEnd({ entity: entityGuid, clip: l.clip }); }
+      if (!l.endEmitted) {
+        l.endEmitted = true;
+        // Re-arm the START too: a finished clip can only resume via a seek (`play()` refuses
+        // one), and that resume is a NEW observed playback wherever it starts from —
+        // `@video.start` means observed playback (#431), so this playback earns its own start
+        // event. Without this, `video.seek` to mid-clip out of the ended state re-arms
+        // `endEmitted` (the `else` below) and the clip would resume playing with no
+        // `@video.start` ever announcing that it did.
+        l.startEmitted = false;
+        emits.push({ kind: 'end', payload: { entity: entityGuid, clip: l.clip } });
+      }
+    } else {
+      // Re-arm: `endEmitted` guards ONE observed end, not the whole `Live` entry's lifetime.
+      l.endEmitted = false;
     }
   });
+
+  // #432: flush the deferred emits now that koota's post-callback write-back has already
+  // happened for every entity above — see the comment where `emits` is declared. Order is
+  // preserved (entity order as iterated, start-before-end within one entity) simply by
+  // flushing in push order; nothing here needs to re-sort.
+  for (const e of emits) {
+    if (e.kind === 'start') emitVideoStart(e.payload);
+    else emitVideoEnd(e.payload);
+  }
+  for (const p of blocked) emitVideoBlocked(p);
 
   // Entities that lost the trait (or were despawned) leak their decoder otherwise.
   for (const e of [...live.keys()]) {
@@ -345,7 +453,31 @@ export function videoSystem(world: World): void {
 /** Seek an entity's live clip, if it has one. Used by the declarative `video.seek` /
  *  `video.stop` / `video.skip` actions, which act on an ENTITY rather than a handle. */
 export function seekEntityVideo(entityId: number, seconds: number): void {
-  live.get(entityId)?.handle.seek(seconds);
+  const l = live.get(entityId);
+  if (!l) return;
+  l.handle.seek(seconds);
+  // A rewind to the start begins a NEW playback, so `@video.start` must fire again for it.
+  // Only the start: `endEmitted` re-arms itself from the reconcile's `handle.ended` edge.
+  if (seconds <= 0) l.startEmitted = false;
+}
+
+/** Claim this entity's `@video.end` announcement for the current playback, latching the guard so
+ *  the reconcile does not announce it a second time. Returns false when the end was ALREADY
+ *  announced — the caller must then stay silent.
+ *
+ *  Exists for `video.skip`, which announces the end itself so a game waiting on "the cutscene is
+ *  over" fires exactly once whether the clip was watched or dismissed. Without this claim, a skip
+ *  pressed AFTER the clip already ended emits a second, redundant `@video.end` for a playback
+ *  that was already announced over.
+ *
+ *  An entity with no live handle claims successfully: a skip must always announce (that is the
+ *  softlock this action exists to prevent), and there is no guard to double-fire against. */
+export function claimVideoEndEmit(entityId: number): boolean {
+  const l = live.get(entityId);
+  if (!l) return true;
+  if (l.endEmitted) return false;
+  l.endEmitted = true;
+  return true;
 }
 
 /** Test hook — drop all state. */

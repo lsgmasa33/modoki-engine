@@ -3,14 +3,16 @@
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
+import { noteGpuContextCreated } from '../core/gpuContextTracking';
+import { installGlProgramReleaseHatch } from './glProgramRelease';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
 import { Transform, Renderable3D, Renderable3DPrimitive, Camera, CameraFrame, Tint, isMaterialInstanced, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, Animator, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text3D, TextAnimation } from '../traits';
 import { layoutText, type TextQuad } from './text/layoutText';
-import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
+import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
-import { makeMtsdfMaterial, updateMtsdfStyle, type MtsdfStyle } from './text/mtsdfShader';
+import { makeMtsdfMaterial, updateMtsdfStyle, canReuseMtsdfMaterial, type MtsdfStyle } from './text/mtsdfShader';
 import { getFontTexture } from './text/fontTextureThree';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getTextDirtyVersion } from './text/textDirty';
@@ -39,9 +41,13 @@ import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
   retiredEnvironments, disposeRetiredEnvironment,
-  retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial,
+  retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial, getTemplatesForModel,
 } from '../loaders/meshTemplateCache';
-import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
+// `getEnvPMREMTexture`/`getEnvCubeTexture`/`sourceForEnvDerived` live in `./envPmrem` (#739, #775,
+// #779) — that module needs `three/webgpu`, which `meshTemplateCache.ts` can no longer import
+// (render3dBoundary, #214).
+import { getEnvPMREMTexture, getEnvCubeTexture, sourceForEnvDerived } from './envPmrem';
+import { getRiggedModel, ensureRiggedModelLoaded, ensureRiggedModelLoadedFor } from '../loaders/riggedModelCache';
 import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
 } from './renderSettings';
@@ -62,7 +68,7 @@ import { getVisualDelta, getTime } from '../core/getTime';
 import { getPlayState } from '../core/playState';
 import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPreview';
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
-import { createPrimitiveMesh } from '../loaders/primitives';
+import { createPrimitiveMesh, isPrimitive, PRIMITIVE_NAMES } from '../loaders/primitives';
 import {
   beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf, retireVariantsOf,
   DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
@@ -80,10 +86,39 @@ const _activeLightIds = new Set<number>();
 const _maskedLights: MaskedLight[] = [];
 const _activeRenderIds = new Set<number>();
 const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 });
+/** #482: names already warned about via an unresolvable `Renderable3DPrimitive.mesh` — one
+ *  console.warn per bad name per world, not one per frame. Shared by both sites that can
+ *  discover the name is bad: the create path (no mesh exists yet) and the rebuild gate (a mesh
+ *  exists but its KIND changed to a name we don't recognize).
+ *
+ *  Reset on `onWorldSwap` below, like `derivedMaterials.ts`/`lightMaskVariants.ts` reset THEIR
+ *  process-globals — a module-global with no reset here specifically broke reproduction: the
+ *  editor runs two render surfaces on one world (SceneView + the Game panel's Scene3D) sharing
+ *  this dedupe so only one ever reported, and reloading the editor to reproduce "why is my
+ *  primitive invisible" warned nothing because the name was already in the set from before. */
+const _warnedUnknownPrimitives = new Set<string>();
+// `_warnedMissingClip` (declared below, keyed `modelRef:clip`) shares this same reset — it had
+// NO world-swap clear at all (#738 group B), so a clip name that warned in one scene stayed
+// silently suppressed forever after, including for an unrelated model reusing the same ref/clip
+// pair in a later scene.
+onWorldSwap(() => { _warnedUnknownPrimitives.clear(); _warnedMissingClip.clear(); });
+function warnUnknownPrimitiveOnce(id: number, meshName: string): void {
+  if (_warnedUnknownPrimitives.has(meshName)) return;
+  _warnedUnknownPrimitives.add(meshName);
+  // "first seen on entity N", not "entity N has" — this fires ONCE per name, so a later frame
+  // with the SAME bad name on a DIFFERENT entity (koota reuses ids LIFO, so `id` can already
+  // belong to something else by the time anyone reads this line) must not be read as naming the
+  // entity that's currently broken.
+  console.warn(
+    `Renderable3DPrimitive has unknown mesh '${meshName}' (first seen on entity ${id}); expected one of: ${PRIMITIVE_NAMES.join(', ')}`,
+  );
+}
 
 // Materials created inline for specific entities (not from caches) are tracked PER RENDER STATE,
 // as `RenderState.ownedMaterials` — only those are safe to dispose when reassigned or at teardown;
-// shared cache materials, the primitive placeholder sentinel and `_defaultMaterial` must not be.
+// shared cache materials and the primitive placeholder sentinel must not be. `_defaultMaterial`
+// itself is never bound directly either (#480) — `syncMaterial` clones it per entity and owns
+// the clone, so the module-level instance stays untouched and is safe only as a clone SOURCE.
 //
 // ⚠️ Per-state, not module-global, because THE EDITOR RUNS TWO OF THESE on one world (SceneView +
 // the Game panel's Scene3D) and each mints its OWN inline materials. A shared set let one loop's
@@ -566,9 +601,24 @@ function sweepRetiredEnvironments(): void {
   for (const ref of envSurfaceRefs) {
     const surface = ref.deref();
     if (!surface) { envSurfaceRefs.delete(ref); continue; }
-    if (surface.environment) bound.add(surface.environment);
+    if (surface.environment) {
+      bound.add(surface.environment);
+      // #739: `surface.environment` holds the PMREM output now, not the equirect (see
+      // `syncEnvironment`). A bound PMREM keeps its SOURCE alive too — resolve it back through
+      // `sourceForEnvDerived` and add it, or a retired equirect with a live PMREM on screen would
+      // look unbound here and get disposed while still driving the render (the #315 shape).
+      const src = sourceForEnvDerived(surface.environment);
+      if (src) bound.add(src);
+    }
     const bg = surface.background as THREE.Texture | THREE.Color | null;
-    if (bg && (bg as THREE.Texture).isTexture) bound.add(bg as THREE.Texture);
+    if (bg && (bg as THREE.Texture).isTexture) {
+      bound.add(bg as THREE.Texture);
+      // #775/#779: `surface.background` is a derived PMREM or cube texture now too (see
+      // `syncEnvironment`), not the raw equirect — same resolve-and-add as `surface.environment`
+      // above, or its source would look unbound here and get disposed mid-render (#315).
+      const bgSrc = sourceForEnvDerived(bg as THREE.Texture);
+      if (bgSrc) bound.add(bgSrc);
+    }
   }
   for (const tex of [...retired]) if (!bound.has(tex)) disposeRetiredEnvironment(tex);
 }
@@ -590,7 +640,18 @@ function clearTextureBackground(scene: THREE.Scene): void {
   if (scene.background && (scene.background as THREE.Texture).isTexture) scene.background = null;
 }
 
-export function syncEnvironment(world: World, scene: THREE.Scene) {
+/** `renderer` is optional and MUST be the renderer THIS surface renders with — never a shared
+ *  "whichever renderer registered most recently" lookup. A PMREM output is a render target
+ *  belonging to a specific GPU context (three's own `PMREMNode.js` keys its cache per renderer for
+ *  the same reason); handing surface A a PMREM built by surface B's renderer hands it a texture
+ *  that was never rendered into on A's device, so A's IBL is permanently black. With three live
+ *  renderers possible at once (GameView, editor SceneView, ParticleEditor —
+ *  `runtime/core/activeRenderer.ts`), there is no global answer to "the" renderer, only "mine".
+ *  Omitting `renderer` is a deliberate degrade, not a shortcut: `getEnvPMREMTexture` returns
+ *  `undefined` for a missing renderer and this function falls back to binding the RAW equirect
+ *  (see below) — absence means "skip the #739 optimisation for this call", never "borrow someone
+ *  else's PMREM". */
+export function syncEnvironment(world: World, scene: THREE.Scene, renderer?: WebGPURenderer | THREE.WebGLRenderer) {
   registerRenderSurface(scene);
   let envActive = false;
   let suppressed = false;
@@ -616,12 +677,43 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       // contribution is suppressed, and syncLights/applyRendererColorConfig compensate.
       const iblOn = tierAllowsIBL(getActiveTierOverrides());
       if (!iblOn) suppressed = true; // this scene HAS an env and the tier is taking it away
-      const wantEnv = iblOn ? cached : null;
+      // #739: bind a PRE-GENERATED PMREM, not the raw equirect. `PMREMNode` (three 0.185.1) uses a
+      // texture DIRECTLY, skipping its own generator, when it already carries
+      // `isPMREMTexture`/`CubeUVReflectionMapping` — which `fromEquirectangular`'s output does.
+      // Handing three the raw equirect instead makes it build (and leak — see
+      // `getEnvPMREMTexture`'s comment) a fresh generator on every object-identity change. Falls
+      // back to the raw equirect when there's no renderer yet or generation failed — never blocks
+      // a frame on this, and the next frame retries once a renderer/PMREM is available.
+      // `renderer` here is THIS surface's own renderer (see the function's doc comment) — NOT
+      // `getActiveRenderer()`, which is a global "most recent registrant" and would hand this
+      // surface a PMREM rendered on a different GPU context.
+      const pmrem = iblOn ? getEnvPMREMTexture(renderer, cached) : undefined;
+      const wantEnv = iblOn ? (pmrem ?? cached) : null;
       const wantEnvIntensity = iblOn ? envIntensity : 1;
       if (scene.environment !== wantEnv) scene.environment = wantEnv;
       if (scene.environmentIntensity !== wantEnvIntensity) scene.environmentIntensity = wantEnvIntensity;
       if (env.showAsBackground) {
-        if (scene.background !== cached) scene.background = cached;
+        // #775/#779: which derived texture the BACKGROUND needs depends on `backgroundBlurriness`,
+        // independently of `iblOn` above — that tier gate suppresses only the lighting
+        // contribution (its own comment: the background was measured not to be the cost), and
+        // when it suppresses IBL three would otherwise still build (and leak) its own conversion
+        // for the background regardless of tier, so building ours here is strictly never a tier
+        // regression.
+        //
+        // `NodeManager.getBackgroundNode` (three, `nodes/NodeManager.js`) forks on blurriness:
+        // > 0 (or an already-CubeUV mapping) routes through `pmremTexture()` → `PMREMNode`, which
+        // builds its own generator per node unless the texture already carries
+        // `isPMREMTexture`/`CubeUVReflectionMapping` (#779 — #739's leak through a second door);
+        // === 0 routes through `cubeMapNode()` → `CubeMapNode`, which builds its own
+        // `CubeRenderTarget` unless the texture's mapping is already non-equirectangular (#775).
+        // A PMREM's level 0 is not the sharp original (`docs/rendering.md` records the sharp
+        // background as deliberate), and `NodeManager` routes ANY CubeUV texture through the blur
+        // path regardless of blurriness — so binding a PMREM at blurriness 0 would silently blur
+        // the sky. Hence cube for sharp, PMREM for blurred, never the other way round.
+        const blurred = env.backgroundBlurriness > 0;
+        const derivedBg = blurred ? getEnvPMREMTexture(renderer, cached) : getEnvCubeTexture(renderer, cached);
+        const wantBg = derivedBg ?? cached; // fall back to the raw equirect when there's no renderer yet or generation failed
+        if (scene.background !== wantBg) scene.background = wantBg;
         if (scene.backgroundIntensity !== bgIntensity) scene.backgroundIntensity = bgIntensity;
         if (scene.backgroundBlurriness !== env.backgroundBlurriness) scene.backgroundBlurriness = env.backgroundBlurriness;
       } else {
@@ -669,6 +761,22 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
  *  every mesh. It's visually inert: unused by scene-environment materials, and ±1e-4 on
  *  a real envMap material is imperceptible. Call this on the frame `environmentIntensity`
  *  changes, before rendering. */
+/** Every distinct material bound anywhere under `obj`, deduped.
+ *
+ *  Walks the subtree because an evicted entity's root is often a `Group`/`LOD` whose materials
+ *  live on child meshes — reading `obj.material` alone would miss every one of them. Handles the
+ *  material-ARRAY form (multi-material meshes) the same way the other walks in this file do. */
+function materialsOf(obj: THREE.Object3D): THREE.Material[] {
+  const seen = new Set<THREE.Material>();
+  obj.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.material) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const mat of mats) if (mat) seen.add(mat);
+  });
+  return [...seen];
+}
+
 export function refreshEnvIntensityObserver(scene: THREE.Scene): void {
   // Dedupe: materials are shared across meshes (cached per GUID). Cycle each material's
   // tick exactly ONCE — cycling per-mesh would advance a material used by N meshes N
@@ -1320,9 +1428,50 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       const modelPath = resolveRef(asset.model);
       if (modelPath && targets.has(modelPath)) toEvict.push(id);
     }
+    // Exactly the materials `invalidateModel` will dispose: the OWNED template materials of the
+    // invalidated models. Read before the eviction loop because it is also read per object, and
+    // safe to read at all only because this listener runs before `invalidateModel` clears the
+    // cache. `runtimeOwnedMaterial` templates are excluded — their material is borrowed, so
+    // `invalidateModel` leaves it alone and nothing derived from it is at risk.
+    const disposedMats = new Set<THREE.Material>();
+    for (const t of targets) {
+      for (const tmpl of getTemplatesForModel(t).values()) {
+        if (!tmpl.runtimeOwnedMaterial) disposedMats.add(tmpl.material);
+      }
+    }
+
     for (const id of toEvict) {
       const obj = state.ecsObjects.get(id);
-      if (obj) scene.remove(obj);
+      if (obj) {
+        // #719: retire any light-mask variant derived from a material `invalidateModel` is about
+        // to dispose, BEFORE it disposes it.
+        //
+        // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
+        // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
+        // light-mask variant is such a clone. On a scene swap the variant caches are already
+        // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
+        // re-import of a live model swaps no world at all, so without this a variant would sit in
+        // `owned` sampling textures that are about to be freed.
+        //
+        // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
+        // A mesh with a material override binds the shared cached `.mat.json`
+        // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
+        // disposes. Retiring on that base would delete variants belonging to other, still-live
+        // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
+        // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
+        // about to be freed.
+        //
+        // Runs on this side because this listener is what knows WHICH objects are being evicted —
+        // not for layering reasons: `loaders/` and this file are both L3-unrestricted
+        // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
+        // would have been legal. The ordering holds because `invalidateModel` fires
+        // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
+        for (const mat of materialsOf(obj)) {
+          const base = baseOf(mat);
+          if (disposedMats.has(base)) retireVariantsOf(base);
+        }
+        scene.remove(obj);
+      }
       state.ecsObjects.delete(id);
       state.ecsSprites.delete(id);
       state.ecsMaterials.delete(id);
@@ -1362,9 +1511,10 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
  *    - **`primitives._placeholderMaterial`**, the module-level sentinel a primitive holds while its
  *      authored material is still loading (or forever, if the ref does not resolve) — documented
  *      at its definition as "must never be disposed";
- *    - **`_defaultMaterial`**, the module-level fallback `syncMaterial` binds for an empty ref.
- *  All three are process-wide singletons or cache entries, so one panel unmounting broke them for
- *  every panel. Ownership is the only safe discriminator, and it is already tracked. */
+ *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — `syncMaterial` never
+ *      binds it directly (#480), only a per-entity CLONE that IS owned and disposed normally.
+ *  All but the last are process-wide singletons or cache entries, so one panel unmounting broke
+ *  them for every panel. Ownership is the only safe discriminator, and it is already tracked. */
 export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
   for (const [id, obj] of state.ecsObjects) {
     scene.remove(obj);
@@ -1450,26 +1600,101 @@ function syncMaterial(
   isInstanced = false,
   isMasked = false,
   castMode: 'auto' | 'on' | 'off' = 'auto',
+  // #480 (narrowed by review — see below): true for a caller whose EMPTY-ref material is written
+  // into IN PLACE by something else in the same pass (the primitive colour block's
+  // `color.setHex`), so an empty ref must not hand it the shared `_defaultMaterial` singleton.
+  // False (the default) for every other caller — a GLB (`Renderable3D`) mesh with no override
+  // never has anything write into its material (Tint/MaterialInstance bind their OWN clones), so
+  // it keeps binding the shared singleton exactly as before #480.
+  mintsPrivateDefault = false,
 ): void {
   const targets = materialTargetsOf(obj);
   const prevMat = state.ecsMaterials.get(id);
   if (prevMat !== curMat) {
-    state.ecsMaterials.set(id, curMat);
-    // Resolve the new material once (a `.mat.json` GUID, or the engine default
-    // when empty), then fan it out to every target. A mesh renderer references a
-    // MATERIAL only — never a texture directly (textures live on the .mat.json).
-    const newMat: THREE.Material | undefined = curMat
-      ? (resolveMaterial(curMat) ?? undefined)
-      : _defaultMaterial;
+    // Resolve the new material once (a `.mat.json` GUID, the engine default for most empty-ref
+    // callers, or a fresh per-entity clone of it for `mintsPrivateDefault` — see below), then fan
+    // it out to every target. A mesh renderer references a MATERIAL only — never a texture
+    // directly (textures live on the .mat.json).
+    let newMat: THREE.Material | undefined;
+    if (curMat) {
+      newMat = resolveMaterial(curMat) ?? undefined;
+    } else if (mintsPrivateDefault) {
+      // #480: clone rather than bind the shared `_defaultMaterial` singleton — the PRIMITIVE
+      // colour block (the only caller that passes `mintsPrivateDefault`) writes straight into
+      // `material.color`, so two primitives whose refs clear to '' in the same frame would
+      // otherwise fight over one object, with the pollution outliving both. The clone is tracked
+      // as OWNED so the existing lifecycle (the retirement handoff below, `disposeRenderState`)
+      // frees it exactly like any other inline material.
+      //
+      // ⚠️ CONFINED TO `mintsPrivateDefault` ON PURPOSE — an earlier version of this fix made the
+      // clone unconditional and broke two things measured on real entities:
+      //  - `applyInstancedBatching` (instancedBatching.ts) keys on `${geo.uuid}|${mat.uuid}`; 8
+      //    identical GLB entities sharing `_defaultMaterial` went from
+      //    `{considered:8,batched:8,groups:1,drawCallsSaved:7}` to
+      //    `{considered:8,batched:0,skipped:{"below-threshold":8}}` once each held its own clone.
+      //  - a light-masked GLB with an empty ref would mint a PER-ENTITY light-mask variant
+      //    (`cloneDerived` stamps `__derivedBase`, so `baseOf(clone)` is the clone ITSELF —
+      //    `lightMaskVariants.ts` shares variants by base identity, so a distinct base per entity
+      //    means a distinct variant per entity in a cache with an explicit "must not grow per
+      //    entity" test). A `Renderable3DPrimitive` can never reach this: `masked` there is
+      //    `!!rend.material && …`, so an empty-ref PRIMITIVE is never masked in the first place —
+      //    which is what makes confining the clone to primitives safe from this specific risk too.
+      // `cloneDerived`, not a bare `.clone()` — every material clone bound to a live mesh must
+      // go through it (materialCloneStamp.test.ts), and it is also what lets this clone
+      // participate in the same retire/refresh bookkeeping as every other derived material.
+      newMat = cloneDerived(_defaultMaterial, _defaultMaterial);
+      state.ownedMaterials.add(newMat);
+      // Force the primitive colour block to re-apply `rend.color` this frame: it only calls
+      // `setHex` when the cached colour differs from the authored one, and a fresh clone starts
+      // at `_defaultMaterial`'s grey — which can equal a stale `ecsColors` entry left over from
+      // before the ref cleared, so the authored colour would otherwise never get written.
+      state.ecsColors.delete(id);
+    } else {
+      newMat = _defaultMaterial;
+    }
+    // Record the ref only once it actually resolved (#479): while `newMat` stays undefined (a
+    // `.mat.json` load still in flight, or MATERIAL_FAILED), leaving `prevMat !== curMat` true
+    // makes this branch re-run — and retry — every following frame, for EVERY entity kind,
+    // including tinted / MaterialInstance / light-masked ones the `else if` below skips.
+    // Recording the ref immediately would make an unresolved ref look "handled" when nothing
+    // was ever bound.
+    if (newMat) state.ecsMaterials.set(id, curMat);
+    // Collect candidate owned materials rather than disposing inline: when `newMat` is not
+    // yet resolved (async .mat.json load still in flight, or MATERIAL_FAILED), `t.material`
+    // is left pointing at the old material below, and disposing it out from under a mesh
+    // still in the scene corrupts that frame's render (#477). Freed below, once we know
+    // whether anything still binds it.
+    // Lazily allocated (#479): this branch can now run every frame for an entity whose ref
+    // never resolves, and an owned material needing to be freed here is rare — an
+    // unconditional `new Set()` is exactly the per-frame GC churn `syncRenderablesChurn`
+    // polices, same reasoning as the lazy allocation in the branch below.
+    let toFree: Set<THREE.Material> | undefined;
     for (const t of targets) {
       const oldMat = t.material as THREE.Material;
-      if (oldMat && state.ownedMaterials.has(oldMat)) {
-        state.ownedMaterials.delete(oldMat);
-        oldMat.dispose();
-      }
+      if (oldMat && state.ownedMaterials.has(oldMat)) (toFree ??= new Set()).add(oldMat);
       // Only 'auto' re-derives cast from the new material's transparency — an explicit
       // 'on'/'off' override (#183) must survive a material swap, not be clobbered here.
       if (newMat) { t.material = newMat; if (castMode === 'auto') t.castShadow = !newMat.transparent; }
+    }
+    // INVARIANT (#477): an owned material is freed only once a replacement is actually
+    // assigned to every target that held it. `newMat === undefined` leaves it bound
+    // everywhere (nothing to free yet — no replacement resolved this frame; the polling
+    // branch below closes the leak once the async load lands).
+    if (toFree) {
+      for (const m of toFree) {
+        if (targets.some((t) => t.material === m)) {
+          // Still bound — no replacement landed. NOT ours to free now, but nor can we simply
+          // leave it: syncMaterial is not the only writer of `t.material` (applyLightMask #136,
+          // materialInstanceSystem), and for a masked/instanced entity the polling branch below
+          // never runs, so nobody would ever come back for it. Hand it to the per-frame sweep,
+          // which frees it once NOTHING binds it — whoever did the rebinding (#477).
+          state.ownedMaterials.delete(m);
+          retireDerivedMaterial(m, () => m.dispose());
+          continue;
+        }
+        state.ownedMaterials.delete(m);
+        m.dispose();
+      }
     }
   } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
@@ -1484,10 +1709,34 @@ function syncMaterial(
     // base; only the per-frame re-bind is suppressed.
     const resolved = resolveMaterial(curMat);
     if (resolved) {
+      // BACKSTOP, not the live path (#477). Today this frees nothing: the only site that
+      // marks a material owned is the primitive branch, and branch 1 above always takes an
+      // owned material OUT of `ownedMaterials` — disposing it when a replacement resolved,
+      // else handing it to the retirement sweep — so by the time we get here `has(oldMat)`
+      // is false. It is kept, and gated on `ownedMaterials`, for two reasons: a future
+      // second insertion site would otherwise silently leak here, and the gate is what
+      // stops us double-freeing a material the sweep now owns. Assign the replacement
+      // BEFORE freeing, same collect-then-check-then-free shape as above.
+      // Lazily allocated: this branch runs every frame for every non-tinted/non-instanced/
+      // non-masked renderable carrying a `.mat.json`, and an owned material needing to be
+      // freed here is rare — an unconditional `new Set()` was hundreds of Sets/frame of GC
+      // churn on the path `syncRenderablesChurn` polices.
+      let toFree: Set<THREE.Material> | undefined;
       for (const t of targets) {
+        const oldMat = t.material as THREE.Material;
+        if (oldMat !== resolved && oldMat && state.ownedMaterials.has(oldMat)) {
+          (toFree ??= new Set()).add(oldMat);
+        }
         if (t.material !== resolved) t.material = resolved;
         // See the 'auto'-only guard above.
         if (castMode === 'auto') t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
+      }
+      if (toFree) {
+        for (const m of toFree) {
+          if (targets.some((t) => t.material === m)) continue;
+          state.ownedMaterials.delete(m);
+          m.dispose();
+        }
       }
     }
   }
@@ -1877,6 +2126,16 @@ function carryOverScaleTracks(
   if (added) bound.resetDuration();
 }
 
+/** Scene-scoped lazy acquire for the render sync (#747). Owns the model with the
+ *  CURRENT scene so `releaseAllForScene` reaches it; falls back to the editor
+ *  session pin only when no scene is loaded — the one case with no owner to give
+ *  it. */
+function lazyAcquireRiggedModel(ref: string): void {
+  const sceneId = getCurrentSceneId();
+  if (sceneId === undefined) { ensureRiggedModelLoaded(ref); return; }
+  ensureRiggedModelLoadedFor(sceneId, ref);
+}
+
 /** The `AnimationLibrary` trait value (the fields the render sync reads). */
 export interface AnimationLibraryValue {
   animSets?: string[];
@@ -1891,11 +2150,26 @@ export interface AnimationLibraryValue {
 export interface LibraryMergeDeps {
   getAnimSet: (ref: string) => { source?: string } | null;
   getRiggedModel: (ref: string) => { prototype: THREE.Object3D; animations: THREE.AnimationClip[] } | undefined;
-  ensureRiggedModelLoaded: (ref: string) => void;
+  lazyAcquireRiggedModel: (ref: string) => void;
   retargetClip: typeof retargetClip;
 }
 
-const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, ensureRiggedModelLoaded, retargetClip };
+// lazyAcquireRiggedModel (the field NAME, matching the scene-scoped acquire it defaults
+// to, #747 and #749's adversarial review): an AnimationLibrary's animSet source GLB has
+// no manifest/resources entry of its own (SCALAR_RESOURCE_TYPE_BY_FIELD only covers
+// SkinnedModel.model), so this is its ONLY acquire path — it now rides the current
+// scene's release instead of pinning forever under LAZY_OWNER. The field used to be
+// named `ensureRiggedModelLoaded` after the real (session-pinning) function it was
+// carrying at the time; that name outlived the swap to the scene-scoped default, so a
+// future caller wiring its own deps would naturally reach for `ensureRiggedModelLoaded`
+// by name and silently reinstate the pin #747 removed — renamed to close that trap.
+// Known, accepted cost: on a scene swap the model is released with the outgoing scene
+// and re-fetched by the next frame's render sync (a frame of pop-in), instead of staying
+// resident. Only one authored scene uses AnimationLibrary today
+// (games/3d-test/runtime/assets/scenes/skinned-test.scene.json); acquiring animSet
+// sources transitively at scene load is the documented follow-up if that pop-in ever
+// matters.
+const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, lazyAcquireRiggedModel, retargetClip };
 
 /** P6 — merge an `AnimationLibrary`'s clips into a rig's mixer: own clips ∪
  *  library clips, keyed by clip name, OWN CLIPS WIN on a name conflict. Each
@@ -1926,7 +2200,7 @@ export function mergeAnimationLibrary(
     if (entry.libraryMerged.has(source)) continue; // already merged this GLB's clips
 
     const rig = deps.getRiggedModel(source);
-    if (!rig) { deps.ensureRiggedModelLoaded(source); continue; } // GLB loading — retry next frame
+    if (!rig) { deps.lazyAcquireRiggedModel(source); continue; } // GLB loading — retry next frame
 
     // Retarget when the global flag is set OR a per-animSet bone map exists (a map
     // means the source rig's bones are named differently → bind-by-name would fail).
@@ -2020,9 +2294,12 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (!entry && sm.model) {
       const rigged = getRiggedModel(sm.model);
       if (!rigged) {
-        // Not loaded yet — kick a lazy load (no-op once a scene has acquired it)
-        // and skip rendering this entity until the prototype is in cache.
-        ensureRiggedModelLoaded(sm.model);
+        // Not loaded yet — kick a SCENE-SCOPED lazy load (#747: this is the branch
+        // reached exactly when the scene's own manifest acquire hasn't resolved yet,
+        // so it must own with the scene, not pin forever — no-op on an already-cached
+        // model, since ensureRiggedModelLoadedFor still stamps the ownership) and skip
+        // rendering this entity until the prototype is in cache.
+        lazyAcquireRiggedModel(sm.model);
         return;
       }
       const root = cloneSkeleton(rigged.prototype);
@@ -2672,6 +2949,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       const tinted = !instanced && entity.has(Tint);
       const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
       const masked = maskNeedsVariant(lightMask);
+      // `mintsPrivateDefault` intentionally omitted (defaults to false, #480 review) — nothing
+      // writes into a GLB's material in place (Tint/MaterialInstance bind their OWN clones), so
+      // an empty ref keeps binding the shared `_defaultMaterial`, exactly as before #480. See the
+      // parameter's doc comment on `syncMaterial` for the batching regression this avoids.
       syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked, rend.castShadow);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
@@ -2706,11 +2987,41 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // is baked in createPrimitiveMesh, so a size change can't be applied via
     // scale (that would also affect children) — geometry has to be rebuilt.
     const sizeChanged = obj && ecsSizes.get(id) !== rend.size;
-    if (obj && (ecsSprites.get(id) !== rend.mesh || sizeChanged)) {
+    const kindChanged = obj && ecsSprites.get(id) !== rend.mesh;
+    // Short-circuited so `isPrimitive` is called ONLY when the kind actually changed — matching
+    // the original evaluation order (several tests mock `loaders/primitives` with just
+    // `createPrimitiveMesh`, no `isPrimitive`/`PRIMITIVE_NAMES`, because their scenarios never
+    // touch a kind change; calling it unconditionally here broke those mocks for no behavioural
+    // gain — `obj &&` below already makes `meshKnown` irrelevant whenever `kindChanged` is falsy).
+    const meshKnown = !kindChanged || isPrimitive(rend.mesh);
+    // #482: a kind change to a name `isPrimitive` doesn't recognize (a hand-edited scene, or a
+    // primitive kind renamed since the scene was authored) must not warn silently — warn once,
+    // but leave the entity rendering whatever it already has; below, the rebuild gate skips it.
+    if (kindChanged && !meshKnown) warnUnknownPrimitiveOnce(id, rend.mesh);
+    // #482: do not free the OLD mesh until the replacement is actually in hand — the same
+    // ordering discipline as #477. An UNKNOWN name is INERT here, full stop, regardless of what
+    // else changed: no rebuild, no free, the old mesh (if any) is kept exactly as it was. This
+    // gate used to read `sizeChanged || (kindChanged && meshKnown)`, which let a size change
+    // paired with an unknown name (or a later size edit on an entity ALREADY stuck on an unknown
+    // name — `ecsSprites` is deliberately not updated for one, so `kindChanged` stays true
+    // forever) fall through the `sizeChanged` half and tear down anyway: geometry disposed, maps
+    // cleared, then the create path's null check fires and the entity vanishes permanently with
+    // nothing left to warn about (`warnUnknownPrimitiveOnce` had already fired for that name on
+    // the frame the kind changed). Gating the ENTIRE condition on `meshKnown` closes every route.
+    if (obj && meshKnown && (sizeChanged || kindChanged)) {
       scene.remove(obj);
       // Dispose owned geometry from the previous mesh so size churn doesn't leak.
       if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
         (obj as THREE.Mesh).geometry.dispose();
+      }
+      // The owned MATERIAL needs the same care as the geometry above, and for the #477 reason:
+      // nothing binds it once this mesh is dropped, and no later pass would come back for it —
+      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh. Retire it
+      // rather than disposing inline; this runs mid-pass, in the frame callback that also renders.
+      const discardedMat = (obj as THREE.Mesh).material as THREE.Material;
+      if (discardedMat && state.ownedMaterials.has(discardedMat)) {
+        state.ownedMaterials.delete(discardedMat);
+        retireDerivedMaterial(discardedMat, () => discardedMat.dispose());
       }
       ecsObjects.delete(id);
       ecsSprites.delete(id);
@@ -2728,19 +3039,41 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // Skip the default material when an override is set — avoids the
       // create-then-immediately-dispose churn we'd otherwise pay on every spawn.
       const hasOverride = !!rend.material;
-      obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color, hasOverride)!;
+      const built = createPrimitiveMesh(rend.mesh, rend.size, rend.color, hasOverride);
+      // #482: `rend.mesh` names a shape `createPrimitiveMesh` doesn't recognize (a hand-edited
+      // scene, or a primitive kind renamed since the scene was authored). Do not free anything —
+      // there is nothing to free here, this is the "no mesh exists yet" path — and do not throw:
+      // warn once per bad name and leave the entity unrendered rather than crash the frame.
+      if (!built) {
+        warnUnknownPrimitiveOnce(id, rend.mesh);
+        return;
+      }
+      obj = built;
+      // #479: whether the ref is SETTLED as of this creation frame — an empty ref always is (the
+      // primitive owns the default material `createPrimitiveMesh` just minted); a non-empty one
+      // is settled only once `resolveMaterial` actually returns something.
+      let materialSettled = true;
       if (!hasOverride) {
         // Track the primitive's default material as owned (safe to dispose)
         state.ownedMaterials.add((obj as THREE.Mesh).material as THREE.Material);
       } else if (rend.material) {
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
+        else materialSettled = false;
       }
       scene.add(obj);
       ecsObjects.set(id, obj);
       ecsSprites.set(id, rend.mesh);
       ecsColors.set(id, rend.color);
-      ecsMaterials.set(id, rend.material || '');
+      // Record the ref only once it is SETTLED (#479) — recording an unresolved ref here is the
+      // fourth door into the same defect `syncMaterial`'s own branch 1 closes: `syncMaterial`
+      // runs later in this very callback and would see `ecsMaterials` already equal to `curMat`
+      // and take the unchanged-ref `else if`, which is SKIPPED for a masked/instanced/tinted
+      // entity — so a primitive SPAWNED with a not-yet-resolved ref would never bind it, staying
+      // on `primitives._placeholderMaterial` (`visible: false`) forever instead of just looking
+      // stale. Leaving it unset here makes `syncMaterial` take branch 1 and retry every frame
+      // until the load lands, same as everywhere else.
+      if (materialSettled) ecsMaterials.set(id, rend.material || '');
       ecsSizes.set(id, rend.size);
       ownsGeometry.add(id);
     }
@@ -2762,7 +3095,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // into, and a shared (material, mask) variant would fight it.
     const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
     const masked = !!rend.material && maskNeedsVariant(lightMask);
-    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow);
+    // `mintsPrivateDefault: true` — the colour block right below writes into an empty-ref
+    // primitive's material in place, so it must never be the shared `_defaultMaterial` (#480).
+    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow, true);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
     // single default-material primitive is NOT a supported MaterialInstance prop base (its
@@ -3152,6 +3487,16 @@ interface TextMeshEntry {
   pages: Map<number, THREE.Mesh>;
   /** Layout-input hash — geometry rebuilds only when it changes. */
   hash: string;
+  /** The atlas half of `hash` (#692) — kept separately so a layout-only change can tell
+   *  it is safe to reclaim the existing page materials rather than rebuild them. */
+  atlasKey?: string;
+  /** The BUILD half of `hash` (#766) — `[font, text, atlasVersion, textDirty]`. Unchanged
+   *  means the new layout can only differ from the old one in each quad's x/y (same glyph
+   *  sequence, same page assignment, same UVs — see `canWriteTextPositionsInPlace`'s
+   *  comment), so a `hash` change coming ONLY from fontSize/align/maxWidth/lineSpacing/
+   *  letterSpacing/anchor can rewrite page positions in place instead of rebuilding
+   *  geometry + material (the direct analogue of `Scene2D.tsx`'s `meshBuildKey`, #749). */
+  buildKey?: string;
   fontId: string;
   billboard: boolean;
   /** Un-animated layout quads + anchor offset, kept so per-glyph animation can
@@ -3174,9 +3519,17 @@ interface TextMeshEntry {
 const _activeText = new Set<number>();
 
 /** Rewrite each page mesh's position attribute from `quads` (reusing the material +
- *  UVs + indices — no shader rebuild), applying the entry's anchor offset. `quads`
- *  must be the SAME length/order as the base layout (animation is length-invariant),
- *  so per-page vertex counts match and the update is in place. */
+ *  UVs + indices — no shader rebuild), applying the entry's anchor offset. Two callers
+ *  rely on this: per-glyph animation, where `quads` is the SAME length/order as the base
+ *  layout every frame (animation is length-invariant); and the #766 layout-only fast
+ *  path, where `quads` is a NEW layout whose per-page vertex counts were already checked
+ *  against the existing mesh by `canWriteTextPositionsInPlace` before this is called.
+ *  Either way the per-page vertex counts match and the update is in place.
+ *
+ *  Invalidates each written page's cached bounds — `boundingBox`/`boundingSphere` are
+ *  computed lazily by three (`Box3.expandByObject`, `Mesh.raycast`) and only when `null`,
+ *  so a surviving geometry object that keeps its old bounds would report the PRE-edit
+ *  extent for selection/picking/`get_layout_bounds` even though the glyphs moved. */
 function updateTextPagePositions3D(entry: TextMeshEntry, quads: TextQuad[]): void {
   const ax = entry.ax ?? 0, ay = entry.ay ?? 0;
   // Positions-only (UVs/indices are invariant, baked into the mesh) — keyed by PAGE.
@@ -3189,6 +3542,8 @@ function updateTextPagePositions3D(entry: TextMeshEntry, quads: TextQuad[]): voi
     if (attr.array.length === pos.length) {
       (attr.array as Float32Array).set(pos);
       attr.needsUpdate = true;
+      mesh.geometry.boundingBox = null;
+      mesh.geometry.boundingSphere = null;
     }
   }
 }
@@ -3207,8 +3562,12 @@ function updateTextPageColors3D(entry: TextMeshEntry, quads: TextQuad[]): void {
   }
 }
 
+/** Dispose an entry's page meshes — geometry AND material both go. The rebuild path
+ *  (#715) no longer calls through here to reclaim a material across a layout change; it
+ *  captures `entry.pages`' materials itself before replacing them, so this is only ever
+ *  reached from `disposeTextMeshEntry` when the whole text entity goes away. */
 function disposeTextPageMeshes(entry: TextMeshEntry): void {
-  for (const mesh of entry.pages.values()) {
+  for (const [, mesh] of entry.pages) {
     entry.group.remove(mesh);
     mesh.geometry.dispose();
     (mesh.material as THREE.Material).dispose();
@@ -3276,7 +3635,11 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     if (!getFontTexture(provider, 0)) { if (entry) entry.group.visible = false; return; }
 
     const hash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
-      t.letterSpacing, t.anchorX, t.anchorY, provider.atlasVersion, getTextDirtyVersion()].join('|');
+      t.letterSpacing, t.anchorX, t.anchorY, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+    // The atlas half of `hash` (#692). When only the LAYOUT half moved, every page material is
+    // still valid — its node graph closes over the atlas texture and metrics and nothing else that
+    // a layout change touches. Style is re-applied by `updateMtsdfStyle` below, every frame.
+    const atlasKey = [t.font, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
 
     if (!entry || entry.hash !== hash) {
       provider.ensureGlyphs(codepointsOf(t.text));
@@ -3289,36 +3652,137 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         scene.add(entry.group);
         textMeshes.set(id, entry);
       }
-      // Rebuild every page mesh from scratch (a layout/atlas change is infrequent, and
-      // the atlas TEXTURE is baked into each TSL node graph so a page's material can't
-      // be mutated in place anyway).
-      disposeTextPageMeshes(entry);
-      // Anchor: block spans x[0,width], yUp y[0,-height]. Shift so the anchor point
-      // (anchorX across width, anchorY down height) sits at the entity origin — same
-      // for every page since they share one layout.
-      const ax = -t.anchorX * layout.width, ay = t.anchorY * layout.height;
-      for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
-        const ptex = getFontTexture(provider, page);
-        if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
-        const g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
-        g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
-        g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
-        g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
-        g.translate(ax, ay, 0);
-        const mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), provider.atlas.type !== 'msdf');
-        const mesh = new THREE.Mesh(g, mat);
-        // Per-glyph animation nudges verts past the static bounds; skip frustum
-        // culling (text is cheap) so an animated glyph never pops out at the edge.
-        mesh.frustumCulled = false;
-        entry.group.add(mesh);
-        entry.pages.set(page, mesh);
+
+      // #766: the BUILD half of `hash` — the fields that decide WHAT gets allocated
+      // (glyph sequence + atlas). Computed HERE, not per-frame — this whole branch only
+      // runs on a `hash` miss, so the per-frame path below gains zero string-concat
+      // allocations from this (mirrors `Scene2D.tsx`'s `meshBuildKey`, #749).
+      const buildKey = [t.font, t.text, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+      let fastPathApplied = false;
+      if (entry.buildKey === buildKey && entry.pages.size > 0) {
+        const hasTrueSdf = provider.atlas.type !== 'msdf';
+        const pagePositions = buildTextPositionsByPage(layout.quads, { yUp: true });
+        // Page-ascending, matching `buildTextPositionsByPage`'s sort — `canWriteTextPositionsInPlace`
+        // compares index-for-index (textMesh.ts:180-189). `entry.pages` is itself built in
+        // ascending order (the rebuild loop below walks `buildTextGeometryByPage`'s sorted
+        // output), so its insertion order already matches; sorted explicitly anyway since that
+        // invariant lives in a different code path than this one.
+        const sortedPages = [...entry.pages.keys()].sort((a, b) => a - b);
+        // `positionsLength` must be the EXISTING mesh's position count in `buildTextPositionsByPage`
+        // units — 2 floats/vertex — not the 3-component array `positionsTo3D` expands into, or the
+        // guard would always refuse. `attr.count` is vertex count; ×2 gets there.
+        const existing = sortedPages.map((page) => {
+          const attr = entry!.pages.get(page)!.geometry.getAttribute('position') as THREE.BufferAttribute;
+          return { page, positionsLength: attr.count * 2 };
+        });
+        const pagesReusable = sortedPages.every((page) => {
+          const mesh = entry!.pages.get(page)!;
+          const ptex = getFontTexture(provider, page);
+          return !!ptex && canReuseMtsdfMaterial(mesh.material as THREE.Material, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf);
+        });
+        // Refuse rather than half-apply (#698's lesson, restated at #749 for the 2D twin): any
+        // failure here falls through to the full rebuild below instead of writing partial state.
+        if (pagesReusable && canWriteTextPositionsInPlace(pagePositions, existing)) {
+          // The anchor needs no extra machinery: `updateTextPagePositions3D` already adds
+          // `entry.ax/ay` onto freshly built positions. Setting them from the NEW layout is
+          // still required — the per-glyph animation path below reads them every frame, so a
+          // stale value would mis-anchor animated text even though the static mesh looks right.
+          entry.ax = -t.anchorX * layout.width;
+          entry.ay = t.anchorY * layout.height;
+          updateTextPagePositions3D(entry, layout.quads);
+          entry.hash = hash;
+          entry.buildKey = buildKey;
+          entry.baseQuads = layout.quads;
+          // ⚠️ Do NOT touch `wasMotion`/`wasColored` here. The full rebuild below clears both
+          // because it mints new geometry AND a new `aTextColor` buffer, both at base state.
+          // This fast path writes base POSITIONS only and leaves the colour buffer untouched, so
+          // clearing `wasColored` would strand an animated colour with nothing left to restore it
+          // (`Scene2D.tsx:2219-2228` documents the identical reasoning for the 2D twin).
+          //
+          // #752 landed 2D-ONLY, and rightly so: `makeMtsdfMaterial` takes no `fontSize`
+          // (mtsdfShader.ts:76-84) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
+          // (mtsdfShader.ts:138-140), the same per-fragment derivative Scene2D's Pixi shader uses
+          // whenever it's available (mtsdfPixiShader.ts's `#else` arm is the no-derivatives
+          // FALLBACK #752 actually fixed). So 3D is structurally immune to the bug #752 fixed —
+          // there is no CPU-computed screenPxRange here to go stale — and `updateMtsdfStyle`
+          // already runs every frame outside this branch regardless. Still no CPU uniform for
+          // this fast path to refresh; if a FUTURE change ever adds a fontSize- or scale-derived
+          // CPU uniform to this material, THIS fast path must start refreshing it too, or resized
+          // text will render with stale antialiasing.
+          fastPathApplied = true;
+        }
       }
-      entry.hash = hash;
-      entry.fontId = t.font;
-      entry.baseQuads = layout.quads; // for per-frame animation (positions/colours)
-      entry.ax = ax; entry.ay = ay;
-      entry.wasMotion = false; entry.wasColored = false;
+
+      if (!fastPathApplied) {
+        // Rebuild every page mesh from scratch (a layout/atlas change is infrequent). Geometry is
+        // always new; the MATERIAL is reclaimed when the atlas is unchanged — the atlas TEXTURE is
+        // baked into each TSL node graph, so a page's material can't be mutated in place across an
+        // atlas change, but a layout-only change never touches it.
+        //
+        // Anchor: block spans x[0,width], yUp y[0,-height]. Shift so the anchor point
+        // (anchorX across width, anchorY down height) sits at the entity origin — same
+        // for every page since they share one layout.
+        const ax = -t.anchorX * layout.width, ay = t.anchorY * layout.height;
+        // Capture the superseded pages/materials WITHOUT freeing anything yet (#715), the same
+        // discipline `gpuComputeBackend.ts`'s "free what this rebuild superseded" block applies to
+        // compute nodes and the render mesh: build and assign the replacements FIRST, free the
+        // superseded ones LAST. Reclaim by page number when the atlas is unchanged — a layout change needs new
+        // geometry, never a new node graph (#692; the direct analogue of #690 on the 2D twin).
+        // Anything left in `reusable` after the loop (atlas changed, or a page this text no
+        // longer touches) is disposed once the new meshes are installed.
+        const oldPages = entry.pages;
+        const atlasReusable = entry.atlasKey === atlasKey;
+        const reusable = new Map<number, THREE.Material>();
+        for (const [page, mesh] of oldPages) reusable.set(page, mesh.material as THREE.Material);
+        const newPages = new Map<number, THREE.Mesh>();
+        try {
+          for (const { page, geo } of buildTextGeometryByPage(layout.quads, { yUp: true })) {
+            const ptex = getFontTexture(provider, page);
+            if (!ptex) continue; // page texture not ready — rebuilds when atlasVersion/textDirty bumps
+            const g = new THREE.BufferGeometry();
+            g.setAttribute('position', new THREE.BufferAttribute(positionsTo3D(geo.positions), 3));
+            g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
+            g.setAttribute('aTextColor', new THREE.BufferAttribute(geo.colors, 4)); // per-glyph colour (white ⇒ no tint)
+            g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
+            g.translate(ax, ay, 0);
+            const hasTrueSdf = provider.atlas.type !== 'msdf';
+            let mat = atlasReusable ? reusable.get(page) : undefined;
+            if (mat && canReuseMtsdfMaterial(mat, ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, hasTrueSdf)) {
+              reusable.delete(page);
+            } else {
+              mat = makeMtsdfMaterial(ptex, provider.atlas.width, provider.atlas.height, provider.atlas.distanceRange, provider.atlas.size, textStyle(t), hasTrueSdf);
+            }
+            const mesh = new THREE.Mesh(g, mat);
+            // Per-glyph animation nudges verts past the static bounds; skip frustum
+            // culling (text is cheap) so an animated glyph never pops out at the edge.
+            mesh.frustumCulled = false;
+            newPages.set(page, mesh);
+          }
+        } finally {
+          // ── free what this rebuild superseded — LAST, deliberately (#715) ──
+          // The new meshes/materials above are fully built and assigned by this point; only now
+          // do the old ones come out. This only mitigates, not eliminates, a transient zero on a
+          // shared material's `usedTimes`: three registers a render pipeline in
+          // `Pipelines.getForRender` at DRAW time, so the replacement mesh has not acquired
+          // anything yet either way when the old material is disposed below — it costs nothing
+          // and is the correct discipline, matching the particle backend next door, but by itself
+          // it does not keep `usedTimes` off zero for a material this text no longer touches.
+          entry.pages = newPages;
+          for (const mesh of newPages.values()) entry.group.add(mesh);
+          for (const [, mesh] of oldPages) {
+            entry.group.remove(mesh);
+            mesh.geometry.dispose();
+          }
+          for (const m of reusable.values()) m.dispose();
+        }
+        entry.hash = hash;
+        entry.atlasKey = atlasKey;
+        entry.buildKey = buildKey;
+        entry.fontId = t.font;
+        entry.baseQuads = layout.quads; // for per-frame animation (positions/colours)
+        entry.ax = ax; entry.ay = ay;
+        entry.wasMotion = false; entry.wasColored = false;
+      }
     }
 
     // Per-glyph animation: recompute page positions (motion effects) or colours
@@ -3747,8 +4211,19 @@ async function prewarmShadersForWorldInner(
       if (!env.hdrPath) return;
       const cached = getCachedEnvironment(env.hdrPath);
       if (cached) {
-        prewarmScene.environment = cached;
+        // #739: mirror the PMREM the real path binds, NOT the raw equirect. Two reasons, and the
+        // second is the load-bearing one. (1) This mirror exists to compile the variant the real
+        // render draws, and since #739 that is a CubeUV PMREM. (2) This hook is registered with
+        // `registerBeforeSwap`, so it runs on EVERY scene swap — handing three a raw equirect here
+        // makes `PMREMNode` build its own generator, which is precisely the per-swap leak #739
+        // fixes, re-entering through the prewarm door and defeating the fix.
+        prewarmScene.environment = getEnvPMREMTexture(renderer, cached) ?? cached;
         prewarmScene.environmentIntensity = env.intensity;
+        // Deliberately NO `prewarmScene.background` mirror (#775/#779): three only derives a
+        // background conversion from a `scene.background` that is actually SET, so there is no
+        // "wrong variant compiles" door here the way there is for `environment` above — a prewarm
+        // scene with `background` left unset compiles nothing background-shaped either way. Don't
+        // add one; there's nothing for it to fix.
       }
     });
   }
@@ -4299,6 +4774,29 @@ export async function makeWebGPURenderer(
       throw e2;
     }
   }
+  // Phase 3 of #590 (docs/rendering.md): note the context AFTER a
+  // successful init, never before — the WebGPU-then-WebGL2 fallback path above can dispose an
+  // EARLIER renderer that never reached here, and that one must not be paired with a decrement.
+  //
+  // Wrapping `dispose` — rather than requiring every caller to also call
+  // `noteGpuContextDestroyed()` — is what makes every existing `renderer.dispose()` call site
+  // correct for free, with no second call site to keep in sync: Scene3D's unmount and rebuild
+  // paths, the KTX2 caps probe's throwaway renderer (`capsProbeRenderer.ts` via
+  // `textureResolver.ts`'s `probe?.dispose()`), and the editor's SceneView/ParticleEditor viewports
+  // all just call `.dispose()` as they already did. The one-shot guard that stops a stray
+  // double-dispose decrementing twice now lives inside `noteGpuContextCreated`'s returned release,
+  // not in a `contextLive` flag here — it was hand-copied at five sites (#858).
+  const releaseContextCount = noteGpuContextCreated();
+  // #715: three's webgl-fallback backend never issues a GL delete for a compiled program/shader
+  // (see glProgramRelease.ts's doc for the measurement) — a leak that accumulates for the life of
+  // this context. Guarded to a no-op on the WebGPU backend and to a loud, self-disabling no-op if
+  // three's private internals this depends on ever move.
+  installGlProgramReleaseHatch(r);
+  const rawDispose = r.dispose.bind(r);
+  r.dispose = (...args: Parameters<typeof rawDispose>) => {
+    releaseContextCount(); // one-shot inside `noteGpuContextCreated` now — see its doc
+    return rawDispose(...args);
+  };
   return r;
 }
 
@@ -4315,6 +4813,21 @@ export async function createRenderer(
   const r = await makeWebGPURenderer(container, { applyWebSizeMode: true });
   // Awaited: registering now imports three's KTX2Loader on demand (#254), and the caps it
   // detects must be in place before anything this renderer draws asks for a KTX2 texture.
-  await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
+  const disposeActiveRenderer = await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
+  // Compose onto the dispose wrapper above (the GPU-context-count one) — same pattern,
+  // same reason: every existing `renderer.dispose()` call site (Scene3D's unmount/rebuild, the
+  // KTX2 probe, the editor viewports) stays correct for free instead of needing a second call
+  // site to keep in sync.
+  //
+  // GPU-context/device loss DETECTION (#802) is deliberately NOT wired here — `createRenderer`
+  // has no lifecycle of its own to hang an `isStale` check on (it returns once and is done); that
+  // belongs to `Scene3D.tsx`, its one caller, which already owns a `disposed` flag spanning this
+  // renderer's whole life (including the context-loss rebuild path) and wires
+  // `attachRendererLossHandling` + `makeViewportLossPolicy` right after calling this function.
+  const priorDispose = r.dispose.bind(r);
+  r.dispose = (...args: Parameters<typeof priorDispose>) => {
+    disposeActiveRenderer();
+    return priorDispose(...args);
+  };
   return r;
 }

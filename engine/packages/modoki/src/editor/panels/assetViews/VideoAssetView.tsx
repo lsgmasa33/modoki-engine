@@ -1,7 +1,8 @@
 /** VideoAssetView (+ VideoImportedStats) — video import settings editor + Apply
- *  (ffmpeg convert) action, mirroring AudioAssetView. Settings persist to the clip's
- *  .meta.json on change; Apply runs the conversion through /api/reimport and reloads.
- *  Preview is a native <video controls> pointed at the converted variant.
+ *  (ffmpeg convert) action, mirroring AudioAssetView. Settings PARK to the clip's
+ *  .meta.json on change (#845 — Cmd+S is the write); Apply runs the conversion
+ *  through /api/reimport and reloads. Preview is a native <video controls> pointed
+ *  at the converted variant.
  *
  *  There is no output-format control on purpose — video is H.264/mp4 only, because
  *  that is the sole codec the iOS WKWebView plays. See docs/video.md. */
@@ -16,11 +17,16 @@ import {
   type VideoPreset, type VideoAudioMode, type VideoResizeMode, type VideoCacheInfo,
 } from '../../../runtime/loaders/videoSettings';
 import { inputStyle, BufferedNumberInput } from '../fields';
-import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { formatBytes, reimportBtnStyle } from './widgets';
 import {
   videoPreviewUrl, describeVideoDelivery, videoSettingsWarnings, conversionSettingsDiffer,
 } from './videoAssetLogic';
 import { withCurrentValue } from './importSettingOptions';
+import {
+  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult, metaReadFallback, stampMetaReadPath,
+} from '../../scene/pendingMeta';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const DELIVERY_LABELS: Record<VideoDelivery, string> = {
   bundled: 'Bundled — ships in the build',
@@ -59,6 +65,8 @@ const rowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', g
 const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', textTransform: 'uppercase', margin: '8px 0 3px' };
 
 export function VideoAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<VideoImportSettings>(DEFAULT_VIDEO_SETTINGS);
   /** What the last load/apply saw — the baseline `conversionSettingsDiffer` compares
@@ -69,18 +77,53 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
 
+  // #845: unlike the sibling asset views, this one keeps a THIRD piece of state — `applied`, what
+  // the sidecar held at the last successful bake — which `conversionSettingsDiffer` compares
+  // `settings` against to show the "re-import to apply" nudge. `applied` must always reflect DISK
+  // (the actual converted output), never a still-parked edit — showing the parked value there
+  // too would compare it against itself and hide the nudge for an edit that has never actually
+  // been baked. So this always fetches (no "skip the network" shortcut), and prefers the parked
+  // doc only for what the PANEL displays (`meta`/`settings`/`converted`) — mirroring
+  // `AtlasAssetView`'s "ask the registry before the file", just without skipping the read.
+  const applyMeta = useCallback((diskMeta: Record<string, unknown>) => {
+    setApplied(resolveVideoSettings(diskMeta as { video?: Partial<VideoImportSettings> }));
+    const parked = peekPendingMeta(path) as Record<string, unknown> | undefined;
+    const m = parked ?? diskMeta;
+    setMeta(m);
+    setSettings(resolveVideoSettings(m as { video?: Partial<VideoImportSettings> }));
+    setConverted(!!m.videoCache);
+  }, [path]);
+
+  // ⚠️ #871: the exemption above is about WHICH DOCUMENT THIS PANEL DISPLAYS, and about nothing
+  // else. It is NOT an exemption from recording the CAS baseline — and because this raw fetch used
+  // to drop the `X-Meta-Sha256` header on the floor, `baselines` had no entry for any `.mp4`,
+  // `flushPendingMetaFor` passed `undefined` as `ifMatch`, and the #845 phase-2 precondition was
+  // inert for this entire asset type while looking present everywhere else.
+  //
+  // `noteMetaReadResult` is deliberately the SAME function `readMetaPreferringPark` calls, not
+  // four lines copied here: it carries the three hazards (ok-only, a missing header means NO
+  // baseline rather than "unchanged", never hash client-side) that a second copy would re-derive.
+  // It runs BEFORE the body is consumed and is orthogonal to `applyMeta` — `applied` still comes
+  // from disk and `meta` still prefers the park.
   const loadMeta = useCallback((signal?: AbortSignal) => {
     return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        const s = resolveVideoSettings(m as { video?: Partial<VideoImportSettings> });
-        setSettings(s);
-        setApplied(s);
-        setConverted(!!m.videoCache);
+      // ⚠️ `metaReadFallback()`, not a bare `{}` (#880). The exemption above is from the READ
+      // HELPER, never from what a failed read means: an untagged `{}` here would let this panel
+      // park an id-less document and mint the asset a fresh GUID. Same shape as the baseline trap
+      // one line down, which is why both now live in values this file cannot half-adopt.
+      // ⚠️ `stampMetaReadPath`, for the same reason as the fallback above and the baseline below:
+      // an exemption from the READ HELPER is not an exemption from what it teaches the document
+      // (#871's lesson, third instance). Without the stamp every `.mp4` park is refused, because
+      // `parkMetaEdit` cannot tell a document this file read from one no panel ever read (#890).
+      .then((r) => {
+        noteMetaReadResult(path, r);
+        return r.ok
+          ? r.json().then((m: Record<string, unknown>) => stampMetaReadPath(m, path))
+          : metaReadFallback();
       })
+      .then((m: Record<string, unknown>) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -88,14 +131,14 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
     return () => ac.abort();
   }, [loadMeta]);
 
-  // Persist a settings change to the meta sidecar immediately, preserving the rest of
-  // the meta (id/videoCache) — same contract as audio/texture.
+  // Persist a settings change to the meta sidecar — PARKED, not written immediately (#845).
+  // Preserves the rest of the meta (id/videoCache) — same contract as audio/texture.
   const update = useCallback((patch: Partial<VideoImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, video: next };
+      const updatedMeta = { ...(meta ?? {}), video: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -104,6 +147,9 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
     setImporting(true);
     setImportStatus(true, `Converting ${name}...`);
     try {
+      // #845: `/api/reimport` reads the settings off DISK — flush any still-parked edit first, or
+      // the conversion would run against the OLD settings while the UI already shows the new ones.
+      await flushPendingMetaFor(path);
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
@@ -234,6 +280,8 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
           min={0.5}
           max={30}
           style={{ ...inputStyle, flex: 1 }}
+          dataUiId="inspector.video.keyframeIntervalSec"
+          dataUiLabel="Keyframe Interval (s)"
         />
       </div>
 
@@ -273,6 +321,7 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
         </div>
       )}
       {converted && <VideoImportedStats cache={cache} />}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.video.unsaved" />
     </>
   );
 }

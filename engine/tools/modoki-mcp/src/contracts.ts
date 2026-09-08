@@ -189,8 +189,14 @@ const DECLS: Record<string, Decl> = {
     filters: ['type', 'name', 'folder', 'limit'],
   },
   modoki_get_asset_meta: {
-    kind: 'read', method: 'GET', route: '/api/read-meta', requires: ['project'], aim: 'asset',
+    kind: 'read', method: 'GET', route: '/api/asset-meta', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png' },
+    // requires:['project'] and NOT ['editor'] on purpose, unlike `modoki_read_asset_def`: the
+    // route falls back to the disk read (labelled `editorConnected:false`) when no renderer
+    // answers, so this keeps working headlessly exactly as it did before #872.
+    notes: 'Prefers a PARKED Inspector import-settings edit over the file — since #845 a sidecar '
+      + 'edit does not reach disk until save_all, so a file read reports the PRE-EDIT value. '
+      + '`source` says which it was.',
   },
   modoki_find_references: {
     kind: 'read', method: 'GET', route: '/api/find-references', requires: ['project'], aim: 'asset',
@@ -209,7 +215,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/reimport',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png' },
-    notes: 'Partial success is a 200 with a non-empty errors[] — deliberately NOT a failed call.',
+    notes: "Partial success is a 200 with a non-empty errors[] — deliberately NOT a failed call. Refuses with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for a target (#882): every handler reads the .meta.json off DISK, so the bake would convert with the pre-edit values and their next save would flush that older document over the cache block it writes. Hatch is `force` — the human's edit is left alone, merely not used — and a forced run reports `bakedFromDisk` rather than passing silently.",
   },
 
   // ── visual capture ──
@@ -362,7 +368,7 @@ const DECLS: Record<string, Decl> = {
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'],
-    notes: 'Same unsaved-work refusal as load-scene.',
+    notes: 'Same unsaved-work refusal as load-scene. ALSO refuses while a prefab is being edited (#853) — exit prefab-edit first; that refusal is not bypassable with discardUnsaved, because it is not about unsaved work. Replaces the world through a real SceneManager swap, so onWorldSwap fires and every id-keyed cache clears; the outgoing scene\'s resources are released immediately.',
   },
   modoki_save_all: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'save-all',
@@ -423,14 +429,14 @@ const DECLS: Record<string, Decl> = {
       + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',
   },
-  modoki_gizmo: {
+  modoki_set_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
   },
-  modoki_scene_view_mode: {
+  modoki_set_scene_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
     minimalArgs: { mode: '3d' },
   },
-  modoki_animation_view_mode: {
+  modoki_set_animation_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-animation-view-mode',
     mutating: true, persists: 'session',
     minimalArgs: { mode: 'dopesheet' },
@@ -443,7 +449,7 @@ const DECLS: Record<string, Decl> = {
     notes: 'The catalog is relayed from the renderer (editor/scene/devicePresets.ts), never copied '
       + 'here — a second table goes stale the first time a device is added.',
   },
-  modoki_game_view_device: {
+  modoki_set_game_view_device: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-game-view-device',
     mutating: true, persists: 'session',
     minimalArgs: { device: 'Free' },
@@ -451,7 +457,7 @@ const DECLS: Record<string, Decl> = {
       + 'Split from modoki_game_view_devices on §4: the read half is a GET, and a mutating op '
       + 'reached by GET has its refusal read as a success.',
   },
-  modoki_collider_edit: {
+  modoki_set_collider_edit: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-collider-edit', mutating: true, persists: 'session',
     minimalArgs: { on: true },
   },
@@ -495,7 +501,10 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_get_console_logs: {
     kind: 'read', method: 'GET', route: '/api/console-logs', filters: ['level', 'limit', 'since'],
-    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode.',
+    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode. ' +
+      'A non-zero `dropped` in the response means entries between the pinned boot prefix and the ' +
+      'recent tail were evicted from the ring — the log is NOT contiguous, so do not read a gap in ' +
+      'it as "nothing happened there".',
   },
   modoki_project_settings: {
     kind: 'control', method: 'GET', route: '/api/project-settings', varies: 'method',
@@ -585,7 +594,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/player-prefs',
     mutating: true, persists: 'file', requires: ['editor'],
     minimalArgs: { action: 'flush' },
-    notes: "persists:'file' means the PLATFORM prefs store (localStorage / @capacitor/preferences), not a project file — it is the only Persists value that says 'survives the session', which is the fact that matters. set/delete flush before replying, so saved:true means the backend ACCEPTED the write; a rejected one is reported PARTIAL rather than ok, because the value stays in the cache and a read-back cannot see the failure. action is REQUIRED (§1) and action:'clear' additionally requires confirm:true (§8). On its OWN route rather than the /api/editor-action relay: that relay's routing key is `action`, and it strips it before relaying, so a tool with an `action` param has it silently DROPPED — measured here, and now refused outright by editorAction().",
+    notes: "persists:'file' means the PLATFORM prefs store (localStorage / @capacitor/preferences), not a project file — it is the only Persists value that says 'survives the session', which is the fact that matters. set/delete flush before replying, so saved:true means the backend ACCEPTED the write; a rejected one is reported PARTIAL rather than ok, because the value stays in the cache and a read-back cannot see the failure. action is REQUIRED (§1) and action:'clear' additionally requires confirm:true (§8). ALL FOUR actions, flush included, are refused NOT_AVAILABLE_HERE while a game/namespace swap is in flight (#438) — a write or flush that settles after the install cannot truthfully report where it landed. A swap that STARTS during the op's own flush is a different case (#454) and is NOT a refusal — the mutation already happened, so it reports PARTIAL with durability:'unknown' rather than NOT_AVAILABLE_HERE, which at entry means nothing was done. On its OWN route rather than the /api/editor-action relay: that relay's routing key is `action`, and it strips it before relaying, so a tool with an `action` param has it silently DROPPED — measured here, and now refused outright by editorAction().",
   },
   modoki_set_timescale: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-timescale',
@@ -676,7 +685,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { paths: ['/assets/particles/probe.particle.json'] },
-    notes: 'NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
+    notes: 'A TOTAL OS refusal answers ok:false (200) and a PARTIAL one answers ok:true with `failed` naming the paths still on disk — the split exists because a single ok:true for both meant isFailureBody short-circuited and this tool reported a refused delete as a successful call (#884). NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
   },
   modoki_list_creatable_assets: {
     kind: 'read', method: 'GET', route: '/api/creatable-assets',
@@ -767,13 +776,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/write-meta',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png', meta: {} },
-    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does.",
+    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does. REFUSES with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for that path, because a wholesale replace DESTROYS it (#872); the hatch is `discardUnsaved`, the DESTROYED half of §8. requires:['project'] and NOT ['editor'] on purpose — the park is renderer-only state, so a definitively-absent renderer means no park can exist and the write proceeds, labelled editorConnected:false. A renderer that is attached and does NOT answer is refused (NO_RENDERER), never treated as 'nothing is parked' (§5).",
   },
   modoki_duplicate_asset: {
     kind: 'asset', method: 'POST', route: '/api/duplicate-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/probe-copy.particle.json' },
-    notes: 'Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering.',
+    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
   },
   modoki_move_asset: {
     kind: 'asset', method: 'POST', route: '/api/move-file',

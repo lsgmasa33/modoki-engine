@@ -10,8 +10,17 @@ export type UILengthUnit = 'px' | '%' | 'vw' | 'vh' | 'vmin' | 'vmax';
 /** UIElement — consolidated UI trait: layout, style, text, and image. */
 export const UIElement = trait({
   // ── Layout ──
+  /** ⚠️ **Pinned on a pooled `UIEntries` row root — authoring `width`/`height` there does
+   *  nothing.** Not to a constant: forced to the scroll view's own RESOLVED box, in `px`, every
+   *  tick — the box the view has already computed for this slot, not `0` or any other fixed value.
+   *  A `%`/`vw`/`vh`/`vmin`/`vmax` unit is the documented contract here (the pool resolves it into
+   *  that same box) and is never warned about; only a `px` value that disagrees with the resolved
+   *  box is. Mechanism, why, and what the warning/Inspector note do and do not reach:
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
   width: 0,   // 0 = auto
   height: 0,  // 0 = auto
+  /** ⚠️ Also pinned on a pooled `UIEntries` row root, to `'px'` — see the note on `width` above:
+   *  the resolved box is always written in px, whatever unit was authored. */
   widthUnit: '%' as UILengthUnit,
   heightUnit: '%' as UILengthUnit,
   flexDirection: 'column' as 'row' | 'column',
@@ -28,6 +37,13 @@ export const UIElement = trait({
    *  4-wide and 7 rows deep. Nothing was wrong with the data — only with mixing the two units. */
   gapUnit: 'px' as UILengthUnit,
   flexGrow: 0,
+  /** ⚠️ **Pinned to `0` on a pooled `UIEntries` row root — authoring `flexShrink` there does
+   *  nothing.** Not the row's own trait default (`1`) — the pool needs the row NOT to shrink, or
+   *  the row's own trailing padding squeezes every entry to nothing (the #651 bug: pages rendered
+   *  0px wide). Because the pin (`0`) differs from the default (`1`), a naive "warn when authored
+   *  ≠ pin" rule would warn on every untouched row; `entriesSystem.ts`'s `pooledFieldNeedsWarning`
+   *  checks against the default too, so only a genuinely AUTHORED `flexShrink` warns. See
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
   flexShrink: 1,
   paddingTop: 0,
   paddingTopUnit: '%' as UILengthUnit,
@@ -37,6 +53,13 @@ export const UIElement = trait({
   paddingRightUnit: '%' as UILengthUnit,
   paddingBottom: 0,
   paddingBottomUnit: '%' as UILengthUnit,
+  /** ⚠️ **Pinned to 0 on a pooled `UIEntries` row root — authoring these there does nothing.**
+   *  Mechanism, why, and what the warning/Inspector note do and do not reach:
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651).
+   *
+   *  NOT a row of the gated-colour table below: that trap is an authored value gated by a
+   *  companion FIELD defaulting to 0, and this has no gating field at all — the gate is whether
+   *  the entity happens to be a scroll view's row. Cited here so nobody adds a wrong row. */
   marginTop: 0,
   marginTopUnit: '%' as UILengthUnit,
   marginRight: 0,
@@ -45,6 +68,7 @@ export const UIElement = trait({
   marginBottomUnit: '%' as UILengthUnit,
   marginLeft: 0,
   marginLeftUnit: '%' as UILengthUnit,
+  /** ⚠️ Also pinned to 0 on a pooled `UIEntries` row — see the margin note above. */
   minWidth: 0,   // 0 = none
   minWidthUnit: 'px' as UILengthUnit,
   maxWidth: 0,   // 0 = none
@@ -54,6 +78,15 @@ export const UIElement = trait({
   maxHeight: 0,  // 0 = none
   maxHeightUnit: 'px' as UILengthUnit,
   alignSelf: 'auto' as 'auto' | 'flex-start' | 'center' | 'flex-end' | 'stretch',
+  /**
+   * Stacking order among siblings.
+   *
+   * The single source of stacking order for every UI element, anchored or not — `UIAnchor` used
+   * to carry its OWN `zIndex` that silently overrode this one on an anchored element (#746 found
+   * the silence; this field's removal in the follow-up change closed the shadowing itself, since
+   * the two fields wrote the same CSS `z-index` onto the same DOM node and one of them could only
+   * ever be a duplicate).
+   */
   zIndex: 0,
   /**
    * Tilt, in DEGREES clockwise. 0 = square, the pre-existing behaviour of every authored element.
@@ -139,6 +172,15 @@ export const UIElement = trait({
   scrollbarThumbColor: 0x888888 as number,
   /** Track colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
   scrollbarTrackColor: 0xdddddd as number,
+  /** ⚠️ **Pinned on a pooled `UIEntries` row root — authoring `isVisible` there does nothing.**
+   *  Not to a constant: forced to whether the SLOT is live (has real data this frame) or parked
+   *  (recycled, off-window) — a parked slot pins `false` regardless of what was authored. Because
+   *  the pin is a runtime STATE rather than a fixed value, and a freshly-spawned parked slot's
+   *  `isVisible` still reads its trait default (`true`) on the very tick it parks,
+   *  `entriesSystem.ts`'s `pooledFieldNeedsWarning` checks the authored value against BOTH the pin
+   *  and the default — the naive "warn when authored ≠ pin" rule would otherwise warn on every
+   *  freshly-parked slot that was never touched. See `docs/ui-system.md` § "The engine OWNS a
+   *  pooled row's box" (#651, widened #761). */
   isVisible: true,
   /**
    * Never take the pointer: taps fall through to whatever is BEHIND this element, while its
@@ -158,12 +200,105 @@ export const UIElement = trait({
    * in the band's stacking context and made it silently unclickable.
    */
   pointerThrough: false,
+  /**
+   * Consume a click that lands on this element or on a non-interactive descendant, instead of
+   * letting it bubble to an ancestor — "stop the tap here, but I am not a button." Children that
+   * carry their own bindings keep working normally; this only intercepts what would otherwise
+   * fall through untouched.
+   *
+   * Why this exists instead of authoring a no-op `call` binding to get the same
+   * `stopPropagation`: a no-op binding is still a discrete click binding, so `UINode.tsx` runs it
+   * through `applyBindings` — which fires the UI click cue and takes the global input lock
+   * (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`, 300ms) for nothing. A tap on a dialog's body
+   * audibly clicked and then deafened the next tap in that dialog for 300ms (#728).
+   *
+   * Canonical use: a modal card whose scrim dismisses on tap. Without this, a tap on the card's
+   * own text falls through to the scrim and closes the dialog.
+   *
+   * ⚠️ Also opts this node into the #664 press-origin gate (`pressOrigin.ts`) — not incidental,
+   * half the reason the field exists. A press that starts on this card and releases past its edge
+   * onto the scrim must not read as a tap on the scrim, and that gate only protects nodes it
+   * considers interactive.
+   *
+   * ⚠️ **Contradicts `pointerThrough`, which WINS** — authoring both is an authoring error, not a
+   * combination with a meaning. `UINode.tsx` enforces that IN CODE (`swallowClicks === true &&
+   * !pointerThrough`), and it has to, because CSS cannot: `pointer-events: none` stops this node
+   * being hit-tested but does NOT remove it from the event path of a click that starts on a
+   * descendant with `auto` — which is the very case `pointerThrough` exists for (a decorative
+   * panel that still holds a working button). Before that gate, a band authored with both fields
+   * swallowed every tap beginning on a Canvas2D mount or scroll box inside it. Do not "simplify"
+   * the gate away on the grounds that `pointer-events: none` already handles it; it does not, and
+   * this comment claimed otherwise for a while before anyone measured it.
+   *
+   * ⚠️ **Not for a `canvas2D` container.** In the editor's click-to-select mode a `canvas2D` node
+   * deliberately gets no click handler (clicks pass through to the canvas), but `swallowClicks`
+   * would still take the pointer — so the click resolves to the container and selects its parent
+   * instead of descending. Nothing authors this today; if you need it, fix the editor branch
+   * rather than authoring around it.
+   *
+   * A node that ALSO carries a real click binding is a different story — that combination is
+   * redundant, not a trap. An interactive node's click handler already calls `stopPropagation`
+   * unconditionally before anything else, so the tap is stopped either way; `UINode.tsx` runs the
+   * interactive path (the `pressBelongsTo` gate, then the binding) and leaves the cursor as
+   * `pointer`. Nothing the author asked for is silently dropped — `swallowClicks` means precisely
+   * "swallow even though I have no binding of my own."
+   */
+  swallowClicks: false,
 
   // ── Style (box visuals) ──
-  backgroundColor: 0 as number,   // 0 = transparent
+  /** Background fill colour. ⚠️ **Inert on its own** — see `backgroundOpacity` below, which
+   *  defaults to 0 and gates whether this paints at all. */
+  backgroundColor: 0 as number,
+  /** Background fill alpha. ⚠️ **Defaults to 0, so setting `backgroundColor` ALONE paints
+   *  NOTHING.** The renderer gates the fill on this field — `ui/UINode.tsx`'s
+   *  `if (node.backgroundOpacity > 0)` — so a colour with no opacity is invisible, not
+   *  transparent-by-choice. Author or patch BOTH.
+   *
+   *  This is the canonical statement of a trap with three prior sightings, all of which worked
+   *  around it instead of documenting it here: four Court overlays shipped with invisible scrims;
+   *  `UIToggle` declares `trackOpacity`/`knobOpacity` explicitly (defaulting to 1) rather than
+   *  borrow this field, and says why; and `ui/sceneChrome.ts`'s `ChromeUIPatch` exposed
+   *  `backgroundColor` with no companion, making a patched colour a silent no-op on any element
+   *  whose scene left this at 0. Cite this comment rather than restating the rule.
+   *
+   *  ⚠️ **This is a FOUR-instance trap, and this comment has understated it twice.** The fix that
+   *  added this paragraph closed the background half and left the border half open; the paragraph
+   *  then called itself the canonical statement of a *two*-instance trap, and a close-out sweep
+   *  found two more. The full set, each an authored colour gated by a companion defaulting to 0:
+   *
+   *  | Colour | Gate (default 0) | Renderer |
+   *  |---|---|---|
+   *  | `backgroundColor` | `backgroundOpacity` | `ui/UINode.tsx` `if (node.backgroundOpacity > 0)` |
+   *  | `borderColor` | `borderWidth` | `if (node.borderWidth)` |
+   *  | `textShadowColor` | `textShadowBlur` OR `textShadowOffsetX` OR `textShadowOffsetY` — all three default 0, so all three must stay 0 for the gate to be closed | `if (node.textShadowBlur \|\| node.textShadowOffsetX \|\| node.textShadowOffsetY)` |
+   *  | `textStrokeColor` | `textStrokeWidth` | `if (node.textStrokeWidth > 0)` |
+   *
+   *  `ui/sceneChrome.ts`'s `ChromeUIPatch` exposes both halves of the first two pairs, because it
+   *  exposed those colours already; it exposes NEITHER half of the last two, which is consistent
+   *  and therefore not the same defect — a caller cannot half-open a gate it cannot reach at all.
+   *  Expose both halves or neither, never the colour alone.
+   *
+   *  ⚠️ **The boundary, because it is about to be tested again:** this is a trap only when the
+   *  gating field's NAME does not announce the gate. `fontSizeMin` does nothing without
+   *  `autoFitText` (landed on main 2026-09-03), and every PostFX strength field does nothing
+   *  without that effect's `enabled` — neither is an instance, because an author who set the
+   *  value and saw nothing happen knows immediately what to look for. `borderColor` gives them
+   *  nothing to look for. Add a row here only when the gate is SILENT in that sense.
+   *
+   *  Counter-example worth keeping in view: `textOpacity`, `borderOpacity`, `textShadowOpacity`
+   *  and `textStrokeOpacity` all default to **1**, so they gate nothing; and `UIToggle` declares
+   *  `trackOpacity`/`knobOpacity` at 1 specifically to avoid inheriting this shape. */
   backgroundOpacity: 0,
   borderRadius: 0,
+  /** Border thickness in CSS px. ⚠️ **Defaults to 0, and it GATES THE WHOLE BORDER** — the
+   *  renderer draws nothing border-related unless this is nonzero (`ui/UINode.tsx`:
+   *  `if (node.borderWidth) { … style.borderColor = … }`). So `borderColor` alone paints NOTHING,
+   *  exactly as `backgroundColor` without `backgroundOpacity` does. Same trap, second instance.
+   *
+   *  This is PAINT, not layout: the renderer sets `box-sizing: border-box`, so a border draws
+   *  INSIDE the element's box and never changes its outer size or moves a sibling. */
   borderWidth: 0,
+  /** Border colour. ⚠️ **Inert on its own** — gated by `borderWidth` above, which defaults to 0. */
   borderColor: 0x333333 as number,
   borderOpacity: 1,      // border color alpha (folded into the borderColor picker)
   opacity: 1,
@@ -216,6 +351,41 @@ export const UIElement = trait({
    * alongside a non-px `fontSize` until that follows.
    */
   fontSizeUnit: 'px' as UILengthUnit,
+  /**
+   * Shrink-to-fit (#614): when true, the effective font size is reduced — never grown past the
+   * authored `fontSize` — until the text fits its box on ONE line, down to `fontSizeMin`. Below
+   * that floor the existing `maxLines`/`textOverflow` behaviour takes over unchanged, exactly as
+   * it would without this field. Off by default: an author opts a label in only where a fixed
+   * string can overflow at some viewport/locale (Court's `ConflictLocalButton`, #614 — "Keep this
+   * device" wrapped to two lines while its twin "Use the cloud" sat on one, both authored
+   * identically). See `ui/autoFitText.ts` for the fit math.
+   *
+   * ⚠️ Does nothing on `elementType: 'input'` — an input's text is player-entered, not an
+   * authored label, and shrinking it as the user types is a different feature (out of scope here).
+   *
+   * ⚠️ **And it is not alone: an ENTIRE field group is dropped on a form control (#745).** This
+   * note used to name `autoFitText` only, which read as "that one field is special" rather than
+   * "these do not apply here". The whole text-style block in `UINode` is gated on `UIElement.text`,
+   * which an `input`/`range` never uses (its value comes from `inputBinding`), and the control
+   * branch re-emits only `fontFamily`, `fontSize`, `fontWeight` and `color`. So on an `<input>` or
+   * `<range>` these are silently dropped as well: `textAlign`, `lineHeight`, `letterSpacing`,
+   * `fontStyle`, `textShadow*` (all five), `textStroke*`, `textOverflow`, `maxLines`.
+   *
+   * They stay unwired on purpose — a form control's text rendering is the platform's, not ours —
+   * so `UINode` warns once per entity in DEV naming the fields you authored and will not get,
+   * rather than pretending to honour them. `text` ITSELF is dropped on `input`/`range`/`Canvas2D`/
+   * `UIToggle` nodes too, with its styling still applied to the box, and warns the same way.
+   */
+  autoFitText: false,
+  /**
+   * The shrink floor for `autoFitText`, in the SAME UNIT as `fontSize` (`fontSizeUnit`) —
+   * deliberately no separate `fontSizeMinUnit`. A floor authored in a different unit than the
+   * size it bounds could not be compared without a second layout read, and two units on one pair
+   * of fields is a drift trap (cf. the `letterSpacingUnit` note above, which must match
+   * `fontSizeUnit` for the same reason). `0` means "no explicit floor": the effective floor is
+   * `fontSize * DEFAULT_AUTOFIT_MIN_RATIO` (see `ui/autoFitText.ts`), i.e. half the authored size.
+   */
+  fontSizeMin: 0,
   fontWeight: 'normal' as 'normal' | 'bold',
   fontStyle: 'normal' as 'normal' | 'italic',
   textColor: 0xffffff as number,
@@ -233,11 +403,17 @@ export const UIElement = trait({
    * only the font shrank. Author both in the same unit.
    */
   letterSpacingUnit: 'px' as UILengthUnit,
+  /** ⚠️ **Inert on its own** — gated by `textShadowBlur`/`textShadowOffsetX`/
+   *  `textShadowOffsetY`, all of which default to 0. The THIRD instance of the trap
+   *  documented on `backgroundOpacity` above; read that comment, don't restate it. */
   textShadowColor: 0x000000 as number,
   textShadowOpacity: 1,  // shadow color alpha (folded into the textShadowColor picker)
   textShadowOffsetX: 0,
   textShadowOffsetY: 0,
   textShadowBlur: 0,
+  /** ⚠️ **Inert on its own** — gated by `textStrokeWidth`, which defaults to 0. The FOURTH
+   *  instance of the trap documented on `backgroundOpacity` above; read that comment, don't
+   *  restate it. */
   textStrokeColor: 0x000000 as number,
   textStrokeOpacity: 1,  // stroke color alpha (folded into the textStrokeColor picker)
   textStrokeWidth: 0,

@@ -136,21 +136,53 @@ export function routeContactEvents<M>(
   }
 }
 
-/** Synthesize `exit` events for pairs still overlapping the given collider handles BEFORE they
- *  are freed — Rapier emits no stop event on collider removal/rebuild, so without this a
- *  despawn-inside-a-trigger (or geometry rebuild) leaves subscribers' overlap state stuck
- *  'entered'. Double-exit safe: the caller deletes its own collider entries before freeing, so a
- *  simultaneously-removed partner is already gone from `colliders`. */
-export function synthesizeContactExits(colliderHandles: readonly number[], world: World, colliders: ColliderMap, narrowPhase: NarrowPhaseLike, bus: PhysicsEventBus, fire: FireOnCollision): void {
+/** ONE pair still overlapping a collider that is about to be freed, waiting to be routed as
+ *  an `exit` — see {@link collectContactExits}. Holds SHALLOW COPIES of the two `ColliderInfo`s,
+ *  not the live entries: `applyBodyMaterial` (physics2D/3DSystem) toggles `info.isSensor` IN
+ *  PLACE for a material/filter edit — that is an in-place apply, not a rebuild — so a partner
+ *  whose `isSensor` flips between the collect and the flush would otherwise rewrite the channel
+ *  {@link routeContactExits} routes on, and a `onSensor` subscriber would never receive the exit
+ *  it is waiting for. Inline routing made that window zero-width; deferring it did not. */
+export interface ContactExitPair { a: ColliderInfo; b: ColliderInfo }
+
+/** Collect `exit` pairs for the given collider handles BEFORE they are freed — Rapier emits no
+ *  stop event on collider removal/rebuild, so without this a despawn-inside-a-trigger (or
+ *  geometry rebuild) leaves subscribers' overlap state stuck 'entered'. Double-exit safe: the
+ *  caller deletes its own collider entries before freeing, so a simultaneously-removed partner is
+ *  already gone from `colliders`.
+ *
+ *  ⚠️ **Collecting and ROUTING are deliberately separate, same as {@link collectContactEvents}
+ *  above — but here the split is load-bearing rather than a frame-timing nicety.** The
+ *  narrow-phase read must happen HERE, while `h`'s collider entries are still registered (the
+ *  caller removes them right after). But routing reaches game code (`OnCollision` dispatch, bus
+ *  subscribers), and the removal that triggers this collect happens INSIDE a
+ *  `world.query(...).updateEach(...)` callback (physics2D/3DSystem's body-reconcile query) — koota
+ *  snapshots each queried trait before the callback and writes it back unconditionally after, so a
+ *  handler's `entity.set` on a queried trait fired synchronously here would be silently clobbered
+ *  by that write-back (#445). Callers must collect into `out` here and call
+ *  {@link routeContactExits} only after the query has closed. */
+export function collectContactExits(colliderHandles: readonly number[], colliders: ColliderMap, narrowPhase: NarrowPhaseLike, out: ContactExitPair[]): void {
   for (const h of colliderHandles) {
     const self = colliders.get(h);
     if (!self) continue;
-    const emitExit = (otherHandle: number) => {
+    const collect = (otherHandle: number) => {
       const other = colliders.get(otherHandle);
       if (!other || other.entityId === self.entityId) return; // gone, or same entity (compound)
-      routePair(world, self, other, 'exit', bus, fire);
+      out.push({ a: { ...self }, b: { ...other } });   // copies — see ContactExitPair
     };
-    narrowPhase.contactPairsWith(h, emitExit);        // solid contacts
-    narrowPhase.intersectionPairsWith(h, emitExit);   // sensor overlaps
+    narrowPhase.contactPairsWith(h, collect);        // solid contacts
+    narrowPhase.intersectionPairsWith(h, collect);   // sensor overlaps
   }
+}
+
+/** Route pairs collected by {@link collectContactExits}, then clear `out` so the array is
+ *  reusable. Deliberately does NOT call `indexLivePair` — synthesized exits involve
+ *  dead/reparented entities that would roll up to the Percept contact index asymmetrically; body
+ *  removal is instead cleaned by `dropEntityFromContactIndex` (see physicsContactIndex.ts), same
+ *  as the synthesize path this replaces. */
+export function routeContactExits(world: World, out: ContactExitPair[], bus: PhysicsEventBus, fire: FireOnCollision): void {
+  for (const p of out) {
+    routePair(world, p.a, p.b, 'exit', bus, fire);
+  }
+  out.length = 0;
 }

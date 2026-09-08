@@ -39,6 +39,16 @@ export interface AddNativeTargetModule {
  *  rather than a union that would force every caller to discriminate. */
 export type EnginePluginModule = Record<string, unknown>;
 
+/** Why {@link loadEnginePluginModuleResult} returned no module: `'no-source'` — the entry `.ts`
+ *  is not on disk; `'no-esbuild'` — the entry exists but `esbuild` could not be imported (measured
+ *  in the packaged editor, #714: it ships `engine/plugins/*.ts` but not `esbuild`, a pruned
+ *  devDependency). */
+export type EnginePluginLoadDegradeReason = 'no-source' | 'no-esbuild';
+
+export type EnginePluginLoadResult =
+  | { module: EnginePluginModule; reason: null }
+  | { module: null; reason: EnginePluginLoadDegradeReason };
+
 /** Load an `engine/plugins/*.ts` implementation by bundling it with esbuild first, or `null` when
  *  that is not possible here (no engine sources, or no esbuild — i.e. the packaged editor).
  *  `relPathFromEngineDir` is relative to `engine/` (e.g. `plugins/vendorPlugins.ts`). */
@@ -46,6 +56,23 @@ export declare function loadEnginePluginModule(
   repoRoot: string,
   relPathFromEngineDir: string,
 ): Promise<EnginePluginModule | null>;
+
+/** Same as {@link loadEnginePluginModule}, but reports WHICH of the two degrade cases fired
+ *  instead of collapsing them into a bare `null` (#714). */
+export declare function loadEnginePluginModuleResult(
+  repoRoot: string,
+  relPathFromEngineDir: string,
+): Promise<EnginePluginLoadResult>;
+
+/** Load engine modules the caller CANNOT run without: same loader as
+ *  {@link loadEnginePluginModuleResult}, but THROWS (naming the entry and the reason) instead of
+ *  degrading to `null`. Returns the namespaces in the order requested, unmerged. See the `.mjs`
+ *  for why a required-load disposition had to exist (#827). */
+export declare function loadRequiredEngineModules(
+  repoRoot: string,
+  relPathsFromEngineDir: readonly string[],
+  purpose: string,
+): Promise<EnginePluginModule[]>;
 
 /** Load `engine/plugins/vendorPlugins.ts` by bundling it with esbuild first, or `null` when that
  *  is not possible here (no engine sources, or no esbuild — i.e. the packaged editor). */

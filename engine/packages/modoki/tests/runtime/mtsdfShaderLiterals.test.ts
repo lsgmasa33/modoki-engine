@@ -22,17 +22,19 @@
  *  future formatter regression without this test having to know which constants exist. */
 import { describe, it, expect } from 'vitest';
 import { mtsdfShaderBitsForTest } from '../../src/runtime/rendering/text/mtsdfPixiShader';
+import { stripComments as sharedStripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
-/** Strip comments before extracting literals.
+/** Comment stripping is the shared scanner (`../helpers/sourceScanner`, #419), with
+ *  `regexLiterals: false` — this source is WGSL/GLSL, where a `/` is always division and the
+ *  JS regex-literal heuristic could only misfire.
  *
- *  Required for correctness, not tidiness: the two extractors have DIFFERENT blind spots.
- *  WGSL's only matches `f32(...)` calls, so prose is invisible to it, while GLSL's matches
- *  any bare decimal — so a comment mentioning a threshold ("the shipped floor of 0.1")
- *  registered as a GLSL-only constant and failed a parity check on two identical programs.
- *  This test is about the CODE the backends emit; the shared template's prose is not part
- *  of it. */
+ *  Stripping is required for CORRECTNESS, not tidiness: the two extractors below have DIFFERENT
+ *  blind spots. WGSL's only matches `f32(...)` calls, so prose is invisible to it, while GLSL's
+ *  matches any bare decimal — so a comment mentioning a threshold ("the shipped floor of 0.1")
+ *  registered as a GLSL-only constant and failed a parity check on two identical programs. This
+ *  test is about the CODE the backends emit; the shared template's prose is not part of it. */
 function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+  return sharedStripComments(src, { regexLiterals: false });
 }
 
 /** Every `f32(<n>)` literal the WGSL program emits. */
@@ -50,6 +52,13 @@ describe('MTSDF shader float literals', () => {
   const { wgsl, glsl } = mtsdfShaderBitsForTest();
   const wgslSrc = wgsl.fragment.main;
   const glslSrc = glsl.fragment.main;
+
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    assertScanIsSane(wgslSrc, stripComments(wgslSrc), 'mtsdf wgsl fragment.main');
+    assertScanIsSane(glslSrc, stripComments(glslSrc), 'mtsdf glsl fragment.main');
+  });
 
   it('emits the same SET of constants on both backends', () => {
     const w = [...new Set(wgslNumbers(wgslSrc))].sort((a, b) => a - b);

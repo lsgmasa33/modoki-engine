@@ -20,6 +20,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { parseAssetJson } from './assetFetch';
+import { createTeardownToken } from '../core/liveness';
 
 /** Per-clip playback parameters within an animset. All optional — a missing
  *  field falls back to the engine default (see ANIMSET_DEFAULTS), which is also
@@ -58,7 +59,14 @@ export const ANIMSET_DEFAULTS: ResolvedAnimParams = Object.freeze({
 const cache = new Map<string, AnimSetDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
-let generation = 0;
+/** Teardown liveness, captured per PATH before each load and re-checked after.
+ *
+ *  `invalidateAll()` is `clearAnimSetCache`'s (the whole cache is gone). A per-key
+ *  `invalidateAnimSet` must NOT refuse an in-flight load of a DIFFERENT key — this cache is driven
+ *  by the editor's file watcher, so an author saving one animset would otherwise make a concurrent
+ *  load of an unrelated animset silently drop it — so it calls `invalidateKey` alone. Cleared
+ *  wholesale by `clearAnimSetCache`, so the per-key map cannot outgrow the cache it shadows. */
+const liveness = createTeardownToken<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here,
 // same as animationClipCache before its fix.
 const unknownGuidSeen = new Set<string>();
@@ -77,28 +85,34 @@ function normalizeAnimSet(json: Partial<AnimSetDef> | undefined): AnimSetDef {
 
 /** Resolve an animset ref to its parsed definition, or null if not yet loaded.
  *  Kicks off a lazy fetch on first miss (retried each frame by the caller). */
-export function getAnimSet(ref: string): AnimSetDef | null {
+export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef | null {
   if (!ref) return null;
   const path = animSetCacheKey(ref);
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
   if (failed.has(path)) return null;
+  // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
+  // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
+  // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
+  // fetch that could only fail and permanently `failed.add`-poison the path (no watcher heals it on
+  // device) — for a question the caller had already decided to answer with a refusal.
+  if (opts?.load === false) return null;
   if (!loading.has(path)) {
-    const gen = generation;
+    const stillLive = liveness.capture(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (!stillLive()) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<AnimSetDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'animset');
         cache.set(path, normalizeAnimSet(json as Partial<AnimSetDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (stillLive()) failed.add(path);
         console.warn(`[animSetCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -141,6 +155,12 @@ export function setAnimSet(refOrPath: string, def: Partial<AnimSetDef>): void {
 export function invalidateAnimSet(refOrPath: string): void {
   const path = animSetCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `invalidateAll()`, which is `clearAnimSetCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one animset must not also refuse an in-flight load of
+  // a DIFFERENT animset.
+  liveness.invalidateKey(path);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -148,7 +168,7 @@ export function invalidateAnimSet(refOrPath: string): void {
 
 /** Drop ALL cached animsets (scene swap / full resource disposal). */
 export function clearAnimSetCache(): void {
-  generation++;
+  liveness.invalidateAll();
   cache.clear();
   loading.clear();
   failed.clear();

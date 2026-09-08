@@ -1,11 +1,13 @@
 /** Enact Phase 2 — the interaction-handle provider registry (the input twin of
  *  screenBounds). Verifies merge, filtering, id resolution, and that one throwing
  *  provider can't break the whole report. */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { createWorld } from 'koota';
 import {
   registerHandleProvider, collectHandles, resolveHandle,
   type InteractionHandle,
 } from '../../src/runtime/rendering/interactionHandles';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 const unregs: Array<() => void> = [];
 function provide(handles: InteractionHandle[]) {
@@ -54,5 +56,21 @@ describe('interactionHandles registry', () => {
     expect(resolveHandle('gone')).not.toBeNull();
     u();
     expect(resolveHandle('gone')).toBeNull();
+  });
+
+  it('re-warns for the same duplicate handle id after a world swap (#738 group B)', () => {
+    // `warnedDuplicates` had NO clear at all in production — a handle id that warned once (two
+    // providers both reporting it) stayed silently suppressed for the rest of the session,
+    // including a later scene that happens to reuse the same id.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    provide([H({ id: 'dup' })]);
+    provide([H({ id: 'dup' })]);
+    collectHandles();
+    collectHandles();
+    expect(err).toHaveBeenCalledTimes(1); // warn-once, not once per poll
+    setCurrentWorld(createWorld()); // world swap — should reset the warn-once memory
+    collectHandles();
+    expect(err).toHaveBeenCalledTimes(2);
+    err.mockRestore();
   });
 });

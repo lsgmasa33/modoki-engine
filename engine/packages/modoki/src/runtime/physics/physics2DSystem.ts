@@ -32,7 +32,7 @@ import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D } from '../core/ecs/worldTransform';
 import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { physics2DEvents } from './Physics2DEvents';
-import { makeFireOnCollision, collectContactEvents, routeContactEvents, synthesizeContactExits, refOf, type ColliderInfo, type DrainedPair } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, type ColliderInfo, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
 import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
@@ -459,18 +459,18 @@ function createBody(
   return rec;
 }
 
-/** Synthesize `exit` events for any pair still overlapping THIS body's colliders, BEFORE they
- *  are freed. Rapier emits no stop event when a collider is removed or rebuilt, so without
- *  this a despawn-inside-a-trigger (or a geometry rebuild) leaves subscribers' overlap state
- *  stuck 'entered' (H1). Double-exit safe when both bodies go the same frame: the other
- *  collider must still be registered (removeBody deletes its own entries before freeing, so
- *  the second removal finds no partner). */
 // The declarative OnCollision2D dispatcher, bound to this dimension's trait (shared core).
 const fireOnCollision = makeFireOnCollision(OnCollision2D);
 
-function removeBody(st: PhysicsWorldState, world: World, rec: BodyRec): void {
-  // Emit synthetic exits for still-overlapping pairs before the colliders vanish (H1).
-  synthesizeContactExits(rec.colliderHandles, world, st.colliders, st.world.narrowPhase, physics2DEvents, fireOnCollision);
+/** COLLECT `exit` pairs for anything still overlapping THIS body's colliders, BEFORE they are
+ *  freed, then free the body. Rapier emits no stop event when a collider is removed or rebuilt,
+ *  so without this a despawn-inside-a-trigger (or a geometry rebuild) leaves subscribers' overlap
+ *  state stuck 'entered' (H1). Double-exit safe when both bodies go the same frame: the other
+ *  collider must still be registered (this deletes its own entries before freeing, so the second
+ *  removal finds no partner). ROUTING those pairs is the CALLER's job and must not happen until
+ *  the reconcile query has closed — see `collectContactExits` and #445. */
+function removeBody(st: PhysicsWorldState, world: World, rec: BodyRec, exits: ContactExitPair[]): void {
+  collectContactExits(rec.colliderHandles, st.colliders, st.world.narrowPhase, exits);
   // Rapier's removeRigidBody auto-removes this body's joints, invalidating their handles.
   // Drop the referencing JointRecs from our map here (map-only, NO getImpulseJoint — a
   // stale handle could resolve to a reused-index sibling and wrongly remove it). The joint
@@ -536,8 +536,8 @@ function soloColliderSig(entity: Entity, tf: TfData): string {
   return `${entity.id()}:${entity.generation()}:${px}:${py}:${pr}:${ws.sx}:${ws.sy}:${colliderGeomSig(entity)}`;
 }
 
-function removeSoloCollider(st: PhysicsWorldState, world: World, rec: SoloColliderRec): void {
-  synthesizeContactExits(rec.colliderHandles, world, st.colliders, st.world.narrowPhase, physics2DEvents, fireOnCollision);
+function removeSoloCollider(st: PhysicsWorldState, world: World, rec: SoloColliderRec, exits: ContactExitPair[]): void {
+  collectContactExits(rec.colliderHandles, st.colliders, st.world.narrowPhase, exits);
   for (const h of rec.colliderHandles) {
     const col = st.world.getCollider(h);
     if (col) st.world.removeCollider(col, true);   // wakeUp any body it was touching
@@ -927,6 +927,11 @@ export function physics2DSystem(world: World): void {
   // Compound children (Collider2D + Transform, no own RigidBody2D) grouped by parent id.
   const childrenByParent = collectCompoundChildren(world);
 
+  // #445: collected inside the query below and routed AFTER it closes — routing reaches game code
+  // (`OnCollision2D`, bus subscribers), and a handler's `entity.set` on a queried trait would be
+  // clobbered by `updateEach`'s write-back.
+  const exits: ContactExitPair[] = [];
+
   // ── Reconcile + push (ECS → Rapier) ──
   world.query(Transform, RigidBody2D).updateEach(([tf, rb]: [TfData, RbData], entity) => {
     const id = entity.id();
@@ -937,7 +942,7 @@ export function physics2DSystem(world: World): void {
     let rec = st.bodies.get(id);
     // Rebuild on a structural change OR an id recycled onto a new entity (stale gen) —
     // otherwise the newcomer would silently adopt the old body's simulated pose.
-    if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeBody(st, world, rec); rec = undefined; }
+    if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeBody(st, world, rec, exits); rec = undefined; }
     if (!rec) { createBody(st, id, gen, tf, rb, entity, children, cfg, sig); return; }
 
     // Material / filter / layer edits apply to the live collider(s) IN PLACE — no rebuild,
@@ -967,10 +972,11 @@ export function physics2DSystem(world: World): void {
       }
     }
   });
+  routeContactExits(world, exits, physics2DEvents, fireOnCollision);
 
   // ── Cleanup despawned/detached bodies ──
   for (const [id, rec] of st.bodies) {
-    if (!seen.has(id)) removeBody(st, world, rec);
+    if (!seen.has(id)) removeBody(st, world, rec, exits);
   }
 
   // ── Solo (parentless) static colliders: a Collider2D with no RigidBody2D and no body parent
@@ -986,7 +992,7 @@ export function physics2DSystem(world: World): void {
       const tf = child.get(Transform) as TfData;
       const sig = soloColliderSig(child, tf);
       let rec = st.soloColliders.get(cid);
-      if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeSoloCollider(st, world, rec); rec = undefined; }
+      if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeSoloCollider(st, world, rec, exits); rec = undefined; }
       if (!rec) {
         const handles = attachSoloCollider(st, child, cfg);
         // No handles ⇒ shape invalid (makeColliderDesc warned once) — leave untracked so it retries.
@@ -1004,8 +1010,9 @@ export function physics2DSystem(world: World): void {
   // Drop solo colliders that are no longer solo (despawned, gained their own body, or their parent
   // became one — in which case the body pass already re-adopted them as compound children).
   for (const [, rec] of st.soloColliders) {
-    if (!seenSolo.has(rec.entityId)) removeSoloCollider(st, world, rec);
+    if (!seenSolo.has(rec.entityId)) removeSoloCollider(st, world, rec, exits);
   }
+  routeContactExits(world, exits, physics2DEvents, fireOnCollision);
 
   // ── Reconcile joints (after bodies exist, before stepping) ──
   reconcileJoints(st, world, cfg);

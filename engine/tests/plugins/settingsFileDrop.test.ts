@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { readScannedSource } from '@modoki/engine/testing';
 
 let projectRoot = '';
 let outsideRoot = '';
@@ -331,7 +332,7 @@ describe('/api/source-image — the preview bytes', () => {
  *  an image path" under a perfectly good icon; adding it to the BACKEND alone does nothing at all,
  *  visibly. A guard is cheap; noticing either by hand is not. */
 describe('the image-extension allowlists', () => {
-  const read = (rel: string) => fs.readFileSync(path.join(__dirname, '../..', rel), 'utf-8');
+  const read = (rel: string) => readScannedSource(path.join(__dirname, '../..', rel)).code;
 
   it('the backend content-type table and the renderer regex cover the same extensions', () => {
     const routerSrc = read('plugins/backend/editorBackendRouter.ts');

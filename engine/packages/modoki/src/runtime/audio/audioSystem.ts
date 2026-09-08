@@ -200,6 +200,28 @@ export function stopWorldAudio(world: World): void {
   clearAudioCues(world);
 }
 
+/** Re-arm the autoplay guard after a realm-death FALSE ALARM (#611). `App.tsx`'s
+ *  `app.cleanup` realm-shutdown task calls `audioDispose()` unconditionally, which
+ *  `stopAll()`s and ends every live handle. If the realm actually survives (the
+ *  `pagehide` backstop over-triggering, or `shutdownRealmThenReload()`'s throwing
+ *  route), those handles stay `ended` and `autoplayed` above still holds every id
+ *  it ever saw — so an authored `loop + autoplay` source (music, ambience) can
+ *  never re-declare intent and is silent for the rest of the session, with
+ *  `playing: false` in the Inspector and nothing to explain it.
+ *
+ *  Clearing `autoplayed` makes the next `audioSystem` tick treat every autoplay
+ *  source as freshly spawned: it re-sets `playing = true` and `startOrSwap`
+ *  recreates the handle — deliberately a restart from the top, exactly what a real
+ *  reload would have produced. It does NOT resume mid-track, and is not meant to.
+ *
+ *  Reads `states` directly rather than `stateFor` — a world with no audio state yet
+ *  has nothing to re-arm, and `stateFor` would wrongly create one. */
+export function rearmAudioAutoplay(world: World): void {
+  const s = states.get(world);
+  if (!s) return;
+  s.autoplayed.clear();
+}
+
 /** Hard-stop one entity's audio (tear the handle down, distinct from pause). Backs
  *  the built-in `audio.stop` action. Safe to call for an entity with no live handle.
  *

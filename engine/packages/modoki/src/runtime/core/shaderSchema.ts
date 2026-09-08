@@ -8,7 +8,10 @@ export type ShaderParamType = 'float' | 'color' | 'bool' | 'vec2' | 'vec3' | 've
 
 /** The known param types — used to surface a typo'd `type` at manifest-load time
  *  rather than silently falling through to `coerceParamValue`'s zero default. */
-const SHADER_PARAM_TYPES: ReadonlySet<string> = new Set<ShaderParamType>([
+/** Exported so `assetSchemas.ts` can DERIVE the agent-facing note instead of transcribing it —
+ *  a hand-copied union went stale on the day it landed (#831 close-out): it said
+ *  `"float"|"color"` while a committed shader already used `texture`. */
+export const SHADER_PARAM_TYPES: ReadonlySet<string> = new Set<ShaderParamType>([
   'float', 'color', 'bool', 'vec2', 'vec3', 'vec4', 'texture',
 ]);
 
@@ -25,6 +28,11 @@ export interface ShaderParam {
 }
 
 export type ShaderParamSchema = Record<string, ShaderParam>;
+
+/** The shader body extensions — raw WGSL/GLSL source, sibling to a `.shader.json`
+ *  descriptor. Deliberately NOT manifest assets (see `assetTypeClassifier.ts`):
+ *  no GUID, no manifest entry, no `LiveReloadKind` of their own. */
+export const SHADER_BODY_EXTS = ['.glsl', '.wgsl'] as const;
 
 /** A file-based shader manifest (`<name>.shader.json`). Raw WGSL/GLSL bodies live
  *  in sibling `<name>.wgsl` / `<name>.glsl` files. */
@@ -43,6 +51,32 @@ export interface ShaderManifest {
    *  vec4 alpha is a per-pixel preserve mask (0..1) rather than opacity; the loader
    *  routes it into the NPR lineColor target. Omitted → fully NPR (grayscale). */
   colorPreserve?: 'alpha';
+}
+
+/** Derive the sibling body path from a `.shader.json` manifest path. */
+export function shaderBodyPath(manifestPath: string, ext: 'glsl' | 'wgsl'): string {
+  return manifestPath.replace(/\.shader\.json$/i, `.${ext}`);
+}
+
+/** Reverse of {@link shaderBodyPath}: map a shader body path (`<name>.glsl` /
+ *  `<name>.wgsl`) back to its sibling `<name>.shader.json` descriptor. Returns
+ *  null for any other extension. */
+export function shaderManifestPathForBody(bodyPath: string): string | null {
+  // Derived from SHADER_BODY_EXTS rather than repeating the extensions, so both DIRECTIONS of the
+  // descriptor<->body mapping read from one list.
+  // ⚠️ That is the scope of the claim — it is NOT "adding a third body extension is a one-line
+  // change", which an earlier version of this comment said and which is false. At least four other
+  // places hard-code the pair independently, and the tree-shaker one is load-bearing (it is what
+  // keeps a body file in a production build at all):
+  //   engine/plugins/asset-tree-shaker.ts (:87 kept-extensions, :117 classifier, :886 sibling walk)
+  //   engine/plugins/backend/staticAssets.ts (:44 MIME)
+  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (:31 TEXT_ASSET_EXTS)
+  // Those cannot import this constant (plugin/runtime split), so a third extension is a sweep.
+  const lower = bodyPath.toLowerCase();
+  for (const ext of SHADER_BODY_EXTS) {
+    if (lower.endsWith(ext)) return bodyPath.slice(0, -ext.length) + '.shader.json';
+  }
+  return null;
 }
 
 /** Surface an authoring typo (e.g. `type: 'flot'`) loudly instead of letting

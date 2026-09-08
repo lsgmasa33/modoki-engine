@@ -28,7 +28,9 @@ import { DeviceTab } from './tabs/DeviceTab';
 import { ProfilerTab } from './tabs/ProfilerTab';
 import { InputTab } from './tabs/InputTab';
 
-// Start capturing console.* as soon as the (enabled) debug-menu chunk loads.
+// Capture already started, eagerly, in main.tsx (#596/#597 Stage 3b) — this is only the debug
+// menu's VIEW onto that shared ring. The call is a safety net for a standalone @modoki/engine
+// consumer with no app shell around it; it decides nothing about WHEN capture starts.
 installConsoleCapture();
 // Make per-frame draw-call/triangle stats accurate under multi-pass rendering.
 installDrawCallProbe();

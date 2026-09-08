@@ -31,12 +31,19 @@ let game: TestWorld | undefined;
 beforeEach(() => { game = createTestWorld({}); clearJournal(); clearWatch(); });
 afterEach(() => { game?.dispose(); game = undefined; vi.restoreAllMocks(); });
 
-/** Load the bridge fresh (module-private console ring starts empty), with console.* silenced
- *  BEFORE capture wraps it, so 100+ seeded entries don't spam the test output. */
+/** Reset the ONE shared console ring — not a module-private buffer any more (#596/#597 Stage 3a
+ *  deleted `agentBridge`'s own `consoleBuffer`/`consoleHooked`; `dumpConsoleLogs` now projects the
+ *  shared ring) — with console.* silenced BEFORE reinstalling it, so 100+ seeded entries don't spam
+ *  the test output: the freshly-mocked `console.log`/`.error` is what the ring wraps as "original",
+ *  so the real forwarded call is silent. `installConsoleCapture()` is now a thin shim (it just
+ *  ensures the shared ring is installed) — called anyway so this file still exercises that exported
+ *  call site the way `initAgentBridge()` does. */
 async function freshBridge() {
-  vi.resetModules();
+  const { __resetConsoleRingForTest, installConsoleRing } = await import('@modoki/engine/runtime/core/consoleRing');
+  __resetConsoleRingForTest();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  installConsoleRing();
   const mod = await import('../../app/debug/agentBridge');
   mod.installConsoleCapture();
   return mod;
@@ -110,6 +117,24 @@ describe('console-logs: the op tails, the producer does not', () => {
     const r = await runAgentOp('console-logs', { limit: 3 }) as { logs: unknown[]; total: number };
     expect(r.logs).toHaveLength(3);
     expect(r.total).toBe(30);
+  });
+
+  // Finding A (#596/#597 close-out review): the ring is `[pinned boot prefix] ++ [rolling tail]` —
+  // once it wraps, that is DISCONTIGUOUS, and `logs`/`byLevel` above silently concatenate the two
+  // halves with no marker at the seam. `getConsoleRingDropped()` existed, unreached by any
+  // production caller, until this op started returning it.
+  it('reports dropped — the disclosure that the ring is discontiguous, not just short', async () => {
+    const { runAgentOp } = await freshBridge(); // installConsoleRing() default: capacity 512, bootPrefix 128
+    for (let i = 0; i < 700; i++) console.log(`m${i}`);
+    const r = await runAgentOp('console-logs', {}) as { dropped: number };
+    expect(r.dropped).toBe(700 - 512);
+  });
+
+  it('dropped is 0 while the ring has never wrapped', async () => {
+    const { runAgentOp } = await freshBridge();
+    console.log('a'); console.log('b');
+    const r = await runAgentOp('console-logs', {}) as { dropped: number };
+    expect(r.dropped).toBe(0);
   });
 
   it('diagnose reads the PRODUCER, so it is unaffected by the op-level tail', async () => {

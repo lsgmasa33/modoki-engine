@@ -21,13 +21,13 @@ const spyError = () => {
 };
 afterEach(() => { for (const s of spies) s.mockRestore(); spies = []; });
 
-const build = (write: (v: string) => Promise<boolean>) =>
-  makeBaseSceneUndo({ path: '/scenes/level.scene.json', old: '/scenes/base.scene.json', next: '', write });
+const build = (write: (v: string) => Promise<boolean>, fileDirect = true) =>
+  makeBaseSceneUndo({ path: '/scenes/level.scene.json', old: '/scenes/base.scene.json', next: '', write, fileDirect });
 
 describe('makeBaseSceneUndo', () => {
   it('labels by DIRECTION of the edit — clearing reads "Clear base scene"', () => {
     expect(build(async () => true).label).toBe('Clear base scene');
-    expect(makeBaseSceneUndo({ path: '/p', old: '', next: '/b', write: async () => true }).label).toBe('Set base scene');
+    expect(makeBaseSceneUndo({ path: '/p', old: '', next: '/b', write: async () => true, fileDirect: true }).label).toBe('Set base scene');
   });
 
   it('undo writes the OLD value and redo writes the NEXT one', async () => {
@@ -72,5 +72,18 @@ describe('makeBaseSceneUndo', () => {
     // the flag would self-block a follow-up scene-mutate via the "unsaved live changes"
     // guard that route carries — a silent breakage with no test of its own otherwise.
     expect(build(async () => true)._isFileDirect).toBe(true);
+  });
+
+  // `_isFileDirect` decides whether this action contributes an edit-version bump, and #831 made it
+  // a PARAMETER rather than a hardcoded `true`. Both directions are pinned: a hardcode in either
+  // direction breaks exactly one of these, and neither breakage is visible from the other tests.
+  it('carries fileDirect through — TRUE for a parked edit on a scene the editor has not loaded', () => {
+    expect(build(async () => true, true)._isFileDirect).toBe(true);
+  });
+
+  it('carries fileDirect through — FALSE for the OPEN scene, whose bump is what makes Cmd+S write', () => {
+    // Applying the ref to `setCurrentBaseScene` changes live editor state and nothing else; without
+    // the bump `hasUnsavedChanges()` stays false and the save has no reason to run.
+    expect(build(async () => true, false)._isFileDirect).toBe(false);
   });
 });

@@ -10,13 +10,13 @@
  *  Dev-only (lives under the editor tree, not shipped). */
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { useOverlay } from '../input/useOverlayEscape';
 import { isTextEditable } from '../input/focusScope';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
 import {
   gridSlices, makeSlice, inferGridFromRects, DEFAULT_PIVOT,
   type SpriteSlice, type SpriteRect,
@@ -87,6 +87,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
+  // #845 close-out: the pending-registry value `readMetaPreferringPark` observed for `path` at
+  // load time (or `undefined` when nothing was parked) — carried to `save()` so it can tell
+  // `metaWrittenToDisk` apart "the park this Save already incorporated" from "an Inspector edit
+  // parked while this modal was still open", which must survive to the next Cmd+S. See
+  // pendingMeta.ts's header addendum.
+  const pendingRefAtLoadRef = useRef<unknown>(undefined);
+  /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
+   *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
+   *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
+   *  `false` and only an ok read sets it. `makeTexture2D`'s "A FAILED READ MUST ABORT" comment is the precedent this follows. */
+  const metaLoadedRef = useRef(false);
 
   // ── Load the source image + existing slice meta ──
   useEffect(() => {
@@ -109,9 +120,19 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   useEffect(() => {
     const ac = new AbortController();
-    backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
+    // ⚠️ Reset the per-path state BEFORE the read, not only inside its `.then`. An abort or a
+    // rejected read would otherwise leave the PREVIOUS path's values in place — and `meta` still
+    // holds that asset's document, `id` included, so a save here would write asset A's sidecar
+    // over asset B and duplicate the GUID. That is strictly worse than the id-less write the
+    // `metaLoadedRef` guard was added for. (I could not construct a live route past the modal
+    // overlay, so this is hardening rather than a demonstrated bug — but the cost is three lines
+    // and the failure is silent.)
+    metaLoadedRef.current = false;
+    pendingRefAtLoadRef.current = undefined;
+    readMetaPreferringPark(path, { signal: ac.signal })
+      .then(({ meta: m, pendingRef, ok }) => {
+        pendingRefAtLoadRef.current = pendingRef;
+        metaLoadedRef.current = ok;
         setMeta(m);
         const existing = Array.isArray(m.sprites) ? (m.sprites as SpriteSlice[]) : [];
         setSprites(existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } })));
@@ -593,7 +614,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
     const nextMeta = {
-      ...(meta ?? {}), version: 2,
+      ...(meta ?? {}),
       spriteMode: clean.length ? 'multiple' : 'single',
       sprites: clean,
       spriteSheet: { width: imgDims.w, height: imgDims.h },
@@ -605,6 +626,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     if (clean.length === 0) { delete (nextMeta as Record<string, unknown>).sprites; delete (nextMeta as Record<string, unknown>).spriteSheet; }
     // AWAIT before onClose() — same race as the 9-slice editor: the Inspector re-reads this
     // file on close, and an un-awaited POST let that GET win and report the pre-edit slices.
+    // ⚠️ REFUSE rather than write a document built on a failed read. `/api/write-meta` replaces
+    // the sidecar wholesale, so a fallback `{}` base writes one with no `id`, and the scanner's
+    // heal pass mints a FRESH GUID — every scene/prefab ref to this asset dangles, silently, from
+    // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
+    // the edit is not thrown away for a reason that has nothing to do with the edit.
+    if (!metaLoadedRef.current) {
+      console.error(`[SpriteEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      return;
+    }
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
@@ -612,6 +642,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       console.error(`[SpriteEditor] save failed for ${path} — the dialog is staying open so the slices are not lost. See the /api/write-meta error above.`);
       return;
     }
+    // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
+    // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
+    // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
+    metaWrittenToDisk(path, pendingRefAtLoadRef.current);
 
     // Live-register the slices so existing references resolve without a rescan, and
     // drop entries for slices that were removed in this session.
@@ -685,17 +719,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
                 </select>
               </Row>
               {grid.mode === 'count' ? (
-                <Row><Num label="Cols" v={grid.cols} on={(v) => setGridParam({ cols: v })} onBlur={flushParamEdit} /><Num label="Rows" v={grid.rows} on={(v) => setGridParam({ rows: v })} onBlur={flushParamEdit} /></Row>
+                <Row><Num label="Cols" v={grid.cols} on={(v) => setGridParam({ cols: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.cols" /><Num label="Rows" v={grid.rows} on={(v) => setGridParam({ rows: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.rows" /></Row>
               ) : (
-                <Row><Num label="Cell W" v={grid.cellW} on={(v) => setGridParam({ cellW: v })} onBlur={flushParamEdit} /><Num label="Cell H" v={grid.cellH} on={(v) => setGridParam({ cellH: v })} onBlur={flushParamEdit} /></Row>
+                <Row><Num label="Cell W" v={grid.cellW} on={(v) => setGridParam({ cellW: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.cellW" /><Num label="Cell H" v={grid.cellH} on={(v) => setGridParam({ cellH: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.cellH" /></Row>
               )}
-              <Row><Num label="Off X" v={grid.offsetX} on={(v) => setGridParam({ offsetX: v })} onBlur={flushParamEdit} /><Num label="Off Y" v={grid.offsetY} on={(v) => setGridParam({ offsetY: v })} onBlur={flushParamEdit} /></Row>
-              <Row><Num label="Pad X" v={grid.paddingX} on={(v) => setGridParam({ paddingX: v })} onBlur={flushParamEdit} /><Num label="Pad Y" v={grid.paddingY} on={(v) => setGridParam({ paddingY: v })} onBlur={flushParamEdit} /></Row>
+              <Row><Num label="Off X" v={grid.offsetX} on={(v) => setGridParam({ offsetX: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.offsetX" /><Num label="Off Y" v={grid.offsetY} on={(v) => setGridParam({ offsetY: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.offsetY" /></Row>
+              <Row><Num label="Pad X" v={grid.paddingX} on={(v) => setGridParam({ paddingX: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.paddingX" /><Num label="Pad Y" v={grid.paddingY} on={(v) => setGridParam({ paddingY: v })} onBlur={flushParamEdit} dataUiId="spriteEditor.grid.paddingY" /></Row>
               <button style={btn} onClick={applyGrid}>Slice Grid</button>
             </Section>
 
             <Section title="Auto (by alpha)">
-              <Row><Num label="Threshold" v={alphaThreshold} on={(v) => { noteParamEdit(); setAlphaThreshold(v); }} onBlur={flushParamEdit} /></Row>
+              <Row><Num label="Threshold" v={alphaThreshold} on={(v) => { noteParamEdit(); setAlphaThreshold(v); }} onBlur={flushParamEdit} dataUiId="spriteEditor.auto.threshold" /></Row>
               <button style={btn} onClick={applyAutoAlpha}>Detect Sprites</button>
             </Section>
 
@@ -703,9 +737,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
               {selSlice ? (
                 <>
                   <Row><input value={selSlice.name} onChange={(e) => patchSelected({ name: e.target.value })} onBlur={flushParamEdit} style={{ ...inputStyle, flex: 1 }} placeholder="name" /></Row>
-                  <Row><Num label="X" v={selSlice.rect.x} on={(v) => patchSelected({ rect: { x: v } })} onBlur={flushParamEdit} /><Num label="Y" v={selSlice.rect.y} on={(v) => patchSelected({ rect: { y: v } })} onBlur={flushParamEdit} /></Row>
-                  <Row><Num label="W" v={selSlice.rect.w} on={(v) => patchSelected({ rect: { w: v } })} onBlur={flushParamEdit} /><Num label="H" v={selSlice.rect.h} on={(v) => patchSelected({ rect: { h: v } })} onBlur={flushParamEdit} /></Row>
-                  <Row><Num label="Pivot X" v={selSlice.pivot.x} step={0.1} on={(v) => patchSelected({ pivot: { x: v } })} onBlur={flushParamEdit} /><Num label="Pivot Y" v={selSlice.pivot.y} step={0.1} on={(v) => patchSelected({ pivot: { y: v } })} onBlur={flushParamEdit} /></Row>
+                  <Row><Num label="X" v={selSlice.rect.x} on={(v) => patchSelected({ rect: { x: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.x" /><Num label="Y" v={selSlice.rect.y} on={(v) => patchSelected({ rect: { y: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.y" /></Row>
+                  <Row><Num label="W" v={selSlice.rect.w} on={(v) => patchSelected({ rect: { w: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.w" /><Num label="H" v={selSlice.rect.h} on={(v) => patchSelected({ rect: { h: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.h" /></Row>
+                  <Row><Num label="Pivot X" v={selSlice.pivot.x} step={0.1} on={(v) => patchSelected({ pivot: { x: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.pivotX" /><Num label="Pivot Y" v={selSlice.pivot.y} step={0.1} on={(v) => patchSelected({ pivot: { y: v } })} onBlur={flushParamEdit} dataUiId="spriteEditor.selected.pivotY" /></Row>
                   <button style={{ ...btn, background: '#7a2727', border: '1px solid #913030' }} onClick={deleteSelected}>Delete Sprite</button>
                 </>
               ) : <div style={{ color: '#666', fontSize: 11 }}>Drag on the image to draw a sprite, or slice a grid.</div>}
@@ -855,11 +889,14 @@ function Row({ children }: { children: React.ReactNode }) {
  *  `onBlur` sits on the LABEL, not the input: React's onBlur is `focusout`, which bubbles,
  *  and BufferedNumberInput owns the input's own focus handlers. It is an EXTRA commit signal
  *  for the click-away path — never the only one, which is what #244 was. */
-function Num({ label, v, on, step, onBlur }: { label: string; v: number; on: (v: number) => void; step?: number; onBlur?: () => void }) {
+// dataUiId is REQUIRED (#724 close-out) — findBufferedInputs (chromeTagging.test.ts) sees only
+// a literal Buffered-input JSX tag, so an optional prop here would let a new caller of this
+// helper go untagged with the suite green. The type checker is the guard now.
+function Num({ label, v, on, step, onBlur, dataUiId }: { label: string; v: number; on: (v: number) => void; step?: number; onBlur?: () => void; dataUiId: string }) {
   return (
     <label style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }} onBlur={onBlur}>
       <span style={{ color: '#888', fontSize: 10 }}>{label}</span>
-      <BufferedNumberInput value={v} onChange={on} step={step ?? 1} style={inputStyle} />
+      <BufferedNumberInput value={v} onChange={on} step={step ?? 1} style={inputStyle} dataUiId={dataUiId} dataUiLabel={label} />
     </label>
   );
 }

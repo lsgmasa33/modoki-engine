@@ -16,6 +16,7 @@ async function setup() {
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
+    registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
     resolveMeshTemplate: vi.fn(), resolveMaterialForMesh: vi.fn(), resolveMaterial: vi.fn(),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
@@ -23,7 +24,7 @@ async function setup() {
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   vi.doMock('../../src/runtime/core/assetRefRules', () => ({ isGuid: (s: string) => !!s }));
   const loadAsync = vi.fn(async () => ({ isTexture: true, colorSpace: '', flipY: false }));

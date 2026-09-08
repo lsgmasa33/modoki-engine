@@ -13,8 +13,7 @@ import type { CSSProperties } from 'react';
 // STRETCH_X/STRETCH_Y come from anchorLayout so the two paths cannot disagree on WHICH
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
-
-export type AnchorCssData = AnchorData & { zIndex?: number };
+import { isElementMarginInert } from './uiAuthoring';
 
 /** Compose a UIElement's tilt AND scale onto whatever transform the anchor already wrote
  *  (#234 tilt, #340 scale).
@@ -40,7 +39,7 @@ export type AnchorCssData = AnchorData & { zIndex?: number };
  *  defaults to 1 and is checked against 1 rather than falsy: `scale: 0` is a legitimate authored
  *  value (a pop-in clip's first keyframe) and must still emit `scale(0)`. */
 export function applyRotationStyle(
-  style: CSSProperties, degrees: number, a?: AnchorCssData, scale = 1,
+  style: CSSProperties, degrees: number, a?: AnchorData, scale = 1,
 ): void {
   const tilted = !!degrees;
   const scaled = scale !== 1;
@@ -77,9 +76,8 @@ function safeAreaInset(edge: 'top' | 'bottom' | 'left' | 'right'): string {
 
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
  *  (Mirrors anchorLayout.resolveAnchorRect — keep them in sync; parity-tested.) */
-export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
+export function applyAnchorStyle(style: CSSProperties, a: AnchorData): void {
   style.position = 'absolute';
-  if (a.zIndex) style.zIndex = a.zIndex;
 
   // Position the element's top-left at the anchor reference point.
   // All non-stretch modes use top+left so pivot translate(-X%,-Y%) works uniformly.
@@ -156,12 +154,27 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
     else style.left = fmtSub(style.left, a.right, a.rightUnit);
   }
 
-  // For anchored (absolute) elements, margin does not affect position — the pivot
-  // sits at the anchor point regardless. Margin is only effective in flow layout.
-  style.marginTop = undefined;
-  style.marginRight = undefined;
-  style.marginBottom = undefined;
-  style.marginLeft = undefined;
+  // All four authored `UIElement` margins are discarded on an anchored element (#757).
+  //
+  // ⚠️ This is a DECISION, not an observation, and the comment here used to overstate it: it said
+  // margin "does not affect position — the pivot sits at the anchor point regardless", which is
+  // true of the pivot but not of the box. On a STRETCHED axis (`top: 0; bottom: 0` with
+  // `height: auto`) CSS margins do participate in the over-constrained resolution and would inset
+  // the box. Upheld by the owner (2026-09-05): anchor offsets stay the ONE way to inset a stretched
+  // element, so margin does not get a second job here.
+  //
+  // The predicate is shared with the Inspector's gate (`isElementMarginInert`) rather than restated
+  // inline, so the editor cannot disagree with the layout about what is inert — the same
+  // cannot-drift rule `isSizeInert` already follows. Inside this
+  // function `a.anchor` is always present, so the call is always true; it is written this way so
+  // that if the condition is ever narrowed, BOTH surfaces narrow together instead of silently
+  // parting company.
+  if (isElementMarginInert(a.anchor)) {
+    style.marginTop = undefined;
+    style.marginRight = undefined;
+    style.marginBottom = undefined;
+    style.marginLeft = undefined;
+  }
 
   // Pivot (0,0) = element's top-left sits at the anchor point.
   // Pivot (0.5,0.5) = element's center sits at the anchor point.
@@ -180,8 +193,11 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   // reaches: a stretched axis spans BOTH its edges; a stretch-pinned bar (top-stretch,
   // …) also reaches its pinned edge. The inset expression is a LIVE CSS value (see
   // safeAreaInset above), so the browser re-resolves it on orientation change — and in
-  // an editor device preview on a preset change — with no runtime code. The editor
-  // disables the Safe Area checkbox for non-stretch anchors to match this. */
+  // an editor device preview on a preset change — with no runtime code. The editor greys the
+  // Safe Area checkbox out on `center` ONLY (`Inspector.tsx` `safeAreaInert`), which is correct
+  // and is NOT the same rule as "non-stretch": a point anchor like `top-left` still reaches its
+  // pinned edge and takes the offset arm below, so its Safe Area is live. This comment claimed
+  // the wider rule until #757's close-out; the code was always right. */
   //
   // ⚠️ The two arms below are MUTUALLY EXCLUSIVE BY CONSTRUCTION — a stretched anchor
   // takes the padding arm, a point anchor takes the offset arm, and nothing can take

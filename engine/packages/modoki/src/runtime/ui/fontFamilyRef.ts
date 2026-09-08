@@ -62,17 +62,28 @@ export function resetFontRefWarnings(): void {
 /** `(fontFamily, systemFont)` → the CSS `font-family` value, or `''` for "browser default".
  *  Never throws and never blocks a render: a ref that resolves to nothing falls through to
  *  `systemFont`, exactly as an unset one would. */
-export function resolveUIFontFamily(fontFamily: string | undefined, systemFont: string | undefined): string {
+export function resolveUIFontFamily(
+  fontFamily: string | undefined,
+  systemFont: string | undefined,
+  /** Which TRAIT authored the value, for the diagnostics below. Two traits carry a DOM font
+   *  ref: `UIElement.fontFamily` (per element) and `UISettings.fontFamily` (the scene-wide
+   *  default, #803). A warning that names the wrong one sends the author hunting through
+   *  elements for a field none of them authors — Court, whose only DOM font ref lives on
+   *  `UISettings`, is exactly that case. Defaults to the older and far more common caller. */
+  authoredOn: 'UIElement' | 'UISettings' = 'UIElement',
+): string {
   const ref = fontFamily || '';
   const system = systemFont || '';
   if (!ref) return system;
 
+  // Warn-once keys carry the trait: the same broken GUID on both surfaces is two distinct
+  // authoring mistakes to fix, and one key would silence whichever was reached second.
   if (isGuid(ref)) {
     const family = domFontProvider.get()?.familyForGuid(ref);
-    if (family) { warned.delete(`unresolved:${ref}`); return cssQuote(family); }
+    if (family) { warned.delete(`unresolved:${authoredOn}:${ref}`); return cssQuote(family); }
     warnOnce(
-      `unresolved:${ref}`,
-      `[UIElement] fontFamily ${ref} resolves to no font asset — ` +
+      `unresolved:${authoredOn}:${ref}`,
+      `[${authoredOn}] fontFamily ${ref} resolves to no font asset — ` +
         (system
           ? `falling back to systemFont "${system}".`
           : 'falling back to the browser default. Re-pick the font in the Inspector.'),
@@ -80,15 +91,20 @@ export function resolveUIFontFamily(fontFamily: string | undefined, systemFont: 
     return system;
   }
 
-  // LEGACY (pre-#231): the field held the CSS family name itself. Still honoured so a scene
-  // authored before the migration renders in the right typeface rather than silently
-  // reverting to the browser default — but warned, because it is invisible to the build's
-  // ref walk (a `fontFamily` name is not a ref the tree-shaker can follow to a file, so the
-  // font may simply be absent from a production bundle).
+  // The field holds a CSS family NAME rather than a GUID. Still honoured so the text renders in
+  // the intended typeface rather than silently reverting to the browser default — but warned,
+  // because it is invisible to the build's ref walk (a family name is not a ref the tree-shaker
+  // can follow to a file, so the font may simply be absent from a production bundle).
+  //
+  // On `UIElement` this is LEGACY, pre-#231 authoring, and saying so tells the author where it
+  // came from. `UISettings.fontFamily` was created by #803 and never held a family name, so
+  // there is nothing legacy about it — only a hand-typed value in an asset-ref field. Claiming
+  // "pre-#231 authoring" there would be a confident falsehood in a diagnostic.
   warnOnce(
-    `legacy:${ref}`,
-    `[UIElement] fontFamily "${ref}" is a CSS family NAME, not a font-asset GUID (pre-#231 ` +
-      'authoring). It still renders in the editor, but the build cannot see it as a reference — ' +
+    `legacy:${authoredOn}:${ref}`,
+    `[${authoredOn}] fontFamily "${ref}" is a CSS family NAME, not a font-asset GUID` +
+      (authoredOn === 'UIElement' ? ' (pre-#231 authoring)' : '') +
+      '. It still renders in the editor, but the build cannot see it as a reference — ' +
       're-pick the font in the Inspector, or move the name to the systemFont field if it is a ' +
       'system typeface.',
   );

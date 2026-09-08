@@ -8,8 +8,9 @@ import { useEditorStore } from './store/editorStore';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
-import { loadScene } from './scene/serialize';
+import { loadScene, newScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
+import { getModeOwner } from './scene/playMode';
 import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
 import { getCurrentWorld } from '../runtime/core/ecs/world';
 import { fireDirtyListeners } from '../runtime/core/ecs/entityUtils';
@@ -25,11 +26,26 @@ export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
   store: typeof useEditorStore;
   getAllEntities: typeof getAllEntities;
-  /** Load a scene by path into the live editor world (returns true on success).
-   *  E2E setup uses this instead of seeding the project-namespaced
-   *  `modoki-last-scene:<project>` localStorage key, so fixture loading is
+  /** Load a scene by path into the live editor world — 'loaded' on success, 'superseded' when a
+   *  newer load won the swap first, 'refused' when its format version is too new/unreadable for
+   *  this build (docs/format-versioning.md § 2b-bis), 'failed' otherwise. E2E setup uses this
+   *  instead of seeding
+   *  the project-namespaced `modoki-last-scene:<project>` localStorage key, so fixture loading is
    *  independent of which project the dev server happens to open. */
-  loadScene(scenePath: string): Promise<boolean>;
+  loadScene(scenePath: string): Promise<SceneLoadOutcome>;
+  /** Re-point the editor's tracked scene path with NO world swap and NO structural change —
+   *  what `saveScene()` does on a Save As (`scene/serialize.ts`, both branches). Exposed
+   *  because that seam is otherwise only reachable through a native file dialog, and it is
+   *  where #839's first fix regressed: a path-keyed collapse claim read "needs restore" here
+   *  and wiped the arrangement the user had just saved. */
+  renameCurrentScenePath(scenePath: string): void;
+  /** Replace the whole world with a fresh starter scene under `scenePath` — the engine half
+   *  of Assets → Create Scene (`builtinCreatableAssets`'s override, minus the save dialog and
+   *  the file write). Exposed because that gesture is otherwise only reachable through a
+   *  native save panel, and it is the seam #853 lived in: it replaces every entity, so an
+   *  id-keyed cache that is not invalidated aliases the outgoing scene's state onto the
+   *  incoming entities. Rejects when the editor is in prefab-edit mode, like the real route. */
+  newScene(scenePath: string): Promise<void>;
   /** Name of the currently selected entity, or null if none. */
   selectedEntityName(): string | null;
   /** Read a single trait field off an entity (for asserting edits landed). */
@@ -45,6 +61,17 @@ export interface EditorTestBridge {
    *  would animate every rig's baked clip out of Play mode and clobber the
    *  keyframe pose) — the E2E asserts it stays false during preview. */
   isSkeletalPreviewing(): boolean;
+  /** WHICH panel currently owns the editor scrub/preview run mode ('timeline' | 'animation'), or
+   *  null when stopped. This is `playMode.ts`'s `_modeOwner` — module state, so an E2E cannot
+   *  reach it through the store.
+   *
+   *  Exposed for the #810 seam: `isPreviewPlaying` is ONE store flag both preview panels read, so
+   *  a single ▶ ran both panels' effects and each took this single-valued mode from the other.
+   *  The Timeline always landed second (its entry sits behind an await), so it always won and
+   *  stopped the Animation panel's loop. The playhead advancing is NOT enough to catch that —
+   *  with a timeline doc open the Timeline's own loop advances it too — so the owner is the
+   *  discriminating read, and without it the E2E would pass under both correct and broken. */
+  previewModeOwner(): string | null;
   /** Pose a Director's timeline at absolute time `t` while STOPPED — the same
    *  scrub-preview path the Timeline panel drives (previewTimelineAt + repaint).
    *  Lets an E2E verify skeletal seek-scrub (Phase 5) deterministically: scrub,
@@ -114,6 +141,9 @@ export function installEditorTestBridge(): void {
     isSkeletalPreviewing() {
       return isSkeletalPreviewing();
     },
+    previewModeOwner() {
+      return getModeOwner();
+    },
     scrubTimeline(directorId, def, t) {
       previewTimelineAt(getCurrentWorld(), directorId, normalizeTimeline(def as Partial<TimelineDef>), t);
       fireDirtyListeners();
@@ -145,6 +175,12 @@ export function installEditorTestBridge(): void {
     },
     flushCoalescedEdits() {
       flushCoalescedEdits();
+    },
+    renameCurrentScenePath(scenePath) {
+      setCurrentScenePath(scenePath);
+    },
+    newScene(scenePath) {
+      return newScene(scenePath);
     },
     getPointerState() {
       const input = getInput(getCurrentWorld());

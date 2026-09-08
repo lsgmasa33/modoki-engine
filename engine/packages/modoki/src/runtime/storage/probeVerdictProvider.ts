@@ -67,8 +67,58 @@ probeVerdictStore.provide({
     if (clean.length !== samples.length) return null;
     return { fingerprint, deviceClass, samples: clean, final: final === true };
   },
-  write(verdict) {
+  write(verdict, session) {
+    // `session` is the capture-before/compare-after pattern from `PlayerPrefs.swapGeneration()`'s
+    // own doc comment (worked precedent: `agentBridge.ts`'s `player-prefs-write` op). Checked only
+    // when the caller supplied one — `null`/`undefined` means "no session supplied", so existing
+    // callers (and the write→read round-trip test) are unaffected.
+    if (session !== undefined && session !== null) {
+      // A malformed token (wrong shape, or a store that spells "no session" as `null` and got past
+      // the check above some other way) is treated as a MISMATCH, not trusted and not thrown.
+      // Throwing here is the worst outcome available: `resolveProbeClass`'s own `try` swallows it,
+      // so the verdict is never cached and the device pays a launch-BLOCKING probe every boot
+      // forever, with nothing in the log pointing back at this file.
+      const wellFormed = typeof session === 'object'
+        && typeof (session as { gen?: unknown }).gen === 'number'
+        && typeof (session as { ns?: unknown }).ns === 'string';
+      if (!wellFormed) {
+        console.log('[probeVerdictProvider] discarded a probe verdict: malformed session token');
+        return;
+      }
+      const { gen, ns } = session as { gen: number; ns: string };
+      const currentNs = PlayerPrefs.namespace();
+      if (ns !== currentNs) {
+        // Ordinary path (an OTA sub-game switch, a hash navigation) — see
+        // `globalErrors.ts`'s rule that `console.warn` is a Crashlytics alerting issue and must
+        // not fire on one.
+        console.log(
+          `[probeVerdictProvider] discarded a probe verdict captured for namespace "${ns}" — the ` +
+          `store was re-namespaced to "${currentNs}" while the probe ran; one re-probe next launch`,
+        );
+        return;
+      }
+      if (gen !== PlayerPrefs.swapGeneration()) {
+        // Namespace matches, but the generation moved: a swap opened AND CLOSED entirely inside
+        // the probe's own awaits — the case `isSwapInFlight()` structurally cannot see (see
+        // `swapGeneration()`'s doc comment in `playerPrefs.ts`).
+        console.log(
+          `[probeVerdictProvider] discarded a probe verdict captured for namespace "${ns}" — a ` +
+          `swap opened and closed while the probe ran; one re-probe next launch`,
+        );
+        return;
+      }
+      if (PlayerPrefs.isSwapInFlight()) {
+        console.log(
+          `[probeVerdictProvider] discarded a probe verdict captured for namespace "${ns}" — a ` +
+          `swap is currently in flight; one re-probe next launch`,
+        );
+        return;
+      }
+    }
     if (verdict === null) PlayerPrefs.delete(PROBE_VERDICT_PREF_KEY);
     else PlayerPrefs.set(PROBE_VERDICT_PREF_KEY, { ...verdict });
+  },
+  session() {
+    return { gen: PlayerPrefs.swapGeneration(), ns: PlayerPrefs.namespace() };
   },
 });

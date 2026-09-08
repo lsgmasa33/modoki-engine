@@ -116,14 +116,15 @@ async function setup() {
 }
 
 describe('scene identity survives a load→save round trip', () => {
-  it('a v9 file migrated to v12 keeps its own `id` and `createdAt` — only the FORMAT changes', async () => {
+  it('a v9 file migrated to the current version keeps its own `id` and `createdAt` — only the FORMAT changes', async () => {
     const { load, serializeScene } = await setup();
     await load(SCENE_PATH);
 
     const saved = await serializeScene();
+    const { SCENE_FORMAT_VERSION } = await import('../../src/runtime/core/version');
 
     // The migration itself must have happened...
-    expect(saved.version).toBe(12);
+    expect(saved.version).toBe(SCENE_FORMAT_VERSION);
     expect(saved.entities).toHaveLength(2);
     // ...and it must be the only thing that changed. `id` is an asset REFERENCE:
     // project.config.json and createEditorSceneFallback.test.ts both name it, so a

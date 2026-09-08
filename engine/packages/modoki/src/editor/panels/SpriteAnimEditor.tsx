@@ -11,13 +11,17 @@
  *  asset updates next frame. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
+import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
@@ -43,11 +47,48 @@ export default function SpriteAnimEditor() {
   // Active track is LOCAL panel state — the asset is just the clip set, it has no
   // "active clip" concept (that lives on the SpriteAnimator trait instead).
   const [active, setActive] = useState('');
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingSpriteAnimDef` null, `commit` early-returns on that, and the clip surface below is
+   *  gated on `def` — editing is disabled by construction. A genuinely MISSING file is NOT this
+   *  (#896, and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingSpriteAnimAsset');
+  }, []);
 
   // ── Load the asset def when the open target changes ──
   useEffect(() => {
     lastAction.current = null;
     lastGroup.current = undefined;
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSpriteAnimDef;
@@ -58,7 +99,19 @@ export default function SpriteAnimEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'spriteanim')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'spriteanim');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadSpriteAnimDef } = useEditorStore.getState();
@@ -76,13 +129,16 @@ export default function SpriteAnimEditor() {
       adoptParkedDoc(asset.path, 'spriteanim', doc);
       loadSpriteAnimDef(doc);
       setActive(Object.keys(doc.clips)[0] ?? '');
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeSpriteAnim(json);
+        const loaded = normalizeSpriteAnim(json as Parameters<typeof normalizeSpriteAnim>[0]);
         // Baseline is the doc WITH the minted id, never an id-less twin — that trick made the
         // autosave write the new id, and without an autosave it would park a write just for
         // OPENING a legacy asset. The scanner heals missing GUIDs already (buildManifest heal).
@@ -92,7 +148,24 @@ export default function SpriteAnimEditor() {
         loadSpriteAnimDef(loaded);
         setActive(Object.keys(loaded.clips)[0] ?? '');
       })
-      .catch((e) => { if (cancelled) return; console.warn('[SpriteAnimEditor] load failed', e); const fb = { clips: {} }; savedMarkRef.current?.(fb); loadSpriteAnimDef(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896: this substituted `{ clips: {} }` on ANY failure and marked it as the SAVED
+        // baseline, so the first edit parked a full-replace write of an EMPTY clip set over the
+        // authored file. The `id` survived (the route preserves it when the incoming doc omits
+        // one) — every clip did not. Only a genuinely MISSING file keeps the empty default, which
+        // is what authoring a brand-new `.spriteanim.json` needs.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[SpriteAnimEditor] load failed (asset missing), starting empty', e);
+          const fb = { clips: {} };
+          savedMarkRef.current?.(fb);
+          loadSpriteAnimDef(fb);
+          return;
+        }
+        console.error(`[SpriteAnimEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // Key on the stable path + explicit reopen nonce, not the asset object identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -179,8 +252,8 @@ export default function SpriteAnimEditor() {
     const path = await saveAssetDialog({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', prompt: 'Create Sprite Animation' });
     if (!path) return;
     const guid = newGuid();
-    const doc = { id: guid, clips: { idle: defaultSpriteClip() } };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const doc = { id: guid, ...defaultSpriteAnimData() };
+    const ok = await writeAssetFile(path, jsonFileBody(doc));
     if (!ok) return;
     // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
     // is authoritative — drop any parked write for that path.
@@ -201,6 +274,24 @@ export default function SpriteAnimEditor() {
     <div style={{ display: 'flex', width: '100%', height: '100%', background: '#1a1a2e', fontFamily: 'monospace', fontSize: 12, color: '#ccc' }}>
       {/* Preview */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {asset && loadState === 'failed' && (
+          <AssetLoadRefusedBanner
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="spriteAnim.loadBanner"
+            onRetry={retryLoad}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
+        {asset && parkAdopted && (
+          <ParkAdoptedBanner
+            path={asset.path}
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="spriteAnim.parkAdopted"
+            onReload={retryLoad}
+            onKeep={() => setParkAdopted(false)}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
         {clip && frames.length > 0
           ? <FlipbookPreview clip={clip} />
           : <div style={{ color: '#555' }}>{asset ? 'No frames in this clip yet' : 'Double-click a .spriteanim.json in Assets to edit'}</div>}
@@ -244,7 +335,8 @@ export default function SpriteAnimEditor() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                 <span style={labelStyle}>fps</span>
-                <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }} />
+                <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }}
+                  dataUiId="spriteAnim.clip.fps" dataUiLabel={activeName} />
                 <span style={labelStyle}>mode</span>
                 <select data-ui-id="spriteAnim.clip.mode" data-ui-kind="field" data-ui-label="mode" value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
                   <option value="once">once</option>
@@ -254,7 +346,8 @@ export default function SpriteAnimEditor() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
                 <span style={labelStyle}>cycles</span>
-                <BufferedNumberInput value={clip!.cycles} step={1} onChange={(v) => writeClip(activeName, `cycles:${activeName}`, (c) => ({ ...c, cycles: Math.max(0, v) }))} style={{ ...inputStyle, width: 56 }} />
+                <BufferedNumberInput value={clip!.cycles} step={1} onChange={(v) => writeClip(activeName, `cycles:${activeName}`, (c) => ({ ...c, cycles: Math.max(0, v) }))} style={{ ...inputStyle, width: 56 }}
+                  dataUiId="spriteAnim.clip.cycles" dataUiLabel={activeName} />
                 <span style={{ color: '#666', fontSize: 10 }}>0 = infinite</span>
               </div>
 
@@ -266,7 +359,8 @@ export default function SpriteAnimEditor() {
                   <span style={{ width: 18, textAlign: 'right', color: '#666', fontSize: 10 }}>{i}</span>
                   <FrameThumb guid={ref} />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']} />
+                    <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']}
+                      dataUiId={`spriteAnim.frames.${i}.sprite`} dataUiLabel={`frame ${i}`} />
                   </div>
                   <button data-ui-id={`spriteAnim.frames.${i}.up`} data-ui-kind="button" data-ui-label="Move up" onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
                   <button data-ui-id={`spriteAnim.frames.${i}.down`} data-ui-kind="button" data-ui-label="Move down" onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
@@ -274,7 +368,8 @@ export default function SpriteAnimEditor() {
                 </div>
               ))}
               <div style={{ marginTop: 2 }}>
-                <AssetRefField label="+ add" value="" onChange={addFrame} accept={['sprite']} placeholder="pick (▦) or drop a sprite" />
+                <AssetRefField label="+ add" value="" onChange={addFrame} accept={['sprite']} placeholder="pick (▦) or drop a sprite"
+                  dataUiId="spriteAnim.frames.add" dataUiLabel="add frame" />
               </div>
             </>
           )}

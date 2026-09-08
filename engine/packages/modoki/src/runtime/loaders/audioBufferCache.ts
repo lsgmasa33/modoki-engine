@@ -20,6 +20,7 @@ import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { getAssetEntry, getAudioLoadType, isGuid } from './assetManifest';
 import { getAudioContext } from '../audio/audioContext';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { createTeardownToken } from '../core/liveness';
 
 type SceneId = number;
 
@@ -27,9 +28,12 @@ const audioBufferCache = new Map<string, AudioBuffer>();
 const audioLoadPromises = new Map<string, Promise<void>>();
 const audioOwners = new Map<string, Set<SceneId>>();
 
-// Bumped by disposeAllAudioBuffers so an in-flight fetch/decode that resolves
-// after a teardown is dropped instead of re-populating a dead cache.
-let audioGeneration = 0;
+// Teardown liveness — PER-KEY (#856): invalidateAudio (a single clip's re-import) invalidates only
+// that clip's key, so an in-flight fetch/decode of an UNRELATED clip started around the same time
+// is not superseded and its result still gets installed. disposeAllAudioBuffers (full teardown)
+// still invalidates wholesale, so an in-flight fetch/decode that resolves after a teardown is
+// dropped instead of re-populating a dead cache.
+const audioLiveness = createTeardownToken();
 
 const unknownGuidSeen = new Set<string>();
 function refToPath(ref: string | undefined | null): string | undefined {
@@ -119,11 +123,12 @@ export function invalidateAudio(ref: string): void {
   // halves (#304) — an Audio Inspector reading the sidecar has the same
   // path-keyed staleness the other two had.
   emitAssetInvalidated('audio', path);
-  // Bump the generation so an in-flight fetch/decode of the OLD bytes is discarded
-  // by fetchAudioBuffer's `gen !== audioGeneration` guard instead of racing the
-  // stale buffer back into the cache after we clear it (same reason
-  // disposeAllAudioBuffers bumps it).
-  audioGeneration++;
+  // Invalidate so an in-flight fetch/decode of the OLD bytes is discarded by
+  // fetchAudioBuffer's `stillLive()` guard instead of racing the stale buffer back
+  // into the cache after we clear it (same reason disposeAllAudioBuffers invalidates).
+  // PER-KEY (#856): only THIS path's in-flight decode is superseded — an unrelated clip's
+  // concurrent fetch/decode must not be discarded just because a sibling was re-imported.
+  audioLiveness.invalidateKey(path);
   audioBufferCache.delete(path);
   audioLoadPromises.delete(path);
 }
@@ -137,7 +142,7 @@ export function getAudioCacheStats(): { owners: Record<string, number>; buffers:
 
 /** Full teardown — drop every buffer + owner and invalidate in-flight decodes. */
 export function disposeAllAudioBuffers(): void {
-  audioGeneration++;
+  audioLiveness.invalidateAll();
   audioBufferCache.clear();
   audioLoadPromises.clear();
   audioOwners.clear();
@@ -187,7 +192,7 @@ function fetchAudioBuffer(path: string): Promise<void> {
   const ctx = getAudioContext();
   if (!ctx) return Promise.resolve(); // headless — owner registered, no decode
 
-  const gen = audioGeneration;
+  const stillLive = audioLiveness.capture(path);
   const promise = (async () => {
     try {
       const bytes = await xhrAudioBytes(servedAudioUrl(path));
@@ -203,7 +208,7 @@ function fetchAudioBuffer(path: string): Promise<void> {
       }
       // Dropped mid-load (teardown or last owner released)? Discard the result
       // rather than leaving an owner-less buffer resident forever.
-      if (gen !== audioGeneration || !audioOwners.has(path)) return;
+      if (!stillLive() || !audioOwners.has(path)) return;
       audioBufferCache.set(path, buffer);
     } catch (err) {
       // Stringify the message — the Capacitor native console serializes a raw

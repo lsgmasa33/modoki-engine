@@ -29,14 +29,14 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
-      + 'with no screen attached to it is unfalsifiable. Set it with modoki_game_view_device. ' +
+      + 'with no screen attached to it is unfalsifiable. Set it with modoki_set_game_view_device. ' +
       'Also `animationViewMode` (dopesheet|curves) — WHICH of the Animation panel\'s two views is '
       + 'showing, and therefore which interaction handles exist at all. `animationView` carries the '
       + 'same answer WITH the two qualifiers an empty handle list needs: `panelMounted` (an '
       + 'Animation tab that exists but was never SELECTED does not mount, and then NEITHER view '
       + 'publishes handles) and, in curves, a note that tangent handles need an ACTIVE TRACK as '
       + 'well as the view. Read these before concluding a clip has no tangents. Set the view with '
-      + 'modoki_animation_view_mode. ' +
+      + 'modoki_set_animation_view_mode. ' +
       'Also `spriteEditorSelection` (guid|null) — which slice is selected in the open Sprite ' +
       'Editor; its resize/pivot handles only exist for that slice, and it opens with none ' +
       'selected, so an empty `modoki_handles editor=sprite` is otherwise ambiguous. Set with ' +
@@ -56,15 +56,16 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'MANUAL-ONLY, so there is no mode to set — this is a READ. Returns `mode:"manual"` plus ' +
       '`unsavedChanges` (null if no editor is connected).\n\n' +
       'THE CONTRACT: modoki_mutate_scene / modoki_set_transform apply as ONE undoable step to the ' +
-      'RUNNING world and do NOT touch the scene file; the particle/anim/timeline ops park their ' +
-      'write in a dirty-asset registry (see modoki_get_editor_state `dirtyAssetPaths`). Both reach ' +
+      'RUNNING world and do NOT touch the scene file; the asset-editing ops (any ASSET_SCHEMA_TYPES ' +
+      'type) park their write in a dirty-asset registry (see modoki_get_editor_state ' +
+      '`dirtyAssetPaths`). Both reach ' +
       'disk only via modoki_save_all. The live-world entity/prefab tools (create/duplicate/delete/' +
       'reparent) were always live-only. modoki_write_asset/modoki_create_asset are explicit ' +
       '"write this file" tools and always write.\n\n' +
       'SO: call modoki_save_all before anything that reads the scene FILE — modoki_build refuses ' +
       'while unsaved, and a file-direct mutate (a scene that is NOT the one open, or setBaseScene) ' +
-      '409s while unsaved. A game-code edit force-reloads the editor and DISCARDS unsaved scene ' +
-      'edits, so do not let unsaved work pile up.\n\n' +
+      '409s while unsaved. A game-code edit force-reloads the editor and DISCARDS ALL unsaved work — ' +
+      'scene edits AND any pending asset edit parked above — so do not let unsaved work pile up.\n\n' +
       'The former \'auto\' mode (save on every mutation) was REMOVED so a tool\'s effect never ' +
       'depends on invisible session state. Passing `mode` is refused with a 400, not ignored.',
     {},
@@ -241,10 +242,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_new_scene',
-    'Start a fresh untitled scene (clears all entities, spawns a default Camera). Unsaved ' +
-      'until you modoki_save_all({path}) — it has no path yet, so save_all REQUIRES one. ' +
-      'WARNING: this DISCARDS the live world; anything created and not saved is gone (it ' +
-      'refuses if there are unsaved changes — pass discardUnsaved:true to discard them deliberately).',
+    'Start a fresh untitled scene: replaces the world with a starter set (Camera, HDR ' +
+      'Environment, Directional + Ambient light). Unsaved until you modoki_save_all({path}) — ' +
+      'it has no path yet, so save_all REQUIRES one. WARNING: this DISCARDS the live world; ' +
+      'anything created and not saved is gone (it refuses if there are unsaved changes — pass ' +
+      'discardUnsaved:true to discard them deliberately). ALSO refuses while a prefab is being ' +
+      'edited (#853) — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
+      'it is not about unsaved work. The replacement is a real world swap, so every id-keyed ' +
+      'cache clears and the outgoing scene\'s resources are released immediately — entity ids ' +
+      'are reassigned, so re-read any id you were holding.',
     { discardUnsaved: discardUnsavedParam },
     async ({ discardUnsaved }) => editorAction('new-scene', discardUnsaved ? { discardUnsaved } : {}),
   );
@@ -267,8 +273,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_discard_asset_edits',
     'ABANDON parked asset writes — the counterpart to modoki_save_all for the dirty-asset registry '
-      + '(the pending particle/anim/timeline defs listed as `dirtyAssetPaths` by '
-      + 'modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
+      + '(the pending asset defs — any ASSET_SCHEMA_TYPES type, not just particle/anim/timeline — '
+      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
       + 'exploratory modoki_particle_set / anim_set_clip / timeline_set could not be backed out.\n\n'
       + 'DO NOT "undo" one by re-applying the old def — that is not equivalent and the difference '
       + 'bites: it re-parks a write (so the doc is still dirty and the next save_all commits it), and '
@@ -422,7 +428,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
 
   // ── gizmo / focus ──
   tool(
-    'modoki_gizmo',
+    'modoki_set_gizmo',
     'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local).',
     {
       mode: z.enum(['translate', 'rotate', 'scale']).optional(),
@@ -431,7 +437,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async (p) => editorAction('set-gizmo', p),
   );
   tool(
-    'modoki_scene_view_mode',
+    'modoki_set_scene_view_mode',
     "Set the SceneView viewport mode: '3d' (Three.js) or 'ui' (the 2D/UI overlay). The " +
       "toolbar selector is a native <select> that trusted input can't drive, so use this. " +
       "'ui' mode is REQUIRED to edit Collider2D vertices (with set-collider-edit) and to see " +
@@ -440,7 +446,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
   );
   tool(
-    'modoki_animation_view_mode',
+    'modoki_set_animation_view_mode',
     "Set which view the Animation editor's timeline area shows: 'dopesheet' (keyframe TIMING — "
       + "diamonds) or 'curves' (keyframe VALUES + easing — a graph). Exactly ONE is mounted, and "
       + 'they publish DIFFERENT interaction handles, so this decides what modoki_handles can even '
@@ -475,12 +481,12 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
       + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
       + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
-      + 'not a separate row, so pass `orientation` to modoki_game_view_device. Changes nothing.',
+      + 'not a separate row, so pass `orientation` to modoki_set_game_view_device. Changes nothing.',
     {},
     async () => getJson('/api/game-view-devices'),
   );
   tool(
-    'modoki_game_view_device',
+    'modoki_set_game_view_device',
     'Set WHICH SCREEN the Game panel previews at. The device picker is a popup trusted input '
       + 'cannot operate, so this is the only way an agent can change it — without it every layout '
       + 'check measures whatever device the human last left selected. Pass `device` (a name from '
@@ -518,9 +524,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async (p) => editorAction('set-game-view-device', p),
   );
   tool(
-    'modoki_collider_edit',
+    'modoki_set_collider_edit',
     'Toggle Collider2D vertex-edit mode (the toolbar "Points" button) for the selected ' +
-      "entity. Pair with modoki_scene_view_mode 'ui' + a selected entity that has an editable " +
+      "entity. Pair with modoki_set_scene_view_mode 'ui' + a selected entity that has an editable " +
       'collider (polygon/polyline/concave); then modoki_handles editor=collider2d lists its ' +
       'draggable vertices. Returns editor state.',
     { on: z.boolean().describe('true enters collider vertex-edit mode on the selected entity, false leaves it.') },

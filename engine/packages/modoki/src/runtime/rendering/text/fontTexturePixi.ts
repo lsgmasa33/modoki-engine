@@ -58,14 +58,27 @@ function getDynamicFontTexturePixi(provider: FontProvider, page: number): Textur
   if (!canvas) return null;
   const key = `${provider.id}:canvas:${page}`;
   let tex = cache.get(key);
+  // Defense-in-depth: the disposer below always evicts BEFORE destroying, so a cache hit should
+  // never be destroyed — but make this function total rather than trust that ordering forever.
+  if (tex?.destroyed) {
+    cache.delete(key);
+    tex = undefined;
+  }
   if (!tex) {
     const source = new CanvasSource({ resource: canvas, scaleMode: 'linear', alphaMode: 'no-premultiply-alpha' });
-    tex = new Texture({ source });
-    cache.set(key, tex);
+    const created = new Texture({ source });
+    cache.set(key, created);
     provider.addDisposable(() => {
       cache.delete(key);
-      tex!.destroy(true);
+      created.destroy(true);
     });
+    // ⚠️ addDisposable on an ALREADY-disposed provider runs `fn` NOW, not later — documented,
+    // deliberate (fontProvider.ts). So by this line the texture minted three lines up can
+    // already be destroyed and evicted, and returning it would hand Scene2D a corpse it binds
+    // and renders in the same pass. Latent today (no disposed provider has a route to here),
+    // so this closes the contract hole rather than a reproduced failure. (#481)
+    if (created.destroyed) return null;
+    tex = created;
   }
   if (uploadedVersion.get(tex) !== provider.atlasVersion) {
     tex.source.update();
@@ -97,7 +110,11 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
    *  (version pinned 0) or all-canvas (this path unreachable); the hybrid made both live. */
   const key = `${provider.id}:image`;
   const existing = cache.get(key);
-  if (existing) return existing;
+  // Same destroyed-but-truthy hazard as the dynamic path above (#481). This branch has it too,
+  // and "the producer side is closed" is only true if BOTH paths are — a fix applied to one
+  // branch of two reads as complete and is not.
+  if (existing?.destroyed) cache.delete(key);
+  else if (existing) return existing;
   // Queue behind an in-flight load rather than dropping this caller's wake-up (see `waiters`).
   if (addWaiter(key, onReady)) return null;
 
@@ -114,6 +131,25 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
         cache.delete(key);
         Assets.unload(url).catch(() => { /* already gone */ });
       });
+      // ⚠️ ON AN ALREADY-DISPOSED PROVIDER the disposer above just ran SYNCHRONOUSLY (#481), so
+      // the entry cached one line up is already gone and this texture is being unloaded — and the
+      // wake below is STILL CORRECT. Do not "fix" this into an early return or a `wake:false`;
+      // that was tried during #481's close-out and is a regression, twice over:
+      //
+      //  · `waiters` is keyed by the font GUID, so it OUTLIVES the provider INSTANCE while the
+      //    cache entry does not. The set can legitimately hold a waiter belonging to the live
+      //    SUCCESSOR — `invalidateFont` disposes P1 and re-acquires P2 under the same guid, and a
+      //    repaint in that window queues P2's `markDirty` behind P1's still-in-flight load
+      //    (`addWaiter` returns true). Not waking strands exactly that renderer, which is verbatim
+      //    the "texts are not rendered until I click the entity" bug this set exists to prevent.
+      //  · The feared load/unload storm cannot happen. A woken repaint resolves its provider
+      //    through `getLoadedFont(guid)`, and every disposal path deletes from `providers` in the
+      //    same synchronous block — so the retry gets the LIVE P2 or no provider at all, never the
+      //    disposed P1 that landed here. Bounded at one iteration.
+      //
+      // The `.catch` below may settle without waking only because no successor is stranded there;
+      // the analogy between the two paths is false.
+      //
       // Cache FIRST, then wake — a waiter re-renders synchronously inside markDirty in some
       // hosts, and it must find the texture rather than kick a second load.
       settleWaiters(key, true);

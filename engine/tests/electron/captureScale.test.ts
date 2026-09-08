@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { BrowserWindow } from 'electron';
 import { fitToMaxSide, captureViewport, explainCaptureFailure, normalizeJpegQuality, jpegSize } from '../../electron/rendererOps';
 import { normalizeJpegQuality as runtimeNormalizeJpegQuality } from '@modoki/engine/runtime';
-import type { CaptureWindowFacts } from '../../electron/rendererOps';
+import type { CaptureWindowFacts, SurfaceProbe } from '../../electron/rendererOps';
 
 vi.mock('../../plugins/backend/tempFiles', () => ({ pruneOldTempFiles: vi.fn() }));
 vi.mock('node:fs', async (importOriginal) => {
@@ -264,13 +264,13 @@ describe('captureViewport failure path', () => {
   }
 
   it('consults the probe and folds its verdict into the thrown message', async () => {
-    const probe = vi.fn(async () => ({ frameLoop: { status: 'idle', refCount: 0 } }));
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle', refCount: 0 } }));
     await expect(captureViewport(failingWindow(), { probe })).rejects.toThrow(/NOTHING IS RENDERING/);
     expect(probe).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT probe on the happy path — a diagnostic must cost nothing when nothing is wrong', async () => {
-    const probe = vi.fn(async () => ({ frameLoop: { status: 'running' } }));
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'running' } }));
     const { win } = fakeWindow(1200, 800);
     await captureViewport(win, { probe });
     expect(probe).not.toHaveBeenCalled();

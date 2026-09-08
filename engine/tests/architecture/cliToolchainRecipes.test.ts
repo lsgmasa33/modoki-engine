@@ -22,8 +22,16 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+
+/** A Markdown doc, read as PROSE — the doc TEXT is the subject of these assertions, and
+ *  Markdown carries no comment syntax a scan could be blinded by (#812). */
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the doc text IS the subject, so there is nothing to see past',
+} as const;
 
 const REPO = path.resolve(__dirname, '../../..');
 const DOCS = path.join(REPO, 'docs');
@@ -59,11 +67,23 @@ const SKIP_PATHS = [
   /^scripts\/oss\//,            // curated public overlay, reviewed on its own terms
 ];
 
+/** Floored well under the 528 measured today (698 total `.md` files, minus SKIP_PATHS) — only a
+ *  broken enumeration or a `match` that stops matching can turn this red, never ordinary doc
+ *  churn. This file previously carried NO non-vacuity check at all beyond the named-file
+ *  membership assertions below; `repoFiles()`'s `floor` is required, so this is new coverage,
+ *  not merely a migration. */
 function allMarkdown(): string[] {
-  const listed = execFileSync('git', ['ls-files', '-z', '--', '*.md'], {
-    cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-  }).split('\0').filter(Boolean);
-  return listed.filter((rel) => !SKIP_PATHS.some((re) => re.test(rel)));
+  return repoFiles({
+    match: (rel: string) => rel.endsWith('.md') && !SKIP_PATHS.some((re) => re.test(rel)),
+    // ⚠️ Floored under the PUBLIC OSS SNAPSHOT's count (86 markdown files, measured by assembling
+    // a real stage), not this clone's 528. `engine/tests/**` ships, and
+    // `scripts/publish-engine-oss.sh` is INCLUDE-ONLY — `git ls-files -- engine build docs` plus a
+    // handful of named root files — so the snapshot has no `games/`, `qa/`, `.agent-memory/`,
+    // `layouts/` or `scripts/`, and `docs/` minus seven private files. A floor of 200 (this
+    // clone's number, scaled down) went red on the public gate; the mental model "snapshot = repo
+    // minus games/" is what produced it and is wrong.
+    floor: 50,
+  }).map(({ rel }) => rel);
 }
 
 /** Patterns that must never appear INSIDE a fenced command block in those docs, with the reason
@@ -106,7 +126,7 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
   it('no tracked markdown tells you to hand-roll a toolchain probe in a command block', () => {
     const offences: string[] = [];
     for (const file of allMarkdown()) {
-      const md = fs.readFileSync(path.join(REPO, file), 'utf8');
+      const md = readScannedSource(path.join(REPO, file), DOC_AS_PROSE).raw;
       for (const block of commandBlocks(md)) {
         for (const line of block.split('\n')) {
           for (const { re, why } of BANNED) {
@@ -152,9 +172,21 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
     // one above — a doc that reads authoritative and does not work.
     const script = path.resolve(__dirname, '../../scripts/print-toolchain-env.mjs');
     expect(fs.existsSync(script)).toBe(true);
-    const src = fs.readFileSync(script, 'utf8');
+    const src = readScannedSource(script).code;
     // It must DELEGATE. If this file ever grows its own candidate list it becomes the third probe.
-    expect(src).toContain("'engine', 'toolchain', 'index.ts'");
+    //
+    // The entry is spelled relative to `engine/` because #827 folded this script onto the SHARED
+    // esbuild seam (`loadVendorPlugins.mjs`), which takes `relPathFromEngineDir`. Before that the
+    // script bundled `path.join(repoRoot, 'engine', 'toolchain', 'index.ts')` itself, and this
+    // assertion matched that literal. Both spellings name the same module; what is being pinned
+    // is that SOME delegation to it exists, not the loader's shape.
+    expect(src).toContain("'toolchain', 'index.ts'");
+    // ⚠️ …and that it goes through the shared loader rather than a private esbuild copy. This half
+    // is the #827 half: two scripts each carrying their own bundle-to-temp-and-import is what that
+    // issue is about, and a fresh `import { build } from 'esbuild'` here is how it comes back.
+    expect(src).toMatch(/loadRequiredEngineModules\(/);
+    expect(src, 'a private esbuild loader is back — use loadVendorPlugins.mjs (#827)')
+      .not.toMatch(/from ['"]esbuild['"]/);
     expect(src).toMatch(/detect\(['"]java['"]\)/);
     expect(src).toMatch(/detect\(['"]android-sdk['"]\)/);
   });
@@ -162,7 +194,7 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
   it('every recipe doc that mentions the script spells it the same way', () => {
     const invocation = 'node engine/scripts/print-toolchain-env.mjs';
     for (const file of RECIPE_DOCS) {
-      const md = fs.readFileSync(path.join(DOCS, file), 'utf8');
+      const md = readScannedSource(path.join(DOCS, file), DOC_AS_PROSE).raw;
       if (!md.includes('print-toolchain-env')) continue;
       expect(md, `${file} names the script but not the runnable form`).toContain(invocation);
     }

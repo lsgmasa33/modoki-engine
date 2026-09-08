@@ -33,14 +33,17 @@ function makeFactory() {
     };
     let committed = -1;
     let commitCalls = 0;
+    const setQuadCalls: Array<ParticleEffectDef['render']> = [];
     const container = new Container(); // real, so wrapper.addChild(container) works
     return {
       container,
       outputs,
       commit(n: number) { committed = n; commitCalls++; },
+      setQuad(render: ParticleEffectDef['render']) { setQuadCalls.push(render); },
       dispose() { container.destroy(); }, // removes the inner container from the wrapper
       get committed() { return committed; },
       get commitCalls() { return commitCalls; },
+      get setQuadCalls() { return setQuadCalls; },
     };
   };
   return { make, get builds() { return builds; } };
@@ -116,6 +119,22 @@ describe('PixiParticleBackend lifecycle', () => {
     expect(f.builds).toBe(1);
     const c = be.getContainer(h) as unknown as { zIndex: number };
     expect(c.zIndex).toBe(7);
+  });
+
+  it('setDef: a quad-key change (aspect/anchor/offset) applies via setQuad and commits immediately, even while STOPPED (#769)', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def({ render: { blend: 'additive', aspect: 1, anchor: 'center', offset: [0, 0] } }));
+    be.pause(h); // paused/stopped: update() would return before ever reaching commit()
+    const before = getObj(be, h).commitCalls;
+
+    be.setDef(h, def({ render: { blend: 'additive', aspect: 2, anchor: 'bottom', offset: [3, 4] } }));
+
+    expect(f.builds).toBe(1); // no rebuild
+    expect(getObj(be, h).setQuadCalls).toHaveLength(1);
+    expect(getObj(be, h).setQuadCalls[0]).toMatchObject({ aspect: 2, anchor: 'bottom', offset: [3, 4] });
+    // The whole edit is applied NOW, not deferred to the next commit (which never comes while stopped).
+    expect(getObj(be, h).commitCalls).toBe(before + 1);
   });
 
   it('setTransform (local space): extracts translation and z-rotation into the container', () => {
@@ -274,7 +293,9 @@ describe('PixiParticleBackend sub-pixel 2D warning', () => {
 // The mock's committed/commitCalls getters live on the outer PixiParticleObject, not on its
 // container (which is what getContainer returns). Reach the object the backend stored for a handle
 // via its private entries map.
-function getObj(be: PixiParticleBackend, h: { id: number }): { committed: number; commitCalls: number } {
+function getObj(be: PixiParticleBackend, h: { id: number }): {
+  committed: number; commitCalls: number; setQuadCalls: Array<ParticleEffectDef['render']>;
+} {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const entry = (be as any).entries.get(h.id);
   return entry.obj;

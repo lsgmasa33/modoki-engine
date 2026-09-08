@@ -23,6 +23,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const BACKEND = path.resolve(__dirname, '../../plugins/backend');
 
@@ -53,7 +54,7 @@ function adbCallSites(): Array<{ file: string; near: string; window: string }> {
   const out: Array<{ file: string; near: string; window: string }> = [];
   for (const entry of fs.readdirSync(BACKEND)) {
     if (!entry.endsWith('.ts')) continue;
-    const src = fs.readFileSync(path.join(BACKEND, entry), 'utf8');
+    const src = readScannedSource(path.join(BACKEND, entry)).code;
     const marker = 'execFileSync(adbBinary()';
     let at = src.indexOf(marker);
     while (at !== -1) {

@@ -81,6 +81,12 @@ export function inputSystem(world: World): void {
     Object.assign(inp.pointer, frame.pointer);
     inp.pointer.dragX = frame.pointer.dragX * scale;
     inp.pointer.dragY = frame.pointer.dragY * scale;
+    // Gesture: panX/panY are a MAGNITUDE and get the same one-place scaling as dragX/dragY.
+    // pinchScale/pinchScaleDelta are RATIOS and must NOT be scaled — a ratio is already
+    // presentation-invariant, and multiplying one by the zoom factor would compound it.
+    Object.assign(inp.gesture, frame.gesture);
+    inp.gesture.panX = frame.gesture.panX * scale;
+    inp.gesture.panY = frame.gesture.panY * scale;
     inp.lastDevice = frame.lastDevice;
   });
 

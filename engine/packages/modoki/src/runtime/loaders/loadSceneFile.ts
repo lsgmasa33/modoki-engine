@@ -10,11 +10,13 @@ import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import { SCENE_FORMAT_VERSION } from '../core/version';
+import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
-import { parseClipBank } from '../audio/clipBank';
-import { parseAnimClipBank } from '../animation/animClipBank';
+import { parseClipBankResult } from '../audio/clipBank';
+import { parseAnimClipBankResult } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
+import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -145,6 +147,24 @@ export interface LoadSceneOptions {
    *  hygiene against id reuse is independent of this flag and always runs
    *  (`clearOverrideMarks(entity.id())` on each fresh spawn, below). */
   clearMarks?: boolean;
+}
+
+/** Thrown by `loadSceneFile` when a scene's format version is `too-new` or `unreadable`
+ *  (docs/format-versioning.md § 2b-bis — Scene is REFUSE). A named class rather than a bare
+ *  `Error` so a caller several frames up (the editor's `loadScene` wrapper, item 2/3 of #784
+ *  phase C3) can tell "this load was refused because of its format version" apart from every
+ *  other reason a scene load can throw (a missing file, a bad prefab ref, …) without parsing
+ *  the message. Mirrors `ImportWriteAborted` (`editor/scene/modelImport.ts`) and
+ *  `MissingAssetError` (`runtime/loaders/assetFetch.ts`) — the established shape in this repo
+ *  for "a specific, nameable reason a throw needs to survive to a caller that must react
+ *  differently to it than to a generic failure". */
+export class SceneFormatRefusedError extends Error {
+  readonly reason: 'too-new' | 'unreadable';
+  constructor(message: string, reason: 'too-new' | 'unreadable') {
+    super(message);
+    this.name = 'SceneFormatRefusedError';
+    this.reason = reason;
+  }
 }
 
 const TEXT_FIELDS = ['fontSize', 'fontWeight', 'textColor', 'textAlign'] as const;
@@ -355,6 +375,24 @@ function migrateV10toV11(data: SceneData): void {
  *  it, so both shapes load identically (scene-loading.md, Phase 3). */
 function migrateV11toV12(data: SceneData): void {
   if (data.version >= 12) return;
+  data.version = 12;
+}
+
+/** Migrate v12→v13: `UIAnchor.zIndex` is removed — it and `UIElement.zIndex` wrote the
+ *  same CSS `z-index` onto the same DOM node (`applyAnchorStyle` overwrote the element's
+ *  value whenever the anchor's was truthy), so the anchor field only ever shadowed the
+ *  element field. A truthy anchor value is what actually rendered, so it wins: copy it
+ *  onto `UIElement.zIndex` (only when there IS a `UIElement` trait — an entity with a
+ *  `UIAnchor` but no `UIElement` is skipped rather than inventing one), then delete
+ *  `UIAnchor.zIndex` unconditionally, truthy or not. Idempotent — a file with no
+ *  `UIAnchor.zIndex` left is untouched. Structured walk (see `migrateUIAnchorZIndexStructured`)
+ *  — reaches `overrides[localId][UIAnchor]`, `added[]` subtrees and `nestedOverrides` paths too,
+ *  same as `migrateV8toV9`'s `renameRenderableActiveToVisibleDeep`. */
+function migrateV12toV13(data: SceneData): void {
+  if (data.version >= 13) return;
+  // Structured walk — not just entry.traits — so overrides[localId][UIAnchor], added[] subtrees
+  // and nestedOverrides paths all get the same fix (mirrors migrateV8toV9's renameRenderableActiveToVisibleDeep).
+  for (const entry of data.entities) migrateUIAnchorZIndexStructured(entry);
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -1058,6 +1096,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Text2D.font': 'font',
   'UIElement.imageSrc': 'texture',
   'UIElement.fontFamily': 'font-family',   // a font asset consumed by the DOM (#231)
+  'UISettings.fontFamily': 'font-family',  // scene-wide DOM default for every UI root (#803)
   'PrefabInstance.source': 'prefab',
   'Environment.hdrPath': 'environment',
   'ParticleEmitter.effect': 'particle',
@@ -1244,7 +1283,13 @@ export function collectResourceRefsFromEntities(
     // handled by the loop above.
     const audioSrc = entry.traits['AudioSource'] as Record<string, unknown> | undefined;
     if (audioSrc && typeof audioSrc !== 'boolean') {
-      for (const c of parseClipBank(audioSrc.clips)) if (looksFetchable(c.ref)) add('audio', c.ref);
+      // #731: parseClipBank's own never-throws contract collapses "no bank" and "malformed bank"
+      // into the same `[]` — a corrupt AudioSource.clips bank would then silently ship with none
+      // of its clips acquired, and the game plays silence with no signal. The Result variant tells
+      // the two apart so the malformed case is at least visible.
+      const { entries: audioClips, malformed: audioClipsMalformed } = parseClipBankResult(audioSrc.clips);
+      if (audioClipsMalformed) console.warn(`[loadSceneFile] malformed AudioSource.clips bank — its clips will not be acquired: ${JSON.stringify(audioSrc.clips)}`);
+      for (const c of audioClips) if (looksFetchable(c.ref)) add('audio', c.ref);
     }
     // Animator.clips — the named keyframe-clip bank, a JSON-string `[{name, clip, …}]`.
     // Each `clip` is a `.anim.json` GUID; parse + collect so a multi-clip animator's clips
@@ -1252,7 +1297,11 @@ export function collectResourceRefsFromEntities(
     // ref), so Animator intentionally has NO entry in REF_FIELDS_BY_TRAIT.
     const animator = entry.traits['Animator'] as Record<string, unknown> | undefined;
     if (animator && typeof animator !== 'boolean') {
-      for (const c of parseAnimClipBank(animator.clips)) if (looksFetchable(c.clip)) add('animation', c.clip);
+      // #731: same fail-open shape as AudioSource.clips above — a malformed bank must not read as
+      // an empty, correctly-authored one.
+      const { entries: animClips, malformed: animClipsMalformed } = parseAnimClipBankResult(animator.clips);
+      if (animClipsMalformed) console.warn(`[loadSceneFile] malformed Animator.clips bank — its clips will not be acquired: ${JSON.stringify(animator.clips)}`);
+      for (const c of animClips) if (looksFetchable(c.clip)) add('animation', c.clip);
     }
     // Renderable2D.sprite is USUALLY a texture, but a video GUID is legal there too
     // (a moving picture on a 2D sprite). Type it by what the asset actually IS, not by
@@ -1420,6 +1469,47 @@ function resolveEntityIdField(raw: unknown, idMap: Map<number, number>, world: W
 export async function loadSceneFile(data: SceneData, options: LoadSceneOptions): Promise<void> {
   // New WORLD → drop every prior override mark (ecs ids are reused across worlds).
   // Marks for this scene's instances are re-seeded below as overrides are applied.
+  // Classify BEFORE anything mutates `data` — see docs/format-versioning.md § 2a/2b-bis.
+  // This must run ahead of the migration ladder AND the two unconditional mutators below
+  // (assignSyntheticEntityIds, stripLegacyCameraFrameShowGizmo): both write into `data`
+  // regardless of version, so a too-new or unreadable document was being mutated before
+  // anything ever looked at its version (#784 phase C3).
+  //
+  // Classification happens at BOTH this site and in `SceneManager.loadScene` (right
+  // after `parseAssetJson`, before `collectSceneResourceRefs`) — not because it was
+  // moved, but because `SceneManager` mutates the same object (assigning
+  // `sceneData.resources`) and spawns entities from it before ever calling this
+  // function, so a too-new/unreadable scene must be refused before that happens,
+  // not merely before this function's own migration ladder runs — `SceneManager` is
+  // the only non-test caller of `loadSceneFile` (#784 phase C adversarial review,
+  // finding 1). The guard stays HERE too because `loadSceneFile` is the single
+  // entry every OTHER path funnels through — `preloaded` snapshots, direct
+  // test/tool calls — and both sites route through the same `classifyFormatVersion`
+  // and the same `SceneFormatRefusedError`, so they cannot disagree on the verdict.
+  // (#807 removed a `sceneData.version = Math.max(sceneData.version ?? 6, 6)` tail
+  // that used to sit at the end of `collectSceneResourceRefs` and ran before this
+  // guard on a `SceneManager`-driven load — it doesn't factor into either site's
+  // reasoning any more.)
+  const verdict = classifyFormatVersion(data, SCENE_FORMAT_VERSION);
+  if (verdict.kind === 'too-new') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
+      `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
+      'too-new',
+    );
+  }
+  if (verdict.kind === 'unreadable') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
+      `The file may be corrupt or hand-edited incorrectly.`,
+      'unreadable',
+    );
+  }
+  // `absent` (no version field at all) is NOT refused — a genuinely pre-v3 scene has
+  // no `version` key and SHOULD run the whole migration ladder below. This looks like
+  // an oversight next to the too-new/unreadable throws above, but it is deliberate:
+  // `absent` is § 2a's "legacy or freshly created — readable" verdict, and refusing it
+  // would break every scene the ladder exists to migrate.
   // Opt-out for a chain/carry load, where SceneManager owns the once-per-world clear
   // and a per-call clear would wipe the marks an earlier scene in the chain seeded
   // (A9 defect 1) — see the `clearMarks` docblock on LoadSceneOptions.
@@ -1433,19 +1523,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV9toV10(data);
   migrateV10toV11(data);
   migrateV11toV12(data);
+  migrateV12toV13(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
-  // Forward-version guard: the migration steps only upgrade OLDER files. A scene
-  // authored by a NEWER engine (version > current) passes through untouched and
-  // would load silently even though its data may not be understood — warn loudly
-  // so a downgrade mismatch isn't invisible.
-  if (typeof data.version === 'number' && data.version > SCENE_FORMAT_VERSION) {
-    console.warn(
-      `[scene] file format version ${data.version} is newer than this engine supports ` +
-      `(${SCENE_FORMAT_VERSION}). Loading anyway — some data may be ignored or misread. ` +
-      `Update the engine if the scene looks wrong.`,
-    );
-  }
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
   const world = options.world ?? getCurrentWorld();
   const allTraits = getAllTraits();

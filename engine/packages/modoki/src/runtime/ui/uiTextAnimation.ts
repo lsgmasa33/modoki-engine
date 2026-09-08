@@ -47,6 +47,22 @@ const EFFECTS: Record<string, EffectDef> = {
 /** Extra span styles a rainbow effect needs (a horizontally-scrolling gradient clipped
  *  to the text). Keeps the effect self-contained; other effects add nothing. */
 const RAINBOW_STYLE: Record<string, string> = {
+  // ⚠️ `width: fit-content` is what makes the effect an effect (#657). The gradient's
+  // positioning area is the SPAN'S BOX, not the glyphs — and the span is `display: block`
+  // (#646), so it fills its container and short text sees only a slice of the spectrum.
+  // Measured on "SCORE" in a 600px host at 42px: ink/box was 0.249 — roughly red→orange, a
+  // quarter of the rainbow — in the ordinary flex case, and #646 made the two non-flex
+  // contexts (`-webkit-box` under maxLines, and AutoFitText's span) match it at 0.249 where
+  // they had been 1.000. `fit-content` restores 1.000 in ALL THREE and keeps the line clamp
+  // working. Rainbow text is overwhelmingly short labels, scores and counters, so the short
+  // case is the reachable one, not an edge.
+  //
+  // The trade the owner accepted: a fit-content block HUGS its text instead of filling the box.
+  // ⚠️ An earlier version of this comment said centring was "now the parent's job
+  // (`justifyContent`/`textAlign`)". Half wrong, and measured: `justifyContent` on a flex parent
+  // does still centre it, but `textAlign` does NOT — a shrink-wrapped block has no inline content
+  // left to align. That is what `shrinkWrapAlign` below exists to carry across.
+  width: 'fit-content',
   backgroundImage: 'linear-gradient(90deg,#ff4d4d,#ffdb4d,#4dff65,#4dffff,#4d65ff,#ff4dff,#ff4d4d)',
   backgroundSize: '200% auto',
   backgroundClip: 'text',
@@ -80,7 +96,46 @@ export interface UITextAnimStyle {
 /** Map an effect + params → the CSS animation for a DOM text element, or null for
  *  `none`/unknown. The amplitude comes back in **em** and is resolved by the renderer against
  *  the element's own computed font size, so this takes no `fontSize` (#245). Pure. */
-export function uiTextAnimation(params: UITextAnimParams): UITextAnimStyle | null {
+/** Carry the element's `textAlign` onto a SHRINK-WRAPPED span (#657 follow-up).
+ *
+ *  ⚠️ MEASURED, after the plain `width: fit-content` fix regressed centring. `text-align` centres
+ *  INLINE content inside a box; once the span is `display: block` + `fit-content` the box is only
+ *  as wide as its glyphs, so there is nothing left for `text-align` to centre and the box itself
+ *  sits flush at the start of the line — a centred "SCORE" jumped to the left edge. Auto margins
+ *  are what position a shrink-to-fit BLOCK, so they are the mechanism that has to carry the
+ *  authored alignment across.
+ *
+ *  `UIElement.textAlign` is typed `'left' | 'center' | 'right'`, so there is no `start`/`end` arm
+ *  to write and no RTL question to answer — adding one would be a branch no caller can reach.
+ *
+ *  Left needs no margin (the default position is already correct), and a flex parent that
+ *  centres via `justifyContent` is unaffected either way — an auto inline margin centres a flex
+ *  item too, so the two agree rather than fight. Verified on all four combinations. */
+export function shrinkWrapAlign(textAlign?: string): Record<string, string> {
+  if (textAlign === 'center') return { marginInline: 'auto' };
+  if (textAlign === 'right') return { marginLeft: 'auto' };
+  return {};
+}
+
+/** RAINBOW_STYLE + the alignment, CACHED PER ALIGNMENT so the object is referentially stable.
+ *
+ *  ⚠️ Not a micro-optimisation. `AnimatedText` is `React.memo`'d and its docblock calls that
+ *  load-bearing: `extra` used to be the module-level `RAINBOW_STYLE`, so the shallow compare
+ *  bailed out on every per-frame re-render. Spreading a fresh object per call defeated that for
+ *  the one effect that carries extra style. There are three possible alignments, so a tiny map
+ *  restores stability without giving up the alignment carry-through. */
+const RAINBOW_BY_ALIGN = new Map<string, Record<string, string>>();
+function rainbowStyleFor(textAlign?: string): Record<string, string> {
+  const key = textAlign ?? '';
+  let v = RAINBOW_BY_ALIGN.get(key);
+  if (!v) {
+    v = { ...RAINBOW_STYLE, ...shrinkWrapAlign(textAlign) };
+    RAINBOW_BY_ALIGN.set(key, v);
+  }
+  return v;
+}
+
+export function uiTextAnimation(params: UITextAnimParams, textAlign?: string): UITextAnimStyle | null {
   const m = EFFECTS[params.effect];
   if (!m) return null;
   if (m.perChar) {
@@ -96,7 +151,7 @@ export function uiTextAnimation(params: UITextAnimParams): UITextAnimStyle | nul
   return {
     animation: `${m.kf} ${dur}s ${m.timing} 0s ${iter} ${direction} ${fill}`,
     amp: m.amp ? params.amplitude : 0,
-    ...(m.gradient ? { style: RAINBOW_STYLE } : {}),
+    ...(m.gradient ? { style: rainbowStyleFor(textAlign) } : {}),
   };
 }
 

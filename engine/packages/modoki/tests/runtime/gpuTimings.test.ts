@@ -435,6 +435,58 @@ describe('a resolve in flight across a session boundary (close-out review)', () 
     expect(b.renderer.resolveTimestampsAsync).toHaveBeenCalledTimes(1);
   });
 
+  it('clears trackTimestamp on the OUTGOING renderer when arming a new one (#810)', async () => {
+    // Without this, a displaced renderer (never disarmed — nothing else clears its flag) would
+    // keep writing GPU timestamp queries every frame forever, for as long as the process lives.
+    const a = makeRenderer();
+    activate(a);
+    setGpuTimingEnabled(true);
+    expect(a.backend.trackTimestamp).toBe(true);
+    const b = makeRenderer();
+    activate(b);
+    pollGpuTimings(); // re-arms on B (renderer !== armedRenderer)
+    expect(a.backend.trackTimestamp).toBe(false); // A's flag is cleared, not left on forever
+    expect(b.backend.trackTimestamp).toBe(true);
+  });
+
+  it('clears the OUTGOING renderer even when the incoming one cannot time (#810)', () => {
+    // The editor's two viewports need not share a backend, so the renderer that displaces the
+    // armed one may itself be unsupported. That path returns early, so if the clear lived in the
+    // success path below it, A would keep writing timestamp queries forever — the exact leak.
+    const a = makeRenderer();
+    activate(a);
+    setGpuTimingEnabled(true);
+    expect(a.backend.trackTimestamp).toBe(true);
+
+    activate(makeRenderer({ features: [] })); // WebGPU device without 'timestamp-query'
+    pollGpuTimings();
+
+    expect(a.backend.trackTimestamp).toBe(false);
+  });
+
+  it('adopts an unsupported incoming renderer so the probe stops re-running every frame (#810)', () => {
+    // `pollGpuTimings`'s "once shown not to support timestamps, stop asking it" guard compares
+    // `renderer === armedRenderer`. Leaving armedRenderer on the DISPLACED renderer makes that test
+    // never match, so arm() + its probe would run on every frame — on exactly the low-end devices
+    // that guard exists to protect.
+    const a = makeRenderer();
+    activate(a);
+    setGpuTimingEnabled(true);
+
+    const b = makeRenderer({ features: [] });
+    const has = vi.fn(() => false);
+    (b.backend as unknown as { device: { features: unknown } }).device.features = { has };
+    activate(b);
+
+    pollGpuTimings();
+    const afterFirstPoll = has.mock.calls.length;
+    expect(afterFirstPoll).toBeGreaterThan(0); // it did probe B once
+
+    pollGpuTimings();
+    pollGpuTimings();
+    expect(has.mock.calls.length).toBe(afterFirstPoll); // …and never again
+  });
+
   it('does not let a stale resolve attribute A\'s pass ranges to B\'s frames', async () => {
     const a = makeRenderer();
     activate(a);

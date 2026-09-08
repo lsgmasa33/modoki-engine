@@ -13,7 +13,7 @@ Four layers. Each may import only the layers below it.
 |---|---|---|
 | **L0 core** | `core/` — `core/ecs/` (world, registry, entity index, world transforms + the `transformPropagationSystem` render-path cache, trait registry), the deterministic primitives (`rng`, `journal`, `gameJournal`, `clock`, `getTime`, `timeSystem`, `playState`, `pipeline`, `projection`, `lateUpdate`, `stepSimulation`, `warnSuppress`), the cross-subsystem seams (`skeletalSeek`, `particleControlRegistry`, `timelinePreview`, `skeletalPreview`, `actionRegistry`, `curves`, `uiDirty`, `screenBounds`, `activeRenderer`, `currentScene`, `sceneSwapHooks`, `managerTypes`, `providerSlot` + the provider slots built on it — `textureProvider`/`textureRefs`, `assetPlumbing`, `shaderSchema`), the core traits (`Transform`, `EntityAttributes`, `Time`, the input action vocabulary `inputActions`), and the loose root files (`config`, `gameDefinition`, `appServices`, `instanceGuard`, `version`) | **nothing** |
 | **L1 traits** | `traits/` — pure data schemas (koota traits + their accessors) | L0 |
-| **L2 subsystems** | `animation`, `audio`, `input`, `particles`, `physics`, `rendering`, `skinning`, `storage`, `timeline`, `ui`, `zones` | L0, L1 — **not each other**, except the declared exceptions below |
+| **L2 subsystems** | `account`, `animation`, `audio`, `iap`, `input`, `particles`, `physics`, `rendering`, `skinning`, `storage`, `sync`, `timeline`, `ui`, `zones` | L0, L1 — **not each other**, except the declared exceptions below |
 | **L3 composition** | `loaders`, `scene`, `managers`, `assets`, `actions`, `harness`, `debug`, `store`, `ota` | everything |
 
 `runtime/index.ts` — the public barrel — is the one deliberately unlayered file, and the only
@@ -225,12 +225,14 @@ run into the same shape of question:
   (`config`, `gameDefinition`, `appServices`, `instanceGuard`, `version`) are all leaves too —
   leaving them loose at `runtime/` root (the rejected option) would have preserved exactly the kind
   of un-owned, importable-from-anywhere space where the next `systems/` starts to form.
-- **D4 — `rendering/{Scene2D.tsx,Scene3D.tsx,scene3DSync.ts}` are reclassified L3 in place, not
-  moved.** They structurally compose scene data + loaders + subsystems into a rendered frame — L3
-  composition wearing an L2 folder path — but physically moving them would change
+- **D4 — `rendering/{Scene2D.tsx,Scene3D.tsx,scene3DSync.ts,envPmrem.ts}` are reclassified L3 in
+  place, not moved.** They structurally compose scene data + loaders + subsystems into a rendered
+  frame — L3 composition wearing an L2 folder path — but physically moving them would change
   `engine/app/App.tsx`'s deep import of `Scene3D`, a public-surface change. Implemented as a
   file-level ESLint carve-out (`L3_RECLASSIFIED_FILES`), the same mechanism used pre-P6 for the L0
-  primitives still sitting in `systems/`.
+  primitives still sitting in `systems/`. `envPmrem.ts` joined in #739: it registers itself with
+  `loaders/meshTemplateCache.ts`'s env-dispose hook registry at module scope so a 2D-only build
+  (which never imports it) never pulls in `three/webgpu`.
 - **D5 — an unprovided provider slot warns once and returns a neutral value; it does not throw.**
   See "The registration-inversion pattern" above — this is what keeps headless unit tests and
   DCE'd playable-ad builds from crashing on a missing provider.
@@ -305,9 +307,11 @@ one up:
 package, and it stays the whole engine. This was the open question the layering work deferred until
 boundaries were real; they are now, and the answer is no. Recorded here so it is not re-litigated.
 
-**Leaves exist — that part of the hypothesis held.** Measured over `buildRuntimeGraph()`, eight of
-the eleven L2 folders have zero static edges to another L2 folder, zero to L3, and zero out of
-`runtime/`: `animation`, `audio`, `input`, `particles`, `physics`, `storage`, `ui`, `zones`. The
+**Leaves exist — that part of the hypothesis held.** Eleven of the fourteen L2 folders have zero
+static edges to another L2 folder, zero to L3, and zero out of `runtime/`: `account`, `animation`,
+`audio`, `iap`, `input`, `particles`, `physics`, `storage`, `sync`, `ui`, `zones`. ⚠️ An external npm
+dependency does not disqualify a leaf — `physics` imports `three` and `koota` and is one; the
+property is about edges INSIDE `runtime/`. The
 other three are the declared producer→conductor→presentation exceptions (`rendering`, `timeline`,
 `skinning`) and are structurally ineligible by design. A provider slot does not disqualify a leaf —
 `animation`, `audio`, `particles` and `physics` each own one, but the slot is L0 machinery and the

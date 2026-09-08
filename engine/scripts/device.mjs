@@ -4,10 +4,10 @@
  *
  * `deviceClaimsStore.mjs` already arbitrates the hardware for the MCP surface
  * (`device_connect`) and for `claim-guard.mjs`'s Bash hook, but both of those
- * only reach a Claude Code session in THIS repo. Codex, Cursor, Antigravity, a
- * human's own terminal — none of them go through either path, so a claim taken
- * by one of them is invisible to the others and vice versa. This file is the
- * one surface every one of those can reach: `node engine/scripts/device.mjs …`
+ * only reach a Claude Code session in THIS repo. A human's own terminal, a
+ * script, any future non-Claude tooling — none of them go through either path,
+ * so a claim taken by one of them is invisible to the others and vice versa.
+ * This file is the one surface every one of those can reach: `node engine/scripts/device.mjs …`
  * (or the `npm run device:*` shortcuts) needs nothing but Node.
  *
  * ── The owner token ──
@@ -37,8 +37,10 @@ import path from 'node:path';
 
 import {
   claimDevice, releaseDevice, listClaims, describeConflict, foreignClaimFor, CLI_CLAIM_TTL_MS,
+  sameClone,
 } from './deviceClaimsStore.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
+import { canonicalPath } from './pathIdentity.mjs';
 
 // ── Repo root + owner token ─────────────────────────────────────────────────
 
@@ -47,20 +49,24 @@ import { parseDeviceCommand } from './deviceCommandTargets.mjs';
  *  machine with no `git` on PATH (unlikely, but claiming hardware must not
  *  hard-depend on a binary this script does not otherwise need). */
 function findRepoRoot() {
+  // #881: all three canonicalisations were the JS `fs.realpathSync` walk wrapped in a try/catch —
+  // symlinks yes, `subst` and drive-letter case no. `canonicalPath` is `.native` with the same
+  // resolve-on-failure fallback, so the try/catch scaffolding goes with it. This matters here more
+  // than most: the value becomes `OWNER = cli:<root>`, the identity every claim and release in this
+  // invocation is recorded under, and `claim-guard.mjs` compares its own root against it — two
+  // spellings of one clone and a clone is refused its OWN device.
   const viaGit = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
   if (viaGit.status === 0 && viaGit.stdout && viaGit.stdout.trim()) {
-    try { return fs.realpathSync(viaGit.stdout.trim()); } catch { /* fall through */ }
+    return canonicalPath(viaGit.stdout.trim());
   }
   let dir = process.cwd();
   for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) {
-      try { return fs.realpathSync(dir); } catch { break; }
-    }
+    if (fs.existsSync(path.join(dir, '.git'))) return canonicalPath(dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  try { return fs.realpathSync(process.cwd()); } catch { return process.cwd(); }
+  return canonicalPath(process.cwd());
 }
 
 const repoRoot = findRepoRoot();
@@ -93,8 +99,8 @@ function currentBranch() {
  *  A bare `spawnSync('adb', …)` is a lint ERROR in this repo, and for a good reason: the packaged
  *  editor's adb is NOT on PATH, so a bare spawn ENOENTs there. The authority is
  *  `detectAdb()` in `engine/toolchain/index.ts` — which this file cannot import, being plain ESM
- *  that must run under bare `node` with no build step (that is the whole point of the CLI: Codex,
- *  a terminal, a script). So it mirrors that resolution order instead, most-specific first, and
+ *  that must run under bare `node` with no build step (that is the whole point of the CLI: a
+ *  terminal, a script). So it mirrors that resolution order instead, most-specific first, and
  *  falls back to PATH last.
  *
  *  The PATH fallback is correct rather than lazy HERE, and the toolchain agrees in code: with no
@@ -362,10 +368,11 @@ function resolveIosProductType(udid) {
  *     hand what an automated comparison could not settle. */
 function checkIosPhoneCollision(udid, { force }) {
   const foreignWithModel = listClaims().filter(
-    // Compared as PATHS, not strings: a claim recorded with a trailing slash (or any other spelling
-    // of the same directory) must not make this clone look like a stranger and refuse its own phone.
-    // `claim-guard.mjs` resolves the same comparison the same way.
-    (c) => c.deviceId.startsWith('ip:') && path.resolve(c.clone) !== path.resolve(repoRoot) && c.model,
+    // Compared through `sameClone` (#865) — the ONE comparison, shared with `foreignClaimFor`,
+    // `ownAdbClaim` and `claim-guard.mjs`. Two spellings of the same directory still match; an
+    // unqualified stored path now matches NOTHING, so it reads as foreign and gets warned about
+    // rather than silently resolving onto this cwd and vanishing from the list.
+    (c) => c.deviceId.startsWith('ip:') && !sameClone(c.clone, repoRoot) && c.model,
   );
   if (!foreignWithModel.length) return;
 

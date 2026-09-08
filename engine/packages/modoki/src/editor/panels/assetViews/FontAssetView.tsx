@@ -1,8 +1,9 @@
 /** FontAssetView — MSDF font import settings editor + Apply (bake) action.
- *  Mirrors TextureAssetView: settings persist to the font's `.meta.json` `font`
- *  block on change; Apply runs msdf-atlas-gen (via /api/reimport) and reloads.
- *  The baked mtsdf atlas + Chlumsky metrics are served at `<src>~atlas.png` +
- *  `<src>~metrics.json`; the font is then GUID-referenceable by the Text traits. */
+ *  Mirrors TextureAssetView: settings PARK to the font's `.meta.json` `font`
+ *  block on change (#845 — Cmd+S is the write); Apply runs msdf-atlas-gen (via
+ *  /api/reimport) and reloads. The baked mtsdf atlas + Chlumsky metrics are served
+ *  at `<src>~atlas.png` + `<src>~metrics.json`; the font is then GUID-referenceable
+ *  by the Text traits. */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
@@ -13,10 +14,13 @@ import {
 } from '../../../runtime/core/fontSettings';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
-import { DropdownField, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
+import { DropdownField, formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
 import { commitAxisDraft, applyAxisEdit } from './fontAxisEdit';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { OUTLINE_MAX_SPREAD } from '../../../runtime/rendering/text/mtsdfStyle';
+import { useMetaDirty } from '../useMetaDirty';
+import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 
 const CHARSET_OPTIONS: { value: FontCharsetPreset; label: string }[] = [
   { value: 'ascii', label: 'ASCII (printable, 95 glyphs)' },
@@ -63,6 +67,8 @@ const AXIS_LABELS: Record<string, string> = {
 };
 
 export function FontAssetView({ path, name }: { path: string; name: string }) {
+  // #870: a parked import-settings edit was invisible in the panel that MADE it.
+  const metaDirty = useMetaDirty(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<FontImportSettings>(DEFAULT_FONT_SETTINGS);
   const [customChars, setCustomChars] = useState('');
@@ -72,18 +78,22 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
 
+  const applyMeta = useCallback((m: Record<string, unknown>) => {
+    setMeta(m);
+    const s = resolveFontSettings(m as { font?: Partial<FontImportSettings> });
+    setSettings(s);
+    setCustomChars(s.customChars ?? '');
+    setConverted(!!m.fontCache);
+  }, []);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((m: Record<string, unknown>) => {
-        setMeta(m);
-        const s = resolveFontSettings(m as { font?: Partial<FontImportSettings> });
-        setSettings(s);
-        setCustomChars(s.customChars ?? '');
-        setConverted(!!m.fontCache);
-      })
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a settings edit here is PARKED, so disk still holds
+    // the PRE-edit doc until Cmd+S. `apply` flushes this path before it reimports, so by the time
+    // this runs after one, nothing is parked here and this falls through to a fresh read.
+    return readMetaPreferringPark(path, { signal })
+      .then(({ meta: m }) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, applyMeta]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -111,21 +121,21 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       const next: FontImportSettings = { ...prev };
       if (nextAxes) next.variationAxes = nextAxes;
       else delete next.variationAxes;
-      const updatedMeta = { ...(meta ?? {}), version: 2, font: next };
+      const updatedMeta = { ...(meta ?? {}), font: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
 
-  // Persist a settings change to the meta sidecar immediately (discrete controls).
+  // Persist a settings change to the meta sidecar — PARKED, not written immediately (#845).
   // Full meta preserved (id/fontCache).
   const update = useCallback((patch: Partial<FontImportSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
-      const updatedMeta = { ...(meta ?? {}), version: 2, font: next };
+      const updatedMeta = { ...(meta ?? {}), font: next };
       setMeta(updatedMeta);
-      writeMetaOrWarn(path, updatedMeta);
+      parkMetaEdit(path, updatedMeta);
       return next;
     });
   }, [meta, path]);
@@ -157,6 +167,9 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
     setImporting(true);
     setImportStatus(true, `Baking ${name}...`);
     try {
+      // #845: `/api/reimport` reads the settings off DISK — flush any still-parked edit first, or
+      // the bake would run against the OLD settings while the UI already shows the new ones.
+      await flushPendingMetaFor(path);
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
@@ -326,6 +339,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       </button>
       {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} />}
       {converted && <FontAtlasPreview path={path} cache={meta?.fontCache as FontCacheInfo | undefined} />}
+      <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.font.unsaved" />
     </>
   );
 }

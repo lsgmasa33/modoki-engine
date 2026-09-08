@@ -23,10 +23,10 @@
  *  clean — the packaged first-launch picker being cancelled (nothing to open) and
  *  window-all-closed off darwin. Only a FAILED launch must be non-zero. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
-const mainTs = fs.readFileSync(path.resolve(__dirname, '../../electron/main.ts'), 'utf8');
+const mainTs = readScannedSource(path.resolve(__dirname, '../../electron/main.ts')).code;
 
 describe('a failed launch exits non-zero', () => {
   it('the deferred-quit teardown exits with the tracked code, not a hard-coded 0', () => {

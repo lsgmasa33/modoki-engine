@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseAnimClipBank,
+  parseAnimClipBankResult,
   stringifyAnimClipBank,
   resolveActiveClip,
   animatorHasClip,
@@ -47,6 +48,44 @@ describe('parseAnimClipBank', () => {
     expect(stringifyAnimClipBank([])).toBe('[]');
     const entries = [{ name: 'a', clip: G }];
     expect(parseAnimClipBank(stringifyAnimClipBank(entries))).toEqual(entries);
+  });
+});
+
+// #731: parseAnimClipBank's plain `[]`-on-failure contract can't tell "no bank authored" apart
+// from "malformed bank" — the build tree-shaker needs that distinction to warn instead of
+// silently shaking a clip's asset out of the prod build. parseAnimClipBank itself (above) is
+// UNCHANGED and must stay green: it is now a thin delegate over parseAnimClipBankResult.
+describe('parseAnimClipBankResult', () => {
+  it('malformed: false, entries: [] for "no bank authored" (absent/empty/wrong-type src)', () => {
+    expect(parseAnimClipBankResult('')).toEqual({ entries: [], malformed: false });
+    expect(parseAnimClipBankResult(undefined)).toEqual({ entries: [], malformed: false });
+    expect(parseAnimClipBankResult(42)).toEqual({ entries: [], malformed: false });
+  });
+
+  it('malformed: true for a string that could not be decoded into a valid bank array', () => {
+    expect(parseAnimClipBankResult('{not json')).toEqual({ entries: [], malformed: true });
+    expect(parseAnimClipBankResult('{"name":"x"}')).toEqual({ entries: [], malformed: true }); // object, not array
+  });
+
+  it('accept side: a well-formed bank is malformed: false with the same entries parseAnimClipBank returns', () => {
+    const src = JSON.stringify([{ name: 'idle', clip: G }, { name: 'walk', clip: H, speed: 2 }]);
+    const r = parseAnimClipBankResult(src);
+    expect(r.malformed).toBe(false);
+    expect(r.entries).toEqual(parseAnimClipBank(src));
+    expect(r.entries).toEqual([{ name: 'idle', clip: G }, { name: 'walk', clip: H, speed: 2 }]);
+  });
+
+  it('does NOT flag malformed for a valid array containing a droppable entry', () => {
+    // A dropped entry (missing name/clip) is normal authoring mid-edit, not corruption.
+    const r = parseAnimClipBankResult(JSON.stringify([{ name: 'ok', clip: G }, { name: 'no-clip' }]));
+    expect(r.malformed).toBe(false);
+    expect(r.entries).toEqual([{ name: 'ok', clip: G }]);
+  });
+
+  it('parseAnimClipBank is a thin delegate — same entries as .entries on every input above', () => {
+    for (const src of ['', undefined, 42, '{not json', '{"name":"x"}', JSON.stringify([{ name: 'a', clip: G }])]) {
+      expect(parseAnimClipBank(src)).toEqual(parseAnimClipBankResult(src).entries);
+    }
   });
 });
 

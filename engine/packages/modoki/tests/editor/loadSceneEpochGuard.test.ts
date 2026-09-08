@@ -81,7 +81,7 @@ describe('loadScene epoch guard (superseded loads cannot clobber the winner)', (
     // The loser (call1) is superseded and rejects with AbortError — its `finally` must NOT
     // clear the modal the winner is actively driving.
     call1.reject(new DOMException('Aborted', 'AbortError'));
-    await expect(p1).resolves.toBe(false);
+    await expect(p1).resolves.toBe('superseded');
     expect(useEditorStore.getState().sceneLoadStatus.active).toBe(true);
     expect(useEditorStore.getState().sceneLoadStatus).toEqual({ active: true, loaded: 1, total: 4 });
 
@@ -92,7 +92,7 @@ describe('loadScene epoch guard (superseded loads cannot clobber the winner)', (
 
     // The winner completes normally — NOW the modal clears.
     call2.resolve();
-    await expect(p2).resolves.toBe(true);
+    await expect(p2).resolves.toBe('loaded');
     expect(useEditorStore.getState().sceneLoadStatus.active).toBe(false);
   });
 
@@ -126,7 +126,7 @@ describe('loadScene epoch guard (superseded loads cannot clobber the winner)', (
     await Promise.resolve();
     const [call1] = h.loadCalls;
     call1.reject(new DOMException('Aborted', 'AbortError'));
-    await expect(p1).resolves.toBe(false);
+    await expect(p1).resolves.toBe('superseded');
 
     expect(errSpy).not.toHaveBeenCalled();
   });
@@ -138,7 +138,7 @@ describe('loadScene epoch guard (superseded loads cannot clobber the winner)', (
     await Promise.resolve();
     const [call1] = h.loadCalls;
     call1.reject(new Error('HTTP 404'));
-    await expect(p1).resolves.toBe(false);
+    await expect(p1).resolves.toBe('failed');
 
     expect(errSpy).toHaveBeenCalledTimes(1);
     expect(useEditorStore.getState().sceneLoadStatus.active).toBe(false);
@@ -155,7 +155,7 @@ describe('loadScene epoch guard (superseded loads cannot clobber the winner)', (
     expect(useEditorStore.getState().sceneLoadStatus).toEqual({ active: true, loaded: 3, total: 3 });
 
     call1.resolve();
-    await expect(p1).resolves.toBe(true);
+    await expect(p1).resolves.toBe('loaded');
     expect(useEditorStore.getState().sceneLoadStatus.active).toBe(false);
   });
 });

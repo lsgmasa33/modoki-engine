@@ -23,6 +23,7 @@
  *  rejects the app. That is a backend concern (the native backend sets the flag);
  *  the Cache API is already exempt. */
 
+import { createTeardownToken } from '../core/liveness';
 import {
   planAdmission, explainRefusal, totalBytes, type CacheEntry,
 } from './videoCachePolicy';
@@ -62,6 +63,12 @@ export interface DownloadProgress {
 
 export class VideoCache {
   private index = new Map<string, IndexEntry>();
+  /** Invalidated by `clear()`, which is the one operation that can empty the index underneath an
+   *  in-flight download. `doFetch` awaits three times (the fetch, the body read, the backend
+   *  write) and only then writes `index` and PERSISTS it — so without this, a clear landing in
+   *  that window leaves the very entry the user asked to delete, in the backend and in the
+   *  saved index, surviving a reload. See docs/async-lifetime.md. */
+  private readonly liveness = createTeardownToken();
   private readonly backend: CacheBackend;
   private readonly budget: number;
   private readonly now: () => number;
@@ -145,7 +152,7 @@ export class VideoCache {
   /** A cached clip's local URL, touching its LRU position. Undefined when not cached. */
   async get(key: string): Promise<string | undefined> {
     const url = await this.backend.urlFor(key);
-    if (!url) { this.index.delete(key); return undefined; }
+    if (!url) { this.index.delete(key); this.saveIndex(); return undefined; }
     const e = this.index.get(key);
     if (e) { e.lastUsed = this.now(); this.saveIndex(); }
     return url;
@@ -162,7 +169,13 @@ export class VideoCache {
     const existing = this.inFlight.get(key);
     if (existing) return existing;
 
-    const job = this.doFetch(key, url, onProgress).finally(() => { this.inFlight.delete(key); });
+    // Identity-checked, and load-bearing only BECAUSE `clear()`/`delete()` now drop their
+    // in-flight entries (below): that is what lets a fresh request for the same key register its
+    // own promise while the superseded one is still settling. The old job must then remove only
+    // ITSELF, or it would evict the newcomer and leave a live download unreachable to every later
+    // caller. Same token shape as everything else in this file; see docs/async-lifetime.md.
+    const job: Promise<string | undefined> = this.doFetch(key, url, onProgress)
+      .finally(() => { if (this.inFlight.get(key) === job) this.inFlight.delete(key); });
     this.inFlight.set(key, job);
     return job;
   }
@@ -170,6 +183,9 @@ export class VideoCache {
   private async doFetch(
     key: string, url: string, onProgress?: (p: DownloadProgress) => void,
   ): Promise<string | undefined> {
+    // Captured before the first await, PER KEY: `clear()` invalidates everything, `delete(key)`
+    // invalidates just this one. Re-checked at the one place this writes shared state.
+    const stillLive = this.liveness.capture(key);
     const res = await fetch(url);
     if (!res.ok) throw new Error(`video download failed: ${res.status} ${res.statusText} — ${url}`);
 
@@ -193,12 +209,32 @@ export class VideoCache {
     });
     if (!plan.ok) throw new Error(`video cache refused ${key}: ${explainRefusal(plan, this.budget)}`);
 
-    for (const victim of plan.evict) {
-      await this.backend.delete(victim);
-      this.index.delete(victim);
+    try {
+      for (const victim of plan.evict) {
+        await this.backend.delete(victim);
+        this.index.delete(victim);
+      }
+    } catch (err) {
+      // A rejection here (mid-loop, not the last victim) used to abort doFetch before
+      // the saveIndex() below ever ran: the first victim was gone from the backend AND
+      // the in-memory index, but the PERSISTED index still claimed it. That ghost entry
+      // survives a reload, inflates usedBytes() past what actually exists on disk, and
+      // makes planAdmission refuse a download that would genuinely fit. Persist whatever
+      // we actually freed before propagating — the fetch still can't proceed (we could
+      // not make room), but the index must not lie about what's left.
+      this.saveIndex();
+      throw err;
     }
 
     await this.backend.write(key, blob);
+    if (!stillLive()) {
+      // A clear() emptied the cache while this was downloading. Seating the entry now would
+      // resurrect exactly what the user asked to remove — and `saveIndex()` would persist it, so
+      // it would outlive the session. Drop the bytes we just wrote and report no cached copy;
+      // `fetchAndStore` already returns `string | undefined`, so this is an outcome callers have.
+      try { await this.backend.delete(key); } catch { /* nothing left to undo */ }
+      return undefined;
+    }
     this.index.set(key, { bytes: blob.size, lastUsed: this.now(), pinned: this.index.get(key)?.pinned });
     this.saveIndex();
     return this.backend.urlFor(key);
@@ -226,15 +262,61 @@ export class VideoCache {
   }
 
   async delete(key: string): Promise<void> {
+    // Per-key twin of `clear()`'s invalidateAll: a download of THIS key in flight must not re-seat
+    // the entry we are about to remove. Same defect, one key instead of all — and unlike `clear()`
+    // it must not stale a download of any OTHER key, which is what `invalidateKey` is for.
+    this.liveness.invalidateKey(key);
+    // ⚠️ Drop the in-flight entry TOO, not just the liveness token. Staling the download without
+    // this left the dead job registered, so the next `fetchAndStore(key)` coalesced onto it via
+    // the `if (existing) return existing` fast path and got `undefined` — a permanent cache miss
+    // with no re-download, from a request that should have started a fresh one. That is a
+    // regression this guard introduced and this line closes.
+    this.inFlight.delete(key);
     await this.backend.delete(key);
     this.index.delete(key);
     this.saveIndex();
   }
 
   async clear(): Promise<void> {
-    for (const k of [...this.index.keys()]) await this.backend.delete(k);
-    this.index.clear();
-    this.saveIndex();
+    // Mirror delete()'s ordering PER KEY — index.delete only after the backend
+    // delete succeeds — so a mid-loop throw leaves index and backend consistent for
+    // everything already processed, instead of the whole clear aborting with stale
+    // index entries for keys that are actually gone.
+    //
+    // Keep going past a failure: one unevictable key (an I/O error, an entry the
+    // browser is mid-evicting) must not strand every other key in the cache. Collect
+    // the failures and rethrow at the end so the caller still learns the clear was
+    // incomplete.
+    this.liveness.invalidateAll(); // any download in flight must not re-seat an entry behind us
+    this.inFlight.clear();          // …and must not be handed to the next caller as a live job
+    const failed: string[] = [];
+    let firstErr: unknown;
+    try {
+      for (const k of [...this.index.keys()]) {
+        try {
+          await this.backend.delete(k);
+          this.index.delete(k);
+        } catch (err) {
+          failed.push(k);
+          firstErr ??= err;
+        }
+      }
+    } finally {
+      // Persist whatever we actually managed, even on the way out — this is the bug
+      // being fixed: the old code never reached saveIndex() after a throw.
+      this.saveIndex();
+    }
+    if (failed.length) {
+      // Cap the inlined key list — a 500-entry cache with a broken storage layer must
+      // not produce a 500-key message. The full count is already in the message, so
+      // nothing is lost, just not spelled out.
+      const shown = failed.slice(0, 5).join(', ');
+      const more = failed.length > 5 ? ` (+${failed.length - 5} more)` : '';
+      throw new Error(
+        `video cache clear: failed to delete ${failed.length} ${failed.length === 1 ? 'entry' : 'entries'}: ${shown}${more}`,
+        { cause: firstErr },
+      );
+    }
   }
 }
 

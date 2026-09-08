@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import picomatch from 'picomatch';
 import viteConfig from '../../vite.config';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
  * A test file that no `test.include` glob matches NEVER RUNS, and says nothing when it
@@ -47,22 +47,18 @@ function includeGlobs(): string[] {
 
 describe('every test file on disk is collected by vitest', () => {
   it('no test file is orphaned by the include list', () => {
-    // `--others --exclude-standard` as well as the tracked set: a test file is at its most
-    // orphanable BEFORE it is committed, which is exactly when the author would want to hear
+    // `includeUntracked: true` (the default) as well as the tracked set: a test file is at its
+    // most orphanable BEFORE it is committed, which is exactly when the author would want to hear
     // about it. (Written with tracked-only first — and it passed happily with the include
-    // glob for the brand-new, still-untracked `tests/app/` deleted.)
-    // `execFileSync`, NOT a shell string — the repo's established shape for this
-    // (privateBuildFields, noNulBytesInSource, metaSidecarChurn, cliToolchainRecipes all do
-    // it this way). `execSync` spawns cmd.exe on Windows, which does NOT strip single quotes,
-    // so quoted globs reach git literally and it matches nothing: measured here, the quoted
-    // form returns 0 paths where the expanded form returns 1093. That would have failed the
-    // `win` clone and the Windows CI leg on the sanity assert below, for a reason having
-    // nothing to do with orphaned tests.
-    const tracked = execFileSync(
-      'git',
-      ['ls-files', '--cached', '--others', '--exclude-standard', '*.test.ts', '*.test.tsx'],
-      { cwd: repoRoot, encoding: 'utf8' },
-    ).trim().split('\n').filter(Boolean);
+    // glob for the brand-new, still-untracked `tests/app/` deleted.) `repoFiles()` enumerates via
+    // `execFileSync`, never a shell string — the repo's established shape for this (see its own
+    // module doc-block: `execSync` spawns cmd.exe on Windows, which does NOT strip single quotes,
+    // so a quoted glob reaches git literally and matches nothing).
+    const tracked = repoFiles({
+      match: /\.test\.tsx?$/,
+      floor: 0,
+      includeUntracked: true,
+    }).map((f) => f.rel);
 
     const candidates = tracked.filter((f) => (
       // The engine PACKAGE is its own vitest project with its own config.

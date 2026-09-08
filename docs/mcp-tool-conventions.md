@@ -40,11 +40,12 @@ not outrank #1.
 misspelled key is a **refusal** naming the tool's real parameter names — never silently dropped.
 
 Why: zod strips unknown keys by default, and the MCP SDK builds a plain `z.object` (no `.strict()`)
-— verified at `@modelcontextprotocol/sdk/.../zod-compat.js:14`. For a tool whose params are all
-optional, that turns a typo into **a different operation**: `modoki_set_selection {name:'Capsule'}`
-(no such param) parses to `{}`, which that tool documents as "no refs = clear", so it **clears the
-human's selection and reports success**. That was measured, fixed for `modoki_batch`'s pre-flight —
-and left in place for every direct call, which is where most calls happen (V2).
+— verified in `@modelcontextprotocol/sdk`'s `objectFromShape` (`.../zod-compat.js`). For a tool
+whose params are all optional, that turns a typo into **a different operation**:
+`modoki_set_selection {name:'Capsule'}` (no such param) parses to `{}`, which that tool documents as
+"no refs = clear", so it **clears the human's selection and reports success**. That was measured,
+fixed for `modoki_batch`'s pre-flight — and left in place for every direct call, which is where
+most calls happen (V2).
 
 Corollaries:
 - `modoki_batch`'s envelope itself is strict too, including **inside** each step object: `arg` for
@@ -78,6 +79,59 @@ Violations that produced this rule:
   disagrees by a constant it cannot see, and the honest reading of that is "my edit did not land" (F8).
 - **`onScreen`** — "inside the viewport" for 2D/3D, but merely "has non-zero size" for UI entities,
   so a UI element parked far off-screen reports `onScreen:true` (S1 `get_layout_bounds`).
+
+### 2a. The TOOL name is the whole interface when schemas are deferred
+
+**A tool's name must distinguish it from its neighbours without its description**, because an agent
+often cannot see the description. Claude Code advertises this surface **deferred** — names only,
+schemas fetched on demand ([mcp-response-budget.md](./mcp-response-budget.md) § "Definition surface
+under tool deferral") — so a name is chosen from a list of ~148 strings and nothing else. A pair
+that reads the same at that width is a coin flip, and §0 ranks a wrong action above an unclear one.
+
+Audit of the whole surface, 2026-08-31 (24 lexically-similar pairs examined; most are fine —
+`get_scene_state`/`get_editor_state`, the five `open_*_editor`, and the read/write pairs all carry
+their distinction in the name). **Four did not** — the first is now fixed, the other three are a
+recorded decision (both below):
+
+| pair | why it is a coin flip | severity |
+|---|---|---|
+| `game_view_devices` (read) vs `game_view_device` (**mutating**) — *fixed, see below* | one character — a plural — separated a list from a write | **highest**: the boundary crossed is read↔mutate |
+| `eval` (**mutating**) vs `eval_api` (read) | `_api` reads as "eval, via the API"; it is the **discovery/list** call. Both servers | high |
+| `create_asset` vs `create_registered_asset` | "registered" names an implementation fact, not the difference an agent picks on (scaffold-with-defaults vs the Assets panel's "New X" kinds) | medium |
+| `focus` (keyboard/panel focus) vs `focus_entity` (camera framing) | bare `focus` does not say *what* is focused | low |
+
+Related inconsistency, same audit: `set_skin_mode` carried the `set_` prefix its siblings
+`scene_view_mode` and `animation_view_mode` did not, though all three are mutating setters.
+
+**The rule that audit produced — a mutating setter is named `set_*`** (#483, landed 2026-08-31).
+`scene_view_mode`, `animation_view_mode`, `game_view_device`, `gizmo` and `collider_edit` were
+renamed to `set_scene_view_mode`, `set_animation_view_mode`, `set_game_view_device`, `set_gizmo` and
+`set_collider_edit`, joining `set_transform`, `set_selection`, `set_timescale`, `set_playhead` and
+`set_skin_mode`. That also **dissolves the highest-severity row above**: a plural is no longer what
+separates the list from the write — `set_` is, and `game_view_devices` is left unambiguously the
+read. The split itself was always correct (§4 — the read half is a GET); only the naming was.
+
+**The rule is a GUARD, not prose** (`mcpRegistry.test.ts`, "a tool whose backend op is `set-*` is
+NAMED `modoki_set_*`"). The discriminator is the backend op, so a new `set-*` op cannot ship under
+a non-`set_` name. That mechanism exists because the issue's own list was **incomplete**: it named
+three tools, and the close-out sweep found `gizmo` (op `set-gizmo`) and `collider_edit` (op
+`set-collider-edit`) — `gizmo` nine lines above the renames, in the same file. A rule
+carried only by prose is a rule the next audit re-discovers.
+
+Two families are deliberately OUT of scope, so nobody "fixes" them into the guard:
+- **The `asset`-kind writers** — `particle_set`, `timeline_set`, `anim_set_clip`, `anim_add_key`,
+  `timeline_add_clip`. These are **subject-first on purpose** (`anim_*`, `timeline_*`, `particle_*`)
+  so a family sorts together in a name-only list, which is the same deferral pressure the `set_`
+  rule serves. Their names match their ops exactly, and their ops are not `set-*`.
+- **`select_sprite_slice`** — a genuine `select-` verb, not a setter.
+
+⚠️ **The other three rows stay UNFIXED, and that is a decision, not a backlog.** All three fail
+**recoverably** — you get the wrong read, notice, and call the right tool — and there is no observed
+instance of an agent picking wrong; the audit is theoretical risk, while every fix is a RENAME
+touching the contracts table, the generated catalog, `liveCoverage`, and every doc and test naming
+the tool. That is the same cost that made §7 decline splitting `watch` and the journals. They stay
+recorded so a *new* tool does not add a fifth. **When naming a new tool, the test is: could an agent
+seeing only this name and its neighbours pick wrong?**
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 
@@ -304,14 +358,27 @@ variance is machine-readable while it lasts.
   entries; that cost is knowingly accepted and documented.)
 - **Persistence is manual and the response says so**: a live edit reports `saved:false` plus the
   hint naming `modoki_save_all`. A tool that writes the file reports `saved:true`. Never guess.
-- **A world-swapping or file-reading operation refuses when unsaved live work would be lost or
-  omitted**, with `REQUIRES_SAVE` and an escape hatch — `discardUnsaved` where the work is
-  DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`), `force` where it merely goes
-  un-included (`build`/`add_native_target`/`ota_publish`). Two consequences, two names: one word
-  for both is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/`build` do
-  this; **`ota_publish` does not** — it builds from the scene file and ships over the air, so an
-  agent that just edited the live world publishes an artifact missing its own work and is told
-  "✅ Published" (S1).
+- **An operation that swaps the world, or READS OR WRITES a file the editor holds unsaved work
+  for, refuses when that work would be lost or omitted**, with `REQUIRES_SAVE` and an escape hatch
+  — `discardUnsaved` where the work is DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`/
+  `write_asset_meta`), `force` where it merely goes un-included (`build`/`add_native_target`/
+  `ota_publish`/`reimport_asset`/`duplicate_asset`). Two consequences, two names: one word for both
+  is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/
+  `build` do this; **`ota_publish` does not** — it builds from the scene file and ships over the
+  air, so an agent that just edited the live world publishes an artifact missing its own work and
+  is told "✅ Published" (S1).
+
+  ⚠️ **This said "world-swapping or file-READING", and the omission was load-bearing** (#872). A
+  file WRITE is the case with the worst consequence — `write_asset_meta` replaces a `.meta.json`
+  wholesale, destroying a parked Inspector edit — and the rule as written did not name it, so the
+  issue that found the defect declared an open three-way contract fork and parked the work for a
+  decision this section had already made. **Check this doc before drafting options**; a rule that
+  covers your case is not always spelled with your case's verb.
+
+  ⚠️ **"Unsaved work" is not only the live world.** Anything the editor is holding that disk does
+  not have counts, including a registry in the RENDERER that the answering route runs too far from
+  to see — the sidecar park gate has to make a round trip to ask, and "the renderer did not answer"
+  must be a refusal, not a proceed (see §5, and `docs/mcp-persistence.md` § 5).
 - **What can be proven wrong BEFORE starting is refused before starting; what is only discovered
   mid-flight is reported per-op.** A `setTrait` naming a field the trait does not have is provably
   ineffective from the schema alone, so `/api/scene-mutate` now refuses the whole call pre-flight —
@@ -358,6 +425,49 @@ runtime-only op in the editor file is therefore not a stylistic slip; it is how 
 opened one op at a time, each new capability landing wherever its first caller happened to live.
 An op registered in `agentEditorOps.ts` whose handler reaches nothing from `editor/` is a finding.
 
+## 9-bis. A cross-runtime reply is DECODED, never cast (#644 → #647/#648)
+
+Every reply that crosses a runtime boundary — the device wire, the `requestBrowser` relay, the
+Capacitor bridge, an `/api/*` route answering a long-lived MCP process — comes from a producer that
+**versions independently of its consumer**. A TypeScript annotation on that value is a promise
+nobody keeps. Three defect shapes came out of casting one anyway, and all three report something
+FALSE rather than failing:
+
+| Shape | What the caller is told | Example |
+|---|---|---|
+| A named field is absent | a confident **empty answer** | `list_assets` on a missing route: "this project has no assets" (`.assets` on the SPA's `index.html`) |
+| An array method on a non-array | throws into a `catch` that means something else | #644's `result.map is not a function` reported as *"no editor is listening on that port"* |
+| A declared field is dropped | **could-not-look collapsed into nothing-is-there** | `getNativeLogs` dropping `error`, so `{logs:[], error:'OSLogStore denied'}` reads as "No logs." |
+
+**The pattern**, established by `parseConsoleLogsReply` (`game-debug-mcp/src/reply.ts`) and
+`decodeAimReply` (`plugins/backend/deviceAim.ts`), and now also `parseNativeLogsReply` and
+`decodeSceneOpsReply` (`plugins/backend/sceneOpsReply.ts`):
+
+1. A **pure decoder** — `unknown` in, a **discriminated union** out. Never a throw, never a cast.
+2. **Every historical wire shape tolerated explicitly**, with the commit or build that changed it
+   named in the comment. A bare array and `{logs, …}` are both live at once whenever the two sides
+   ship separately.
+3. An unrecognised shape is described **BY KEYS ONLY** — `describeShape` in
+   `engine/tools/shared/mcpResult.ts` (the §9 shared home; `engine/app/debug/bridgeHelpers.ts`
+   keeps a deliberate copy, because `engine/app` reaches `tools/shared` only with `import type` and
+   a value import would put MCP formatting code in the bundle that ships to devices). A log line or
+   a scene op can carry secrets and authored strings; a refusal must never echo the value.
+4. The refusal says **what it is NOT**: "this is not 'the project has no assets', it is a reply this
+   build cannot read."
+
+⚠️ **Pick the remedy by whether the work already happened.** A relay that never returned is safe to
+call "no editor" and safe to retry. A relay that RETURNED an unreadable shape is neither — the ops
+already applied. `/api/scene-mutate` reported the second as a 500, which `context.ts` maps to
+`NOT_AVAILABLE_HERE` ("relaunch the editor"), so a caller retried and **double-applied a write**. It
+now answers 200 `{ok:false, code:'PARTIAL'}`: `isFailureBody` makes it a failure and `codeFromBody`
+lifts the code, so `PARTIAL` reaches the agent with no new plumbing.
+
+⚠️ **`raw call()` skips the shared guards.** `htmlFallthrough` runs inside `getJson`/`postJson`
+only, so a raw-`call()` site gets no SPA-fallthrough protection — a missing dev-server route answers
+**200 with `index.html`**. Raw `call()` is legitimate (a §5 label more specific than `getJson`
+hardcodes; a shape guard that must not throw into `getJson`'s `transform`-then-catch), but such a
+site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
+
 ## 10. Every tool declares its contract, and is covered three ways
 
 - **Contract**: one entry in `contracts.ts`, asserted both directions (no tool without a contract,
@@ -397,6 +507,30 @@ An op registered in `agentEditorOps.ts` whose handler reaches nothing from `edit
   `src/liveCoverage.ts` with the reason each is un-sweepable, and a CI-safe guard asserts the split
   stays total: every tool is swept, smoke-covered, or listed. A gap list nothing checks is a gap list
   that grows.
+- **A `COVERED_BY_SMOKE` entry is a CLAIM, and the guard that keeps it honest is TEXT-based** (#496).
+  `liveCoverage.test.ts` asserts every listed name appears in `test-smoke.mjs` — that proves the name
+  is present, not that anything runs it. Necessary, not sufficient: three entries
+  (`modoki_dispatch_action`, `modoki_set_selection`, `modoki_save_all`) passed that grep with no
+  executing case behind them. Watch for two shapes: a name inside a batch step the case asserts is
+  REFUSED before it runs, and a name in an assertion that the step landed in `notRun` — a case that
+  PROVES the tool did not run still satisfies a grep for it. Only a human reading the call site
+  distinguishes these; the guard stops the debt growing, it cannot audit what is already claimed.
+  Adding a name to the bucket silences the sweep and buys nothing.
+- **A live smoke case that SAVES must leave the working tree clean** (#496) — it runs against the
+  human's real project (CLAUDE.md #18). ⚠️ Passing an explicit `path` does not make it safe, two ways,
+  both measured. (a) A save-as writes the CURRENT scene's own guid into the new file, so the probe and
+  the real scene briefly share one guid; the dev asset scanner auto-heals a guid collision by keeping
+  the lexicographically-first path's id and REWRITING the other file
+  (`engine/plugins/vite-asset-scanner.ts`, `buildManifest(..., heal=true)`) — the first green run of
+  the save_all case re-minted the guid of the committed `tropical-island.scene.json` while reporting
+  SMOKE OK. Keep the probe out of the manifest entirely: `detectType` classifies a plain `.json` as a
+  scene only by the `.scene.json` suffix or the legacy `/scenes/` directory, and as a material only
+  under `/materials/` — anywhere else it is not an asset at all, so it carries no guid to collide.
+  (b) `path` redirects only the PRIMARY scene — `saveAll`'s `extraSaved` loop
+  (`engine/packages/modoki/src/editor/scene/serialize.ts`) writes every other dirty loaded scene to
+  its own real path, which no argument redirects and no precondition can see. A case that saves must
+  inspect `extraSaved` and fail loudly naming those files. General rule: verify a smoke case with
+  `git status` after the run, not its own ✓.
 - **A refusal the sweep expects is declared too** (`EXPECTED_REFUSALS`, matched on the refusal text
   with the reason it is correct). Without that, the sweep either flags three correct refusals every
   run — and gets ignored — or blanket-accepts `REFUSED_BY_OP` and stops seeing a real one. A stale

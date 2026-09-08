@@ -19,7 +19,7 @@ import React from 'react';
 //    vi.hoisted so they exist before the mocks are hoisted above the imports). ──
 const spies = vi.hoisted(() => ({
   attributionInit: vi.fn(),
-  playerPrefsInit: vi.fn(async () => {}),
+  playerPrefsInit: vi.fn(async () => ({ discardedPending: [] })),
   loadScene: vi.fn(async () => {}),
   clearAppServices: vi.fn(),
   resolveTierForNo3DProject: vi.fn(async () => {}),
@@ -52,6 +52,10 @@ vi.mock('@modoki/engine/runtime', () => ({
   // the barrel is fully mocked, and a named export App.tsx imports and this factory omits is a
   // module-init error, not a missing call.
   waitForScenePaint: vi.fn(async () => 'idle'),
+  // App.tsx derives its two-frame ceiling from this (#682) — an explicit-list mock missing a newly
+  // imported name fails at BINDING, so this file collects zero tests rather than failing a case.
+  // Mirrors `runtime/rendering/scenePaintSignal.ts`; nothing here asserts on the value.
+  SCENE_PAINT_MAX_WAIT_MS: 5000,
 }));
 
 vi.mock('@modoki/engine/runtime/debug', () => ({
@@ -299,5 +303,46 @@ describe('GameShell recovery paths', () => {
     // overlay stayed up for the rest of the session, covering game A which was running fine.
     rerender(React.createElement(GameShell, { gameId: 'game-a' }));
     await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+  });
+});
+
+describe('a cancelled swap does not tear down the game that is live again (#511 continuation)', () => {
+  // The A→B→A-while-suspended case that used to live here ('A→B→A while B is suspended on
+  // unregisterSystems must NOT call clearAppServices') is DELETED, not rewritten in place.
+  //
+  // Under the pre-#516 code that expectation was the real #511 invariant. Under the #516 fix
+  // it is no longer true ON PURPOSE: the swap-back JOINS the interrupted teardown and performs
+  // the destructive half itself before re-registering A, so `clearAppServices` legitimately
+  // DOES fire once on this path — the old "torn down and never rebuilt" bug this repo used to
+  // ship is exactly what made "no clearAppServices" look like the invariant, when the actual
+  // bug was that A was left torn down with nothing left to call it. The test only kept passing
+  // after #516 landed because its two `setTimeout(0)` ticks happened to land before the
+  // re-entrant continuation's own `await import('tierBoot')` resolved — a timing accident, not
+  // a passing assertion (50×5ms ticks report `clearAppServices` called once and fail).
+  //
+  // What the design now guarantees on this exact path — B's dead continuation does not call
+  // `clearAppServices` (the real #511 invariant, which survives), `clearAppServices` fires
+  // EXACTLY ONCE for A across the whole sequence, and it lands BEFORE A's re-registration — is
+  // already pinned, word for word, by `gameShellSwapCancel.test.tsx`'s
+  // "clearAppServices (the destructive half) runs exactly once for A, and BEFORE A
+  // re-registers" (under 'GameShell A→B→A once-per-load contract (#516)'), which uses the same
+  // A-tears-itself-down-then-rejoins shape and asserts both the count and the exact
+  // `['registerSystems:A', 'clearAppServices', 'registerSystems:A']` ordering. Keeping a second,
+  // differently-named case here for the same scenario would just be two names for one
+  // assertion, so it isn't rewritten — it's removed.
+
+  it('an UNCANCELLED A→B swap DOES call clearAppServices exactly once (control)', async () => {
+    makeGame('game-a');
+    makeGame('game-b');
+
+    const { rerender } = render(React.createElement(GameShell, { gameId: 'game-a' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+
+    rerender(React.createElement(GameShell, { gameId: 'game-b' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+
+    expect(spies.clearAppServices).toHaveBeenCalledTimes(1);
   });
 });

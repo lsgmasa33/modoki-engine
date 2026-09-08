@@ -43,6 +43,7 @@
 
 import { getActiveRenderer } from './activeRenderer';
 import { PROFILE_WINDOW_FRAMES, summarizeStat, type FrameStat } from './frameProfiler';
+import { createTeardownToken } from './liveness';
 
 /** Distinct pass labels retained. A label is authored by engine code (`gpuPassScope`), not
  *  derived from scene data, so this is a guard against a runaway caller rather than an expected
@@ -131,7 +132,7 @@ let armedRenderer: unknown = null;
 let resolveInFlight = false;
 let resolveStartedAtFrame = 0;
 let errors = 0;
-/** Generation token for the measurement session. Bumped by every event that invalidates results
+/** Teardown liveness for the measurement session. Invalidated by every event that stales results
  *  already in flight: enable, disable, reset, and a renderer swap.
  *
  *  ── WHY A TOKEN AND NOT A FLAG CHECK IN `drain` ────────────────────────────────────────────
@@ -145,9 +146,11 @@ let errors = 0;
  *  a latch that now belongs to a newer resolve, letting two run concurrently against one pool and
  *  double-drain it.
  *
- *  Same mechanism, and the same reasoning, as `frameDriver`'s `loopGen`: make the stale-result
+ *  The same TOKEN as `frameDriver`'s rAF chain — though note that one is a
+ *  supersession token (a re-arm wins) and this is a teardown token (an invalidate wins); both now
+ *  come from `runtime/core/liveness.ts`, and `loopGen` no longer exists: make the stale-result
  *  class unrepresentable rather than guarding each site that could publish one. */
-let generation = 0;
+const liveness = createTeardownToken();
 
 const totalSamples = new Float64Array(PROFILE_WINDOW_FRAMES);
 const sampleFrameIds = new Float64Array(PROFILE_WINDOW_FRAMES);
@@ -208,11 +211,38 @@ function arm(): void {
       'first frame after one does.';
     return;
   }
+  // The OUTGOING renderer is being displaced (a relaunch, a viewport remount) and never goes
+  // through `disarm()` — nothing else clears its `trackTimestamp` flag, so left alone it would keep
+  // writing GPU timestamp queries every frame for as long as the process lives (#810, reachable
+  // only while the profiler is enabled). Clear it, and purge its pool for the same reason
+  // `purgePool`'s own doc comment gives — a resolve landing for it after this point would otherwise
+  // file a stale sample under the NEW renderer's frame counter.
+  //
+  // ⚠️ This runs BEFORE the support probe, not inside the success path below. The incoming renderer
+  // may be the one that cannot time (the editor's two viewports need not share a backend), and on
+  // that path we still displaced the old one — leaving the clear until after `probe.ok` would leak
+  // exactly the flag this exists to clear, on the one path where nothing later cleans it up.
+  const displaced = armedRenderer && armedRenderer !== renderer ? armedRenderer : null;
+  if (displaced) {
+    clearTrackTimestamp(displaced);
+    purgePool(displaced);
+    // The old renderer's in-flight work is now unattributable — its frame ids belong to a counter
+    // we are leaving behind. Retire it here rather than only in the success path below.
+    liveness.invalidateAll();
+    resolveInFlight = false;
+    pendingRanges = [];
+  }
   const probe = probeSupport(renderer);
   backendKind = probe.backend;
   if (!probe.ok) {
     status = 'unsupported';
     detail = probe.reason;
+    // Adopt it anyway. `pollGpuTimings`'s "once shown not to support timestamps, stop asking it"
+    // guard is `status === 'unsupported' && renderer === armedRenderer` — leaving `armedRenderer`
+    // pointing at the DISPLACED renderer makes that test never match, so `arm()` (and its probe)
+    // would run again on every single frame. A remount with a different renderer still re-probes,
+    // which is what that guard's own comment promises.
+    armedRenderer = renderer;
     return;
   }
   try {
@@ -223,7 +253,7 @@ function arm(): void {
     // which the new counter will eventually reach and mis-attribute, and its `resolveStartedAtFrame`
     // would be compared against the new renderer's much lower `info.frame` — leaving the
     // stuck-resolve escape permanently un-trippable.
-    generation++;
+    liveness.invalidateAll();
     resolveInFlight = false;
     pendingRanges = [];
     status = 'pending';
@@ -243,22 +273,33 @@ function arm(): void {
  *  TWO samples with a max of 99ms from before the disable.
  *
  *  We are already the only consumer of that map (three never reads or clears it — see `drain`),
- *  so clearing it here is the same ownership, applied at the other boundary. */
-function purgePool(): void {
+ *  so clearing it here is the same ownership, applied at the other boundary.
+ *
+ *  Takes the renderer explicitly (rather than reading `armedRenderer`) so `arm()` can purge the
+ *  OUTGOING renderer's pool at the moment it is being displaced by a new one (#810) — by then
+ *  `armedRenderer` may already point at the replacement, or the caller may want to target a
+ *  renderer that was never the current one at all. */
+function purgePool(renderer: unknown): void {
   try {
-    (armedRenderer as {
+    (renderer as {
       backend?: { timestampQueryPool?: Record<string, { timestamps?: Map<string, number> }> };
     } | null)?.backend?.timestampQueryPool?.render?.timestamps?.clear();
   } catch { /* teardown must never throw */ }
 }
 
-function disarm(): void {
-  const r = armedRenderer as { backend?: { trackTimestamp?: boolean } } | null;
+/** Clear `trackTimestamp` on `renderer`. Split out of `disarm()` so `arm()` can apply it to the
+ *  OUTGOING renderer too (#810) — never throws. */
+function clearTrackTimestamp(renderer: unknown): void {
+  const r = renderer as { backend?: { trackTimestamp?: boolean } } | null;
   try { if (r?.backend) r.backend.trackTimestamp = false; } catch { /* teardown must not throw */ }
+}
+
+function disarm(): void {
+  clearTrackTimestamp(armedRenderer);
   // Retire anything in flight: a resolve landing after the caller turned timing OFF would write
   // into the rings, so a later re-enable would open with samples from before the disable.
-  generation++;
-  purgePool();
+  liveness.invalidateAll();
+  purgePool(armedRenderer);
   armedRenderer = null;
   resolveInFlight = false;
   pendingRanges = [];
@@ -320,7 +361,7 @@ function probeSupport(renderer: unknown): { ok: boolean; backend?: 'WebGPU' | 'W
  *  internals — which guessing "ordinal 0 is the shadow pass" would not.
  *
  *  ⚠️ THE UID's ORDINAL IS 1-BASED. `Renderer._renderScene` does `info.render.frameCalls++` and
- *  only THEN calls `updateTimeStampUID` (three r0.184, Renderer.js:1495 and :1501), so a call
+ *  only THEN calls `updateTimeStampUID` (three r0.185.1, Renderer.js:1599 and :1605), so a call
  *  observed with the counter at `from` beforehand is stamped `from + 1`. The claimed range is
  *  therefore the HALF-OPEN-ON-THE-LEFT interval `(from, to]`, not `[from, to)`. Getting this
  *  backwards does not fail loudly — it silently shifts every label by one and drops the last
@@ -387,13 +428,13 @@ export function pollGpuTimings(): void {
   if (typeof resolve !== 'function') return;
   resolveInFlight = true;
   resolveStartedAtFrame = readRenderInfo()?.frame ?? 0;
-  // Capture the generation. A disable / reset / renderer swap between here and the landing makes
-  // this result describe a session the caller has already ended — see `generation`.
-  const gen = generation;
+  // Capture liveness. A disable / reset / renderer swap between here and the landing makes this
+  // result describe a session the caller has already ended — see `liveness`.
+  const stillLive = liveness.capture();
   Promise.resolve(resolve.call(renderer, 'render'))
-    .then(() => { if (gen === generation) drain(renderer); })
-    .catch(() => { if (gen === generation) errors++; })
-    .finally(() => { if (gen === generation) resolveInFlight = false; });
+    .then(() => { if (stillLive()) drain(renderer); })
+    .catch(() => { if (stillLive()) errors++; })
+    .finally(() => { if (stillLive()) resolveInFlight = false; });
 }
 
 /** Read the pool's resolved uid -> ms map, group it by frame, and record the completed frames.
@@ -603,8 +644,8 @@ export function resetGpuTimings(): void {
   // flight describes what came before, so retire it rather than letting it land in the fresh
   // window and flip `status` back to 'active' carrying the previous action's samples — and purge
   // what three has already resolved but we have not consumed, or the next drain files it anyway.
-  generation++;
-  purgePool();
+  liveness.invalidateAll();
+  purgePool(armedRenderer);
   resolveInFlight = false;
   if (enabled && status === 'active') status = 'pending';
 }

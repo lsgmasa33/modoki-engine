@@ -19,38 +19,31 @@
  *  re-introducing an exclude that swallows one, fails here instead of going unnoticed. */
 
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
 /** Resolve a tsconfig to the concrete file list tsc would compile — `parseJsonConfigFileContent`
- *  does the include/exclude/extends resolution without building a program. */
+ *  does the include/exclude/extends resolution without building a program. TypeScript's own
+ *  `fileNames` is a THIRD absolute-path derivation (re-resolved against `process.cwd()`), so it is
+ *  converted here to repo-relative POSIX keys — the same shape `testFilesUnder`'s `rel` already
+ *  is — rather than compared as an absolute path (#849). */
 function resolveConfigFiles(configPath: string): string[] {
   const read = ts.readConfigFile(configPath, ts.sys.readFile);
   expect(read.error, `${configPath} failed to parse`).toBeUndefined();
   const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, path.dirname(configPath));
   expect(parsed.errors.filter((e) => e.category === ts.DiagnosticCategory.Error)).toEqual([]);
-  return parsed.fileNames.map((f) => path.resolve(f));
+  return parsed.fileNames.map((f) => path.relative(repoRoot, path.resolve(f)).split(path.sep).join('/'));
 }
 
-/** Every *.test.ts / *.test.tsx / *.spec.ts under `dir`. */
-function testFilesUnder(dir: string): string[] {
-  const out: string[] = [];
-  const walk = (d: string) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'node_modules' || e.name === 'dist') continue;
-        walk(p);
-      } else if (/\.(test|spec)\.tsx?$/.test(e.name)) {
-        out.push(path.resolve(p));
-      }
-    }
-  };
-  walk(dir);
-  return out;
+/** Every *.test.ts / *.test.tsx / *.spec.ts under `dir`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 517/720 measured today for the two callers. */
+function testFilesUnder(dir: string): Array<{ rel: string; abs: string }> {
+  return repoFiles({
+    under: dir, match: /\.(test|spec)\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 300,
+  });
 }
 
 const CASES = [
@@ -83,12 +76,12 @@ describe('test typecheck coverage (issue #23)', () => {
           ? 'engine/packages/modoki/tsconfig.check.json'
           : 'engine/tsconfig.app.json';
         const set = new Set(resolveConfigFiles(path.join(repoRoot, excludesTests)));
-        expect(onDisk.some((f) => !set.has(f))).toBe(true);
+        expect(onDisk.some(({ rel }) => !set.has(rel))).toBe(true);
       });
 
       it('includes EVERY test file in the typecheck program', () => {
         const set = new Set(covered);
-        const missing = onDisk.filter((f) => !set.has(f)).map((f) => path.relative(repoRoot, f));
+        const missing = onDisk.filter(({ rel }) => !set.has(rel)).map(({ rel }) => rel);
         // A failure here means those files are transpiled-but-never-typechecked again —
         // check the config's `include`, and whether an `exclude` (possibly INHERITED via
         // `extends`) is swallowing them.

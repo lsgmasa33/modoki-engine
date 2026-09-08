@@ -47,6 +47,18 @@ native plugins → `dist/`) **and** `engine/scripts/bootstrap-game-deps.mjs`, wh
 `dist/` is what makes `npm test` / the editor fail with `Failed to resolve import
 "capacitor-<x>"`. See the Two Clones section of `CLAUDE.md`.
 
+⚠️ **This makes a plain `npm install` a TRACKED-FILE mutator, not just a `dist/`/`node_modules`
+one.** `bootstrap-game-deps.mjs` calls `vendorEnginePlugins(gameDir, repoRoot, {canBuild: true})`
+for every game — and when an engine `capacitor-*` plugin's source differs from its
+already-committed tarball, that re-vendor writes a new `games/<id>/plugins/*.tgz` and rewrites the
+matching `games/<id>/package.json` dep spec, both git-tracked, across as many as 26 projects at
+once. Correctly gated (only a stale tarball triggers a re-pack), so a clean checkout with nothing
+to vendor sees no churn — but it means the rewrite can land in your working tree from an `npm
+install` you ran for an unrelated reason. This is exactly the CLAUDE.md `git add -A` scar (#18): a
+developer who installs deps and then stages broadly (`git add -A`/`git add .`) sweeps these
+re-vendored files into whatever commit they were about to make. Stage paths explicitly, and check
+`git diff --cached -- games/` before committing after any `npm install`.
+
 The chain also runs `engine/scripts/stamp-plugin-builds.mjs` immediately after `build:plugins`
 (#395). `build:plugins` builds each plugin's `dist/` directly and wrote no **build stamp**, so the
 next caller of `ensurePluginBuilt` (the editor on open, the vendorer, a test) read a perfectly
@@ -89,7 +101,15 @@ A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native bu
 `capacitor.config.json` + vendor plugins → `npm install` → web build → `npx cap add` → heal.
 It then continues into the build, pausing first only if the scaffold surfaces a warning you
 must act on (e.g. missing Firebase config). The explicit **Add … Target** menu items do just
-the scaffold. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`.
+the scaffold. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
+mid-`cap add`) **is detected as incomplete and repaired automatically on the next attempt**,
+rather than being permanently misread as "already scaffolded" (#581) —
+`isNativeTargetScaffolded` in `addNativeTarget.ts` is the authoritative check, not folder
+existence. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`, or
+`node engine/scripts/add-native-targets.mjs games/<id> [--force]` to drive the SAME pipeline from
+a terminal for one or many projects (`--all-missing` sweeps every project missing a platform;
+`--force` regenerates an already-complete target — refused together with `--all-missing`, since
+that combination could regenerate targets nobody asked to touch).
 
 `healNativeConfig` (`engine/plugins/healNativeConfig.ts`) runs on project open **and** at the
 start of every iOS/Android build — it syncs the project's `build.appleTeamId` into the iOS
@@ -457,10 +477,12 @@ clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed on
 or connect it in the editor), and release the moment you are done — a claim is machine-wide and
 locks that phone out of every other clone and out of the owner's own hands.
 
-### One build at a time (#173)
+### One build at a time (#173, #650)
 
-**Three routes compile into the same `<project>/dist`, so they share ONE slot** — not one lock each.
-`/api/build`, `/api/ota/publish`, and `/api/add-native-target` all run the byte-identical
+**SIX entry points compile into the same `<project>/dist`, so they share ONE slot** — not one lock
+each. Three editor routes (`/api/build`, `/api/ota/publish`, `/api/add-native-target`) and three CLI
+scripts (`build-web.mjs`, `add-native-targets.mjs`, `ota-publish.mjs`), which
+[§ CLI recipes](#cli-recipes) tells you to run by hand. The three routes all run the byte-identical
 `node engine/scripts/build-web.mjs --target native` from the same cwd into the same `dist`
 (`vite-asset-scanner.ts` build steps · the publish route's step 1 · `addNativeTarget.ts`). Whichever
 starts second rewrites that dist while the first is still copying it, and the failure is quiet:
@@ -472,8 +494,39 @@ starts second rewrites that dist while the first is still copying it, and the fa
   checks for an update**, with no local artifact to inspect first. One human doing two ordinary
   things in one window (start Build → iOS, then Publish OTA while it runs) reaches it.
 - **scaffold ↔ anything** → `npm install` + `cap add` into the project on top of the dist race;
-  two scaffolds for one platform also race the `existsSync(nativeDir)` gate that is supposed to
-  make the route a no-op.
+  two scaffolds for one platform also race the `isNativeTargetScaffolded` gate that is supposed to
+  make the route a no-op. (That gate checks for the platform's real project file, not just the
+  folder — a folder a killed scaffold left half-written is a *different* hazard, fixed in #581.)
+
+**Two layers, because one process cannot see the other (#650).** `acquireBuild`
+(`plugins/backend/buildLock.ts`) is a module-level flag: it closes build-vs-build *inside one
+backend process* — an agent firing `modoki_build` while a human's build runs — and is blind to
+everything else. A CLI script is a SEPARATE PROCESS, so the documented by-hand recipe raced the
+editor's publish through a path the flag provably could not observe. `acquireBuildSlot` now takes
+both: the in-process flag, plus a cross-process claim in `~/.modoki/build-claims.json`
+(`scripts/buildClaimsStore.mjs` — an O_EXCL `mkdir` lock, an atomic temp+rename write, and dual
+pid/TTL staleness, the shape `deviceClaimsStore.mjs` already uses for hardware). The CLI scripts
+take the claim and **refuse and exit** rather than waiting: a scripted build must not hang on an
+interactive editor, which is what the routes already do.
+
+⚠️ **The holder SPAWNS a child that wants the same claim, and that nearly shipped as a deadlock.**
+Every route's first pipeline step is `node engine/scripts/build-web.mjs` with
+`MODOKI_PROJECT=<projectRoot>` — the child then asks for a claim on the identical key and, without
+a re-entrancy rule, is refused by its own parent. The fix: a successful grant publishes its token on
+`MODOKI_BUILD_CLAIM_TOKEN`, which every spawn path already inherits via `{ ...process.env }`; a
+later request for the SAME resolved root whose env token matches the live claim's token **and comes
+from a different pid** gets a pass-through handle with a no-op `release()`, so a child exiting first
+cannot free its parent's claim. The different-pid half is load-bearing on its own — without it the
+ancestor re-acquiring on *itself* would pass through, silently defeating the one-claim rule.
+
+⚠️ **The test that was supposed to catch this is the reason it got as far as it did.**
+`tests/architecture/cliBuildClaims.test.ts` was pure source-text matching: it asserted that each
+script *calls* `acquireBuildClaim` — and "every entry point calls the claim" is precisely the
+property that produces the deadlock. It did not merely miss the defect, it confirmed the thing that
+caused it, and it was green throughout. A source grep cannot see composition, reachability, or what
+happens when two of the asserted call sites are parent and child. The coverage that matters here is
+the integration test in that same file which **actually spawns `build-web.mjs` under a held claim**;
+add one of those before trusting any future grep-shaped guard in this family.
 
 Refused, not queued: these run for minutes and nothing cancels one, so a queued SSE stream would sit
 silent and read as a wedged editor. The refusal is a `FAILED:` status naming what holds the slot
@@ -526,6 +579,17 @@ compound steps did. Measured: aborting a real build killed a 5-process, 4-level 
 (`cmd.exe` → `node build-web.mjs` → `cmd.exe` → `tsc`) in **350ms**, against an **11175ms**
 uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0
 for all 7 processes across 11 samples of a full build).
+
+`buildStepShell.test.ts` carries a Windows suite that pins that path, and it runs on CI. It was
+gated OFF CI for about a month on the theory that the runner reaps the tool before the assertions
+can see it — but the run history refutes that: with the gate absent, the suite ran on every
+`ci/main` run across that window and passed on every green one, and a runner that reaped the tool
+would have failed the suite's own CONTROL (which asserts the orphan is STILL ALIVE) on every single
+run, not intermittently — so the reaping premise is refuted by the run history regardless of the
+exact count. The real cause was the suite's CONTROL awaiting the wrong event (`close` instead of
+`exit`), fixed on the `win` branch and merged in. The gate is gone now, and the suite's only
+residual is a small flake at child discovery — timeouts on `kids.length === 0` at the first
+CONTROL — addressed by a longer poll deadline in the test itself.
 
 ⚠️ **One residual hole, and one that was closed by measuring it (#185):**
 
@@ -1233,16 +1297,18 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
-#### `--target native` runs the same three in-process heals as the editor (#148, #150)
+#### `--target native` runs the same in-process heals as the editor (#148, #150), then verifies (#685)
 
-Before its shell steps, `build-web.mjs` now runs the SAME three in-process heals as the editor's
-`/api/build`, in the same order, for the same reason each exists:
+Before its shell steps, `build-web.mjs` runs the SAME three in-process heals as the editor's
+`/api/build`, in the same order, for the same reason each exists — and then BOTH paths verify the
+result:
 
 | In-process heal | Editor `/api/build` | CLI `--target native` |
 |---|---|---|
 | `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
 | `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
 | `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
+| `verifyInstalledMatchesTarballResult` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
 
 Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
 tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
@@ -1251,6 +1317,25 @@ predates an engine-required Capacitor plugin (`@capacitor/preferences`, `@capaci
 gets one just by building; and `build.appleTeamId` only reaches a device build once it's synced
 into the generated native project. On `web`/`playable` none of this runs (every heal here is a
 native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
+
+⚠️ **The fourth row is a CHECK, and it runs UNCONDITIONALLY — not behind the install condition
+the three heals share.** The state it catches is `node_modules` holding a previous tarball's
+contents while the dep spec, both lockfiles and the install marker all agree the current one is
+installed. In that state nothing looks changed, `npm install` reports "up to date", and the install
+step does nothing — so a check gated on "did a heal change something?" could never fire in the one
+case it exists for. It fails the build rather than repairing: an `rm -rf` inside `node_modules`
+mid-build is itself a mutation, and — the load-bearing reason — this check knows only that the
+tarball and `node_modules` DISAGREE, not which side is right. `vendorEnginePlugins` may rewrite a
+tracked lockfile mid-build because it just packed the tarball and knows it is correct; this check
+has no such knowledge, and one of its reachable causes is a mis-resolved `.tgz` merge conflict
+where the committed tarball is the wrong generation. The remedy is printed per plugin — and it is NOT a
+bare `rm -rf <project>/node_modules/<plugin> && npm install`, which leaves the stale integrity in
+place; see the ⚠️ npm-cache-trap block a few sections below for the recipe that actually works.
+
+⚠️ **Both paths, deliberately.** A check in only one recreates #148's asymmetry — and the editor's
+Build menu is the canonical path, so a CLI-only guard would protect the path fewer humans use.
+`cliNativeBuildHeals.test.ts` pins the call's position in both, brace-matched rather than by string
+match, so the two cannot drift apart.
 
 Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
 plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
@@ -1310,6 +1395,135 @@ reads the list from `ENGINE_REQUIRED_CAP_PLUGINS` rather than restating it. If i
 native build for the named project, then `npm install` in it, and **commit the `package.json` +
 `package-lock.json`** — committing is the part that matters.
 
+⚠️ **A plain `npm install` cannot repair a plugin re-packed IN PLACE** (same content-addressed
+filename, new bytes) — npm resolves `file:` deps from the LOCKFILE, not by re-opening the tarball,
+so it reports "up to date" while `node_modules/<plugin>` keeps the OLD bytes (#685).
+`vendorEnginePlugins` now deletes that plugin's own lockfile entry whenever it re-packs one in
+place, so the `npm install` right after a re-vendor genuinely re-resolves — but a state that
+predates that fix, or one made by hand (a `git checkout` of an old tarball, an interrupted
+re-vendor), still needs the entry removed manually. `npm install`, `npm install --force`, and
+`rm -rf node_modules/<plugin> && npm install` ALONE all leave the stale integrity in place and fix
+nothing. ⚠️ **Nor is `npm install --package-lock-only` the answer — it is what CREATES the
+unrecoverable state**, measured (#685); see the PLO warning below. The safe repair is the one
+documented there: delete `packages["node_modules/<plugin>"]` from the project's
+`package-lock.json`, then a PLAIN `npm install`, and — only if that still reports "up to date" —
+a third step (`rm -rf node_modules/<plugin> && npm install`) for when
+`node_modules/.package-lock.json` is itself ahead of the disk.
+
+**The trigger is a CONJUNCTION, measured on npm 11.12.1 / node v26 (#685).** Each row is an
+independently re-poisoned tree, so the results don't contaminate each other:
+
+| tarball bytes | filename / `file:` spec | lockfile entry | result |
+|---|---|---|---|
+| change | changes | advances | heals (`changed 1 package`) |
+| change | changes | **stale** | heals (`changed 1 package`) |
+| change | **same** | advances | heals (`changed 1 package`) |
+| change | **same** | **never regenerated** | **POISONED** — `up to date`, old bytes stay on disk |
+
+npm re-extracts when **either** the `file:` spec or the lockfile entry moves; only both standing
+still while the bytes move poisons the tree. A fourth control rules out the resolver theory the
+issue floated: two tarballs at DIFFERENT filenames both declaring the same internal `1.0.0` still
+re-extract, so npm does not key a `file:` dep on `name@version`, and N indistinguishable `1.0.0`
+tarballs are harmless on their own.
+
+So the `<base>-h<hash>` packed version is NOT what prevents this — the lockfile regeneration that
+ships with a re-vendor is. A version-only re-pack keeps the filename: `pluginContentHash` normalizes
+the version out of its hash input (it must, or the hash would feed on itself), so `9b8891576`
+rewrote all 27 tarballs in place —
+
+```
+git show --name-status --find-renames 9b8891576 -- 'games/*/plugins/*.tgz' 'demos/*/plugins/*.tgz'
+→ 27 M, zero R      (the games glob ALONE is 21 — the other 6 are demos)
+```
+
+— yet merging it was safe, because all 22 affected projects had their own `package-lock.json`
+regenerated in the same commit (plus the repo root's, which protects no project). Verified against
+the real pre/post tarball bytes extracted from both sides of that commit, not synthetics.
+
+⚠️ **`npm install --package-lock-only` CREATES the poisoned bookkeeping — do not run it alone.**
+This is the state #685 spent months unable to reproduce, and it is one command away. PLO writes the
+NEW integrity into `package-lock.json` **and** into `node_modules/.package-lock.json` without
+touching the extracted files — whenever it has a reason to re-resolve, i.e. the entry was deleted
+(step 1 of the recipe) or the `file:` spec/filename moved (the `git pull` case). It is a pure no-op
+when the entry is present and the spec unchanged, so a bare PLO on a same-filename stale tree does
+nothing and is not the way to reproduce this. The bookkeeping then says tarball C while the disk holds tarball B, so every later
+`npm install` reports `up to date` forever and nothing ever re-extracts.
+
+**The safe repair — delete the entry, then a PLAIN `npm install`, with a conditional third step:**
+
+```bash
+# 1. delete packages["node_modules/<plugin>"] from the project's package-lock.json
+# 2. (cd <project> && npm install)      # NOT --package-lock-only
+# 3. ONLY if step 2 reported "up to date" and the tree is still stale — node_modules/.package-lock.json
+#    is itself ahead of the disk and nothing will re-extract:
+#    (cd <project> && rm -rf node_modules/<plugin> && npm install)
+```
+
+Measured: that heals. It is also exactly what `vendorEnginePlugins` does after an in-place re-pack
+(`invalidateLockfileEntry`, then the plain `npm install` both native build paths already run), which
+is why that path genuinely re-resolves.
+
+⚠️ **Do not confuse step 3 above with the SUPERSEDED recipe** — the one this doc and the guards
+printed until 2026-09-05, whose step 2 was `npm install --package-lock-only`. That one also ended
+up working, but only because its step 3 (`rm -rf node_modules/<plugin>`) undid the damage its own
+step 2 did: **stopping after THAT step 2 leaves the tree in the worst state of all**, and it is the
+reason the messages now name PLO as the cause rather than the cure. Step 3 above is conditional and
+undoes nothing.
+
+⚠️ **What is and is not closed off.** `vendorEnginePlugins` invalidating the lockfile entry on an
+in-place re-pack means no in-repo re-vendor can CAUSE the state, and `bootstrap-game-deps` never
+skipping a present `node_modules` (the #215 scar) means an install always runs — but note that a
+plain `npm install` on an already-poisoned tree does NOT heal it, so neither of those is a cure.
+The cure is the detector: `verifyInstalledMatchesTarballResult` compares tarball to installed and fails
+both native build paths regardless of how the state arose. ⚠️ **One gap, and it is narrower than it
+looks**: `build-web.mjs` loads `vendorPlugins.ts` through esbuild at runtime and, when that load
+returns null, prints a loud warning and skips the check. A packaged editor is that case — it ships
+the `.ts` sources but prunes esbuild as a devDependency — so a bare `node engine/scripts/build-web.mjs`
+there would not check. The editor's own **Build menu is unaffected**: `/api/build` imports
+`verifyInstalledMatchesTarballResult` statically and fails before it ever spawns the CLI. What stays reachable otherwise is a mis-resolved `.tgz` binary merge conflict (tarball
+from one side, lockfile from the other) or hand-editing.
+
+⚠️ **That gap is a DECISION, not an oversight — do not "fix" it without new evidence** (owner,
+2026-09-05, closing #714). The skip stays non-fatal, and the prebuilt-JS-twin option that would let
+the check run without esbuild was declined. The reason is reach: the exposed path is the bare
+`node engine/scripts/build-web.mjs` invocation, which is the one *fewer humans use* — and #685's own
+history is that a CLI-only guard recreated #148's asymmetry, so a second implementation to cover the
+less-used path risks buying that defect class again. Reopening it needs evidence that the bare-CLI
+path is actually used for native builds, which is the premise the decision rests on.
+
+What #714 DID change is the diagnosis. `loadEnginePluginModule` used to return a bare `null` for two
+different causes, so the warning could not say which fired — "nothing to check" and "cannot check"
+were indistinguishable and the gate failed open either way. `loadEnginePluginModuleResult` now
+reports `no-source` vs `no-esbuild`, and the warning names the cause and the remedy: inside a
+packaged editor `no-esbuild` is expected, while on a source checkout it means the install is
+incomplete (`npm install` at the repo root).
+
+#### Degrading is a disposition
+
+**…not the loader's nature — and until #827 that cost two extra copies of it.** Every caller above
+treats the load as an optional convenience, so `null` is right for them. Two CLI scripts are in the
+opposite position: `add-native-targets.mjs` has nothing to scaffold with and
+`print-toolchain-env.mjs`'s entire stdout is `detect()`'s answer, so a silent degrade would leave the
+first crashing on `scaffoldNativeTarget is not a function` and the second printing an empty
+`eval`-able line that quietly leaves `JAVA_HOME` unset. Rather than reach a seam that degrades, each
+had grown its **own** bundle-to-temp-and-import copy — and `add-native-targets.mjs` said so in a
+comment (*"Same approach as `print-toolchain-env.mjs`"*), citing the other copy instead of importing
+it. `loadRequiredEngineModules` supplies the missing disposition: same loader, but it THROWS naming
+the entry and which of the two reasons fired. Both scripts now go through the one seam, guarded by a
+census in `cliNativeBuildHeals.test.ts` (no `engine/scripts/*.mjs` imports or shells `esbuild`
+directly, with an allowlist that states why each entry is not a loader).
+
+⚠️ `build-electron.mjs` and `stage-vite-config.cjs` are **not** copies and are allowlisted
+permanently: both esbuild-*bundle* to shippable `outfile`s (Electron main + the MCP entry; the
+packaged `vite.config.cjs`, #326) and never import what they build.
+
+⚠️ `migrate-meta-sidecars.mjs` **is** a third copy of the mechanism — it esbuilds `meta-sidecar.ts`
+to a temp outfile and `await import(...)`s it, the same bundle-to-temp-and-import driven through a
+subprocess. It is allowlisted as **deferred**, not as a non-instance: a one-off migration with no
+preamble and no build claim was not worth pulling into #827's slice. One further copy lives at
+`games/wordweave/tools/run.mjs` and is out of reach by design — a game importing `engine/scripts/**`
+fails `gamePortability.test.ts`.
+
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
   its tarball. Expect a re-vendor after a docs-only plugin edit.
@@ -1322,8 +1536,8 @@ Two notes worth carrying:
   pass green and ship the previous native code. It compares the shipped set MINUS `dist/` — the same
   set the tarball's NAME is computed over. `dist/` is deliberately out of scope: it is gitignored,
   rebuilt per clone, and the vendorer already refuses to re-pack on a dist-only change (the
-  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 21
-  tarballs plus 21 lockfiles for a tsc patch bump — the exact churn that decision exists to
+  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 27
+  tarballs plus 22 project lockfiles for a tsc patch bump — the exact churn that decision exists to
   prevent. Two halves of one system cannot hold opposite positions on the same input. A third check hashes each tarball and compares it to the `integrity` its
   project's `package-lock.json` records (driven off the lockfile, so a project that drops the dep
   from `package.json` while the lock keeps it is still seen) — a re-vendor can rewrite a tarball under an UNCHANGED name
@@ -1481,6 +1695,19 @@ both embed a profile containing the device UDID. **It is deterministic per bundl
 it reads as "works sometimes": nearly every project here has 2 frameworks, and only `3d-test`
 carries the Firebase/Google set.
 
+⚠️ **THE `court` CONTROL IS STALE — Court is no longer a 2-framework bundle** (measured
+2026-09-01, `games/court` on `work-qa`). A `cap sync ios` now reports **11 Capacitor plugins**
+and the built `App.app/Frameworks` holds **16**: absl, AppsFlyerLib, Capacitor, Cordova,
+FBAEMKit, FBSDKCoreKit, FBSDKCoreKit_Basics, FBSDKLoginKit, FirebaseAnalytics,
+FirebaseFirestoreInternal, GoogleAdsOnDeviceConversion, GoogleAppMeasurement,
+GoogleAppMeasurementIdentitySupport, grpc, grpcpp, openssl_grpc. So the `court` row in the table
+above no longer describes today's Court, and **the "2 vs 6" contrast that carried the whole nested-frameworks
+conclusion has lost its low end** — the conclusion may still hold, but this table no longer
+evidences it. What was NOT re-measured: whether go-ios now fails on Court. That install went
+straight to `ideviceinstaller` (SUCCESS, InstallComplete 100%, iPhone 8 16.7.16) precisely
+because 16 frameworks is well past the failing case, so nobody has re-run the go-ios arm.
+**Re-measure before quoting this table as a control again.**
+
 `ios install` zips the `.app` and lets `installd` extract it (note the `.ipa.app` in the error
 path); that round-trip is what breaks the signature's resource seal, and more nested signed code
 means more seal to preserve. libimobiledevice does not use that path. Three dead ends already ruled
@@ -1532,7 +1759,7 @@ Three caveats, none of which the install step can fix for you:
   [trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry). Getting there is `go-ios`
   territory and an owner decision, not something to re-diagnose.
 
-The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
+The split, shipped as `planIosInstall` (#217, detailed below):
 **iOS 15/16 → go-ios** (`ios install`/`ios launch`, what the editor build now uses; the manual
 libimobiledevice recipe above still works as a fallback);
 **iOS 17+ → `xcrun devicectl … --console`**.
@@ -1738,6 +1965,10 @@ exactly that (the count moves with every merged commit, so whichever clone build
 is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
 builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
 unrelated commits.
+⚠️ **"On every build" undersells when it fires: a plain `launch-editor.sh games/<id>` is enough.**
+Observed 2026-09-07 on `games/court` — launching the editor with no game build requested rewrote
+`versionCode` 6106 → 7173 and both `CURRENT_PROJECT_VERSION`s with it. Nothing is wrong when you
+see that diff after a read-only editor session; revert it rather than hunting it.
 
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,

@@ -4,11 +4,13 @@
  *  mutators. The system-level wiring (Input → focus movement → activation) is covered
  *  headlessly in uiFocusSystem.test.ts. */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { createWorld } from 'koota';
 import {
   pickInDirection, pushScope, popScope, activeScope, setFocus, focusedGuid, resetFocus,
-  requestActivate, retargetFocusedGuid, useFocusStore,
+  requestActivate, retargetFocusedGuid, useFocusStore, ensureFocusWorldSwapHook,
 } from '../../src/runtime/ui/focusManager';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import type { ScreenRect } from '../../src/runtime/core/screenBounds';
 
 const rect = (x: number, y: number): ScreenRect => ({ x, y, w: 10, h: 10 });
@@ -126,5 +128,64 @@ describe('retargetFocusedGuid', () => {
     setFocus('a-button');
     retargetFocusedGuid('slot-3', 'slot-1');
     expect(focusedGuid()).toBe('a-button');
+  });
+});
+
+describe('ensureFocusWorldSwapHook — lazy init latch ordering', () => {
+  it('does not latch permanently true when onWorldSwap throws on the first call', async () => {
+    vi.resetModules();
+    // shouldThrow stays false through the module's own import-time onWorldSwap calls
+    // (other modules in the chain — e.g. timelinePreview — register at module scope) and is
+    // only flipped on once the module is loaded, so it targets exactly the explicit calls
+    // to ensureFocusWorldSwapHook() below.
+    let shouldThrow = false;
+    const onWorldSwap = vi.fn(() => {
+      if (shouldThrow) throw new Error('onWorldSwap missing from mock');
+    });
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
+      getCurrentWorld: vi.fn(),
+      findEntityByGuid: vi.fn(),
+      setStructureCallback: vi.fn(),
+      onWorldSwap,
+    }));
+    const { ensureFocusWorldSwapHook } = await import('../../src/runtime/ui/focusManager');
+    const callsBeforeTest = onWorldSwap.mock.calls.length;
+
+    // First call: registration throws. The throw must propagate.
+    shouldThrow = true;
+    expect(() => ensureFocusWorldSwapHook()).toThrow('onWorldSwap missing from mock');
+    expect(onWorldSwap).toHaveBeenCalledTimes(callsBeforeTest + 1);
+
+    // Second call: registration now succeeds. Before the fix, the latch was set BEFORE the
+    // throwing call, so this second call would silently no-op instead of retrying.
+    shouldThrow = false;
+    expect(() => ensureFocusWorldSwapHook()).not.toThrow();
+    expect(onWorldSwap).toHaveBeenCalledTimes(callsBeforeTest + 2);
+
+    vi.doUnmock('../../src/runtime/core/ecs/world');
+    vi.resetModules();
+  });
+});
+
+// #838: this file never mocks `core/ecs/world` (the one test above that does uses its OWN
+// isolated module instance via vi.resetModules()/vi.doMock(), so it does not affect the
+// statically-imported `focusManager`/`core/ecs/world` bindings the rest of this file — including
+// this test — uses). So a REAL `setCurrentWorld` swap reaches the real production listener
+// registered by `ensureFocusWorldSwapHook` directly — no capture needed. The latch-ordering test
+// above only proves registration SUCCEEDS; it never drives the registered callback, which is the
+// gap this test closes.
+describe('the PRODUCTION world-swap wiring (#838) — not just latch ordering', () => {
+  it('a real world swap resets focus via the ensureFocusWorldSwapHook registration', () => {
+    ensureFocusWorldSwapHook();
+    setFocus('slot-3');
+    requestActivate('slot-3');
+    expect(focusedGuid()).toBe('slot-3');
+    expect(useFocusStore.getState().pendingActivateGuid).toBe('slot-3');
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    expect(focusedGuid()).toBe('');
+    expect(useFocusStore.getState().pendingActivateGuid).toBe('');
+    expect(useFocusStore.getState().scopeStack).toEqual(['']);
   });
 });

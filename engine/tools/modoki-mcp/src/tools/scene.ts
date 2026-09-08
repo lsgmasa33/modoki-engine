@@ -10,10 +10,11 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { type ToolResult } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
-import { mutateOpSchema, precisionParam } from '../shapes.js';
+import { mutateOpSchema, precisionParam, unsavedForceParam } from '../shapes.js';
+import { describeShape } from '../../../shared/mcpResult.js';
 
 export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
-  const { ok, fail, httpFailure, call, getJson, postJson, unreachable } = ctx;
+  const { ok, fail, httpFailure, call, getJson, postJson, unreachable, htmlFallthrough, noSuchRoute } = ctx;
 
   // ── get_scene_state — PRIMARY verification tool ──
   tool(
@@ -234,6 +235,26 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       try {
       const { status, body } = await call('/api/trait-schema');
       if (status >= 400) return httpFailure('read the live trait registry', status, body);
+      // #648 — raw `call()` skips `getJson`'s SPA-fallthrough guard: a missing /api/trait-schema
+      // route on the dev server falls through to index.html, 200. Undetected, `.traits` on that
+      // string is `undefined`, `?? {}` swallows it, and summarizeTraits reports a clean empty
+      // registry — "this project has zero traits", never a true answer.
+      if (htmlFallthrough(body)) return noSuchRoute('/api/trait-schema');
+      const traitsField = body && typeof body === 'object' ? (body as { traits?: unknown }).traits : undefined;
+      const traitsShapeOk = traitsField !== null && typeof traitsField === 'object' && !Array.isArray(traitsField);
+      if (!body || typeof body !== 'object' || !traitsShapeOk) {
+        return fail({
+          code: 'NOT_AVAILABLE_HERE',
+          what: 'read the live trait registry',
+          why: `the backend answered 200, but the body was ${describeShape(body)} — not the ` +
+            `{traits:{...}} shape /api/trait-schema is supposed to answer with. This is NOT ` +
+            `"this project has no traits"; it is a reply this build cannot read.`,
+          options: [
+            'this editor build may be from a DIFFERENT checkout than this MCP server — relaunch the editor from this checkout',
+            'check the editor is actually running: modoki_identity',
+          ],
+        });
+      }
       const b = body as { schemaAvailable?: boolean; traits?: Record<string, TraitSchema> };
       const result = summarizeTraits(b.traits ?? {}, b.schemaAvailable, { name, all });
       return 'error' in result ? fail(result.error) : ok(result);
@@ -260,7 +281,26 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       try {
       const { status, body } = await call('/api/scan-assets');
       if (status >= 400) return httpFailure('read the project asset manifest', status, body);
-      const assets = (body as { assets?: AssetEntry[] }).assets ?? [];
+      // #648 — raw `call()` skips `getJson`'s SPA-fallthrough guard: a missing /api/scan-assets
+      // route on the dev server falls through to index.html, 200. Undetected, `.assets` on that
+      // string is `undefined`, `?? []` swallows it, and summarizeAssets reports a clean empty
+      // manifest — "this project has no assets", never a true answer.
+      if (htmlFallthrough(body)) return noSuchRoute('/api/scan-assets');
+      const assetsField = body && typeof body === 'object' ? (body as { assets?: unknown }).assets : undefined;
+      if (!body || typeof body !== 'object' || !Array.isArray(assetsField)) {
+        return fail({
+          code: 'NOT_AVAILABLE_HERE',
+          what: 'read the project asset manifest',
+          why: `the backend answered 200, but the body was ${describeShape(body)} — not the ` +
+            `{assets:[...]} shape /api/scan-assets is supposed to answer with. This is NOT ` +
+            `"this project has no assets"; it is a reply this build cannot read.`,
+          options: [
+            'this editor build may be from a DIFFERENT checkout than this MCP server — relaunch the editor from this checkout',
+            'check the editor is actually running: modoki_identity',
+          ],
+        });
+      }
+      const assets = assetsField as AssetEntry[];
       return ok(summarizeAssets(assets, { type, folder, name, all, limit }));
       } catch (e) { return unreachable(e); }
     },
@@ -269,10 +309,22 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   // ── get_asset_meta ──
   tool(
     'modoki_get_asset_meta',
-    'Read an asset\'s .meta.json sidecar (import settings for textures/models, etc.). ' +
-      'Returns {} if there is no sidecar.',
-    { path: z.string().describe('Asset-root URL of the asset.') },
-    async ({ path }) => getJson(`/api/read-meta?path=${encodeURIComponent(path)}`),
+    'Read an asset\'s .meta.json sidecar (import settings for textures/models, etc.), PREFERRING a '
+      + 'parked Inspector edit over the file.\n\n'
+      + 'WHY that matters (#845/#872): an Inspector import-settings change is MANUAL-SAVE — it is '
+      + 'parked in the editor and reaches disk only at modoki_save_all. So the FILE is the '
+      + 'PRE-EDIT document for as long as a park is unflushed, and this tool used to return it '
+      + 'with no way to tell. `source` says where the answer came from: `parked` (an unsaved '
+      + 'editor edit — `unsaved:true`, and modoki_get_editor_state lists it under '
+      + '`pendingImportSettings`) or `disk`.\n\n'
+      + 'HEADLESS: with no editor running, `editorConnected:false` comes back with the file\'s '
+      + 'contents — a real answer, but one that could not check for a park.\n\n'
+      + 'An empty `meta` is AMBIGUOUS: it means no sidecar, a sidecar that does not PARSE (#778), '
+      + 'or — when `read:"failed"` — that the read itself failed. Do NOT write an empty document '
+      + 'back with modoki_write_asset_meta: that route REPLACES the sidecar, so a write built on '
+      + 'one drops the asset GUID and the scanner mints a new one, orphaning every reference to it.',
+    { path: z.string().describe('Asset-root URL of the asset, e.g. /assets/textures/rock.png.') },
+    async ({ path }) => getJson(`/api/asset-meta?path=${encodeURIComponent(path)}`),
   );
 
   // ── reimport_asset ──
@@ -280,15 +332,21 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_reimport_asset',
     'Re-run the import pipeline for a source asset (texture → KTX2/WebP, model → LOD ' +
       'GLB + postprocessor bake), or every asset under a folder (recursive). Returns ' +
-      '{converted, skipped, errors}.',
+      '{converted, skipped, errors}.\n\n' +
+      '⚠️ The bake reads the .meta.json settings from DISK, so this refuses (REQUIRES_SAVE) while a ' +
+      'human has a parked Inspector import-settings edit for a target: it would convert with the ' +
+      'PRE-EDIT values while the panel shows the new ones, and their next save would then flush ' +
+      'that older document over the cache block this bake writes. modoki_save_all first (then the ' +
+      'bake uses their settings), or force:true to convert from disk anyway.',
     {
       path: z.string().describe('Asset-root URL of the asset or folder.'),
       recursive: z.boolean().optional().describe('Reimport every asset under the path.'),
+      force: unsavedForceParam,
     },
     // A reimport re-encodes textures (toktx KTX2) and models (LOD GLB) SEQUENTIALLY in a
     // non-streaming handler. On the 30s default a recursive folder reimport aborted mid-bake and
     // reported a spurious "backend did not respond" while the bake kept running and DID land on
     // disk. Give it real headroom (a single import_file already gets 120s). (C7 re-audit.)
-    async ({ path, recursive }) => postJson('/api/reimport', { path, recursive: !!recursive }, recursive ? 10 * 60_000 : 120_000),
+    async ({ path, recursive, force }) => postJson('/api/reimport', { path, recursive: !!recursive, ...(force ? { force: true } : {}) }, recursive ? 10 * 60_000 : 120_000),
   );
 }

@@ -24,14 +24,19 @@
  *  FAILURE where the source is the only way the font renders at all), and would not catch a
  *  subtler break in the copy itself. */
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
-const SRC = fs.readFileSync(
+const SCANNED = readScannedSource(
   path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../plugins/vite-asset-scanner.ts'),
-  'utf8',
 );
+/** Comments blanked — every assertion below is about CODE, and prose in this file names the same
+ *  identifiers it asserts on. */
+const SRC = SCANNED.code;
+/** ⚠️ The one view that keeps comments, for the single assertion whose SUBJECT is the comment.
+ *  Named apart from `SRC` so reaching for prose is a deliberate act rather than the default. */
+const SRC_WITH_PROSE = SCANNED.raw;
 
 /** The SUCCESS half of the baked-font branch: after the atlas/metrics copies, before the
  *  bookkeeping — i.e. strictly inside `try`, excluding the `catch`.
@@ -136,7 +141,11 @@ describe('baked fonts ship their source file only when something needs it', () =
   // If someone re-optimises the payload, the comment block is the first thing they read —
   // it has to name the consumer that breaks, or the source looks like dead weight.
   it('records WHY the source ships conditionally, so the payload cost is not re-cut blindly', () => {
-    const branch = SRC.slice(Math.max(0, SRC.indexOf('Bake each kept font')), SRC.indexOf('const convertedFonts'));
+    // ⚠️ Reads the PROSE view deliberately: this assertion is that a rationale is written down,
+    // so the comment is the subject rather than something to see past. It is the third such case
+    // in the repo, beside `docCitations` and `editorStoreActionsReachable`.
+    const src = SRC_WITH_PROSE;
+    const branch = src.slice(Math.max(0, src.indexOf('Bake each kept font')), src.indexOf('const convertedFonts'));
     expect(branch).toContain('FontFace');
     expect(branch).toContain('loadAllFonts');
   });

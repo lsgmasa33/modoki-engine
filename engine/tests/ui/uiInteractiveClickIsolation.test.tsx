@@ -25,6 +25,7 @@ const NODE_DEFAULTS = {
   marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
   minWidth: 0, maxWidth: 0, minHeight: 0, maxHeight: 0,
   alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
+  swallowClicks: false,
   backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0,
   borderColor: 0x333333, borderOpacity: 1, opacity: 1,
   text: '', fontFamily: '', fontSize: 16, fontWeight: 'normal', fontStyle: 'normal',
@@ -82,5 +83,20 @@ describe('the control that is NOT interactive still passes its click through', (
     const { onBackdropClick, el } = renderInBackdrop({ elementType: 'div' });
     fireEvent.click(el);
     expect(onBackdropClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('...unless it authors swallowClicks, which is the whole point of the field (#728)', () => {
+    // The pair above/below is the tightest statement of what #728 added: the SAME node, through
+    // the SAME harness, one boolean apart. The plain div passes its click to the dismissing
+    // backdrop — which is the bug every dialog body had — and this one does not.
+    //
+    // Note what is NOT authored here: no `action`, no bindings. Before #728 the only way to get
+    // this behaviour was to give the node a no-op `call` binding, which made it a button and cost
+    // the click cue plus the 300ms input lock. That cost is pinned separately, through the real
+    // `applyBindings`, in `packages/modoki/tests/runtime/uiToggleClickCue.test.tsx`.
+    const { onBackdropClick, el } = renderInBackdrop({ elementType: 'div', swallowClicks: true });
+    fireEvent.click(el);
+    expect(onBackdropClick, 'a swallowClicks container must consume the tap rather than let it '
+      + 'dismiss the dialog behind it').not.toHaveBeenCalled();
   });
 });

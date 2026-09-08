@@ -25,7 +25,6 @@ export const textureReimportHandler: ReimportHandler = async (sourceUrlPath, abs
     textureType: type, // 2d/ui → also emit a WebP browser sibling for editor/DOM
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   // Stamp the resolved type explicitly so legacy textures gain one on first
   // re-import (the scanner + validation key off `meta.type`).
   meta.type = type;

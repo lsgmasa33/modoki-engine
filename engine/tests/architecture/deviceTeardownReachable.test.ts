@@ -20,13 +20,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
-const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+const read = (rel: string) => readScannedSource(path.join(repoRoot, rel)).code;
 
 describe('device teardown hooks are reachable from production code', () => {
   it('releaseDeviceResourcesOnExit is called on the Electron quit path', () => {

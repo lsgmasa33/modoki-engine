@@ -4,8 +4,12 @@ Status: **Phases 1–4 shipped** (`verify` green) — runtime audio subsystem +
 editor authoring (Audio Inspector) + the ffmpeg converter + mix helpers + the
 **declarative control layer** (engine-reconciled `AudioSource` + built-in `audio.*`
 actions), plus a fully-declarative demo game (`games/audio-demo`) and a Unity-style
-editor **Mute Audio** toggle. Only the **native backend** (deferred by design) and
-a couple of small polish items remain. Owner: solo.
+editor **Mute Audio** toggle, plus an **iOS `AVAudioSession` category**, tried and abandoned
+(#548 — **closed won't-do**: device-tested, shown not to work, and the only remaining path is a
+native audio backend the owner judged not worth the effort; its auto-ducking half was removed
+after device testing, and the plugin itself was removed once the category was shown inert — see
+below). Only the **native backend** (deferred by design) and a couple of small polish items
+remain. Owner: solo.
 
 ## Decisions (settled)
 
@@ -95,8 +99,17 @@ AudioListener trait ─┘        │
   own-only stream), and a scene-scoped refcounted `audioBufferCache` wired into
   `releaseAllForScene` + `disposeAllCachedResources`. `loadType` lives in the
   clip's `.meta.json` (read via `getAudioLoadType`, default `buffer`).
-- **App wiring** — `App.tsx` resumes the context on first user gesture and
-  disposes on teardown. The old oscillator `services/audio.ts` is deleted.
+- **App wiring** — `App.tsx` calls `useAudioResumeRearm()`
+  (`engine/app/useAudioResumeRearm.ts`), which keeps a persistent gesture listener
+  (pointerdown/touchstart/keydown) and re-arms on foreground (`visibilitychange`,
+  native `appStateChange`) to resume the context, disposing on teardown; a single
+  first-gesture resume isn't enough because an iOS audio-session interruption
+  (e.g. a Music.app takeover) can suspend the context long after it (#489). The
+  old oscillator `services/audio.ts` is deleted.
+  **Device-verified** (owner, iPhone 8 / iOS 16.7.16, 2026-09-01): play Music.app,
+  stop it, foreground Court — audio returns with **no relaunch**. Re-test that way;
+  no simulator or headless test reproduces an audio-session interruption, so this
+  path's only real evidence is a phone.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.
@@ -173,8 +186,11 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   wall-clock, determinism-guard-safe). Exported as `crossfadeAudio`. The broader mix
   API (bus fades, ducking, mix snapshots — `fadeBusVolume`/`duckBus`/`captureBusMix`/
   `restoreBusMix`) was **frozen** and removed: it had no consumer beyond its own test.
-  Reintroduce a specific helper when a game actually needs it. `setBusVolume` (used by
-  the demo's mixer sliders) stays.
+  `setBusVolume` (used by the demo's mixer sliders) stays.
+  **Update (#548):** a scoped helper (`setAudioMusicDucked`, a dedicated duck node) briefly
+  reintroduced part of this frozen space, then was removed again when device testing showed
+  the ducking it powered does not work — see "iOS audio session" below. The freeze holds again
+  for the whole API: no `fadeBusVolume`, no `duckBus`, no `captureBusMix`/`restoreBusMix`.
 - **Tests** — `tests/plugins/audioConvert.test.ts` (ffmpeg flag vectors),
   `audioCache.test.ts` (hash stability, loadType-invariant), `tests/runtime/
   audioMix.test.ts` (settings resolve, format mappings, `setBusVolume` record-mode
@@ -339,10 +355,10 @@ teardown paths (`entity-stop` · `entity-gone` · `not-playing` · `world-teardo
 which are otherwise indistinguishable from outside.
 
 **`@audio` vs the Timeline's `@cue` — they are a PAIR, not a duplicate.** Timeline's
-audio track (`timelineSystem.ts:618-620`) calls `cueClip(...)` and then emits `@cue`,
-which records that the Director *asked* for a sound at that beat. `@audio` records
-whether a voice actually *started*. So a Timeline audio beat normally produces
-`@cue` followed by `@audio {phase:'start'}` — and the diagnostic case is when the
+audio track (`timelineSystem.ts`'s `applyDirectorFrame`, `'audio'` case) calls `cueClip(...)`
+and then emits `@cue`, which records that the Director *asked* for a sound at that beat.
+`@audio` records whether a voice actually *started*. So a Timeline audio beat normally
+produces `@cue` followed by `@audio {phase:'start'}` — and the diagnostic case is when the
 first appears without the second, which is precisely "the cutscene called for a sound
 and none played". Do not read the two events as double-counting one thing.
 
@@ -494,15 +510,132 @@ headless test drive the cap deterministically.
 
 Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 
+## iOS audio session (#548) — WON'T DO (owner, 2026-09-02)
+
+**The problem.** iOS set no `AVAudioSession` category anywhere in this repo, so every Modoki game
+inherited the platform default, `.soloAmbient` — which **deactivates** whatever another app (Apple
+Music, a podcast) was playing the instant our own audio started. The owner asked for the opposite:
+let other apps' audio keep playing alongside ours.
+
+### The session category (plugin since removed)
+
+`.ambient` + `.mixWithOthers` is the category that mixes instead of interrupting.
+`engine/packages/capacitor-modoki-audio/` was a standalone Capacitor plugin (SPM, iOS-only, same
+pattern as every other plugin in this doc) that set it: `load()` applied the default the instant
+the app launched (before any playback), and `configure({category})` let the game override it.
+**Every `AVAudioSession` call was do/catch-wrapped and degraded to the OS default rather than
+trapping** — a failed category set must not crash the splash screen.
+
+Two categories were exposed, both mixing with other apps: `'ambient'` (default) additionally
+silenced our audio when the ring/silent switch was on — what a casual game normally wants —
+`'playback'` kept playing through it, for a game whose music is the point. Authored as
+`capacitor.audioSessionCategory` in `project.config.json` — a per-game knob, not a code constant,
+because whether a game's music should survive Silent Mode is a design call, not an engine
+invariant.
+
+**The plugin, the config field, and all its wiring were removed** once the measurements below
+showed the category has no observable effect (owner ruling, 2026-09-02 — see "RULING" below): the
+package `engine/packages/capacitor-modoki-audio/`, `capacitor.audioSessionCategory` /
+`AUDIO_SESSION_CATEGORIES` in `engine/project-config.ts`, its Project Settings field, and every
+project's dependency on it. Nothing above is buildable from the current tree — it is recorded here
+because the reasoning (and the dead end it documents) is the durable part.
+
+Android has no equivalent and needs none — audio there is 100% WebView (Web Audio), there is
+**zero** audio-focus code anywhere in this repo, and Chromium requests audio focus on our behalf
+with no handle Modoki holds to duck or release.
+
+### Ducking was removed — measured, not a design preference
+
+#548 originally shipped a second half: auto-ducking the music bus (`setAudioMusicDucked`, a
+dedicated `musicDuck` gain node between `buses.music` and `master`) driven by a policy hook
+(`useAudioDucking`, `shouldDuckMusic`) reading `AVAudioSession.isOtherAudioPlaying` /
+`secondaryAudioShouldBeSilencedHint`. **It was removed entirely (owner, 2026-09-01)** after device
+testing showed it does not work:
+
+- **WKWebView keeps its own `AVAudioSession`, separate from the app's** (WebKit bug 167788). A
+  Modoki game's audio is Web Audio, so it lives in WebKit's session — which means our own audio
+  reads back as "other audio" to the *app's* session, not as ours.
+- Measured on **two devices**: iPhone 8 / iOS 16.7.16 (Court) and iPhone Air / iOS 26.6
+  (audio-demo). On both, `isOtherAudioPlaying` **and** `secondaryAudioShouldBeSilencedHint`
+  reported `true` with nothing else playing, on a fresh launch, and stayed `true` with the
+  AudioContext suspended for 6 seconds — the OS was reporting our own (WebKit-owned) session back
+  to us as "other audio."
+- Consequence: enabling the duck silenced the game's **own** music at launch, permanently — the
+  owner heard SFX and no music, with no other app playing anything.
+
+There is no fix pending — the signal this half depended on cannot distinguish "another app is
+playing" from "our own WKWebView audio session exists," so there is nothing left to build here
+until/unless a different signal is found.
+
+### Not a replacement for #489's re-arm
+
+⚠️ Historical note, kept because the conclusion still holds: `.ambient` was *intended* to change
+**whether** another app's audio takes over outright (it did not, see above), and either way it
+never changed what happens on a phone call, a Siri invocation, or an alarm — those interrupt the
+audio session under **any** category. `useAudioResumeRearm`
+(`engine/app/useAudioResumeRearm.ts`) stays load-bearing for those; #548 and #489 are independent
+mechanisms.
+
+### Verification — HISTORICAL: what was measured, and why it stopped there
+
+⚠️ **Not executable any more — the plugin and the config field it describes no longer exist.**
+Kept because the measurement is the evidence behind the RULING above, not because anything here is
+to be re-run.
+
+No headless test or simulator reproduces a real `AVAudioSession` interruption, so the only evidence
+was ever a phone. The acceptance test was: start Apple Music, then launch the game; Music should
+keep playing with the game's audio alongside it. Measured on the **iPhone Air / iOS 26.6**:
+launching the app **still stopped** Music.app's playback. Re-applying the category at runtime,
+after WebKit's own session already existed, did not change it either (next section). That is what
+closed the issue.
+
+### RULING: won't do (owner, 2026-09-02)
+
+Letting other apps' music keep playing **is not being pursued**. The estimate for the only path that
+could work — moving audio out of the WebView into a native backend — is ~2-4 weeks: a custom plugin
+on both platforms (`@capacitor-community/native-audio` covers none of buses, spatial, crossfade or
+pitch), Android audio-focus handling that does not exist yet, GUID→on-disk asset plumbing, and TWO
+backends maintained forever since web and the editor still need Web Audio. Weighed against a
+nice-to-have for a puzzle game, the owner declined.
+
+⚠️ **Do not reopen this by setting an `AVAudioSession` category.** Every app-side variant has been
+tried and measured — see below. If it is ever revisited, start with the one-hour spike: build a game
+with ALL audio disabled and launch it with Music.app playing. If Music survives, WebView audio is
+what takes the session and a native backend would fix it; if Music dies anyway, the WebView's mere
+presence takes it and a native backend buys nothing. That spike gates the whole feature and has not
+been run.
+
+### The obvious fix is TESTED and DEAD — it is not a timing problem (owner, 2026-09-02)
+
+The natural theory was that WebKit establishes its own media session when playback begins and
+overrides whatever we set at `load()`, so the category simply had to be applied LATER. That was
+tested directly on Court, iPhone Air / iOS 26.6: with the game's audio already playing (so WebKit's
+session definitely existed), `ModokiAudio.configure({category:'ambient'})` was re-applied at runtime
+— it succeeded in 7ms and did not disturb our own playback. Then Music.app was started and the game
+foregrounded. **Music.app still stopped.**
+
+So re-applying after the fact does not win either, and this is NOT a matter of ordering. Nor is it a
+"bug to work around": WKWebView owns its own audio session and does not take the app's category
+(WebKit 167788), so **no `AVAudioSession` configuration from the app side can make WebView audio
+mix** — which also means a third-party session plugin (e.g. Capawesome's) cannot help, since it does
+the same thing this one does.
+
+⚠️ **The only remaining path is architectural: move audio OUT of the WebView.** A native audio
+backend (`@capacitor-community/native-audio`) puts playback in a session the category actually
+governs. That backend is currently deferred by design — see this file's own note that "all targets
+(web + iOS + Android) are WebView/browser, so Web Audio covers 100% today". #548 is the first
+concrete reason to revisit that trade, and it is a large change, not a fix.
+
+What is observed instead today, and must not be mistaken for a ducking regression: starting
+Music.app suspends the game's `AudioContext` (the ordinary #489 interruption), the game goes silent,
+and the next user gesture resumes it via `useAudioResumeRearm`. That is the re-arm working, not the
+category failing to be set.
+
 ## Remaining
 
 - **Native backend** — `@capacitor-community/native-audio` behind `audioService`,
   **deferred by design** — only if measured device latency demands it (all targets
   are WebView, so Web Audio covers 100% today).
-- **Editor gesture-unlock (small)** — the game shell (`App.tsx`) resumes the
-  AudioContext on first gesture, but `EditorApp` does not, so a context suspended
-  mid-session stays silent until an editor relaunch. Add `audioResume()` on first
-  gesture in the editor shell.
 - **World-space spatial** ✅ SHIPPED — spatial positions now read each entity's
   **world** position, so nested rigs are spatialized correctly. `audioSystem` exposes
   `setAudioWorldPositionResolver` and stays **THREE-free**: the app injects a resolver

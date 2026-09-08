@@ -29,21 +29,33 @@ export const ASSET_TYPE_COLORS: Record<string, string> = {
   rig2d: '#a29bfe',       // soft indigo (2D skinning rig — bones/skeleton family)
   sprite: '#16a085',      // dark teal (2D image family, sibling of texture)
   atlas: '#27ae60',       // emerald (packed sprite sheet; texture/sprite family)
+  level: '#d35400',       // pumpkin (pure-data level layout, e.g. Sling's .level.json)
+  wave: '#3498db',        // peter-river blue (enemy/spawn wave data)
+  'court-level': '#c0392b', // pomegranate (Court's puzzle level data)
+  timeline: '#e17055',    // terracotta (Director timeline; animation family)
+  audio: '#2980b9',       // belize-hole blue (audio clip)
+  video: '#8e44ad',       // wisteria (video clip)
   script: '#9aa7b4',      // slate-grey (source code — not an asset-pipeline type)
 };
 
 /** Canonical asset-type list + display order — the SINGLE source of truth shared
  *  by the Assets panel's category (list) view section order AND the type-filter
- *  menu, so the two never drift. Grouped roughly by pipeline stage: composition →
- *  rendering → animation → fx → lighting → text → code. 'script' is a pseudo-type
- *  (source files, not asset-manifest entries). Types absent here sort last,
- *  alphabetically. Keep in sync with ASSET_TYPE_COLORS above. */
+ *  menu, so the two never drift. Grouped roughly by pipeline stage: composition
+ *  (incl. pure-data level/wave/court-level) → rendering → animation (incl.
+ *  timeline) → fx → lighting → text → media (audio/video) → code. 'script' is a
+ *  pseudo-type (source files, not asset-manifest entries). Types absent here sort
+ *  last, alphabetically. Keep in sync with ASSET_TYPE_COLORS above, and with the
+ *  `glyph()` switch below — every entry here needs a badge glyph or it falls back
+ *  to a 3-letter text label (harmless, but check it's the intent). Coverage over
+ *  every type the classifier (`loaders/assetTypeClassifier.ts`) actually produces
+ *  is pinned by `tests/editor/assetTypeOrder.test.ts` (#417). */
 export const ASSET_TYPE_ORDER: readonly string[] = [
-  'scene', 'prefab',
+  'scene', 'prefab', 'level', 'wave', 'court-level',
   'model', 'mesh', 'material', 'texture', 'sprite', 'atlas',
-  'animation', 'animset', 'spriteanim', 'rig2d',
+  'animation', 'animset', 'spriteanim', 'rig2d', 'timeline',
   'particle', 'shader',
   'environment', 'font',
+  'audio', 'video',
   'script',
 ];
 
@@ -99,6 +111,18 @@ function glyph(type: string, bg: string): ReactNode {
       return (<><rect {...S} x="2.4" y="4.6" width="8.6" height="8.6" rx="1.1" /><path {...S} d="M5 4.6V3.1h8.5v8.5h-1.5" /><path d="M5.7 7.3l3.4 2-3.4 2z" fill="currentColor" /></>);
     case 'rig2d': // bone (2D skinning rig) — a diagonal bone with lobed ends
       return (<><path {...S} strokeWidth={1.6} d="M5.2 10.8l5.6-5.6" /><circle cx="4.3" cy="10" r="1.3" fill="currentColor" /><circle cx="6" cy="11.7" r="1.3" fill="currentColor" /><circle cx="11.7" cy="6" r="1.3" fill="currentColor" /><circle cx="10" cy="4.3" r="1.3" fill="currentColor" /></>);
+    case 'level': // stacked layers (pure-data level layout)
+      return (<><path {...S} d="M8 2.3L2.6 5.3 8 8.3l5.4-3z" /><path {...S} d="M2.6 8.3L8 11.3l5.4-3" /><path {...S} d="M2.6 11L8 14l5.4-3" /></>);
+    case 'wave': // zigzag (enemy/spawn wave pattern) — distinct from animation's smooth sine
+      return (<path {...S} strokeWidth={1.4} d="M2 11L5 5l3 6 3-6 3 6" />);
+    case 'court-level': // puzzle piece (Court's puzzle level data)
+      return (<path {...S} d="M3 3h4.2c.1-.9 1.6-.9 1.6 0H13v4.2c.9.1.9 1.6 0 1.6V13H8.8c-.1.9-1.6.9-1.6 0H3V8.8c-.9-.1-.9-1.6 0-1.6z" />);
+    case 'timeline': // horizontal track + keyframe markers
+      return (<><path {...S} d="M2.4 8h11.2" /><rect x="3.4" y="6.7" width="2.4" height="2.6" rx="0.4" fill="currentColor" /><rect x="10.2" y="6.7" width="2.4" height="2.6" rx="0.4" fill="currentColor" /><circle cx="8" cy="8" r="1.3" fill="currentColor" /></>);
+    case 'audio': // speaker + sound waves
+      return (<><path {...S} d="M2.6 6.4h2.6L8.4 3v10L5.2 9.6H2.6z" fill="currentColor" /><path {...S} d="M10.4 5.6a4 4 0 0 1 0 4.8M12.4 3.6a7 7 0 0 1 0 8.8" /></>);
+    case 'video': // video camera (distinct from spriteanim's frames+play-triangle)
+      return (<><rect {...S} x="2.2" y="4.4" width="8" height="7.2" rx="1" /><path {...S} d="M10.2 6.6l3.6-2v6.8l-3.6-2z" /></>);
     case 'script': // angle brackets (source file: </>)
       return (<path {...S} strokeWidth={1.5} d="M6 4.5L2.5 8 6 11.5M10 4.5L13.5 8 10 11.5" />);
     default:

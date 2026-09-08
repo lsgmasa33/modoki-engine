@@ -167,7 +167,7 @@ describe('screenToReference2D — the pick coordinate inverse (Phase 2)', () => 
     const { computeCanvasScale, screenToReference2D } = await getModule();
     const cs = computeCanvasScale(1080, 1920, 800, 600, 'fitH');
     expect(screenToReference2D(100, 100, { left: 0, top: 0, width: 0, height: 100 }, 800, 600, cs)).toEqual({ x: 0, y: 0 });
-    const zero = { scale: 1, scaleX: 0, scaleY: 0, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1 };
+    const zero = { scale: 1, scaleX: 0, scaleY: 0, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1, refW: 1080, refH: 1920 };
     expect(screenToReference2D(100, 100, { left: 0, top: 0, width: 50, height: 50 }, 800, 600, zero)).toEqual({ x: 0, y: 0 });
   });
 
@@ -219,7 +219,7 @@ describe('referenceToScreen2D — the forward twin (round-trip with screenToRefe
 
   it('degenerate backing size returns the rect origin (never NaN)', async () => {
     const { referenceToScreen2D } = await getModule();
-    const cs = { scale: 1, scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1 };
+    const cs = { scale: 1, scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1, refW: 1080, refH: 1920 };
     const rect = { left: 5, top: 9, width: 100, height: 200 };
     expect(referenceToScreen2D(50, 50, rect, 0, 100, cs)).toEqual({ x: 5, y: 9 });
   });

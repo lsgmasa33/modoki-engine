@@ -1,0 +1,64 @@
+{
+  "id": "e2e-ui-resize-entity-scale-scene-0000-00000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "ScaledParent",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 200, "height": 150, "widthUnit": "px", "heightUnit": "px", "scale": 2, "backgroundColor": 6316128, "backgroundOpacity": 0.3 },
+        "UIAnchor": { "anchor": "center", "top": 0, "topUnit": "px", "left": 0, "leftUnit": "px", "right": 0, "rightUnit": "px", "bottom": 0, "bottomUnit": "px", "pivotX": 0.5, "pivotY": 0.5, "safeArea": false, "zIndex": 1 },
+        "EntityAttributes": { "name": "ScaledParent", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 2,
+      "name": "ScaledPercentChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 50, "height": 50, "widthUnit": "%", "heightUnit": "px", "backgroundColor": 16729344, "backgroundOpacity": 0.9 },
+        "EntityAttributes": { "name": "ScaledPercentChild", "isActive": true, "sortOrder": 0, "parentId": 1, "layer": "ui" }
+      }
+    },
+    {
+      "id": 3,
+      "name": "ScaledPxChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 40, "height": 30, "widthUnit": "px", "heightUnit": "px", "backgroundColor": 65450, "backgroundOpacity": 0.9 },
+        "EntityAttributes": { "name": "ScaledPxChild", "isActive": true, "sortOrder": 1, "parentId": 1, "layer": "ui" }
+      }
+    },
+    {
+      "id": 4,
+      "name": "ScaledAutoPxChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 0, "height": 30, "widthUnit": "px", "heightUnit": "px", "minWidth": 100, "minWidthUnit": "px", "alignSelf": "flex-start", "backgroundColor": 5635925, "backgroundOpacity": 0.9 },
+        "EntityAttributes": { "name": "ScaledAutoPxChild", "isActive": true, "sortOrder": 2, "parentId": 1, "layer": "ui" }
+      }
+    },
+    {
+      "id": 5,
+      "name": "RotatedParent",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 80, "height": 60, "widthUnit": "px", "heightUnit": "px", "rotation": 15, "backgroundColor": 6316128, "backgroundOpacity": 0.3 },
+        "UIAnchor": { "anchor": "center", "top": 0, "topUnit": "px", "left": 270, "leftUnit": "px", "right": 0, "rightUnit": "px", "bottom": 0, "bottomUnit": "px", "pivotX": 0.5, "pivotY": 0.5, "safeArea": false, "zIndex": 1 },
+        "EntityAttributes": { "name": "RotatedParent", "isActive": true, "sortOrder": 3, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 6,
+      "name": "RotatedPercentChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 50, "height": 20, "widthUnit": "%", "heightUnit": "px", "backgroundColor": 16729344, "backgroundOpacity": 0.9 },
+        "EntityAttributes": { "name": "RotatedPercentChild", "isActive": true, "sortOrder": 0, "parentId": 5, "layer": "ui" }
+      }
+    }
+  ]
+}

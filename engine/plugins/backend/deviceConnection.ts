@@ -556,6 +556,35 @@ export interface ConnectRequest {
   debugBuild?: boolean;
 }
 
+/** Sentinel for "this field was OMITTED from the request" in `connectRequestKey` below — a string
+ *  that cannot collide with any real `ip`/`serial` value, nor with the JSON-encoded form of any
+ *  real `port`/`useAdb` value, so it can never be mistaken for an explicit one. */
+const OMITTED = ' omitted';
+
+/** Stable key for "is this the SAME connect request as the one already in flight?" (#527). Covers
+ *  every field `ConnectRequest` declares, normalized the same way `connectInner`'s own head
+ *  normalizes them (trim the strings, default the rest) — so a request differing only in
+ *  whitespace still joins, and so does an explicit-vs-omitted `debugBuild: false` (`connectInner`
+ *  never distinguishes those two for that field, so `!!` is safe there). `useAdb`, `serial` and
+ *  `port` deliberately do NOT get that treatment: `connectInner` branches on `=== undefined` for
+ *  each of them (`bareReconnect`'s `req.useAdb === undefined`, `wantSerial`'s
+ *  `req.serial === undefined`, and `devicePort`'s `req.port ?? DEVICE_PORT`) — omitted means "reuse
+ *  the last target" (or the default port), while an explicit value — including explicit `null` or
+ *  `''` — means "no preference, ask fresh". So OMITTED must key differently from every explicit
+ *  value for `useAdb` and `port` (the `OMITTED` sentinel above does that); for `serial`, an explicit
+ *  `null` and an explicit `''` mean the SAME thing ("no preference") and must key the same as each
+ *  other, while still keying differently from omitted. A request naming a DIFFERENT target must not
+ *  produce the same key either: that is a deliberate re-target, not a duplicate. */
+function connectRequestKey(req: ConnectRequest): string {
+  return JSON.stringify({
+    ip: req.ip?.trim() ?? '',
+    useAdb: req.useAdb === undefined ? OMITTED : req.useAdb,
+    serial: req.serial === undefined ? OMITTED : (req.serial ?? '').trim(),
+    port: req.port === undefined ? OMITTED : req.port,
+    debugBuild: !!req.debugBuild,
+  });
+}
+
 export class DeviceConnectionManager {
   private client: DeviceLeaseClient | null = null;
   private transport: TcpLeaseTransport | null = null;
@@ -579,16 +608,31 @@ export class DeviceConnectionManager {
    *  bridge). Separate from `platform` so a stable null latches but a failed ASK does not. */
   private platformResolved = false;
   private platformInFlight: Promise<DeviceIdentity> | null = null;
-  /** Bumped at the head of every `connect()`. Nothing serializes `POST /api/device/connect` — a
-   *  double-clicked Connect button, or an agent retrying a slow `device_connect`, can put two calls
-   *  in flight on this one manager — and `claimedDeviceId`/`client`/`target` are all SHARED state,
-   *  so the loser's continuation resumes into the winner's session. That reentrancy gap predates
-   *  this field and is wider than it (`disconnect()` operates on whatever `this.client` currently
-   *  is); what the counter closes is the one place a stale continuation can do real DAMAGE rather
-   *  than merely return a stale status — see its use after `client.connect()` below. */
-  private connectGeneration = 0;
+  /** Bumped every time this manager's SESSION IDENTITY changes — by a `connect()` (inside its own
+   *  `disconnect()`, see below) and by a bare `disconnect()`. Nothing serializes
+   *  `POST /api/device/connect` — a double-clicked Connect button, or an agent retrying a slow
+   *  `device_connect`, can put two calls in flight on this one manager — and
+   *  `claimedDeviceId`/`client`/`transport`/`target` are all SHARED state, so a stale continuation
+   *  resuming after an await can act on a session that is no longer its own. This counter covers a
+   *  `disconnect()` (bare, or another `connect()`'s own internal teardown) landing while a
+   *  `connect()` is suspended on an await — teardown-during-connect, both in the #283 rediscovery
+   *  block and via the `onState` callbacks below (the #506 case). What it does NOT cover is the
+   *  PRIMARY path's own client install (the `this.transport`/`this.client`/`this.target`
+   *  assignments in `connectInner`) — those are still assigned un-gated, so which client two truly
+   *  racing `connect()`s leave installed is decided by assignment order, not by this generation.
+   *  That primary-path assignment race is pre-existing and out of scope here. It also does NOT serialize
+   *  `POST /api/device/connect` itself as a FIELD — a second call can still land on this manager and
+   *  race the first. What DOES serialize it now is the `connect()` wrapper below (#527): an
+   *  IDENTICAL in-flight request joins rather than starting a second attempt. A DIFFERING request
+   *  still races straight through to `connectInner`, which is what the generation guards here are
+   *  for. */
+  private sessionGeneration = 0;
   private readonly guid: string;
   private readonly stateDir: string;
+  /** An IDENTICAL `connect()` request already in flight, if any (#527) — see the public `connect`
+   *  below. Keyed by `connectRequestKey` so a differing request (a genuine re-target) never joins
+   *  one it does not match. */
+  private inFlightConnect: { key: string; promise: Promise<DeviceConnectStatus> } | null = null;
 
   /** `stateDir` is the per-clone `.modoki` dir the last-target file lives in — injectable so tests
    *  isolate their persisted state instead of scribbling on the real repo's `.modoki`. */
@@ -598,12 +642,43 @@ export class DeviceConnectionManager {
     this.lastTarget = loadLastTarget(stateDir);
   }
 
+  /** Public entry point for `POST /api/device/connect`. Nothing serializes that route (see
+   *  `sessionGeneration`'s doc) — a double-clicked Connect button, or an agent retrying a slow
+   *  `device_connect`, can land two calls on this one manager before the first has even started its
+   *  own teardown. Change 1 above makes a raced `disconnect()`/`connect()` interleaving SAFE, but a
+   *  second IDENTICAL connect racing in is still pointless work: it repeats the same teardown and
+   *  handshake for no different outcome. So a second call naming the SAME target (by
+   *  `connectRequestKey`) while the first is still in flight JOINS it and returns its result,
+   *  instead of starting a second attempt.
+   *
+   *  Scoped to an IDENTICAL request on purpose. A connect naming a DIFFERENT target is a deliberate
+   *  RE-TARGET, and answering it with the previous device's status would be wrong — a differing key
+   *  falls straight through to `connectInner`, i.e. today's behaviour (full teardown + connect),
+   *  which Change 1 now makes safe to race. */
+  async connect(req: ConnectRequest): Promise<DeviceConnectStatus> {
+    const key = connectRequestKey(req);
+    const existing = this.inFlightConnect;
+    if (existing && existing.key === key) return existing.promise;
+    const p: Promise<DeviceConnectStatus> = this.connectInner(req).finally(() => {
+      if (this.inFlightConnect?.promise === p) this.inFlightConnect = null;
+    });
+    this.inFlightConnect = { key, promise: p };
+    return p;
+  }
+
   /** Connect (or reconnect) to a device. Tears down any prior link first, so a re-Connect with a
    *  new IP is clean. `useAdb` runs `adb forward` and targets 127.0.0.1; otherwise the typed IP.
    *  With NEITHER `ip` nor `useAdb` (a "bare" reconnect), reuse the last target this clone used. */
-  async connect(req: ConnectRequest): Promise<DeviceConnectStatus> {
-    const generation = ++this.connectGeneration;
+  private async connectInner(req: ConnectRequest): Promise<DeviceConnectStatus> {
+    // Capture AFTER the teardown, not before: `disconnect()` bumps `sessionGeneration` itself (as
+    // its first statement), so capturing here before calling it would read a generation that is
+    // stale the instant `disconnect()` returns — on EVERY connect, not just a raced one. That
+    // would silently disable the #164 guard below (`generation === this.sessionGeneration` would
+    // never be true), leaving a failed connect's claim standing forever. Two racing connects still
+    // separate correctly this way: each captures only after ITS OWN `disconnect()` has bumped the
+    // counter, so the loser's capture is strictly behind the winner's.
     await this.disconnect();
+    const generation = ++this.sessionGeneration;
     // A bare call (no ip, no explicit useAdb) reconnects the last target — all-or-nothing, so that
     // supplying just an ip still means WiFi (never adb) and supplying useAdb still means USB. Capture
     // the prior target BEFORE we overwrite this.lastTarget below.
@@ -695,7 +770,12 @@ export class DeviceConnectionManager {
       transport: this.transport,
       // The advice keys off the DEVICE port, not the host end of the tunnel: an ECONNREFUSED on a
       // derived 127.0.0.1:9097 still means "nothing is listening on 9095 over there".
-      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
+      //
+      // Guarded on the generation: this callback is live from construction, not from when
+      // `connect()` resolves, so a `disconnect()` landing while `client.connect()` below is still
+      // in flight must not have this stale callback write status onto the manager AFTER the
+      // teardown already ran (#506).
+      onState: (s, d) => { if (generation !== this.sessionGeneration) return; this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
     let landed = await this.client.connect();
@@ -725,41 +805,78 @@ export class DeviceConnectionManager {
             + `owns ${found.port} — re-targeting, since every device_* call would otherwise drive the `
             + `wrong app (#88/#283).`);
         }
-        this.retargetIdentity();
-        try {
-          // Hang up on the wrong app BEFORE re-targeting. Two live lease clients over one host
-          // port would both hold sockets through the same forward rule, and the one we are
-          // abandoning is exactly the app we do not want driven.
-          try { await this.client.disconnect(); } catch { /* already dead is fine */ }
-          adbRunner.forward(port, serial, found.port);
-          this.transport = new TcpLeaseTransport(host, port);
-          this.client = new DeviceLeaseClient({
-            guid: this.guid,
-            transport: this.transport,
-            onState: (st, d) => { this.state = st; this.detail = explainConnectFailure(d, found.port, useAdb, debugBuild); },
-          });
-          this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
-          landed = await this.client.connect();
-          if (landed === 'connected') {
-            console.warn(`[device] the app is listening on ${found.port}, not the default ${devicePort} `
-              + `(${found.pkg} — it lost the bind race, #283). Connected there.`);
-            // Verify the app that ANSWERED is the one we aimed at. The port already belongs to the
-            // foreground app's uid, so this should always agree — but "should" is what #88 was too,
-            // and a lease pointed at a sibling game answers every later call plausibly and wrongly.
-            //
-            // Only when the bridge NAMES itself: a pre-#88 build reports null, and refusing or
-            // crying mismatch on "could not look" would break every older build for no signal.
-            const answering = await this.deviceAppId();
-            if (answering && answering !== found.pkg) {
-              console.warn(`[device] ⚠️ discovered port ${found.port} for ${found.pkg}, but the app `
-                + `answering is ${answering}. device_* calls will drive ${answering} — disconnect and `
-                + `relaunch the app you meant (#88/#283).`);
+        // #506 — an external `disconnect()` can land while any of the awaits below (this client's
+        // own hangup, the retry's `client.connect()`) are in flight. It already bumped
+        // `sessionGeneration`, tore down `this.client`/`this.transport`/`this.target` and released
+        // the claim; resuming past this point must not undo any of that. So the WHOLE rediscovery
+        // — including the retarget and the old client's hangup, not just the new client's install —
+        // is gated on the generation still matching: stale, skip it entirely (no retarget, no
+        // hangup, no forward, no new client) and leave `landed` exactly as it was. The retarget and
+        // hangup below could not be shown to race in practice (whatever wakes this continuation is
+        // `disconnect()` tearing down `this.client`, which is what this block is about to touch
+        // anyway) — this is a defensive placement, not a reproduced bug.
+        if (generation === this.sessionGeneration) {
+          this.retargetIdentity();
+          try {
+            // Hang up on the wrong app BEFORE re-targeting. Two live lease clients over one host
+            // port would both hold sockets through the same forward rule, and the one we are
+            // abandoning is exactly the app we do not want driven.
+            try { await this.client.disconnect(); } catch { /* already dead is fine */ }
+            adbRunner.forward(port, serial, found.port);
+            // Built into LOCALS and published only after the generation is re-checked below — see
+            // there. Assigning straight onto `this.transport`/`this.client` here would leave a
+            // window where a concurrent `disconnect()` sees a half-installed session, and (per the
+            // trap this whole fix exists for) would lose the local handle needed to hang this
+            // client up if it turns out superseded.
+            const transport = new TcpLeaseTransport(host, port);
+            const client = new DeviceLeaseClient({
+              guid: this.guid,
+              transport,
+              // Same reasoning as the primary `onState` above: live from construction, so a
+              // superseded client must not write status onto a manager that has already moved on.
+              onState: (st, d) => { if (generation !== this.sessionGeneration) return; this.state = st; this.detail = explainConnectFailure(d, found.port, useAdb, debugBuild); },
+            });
+            const landedRetry = await client.connect();
+            if (generation === this.sessionGeneration) {
+              this.transport = transport;
+              this.client = client;
+              this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
+              landed = landedRetry;
+              if (landed === 'connected') {
+                console.warn(`[device] the app is listening on ${found.port}, not the default ${devicePort} `
+                  + `(${found.pkg} — it lost the bind race, #283). Connected there.`);
+                // Verify the app that ANSWERED is the one we aimed at. The port already belongs to
+                // the foreground app's uid, so this should always agree — but "should" is what #88
+                // was too, and a lease pointed at a sibling game answers every later call plausibly
+                // and wrongly.
+                //
+                // Only when the bridge NAMES itself: a pre-#88 build reports null, and refusing or
+                // crying mismatch on "could not look" would break every older build for no signal.
+                const answering = await this.deviceAppId();
+                if (answering && answering !== found.pkg) {
+                  console.warn(`[device] ⚠️ discovered port ${found.port} for ${found.pkg}, but the app `
+                    + `answering is ${answering}. device_* calls will drive ${answering} — disconnect and `
+                    + `relaunch the app you meant (#88/#283).`);
+                }
+              }
+            } else {
+              // Superseded while `client.connect()` was in flight. Unwind what we just built
+              // rather than publish it: hang up the local client only. Do NOT also remove the
+              // forward rule (`tcp:<port>`, the host-port-scoped constant this whole manager
+              // shares) — `port`/`serial` are the SAME for every connect on this manager, so
+              // whoever superseded us has, by construction, already re-forwarded that exact rule
+              // to their own live session; removing it here would tear down a WINNER's tunnel out
+              // from under it (every `device_*` call then fails against a session that still
+              // reports 'connected'), which is strictly worse than the leak this unwind exists to
+              // avoid. Reclaiming the forward belongs to whoever OWNS the session — `disconnect()`
+              // already does that for its own — never to a superseded continuation.
+              try { await client.disconnect(); } catch { /* already dead is fine */ }
             }
+          } catch (e) {
+            // Keep the ORIGINAL failure as the reported one: this retry is a bonus attempt, and
+            // replacing "the app never answered" with "adb forward failed" would hide the real cause.
+            console.warn(`[device] port rediscovery failed: ${e instanceof Error ? e.message : String(e)}`);
           }
-        } catch (e) {
-          // Keep the ORIGINAL failure as the reported one: this retry is a bonus attempt, and
-          // replacing "the app never answered" with "adb forward failed" would hide the real cause.
-          console.warn(`[device] port rediscovery failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
@@ -783,14 +900,19 @@ export class DeviceConnectionManager {
     // Whether the event loop really orders it that way is delicate and I did not reproduce it; the
     // guard costs one integer compare and makes the question moot, which is the right trade for a
     // failure whose blast radius is "two clones drive one phone".
-    if (landed !== 'connected' && generation === this.connectGeneration) this.releaseClaim();
+    if (landed !== 'connected' && generation === this.sessionGeneration) this.releaseClaim();
     // The app may be alive on a FALLBACK port. Ask the phone before leaving the caller with a
     // message that guesses — this is the one cause `explainConnectFailure` cannot infer from a
     // socket outcome, and the app prints it (bug `OikQcN8V5NMH0xUr9UnK`). Done HERE rather than in
     // `onState` because it needs an await, and only on a failed adb connect so the happy path pays
     // nothing. Best-effort: the sniffer swallows its own errors, so a wedged adb leaves the
     // original message rather than replacing one failure with two.
-    if (landed !== 'connected' && useAdb && this.state !== 'connected') {
+    // Guarded on the generation too (#506): without it, a superseded continuation whose external
+    // `disconnect()` already settled `state:'disconnected', detail:undefined` would still run the
+    // logcat dump and write a stale "nothing is listening" detail back onto a manager that has
+    // already moved on. `this.state !== 'connected'` alone only shields a LIVE session's detail
+    // from this write, not a torn-down one's.
+    if (landed !== 'connected' && useAdb && this.state !== 'connected' && generation === this.sessionGeneration) {
       const sniffed = parseBoundBridgePort(await adbRunner.logcatDump(serial), devicePort);
       if (sniffed) this.detail = explainConnectFailure(this.detail, devicePort, useAdb, debugBuild, sniffed);
     }
@@ -885,16 +1007,22 @@ export class DeviceConnectionManager {
   }
 
   async disconnect(): Promise<DeviceConnectStatus> {
-    if (this.client) { try { await this.client.disconnect(); } catch { /* */ } }
-    // Reclaim the adb-forward rule this connection created (L10) — an un-removed `tcp:<port>`
-    // forward outlives the editor and can mask a device swap (127.0.0.1 keeps answering the old
-    // tunnel). Best-effort; a re-connect re-adds the idempotent rule anyway. Targeted at the SAME
-    // serial the forward was created with (#149): un-targeted, this errors out on a two-phone Mac
-    // and leaves the rule behind — the mask it exists to prevent.
-    if (this.target?.useAdb) {
-      try { adbRunner.removeForward(this.target.port, this.target.serial); }
-      catch { /* forward may already be gone / adb absent — non-fatal */ }
-    }
+    // Bumped FIRST, before any await below, so anything already suspended on this manager's prior
+    // session (a racing `connect()`'s rediscovery block, its `onState` callback) is superseded
+    // immediately rather than after this call's own awaits land.
+    this.sessionGeneration++;
+    // #527 — every SYNCHRONOUS field write happens BEFORE the one await this call makes. This used
+    // to null `client`/`transport`/`target` only AFTER `await this.client.disconnect()` returned,
+    // which meant a teardown suspended there resumed and wiped whatever those fields held at that
+    // LATER moment — not necessarily what it captured them as. A second `connect()` racing in during
+    // that suspension publishes its own live client onto those same fields; the resumed teardown then
+    // nulled the newer connect's client instead of its own, leaving that newer client's socket open
+    // and unreachable (this method only ever hangs up `this.client`, and `this.client` was no longer
+    // the one it meant to hang up). Capturing the client/target into locals FIRST, and doing every
+    // field write before the await, closes that window: nothing this call does after the await can
+    // observe or clobber a session that arrived later.
+    const client = this.client;
+    const target = this.target;
     // The CDP session is reached through a SECOND, separate adb forward (its own per-clone port),
     // and the lease used to leave both it and its socket standing — so releasing the phone left a
     // cached session and a tunnel still aimed at it (#160). Unconditional, not gated on `useAdb`:
@@ -902,7 +1030,30 @@ export class DeviceConnectionManager {
     // phone — or to one reached by IP — must not inherit the previous device's route. Cheap when
     // there is nothing to drop, and `disconnect()` runs at the head of every connect.
     resetDeviceCdpSession();
-    this.releaseClaim();
+    // The claim is held ACROSS the hangup, ON PURPOSE. Releasing it before `client.disconnect()`
+    // resolves would empty the machine-wide claims file while `DeviceLeaseAuthority` still records
+    // our guid as the live lease owner: a sibling clone polling `device_list` then passes the claim
+    // gate, connects with a different guid, and reaches `DeviceLeaseAuthority.connect`'s
+    // `{ok:false, reason:'busy'}` — which the client documents as "human must resolve (error
+    // dialog)", not a retryable state. `client.disconnect()` can block the full
+    // `REQUEST_TIMEOUT_MS` (5s) when the phone stopped answering, and `socketDropped` then starts
+    // `LEASE_GRACE_MS` (5s) on top of that — so an early release leaves the sibling refused for
+    // ~10s with the WRONG error. Holding the claim across the hangup instead means a sibling is
+    // refused at the CLAIM level — the good failure #149 exists to produce, naming the clone that
+    // holds it. So the actual `releaseDevice()` call moves to AFTER the hangup and after
+    // `removeForward` below.
+    //
+    // The FIELD write stays here, synchronous, before the await — that is the separate #527 rule
+    // (no manager-STATE write after an await): capture the claim id into a local and null the field
+    // now, so a stale continuation resuming later can never observe the field again. That does NOT
+    // by itself mean it can never RELEASE a newer session's claim: `releaseDevice()` releases by
+    // `(deviceId, pid)`, and every session in this process shares one pid, so a stale continuation
+    // holding the OLD claim id in its local can still call `releaseDevice(claimId)` after a newer
+    // `connect()` on this same manager has re-claimed that same device id. The release call below
+    // additionally checks ownership against the CURRENT field before releasing, which is what
+    // actually closes that window.
+    const claimId = this.claimedDeviceId;
+    this.claimedDeviceId = null;   // synchronous — the stale-continuation rule is about FIELD writes
     this.client = null;
     this.transport = null;
     this.state = 'disconnected';
@@ -913,7 +1064,35 @@ export class DeviceConnectionManager {
     this.hardware = { deviceModel: null, osVersion: null };
     this.platformResolved = false;
     this.platformInFlight = null;
-    return this.status();
+    // Snapshot the return value HERE, before the await below — so this call reports its OWN
+    // disconnected status, not whatever a newer session has published onto the manager by the time
+    // the hangup below finishes.
+    const result = this.status();
+    if (client) { try { await client.disconnect(); } catch { /* */ } }
+    // Reclaim the adb-forward rule this connection created (L10) — an un-removed `tcp:<port>`
+    // forward outlives the editor and can mask a device swap (127.0.0.1 keeps answering the old
+    // tunnel). Best-effort; a re-connect re-adds the idempotent rule anyway. Targeted at the SAME
+    // serial the forward was created with (#149): un-targeted, this errors out on a two-phone Mac
+    // and leaves the rule behind — the mask it exists to prevent. Uses the captured LOCAL `target`,
+    // not `this.target` (already null above) — and, for the same #527 reason, not whatever a newer
+    // connect() may have published there since.
+    //
+    // Removed BEFORE the claim is handed back, below: a sibling that re-claims and re-forwards the
+    // same host port to the same serial would pass `removeForward`'s ownership check, so a later
+    // removal here would strip ITS live rule instead of ours.
+    if (target?.useAdb) {
+      try { adbRunner.removeForward(target.port, target.serial); }
+      catch { /* forward may already be gone / adb absent — non-fatal */ }
+    }
+    // The actual external release, on the captured local — not `releaseClaim()`, which reads
+    // `this.claimedDeviceId` (already nulled above) and would be a no-op here. Gated on OWNERSHIP,
+    // not merely on `claimId` being set: `this.claimedDeviceId === claimId` means a newer `connect()`
+    // on this same manager has already re-claimed this exact device (not ours to release); null or a
+    // different id means ours is still the one to hand back. A plain generation check would be
+    // wrong here — a second bare `disconnect()` call (no reconnect after) has its own `claimId`
+    // already null, and a generation check would then wrongly skip releasing the still-valid claim.
+    if (claimId && this.claimedDeviceId !== claimId) { try { releaseDevice(claimId); } catch { /* a claims file we cannot write must never block a disconnect */ } }
+    return result;
   }
 
   /** Which PLATFORM the app holding this lease runs on (`'ios'` / `'android'` / `'web'`), or null

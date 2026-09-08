@@ -8,7 +8,7 @@
  * same IParticleBackend contract — this module is intentionally renderer-agnostic.
  */
 
-import { spriteFrameIndex, type ParticleEffectDef, type RGB } from './types';
+import { resolveTrailSegments, resolveTiles, spriteFrameIndex, type ParticleEffectDef, type RGB } from './types';
 import { makeRng, randRange, sampleCurve, sampleGradientAlpha, sampleGradientColor } from '../core/curves';
 import { resolveCollider, collide, type CollisionHit } from './colliders';
 import { resolveShape, samplePolyline, type ResolvedShape } from './emitterShapes';
@@ -112,7 +112,7 @@ export class CpuParticleSim {
     this.recordBirths = !!def.subEmitters?.some((s) => s.trigger === 'birth');
     this.recordDeaths = !!def.subEmitters?.some((s) => s.trigger === 'death');
     this.trailEnabled = !!def.trail?.enabled;
-    this.trailSeg = Math.max(2, def.trail?.segments ?? 8);
+    this.trailSeg = resolveTrailSegments(def.trail?.segments);
     this.trailOut = trailOut ?? null;
     this.trailHist = this.trailEnabled ? new Float32Array(this.max * this.trailSeg * 3) : new Float32Array(0);
     this.px = new Float32Array(this.max);
@@ -497,7 +497,7 @@ export class CpuParticleSim {
     const grad = def.colorOverLife;
     const sc = this.scratch;
     const r = def.render;
-    const tileCount = Math.max(1, (r.tilesX ?? 1) * (r.tilesY ?? 1));
+    const tileCount = resolveTiles(r.tilesX) * resolveTiles(r.tilesY);
     const spriteMode = r.spriteMode ?? 'once';
     const spriteCycles = r.spriteCycles ?? 1;
     const randomStart = r.spriteRandomStart ?? false;

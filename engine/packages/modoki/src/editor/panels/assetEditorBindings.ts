@@ -12,10 +12,15 @@
  *    content (duration 7) while the renamed file kept the old (duration 2). Your edits go
  *    to a zombie and the asset you renamed silently stops receiving them.
  *
- *  Neither fails; a file simply appears, so nothing reports it. The Assets panel already
- *  fixes its own SELECTION at every one of these sites — this is the same repair one layer
- *  down, and the reason it is a shared module rather than five inline blocks is that the
- *  first version of this fix covered `executeDeletion` alone and missed the other four.
+ *  Neither fails; a file simply appears, so nothing reports it. The reason this is a shared
+ *  module rather than five inline blocks is that the first version of this fix covered
+ *  `executeDeletion` alone and missed the other four.
+ *
+ *  ⚠️ **This header used to claim "the Assets panel already fixes its own SELECTION at every one
+ *  of these sites".** It did not — exactly ONE of thirteen move sites repaired the selection
+ *  (`handleRename`), and `assetUndo.ts` had zero selection references at all. That claim was the
+ *  reason selection stayed out of this module for so long, so it is corrected rather than
+ *  deleted: the repair is now `applyMovesToSelection`, below, inside the seam (#867).
  *
  *  ⚠️ **The BINDING is only half of it now (#259).** While the panels autosaved, closing the
  *  panel ended the story: nothing else held the path. Now the panel parks its document in the
@@ -31,54 +36,87 @@
  *  `openAssetInEditor` binds by it — so there is no normalization to get wrong; if that
  *  ever stops being true this needs a shared canonicalizer, not a looser match here. */
 
-import { useEditorStore } from '../store/editorStore';
-import { getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets } from '../scene/dirtyAssets';
+import { useEditorStore, type SelectedAsset, type EditingAssetField } from '../store/editorStore';
+import {
+  getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
+} from '../scene/dirtyAssets';
+import {
+  getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline, stampMetaReadPath,
+} from '../scene/pendingMeta';
+import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
+import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
+
+/** The display name a repaired item should carry after `move`.
+ *
+ *  ⚠️ **A repair must not invent a name.** Three formats are already in play for this field: the
+ *  manifest's display name (`AssetEntry.name`, e.g. `Cutscene.Timeline`) when you click an asset,
+ *  and the bare STEM (`planRename`'s `base` — `toPath = dir/base + ext`, so `run`, not
+ *  `run.spriteanim.json`) when you rename one. A first cut of #867's selection repair derived the
+ *  basename-with-extension, which is a THIRD format and matches neither.
+ *
+ *  The rule that is right in every case: **a move only changes the name when it renamed this exact
+ *  path.** A relocation — a drag into a folder, a cut/paste, a folder move — leaves every basename
+ *  untouched, so the existing name is already correct and must be kept.
+ *
+ *  `m.name` is preferred when the move supplies one, but ONLY on an exact match: for a `prefix`
+ *  move `m.name` is the FOLDER's new name, and applying it to a child would rename every file in a
+ *  moved folder to the folder's name. When no name is supplied and the basename genuinely changed
+ *  — which is what an agent rename through `/api/move-file` looks like, since the route has no
+ *  display-name convention to send — the stem is derived from the DESTINATION.
+ *
+ *  ⚠️ That derivation is *not* identical to `planRename`'s `base`, and an earlier draft of this
+ *  comment claimed it was. `planRename` splits the extension off the SOURCE and reuses it
+ *  (`toPath = dir + base + ext`); this splits the DESTINATION. They diverge when a rename crosses a
+ *  compound-extension boundary: renaming `index.json` to `level.court` gives
+ *  `planRename.base = 'level.court'` and `toPath = …/level.court.json`, while `splitAssetPath` sees
+ *  the compound `.court.json` and returns `'level'`. Cosmetic — one rename can show `level.court`
+ *  in the Inspector and `level` in a panel header — and only reachable on the panel path, where
+ *  `m.name` wins anyway. Recorded rather than fixed: matching `planRename` needs the SOURCE
+ *  extension, which a repair applied to an arbitrary path does not have.
+ *
+ *  Returns `undefined` for "keep the name you already have" — which is what
+ *  `remapEditingAssetPath`'s own `name ?? cur.name` already means, so the binding path needs no
+ *  current-name argument it does not have. */
+export function repairedName(from: string, to: string, move: PathMove): string | undefined {
+  // Only an EXACT match may take the move's own name; on a `prefix` move it belongs to the folder.
+  if (from === move.from && move.name != null) return move.name;
+  const fromBase = from.slice(from.lastIndexOf('/') + 1);
+  const toBase = to.slice(to.lastIndexOf('/') + 1);
+  if (fromBase === toBase) return undefined;  // relocated, not renamed — the name still fits
+  return splitAssetPath(to).base;
+}
 
 /** One editor's binding: the store field naming its asset, and the action that clears it. */
 export interface AssetEditorBinding {
   /** Human-readable, for the console line — none of this should happen silently. */
   readonly label: string;
-  readonly assetField: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
-    | 'editingAnimationAsset' | 'editingTimelineAsset';
+  readonly assetField: EditingAssetField;
   readonly close: 'closeParticleEditor' | 'closeSpriteAnimEditor' | 'closeSkinEditor'
     | 'closeAnimationEditor' | 'closeTimelineEditor';
 }
 
-/** Every asset editor that binds to a file. Adding a sixth means adding it HERE — a new
- *  editor that forgets this line resurrects deleted assets exactly like the first five did. */
-export const ASSET_EDITOR_BINDINGS: readonly AssetEditorBinding[] = [
-  { label: 'particle', assetField: 'editingParticleAsset', close: 'closeParticleEditor' },
-  { label: 'sprite animation', assetField: 'editingSpriteAnimAsset', close: 'closeSpriteAnimEditor' },
-  { label: 'skin', assetField: 'editingSkinAsset', close: 'closeSkinEditor' },
-  { label: 'animation', assetField: 'editingAnimationAsset', close: 'closeAnimationEditor' },
-  { label: 'timeline', assetField: 'editingTimelineAsset', close: 'closeTimelineEditor' },
-];
+/** ⚠️ **A `Record` keyed by the union, NOT an array — and that is what makes "adding a sixth means
+ *  adding it HERE" true rather than merely asserted.** It was `readonly AssetEditorBinding[]`, and
+ *  an array literal is never checked for exhaustiveness over a union one of its element FIELDS
+ *  uses: a sixth `EditingAssetField` compiled green with a five-row table, and a missing row here
+ *  is #186 exactly — delete the bound asset and the parked write resurrects it on the next Cmd+S.
+ *  Keyed, a missing row is a compile error at this line. */
+export type AssetEditorBindings = Readonly<Record<EditingAssetField, AssetEditorBinding>>;
 
-/** What happened to a path. `to: null` means the asset is GONE (delete) → unbind; a string
- *  means it MOVED → remap, because the asset survives (its GUID and `.meta.json` sidecar
- *  move with it) and only its location changed. `prefix` makes it a FOLDER operation,
- *  matching the folder itself and everything beneath it. */
-export interface PathMove {
-  readonly from: string;
-  readonly to: string | null;
-  readonly prefix?: boolean;
-  /** Replacement display name, when the caller knows it (an asset rename). */
-  readonly name?: string;
-}
+/** Every asset editor that binds to a file. Adding a sixth means adding it HERE — a new editor that
+ *  forgets this line resurrects deleted assets exactly like the first five did — and since this is
+ *  keyed by `EditingAssetField`, forgetting it is now a COMPILE ERROR rather than a promise. */
+export const ASSET_EDITOR_BINDINGS_BY_FIELD: AssetEditorBindings = {
+  editingParticleAsset: { label: 'particle', assetField: 'editingParticleAsset', close: 'closeParticleEditor' },
+  editingSpriteAnimAsset: { label: 'sprite animation', assetField: 'editingSpriteAnimAsset', close: 'closeSpriteAnimEditor' },
+  editingSkinAsset: { label: 'skin', assetField: 'editingSkinAsset', close: 'closeSkinEditor' },
+  editingAnimationAsset: { label: 'animation', assetField: 'editingAnimationAsset', close: 'closeAnimationEditor' },
+  editingTimelineAsset: { label: 'timeline', assetField: 'editingTimelineAsset', close: 'closeTimelineEditor' },
+};
 
-/** Where `path` ends up under `move`, or `undefined` if the move does not touch it.
- *  `null` = gone. Exported for the test that pins folder-prefix matching. */
-export function applyMove(path: string, move: PathMove): string | null | undefined {
-  if (move.prefix) {
-    // Segment-boundary match ONLY: renaming `/assets/anim` must not capture
-    // `/assets/animations/x.json`, which a bare startsWith would.
-    if (path !== move.from && !path.startsWith(move.from + '/')) return undefined;
-    if (move.to === null) return null;
-    return move.to + path.slice(move.from.length);
-  }
-  if (path !== move.from) return undefined;
-  return move.to;
-}
+/** The same five, as a list — every consumer iterates, and the ORDER is this one. Derived, so it
+ *  cannot drift from the keyed table above. */
+export const ASSET_EDITOR_BINDINGS: readonly AssetEditorBinding[] = Object.values(ASSET_EDITOR_BINDINGS_BY_FIELD);
 
 export interface BindingChange<T> { readonly binding: T; readonly to: string | null; readonly name?: string }
 
@@ -101,7 +139,11 @@ export function resolveBindingMoves<T extends { readonly label: string }>(
       const to = applyMove(b.path, m);
       if (to === undefined) continue;      // this move doesn't touch this binding
       if (to === b.path) break;            // moved onto itself — nothing to do
-      out.push({ binding: b, to, name: m.name });
+      // NOT `m.name`: the route's repair (#867) carries no name, and `remapEditingAssetPath`'s
+      // `name ?? cur.name` then kept the OLD one — so renaming a bound asset through the panel
+      // left the editor's header showing the previous filename, because the route's repair ran
+      // first and the panel's own name-carrying call then found the binding already moved.
+      out.push({ binding: b, to, name: to === null ? undefined : repairedName(b.path, to, m) });
       break;
     }
   }
@@ -136,6 +178,19 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
     }
   }
   const notes: string[] = [];
+  // Remap the flushed-record maps BEFORE discarding, using the same list of moves and the same
+  // "first matching move wins" rule as the loop above. `discardDirtyAssets` below calls
+  // `forgetFlushedHash(from)` — correct when an edit is being DISCARDED, wrong when the file is
+  // merely MOVING. Remapping first means the record has already left `from`, so that call
+  // becomes a harmless no-op and the record survives at `to`.
+  remapFlushedAssetRecords((path) => {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;
+      return to;
+    }
+    return undefined;
+  });
   // Drop every source path FIRST, so a rename onto a path that is itself parked cannot be
   // undone by its own discard landing after the new entry.
   for (const { from } of planned) discardDirtyAssets([from]);
@@ -143,10 +198,146 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
     if (to === null) {
       notes.push(`dropped the unsaved edit parked for ${from} (its asset was deleted)`);
     } else if (doc) {
-      markAssetDirty(to, doc.type, doc.data, doc.origin);
+      // Carry the CAS baseline (ifMatch) across too — this is the only cross-path re-park in the
+      // tree, so "omitted ifMatch preserves what's parked at the destination" (markAssetDirty's
+      // rule for same-path re-parks) is the wrong default here. A rename doesn't change bytes
+      // (renameSync), so the sha256 captured at `from` still describes the file at `to`.
+      markAssetDirty(to, doc.type, doc.data, doc.origin, doc.ifMatch);
       notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
     }
   }
+  notes.push(...applyMovesToParkedMeta(list));
+  return notes;
+}
+
+/** The same rule for PARKED IMPORT SETTINGS (`.meta.json`, #845) — a move carries the edit, a
+ *  delete drops it.
+ *
+ *  ⚠️ This is not a nicety, it is a regression this range would otherwise ship. Before parking,
+ *  every `.meta.json` edit wrote immediately, so no pending edit could outlive its path. Now one
+ *  can, and `pendingMeta` is keyed by ASSET PATH with nothing migrating those keys:
+ *
+ *   - **Delete** `foo.png` with a parked Max Size change → the next Cmd+S POSTs `/api/write-meta`
+ *     for a path with no asset. `resolveAssetPath` is a roots/traversal guard with no existence
+ *     check and `assertSidecarWritable` only checks the format version, so the write SUCCEEDS and
+ *     recreates a committed `foo.png.meta.json` beside a file that no longer exists — a
+ *     resurrection, exactly as the sibling's docblock above describes for asset docs.
+ *   - **Rename** `foo.png`→`bar.png` → the park stays keyed to `foo.png`: an orphan sidecar is
+ *     written AND `bar.png` never receives the edit.
+ *
+ *  Folded into `applyMovesToParkedAssets` rather than given its own call site, because the two
+ *  registries must move together — a caller that remembered one and forgot the other is precisely
+ *  how this gap appeared.
+ *
+ *  ⚠️ **The CAS baseline is CARRIED, not dropped** — and an earlier version of this comment argued
+ *  the opposite ("the first write at the new path is unconditional-but-informed"). `#854` settled
+ *  it for the sibling registry on the same day and the reasoning transfers exactly: at a new key,
+ *  *"preserve what is here"* and *"carry what came from there"* are different answers, and dropping
+ *  the baseline turns the compare-and-swap OFF for the rest of the session — precisely the
+ *  git-checkout hazard it exists for, on a path the human just renamed and is therefore actively
+ *  working on. A rename moves the sidecar's BYTES unchanged, so the old baseline is still a true
+ *  statement about the file at its new name; there is nothing to re-derive and no reason to
+ *  distrust it. See `remapFlushedAssetRecords` in `dirtyAssets.ts` for the sibling's version.
+ *
+ *  ⚠️ **The AGENT move is covered now — #867 landed, and this paragraph used to say otherwise.**
+ *  `/api/move-file` and `/api/delete-asset` call the renderer back themselves
+ *  (`applyMovesInRenderer` in `editorBackendRouter.ts`), so an agent move re-parks the entry at its
+ *  new path carrying its baseline, and an agent delete DROPS the park — without which the next
+ *  Cmd+S recreated an orphan sidecar beside a file that no longer exists (`resolveAssetPath` is a
+ *  roots/traversal guard with NO existence check). The repair is wired to the MOVE rather than to
+ *  its call sites, which is what #867 was a CLASS issue about.
+ *
+ *  That callback is also the precedent the sidecar PARK GATE copies (#872/#882): a Node route
+ *  asking the renderer about `pendingMeta` before it touches a `.meta.json`. See
+ *  `metaParkGate` and `docs/mcp-persistence.md` § 5.
+ *
+ *  Exported for tests. */
+export function applyMovesToParkedMeta(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  // PLAN then apply, for the same chained-move reason spelled out in the sibling above.
+  const planned: { from: string; to: string | null; doc: unknown }[] = [];
+  for (const path of getPendingMetaPaths()) {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;
+      if (to !== path) planned.push({ from: path, to, doc: peekPendingMeta(path) });
+      break;
+    }
+  }
+  // Read the baselines BEFORE any discard — `discardPendingMeta` clears them with the park, which
+  // is right when an edit is genuinely abandoned and wrong here, where the entry is moving.
+  const carried = new Map<string, string | undefined>();
+  for (const { from } of planned) carried.set(from, peekMetaBaseline(from));
+  const notes: string[] = [];
+  for (const { from } of planned) discardPendingMeta([from]);
+  for (const { from, to, doc } of planned) {
+    if (to === null) {
+      notes.push(`dropped the unsaved import-settings edit parked for ${from} (its asset was deleted)`);
+    } else if (doc !== undefined) {
+      // ⚠️ RE-STAMP. The document is stamped with the path it was READ for (#891), and `parkMetaEdit`
+      // refuses a foreign stamp — which is exactly right for a panel holding the previous asset's
+      // document, and exactly wrong here. This is the one place a document legitimately changes
+      // which path it belongs to: the file MOVED, the parked edit moves with it, and the same
+      // human's same edit is still the one being carried. Saying so by re-stamping keeps the
+      // exception at the call site that knows why, rather than as a hole in the guard.
+      parkMetaEdit(to, stampMetaReadPath(doc as Record<string, unknown>, to), carried.get(from));
+      notes.push(`moved the unsaved import-settings edit parked for ${from} → ${to}`);
+    }
+  }
+  return notes;
+}
+
+/** Apply `moves` to the ASSET SELECTION — the Inspector's lead asset and the multi-select set.
+ *
+ *  Both are path-keyed, and until #867 exactly ONE of the move sites repaired them: `handleRename`
+ *  (`Assets.tsx`). `pasteClipboard`'s cut branch, `handleFilesDrop` and every one of `assetUndo.ts`'s
+ *  eight seam calls left the Inspector aimed at a path the file had left — and nothing self-heals,
+ *  because the panel's sync effect reacts to the STORE clearing the selection, never to the selected
+ *  path vanishing from a refreshed listing.
+ *
+ *  Concretely, with an atlas selected: drag it to another folder, click "+ Add member", and the edit
+ *  parks at the dead path with a stale CAS baseline; the next Cmd+S 409s, and the only forward exit
+ *  — Overwrite — recreates the file where it used to be. That is #186's fork, reached through the
+ *  selection instead of through a binding.
+ *
+ *  Repairing the STORE is enough for the panel too: `Assets.tsx`'s store→local effect already
+ *  repoints its own `selected` whenever `selectedAsset.path` differs from it.
+ *
+ *  Exported for tests; `applyAssetPathMoves` is the only production caller. */
+export function applyMovesToSelection(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  const state = useEditorStore.getState();
+  const { selectedAsset, selectedAssets } = state;
+  if (!selectedAsset && selectedAssets.length === 0) return [];
+
+  /** `undefined` = untouched, `null` = its file is gone, otherwise the repointed asset. */
+  const move = (a: SelectedAsset): SelectedAsset | null | undefined => {
+    for (const m of list) {
+      const to = applyMove(a.path, m);
+      if (to === undefined) continue;   // this move does not touch this asset
+      if (to === a.path) return undefined; // moved onto itself
+      if (to === null) return null;
+      return { ...a, path: to, name: repairedName(a.path, to, m) ?? a.name };
+    }
+    return undefined;
+  };
+
+  const notes: string[] = [];
+  const nextLead = selectedAsset ? move(selectedAsset) : undefined;
+  const nextList: SelectedAsset[] = [];
+  let listChanged = false;
+  for (const a of selectedAssets) {
+    const r = move(a);
+    if (r === undefined) { nextList.push(a); continue; }
+    listChanged = true;
+    if (r !== null) nextList.push(r);
+  }
+  if (nextLead === undefined && !listChanged) return notes;
+
+  const lead = nextLead === undefined ? selectedAsset : nextLead;
+  if (nextLead === null) notes.push(`cleared the Inspector selection (${selectedAsset!.path} was deleted)`);
+  else if (nextLead) notes.push(`repointed the Inspector selection to ${nextLead.path}`);
+  useEditorStore.getState().remapSelectedAssets({ selectedAsset: lead, selectedAssets: nextList });
   return notes;
 }
 
@@ -155,6 +346,11 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
  *  (see `applyMovesToParkedAssets`). Returns a short description per change (empty in the
  *  overwhelmingly common case where nothing bound or parked was touched). */
 export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
+  // `moves` is an Iterable and is consumed THREE times below (bindings, parked registries,
+  // the current-folder remap). A generator would be empty by the second read, silently
+  // skipping two of the three repairs. Every caller passes an array today, so this is a trap
+  // rather than a live bug — materialise once and it cannot become one.
+  const list = [...moves];
   const state = useEditorStore.getState();
   const bound = ASSET_EDITOR_BINDINGS.map((b) => ({ ...b, path: state[b.assetField]?.path }));
   const changes = resolveBindingMoves(bound, moves);
@@ -170,7 +366,20 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
     }
   }
   // Independently of the bindings: a parked write can belong to an asset whose panel is CLOSED.
-  notes.push(...applyMovesToParkedAssets(moves));
+  notes.push(...applyMovesToParkedAssets(list));
+  // Independently of BOTH of the above: the Assets panel's own "current folder" is also
+  // path-keyed state that must follow a move, and wiring it per call site is exactly the
+  // mistake this module's header already names — "the first version of this fix covered
+  // `executeDeletion` alone and missed the other four" — a third time, this time for
+  // `currentFolder` instead of a binding. `remapCurrentFolder` is a no-op unless `currentFolder`
+  // IS `from` or sits under it, so this is harmless for the overwhelming majority of moves
+  // (single-asset renames/cuts/deletes) where `currentFolder` names an unrelated folder.
+  for (const m of list) remapCurrentFolder(m.from, m.to);
+  // And independently of all three: the Inspector's own selection (#867 member 3). Same argument
+  // as `currentFolder` above — one site repaired it, twelve did not.
+  notes.push(...applyMovesToSelection(list));
+  // …and the folder-tree sets. Same argument again: three of thirteen sites remapped them by hand.
+  remapFolderSets(list);
   return notes;
 }
 

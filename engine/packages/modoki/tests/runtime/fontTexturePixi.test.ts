@@ -20,8 +20,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const unload = vi.fn(() => Promise.resolve());
 vi.mock('pixi.js', () => ({
   Assets: { unload },
-  Texture: class {},
-  CanvasSource: class {},
+  // A real-enough Texture: the #481 tests need `.destroy()` to actually flip `.destroyed`, since
+  // that flag is exactly what the guard under test reads.
+  Texture: class {
+    destroyed = false;
+    source: unknown;
+    constructor(opts: { source: unknown }) { this.source = opts.source; }
+    destroy() { this.destroyed = true; }
+  },
+  CanvasSource: class {
+    update = vi.fn();
+    constructor(opts: unknown) { Object.assign(this, opts); }
+  },
 }));
 
 /** One controllable in-flight load, so the two callers are genuinely concurrent. */
@@ -118,6 +128,50 @@ describe('getFontTexturePixi — concurrent renderers', () => {
   });
 });
 
+/** #828 — every test above uses a DIFFERENT `provider.id` per case and never resets the
+ *  module-level `cache`, so the key's `${provider.id}` discriminant has never actually been
+ *  asserted: a regression that dropped it from the key would still pass every test above
+ *  (each one only ever looks up the id it just built). This is the one that would catch it —
+ *  two providers, constructed in the SAME test, sharing the atlas-image cache map. */
+describe('per-provider discriminant — two providers, same page (#828)', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+
+  it('two providers with different ids get DISTINCT textures for the SAME page', async () => {
+    const a = provider('font-two-a');
+    const b = provider('font-two-b');
+
+    // The shared module-level `resolveLoad`/`rejectLoad` (used by every OTHER test in this file)
+    // only ever track the LATEST in-flight load, which can't drive two genuinely concurrent
+    // loads — so capture each call's own resolver instead.
+    let resolveA!: (t: unknown) => void;
+    let resolveB!: (t: unknown) => void;
+    loadPixiTexture.mockImplementationOnce(() => {
+      loadCalls++;
+      return new Promise((res) => { resolveA = res as typeof resolveA; });
+    });
+    loadPixiTexture.mockImplementationOnce(() => {
+      loadCalls++;
+      return new Promise((res) => { resolveB = res as typeof resolveB; });
+    });
+
+    expect(getFontTexturePixi(a, 0), 'nothing to draw yet for A').toBeNull();
+    expect(getFontTexturePixi(b, 0), 'nothing to draw yet for B').toBeNull();
+    // A shared `${...}:image` key (dropping provider.id) would route B's request onto A's
+    // already-in-flight load via `addWaiter` instead of starting a second one.
+    expect(loadCalls, 'a shared key would have joined B onto A\'s in-flight load').toBe(2);
+
+    const texA = fakeTexture();
+    const texB = fakeTexture();
+    resolveA(texA);
+    await vi.waitFor(() => expect(getFontTexturePixi(a, 0)).not.toBeNull());
+    resolveB(texB);
+    await vi.waitFor(() => expect(getFontTexturePixi(b, 0)).not.toBeNull());
+
+    expect(getFontTexturePixi(a, 0), 'a shared cache would hand B\'s texture back for A').toBe(texA);
+    expect(getFontTexturePixi(b, 0), 'a shared cache would hand A\'s texture back for B').toBe(texB);
+  });
+});
+
 /** Page 0's IMAGE texture must survive glyph generation.
  *
  *  A baked-seeded dynamic font bumps `atlasVersion` on every generated batch while serving page 0
@@ -163,9 +217,10 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
   const liveProvider = (id: string) =>
     new BakedFontProvider(id, {} as never, `/fonts/${id}~atlas.png`);
 
-  it('drops the entry when the load lands after invalidateFont disposed the provider', async () => {
+  it('drops the entry when the load lands after invalidateFont disposed the provider, and STILL wakes the waiter', async () => {
     const p1 = liveProvider('font-invalidated');
-    expect(getFontTexturePixi(p1 as never, 0), 'load in flight').toBeNull();
+    const wake = vi.fn();
+    expect(getFontTexturePixi(p1 as never, 0, wake), 'load in flight').toBeNull();
 
     // The human re-bakes the font: invalidateFont disposes p1 and re-acquires under the same guid.
     p1.dispose();
@@ -177,6 +232,18 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
 
     // The cleanup ran late instead of never: the entry is gone and the atlas is unloaded.
     expect(unload, 'the superseded atlas is released, not leaked').toHaveBeenCalledTimes(1);
+
+    // ⚠️ THE WAITER MUST STILL BE WOKEN, and an earlier version of this fix asserted the exact
+    // opposite. `waiters` is keyed by the font GUID, so it outlives the provider INSTANCE while
+    // the cache entry does not: the set can hold a waiter belonging to the live successor (p2
+    // below), queued behind p1's still-in-flight load. Not waking strands that renderer — the
+    // "texts are not rendered until I click the entity" bug the waiters set exists to prevent.
+    //
+    // It cannot loop: a woken repaint resolves its provider through `getLoadedFont(guid)`, and
+    // every disposal path deletes from `providers` synchronously, so the retry gets the LIVE
+    // provider or none — never the disposed p1 that landed here. Bounded at one iteration, which
+    // is what the `loadCalls === 2` assertion below measures.
+    expect(wake, 'a live successor may be queued behind this load — wake it').toHaveBeenCalledTimes(1);
 
     const p2 = liveProvider('font-invalidated');
     expect(getFontTexturePixi(p2 as never, 0), 'the DEAD provider’s atlas must not be served')
@@ -198,10 +265,120 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
     const dyn = Object.create(DynamicFontProvider.prototype) as typeof DynamicFontProvider.prototype;
     Object.assign(dyn, {
       disposables: [], glyphMap: new Map(), kern: new Map(), pages: [], ctxs: [],
+      // #635 fix 4: dispose() → cancelFlushRetry() now iterates `retryBatch` unconditionally
+      // (re-adding any still-pending cp to `requested` before clearing the timer) — a NEW field
+      // `dispose` touches, so it belongs on this list for the same reason the others are here.
+      retryBatch: new Set(),
     });
     dyn.dispose();
     const dynCleanup = vi.fn();
     dyn.addDisposable(dynCleanup);
     expect(dynCleanup, 'dynamic: same contract').toHaveBeenCalledTimes(1);
+  });
+});
+
+/** #481 — `addDisposable` on an ALREADY-disposed provider runs its callback SYNCHRONOUSLY
+ *  (asserted directly above). `getDynamicFontTexturePixi` mints a Texture, caches it, then calls
+ *  `provider.addDisposable(...)`, so a provider that is already disposed by the time this runs
+ *  destroys the texture it just minted and evicts it from the cache — all before the function
+ *  returns it. Latent today (nothing constructs a route from a disposed provider to here), so this
+ *  closes a contract hole rather than pins a reproduced failure.
+ *
+ *  ⚠️ The fake below MUST mirror `BakedFontProvider.addDisposable`'s real disposed-branch exactly
+ *  (`try { fn(); } catch {} `, called synchronously) — a fake that queued the callback instead
+ *  would vouch for the bug (this repo has a scar for exactly this class of fake). */
+describe('a dynamic texture built for an ALREADY-disposed provider (#481)', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+
+  function disposedDynamicProvider(id: string) {
+    return {
+      id,
+      atlasVersion: 1,
+      atlasCanvasAt: () => ({} as HTMLCanvasElement),
+      addDisposable: (fn: () => void) => {
+        // Mirrors BakedFontProvider.addDisposable's `if (this.disposed) { try { fn(); } catch {} return; }`
+        try { fn(); } catch { /* ignore */ }
+      },
+    } as never;
+  }
+
+  it('returns null instead of a destroyed Texture, and does not leave it cached', () => {
+    const p = disposedDynamicProvider('font-disposed');
+
+    const tex = getFontTexturePixi(p, 0);
+    expect(tex, 'a corpse texture must never be handed back').toBeNull();
+
+    // The cache must not retain the destroyed entry either — a later call must mint fresh (and,
+    // since the provider is still disposed, be destroyed again), never serve the dead one back.
+    const second = getFontTexturePixi(p, 0);
+    expect(second).toBeNull();
+  });
+});
+
+/** The cache-hit guard for the BAKED (image) path: `if (existing?.destroyed) cache.delete(key);
+ *  else if (existing) return existing;`. A destroyed page-0 image texture sitting in the cache
+ *  (its disposer did not evict it — e.g. something destroyed the Texture directly, bypassing
+ *  `provider.addDisposable`'s callback) must not be handed back; the cache must be evicted and a
+ *  fresh load started instead. */
+describe('a destroyed baked image texture already in the cache is evicted, not served (#481 sibling)', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+
+  it('evicts and starts a fresh load instead of returning the destroyed texture', async () => {
+    const p = provider('font-baked-destroyed');
+    const wake1 = vi.fn();
+    expect(getFontTexturePixi(p, 0, wake1), 'load in flight').toBeNull();
+
+    const tex1 = fakeTexture() as unknown as { source: unknown; destroyed?: boolean };
+    resolveLoad(tex1);
+    await vi.waitFor(() => expect(wake1).toHaveBeenCalled());
+    expect(getFontTexturePixi(p, 0), 'cached after landing').toBe(tex1);
+
+    // Destroy the texture WITHOUT going through the provider's disposer (a real
+    // `Texture.destroy()` flips `.destroyed`, but nothing here evicts the cache entry) — this
+    // is exactly the "disposer did not evict it" case the guard defends against.
+    tex1.destroyed = true;
+
+    const wake2 = vi.fn();
+    const result = getFontTexturePixi(p, 0, wake2);
+    expect(result, 'must not hand back the destroyed texture').not.toBe(tex1);
+    expect(result, 'a fresh load starts instead').toBeNull();
+    expect(loadCalls, 'a second load is kicked for the evicted entry').toBe(2);
+  });
+});
+
+/** #481's eviction branch in the DYNAMIC path (`getDynamicFontTexturePixi`) is unreachable by the
+ *  existing #481 suite: there, the disposer always runs (synchronously, on an already-disposed
+ *  provider) and evicts BEFORE destroying, so `tex?.destroyed` is never true at the top of the
+ *  function. Seed a destroyed texture that the disposer did NOT evict (bypassing it, same as the
+ *  baked case above) to actually exercise the branch. */
+describe('the dynamic-path eviction branch is reachable independently of the disposer (#481 coverage)', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+
+  function dynamicProvider(id: string) {
+    let disposeFn: (() => void) | undefined;
+    return {
+      id,
+      atlasVersion: 1,
+      atlasCanvasAt: () => ({} as HTMLCanvasElement),
+      addDisposable: (fn: () => void) => { disposeFn = fn; },
+      // exposed for the test only — not part of FontProvider
+      __runDispose: () => disposeFn?.(),
+    } as unknown as { id: string; atlasVersion: number; atlasCanvasAt: () => HTMLCanvasElement };
+  }
+
+  it('evicts a destroyed cached texture and mints a fresh, live one', () => {
+    const p = dynamicProvider('font-dynamic-destroyed');
+
+    const tex1 = getFontTexturePixi(p as never, 0) as unknown as { destroyed?: boolean } | null;
+    expect(tex1, 'first call mints a texture').not.toBeNull();
+
+    // Destroy it directly, WITHOUT running the registered disposer — the disposer is what
+    // normally evicts the cache entry, and this is the "eviction didn't happen" case.
+    (tex1 as { destroyed: boolean }).destroyed = true;
+
+    const tex2 = getFontTexturePixi(p as never, 0);
+    expect(tex2, 'must not be null').not.toBeNull();
+    expect(tex2, 'must not be the destroyed texture').not.toBe(tex1);
+    expect((tex2 as unknown as { destroyed?: boolean }).destroyed, 'the fresh texture is live').toBeFalsy();
   });
 });

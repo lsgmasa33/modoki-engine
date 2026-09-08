@@ -6,7 +6,10 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-vi.mock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => null }));
+// `onRendererLost` is required — frameDriver.ts subscribes to it UNCONDITIONALLY at module load
+// (the GPU-fault latch for #590 defect 3/6), so an incomplete mock throws "No onRendererLost
+// export" the moment anything here transitively imports frameDriver.
+vi.mock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => null, onRendererLost: () => () => {} }));
 vi.mock('../../src/runtime/rendering/resizeBus', () => ({ forceResizeAllSurfaces: () => {} }));
 vi.mock('../../src/runtime/core/frameProfiler', async (orig) => {
   const actual = await orig<typeof import('../../src/runtime/core/frameProfiler')>();
@@ -130,6 +133,7 @@ describe('choosePlayerQualityTier(null) — "Auto" must NOT discard the boot pro
     probeVerdictStore.provide({
       read: () => ({ fingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     setRenderSettings({ three: { qualityTier: 'auto' } });
 
@@ -169,6 +173,7 @@ describe('a player pin is not an ASSESSMENT — the promotion ceiling must not l
     probeVerdictStore.provide({
       read: () => ({ fingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     setRenderSettings({ three: { qualityTier: 'auto' } });
     // Launch 2: the stored pin is read before anything else and the probe never runs, so the

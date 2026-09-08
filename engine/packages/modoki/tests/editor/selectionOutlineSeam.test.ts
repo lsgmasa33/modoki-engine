@@ -28,7 +28,7 @@ async function setup() {
     worldTransforms: new Map(), deactivatedEntities: new Set(), transformPropagationSystem: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
-    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(),
+    getRiggedModel: vi.fn(() => undefined), ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   const { createWorld } = await import('koota');
   const traits = await import('../../src/runtime/traits');

@@ -6,5 +6,6 @@ export {
   JSON_ASSET_SUFFIX_TYPE,
   classifyJsonAssetSuffix,
   BINARY_EXT_TYPE,
+  classifyBinaryExt,
   ID_BEARING_TYPES,
 } from '../packages/modoki/src/runtime/loaders/assetTypeClassifier';

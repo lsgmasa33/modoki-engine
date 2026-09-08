@@ -17,8 +17,9 @@
  *  the `userData` assignment must come first) needs an allowlist entry stating why. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
 
@@ -43,41 +44,47 @@ const EXEMPT: Array<{ file: string; contains: string; why: string }> = [
   // `applyLightMask` hands it a `markDerived` clone whenever the mesh is tinted or instanced.
 ];
 
-/** POSIX-normalised so the `EXEMPT` keys and the known-sites set below — both hand-authored with
- *  `/` — still match on Windows, where `relative()` returns backslashes. This guard failed exactly
- *  that way on `ci/main`; the class is documented in `docs/windows.md` § Paths. */
-const toPosix = (p: string) => p.split(sep).join('/');
-
-function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === 'dist') continue;
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (p.endsWith('.ts') || p.endsWith('.tsx')) out.push(p);
-  }
-  return out;
+/** Every `.ts`/`.tsx` under `RUNTIME`, RUNTIME-relative POSIX — via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). `repoFiles()`'s own `rel` is repo-root-relative
+ *  (`engine/packages/modoki/src/runtime/...`); the prefix up to and including the one `runtime/`
+ *  segment is stripped by a plain string search, not a `path.relative`/`sep` round-trip — that
+ *  round-trip (this file's own former `toPosix`, instance 3 of the class docs/windows.md § Paths
+ *  records) is exactly the hazard `repoCorpus.mjs` removes by returning git's own POSIX `rel`
+ *  verbatim. Floored well under the 540 measured today. */
+function runtimeFiles(): Array<{ abs: string; rel: string }> {
+  const MARKER = '/runtime/';
+  return repoFiles({ under: RUNTIME, match: /\.tsx?$/, floor: 400 })
+    .map(({ abs, rel }) => {
+      // ⚠️ THROW rather than tolerate a miss. `indexOf` returns -1 when the marker is absent, and
+      // `slice(-1 + MARKER.length)` is a perfectly valid slice — it would hand back a truncated
+      // but plausible-looking path, every EXEMPT key would quietly stop matching, and the guard
+      // would go green having compared nothing. That is a wrong answer with no error, which is the
+      // precise failure this whole family exists to remove; it must not be reintroduced by the
+      // change removing it. Unreachable while `under` is RUNTIME, which is why it is a throw and
+      // not a fallback: if it ever fires, the assumption changed and the guard should stop.
+      const i = rel.indexOf(MARKER);
+      if (i === -1) {
+        throw new Error(
+          `materialCloneStamp: ${rel} is not under a "runtime/" segment, but \`under\` is RUNTIME `
+          + '— the enumeration root and this prefix strip have drifted apart.',
+        );
+      }
+      return { abs, rel: rel.slice(i + MARKER.length) };
+    });
 }
 
-/** Strip line comments and block-comment bodies so a doc paragraph ABOUT `base.clone()` — of
- *  which this change added several — is not read as a clone site. */
-function codeLines(src: string): Array<{ n: number; text: string }> {
-  const out: Array<{ n: number; text: string }> = [];
-  let inBlock = false;
-  src.split('\n').forEach((raw, i) => {
-    let line = raw;
-    if (inBlock) {
-      const end = line.indexOf('*/');
-      if (end === -1) return;
-      line = line.slice(end + 2);
-      inBlock = false;
-    }
-    const block = line.indexOf('/*');
-    if (block !== -1) { inBlock = line.indexOf('*/', block) === -1; line = line.slice(0, block); }
-    const slash = line.indexOf('//');
-    if (slash !== -1) line = line.slice(0, slash);
-    if (line.trim()) out.push({ n: i + 1, text: line });
-  });
-  return out;
+/**
+ * Non-blank lines of a file, with 1-based numbers, read through the shared scanner (#812).
+ *
+ * The private stripper this replaces was line-oriented and tracked no string state, so a `//`
+ * inside a URL truncated the rest of the line — lowering what a forbidden-pattern guard could see,
+ * which reads as a PASS.
+ */
+function codeLines(file: string): Array<{ n: number; text: string }> {
+  return readScannedSource(file).code
+    .split('\n')
+    .map((text, i) => ({ n: i + 1, text }))
+    .filter(({ text }) => text.trim());
 }
 
 /** The one file allowed to contain a raw material `.clone()`: the helper itself. */
@@ -92,10 +99,9 @@ describe('material clones carry the derived-base stamp', () => {
     // `tintedMaterial` and `applyPropOverride` were all doing while this guard was green. The rule
     // is now "use the helper", and the helper is the only place the raw clone may live.
     const raw: string[] = [];
-    for (const file of walk(RUNTIME)) {
-      const rel = toPosix(relative(RUNTIME, file));
+    for (const { abs: file, rel } of runtimeFiles()) {
       if (rel === HELPER_FILE) continue;
-      for (const { n, text } of codeLines(readFileSync(file, 'utf8'))) {
+      for (const { n, text } of codeLines(file)) {
         if (!CLONE.test(text)) continue;
         if (EXEMPT.some((e) => e.file === rel && text.includes(e.contains))) continue;
         raw.push(`${rel}:${n} — ${text.trim()}`);
@@ -118,9 +124,8 @@ describe('material clones carry the derived-base stamp', () => {
     // clone with the suite green.
     const sites: string[] = [];
     let helperStampsItsOwnClone = false;
-    for (const file of walk(RUNTIME)) {
-      const rel = toPosix(relative(RUNTIME, file));
-      for (const { text } of codeLines(readFileSync(file, 'utf8'))) {
+    for (const { abs: file, rel } of runtimeFiles()) {
+      for (const { text } of codeLines(file)) {
         if (rel === HELPER_FILE) {
           // The helper is where the ONE raw clone lives, and it must still stamp on that line.
           if (CLONE.test(text) && text.includes('markDerived')) helperStampsItsOwnClone = true;

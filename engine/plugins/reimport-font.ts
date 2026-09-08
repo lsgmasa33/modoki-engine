@@ -21,7 +21,6 @@ export const fontReimportHandler: ReimportHandler = async (sourceUrlPath, absPat
     settings,
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   meta.font = settings;
   meta.fontCache = {
     hash: result.hash,
