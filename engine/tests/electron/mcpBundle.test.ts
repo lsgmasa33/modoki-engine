@@ -144,6 +144,13 @@ describe('the SHIPPED modoki-mcp bundle (#945 B1)', () => {
       // into the output — a different name would diff on that line alone.
       const fresh = path.join(dir, path.basename(mcpOutfile));
       await esbuild.build({ ...mcpOpts, outfile: fresh, logLevel: 'silent' });
+      // ⚠️ **The message below carries a FIX and a WHY, and both halves are load-bearing — do not
+      // trim it to just the command.** Field-tested: this guard fired at the hub on its first
+      // `verify` after integrating a batch, on a `dist/` that clone had packaged long before,
+      // against MCP source that arrived in someone ELSE's branch. The hub reported that the
+      // "packaged editor spawns it / connectClaude.ts writes it into .mcp.json" half is what
+      // stopped them looking for a defect in the merged branch's diff. A red whose cause the
+      // reader cannot place gets attributed to the wrong change, or the gate gets disabled.
       expect(
         fs.readFileSync(mcpOutfile, 'utf8'),
         `${path.relative(here, mcpOutfile)} is STALE — it is not what the current source builds. `
