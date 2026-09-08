@@ -24,9 +24,9 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@capacitor/core": "^8.0.0",
+    "@capacitor/core": "^8.5.1",
     "rimraf": "^6.1.0",
-    "rollup": "^4.53.2",
+    "rollup": "^4.63.1",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
