@@ -1,6 +1,93 @@
 import Foundation
 import Capacitor
 import StoreKit
+import os
+
+/// os_log channel for the purchase timing probes (#580). Appears in Xcode's console with no
+/// filtering, and is readable off a device with `device_native_logs subsystem:'com.modoki.iap'`
+/// — `GameDebugPlugin.getNativeLogs` reads the same store.
+private let iapLog = Logger(subsystem: "com.modoki.iap", category: "purchase")
+
+/// Segment timings for ONE `purchase()` call (#580).
+///
+/// ⚠️ **Why this exists, and why it is not debug clutter to delete:** #580 measured every purchase
+/// on the iPhone 8 taking 20-40 REAL seconds to settle, and stayed open for want of an answer to
+/// "which await owned the wait". From JS the whole call is one opaque silence — a slow App Store
+/// fetch, a slow confirmation sheet and slow local verification are indistinguishable from the
+/// outside, which is exactly why the journal measurement in #580 could not root-cause anything.
+///
+/// Four marks partition that silence:
+///
+/// | mark | closes | reads as |
+/// |---|---|---|
+/// | `sched` | `purchase()` entry → the `Task` body actually running | main-actor / CPU starvation — #580's own wakeup-storm hypothesis, previously untestable |
+/// | `A` | → `Product.products(for:)` returned | a network round-trip, and it happens BEFORE Apple's sheet is raised |
+/// | `B` | → `product.purchase()` returned | StoreKit's sheet — **includes the human reading and tapping it** |
+/// | `C` | → `verified()` returned | local signature check, no network |
+///
+/// ⚠️ **Every exit path is marked, including the throw and both early rejects.** A MISSING line
+/// must be readable as "never got there" and never as "that path was not instrumented" — an
+/// unmarked branch would make the probe unable to detect its own positive case.
+///
+/// `.notice`, not `.info`/`.debug`, so the lines survive into the log store and show in Xcode
+/// unfiltered. A purchase is a rare, human-paced event, so a handful of lines costs nothing; this
+/// is deliberately not a per-frame probe.
+///
+/// Monotonic `DispatchTime`, never `Date()`: an NTP correction landing mid-purchase must not be
+/// able to invent or erase a stall.
+///
+/// `@unchecked Sendable` is a HANDOFF, not shared state: the probe is constructed on the caller's
+/// queue and then touched only from inside the one `Task` it was handed to, whose body is serial
+/// even across its awaits. Nothing else ever holds a reference. The package builds in Swift 5
+/// language mode (`swift-tools-version: 5.9`, no strict-concurrency flags), so this is belt and
+/// braces against the App target compiling it under stricter settings — not a silenced race.
+private final class PurchaseProbe: @unchecked Sendable {
+    private let productId: String
+    private let started: DispatchTime
+    private var mark: DispatchTime
+
+    init(_ productId: String) {
+        self.productId = productId
+        let now = DispatchTime.now()
+        self.started = now
+        self.mark = now
+        PurchaseProbe.emit("[iap] \(productId) start")
+    }
+
+    /// ⚠️ **Emitted TWICE on purpose, and the duplication is the point** — measured on the iPhone 8,
+    /// 2026-09-08, after the first run of these probes produced numbers nothing could read:
+    ///
+    /// - `Logger` (os_log) reaches Xcode's console and `OSLogStore`. But `device_native_logs
+    ///   source:'app'` reads `OSLogStore` from inside the process, and on an iPhone 8 that scan
+    ///   **exceeds the 5 s device timeout at every window size, including 20 s unfiltered** — so
+    ///   over MCP, on the oldest supported handset, os_log is unreadable in practice.
+    /// - `idevicesyslog` does not carry an app's own os_log at all (measured: 14 `App[]` lines in a
+    ///   6-minute capture, every one from the launcher shim, and the plugin's own NSLog absent).
+    ///
+    /// `print` goes to stdout, which `idevicedebug run` captures to a file — the ONLY route that
+    /// works headlessly on this device. Neither channel alone is enough, so both are written.
+    private static func emit(_ line: String) {
+        print(line)
+        iapLog.notice("\(line, privacy: .public)")
+    }
+
+    /// Close one segment: its own cost, and the running total since `purchase()` was entered.
+    /// Re-arms the mark, so segments partition the wait rather than overlapping it.
+    func segment(_ name: String, _ outcome: String) {
+        let now = DispatchTime.now()
+        let line = String(
+            format: "[iap] %@ %@ %@ in %.0f ms (total %.0f ms)",
+            productId, name, outcome,
+            PurchaseProbe.ms(mark, now), PurchaseProbe.ms(started, now)
+        )
+        mark = now
+        PurchaseProbe.emit(line)
+    }
+
+    private static func ms(_ from: DispatchTime, _ to: DispatchTime) -> Double {
+        Double(to.uptimeNanoseconds &- from.uptimeNanoseconds) / 1_000_000
+    }
+}
 
 /**
  * Modoki's StoreKit 2 bridge (#196).
@@ -223,13 +310,19 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("productId is required")
             return
         }
+        // #580: started BEFORE the Task, so the `sched` mark below measures how long the Task took
+        // to actually begin running. Under the CPU starvation #580 hypothesised, that delay is the
+        // symptom — and it is invisible from inside the Task body.
+        let probe = PurchaseProbe(productId)
         Task {
+            probe.segment("sched", "task-entered")
             do {
                 // StoreKit returns an EMPTY LIST rather than an error when it cannot offer a
                 // product, and gives no reason. "unknown product" was therefore a misleading
                 // message: the id is usually correct and something else is wrong. Name the real
                 // candidates here, because this string is all a developer gets.
                 guard let product = try await Product.products(for: [productId]).first else {
+                    probe.segment("A", "products-empty")
                     call.reject("the App Store returned no product for \"\(productId)\". The id is "
                         + "often correct and something else is wrong — check, in order: the Paid "
                         + "Applications Agreement is Active (with tax + banking complete); the "
@@ -239,27 +332,38 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                         + "propagate (new products can take hours).")
                     return
                 }
+                probe.segment("A", "products-ok")
                 let result = try await product.purchase()
                 switch result {
                 case .success(let verification):
+                    probe.segment("B", "success")
                     guard let transaction = verified(verification) else {
+                        probe.segment("C", "verify-failed")
                         call.reject("purchase failed verification")
                         return
                     }
+                    probe.segment("C", "verify-ok")
                     // NOT finished here. The engine finishes only once the grant is durable.
                     call.resolve(["transaction": serialize(transaction)])
                 case .userCancelled:
+                    probe.segment("B", "userCancelled")
                     // A normal outcome, never an error.
                     call.resolve(["transaction": NSNull()])
                 case .pending:
                     // Ask-to-Buy awaiting a guardian: no transaction exists yet. It arrives later
                     // as a re-delivery that unfinished() reports. Distinguished from a cancel so
                     // the UI does not tell the player their purchase failed.
+                    probe.segment("B", "pending")
                     call.resolve(["transaction": NSNull(), "pending": true])
                 @unknown default:
+                    probe.segment("B", "unknown-result")
                     call.reject("unknown purchase result")
                 }
             } catch {
+                // #580: `classify` rather than `localizedDescription` here, for the reason the
+                // reject below already gives — a user cancel and an ASD/AMS account fault both
+                // read as "Request Canceled", so the timing line could not say which one stalled.
+                probe.segment("throw", "threw:\(classify(error))")
                 // A THROWN cancel is still a cancel. Falling through to the generic arm would
                 // report it as a failure — including to `purchase_failed` analytics, which the
                 // design says a cancel must never reach (#499).

@@ -215,6 +215,25 @@ describe('collectUnknownFields', () => {
     expect(collectUnknownFields(null, ['version'])).toBeUndefined();
     expect(collectUnknownFields('nope', ['version'])).toBeUndefined();
   });
+
+  /**
+   * #813 — `__proto__` is an ordinary own enumerable key after `JSON.parse`, so a stored document
+   * can carry one. The bag used to be a `{}` literal, and `bag['__proto__'] = v` hit
+   * `Object.prototype`'s SETTER: no own key was created, the bag's prototype was replaced by
+   * document-supplied data, and the "found something unknown" flag was set anyway — a bag with zero
+   * own keys that reads back values the document supplied. `Object.create(null)` removes the setter.
+   *
+   * ⚠️ The helper being correct is NOT the whole story: a consumer that copies the bag back out with
+   * `out[k] = …` re-introduces the same drop, and one that tests `k in bag` sees a phantom hit via
+   * the inherited accessor. Court's `mergeBag` did both — see
+   * `games/court/tests/preservedProtoKey.test.ts`, which covers that seam.
+   */
+  it('#813 — a __proto__ key becomes a real own key instead of polluting the prototype', () => {
+    const bag = collectUnknownFields(JSON.parse('{"version":1,"__proto__":{"coins":999}}'), ['version']);
+    expect(Object.keys(bag!)).toEqual(['__proto__']);
+    expect((bag as Record<string, unknown>).coins).toBeUndefined();
+    expect(mergeUnknownFields({ version: 1 }, bag).__proto__).toEqual({ coins: 999 });
+  });
 });
 
 describe('mergeUnknownFields', () => {

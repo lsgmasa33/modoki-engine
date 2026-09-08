@@ -134,7 +134,31 @@ not writing at all, PRESERVE via `preservedVersion` — and both are subject to 
 
 PRESERVE additionally needs the unknown-field bag (`collectUnknownFields` / `mergeUnknownFields`,
 same module). ⚠️ **Do not hand-roll it.** `wordweave` rolled it twice, in the same game, and review
-still caught a real defect in the second one (#763).
+still caught a real defect in the second one (#763). **Both copies are gone as of #813** — the game
+now calls the shared helpers, so the ordering invariant lives in one place rather than in four
+comments in one game.
+
+**Import them from the narrow subpath, `@modoki/engine/runtime/core/formatVersion`, not from the
+`@modoki/engine/runtime` barrel** (#813). `formatVersion.ts` has no imports of its own, so the narrow
+entry costs nothing to load; the barrel drags the whole runtime graph in, which matters because the
+modules that need these helpers are exactly the pure format modules a game keeps loadable without a
+world, a renderer or a storage backend. Measured on wordweave's `store`+`save` suites: 1.64s before
+the de-dup, **9.07s** via the barrel, **1.67s** via the subpath.
+
+⚠️ **Swap the BAG and nothing else — do not also transfer the version rule.** The two documents in a
+game are rarely symmetric: wordweave's purchases doc has no version-GATED field, its progress doc
+does (`activeGuid` is kept only when the stored version is readable). #763's close-out caught
+`readProgress` copying `readPurchases`'s `v = max(stored, current)`, which disarmed the version floor
+for the one field the floor protects. `preservedVersion`'s own banner carries the same warning.
+
+⚠️ **Keep the reader's conditional SPREAD when you swap.** `collectUnknownFields` returns `undefined`
+rather than `{}` so the key can be omitted entirely; `unknownFields: collectUnknownFields(…)` instead
+*sets* the key to `undefined`, which `Object.keys` and a structural compare can see. This is easy to
+get wrong and easy to believe you have tested: `expect(doc.unknownFields).toBeUndefined()` passes
+either way, and a serializer built on `mergeUnknownFields` normalises the difference away, so #813's
+mutation check found the whole 76-test suite green under exactly that mistake. Assert
+`'unknownFields' in doc === false` on the READER's own result — `games/wordweave/tests/save.test.ts`
+and `store.test.ts` carry the pattern.
 
 ⚠️ **A PRESERVE writer that ALSO syncs to the cloud must carry the bag on the WIRE too, IN PLACE —
 never as a side-car field** (#760 phase G; Court's `saveSync.ts`/`systems.ts` is the worked example).

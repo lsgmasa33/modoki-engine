@@ -10,6 +10,7 @@
     "./runtime/rendering/tierBoot": "./src/runtime/rendering/tierBoot.ts",
     "./runtime/rendering/Game": "./src/runtime/rendering/Game.tsx",
     "./runtime/debug": "./src/runtime/debug/index.ts",
+    "./runtime/core/formatVersion": "./src/runtime/core/formatVersion.ts",
     "./runtime/core/liveness": "./src/runtime/core/liveness.ts",
     "./runtime/core/abandonment": "./src/runtime/core/abandonment.ts",
     "./runtime/core/consoleRing": "./src/runtime/core/consoleRing.ts",

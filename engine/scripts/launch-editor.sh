@@ -27,6 +27,11 @@ set -euo pipefail
 
 # engine/scripts/ → repo root (npm/package.json + node_modules live there).
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# The PHYSICAL spelling of the same root. bash `pwd` is logical, so through a symlinked clone the
+# processes this script launches carry the link spelling in their argv while a later stopper may
+# derive the target spelling — the reaps below match both (#913). Registered after repo-reap.sh is
+# sourced, further down.
+REPO_PHYS="$(cd "$(dirname "$0")/../.." && pwd -P)"
 cd "$REPO"
 
 # Pull --scene <val> / --scene=<val> out of the positional args first, so PROJECT
@@ -144,6 +149,7 @@ export MODOKI_VITE_LOG="$VITE_LOG"
 #    a second copy would drift.
 # shellcheck source=lib/repo-reap.sh
 . "$REPO/engine/scripts/lib/repo-reap.sh"
+reap_repo_register_roots "$REPO" "$REPO_PHYS"
 kill_repo_process() { reap_repo_process "$1"; }
 
 if [ -z "$MULTI" ]; then

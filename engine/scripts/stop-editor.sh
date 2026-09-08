@@ -23,14 +23,28 @@
 set -uo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# bash `pwd` is LOGICAL — through a symlinked clone it returns the LINK spelling, while the editor
+# this script must stop may have been launched with the PHYSICAL one (or the reverse). Both are
+# registered so every reap below matches either (#913).
+REPO_PHYS=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 # shellcheck source=lib/repo-reap.sh
 . "$REPO/engine/scripts/lib/repo-reap.sh"
+reap_repo_register_roots "$REPO" "$REPO_PHYS"
 
 MAIN="$REPO/engine/electron/dist/main.cjs"
 VITE="$REPO/node_modules/vite/bin/vite.js"
 
 if ! reap_repo_alive "$MAIN" && ! reap_repo_alive "$VITE"; then
+  # Say what was LOOKED FOR, not just that nothing was found (#944). "no editor running" and "I
+  # searched for the wrong string" used to be the same line and the same exit code, so a spelling
+  # miss reported as a completed stop — and the editor carried on holding the port. Naming the
+  # patterns is what makes the two distinguishable to a human reading the output.
   echo "[stop-editor] no editor running for this clone ($REPO)."
+  echo "[stop-editor]   looked for: $MAIN"
+  echo "[stop-editor]               $VITE"
+  if [ "$REPO" != "$REPO_PHYS" ]; then
+    echo "[stop-editor]   and the physical spelling under: $REPO_PHYS"
+  fi
   exit 0
 fi
 

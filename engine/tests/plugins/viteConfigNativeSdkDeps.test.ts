@@ -122,15 +122,18 @@ describe.skipIf(!hasInternalGames())('vite.config native-SDK app-services deps (
     const include = config.optimizeDeps?.include ?? []
     const alias = config.resolve?.alias as Parameters<typeof aliasFor>[0]
 
-    const baseline = new Set([
-      '@modoki/engine/runtime',
-      '@modoki/engine/runtime/rendering',
-      '@modoki/engine/runtime/debug',
-      '@modoki/engine/editor',
-      '@modoki/engine/editor/rendering',
-      '@modoki/engine/three',
-    ])
-    for (const spec of include) expect(baseline.has(spec)).toBe(true)
+    // ⚠️ This used to restate the engine baseline as a literal `Set`, which made it a SECOND
+    // hand-maintained copy of `vite.config.ts`'s own list — #813 added a subpath and this test went
+    // red for a correct change, which is the drift, not the defect it is meant to catch.
+    //
+    // The property this test actually owns is its own name: for a project with NO
+    // `packages/app-services`, nothing beyond the engine's own specifiers may appear. Asserting
+    // that directly is drift-proof, and it keeps one fact in one place — the engine list's CONTENTS
+    // belong to `viteConfigEngineOptimizeDeps.test.ts`, which pins them and derives the
+    // game-import requirement; this file owns app-services leakage only.
+    const leaked = include.filter((spec) => !spec.startsWith('@modoki/engine'))
+    expect(leaked, 'a project with no packages/app-services must contribute no optimizeDeps entries')
+      .toEqual([])
     expect(aliasKeys(alias).some((k) => k.startsWith('@capacitor-firebase'))).toBe(false)
   })
 

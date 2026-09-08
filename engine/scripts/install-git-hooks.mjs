@@ -76,7 +76,32 @@ function gitHooksLookupDir() {
 }
 
 const hooksDir = cloneHooksDir();
-if (!hooksDir || !existsSync(SRC_DIR)) {
+
+/** ⚠️ **Two unrelated conditions, deliberately NOT sharing one message** (#944).
+ *
+ *  They used to: `if (!hooksDir || !existsSync(SRC_DIR))` both printed "no git hooks dir". That is
+ *  wrong in the one place it matters most — `verify.mjs` runs this installer as a gate preamble and
+ *  FILTERS the "no git hooks dir" line out of its output on purpose (a tarball extract or any
+ *  non-git checkout would otherwise print it every single run). So a missing hook SOURCE inherited
+ *  a message engineered to be invisible, inside the gate.
+ *
+ *  `verify`'s filter is a deny-list keyed on that exact prefix, so giving this case its own first
+ *  line is all it takes to make it visible — no change to `verify.mjs` is needed. */
+
+// Missing SOURCES is a broken checkout, not a hookless one: engine/scripts/git-hooks/* are TRACKED
+// files, so their absence means this tree is wrong rather than differently shaped.
+//
+// ⚠️ Reported, NOT fatal — and that is load-bearing, not timidity. `prepare` (package.json) runs
+// this on EVERY `npm install`, so exiting non-zero here would turn a cosmetic repo-state problem
+// into an install that cannot complete — including in the public mirror. #944 asks for these
+// outcomes to be *distinguishable*, and explicitly warns against making every empty set fatal.
+if (!existsSync(SRC_DIR)) {
+  console.error(`[hooks] hook SOURCES missing at ${SRC_DIR} — installed nothing. Tracked files are `
+    + 'absent, so this checkout is incomplete; commits from it run whatever hook is already there.');
+  process.exit(0);
+}
+
+if (!hooksDir) {
   console.log('[hooks] no git hooks dir — skipping hook install');
   process.exit(0);
 }

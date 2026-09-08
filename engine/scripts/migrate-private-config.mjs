@@ -26,7 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { discoverProjects } from './projectRoots.mjs';
+import { discoverProjects, PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
 
 // MODOKI_MIGRATE_REPO_ROOT overrides the repo root — test-only, so a vitest suite can point this
@@ -75,7 +75,41 @@ let totalProjectsTouched = 0;
  *  so any entry makes the run exit non-zero. */
 const skipped = [];
 
-for (const proj of discoverProjects(repoRoot)) {
+/** ⚠️ **Zero projects is a DISCOVERY MISS here, not "everything is clean"** (#944, swept in by
+ *  #913's close-out). The tail below prints *"Nothing to migrate — every project is already
+ *  clean"* when the totals are zero — a positive claim about every project, made having examined
+ *  NONE of them if discovery returned an empty list. This file's own header already states the
+ *  principle (*"A silent no-op reported as success is the worst possible answer here"*); it just
+ *  never applied it to this case.
+ *
+ *  It matters more here than at the sibling sites: `CLAUDE.md` records that a fresh clone has NO
+ *  Team ID until this script runs, so a developer told "every project is already clean" reasonably
+ *  believes their private values were migrated out of the committed configs.
+ *
+ *  ⚠️ This floor is about the REPORT, not about being the last line of defence — `npm test`'s
+ *  `privateBuildFields.test.ts` asserts the same invariant on every clone, and the OSS publish
+ *  scrub is discovery-free over every staged config. What a false "already clean" costs is a
+ *  developer's belief about their own repo.
+ *
+ *  Same floor as `typecheck-projects.mjs`, and keyed on the same question — are the ROOTS on disk?
+ *  A checkout may legitimately ship neither (`discoverProjects`' docblock: "the public OSS repo
+ *  ships neither"), and failing there would redden a correct tree. Safe to exit non-zero: this is a
+ *  manual `npm run migrate:private-config`, not a lifecycle hook. */
+const projects = discoverProjects(repoRoot);
+if (projects.length === 0) {
+  const rootsOnDisk = PROJECT_ROOT_DIRS.filter((r) => fs.existsSync(path.join(repoRoot, r)));
+  if (rootsOnDisk.length === 0) {
+    console.log(`No ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} directory under ${repoRoot} `
+      + '— nothing to migrate.');
+    process.exit(0);
+  }
+  console.error(`✖ ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present under ${repoRoot}, but `
+    + 'discovery returned ZERO projects. Nothing was examined, so this run can say NOTHING about '
+    + 'whether a private value is still committed. That is a discovery miss, not a clean repo.');
+  process.exit(1);
+}
+
+for (const proj of projects) {
   const label = `${proj.root}/${proj.name}`;
   const cfgFile = path.join(proj.dir, PROJECT_CONFIG_FILENAME);
   const cfg = readJson(cfgFile);

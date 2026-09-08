@@ -25,10 +25,15 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { discoverProjects } from './projectRoots.mjs';
+import { fileURLToPath } from 'node:url';
+import { discoverProjects, PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 
-const repoRoot = process.cwd();
+/** Derived from THIS FILE, never `process.cwd()` (#944). The old `cwd` form made the script's
+ *  subject depend on where it was invoked from: run from anywhere but the repo root it discovered
+ *  zero projects, and the empty-set branch below reported that as a clean pass. A gate must always
+ *  typecheck the same tree, whoever spawned it and from where. */
+const repoRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..', '..');
 const engineDir = path.join(repoRoot, 'engine');
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 
@@ -37,10 +42,30 @@ if (!existsSync(tscBin)) {
   process.exit(1);
 }
 
+/** ⚠️ **Zero projects is TWO different states and they must not share an exit code** (#944).
+ *
+ *  This is a GATE, so "found nothing" and "there is nothing" cannot both be a green pass: a
+ *  discovery miss would be a typecheck over zero projects that reports success. But an empty result
+ *  is NOT always wrong — `discoverProjects`' own docblock records that a checkout may legitimately
+ *  ship neither root ("the public OSS repo ships neither"), and failing there would break a tree
+ *  that is behaving correctly.
+ *
+ *  So the floor keys on the ROOTS being on disk, not on the project count — which is the actual
+ *  question ("did discovery miss?"), and the one #944 says a gate owes an answer to. Deliberately
+ *  NOT "every empty set is fatal": that issue names the property wanted as *distinguishable*, not
+ *  *fatal*. */
 const projects = discoverProjects(repoRoot);
 if (projects.length === 0) {
-  console.log('[typecheck-projects] no projects found under games/ or demos/ — nothing to do.');
-  process.exit(0);
+  const rootsOnDisk = PROJECT_ROOT_DIRS.filter((r) => existsSync(path.join(repoRoot, r)));
+  if (rootsOnDisk.length === 0) {
+    console.log(`[typecheck-projects] no ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} directory `
+      + `in ${repoRoot} — nothing to typecheck.`);
+    process.exit(0);
+  }
+  console.error(`[typecheck-projects] ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present under `
+    + `${repoRoot}, but discovery returned ZERO projects. That is a discovery miss, not an empty `
+    + 'checkout — a pass here would have typechecked nothing.');
+  process.exit(1);
 }
 
 const results = [];

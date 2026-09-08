@@ -17,6 +17,8 @@
  *  false alarms are worse than silence here, because a banner nobody can act on trains
  *  the reader to ignore banners. */
 
+import { canonicalPath } from '../../scripts/pathIdentity.mjs';
+
 export interface BackendIdentity {
   repoRoot: string;
   projectRoot: string;
@@ -49,16 +51,65 @@ export interface BackendIdentity {
  *  Deliberately folds ONLY the drive letter, not the whole path: full case-folding is
  *  right for an identity KEY (rootKey/cloneId, where any drift breaks it) but wrong here,
  *  since it would place `/a/B` inside `/a/b` on case-SENSITIVE Linux. Drive-letter-only is
- *  also platform-independent, so these paths behave identically under CI on either OS. */
+ *  also platform-independent, so these paths behave identically under CI on either OS.
+ *
+ *  ⚠️ **That refusal is about the FOLD, and it does NOT extend to the REALPATH** (#913). The two
+ *  were conflated by one `no` for a long time: this function declined `pathIdentity.mjs` wholesale
+ *  on the case-sensitivity argument above, which is a correct argument about `samePath`'s
+ *  `pathCaseKey` and says nothing about `canonicalPath`, whose own docblock records that it
+ *  deliberately does NOT case-fold. Two separable properties. So `isWithin` now canonicalises
+ *  (resolving symlinks) and this function still folds only the drive letter — do NOT "simplify"
+ *  that to `samePath`, which would reintroduce the fold this paragraph refuses. */
 function norm(p: string): string {
   const s = p.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
 /** Is `child` the same path as, or inside, `parent`? Segment-aware, so `/a/bc` is NOT
- *  inside `/a/b`. */
+ *  inside `/a/b`.
+ *
+ *  ⚠️ **`norm` on BOTH sides of `canonicalPath`, and both are load-bearing** (#913).
+ *
+ *  Canonicalising first and normalising once at the end is the obvious composition and it is
+ *  WRONG — caught by this file's existing Windows cases, not by review. `canonicalPath` ends in
+ *  `path.resolve`, which is platform-specific: on POSIX a Windows-shaped `E:\\Projects\\modoki` is
+ *  not absolute at all, so it gets anchored under the CWD as a directory literally named
+ *  `E:\\Projects\\modoki`. The leading drive letter is no longer leading, `norm` can no longer fold
+ *  its case, and `isWithin('e:…','E:…')` went false — the exact cry-wolf this file was built to
+ *  stop, reintroduced by the fix for it. These paths are compared under CI on both OSes, so the
+ *  POSIX behaviour of a Windows path is a real case and not a curiosity.
+ *
+ *  So: `norm` FIRST to unify separators and fold the drive case while it is still at the front,
+ *  then `canonicalPath` to resolve symlinks, then `norm` AGAIN because `realpathSync.native`
+ *  emits BACKSLASHES on Windows and the containment test below is `startsWith(p + '/')`.
+ *
+ *  ⚠️ **Only the INNER `norm` is pinned by a test that can run here.** Deleting the outer one
+ *  leaves the suite green on POSIX, where `realpathSync.native` never returns a backslash — it
+ *  fails only on Windows, and into a PERMANENT spurious WRONG EDITOR banner, since `startsWith(p +
+ *  '/')` can never be true against `E:\\Projects\\modoki`. The only gate that would catch it is the
+ *  Windows CI leg, which is `workflow_dispatch`-only. Treat this line as covered by review and by
+ *  that manual leg, NOT by `npm run verify` — and do not "simplify" it away on the evidence of a
+ *  green local run.
+ *
+ *  Why canonicalise at all: the two operands are `process.cwd()` and a repoRoot that arrived over
+ *  the wire from another process, so they are two independently-produced spellings of what may be
+ *  ONE directory. Reached through a symlinked clone they differ as strings while naming the same
+ *  place, and this returned false in BOTH directions — which made `identityMismatch` print a
+ *  confident WRONG EDITOR banner about a session that was correctly configured. That is the
+ *  outcome this file's header ranks worst, since a banner nobody can act on trains the reader to
+ *  ignore banners. Measured on a symlinked temp clone, with two controls, in #913.
+ *
+ *  `canonicalPath` falls back to a bare `resolve` for a path that does not exist, and its docblock
+ *  warns that makes it the wrong canonicaliser for a PREDICATE over missing paths (#892). It is
+ *  the right one HERE: both operands exist by construction in the case that matters, and when one
+ *  does not the fallback degrades to the plain string compare this function already did — never
+ *  worse than before. */
+function canonKey(p: string): string {
+  return norm(canonicalPath(norm(p)));
+}
+
 export function isWithin(child: string, parent: string): boolean {
-  const c = norm(child), p = norm(parent);
+  const c = canonKey(child), p = canonKey(parent);
   return c === p || c.startsWith(p + '/');
 }
 

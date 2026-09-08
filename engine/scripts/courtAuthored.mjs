@@ -70,6 +70,13 @@ export const WATCHED = [
   // built to catch the effect — silently, because the assertions stay green (tablets
   // never bind); what rots is the prose. Guarded by courtSweepScope.test.ts.
   'engine/packages/modoki/src/editor/scene/devicePresets.ts',
+  // #813: Court's preserved-bag merge consumes `collectUnknownFields`, and a change to THAT file is
+  // what produced the sync crash `preservedProtoKey.test.ts` exists to catch. Without this entry a
+  // clone editing only the engine helper matches no watched path, so `games/court/tests/**` is
+  // dropped from discovery entirely and the seam guard does not run for its own change class —
+  // which is exactly what happened. Costs a Court-touching change nothing (this is an OR over a
+  // pathspec); it costs only a clone that edits this one file, which is the clone that should pay.
+  'engine/packages/modoki/src/runtime/core/formatVersion.ts',
 ];
 
 /** Runs a git command in the repo, or `null` if it cannot. Injectable so a test can bind it to a

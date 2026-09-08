@@ -511,6 +511,10 @@ export default defineConfig(({ command }) => {
       include: [
         '@modoki/engine/runtime',
         '@modoki/engine/runtime/rendering',
+        '@modoki/engine/runtime/core/formatVersion',
+        // #813 — wordweave's save/store modules import this NARROW subpath (deliberately, to keep
+        // two pure format modules off the barrel's graph). It is the first such import from a GAME
+        // rather than from `engine/app/**`, which is exactly the case this list exists for.
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',

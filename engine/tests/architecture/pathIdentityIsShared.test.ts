@@ -68,8 +68,29 @@ const repoRoot = path.resolve(__dirname, '..', '..', '..');
  *  files answer this question (`deviceClaims.ts`, `buildLock.ts`, `editorBackendRouter.ts`).
  *  Leaving it out was a scope restriction that claimed the defect could only live in two of the
  *  three surfaces the SSOT serves (close-out review). Adding it cost nothing — measured 0 new
- *  offenders. `engine/app` is still outside: it is renderer code that does not derive repo roots. */
-const ROOTS = ['engine/electron', 'engine/scripts', 'engine/plugins'];
+ *  offenders. `engine/app` is still outside — but ⚠️ **the reason given for that is not quite true**, and the
+ *  close-out sweep found the counter-example: `projectGames.ts`'s `gameLoadFailureMessage` DOES
+ *  compare a dev-server root against a file path, with its own hand-rolled recipe. It stays out
+ *  because the stakes are different, not because the shape is absent — it only picks which of two
+ *  DIAGNOSTIC MESSAGES to print, so a wrong answer is a less accurate error string rather than a
+ *  wrong action, and it full-case-folds on purpose for a documented reason. Do not repeat "app
+ *  does not derive repo roots" as though it were a fact about the code.
+ *
+ *  ⚠️ `engine/tools` added for the same reason one release later (#913): it holds
+ *  `shared/identity.ts`, which answers "am I driving the wrong clone's editor?" — the question
+ *  `CLAUDE.md` tells every session to ask FIRST — and it sat outside every source-scanning guard.
+ *  Measured before adding: 36 files, 0 banned shapes, 0 bare `realpathSync`, so it costs nothing
+ *  today, exactly as `engine/plugins` did.
+ *
+ *  ⚠️ **Claim this widening as a FLOOR for the next site, and nothing more.** It does NOT catch the
+ *  defect that prompted it: `identity.ts`'s `norm` is a `.replace()` chain, which matches neither
+ *  regex below. A guard that cannot see the instance that motivated it is worth having and must
+ *  not be described as having closed the hole.
+ *
+ *  ⚠️ **`scripts/` (the repo-root one) is still outside, and not by oversight.** It holds 3 files
+ *  against `sourceFiles`' `floor: 10`, so adding it would fail the corpus floor rather than police
+ *  anything. It needs a per-root floor before it can join; filed rather than bodged. */
+const ROOTS = ['engine/electron', 'engine/scripts', 'engine/plugins', 'engine/tools'];
 
 function sourceFiles(dir: string): string[] {
   if (!fs.existsSync(path.join(repoRoot, dir))) return [];

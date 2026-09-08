@@ -473,72 +473,104 @@ someone re-attaches it and unknowingly tests against a stale product list.
 
 [tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
-### ⚠️ OPEN (#580): every purchase stalls 20-40 s on the iPhone 8
+### #580: the iPhone 8 purchase stall
 
-**OPEN, root cause not established.** Observed on the iPhone 8 (iOS 16.7.16) on 2026-09-02 across
-two separate test rounds. Recorded here so the measurement is not lost, not as a diagnosis.
+**RESOLVED 2026-09-08 — and mostly not a defect.** Established by five real sandbox purchases on the iPhone 8 (iOS 16.7.16), timed against
+`storekitd`'s own wall clock rather than journal ticks. The headline: **most of the reported 20-40 s
+is normal sandbox StoreKit latency plus the player's own time at Apple's confirmation sheet.** Two
+real Court defects were found underneath it, both now fixed; both were about what Court does DURING
+the wait, not about the wait itself.
 
-Every purchase attempt spanned 1400-2300 journal ticks between `iap.purchase.started` and its
-outcome, regardless of which outcome it settled on.
+#### What the wall clock says
 
-⚠️ **The seconds column is DERIVED, not measured, and the assumption behind it is unverified.** It
-divides ticks by 60. On a live device the journal tick is `time.frame`, incremented once per
-**rendered** frame (`timeSystem()` in `engine/packages/modoki/src/runtime/core/timeSystem.ts`) on a real-clock
-delta — not a fixed dt. (`stepSimulation()`'s `1/60` default governs the HEADLESS deterministic
-stepper, and the original report cited it here in error; it does not apply to a device run.) So if
-Court rendered at ~30fps on an iPhone 8 the real spans are 40-80 s, not 20-40 s — and if rAF is
-throttled while the StoreKit sheet is up, ticks stop entirely and the figure understates by an
-unknown amount. **Nobody measured the frame rate during these attempts.** The tick counts are the
-hard data; treat the seconds as a lower bound.
+`InAppTransactionTask` start/end and the `SBRemoteTransientOverlaySession` activate/invalidate pair
+bracket the sheet exactly, so the human's dwell separates cleanly from machine time:
 
-| attempt | ticks started→settled | derived seconds (assumes 60fps — NOT measured) | outcome |
-|---|---|---|---|
-| coins300 | 216→2207 | ~33.2s | cancelled |
-| coins1000 | 5199→6598 | ~23.3s | granted (via reconcile recovery) |
-| coins300 retry | 11239→12710 | ~24.5s | granted (via reconcile recovery) |
-| coins2500 | 14439→16101 | ~27.7s | cancelled |
-| coins2500 retry | 28178→30467 | ~38.2s | cancelled |
-| coins300 (2nd session) | 1052→2811 | ~29.3s | granted |
+| run | entry → sheet up | dwell at the sheet (human) | **Apple's work AFTER the tap** | total |
+|---|---|---|---|---|
+| 1 | 1.81 s | 233.7 s | **63.4 s** | 298.9 s |
+| 2 | 1.41 s | 16.0 s | 16.0 s | 33.4 s |
+| 3 | 1.37 s | 15.2 s | 19.9 s | 36.5 s |
+| 4 | 1.15 s | 18.9 s | 19.6 s | 39.6 s |
+| 5 | 1.02 s | 157.4 s | 19.4 s | 177.8 s |
 
-**The shape of the failure:** both `granted` outcomes arrived through `reconcile()`'s
-`purchasesUpdated`-driven recovery path (`iap.recovered`), NOT through the direct `purchase()`
-settle. The direct call's own promise resolved LATER and was correctly de-duplicated
-(`iap.duplicate` / `iap.settle-in-flight`, no double-grant). That is consistent with `purchase()`
-itself stalling or resolving unreliably on this device/OS, with `reconcile()` independently
-recovering the transaction.
+- **Apple's post-confirmation work is 16-20 s in four runs of five.** Run 1's 63.4 s is a genuine
+  outlier and is not explained; a long dwell is NOT the explanation (run 5 dwelled 157 s and still
+  took 19.4 s).
+- **Entry → sheet is 1.0-1.8 s, every run.** ⚠️ This kills a plausible-looking suspect: `purchase()`
+  makes its OWN `Product.products(for:)` round-trip before `product.purchase()`, duplicating the
+  fetch `products()` already did for the shelf. It looks like a stall and is not one — **do not
+  "fix" it expecting this symptom to move.**
+- Runs 2-4 totalled 33-40 s, i.e. **squarely inside the originally reported "20-40 s" band**, of
+  which 15-19 s was the human. The original figure was measuring the sum.
 
-**Ruled out**, recorded so nobody re-runs them: the settle-serialization race —
-`settling` is keyed by transaction id
-(the `settling` set in `engine/packages/modoki/src/runtime/iap/purchaseService.ts`, de-dup in `settle()`) and only one
-`court.coins.changed` fired per transaction; the StoreKit 2 `Transaction.updates` listener
-busy-looping — it is a `for await` over an AsyncSequence (`updatesTask` in `IapPlugin.swift`'s `load()`) and suspends
-between events by construction; and `markDirty()` (`games/court/runtime/systems.ts`), a
-trivial boolean set.
+#### The tick-derived seconds were right to be distrusted
 
-⚠️ **Two mechanisms look like they would cover this and do not.**
-- #583's stranded-purchase timeout is **Android-only**
-  (`engine/packages/capacitor-modoki-iap/android/src/main/java/com/modokiengine/capacitor/iap/ModokiIapPlugin.java`,
-  `armStrandTimeout` / `PARKED_PURCHASE_TIMEOUT_MS`), and the iOS Swift path has no equivalent.
-  ⚠️ **But do not read that as "port it to iOS and the stall is bounded".** `PARKED_PURCHASE_TIMEOUT_MS`
-  is `5 * 60_000L` — five minutes (`ModokiIapPlugin.java`), 7-15x the observed span. It would
-  never fire during this symptom, for exactly the reason the watchdog below is dismissed. Porting it
-  would be a no-op against this bug.
-- Court's `STORE_WATCHDOG_MS = 90_000` (`games/court/runtime/systems.ts`) is not a purchase
-  timeout — it only releases the full-screen overlay. It is also longer than the span, so it does
-  not fire during the symptom. ⚠️ That margin is thinner than it looks: it is comfortable only at
-  the assumed 60fps (20-40 s). At 30fps the derived span is 40-80 s and 90 s stops being a
-  comfortable margin — so **measure the frame rate before crossing the watchdog off**.
+The earlier caveat in this section — that `time.frame` counts RENDERED frames, so dividing by 60 is
+unsound — is **confirmed and mattered**. During run 1 the journal recorded `@tier` dropping
+`mid → low` with a *"median frame 23.0ms"* (~43 fps) mid-purchase, so the conversion rate was not
+even constant across a single attempt. **Never convert Court journal ticks to wall-clock seconds for
+a device measurement.** Use `storekitd`'s log, which is wall-clock and needs no assumption.
 
-**Not checked**, so the next session knows where to start: no CPU profiler was attached; whether
-disabling parts of the debug bridge or the analytics SDKs (Firebase, Crashlytics, AppsFlyer) changes
-it; whether it reproduces on newer hardware (the iPhone 8 is the oldest supported device in the
-fleet).
+#### Defect 1 — the watchdog counted human time at Apple's sheet (FIXED)
 
-⚠️ The co-occurring iOS "excessive wakeups" reports that were originally filed as part of this issue
-are **not** the cause and are not a defect. The evidence lives in `docs/devices.md` § "iOS
-`wakeups_resource` reports are expected cost, not a defect", **which is private and not part of the
-published snapshot** (hence a path rather than a link) — in short, the signal spans four bundle ids,
-two of which have no purchase flow at all.
+`STORE_WATCHDOG_MS = 90_000` is armed at purchase start and runs straight through the confirmation
+sheet, which is unbounded human time Court cannot bound: a 157 s dwell entering a sandbox password
+fired it **while the sheet was still up** — the exact thing `armStoreWatchdog`'s own header says it
+"must not" do. ⚠️ **This section previously asserted the watchdog "does not fire during the symptom";
+that is disproved — it fired in 2 of 5 runs.**
+
+It then dropped to `{ kind: 'shelf' }`, tearing Court's own "Buying…" overlay off mid-purchase
+(owner: *"I didn't see Buying…"*, *"the store window is dismissed too"*). Fixed by marking the
+purchase `stalled` and revealing `BusyOverlayClose` — an (X) on the busy panel — instead. The timer's
+purpose was never to hide the overlay; `BusyOverlay` authors no `UIAction`, so it was to stop the
+player being TRAPPED behind a buttonless backdrop. Offering the exit does that; taking the screen
+away did not.
+
+#### Defect 2 — the teardown then SILENCED the outcome (FIXED)
+
+The watchdog also called `beginStoreAttempt()`, so `settleStorePurchase` failed its
+`isCurrentStoreAttempt` guard and returned **before** the `switch (outcome)` that raises the outcome
+card — and before `journalState('court.store.settled')`, which is how it was spotted (4
+`iap.purchase.started`, 3 `court.store.settled`). The player confirmed a purchase, it came back
+`cancelled`, and Court said nothing at all.
+
+⚠️ **This was the FOURTH mechanism producing one symptom** — *the player gets no readable feedback
+about a purchase that did not complete*. The others: #498 (rendered, but as small near-black copy
+inside an `overflow: scroll` panel), the 2026-08-30 → 09-02 show-nothing-on-cancel reversal, and #484
+(an origin upgrade passing `null` erased it mid-read). Each was fixed at its own point in a
+five-point chain, and nothing stated the invariant, so a fourth point was free to go quiet.
+
+**The fix was a deletion, not a fifth guard.** The #464 grant path already releases the screen while
+deliberately NOT bumping the epoch, and says so in its own comment; the watchdog was the one site not
+following an existing documented rule. ⚠️ **Safe because `storeInFlight`, not `storeAttempt`, is the
+double-charge bar** — it is released in `settleStorePurchase`'s `finally`, BEFORE the attempt guard,
+so the same product is refused either way. The epoch bump only ever silenced the settle.
+
+#### Instrument notes — two things that read as "nothing happened" and are not
+
+Both cost a cycle here, and neither is discoverable from the tool description:
+
+- **`idevicesyslog` does not carry an app's own `os_log`.** Measured: 14 `App[]` lines in a 6-minute
+  capture, every one from the Xcode 16 launcher shim, with the plugin's own `NSLog` absent too. A
+  silent syslog is not evidence the code did not run.
+- **`device_native_logs source:'app'` is unusable on the iPhone 8** — it reads `OSLogStore` in-process
+  and exceeds the 5 s device timeout at EVERY window size, including 20 s unfiltered.
+- **What DOES work:** `storekitd`'s own entries in `idevicesyslog` (wall-clock, and it brackets the
+  sheet), plus `device_journal`. For app-side probes on this hardware, `print()` to stdout captured
+  by `idevicedebug run` is the only headless route — `Logger` alone is Xcode-only.
+- ⚠️ **A purchase can be driven headlessly**: `court.shopOpen` then `court.storeBuyCoins300` via
+  `device_dispatch_action`. The buy alone is refused (`court.store.buy-refused`, `why:
+  "not-on-shelf"`) because the shelf gates on fetched prices. **Only the tap on Apple's sheet needs a
+  human** — and while that sheet is up, Court's debug bridge stops accepting the Modoki lease, so the
+  agent is blind for exactly that window.
+
+#### Still open
+
+Whether run 5's `cancelled` was a real user cancel or a sandbox/account fault **misclassified** as
+one. `isCancellation()` cannot tell them apart — a cancel and an ASD/AMS fault both surface as
+`"Request Canceled"`, which is #499's shape. The player tapped Purchase, not Cancel. Needs a device
+run to separate.
 
 ### Android — every device iteration costs a Play upload
 

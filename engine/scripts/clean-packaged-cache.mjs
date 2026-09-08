@@ -185,5 +185,14 @@ for (const { p, reason } of targets()) {
 
 if (EJECT_VOLUMES) ejectStaleVolumes();
 
-if (removed === 0) console.log('[clean-packaged-cache] nothing found — already clean.');
+if (removed === 0) {
+  // Name what was CHECKED, not just that nothing was found (#944). "already clean" and "I looked
+  // in the wrong places" were one line and one exit code, so a path-derivation miss reported as a
+  // completed wipe. This script's own docblock already concedes a neighbouring case where the
+  // report is wrong (#883: a junctioned toolchain prints "removed N path(s)" with the provision
+  // intact), so the reader needs to see the candidate list to tell the two apart.
+  const checked = [...targets()].map(({ p }) => p);
+  console.log(`[clean-packaged-cache] nothing found — already clean. Checked ${checked.length} path(s):`);
+  for (const p of checked) console.log(`  ${p}`);
+}
 else console.log(`\n${DRY_RUN ? '[dry-run] would remove' : '[done] removed'} ${removed} path(s).` + (INCLUDE_TOOLCHAIN ? '' : '  (toolchain kept — pass --toolchain to also wipe it.)'));

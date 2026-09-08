@@ -1,5 +1,10 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import type { UserConfig } from 'vite'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { repoFiles } from '../../scripts/repoCorpus.mjs'
+import { hasInternalGames } from '../helpers/repoLayout'
+import { readScannedSource } from '@modoki/engine/testing'
 
 /**
  * Regression guard for the packaged-editor dep-optimize stabilization fix.
@@ -57,6 +62,55 @@ describe('vite.config @modoki/engine optimizeDeps.include (packaged dep-optimize
     // @modoki/engine must stay OFF the optimize list in dev — it's a symlinked source dep there,
     // and forcing it in would replace engine Fast Refresh with full page reloads on every edit.
     expect(include.some((spec) => spec.startsWith('@modoki/engine'))).toBe(false)
+  })
+
+  /**
+   * #813 — the list above is HAND-MAINTAINED, and the assertions above pin it by literal. That
+   * combination cannot notice a game importing a subpath nobody added: the guard stays green while
+   * the list goes stale, which is exactly the drift `family/derived-corpus` is about.
+   *
+   * This derives the requirement instead. Every `@modoki/engine` specifier reachable from a GAME's
+   * RUNTIME code (not its tests — those never load in the packaged editor, and `@modoki/engine/testing`
+   * is test-only) must appear in the packaged include list, because a specifier first seen when a
+   * project opens is precisely the mid-session re-optimize this whole fix exists to prevent.
+   *
+   * It went red on `@modoki/engine/runtime/core/formatVersion` when wordweave became the first game
+   * to import a narrow `runtime/core/*` subpath — every earlier one came from `engine/app/**`, the
+   * editor's own startup graph, which is never the trigger.
+   */
+  // ⚠️ `skipIf` on THIS case only, not the whole describe (#813 review). The public OSS snapshot
+  // ships no `games/` and exactly two demos, so `repoFiles`' `floor: 50` would THROW there — and
+  // `scripts/publish-engine-oss.sh` does not exclude this file, so both legs of the free public CI
+  // would go red on the next push to `main`. The other cases in this file need no game corpus and
+  // must keep running on the mirror, which is why the guard is not on the describe.
+  it.skipIf(!hasInternalGames())('#813 — every @modoki/engine specifier a GAME\'s runtime imports is in the packaged list', async () => {
+    process.env[ENV_KEY] = '/tmp/fake-userdata/vite-cache'
+    const include = (await buildConfig()).optimizeDeps?.include ?? []
+
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
+    const sources = repoFiles({
+      under: [path.join(repoRoot, 'games'), path.join(repoRoot, 'demos')],
+      match: /\.(ts|tsx)$/,
+      floor: 50,
+    }).filter(({ rel }: { rel: string }) => !rel.includes('/tests/') && !/\.(test|spec)\.tsx?$/.test(rel))
+
+    // `from '<spec>'`, `import('<spec>')` and a bare side-effect `import '<spec>'`, over
+    // COMMENT-STRIPPED source (`readScannedSource`, as `courtSweepScope.test.ts` does) — a doc
+    // comment reading "imported from '@modoki/engine/x'" matches the `from` arm otherwise, and the
+    // widening to double quotes and bare imports enlarges that surface. Both quote styles; a
+    // template literal cannot be a static specifier worth pre-bundling.
+    const SPEC = /(?:from|import\s*\(?)\s*['"](@modoki\/engine[^'"]*)['"]/g
+    const found = new Map<string, string>()
+    for (const { abs, rel } of sources as { abs: string; rel: string }[]) {
+      const text = readScannedSource(abs).code
+      for (const m of text.matchAll(SPEC)) if (!found.has(m[1])) found.set(m[1], rel)
+    }
+
+    expect(found.size).toBeGreaterThan(0)
+    const missing = [...found].filter(([spec]) => !include.includes(spec))
+      .map(([spec, rel]) => `${spec}  (first seen in ${rel})`)
+    expect(missing, 'a game imports an @modoki/engine subpath the packaged optimize list does not '
+      + 'pre-bundle — add it to vite.config.ts optimizeDeps.include').toEqual([])
   })
 
   it('still excludes @zappar/msdf-generator regardless of packaged state', async () => {

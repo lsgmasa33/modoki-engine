@@ -8,7 +8,10 @@
  *    - a missed mismatch costs a whole session of misattributed failures;
  *    - a spurious warning on every legitimate DMG session trains the reader to ignore it. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, isWithin, type BackendIdentity } from '../../tools/shared/identity';
 
 const URL_ = 'http://127.0.0.1:5180';
@@ -175,5 +178,62 @@ describe('tokenMismatchWarning', () => {
     const id = identity({ packaged: true, tokenCheck: 'mismatch' });
     expect(identityMismatch(id, '/somewhere/else', URL_)).toBeNull();
     expect(tokenMismatchWarning(id, URL_)).toMatch(/WRONG EDITOR/);
+  });
+});
+
+/** #913 — the OBSERVED member. The two operands are `process.cwd()` and a repoRoot that arrived
+ *  over the wire from another process, so they are two INDEPENDENTLY PRODUCED spellings that may
+ *  name one directory. Reached through a symlinked clone they differ as strings, the containment
+ *  test failed in both directions, and `identityMismatch` printed a confident WRONG EDITOR banner
+ *  at a correctly-configured session.
+ *
+ *  ⚠️ The polarity is the opposite of #908's: this fails CLOSED, into a FALSE alarm. That is the
+ *  outcome this file's header ranks worst — "a banner nobody can act on trains the reader to
+ *  ignore banners" — and it is the shape that was mis-logged as a benign cwd artifact for months
+ *  in the Windows drive-letter case.
+ *
+ *  ⚠️ The symlink is MANUFACTURED here, deliberately. No clone on this machine is reached through
+ *  one today, so a test that merely used ordinary paths would pass with the mechanism deleted —
+ *  this repo's dominant defect class. Both controls below are what make the positive case mean
+ *  anything: without them, a predicate that returned `null` unconditionally would look fixed. */
+describe('a symlinked clone spells one directory two ways (#913)', () => {
+  let tmpRoot: string, real: string, link: string, other: string;
+
+  beforeAll(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ident-'));
+    real = path.join(tmpRoot, 'modoki-qa');
+    link = path.join(tmpRoot, 'clone-link');
+    other = path.join(tmpRoot, 'modoki-ai');
+    fs.mkdirSync(real, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    fs.symlinkSync(real, link, 'dir');
+  });
+
+  afterAll(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+
+  it('isWithin sees the link and its target as the same directory, in BOTH directions', () => {
+    expect(isWithin(link, real)).toBe(true);
+    expect(isWithin(real, link)).toBe(true);
+  });
+
+  it('identityMismatch stays SILENT when cwd is the link spelling of the served repo', () => {
+    expect(identityMismatch(identity({ repoRoot: real }), link, URL_)).toBeNull();
+  });
+
+  it('CONTROL: silent too when cwd is spelled exactly as the backend reported it', () => {
+    // The case that already worked. A fix that canonicalises only one side would break it.
+    expect(identityMismatch(identity({ repoRoot: real }), real, URL_)).toBeNull();
+  });
+
+  it('CONTROL: a genuinely different checkout still WARNS — the guard is not just off', () => {
+    expect(identityMismatch(identity({ repoRoot: real }), other, URL_)).toContain('WRONG EDITOR');
+  });
+
+  it('CONTROL: a sibling whose name is a PREFIX of the served repo is still outside', () => {
+    // Segment-awareness must survive canonicalisation: ~/Projects/modoki is a prefix of
+    // ~/Projects/modoki-qa on the real machine, and conflating them is the #69 shape.
+    const prefix = path.join(tmpRoot, 'modoki-qa-2');
+    fs.mkdirSync(prefix, { recursive: true });
+    expect(identityMismatch(identity({ repoRoot: real }), prefix, URL_)).toContain('WRONG EDITOR');
   });
 });

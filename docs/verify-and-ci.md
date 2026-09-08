@@ -586,6 +586,43 @@ The generalisable bit: **a scope restriction is a claim about where a defect can
 rule's own exclusions can tell the classes apart, the restriction is buying nothing and hiding
 whatever sits outside it.
 
+#### A script that looked for something reports what it LOOKED FOR — and a gate floors it
+
+The reporting half of the same discipline (#944, after #908 and #129). A script that prints its
+success message and exits 0 on an empty result set makes "did the work" and "matched nothing" one
+output and one exit code, so a lookup that silently found nothing reads as a completed operation.
+The failure then *"presents as **the app is broken**, not as **something was stopped**."*
+
+⚠️ **The property wanted is DISTINGUISHABLE, not FATAL.** Most of these genuinely have nothing to do
+most of the time — `dev:stop` with no server running is the normal case. Three outcomes, three
+messages: did it, had nothing to do, could not look. `stop-editor.sh` now names the patterns it
+searched, and `clean-packaged-cache` the paths it checked, which is what makes a spelling miss
+visible to a human instead of silent.
+
+**A GATE is the exception, and even there the floor goes on the right question.**
+`typecheck-projects` exits non-zero on zero projects — but keyed on whether the project ROOTS are
+on disk, not on the count, because `discoverProjects` documents that a checkout may legitimately
+ship neither ("the public OSS repo ships neither") and a blanket fatal would redden a correct tree.
+Its `repoRoot` is derived from the script, never `process.cwd()`: a gate must check the same tree
+whoever spawned it and from where. `repoCorpus`' required `floor` is the reference shape.
+
+⚠️ **The gate exception has since been taken for a NON-gate, deliberately.**
+`migrate-private-config` is a manual `npm run`, not a gate, and it also exits non-zero on a
+discovery miss — because its empty-set message was not merely unhelpful but a positive claim
+(*"every project is already clean"*) about projects it never examined. So the rule is not "gates
+floor, scripts don't": it is that a script asserting something about what it found owes a floor on
+having found it. A script that only reports its own inaction does not.
+
+⚠️ **An empty result asserted as a CONCLUSION is the worst form.** `logKillForensics` printed an
+empty candidate list as positive evidence that the killer had already exited — while omitting the
+repo's own `stop-editor` from the list it filtered on, so a live stop produced the same empty
+output as no killer at all. If two states are indistinguishable from where you stand, say so rather
+than picking one.
+
+**Two halves, one site.** Whether a lookup MATCHES (`docs/windows.md` § Paths) and what it SAYS when
+it does not are separate mechanisms with separate fixes — but at a reap they are one repair, and
+fixing either alone leaves a half-repair. #908 shipped both together at `dev:stop` for that reason.
+
 ### The second half of that rule: a scope bound ships with an assertion, or it is a comment
 
 **A comment naming a hole is not a guard over it** (#830, 2026-09-06). Applying the rule above to

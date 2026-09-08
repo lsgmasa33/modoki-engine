@@ -665,7 +665,15 @@ function revealMainWindow(): void {
 // and an unbounded dump on every repeat would bury the first (most useful) one under noise.
 let killForensicsLogged = 0;
 const KILL_FORENSICS_MAX = 3;
-const KILL_FORENSICS_CANDIDATES = /pkill|test-packaged|assert-app-renders|launch-editor|stop-dev|vitest|electron-builder|npm run verify/;
+// ⚠️ **This list is the difference between evidence and a false conclusion** (#944). The empty
+// case below used to be PRINTED AS positive evidence that the killer had already exited — an
+// inference stated as a fact, which is the strongest form of the "empty result reported as an
+// outcome" defect because the output actively asserts the wrong thing rather than omitting the
+// right one. It was also missing the repo's own sanctioned stop path: `stop-editor`, the
+// `repo-reap` helper behind it, `stopDevServer`, `clean-packaged-cache`, `smoke-packaged` and
+// `powershell` (the Windows reap) were all structurally invisible, so a LIVE stop-editor.sh
+// produced exactly the same empty list as no killer at all.
+const KILL_FORENSICS_CANDIDATES = /pkill|pgrep|test-packaged|assert-app-renders|launch-editor|stop-editor|repo-reap|stopDevServer|stop-dev|clean-packaged-cache|smoke-packaged|powershell|vitest|electron-builder|npm run verify/;
 function logKillForensics(context: string): void {
   if (killForensicsLogged >= KILL_FORENSICS_MAX) return;
   killForensicsLogged += 1;
@@ -681,20 +689,34 @@ function logKillForensics(context: string): void {
   try {
     const ps = spawn('ps', ['-Ao', 'pid,ppid,lstart,command'], { stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';
+    // ⚠️ Node emits 'close' AFTER a spawn 'error', so without this the failure path prints its
+    // "nothing was looked at" line and is then immediately contradicted by the empty-list report
+    // below — the defect this whole function is being fixed for, reintroduced one handler apart.
+    let looked = true;
     const timer = setTimeout(() => { try { ps.kill(); } catch { /* best effort */ } }, 2000);
     ps.stdout.on('data', (d: Buffer) => { out += d.toString(); });
     ps.on('close', () => {
       clearTimeout(timer);
+      if (!looked) return;
       try {
         const lines = out.split('\n').filter((l) => KILL_FORENSICS_CANDIDATES.test(l)).slice(0, 20);
         console.error(
           `[modoki-electron] kill forensics: ${lines.length} candidate process(es) still running ` +
-          '(empty means the killer had already exited by the time this ran):\n' +
+          '(empty means EITHER the killer had already exited, OR it is not in the candidate list — ' +
+          'these are indistinguishable from here, so do not read an empty list as a conclusion):\n' +
           lines.join('\n'),
         );
       } catch { /* best effort — never throw out of a diagnostic */ }
     });
-    ps.on('error', () => { clearTimeout(timer); /* ps missing/failed — nothing to log */ });
+    // A failed `ps` used to be silent, which produced the SAME output as a successful ps that
+    // matched nothing — so the one case where the snapshot is worthless looked like the case where
+    // it is informative (#944).
+    ps.on('error', (e: Error) => {
+      clearTimeout(timer);
+      looked = false;
+      console.error(`[modoki-electron] kill forensics: \`ps\` failed (${e.message}) — no snapshot was `
+        + 'taken. This is NOT an empty candidate list; nothing was looked at.');
+    });
   } catch { /* best effort — never throw out of a diagnostic */ }
 }
 

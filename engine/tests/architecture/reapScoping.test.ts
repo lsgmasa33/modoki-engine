@@ -89,12 +89,26 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     // `pkill -f` pattern starts with a NAMED variable reference (`$APP`, `${REPO}`, …).
     //
     // Deliberately excludes a leading POSITIONAL parameter (`$1`, `$2`, …, `$@`): that is
-    // `launch-editor.sh`'s `pkill -f "$1"` inside its `kill_pattern` helper, which this task's
-    // brief calls out by name as "already repo-scoped and correct" and explicitly out of
-    // scope to touch. A positional parameter is a function ARGUMENT, not a script-level
-    // variable that this repo's own bugs have shown can go quietly empty — every call site
-    // passes it an absolute path literal, so `${1:?msg}` would harden a call site that was
-    // never the failure mode this guard exists for.
+    // the `pkill -f "$1"` inside `lib/repo-reap.sh`'s workers, which this guard cannot resolve
+    // because the value arrives from a caller.
+    //
+    // ⚠️ **The original justification for this exemption is NO LONGER TRUE, and the exemption is
+    // kept anyway — read why before trusting it** (#913). It used to say "every call site passes
+    // it an absolute path literal", which made the parameter as safe as an inline string. Since
+    // #913 that is false: `reap_repo_process`/`_alive`/`_force` also pass `$alt`, COMPUTED by
+    // `reap_alt_pattern` from two shell globals an external `reap_repo_register_roots` sets.
+    //
+    // What keeps that computed value absolute and non-empty is now four preconditions inside
+    // `reap_alt_pattern` — both roots set, roots differing, the physical root absolute, and the
+    // pattern genuinely under the logical root — and they live in a DIFFERENT FILE from this
+    // comment. Delete the empty/absolute pair and the helper emits
+    // `/engine/electron/dist/main.cjs`, which `pkill -f` matches against EVERY clone's editor on
+    // this machine — and rule 3 here would still be green, because the pattern is still `"$1"`.
+    //
+    // So this guard no longer covers that path at all. `repoReapSpellings.test.ts` does, by
+    // driving the helper and asserting each precondition yields NOTHING rather than something
+    // broader. If that file is ever deleted or weakened, this exemption is uncovered — the two
+    // are load-bearing together, which is the sort of coupling that goes stale silently.
     const offenders: string[] = [];
     for (const file of scriptFiles()) {
       if (!file.endsWith('.sh')) continue; // `${VAR:?}` is bash syntax; JS has no equivalent

@@ -189,7 +189,15 @@ export function collectUnknownFields(
 ): Record<string, unknown> | undefined {
   if (!isRecord(raw)) return undefined;
   const knownSet = new Set(known);
-  const bag: Record<string, unknown> = {};
+  // ⚠️ `Object.create(null)`, NOT `{}` (#813 review). With a normal object literal, a stored
+  // document carrying `__proto__` — which `JSON.parse` makes an ordinary own enumerable key —
+  // hits `Object.prototype`'s `__proto__` SETTER on the assignment below: no own key is created,
+  // the bag's prototype is replaced by attacker-controlled data, and `any` is nevertheless set, so
+  // this returned a bag with zero own keys whose `.someField` reads back values the document
+  // supplied. A null-prototype bag has no such setter, so `__proto__` becomes a real own key and
+  // round-trips like any other unknown field — which is what the additive rule asks for, and what
+  // makes each caller's "absent, not `{}`, when there is nothing unknown" docblock true.
+  const bag: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let any = false;
   for (const [key, value] of Object.entries(raw)) {
     if (knownSet.has(key)) continue;

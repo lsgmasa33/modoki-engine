@@ -528,6 +528,54 @@ load-bearing and commented as such).
   `buildClaimsStore.mjs`'s header enumerates its three intended divergences — this was not one of
   them, which is exactly why it went unnoticed.
 
+### Comparing two paths and MATCHING a foreign process's argv are different problems
+
+Both look like "does this path equal that path", and the same fix does not serve them. Getting this
+wrong is what #913 was.
+
+**Comparing two paths we both produced** — `identityMismatch` against `process.cwd()`, a persisted
+project root against a `__dirname` repo root. Both operands are ours, so canonicalise BOTH sides
+and compare. That is what `pathIdentity.mjs` exists for, and `isUnderOrSame` / `samePath` are the
+entry points.
+
+**Matching a foreign process's argv** — every reap in `repo-reap.sh`, `stopDevServer`,
+`packagedAppPaths`. One operand is the command line some other process was LAUNCHED with, and we
+do not control its spelling. There is nothing to canonicalise on that side, so:
+
+⚠️ **Canonicalising only our own side is strictly WORSE than doing nothing.** It fixes the
+symlinked spelling and breaks the ordinary one that works today. The only correct shape is to
+match a **set** of spellings — the clone's logical root (bash `pwd`) and its physical one
+(`pwd -P`). `reap_repo_register_roots` registers both once and every reap in that file inherits it.
+
+⚠️ **How far `pwd -P` gets you on Windows is UNMEASURED.** It is the right pair on POSIX (a symlink,
+and `/var` → `/private/var` on macOS). Under Git Bash it resolves the MSYS path namespace, which is
+not obviously the same thing as resolving a junction or a `subst`ed drive — those are
+object-manager mappings Windows resolves at a different layer. Do not assume this pair covers them;
+that is the `win` clone's to settle, and the Windows spellings are tracked separately.
+
+⚠️ **Two sequential invocations, never an alternation.** `pkill -f` takes an ERE, so a pattern
+built as `"$A|$B"` with either side empty collapses into one that matches **every process on the
+machine** — the #69 disaster, reintroduced by the fix meant to prevent it. `reap_alt_pattern`
+therefore prints *nothing* rather than a fallback, and refuses unless both roots are set, they
+differ, the physical one is absolute, and the pattern is genuinely under the logical root (a bare
+prefix test would rewrite a SIBLING clone's path — clone names here are prefixes of each other).
+
+**This closes one direction only.** Both spellings are still ours, so stop-via-link/launched-real
+is covered and a process launched by something that derived a third spelling is not. The
+structurally complete fix is to export the physical root at launch so every child carries the
+canonical spelling — ⚠️ **not done on purpose**: `editorPorts`' `backendPortForClone` keys off the
+clone DIRECTORY NAME, so a link whose basename differs from its target's would silently move the
+clone to auto ports (#349's class).
+
+**And the identity refusal is two properties, not one.** `identity.ts` declines the SSOT with a
+correct argument about case-FOLDING (`/a/B` must not sit inside `/a/b` on case-sensitive Linux).
+That says nothing about REALPATH, which `canonicalPath` does without folding. Do not read the one
+refusal as covering both — and do not "simplify" the result to `samePath`, which reintroduces the
+fold. ⚠️ Order matters: normalise separators and the drive case FIRST, then canonicalise, then
+normalise again — `path.resolve` is platform-specific, so on POSIX a Windows-shaped
+`E:\Projects\x` is not absolute and gets anchored under the cwd, after which the drive letter is
+no longer leading and cannot be folded.
+
 ## Never shell out to a platform binary whose shape you assumed
 
 `extractArchive()` used to call `tar`, which made one subprocess the single OS dependency of the
