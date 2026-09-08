@@ -15,6 +15,7 @@ import { useSyncExternalStore } from 'react';
 import { ASSETS_SECTION, type ViewMode } from './assetListing';
 import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
 import { applyMove, type PathMove } from '../utils/assetPaths';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 const LS_EXPANDED = 'editor:assets:expanded:v2';
 const LS_PENDING_FOLDERS = 'editor:assets:pendingFolders';
@@ -79,7 +80,7 @@ function ensureLoaded(): void {
 }
 
 const listeners = new Set<() => void>();
-function emit(): void { for (const l of listeners) l(); }
+function emit(): void { notifyListeners(listeners, 'assetFolderState', []); }
 function subscribe(onChange: () => void): () => void {
   listeners.add(onChange);
   return () => { listeners.delete(onChange); };

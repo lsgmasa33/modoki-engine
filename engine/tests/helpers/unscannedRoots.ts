@@ -23,7 +23,16 @@
  *  ⚠️ **This is NOT a licence to leave a ledger row unbacked in THIS repo.** Every root is present
  *  in a developer clone, so a stale row still fails at authorship, which is where it should. The
  *  filter only ever removes a row whose ROOT is absent — never one whose root is there and whose
- *  token has gone. */
+ *  token has gone.
+ *
+ *  ⚠️ **A guard's OTHER hand-written path lists are in this class too, and using this helper for
+ *  the ledger does not cover them.** `notifyIsShared`'s `EXEMPT` list went red in the snapshot for
+ *  exactly the #830 reason while its ledger passed, because only the ledger was filtered — caught
+ *  at the hub's `verify:publish` on a merge, again the only place that can see it. It could not
+ *  just call this helper: some of its rows live INSIDE `SCAN_DIRS`, where the throw above fires by
+ *  design. So it filters on file existence with its own non-vacuity floor. If a THIRD guard needs
+ *  the same, that is the point to generalise this into a "rows this checkout can validate" pass
+ *  rather than transcribe the rule a third time. */
 
 import fs from 'node:fs';
 import path from 'node:path';

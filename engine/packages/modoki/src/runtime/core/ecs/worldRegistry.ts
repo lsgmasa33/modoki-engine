@@ -10,6 +10,7 @@
  *  disposing a world automatically disposes its index via GC. */
 
 import { createWorld, type World } from 'koota';
+import { notifyListeners } from '../notifyListeners';
 
 let _currentWorld: World | null = null;
 
@@ -52,7 +53,13 @@ export function setCurrentWorld(next: World): void {
     guidIndices.set(next, new Map());
   }
   _currentWorld = next;
-  for (const fn of listeners) fn(next, old);
+  // Isolated per listener (#888). This is the engine's most consequential notification — ~50
+  // subscribers, and `_currentWorld` is ALREADY reassigned on the line above — so a throwing
+  // listener used to commit the promote, starve every subscriber behind it in `Set` order, and
+  // unwind into the promoter's tail. `SceneManager.loadScene`'s tail is what transfers world
+  // ownership (`nextWorld = null; swapped = true`), so its `catch` then released the live scene's
+  // resources and destroyed the world it had just promoted.
+  notifyListeners(listeners, 'worldRegistry', [next, old]);
 }
 
 /** Subscribe to world-swap events. Returns an unsubscribe function. */

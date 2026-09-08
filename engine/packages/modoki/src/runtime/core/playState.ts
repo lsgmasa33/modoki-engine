@@ -21,6 +21,8 @@
  *  which is how they behave today). Nobody SETS `scrub`/`preview` until Phase 1, so behaviour is
  *  byte-identical. Later phases flip call sites to the mode helpers below and retire the shims. */
 
+import { notifyListeners } from './notifyListeners';
+
 export type PlayState = 'stopped' | 'playing' | 'paused';
 export type RunMode = 'stopped' | 'scrub' | 'preview' | 'playing';
 
@@ -55,8 +57,11 @@ export function setRunMode(mode: RunMode, opts?: { advancing?: boolean }): void 
   const prevPlay = derivePlayState();
   _mode = mode;
   _advancing = advancing;
-  if (derivePlayState() !== prevPlay) for (const fn of _playListeners) fn();
-  for (const fn of _modeListeners) fn();
+  // Isolated per listener (#888). `_mode`/`_advancing` are already assigned above, and the two
+  // sets are notified in sequence — so before this, a throwing PLAY listener also starved every
+  // RUN-MODE listener: the mode changed and nothing downstream heard about it.
+  if (derivePlayState() !== prevPlay) notifyListeners(_playListeners, 'playState:play', []);
+  notifyListeners(_modeListeners, 'playState:mode', []);
 }
 
 /** Subscribe to RunMode transitions (any mode/advancing change). Returns an unsubscribe function. */

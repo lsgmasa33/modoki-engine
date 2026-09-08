@@ -26,6 +26,8 @@
  *  Owners that DO have a teardown (e.g. a per-scene manager) must call `removeStoreHook`
  *  themselves — removal is by hook identity, so it only drops that owner's own hook. */
 
+import { notifyListeners } from '../core/notifyListeners';
+
 export type StoreHook = () => Record<string, unknown>;
 
 const _hooks: StoreHook[] = [];
@@ -33,7 +35,7 @@ let _hooksVersion = 0;
 const _versionListeners = new Set<() => void>();
 
 function notifyVersionListeners() {
-  for (const fn of _versionListeners) fn();
+  notifyListeners(_versionListeners, 'storeHooks', []);
 }
 
 export function addStoreHook(hook: StoreHook) {

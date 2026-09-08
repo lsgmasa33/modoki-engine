@@ -15,6 +15,7 @@ import { compareSiblings } from './entityOrder';
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
 // this file's `setStructureCallback` wiring below just to reach it.
 import { addDirtyListener, fireDirtyListeners } from '../renderDirty';
+import { notifyListeners } from '../notifyListeners';
 export { addDirtyListener, fireDirtyListeners };
 
 // Structure-dirty subscriber set — notifies Hierarchy, Console, etc. when
@@ -55,7 +56,7 @@ export function getStructureVersion(): number { return _structureVersion; }
 /** Notify all structure-dirty subscribers. */
 export function markStructureDirty() {
   _structureVersion++;
-  for (const fn of _structureListeners) fn();
+  notifyListeners(_structureListeners, 'entityStructure', []);
 }
 // Wire world.ts registerEntity → markStructureDirty (avoids circular import)
 setStructureCallback(markStructureDirty);

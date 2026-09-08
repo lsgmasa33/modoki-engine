@@ -19,6 +19,7 @@ import { getTime } from '../core/getTime';
 import { getPlayState, onPlayStateChange } from '../core/playState';
 import { registerReadSource, unregisterReadSource } from '../core/readSourceRegistry';
 import type { ManagerDef } from './managerRegistry';
+import { notifyListeners } from '../core/notifyListeners';
 
 const READ_SOURCES = ['deltaTime', 'timeSinceGameStart', 'timeSinceSceneLoad'] as const;
 
@@ -73,7 +74,10 @@ class TimeManagerImpl implements ManagerDef {
   }
 
   dispose(): void {
-    for (const u of this.unsubs) u();
+    // Isolated per unsubscribe (#888). This one aborts its own TAIL, not just the rest of the
+    // loop: a throw here skipped `this.unsubs = []`, every `unregisterReadSource` below, and
+    // `anchors.clear()` — so a single bad unsub left the manager half-disposed.
+    notifyListeners(this.unsubs, 'TimeManager:dispose', []);
     this.unsubs = [];
     for (const n of READ_SOURCES) unregisterReadSource(n);
     this.anchors.clear();

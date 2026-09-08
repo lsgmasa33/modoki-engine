@@ -26,6 +26,7 @@ import { registerReadSource } from '../core/readSourceRegistry';
 import { lastInputDevice } from '../traits/Input';
 import { promptFor, PROMPT_ACTIONS } from './inputPrompts';
 import type { InputDevice } from '../core/inputActions';
+import { notifyListeners } from '../core/notifyListeners';
 
 function currentDevice(): InputDevice {
   const world = peekCurrentWorld();
@@ -40,5 +41,8 @@ export function registerInputPromptSources(): () => void {
   for (const action of PROMPT_ACTIONS) {
     disposers.push(registerReadSource(`${action}Prompt`, () => promptFor(currentDevice(), action)));
   }
-  return () => { for (const d of disposers) d(); };
+  // Isolated per disposer (#888). A teardown fan-out is the same mechanism as a notification
+  // one: one throwing entry starves every disposer behind it, leaving its read source
+  // registered for the life of the process.
+  return () => { notifyListeners(disposers, 'inputPromptSources:dispose', []); };
 }

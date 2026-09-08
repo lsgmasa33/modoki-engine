@@ -24,6 +24,7 @@
  *  module is documented as pure (no DOM, no React) so it unit-tests by direct calls. */
 
 import { useSyncExternalStore } from 'react';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 let epoch = 0;
 const listeners = new Set<() => void>();
@@ -31,7 +32,7 @@ const listeners = new Set<() => void>();
 if (import.meta.hot) {
   import.meta.hot.on('vite:afterUpdate', () => {
     epoch += 1;
-    for (const l of listeners) l();
+    notifyListeners(listeners, 'hmrEpoch', []);
   });
 }
 

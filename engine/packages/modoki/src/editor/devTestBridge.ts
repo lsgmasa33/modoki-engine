@@ -44,7 +44,9 @@ export interface EditorTestBridge {
    *  the file write). Exposed because that gesture is otherwise only reachable through a
    *  native save panel, and it is the seam #853 lived in: it replaces every entity, so an
    *  id-keyed cache that is not invalidated aliases the outgoing scene's state onto the
-   *  incoming entities. Rejects when the editor is in prefab-edit mode, like the real route. */
+   *  incoming entities. Carries the real route's BOTH refusals: prefab-edit mode, and another
+   *  `newScene` still in flight (#887 — this bridge is where that one was live-verified, precisely
+   *  because two overlapping calls are not drivable through the MCP surface). */
   newScene(scenePath: string): Promise<void>;
   /** Name of the currently selected entity, or null if none. */
   selectedEntityName(): string | null;

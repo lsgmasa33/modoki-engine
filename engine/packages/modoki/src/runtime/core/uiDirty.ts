@@ -5,6 +5,8 @@
  *  for backward compatibility, and remains the sole reader of `isUIDirty`/`clearUIDirty` (its
  *  `uiTreeProjection` is still the only place that rebuilds the tree). */
 
+import { notifyListeners } from './notifyListeners';
+
 let _dirty = true; // Start dirty so the first frame builds the tree
 
 // Editor dirty subscriber set — Inspector, UIResizeOverlay, etc. subscribe for event-driven refresh.
@@ -25,7 +27,7 @@ export function setEditorDirtyCallback(fn: (() => void) | null) {
 }
 
 function notifyEditorDirty() {
-  for (const fn of _editorDirtyListeners) fn();
+  notifyListeners(_editorDirtyListeners, 'uiDirty', []);
 }
 
 /** Mark the UI tree as needing a rebuild. Called from writeTraitField, deleteEntity, a world

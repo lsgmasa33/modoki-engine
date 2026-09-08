@@ -71,6 +71,41 @@ Two rules the helper's callers have to keep, both learned the expensive way:
   scene- and game-scoped managers only, and an **app-scoped** manager is never disposed by
   `unloadAll` at all — it activates at `registerManager` and stays active until unregister.
 
+#### The promote's notification cannot abort the promoter (#888)
+
+All three promoters free the replaced world on the lines **after** `setCurrentWorld`, and
+`setCurrentWorld` reassigns `_currentWorld` and then fires ~50 `onWorldSwap` subscribers. Those
+subscribers used to run in a bare loop, so one of them throwing committed the swap, permanently
+starved every subscriber behind it in `Set` order, and unwound into the promoter's tail:
+
+- `unloadAll` and `replaceWorldContent` skipped `destroyWorldWhenSafe` — the leaked slot above,
+  reached through an exception route rather than a missing call.
+- `loadScene` skipped `nextWorld = null` and `swapped = true`, so its `catch` read both stale flags
+  and did the two things they exist to prevent: released every `allocatedSceneId` — the resources
+  of the scene now ON SCREEN — and destroyed the world `_currentWorld` had just been pointed at.
+
+Listeners that can throw are ordinary, not exotic: Rapier world teardown, `Scene3D`'s six dispose
+helpers plus a `dispose()` per light, `Scene2D`'s per-slot and per-mask Pixi disposal, two full
+world scans in `selectionRestore`, the Hierarchy's whole-tree rebuild.
+
+`setCurrentWorld` now goes through **`runtime/core/notifyListeners.ts`**. Read that file's docblock
+for the reporting policy and the two publishers that must supply their own reporter.
+
+⚠️ **That helper is not yet the engine's ONLY fan-out implementation, and an earlier version of this
+paragraph said it was.** #888 migrated 36 call sites; 46 remain hand-rolled — 41 inside the guard's
+scanned roots and 5 outside — pinned individually in
+`engine/tests/architecture/notifyIsShared.test.ts` and tracked as **#953**. What the guard enforces
+is the weaker, true claim: every loop matching the fan-out shape is migrated, on that ledger, or on
+a short EXEMPT list of queries the helper cannot express — so a new one fails at authorship. The three promoters here are migrated — that part is not partial.
+
+⚠️ **The ownership latches deliberately stay AFTER the promote.** Moving them earlier looks like
+defence in depth and is the opposite: with the listener loop isolated, nothing after
+`_currentWorld = next` can throw, and every remaining throw source in `setCurrentWorld`
+(`getCurrentWorld()`'s koota allocation, the two `WeakMap.set` calls) happens *before* the mutation
+commits — the state in which `swapped === false` and `nextWorld === promotedWorld` are true and the
+existing cleanup is exactly right. Setting them early would make them lie in the other direction and
+turn a correct cleanup into a guaranteed leak.
+
 ### Replacing every entity IS a world swap
 
 **`setCurrentWorld` is the engine's only signal for "every entity you were holding is gone", so

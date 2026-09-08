@@ -9,6 +9,7 @@
 import { useSyncExternalStore } from 'react';
 import { addStoreHook } from './storeHooks';
 import { onWorldSwap } from '../core/ecs/world';
+import { notifyListeners } from '../core/notifyListeners';
 
 type UIValue = string | number | boolean;
 
@@ -22,21 +23,21 @@ export function setUIValues(patch: Record<string, UIValue>): void {
   for (const k in patch) { if (values[k] !== patch[k]) { changed = true; break; } }
   if (!changed) return;
   values = Object.freeze({ ...values, ...patch });
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'uiValues', []);
 }
 
 /** Set a single game UI value. */
 export function setUIValue(key: string, value: UIValue): void {
   if (values[key] === value) return;
   values = Object.freeze({ ...values, [key]: value });
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'uiValues', []);
 }
 
 /** Reset the game UI store (e.g. on scene teardown / a fresh game). */
 export function clearUIValues(): void {
   if (Object.keys(values).length === 0) return;
   values = Object.freeze({});
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'uiValues', []);
 }
 
 const subscribe = (cb: () => void): (() => void) => { listeners.add(cb); return () => { listeners.delete(cb); }; };

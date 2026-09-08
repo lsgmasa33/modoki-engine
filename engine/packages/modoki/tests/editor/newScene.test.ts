@@ -20,7 +20,7 @@ import { Environment } from '../../src/three/traits/Environment';
 import { Light } from '../../src/three/traits/Light';
 import { Time } from '../../src/runtime/core/traits/Time';
 import { Input } from '../../src/runtime/traits/Input';
-import { newScene, getCurrentScenePath, setCurrentScenePath } from '../../src/editor/scene/serialize';
+import { newScene, getCurrentScenePath, setCurrentScenePath, NewSceneRefusedError } from '../../src/editor/scene/serialize';
 import { WHITE_HDR_GUID } from '../../src/runtime/assets/builtinAssets';
 import { sceneManager } from '../../src/runtime/scene/SceneManager';
 import { registerManager, unregisterManager } from '../../src/runtime/managers/managerRegistry';
@@ -288,5 +288,77 @@ describe('newScene()', () => {
     await newScene();
     await newScene();
     expect(getAllEntities()).toHaveLength(5); // not 10 — the prior world is gone, not added to
+  });
+
+  // ── #887: two Create Scene gestures must not interleave ─────────────────────────────
+  // ⚠️ These must NOT await the first call. `newScene` is a sequence of process-global writes
+  // around one `await`, so a test that awaits sequentially — every test above this line —
+  // cannot reach the defect at all: it is the second gesture's synchronous HEAD running while
+  // the first is parked that does the damage.
+  describe('a second gesture arriving while the first is in flight', () => {
+    it('is refused, and the first gesture wins outright', async () => {
+      const first = newScene('/assets/scenes/a.json');
+      const second = newScene('/assets/scenes/b.json');
+      const settled = await Promise.allSettled([first, second]);
+
+      expect(settled[0]!.status).toBe('fulfilled');
+      expect(settled[1]!.status).toBe('rejected');
+      expect((settled[1] as PromiseRejectedResult).reason)
+        .toBeInstanceOf(NewSceneRefusedError);
+
+      // One populated world, not two merged and not the loser's. Five = the four starters plus
+      // the materialized Time resource row, exactly as the sequential tests above assert.
+      expect(getAllEntities()).toHaveLength(5);
+      // The path is A's. Pre-fix this was decided by whichever write landed last rather than by
+      // which world won, so the editor could display B's world under A's path.
+      expect(getCurrentScenePath()).toBe('/assets/scenes/a.json');
+    });
+
+    it('refuses while the winner is still in flight, without touching a global', async () => {
+      // The reason this is a lock and not a liveness token: `setCurrentScenePath` runs before
+      // the await, so a loser that got as far as that write could not roll it back. The refusal
+      // therefore has to land in B's synchronous HEAD, ahead of the write — which is what
+      // "before A has even resolved" measures here.
+      //
+      // ⚠️ The path is already A's at this point, not the previous scene's: A's own head is
+      // synchronous too and ran the moment `newScene` was called. An earlier draft of this test
+      // asserted `prev.json` and was simply wrong about the ordering.
+      let firstSettled = false;
+      const first = newScene('/assets/scenes/a.json').then(() => { firstSettled = true; });
+
+      // No `await` between these three lines, deliberately. `newScene`'s refusal is in its
+      // synchronous head, so B's whole contribution happens here — and A demonstrably cannot
+      // have settled yet, because nothing has yielded to the microtask queue. Awaiting B's
+      // rejection first would let A finish underneath and the in-flight claim would be untrue
+      // (measured: `firstSettled` is already true at that point).
+      const second = newScene('/assets/scenes/b.json');
+      expect(firstSettled, 'nothing has yielded, so A cannot have settled — if this is true the '
+        + 'test is no longer exercising the race').toBe(false);
+      expect(getCurrentScenePath()).toBe('/assets/scenes/a.json');
+
+      await expect(second).rejects.toBeInstanceOf(NewSceneRefusedError);
+      await first;
+      // And B never wrote after the fact either.
+      expect(getCurrentScenePath()).toBe('/assets/scenes/a.json');
+    });
+
+    it('releases the latch when the swap REJECTS — one failure must not brick Create Scene', async () => {
+      // Without the `finally`, a single rejected `replaceWorldContent` would refuse every
+      // subsequent Create Scene for the rest of the session.
+      const spy = vi.spyOn(sceneManager, 'replaceWorldContent')
+        .mockRejectedValueOnce(new Error('swap blew up'));
+      await expect(newScene('/assets/scenes/a.json')).rejects.toThrow('swap blew up');
+      spy.mockRestore();
+
+      await expect(newScene('/assets/scenes/b.json')).resolves.toBeUndefined();
+      expect(getAllEntities()).toHaveLength(5);
+    });
+
+    it('accepts an ordinary sequential call — the guard is not stuck on', async () => {
+      // A guard proved only to REJECT is half-tested: this is the accept side.
+      await newScene('/assets/scenes/a.json');
+      await expect(newScene('/assets/scenes/b.json')).resolves.toBeUndefined();
+      expect(getCurrentScenePath()).toBe('/assets/scenes/b.json');
+    });
   });
 });

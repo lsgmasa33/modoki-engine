@@ -12,7 +12,7 @@
  *  down with it when it does. Nothing here loads a scene, so no traitRegistry
  *  mock or preloaded scene data is needed. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
 
 beforeEach(() => { vi.resetModules(); });
 
@@ -38,6 +38,59 @@ async function setup() {
 function expectLive(world: { spawn: () => { isAlive: () => boolean } }): void {
   expect(world.spawn().isAlive()).toBe(true);
 }
+
+describe('#888: a throwing onWorldSwap listener must not abort the promoter', () => {
+  // `setCurrentWorld` fired its subscribers in a bare loop, so a throw unwound into whichever
+  // promoter had just called it — landing BEFORE that promoter's `destroyWorldWhenSafe`. The
+  // symptom is #877's exactly, reached through an exception route instead of a missing call:
+  // the outgoing world's koota slot is never freed, and ~16 of those brick the engine.
+  //
+  // `loadScene`'s far worse consequence (the `catch` releasing the LIVE scene's resources and
+  // destroying the world it just promoted) needs a real scene load, so it lives in
+  // `SceneManager.test.ts` where the fetch and traitRegistry mocks already exist.
+  //
+  // Each test hands its promoted world back at the end — the pool below is shared by the whole
+  // file and the probe at the bottom measures the headroom these leave it.
+
+  it('unloadAll still frees the outgoing world', async () => {
+    const { sceneManager, getCurrentWorld } = await setup();
+    const { onWorldSwap } = await import('../../src/runtime/core/ecs/worldRegistry');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const outgoing = getCurrentWorld();
+    const destroySpy = vi.spyOn(outgoing, 'destroy');
+    const unsub = onWorldSwap(() => { throw new Error('listener boom'); });
+    // Up front, not at the tail: a FAILING test must still hand its world slot back, or the next
+    // test dies of pool exhaustion instead of reporting its own verdict.
+    onTestFinished(() => { unsub(); getCurrentWorld().destroy(); vi.restoreAllMocks(); });
+
+    await expect(sceneManager.unloadAll()).resolves.toBeUndefined();
+
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+    expect(getCurrentWorld()).not.toBe(outgoing);
+    expectLive(getCurrentWorld());
+  });
+
+  it('replaceWorldContent still frees the outgoing world', async () => {
+    // The production-reachable one: Assets → Create Scene and the `new_scene` agent op.
+    const { sceneManager, getCurrentWorld } = await setup();
+    const { onWorldSwap } = await import('../../src/runtime/core/ecs/worldRegistry');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const outgoing = getCurrentWorld();
+    const destroySpy = vi.spyOn(outgoing, 'destroy');
+    const unsub = onWorldSwap(() => { throw new Error('listener boom'); });
+    // Up front, not at the tail: a FAILING test must still hand its world slot back, or the next
+    // test dies of pool exhaustion instead of reporting its own verdict.
+    onTestFinished(() => { unsub(); getCurrentWorld().destroy(); vi.restoreAllMocks(); });
+
+    await expect(sceneManager.replaceWorldContent(() => {})).resolves.toBeUndefined();
+
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+    expect(getCurrentWorld()).not.toBe(outgoing);
+    expectLive(getCurrentWorld());
+  });
+});
 
 describe('#877: unloadAll frees the world slot it replaces', () => {
   // Per-symptom: the world that was current when the teardown promoted is the

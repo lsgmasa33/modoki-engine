@@ -8,6 +8,7 @@
 
 import type React from 'react';
 import type { Point } from './useDraggable';
+import { notifyListeners } from '../core/notifyListeners';
 
 export interface StatWidgetDef {
   id: string;
@@ -27,7 +28,7 @@ let version = 0;
 
 function bump(): void {
   version++;
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'widgetStore', []);
 }
 
 export function registerStatWidget(def: StatWidgetDef): void {

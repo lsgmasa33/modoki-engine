@@ -14,6 +14,7 @@
  *  naturally sparse. */
 
 import { nextCaptureSeq } from '../runtime/core/journal';
+import { notifyListeners } from '../runtime/core/notifyListeners';
 
 export interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only
@@ -174,7 +175,7 @@ export function editorEmit(type: string, payload?: unknown): void {
   const event: EditorEvent = { seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload };
   buffer.push(event);
   if (buffer.length > MAX_EVENTS) buffer.shift();
-  for (const cb of listeners) cb(event);
+  notifyListeners(listeners, 'editorJournal', [event]);
 }
 
 /** Read the editor-activity stream, optionally filtered by `type`, `source`, and/or

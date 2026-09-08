@@ -24,6 +24,7 @@
 
 import { backendFetch } from '../backend/editorBackend';
 import type { AssetSchemaType } from '../../runtime/assets/assetSchemas';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** WHO parked a write. The flush treats the two differently in exactly two ways, both about
  *  what the writer is:
@@ -196,7 +197,7 @@ export function getLastFlushedAssetHash(path: string | undefined): string | null
   return path ? lastFlushedHash.get(path) ?? null : null;
 }
 
-function bump(): void { _version += 1; for (const fn of listeners) fn(); }
+function bump(): void { _version += 1; notifyListeners(listeners, 'dirtyAssets', []); }
 /** Subscribe to registry changes (park / flush / discard). Returns an unsubscribe. */
 export function subscribeDirtyAssets(fn: () => void): () => void {
   listeners.add(fn);

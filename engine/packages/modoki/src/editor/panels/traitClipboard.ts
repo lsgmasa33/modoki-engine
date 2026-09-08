@@ -27,6 +27,7 @@
 
 import { useSyncExternalStore } from 'react';
 import type { TraitMeta } from '../../runtime/core/ecs/traitRegistry';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 export interface TraitClipboardEntry {
   /** Trait name the values were read from. Paste requires an exact match. */
@@ -78,7 +79,7 @@ export function setTraitClipboard(traitName: string, values: Record<string, unkn
     return;
   }
   _entry = { traitName, values: cloned };
-  listeners.forEach((l) => l());
+  notifyListeners(listeners, 'traitClipboard', []);
 }
 
 export function subscribeTraitClipboard(fn: () => void): () => void {

@@ -79,6 +79,7 @@ import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
 import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
 import { metaReadFallback, metaCameFromFailedRead, stampMetaReadPath, metaReadPathOf } from './metaReadFallback';
 import { useEditorStore } from '../store/editorStore';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
@@ -217,7 +218,7 @@ export function noteMetaReadResult(
 
 let _version = 0;
 const listeners = new Set<() => void>();
-function bump(): void { _version += 1; for (const fn of listeners) fn(); }
+function bump(): void { _version += 1; notifyListeners(listeners, 'pendingMeta', []); }
 
 /** Subscribe to changes (park / flush / discard). Returns an unsubscribe. */
 export function subscribePendingMeta(fn: () => void): () => void {

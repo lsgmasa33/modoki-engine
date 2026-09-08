@@ -18,6 +18,8 @@
  * the eventual Modoki-hosted npm package. See docs/modoki-package-manager.md.
  */
 
+import { notifyListeners } from './notifyListeners';
+
 /** Crash reporting hooks the engine shell calls (ErrorBoundary, gameStore). */
 export interface CrashlyticsService {
   recordError(message: string): void;
@@ -75,11 +77,11 @@ export function onAppServicesRegistered(fn: RegistrationListener): void {
 /** A project registers its concrete service implementations (merged over any prior). */
 export function registerAppServices(services: AppServices): void {
   registered = { ...registered, ...services };
-  for (const fn of listeners) {
-    // A listener must never break registration — the game's services are the point, the
-    // notification is a courtesy.
-    try { fn(); } catch { /* ignore */ }
-  }
+  // A listener must never break registration — the game's services are the point, the
+  // notification is a courtesy. Shared isolation since #888; it REPORTS now, where this site
+  // used to swallow silently, because a registration listener that has been dead since boot is
+  // exactly the thing nobody finds.
+  notifyListeners(listeners, 'appServices', []);
 }
 
 /** The currently-registered services. Every field is optional → callers use `?.`. */

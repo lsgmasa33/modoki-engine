@@ -8,6 +8,7 @@
 
 import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
+import { notifyListeners } from '@modoki/engine/runtime/core/notifyListeners';
 
 const dynamicGames: GameDefinition[] = [];
 type Listener = () => void;
@@ -38,7 +39,7 @@ export function registerDynamicGame(def: GameDefinition): boolean {
     return false;
   }
   dynamicGames.push(def);
-  listeners.forEach((l) => l());
+  notifyListeners(listeners, 'gameRegistry', []);
   return true;
 }
 

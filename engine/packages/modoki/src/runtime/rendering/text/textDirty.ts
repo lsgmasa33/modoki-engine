@@ -8,6 +8,8 @@
  *  full text re-evaluation when it changed. A monotonic counter (not a boolean) so
  *  multiple observers each detect the change exactly once. */
 
+import { notifyListeners } from '../../core/notifyListeners';
+
 let _version = 0;
 /** Counts ONLY un-attributed bumps (no fontId given). Kept separate from `_version`
  *  (which counts both attributed and un-attributed bumps) so a per-font read can add
@@ -28,7 +30,7 @@ export function markTextDirty(fontId?: string): void {
   } else {
     _globalOnly++;
   }
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'textDirty', []);
 }
 
 /** The current dirty version — renderers store the last value they acted on and

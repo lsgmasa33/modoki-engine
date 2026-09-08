@@ -1168,6 +1168,10 @@ export class NewSceneRefusedError extends Error {
   constructor(message: string) { super(message); this.name = 'NewSceneRefusedError'; }
 }
 
+/** Mutual exclusion for `newScene()` — see its refusal comment for why this is a lock rather than
+ *  one of `docs/async-lifetime.md`'s liveness tokens. */
+let _newSceneInFlight = false;
+
 /** Start a fresh untitled scene: clear ALL entities and spawn a ready-to-use
  *  starting world — a Camera, an Environment (built-in white.hdr, for reflections),
  *  and default lights (a Directional key + an Ambient fill) so objects are actually
@@ -1184,8 +1188,32 @@ export class NewSceneRefusedError extends Error {
  *  so `onWorldSwap` actually fires. Pass `path` when the new scene already has a file
  *  target (Assets → Create Scene); omit it for an untitled scene.
  *
- *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited. */
+ *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited, and while another `newScene()`
+ *  is still in flight (#887). */
 export async function newScene(path: string | null = null): Promise<void> {
+  // ⚠️ REFUSED while another Create Scene is still running (#887). Two callers reach here and
+  // neither serialises against the other — Assets → Create Scene
+  // (`panels/builtinCreatableAssets.ts`) and the `new-scene` agent op (`app/editor/
+  // agentEditorOps.ts`) — so a double-click, or two `new_scene` ops in one turn (CLAUDE.md:
+  // parallel tool calls have no guaranteed order), used to interleave at the `await` below. The
+  // loser's populated world was discarded, `_currentScenePath` ended up decided by whichever
+  // write landed last rather than by which world won, both callers saved a file, and
+  // `swapHistory` ran twice against two different keys.
+  //
+  // ⚠️ REFUSE, not supersede — and that is forced by the code, not a preference. The two
+  // `setCurrentScenePath`/`setCurrentBaseScene` writes below run BEFORE the await on purpose
+  // (see their own comment), so a liveness token cannot help: the loser would bail in its tail
+  // having already stomped the path, and moving those writes after the await to make bailing
+  // possible would reopen the Hierarchy race that comment exists to close. `serialize.loadScene`
+  // 100 lines above supersedes instead, and it can precisely because it writes the same globals
+  // AFTER its await, behind `stillLive()`. This is the mirror case.
+  //
+  // First statement in the function, so a refused gesture touches no global at all.
+  if (_newSceneInFlight) {
+    throw new NewSceneRefusedError(
+      'A new scene is already being created — wait for it to finish, then try again.',
+    );
+  }
   // ⚠️ REFUSED while editing a prefab (owner, 2026-09-07). Before #853 this produced an
   // ambiguous half-state that two separate guards had to work around — the prefab-edit
   // world stayed live under a real scene path (`saveScene`'s conjunction below) and
@@ -1199,42 +1227,51 @@ export async function newScene(path: string | null = null): Promise<void> {
       + 'then create the scene.',
     );
   }
-  // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
-  // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
-  // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
-  // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
-  // dependency instead of racing it.
-  setCurrentScenePath(path);
-  setCurrentBaseScene(undefined);
-  // Replace the world CONTENT through SceneManager rather than deleting and respawning in
-  // place (#853). The in-place version was the one path in the repo that replaced every
-  // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
-  // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
-  // aliased exactly onto the incoming scene's entities.
-  await sceneManager.replaceWorldContent((world) => {
-    spawnEntity(world,
-      Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-    );
-    spawnEntity(world,
-      Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-    );
-    spawnEntity(world,
-      Transform({ x: 5, y: 10, z: 7 }),
-      Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-      EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-    );
-    spawnEntity(world,
-      Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-      EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-    );
-  });
-  // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
-  // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
-  // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
-  swapHistory(path ?? '');
-  markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
-  clearAllSceneDirty();
-  console.log('[Editor] New scene created');
+  // `try`/`finally` from here, not a clear at the end: `replaceWorldContent` can reject (a
+  // resource release or a world destroy in its tail), and a latch left stuck true would brick
+  // Create Scene for the rest of the session.
+  _newSceneInFlight = true;
+  try {
+    // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
+    // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
+    // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
+    // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
+    // dependency instead of racing it. ⚠️ This is also what makes the refusal above a LOCK
+    // rather than a supersession token — see there.
+    setCurrentScenePath(path);
+    setCurrentBaseScene(undefined);
+    // Replace the world CONTENT through SceneManager rather than deleting and respawning in
+    // place (#853). The in-place version was the one path in the repo that replaced every
+    // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
+    // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
+    // aliased exactly onto the incoming scene's entities.
+    await sceneManager.replaceWorldContent((world) => {
+      spawnEntity(world,
+        Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
+      );
+      spawnEntity(world,
+        Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
+      );
+      spawnEntity(world,
+        Transform({ x: 5, y: 10, z: 7 }),
+        Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
+        EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
+      );
+      spawnEntity(world,
+        Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
+        EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
+      );
+    });
+    // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
+    // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+    // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
+    swapHistory(path ?? '');
+    markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
+    clearAllSceneDirty();
+    console.log('[Editor] New scene created');
+  } finally {
+    _newSceneInFlight = false;
+  }
 }
 
 /** Report (and reset) the #124 probe: authored entity fields that a SYSTEM rewrote while the

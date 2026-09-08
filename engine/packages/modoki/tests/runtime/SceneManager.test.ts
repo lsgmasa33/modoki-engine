@@ -5,7 +5,7 @@
  *  registry's worldSwap listeners are real — we observe entity-id changes after
  *  the swap to confirm the new world is active. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
 import { trait } from 'koota';
 import { completeResponse } from '../stubs/assetResponse';
 
@@ -1026,6 +1026,79 @@ describe('filterPersistentDuplicates', () => {
     const snapshots = [snap(10, 'Player', 'guid-1')];
     const out = filter(data as any, snapshots as any);
     expect(out.entities.map((e: any) => e.id)).toEqual([1]);
+  });
+});
+
+describe('#888: a throwing onWorldSwap listener must not abort loadScene', () => {
+  // ⚠️ Placed BEFORE the `beforeSwap hooks` block on purpose — that block ends with a
+  // fire-and-forget `unloadAll()` whose tail destroys the then-current world, and its own comment
+  // says a test appended after it runs against a settling teardown.
+  //
+  // Combined into one test to stay within koota's 16-world limit, matching the block below.
+  //
+  // Pre-fix, `setCurrentWorld` fired its ~50 subscribers in a bare loop, so a throw unwound out of
+  // `SceneManager.ts:1061` BEFORE `nextWorld = null` (:1062) and `swapped = true` (:1065). The
+  // `catch` at :1188 then read both stale flags and did exactly the two things they exist to
+  // prevent: released every `allocatedSceneId` — the resources of the scene now on screen — and
+  // called `destroy()` on the world `_currentWorld` had just been pointed at.
+  it('completes the load, keeps its resources, and leaves the promoted world live', async () => {
+    defineSceneA();
+    const { sceneManager } = await getSceneManager();
+    const { getCurrentWorld } = await getWorld();
+    const { onWorldSwap } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const { getResourceStats } = await getCache();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const after = vi.fn();
+    const unsubThrower = onWorldSwap(() => { throw new Error('listener boom'); });
+    const unsubAfter = onWorldSwap(after);
+    // Registered up front rather than run at the end of the body: koota's 16-world pool is
+    // module-level in a dependency `vi.resetModules()` does not reload, so it is shared by this
+    // whole file and a test that promotes a world and walks away spends a slot permanently. If
+    // this test FAILS, a tail cleanup would never run and the next test would die of pool
+    // exhaustion instead of reporting its own verdict — measured while mutation-checking this.
+    onTestFinished(() => {
+      unsubThrower();
+      unsubAfter();
+      getCurrentWorld().destroy();
+    });
+
+    // (1) The load resolves. Pre-fix it REJECTED — and a test asserting only this would be
+    // satisfied by a fix that swallowed the throw and left the wreckage behind, so it is the
+    // weakest of the five assertions here, not the point of the test.
+    await expect(sceneManager.loadScene('/sceneA.json')).resolves.toBeUndefined();
+
+    // (2) The scene is actually current, not half-installed.
+    expect(sceneManager.getCurrent()?.path).toBe('/sceneA.json');
+    expect(sceneManager.getCurrent()?.state).toBe('active');
+
+    // (3) The live scene's resources were NOT released by the catch's `if (!swapped)` branch.
+    const stats = getResourceStats();
+    expect(stats.materials['/materials/m1.mat.json']).toBe(1);
+    expect(stats.materials['/materials/m2.mat.json']).toBe(1);
+    expect(stats.materials['/materials/m3.mat.json']).toBe(1);
+
+    // (4) The promoted world was not destroyed by the catch's `if (nextWorld)` branch.
+    // `isAlive()` is the ONE probe that separates a destroyed koota world from a live one —
+    // `spawn`/`query`/`get`/`has`/`id` all answer normally after `destroy()`. Rationale in full:
+    // `sceneManagerWorldSlots.test.ts`'s `expectLive`.
+    expect(getCurrentWorld().spawn().isAlive()).toBe(true);
+
+    // (5) The listener behind the thrower still ran — `Set` iteration order is registration
+    // order and the loop is not resumable, so pre-fix it never fired for this swap at all.
+    expect(after).toHaveBeenCalledTimes(1);
+
+    // ⚠️ WHAT THIS TEST CANNOT TELL YOU (#954). The thrower here throws on its FIRST statement, so
+    // "isolated" and "isolated but half-torn-down" look identical to every assertion above. The
+    // real `onWorldSwap` listeners (Scene3D, Scene2D) are ~15-step disposal SEQUENCES with no
+    // internal isolation, so a mid-sequence throw still skips their `ecsLights.clear()` /
+    // `markRenderDirty()` tail — on a swap that now resolves. Do not read this test as covering
+    // that; it is filed separately because the fix is at a different level.
+
+    // The containment is reported, not silent.
+    expect(errorSpy).toHaveBeenCalled();
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain('[worldRegistry]');
+
   });
 });
 

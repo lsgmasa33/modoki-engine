@@ -41,7 +41,10 @@ describe('emitAssetInvalidated', () => {
   });
 
   it('isolates a throwing listener so the others still run — and the caller still evicts', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // console.ERROR since #888: the isolation moved to the shared `notifyListeners`, which reports
+    // on one channel for all 23 publishers. Not a downgrade in visibility — `globalErrors.ts`
+    // routes warn and error to the same Crashlytics destination and differs only in budget.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const fired: Fired[] = [];
     onAssetInvalidated(() => { throw new Error('boom'); });
     record(fired);
@@ -49,8 +52,10 @@ describe('emitAssetInvalidated', () => {
     // leave a half-evicted cache — worse than a stale panel.
     expect(() => emitAssetInvalidated('audio', CLIP)).not.toThrow();
     expect(fired).toEqual([['audio', CLIP, [CLIP]]]);
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+    expect(err).toHaveBeenCalled();
+    // The label still names the invalidation KIND — that is what identifies which listener died.
+    expect(String(err.mock.calls[0]?.[0])).toContain('[assetInvalidation:audio]');
+    err.mockRestore();
   });
 
   // QA-ASSET-0005's sibling, close-out sweep: a re-import landing while the 3D/2D render loop

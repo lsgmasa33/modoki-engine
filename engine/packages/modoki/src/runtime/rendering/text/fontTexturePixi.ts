@@ -13,6 +13,7 @@
 import { Assets, Texture, CanvasSource } from 'pixi.js';
 import { loadPixiTexture } from '../pixiTextureLoad';
 import type { FontProvider } from './fontProvider';
+import { notifyListeners } from '../../core/notifyListeners';
 
 const cache = new Map<string, Texture>();
 /** In-flight atlas loads → every caller waiting to be woken when one lands.
@@ -46,7 +47,9 @@ function settleWaiters(key: string, wake: boolean): void {
   const set = waiters.get(key);
   waiters.delete(key);
   if (!wake || !set) return;
-  for (const fn of set) fn();
+  // Isolated per waiter (#888): the `waiters.delete(key)` above has ALREADY run, so a throwing
+  // waiter used to leave every waiter behind it parked forever with nothing left to settle them.
+  notifyListeners(set, 'fontTexturePixi', []);
 }
 /** Last atlasVersion uploaded into each dynamic canvas-backed Texture. */
 const uploadedVersion = new WeakMap<Texture, number>();

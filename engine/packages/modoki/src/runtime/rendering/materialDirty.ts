@@ -22,6 +22,8 @@
  *  time/curve-driven override changes every frame and therefore redraws every frame, which is
  *  what it is asking for. */
 
+import { notifyListeners } from '../core/notifyListeners';
+
 const listeners = new Set<() => void>();
 
 /** Signal that a 3D material property changed outside the ECS write path. O(1).
@@ -37,9 +39,7 @@ const listeners = new Set<() => void>();
  *  throw there would take out the ECS system loop for the frame — an observer must not be able to
  *  break the simulation, and it must not be able to starve the observers after it either. */
 export function markMaterial3DDirty(): void {
-  for (const l of listeners) {
-    try { l(); } catch (err) { console.error('[materialDirty] listener threw', err); }
-  }
+  notifyListeners(listeners, 'materialDirty', []);
 }
 
 /** Subscribe to dirty bumps (e.g. to arm a render-on-demand gate). Returns an unsubscribe. */

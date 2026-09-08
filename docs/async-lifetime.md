@@ -217,6 +217,37 @@ case, and the only defence is the convention, not the test.
 Both are the generation token doing its ordinary job — the continuation just is not spelled `await`.
 When you are looking for sites that need a token, grep for the deferral, not for the keyword.
 
+### A fifth shape: a deliberate PRE-await write, where no liveness token can be right (#887)
+
+Every token above assumes the writes happen *after* the deferral, so a loser can be told to bail
+before it touches anything. `editor/scene/serialize.ts`'s `newScene()` breaks that assumption on
+purpose, and the two halves of that one file are the clearest statement of the rule:
+
+| | writes the four editor globals | so its token is |
+|---|---|---|
+| `serialize.loadScene` | **after** its `await`, behind `stillLive()` | a supersession epoch — a newer open wins |
+| `serialize.newScene` | **before** its `await`, by design | a **lock**: the second call is refused |
+
+`newScene` sets `setCurrentScenePath` / `setCurrentBaseScene` first because `setCurrentWorld` fires
+`onWorldSwap` synchronously and the Hierarchy's restore reads `getCurrentScenePath()` a frame
+later — and `aSceneSwapIsHappening()` is false on that path, so nothing waits for the state to
+settle. Writing first removes an ordering dependency instead of racing it.
+
+That makes supersession **unusable**, not merely awkward: a loser bailing in its tail has already
+stomped the path and cannot roll it back, and moving the write after the `await` to make bailing
+possible reopens the exact race the pre-write closes. So the question the site actually asks is not
+*am I still live?* but *may I start at all?* — and the answer is a plain in-flight boolean plus a
+typed refusal, released in a `finally` so one rejected swap does not brick the operation for the
+session. `editor/scene/playMode.ts`'s `enterPlay` (#470) is the same shape and the precedent to
+copy.
+
+**The test to apply before reaching for an epoch: does this function write anything the caller can
+observe BEFORE its first deferral?** If yes, a liveness token is guarding the wrong half of it.
+
+⚠️ Neither guard sees this. `livenessTokenIsShared` looks for a counter, and there is none; nothing
+looks for "an async function with pre-await writes and no mutual exclusion" — that is the same
+statement-order analysis § Enforcement declines to build.
+
 ### A fourth shape the helper does NOT cover: capture, and let a THIRD PARTY consume it
 
 Every token above answers *am I still live?* from inside the continuation. `NavigationManager` (#808)
@@ -477,7 +508,12 @@ Two places do not follow the rule, on purpose. Neither is a defect to re-file.
 - [managers-and-systems.md](./managers-and-systems.md) — why this app has no app-level teardown path,
   and why the `disposed`-boolean token is rarer here than it looks. Every end-of-lifetime at app scope
   is a realm death; scene scope is where teardown is real.
-- [scene-loading.md](./scene-loading.md) — the scene load/swap lifecycle these guards protect.
+- [scene-loading.md](./scene-loading.md) — the scene load/swap lifecycle these guards protect,
+  including § "The promote's notification cannot abort the promoter" (#888). That is the THIRD
+  guard in this family — `engine/tests/architecture/notifyIsShared.test.ts` over
+  `runtime/core/notifyListeners.ts`, built like the two above and carrying the same shape of
+  stated blind spots. It is a different question (an exception escaping a synchronous fan-out,
+  not a stale continuation), so nothing here covers it and it does not belong in this doc's body.
 - [architecture-layers.md](./architecture-layers.md) — why the helper lives in L0 `runtime/core/`.
 - [rendering.md](./rendering.md) § "The 2D path needs the same recovery" — the renderer-side
   story behind #801, and why a recovery's cure must sit on the same success path as its bring-up.

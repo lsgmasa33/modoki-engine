@@ -515,6 +515,9 @@ export default defineConfig(({ command }) => {
         // #813 — wordweave's save/store modules import this NARROW subpath (deliberately, to keep
         // two pure format modules off the barrel's graph). It is the first such import from a GAME
         // rather than from `engine/app/**`, which is exactly the case this list exists for.
+        // #888 — same shape: games/sling's editor stores import the shared listener-isolation
+        // helper by its narrow subpath rather than through the barrel.
+        '@modoki/engine/runtime/core/notifyListeners',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',

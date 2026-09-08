@@ -32,6 +32,7 @@
  *  and a recorded press can be drawn on one overlay with no transform between them. */
 
 import { onWorldSwap } from '../core/ecs/world';
+import { notifyListeners } from '../core/notifyListeners';
 
 /** A region's geometry. Circles are not expressible as rects and the difference is exactly what
  *  was misread in the Court session, so the shape is a discriminated union rather than a
@@ -269,9 +270,9 @@ export function isHitRegionOverlayVisible(): boolean {
 export function setHitRegionOverlayVisible(on: boolean): void {
   if (overlayOn === on) return;
   overlayOn = on;
-  for (const fn of listeners) {
-    try { fn(); } catch { /* one bad subscriber must not stop the others */ }
-  }
+  // One bad subscriber must not stop the others (#888). It REPORTS now, where this site used to
+  // swallow silently — an overlay subscriber that has been dead all session is worth a line.
+  notifyListeners(listeners, 'hitRegions', []);
 }
 
 export function subscribeHitRegionOverlay(fn: () => void): () => void {

@@ -23,6 +23,7 @@
 
 import { rawNow } from './clock';
 import { createTeardownToken } from './liveness';
+import { notifyListeners } from './notifyListeners';
 
 export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
 
@@ -219,19 +220,14 @@ function notify(): void {
   notifyScheduled = true;
   queueMicrotask(() => {
     notifyScheduled = false;
-    for (const fn of listeners) {
-      // Per-listener, and never allowed to escape or block the rest — see the module doc comment
-      // above `unpatchedLog` (where `unpatchedError` used to be) for why the report below goes
-      // through `unpatchedLog` and not the live `console.error`.
-      try {
-        fn();
-      } catch (err) {
-        // `unpatchedLog`, not a `console.error` path: this is an internal bookkeeping failure, and
-        // routing it through anything that reaches `globalErrors.ts` would spend a real
-        // Crashlytics issue on it.
-        unpatchedLog('[consoleRing] a subscriber threw during flush', err);
-      }
-    }
+    // Per-listener isolation comes from the shared helper (#888); the REPORTER does not, and
+    // must not. `unpatchedLog`, not a `console.error` path: this is an internal bookkeeping
+    // failure, and routing it through anything that reaches `globalErrors.ts` would spend a real
+    // Crashlytics issue on it — and `console.error` here would re-enter the flush we are inside.
+    // See the module doc comment above `unpatchedLog` (where `unpatchedError` used to be).
+    notifyListeners(listeners, 'consoleRing', [], (label, err) => {
+      unpatchedLog(`[${label}] a subscriber threw during flush`, err);
+    });
   });
 }
 

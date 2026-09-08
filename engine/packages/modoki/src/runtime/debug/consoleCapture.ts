@@ -26,6 +26,7 @@ import {
   type ConsoleRingLevel,
 } from '../core/consoleRing';
 import { createTeardownToken } from '../core/liveness';
+import { notifyListeners } from '../core/notifyListeners';
 
 export type ConsoleLevel = ConsoleRingLevel;
 
@@ -75,20 +76,16 @@ function notifyLocal(): void {
   queueMicrotask(() => {
     if (!stillLive()) return; // reset between schedule and drain
     notifyScheduled = false;
-    for (const fn of listeners) {
-      // Per-listener, and NOT optional — a throwing listener must not escape or block the others.
-      try {
-        fn();
-      } catch (err) {
-        // ⚠️ `unpatchedLog`, NOT `console.error`. Same reasoning as the shared ring's own flush
-        // catch: `globalErrors.ts:490` wraps `console.error` and reports to Crashlytics, and its
-        // dedup only recognises a call whose sole argument is an `Error` object — so reporting an
-        // INTERNAL bookkeeping failure here with two args files a real Crashlytics issue and spends
-        // the session's error budget. Reaching this at all means a `subscribeConsole` listener threw
-        // during a Clear-triggered flush; that deserves a log line, not a crash report.
-        unpatchedLog('[consoleCapture] a subscriber threw during flush', err);
-      }
-    }
+    // Per-listener isolation comes from the shared helper (#888) and is NOT optional.
+    // ⚠️ The REPORTER stays local and stays `unpatchedLog`, NOT `console.error`. Same reasoning as
+    // the shared ring's own flush catch: `globalErrors.ts:490` wraps `console.error` and reports to
+    // Crashlytics, and its dedup only recognises a call whose sole argument is an `Error` object —
+    // so reporting an INTERNAL bookkeeping failure here with two args files a real Crashlytics
+    // issue and spends the session's error budget. Reaching this at all means a `subscribeConsole`
+    // listener threw during a Clear-triggered flush; that deserves a log line, not a crash report.
+    notifyListeners(listeners, 'consoleCapture', [], (label, err) => {
+      unpatchedLog(`[${label}] a subscriber threw during flush`, err);
+    });
   });
 }
 

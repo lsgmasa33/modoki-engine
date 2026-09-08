@@ -14,6 +14,8 @@
  *  measured on games/space-console: 10s+, reproduced twice). The continuously-rendering GameView
  *  needs none of this. */
 
+import { notifyListeners } from '../core/notifyListeners';
+
 type ModelLoadedListener = (modelPath: string) => void;
 
 const listeners = new Set<ModelLoadedListener>();
@@ -28,8 +30,5 @@ export function onModelTemplatesLoaded(fn: ModelLoadedListener): () => void {
  *  redraw armed ahead of the cache write would draw the same empty frame and settle again.
  *  A throwing listener is contained: a load must not fail because an observer did. */
 export function notifyModelTemplatesLoaded(modelPath: string): void {
-  for (const fn of listeners) {
-    try { fn(modelPath); }
-    catch (e) { console.warn('[MeshCache] model-loaded listener threw:', e); }
-  }
+  notifyListeners(listeners, 'modelLoadNotify', [modelPath]);
 }

@@ -27,6 +27,7 @@
  *  bytes ever got drawn. */
 
 import { fireDirtyListeners } from './renderDirty';
+import { notifyListeners } from './notifyListeners';
 
 export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment' | 'shader';
 
@@ -75,10 +76,9 @@ export function emitAssetInvalidated(
   path: string,
   targets: ReadonlySet<string> = new Set([path]),
 ): void {
-  for (const fn of listeners) {
-    try { fn(kind, path, targets); }
-    catch (e) { console.warn(`[assetInvalidation] ${kind} listener threw:`, e); }
-  }
+  // The label carries `kind` because that is what identifies WHICH invalidation the dead
+  // listener was watching; the shared helper only supplies the isolation (#888).
+  notifyListeners(listeners, `assetInvalidation:${kind}`, [kind, path, targets]);
   fireDirtyListeners();
 }
 

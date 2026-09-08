@@ -38,6 +38,7 @@
  *     that fails is re-parked, so a failed flush is still pending and still reported. */
 
 import { backendFetch } from '../backend/editorBackend';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** Set (or clear, with `null`) the `baseScene` ref on a scene FILE.
  *
@@ -90,7 +91,7 @@ const activeFlushMarkers = new Set<Set<string>>();
 
 let _version = 0;
 const listeners = new Set<() => void>();
-function bump(): void { _version += 1; for (const fn of listeners) fn(); }
+function bump(): void { _version += 1; notifyListeners(listeners, 'pendingBaseScene', []); }
 
 /** Subscribe to changes (park / flush / discard). Returns an unsubscribe. */
 export function subscribePendingBaseScenes(fn: () => void): () => void {

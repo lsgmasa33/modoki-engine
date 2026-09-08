@@ -24,6 +24,7 @@ import { createTeardownToken } from '../core/liveness';
 import { isGuid } from '../core/assetRefRules';
 import { getGuidForPath, resolveRef } from './assetManifest';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { notifyListeners } from '../core/notifyListeners';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
@@ -93,7 +94,10 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
       if (!stillLive()) return;
       loading.delete(guid);
       const wakes = waiters.get(guid); waiters.delete(guid);
-      if (program) { programs.set(guid, program); wakes?.forEach((cb) => cb()); }
+      // Isolated per waiter (#888), and the ordering is why it matters: `waiters.delete(guid)`
+      // above has already run, so a throwing waiter used to leave every waiter behind it parked
+      // forever with nothing left to settle them. Same shape as `fontTexturePixi.settleWaiters`.
+      if (program) { programs.set(guid, program); if (wakes) notifyListeners(wakes, 'spriteMaterialCache', []); }
       else failed.add(guid); // missing body / wrong space / reserved-name — buildPixiShaderProgram warned
     })
     .catch((e) => {

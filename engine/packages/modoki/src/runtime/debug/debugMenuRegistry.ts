@@ -11,6 +11,7 @@
  *  docs/debug-menu.md. */
 
 import type React from 'react';
+import { notifyListeners } from '../core/notifyListeners';
 
 /** A full custom tab in the debug menu. */
 export interface DebugTabDef {
@@ -46,7 +47,7 @@ let version = 0;
 
 function bump(): void {
   version++;
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'debugMenuRegistry', []);
 }
 
 /** Register (or replace, by id) a full custom debug tab. */

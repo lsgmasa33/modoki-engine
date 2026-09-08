@@ -3,7 +3,7 @@
  *  additive introduction is byte-identical (scrub/preview read back as 'stopped'; Play-paused reads
  *  back as 'paused') and the gate helpers match the intended per-mode behavior. */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   getRunMode, setRunMode, isAdvancing, getPlayState, setPlayState, isSimRunning,
   onPlayStateChange, onRunModeChange,
@@ -90,5 +90,44 @@ describe('RunMode ↔ PlayState compat derivation', () => {
 
     setRunMode('playing', { advancing: false }); // paused Play
     expect([shouldFireActions(), shouldRunSimTier(), isLiveRender()]).toEqual([false, false, true]);
+  });
+});
+
+describe('a throwing listener does not take out the other set (#888)', () => {
+  // `setRunMode` assigns `_mode`/`_advancing` and THEN notifies two DIFFERENT sets in sequence —
+  // play-state listeners, then run-mode listeners. Before the isolation, a throwing play-state
+  // listener unwound out of `setRunMode` before the second loop ran at all: the mode had changed
+  // and every run-mode subscriber in the engine missed the transition, permanently, because the
+  // loop is not resumable and nothing retries it.
+  it('a throwing PLAY listener still lets the RUN-MODE listeners fire', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    setPlayState('stopped');            // a known starting state, so the transition below is real
+
+    const modeSeen = vi.fn();
+    const unsubThrow = onPlayStateChange(() => { throw new Error('listener boom'); });
+    const unsubMode = onRunModeChange(modeSeen);
+
+    expect(() => setRunMode('playing')).not.toThrow();
+    expect(modeSeen).toHaveBeenCalled();
+
+    unsubThrow();
+    unsubMode();
+    vi.restoreAllMocks();
+  });
+
+  it('a throwing listener does not starve the ones after it in its OWN set', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    setPlayState('stopped');
+
+    const after = vi.fn();
+    const unsubThrow = onPlayStateChange(() => { throw new Error('listener boom'); });
+    const unsubAfter = onPlayStateChange(after);
+
+    setRunMode('playing');
+    expect(after).toHaveBeenCalled();
+
+    unsubThrow();
+    unsubAfter();
+    vi.restoreAllMocks();
   });
 });

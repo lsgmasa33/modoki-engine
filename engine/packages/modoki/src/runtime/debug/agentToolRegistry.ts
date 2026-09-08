@@ -30,6 +30,7 @@
  */
 
 import { isDebugMenuEnabled } from './debugMenuRegistry';
+import { notifyListeners } from '../core/notifyListeners';
 
 /** A parameter's declared type. Deliberately a SMALL closed set.
  *
@@ -84,7 +85,7 @@ let version = 0;
 
 function bump(): void {
   version++;
-  for (const l of listeners) l();
+  notifyListeners(listeners, 'agentToolRegistry', []);
 }
 
 /** Names an agent tool may not take. `modoki_` is the engine's own surface: a game tool taking

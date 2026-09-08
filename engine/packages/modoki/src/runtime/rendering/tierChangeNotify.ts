@@ -26,6 +26,7 @@
 import { emit } from '../core/journal';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import type { QualityTier, TierResolution } from './qualityTier';
+import { notifyListeners } from '../core/notifyListeners';
 
 /** `prev` is `null` on the first resolution of a session — the tier a device booted into,
  *  which is a change from "nothing decided yet" and is delivered rather than swallowed. */
@@ -60,7 +61,5 @@ export function publishQualityTierChange(res: TierResolution, prev: QualityTier 
   const world = peekCurrentWorld();
   if (world) emit('@tier', { tier: res.tier, prev, source: res.source, reason: res.reason }, world);
 
-  for (const fn of listeners) {
-    try { fn(res, prev); } catch (e) { console.warn('[qualityTier] tier-change listener failed:', e); }
-  }
+  notifyListeners(listeners, 'qualityTier', [res, prev]);
 }
