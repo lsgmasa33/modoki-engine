@@ -174,7 +174,19 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
     expect(fs.existsSync(script)).toBe(true);
     const src = readScannedSource(script).code;
     // It must DELEGATE. If this file ever grows its own candidate list it becomes the third probe.
-    expect(src).toContain("'engine', 'toolchain', 'index.ts'");
+    //
+    // The entry is spelled relative to `engine/` because #827 folded this script onto the SHARED
+    // esbuild seam (`loadVendorPlugins.mjs`), which takes `relPathFromEngineDir`. Before that the
+    // script bundled `path.join(repoRoot, 'engine', 'toolchain', 'index.ts')` itself, and this
+    // assertion matched that literal. Both spellings name the same module; what is being pinned
+    // is that SOME delegation to it exists, not the loader's shape.
+    expect(src).toContain("'toolchain', 'index.ts'");
+    // ⚠️ …and that it goes through the shared loader rather than a private esbuild copy. This half
+    // is the #827 half: two scripts each carrying their own bundle-to-temp-and-import is what that
+    // issue is about, and a fresh `import { build } from 'esbuild'` here is how it comes back.
+    expect(src).toMatch(/loadRequiredEngineModules\(/);
+    expect(src, 'a private esbuild loader is back — use loadVendorPlugins.mjs (#827)')
+      .not.toMatch(/from ['"]esbuild['"]/);
     expect(src).toMatch(/detect\(['"]java['"]\)/);
     expect(src).toMatch(/detect\(['"]android-sdk['"]\)/);
   });

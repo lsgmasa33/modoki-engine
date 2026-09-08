@@ -19,6 +19,8 @@ import { fireDirtyListeners, findEntity } from '../../runtime/core/ecs/entityUti
 import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
@@ -77,6 +79,22 @@ export default function TimelineEditor() {
   const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingTimelineAsset);
   const nonce = useEditorStore((s) => s.timelineEditNonce);
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingTimelineDoc` null, and `commit` early-returns on that, so no edit can reach the
+   *  registry — editing is disabled by construction. A genuinely MISSING file is NOT this (#896,
+   *  and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
+   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
+   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
+   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
+   *  re-reading the file, leaving the panel editing normally over a document it never read. The
+   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
+   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
+   *  was this button. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingTimelineAsset');
+  }, []);
   const doc = useEditorStore((s) => s.editingTimelineDoc);
   const rootId = useEditorStore((s) => s.directorRootEntityId);
   const playhead = useEditorStore((s) => s.playheadTime);
@@ -198,6 +216,7 @@ export default function TimelineEditor() {
     setSelectedTrack(null);
     setSelectedItem(null);
     setViewport(DEFAULT_VIEWPORT);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingTimelineDoc;
@@ -238,7 +257,24 @@ export default function TimelineEditor() {
         savedMarkRef.current?.(loaded);
         loadTimelineDoc(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[TimelineEditor] load failed, using default', e); const fb = defaultTimeline(newGuid(), asset.name); savedMarkRef.current?.(fb); loadTimelineDoc(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896, the AnimationEditor twin: this substituted `defaultTimeline(newGuid(), …)` on ANY
+        // failure and marked it as the SAVED baseline, so the first edit parked a full-replace
+        // write of the fabrication over the authored file — wearing a FRESH guid, which defeats
+        // `/api/asset-write`'s id preservation and leaves the heal pass nothing to flag. Every
+        // Director reference to the old guid dangled. Only a genuinely MISSING file keeps defaults.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[TimelineEditor] load failed (asset missing), using default', e);
+          const fb = defaultTimeline(newGuid(), asset.name);
+          savedMarkRef.current?.(fb);
+          loadTimelineDoc(fb);
+          return;
+        }
+        console.error(`[TimelineEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);
@@ -647,6 +683,25 @@ export default function TimelineEditor() {
   savedMarkRef.current = markSaved;
 
   if (!asset) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>No timeline open. Double-click a <code>.timeline.json</code> in Assets, or open a Director&apos;s timeline.</div>;
+  // ⚠️ BEFORE the `!doc` return (#896 review, finding 2). A refusal leaves `doc` null, so the
+  // banner further down was unreachable and the human saw "Loading timeline…" forever, with a
+  // console line as the only signal that the file had been refused.
+  if (loadState === 'failed') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#1b1b1f' }}>
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="timeline.loadBanner"
+          onRetry={retryLoad}
+        />
+        <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>
+          <div>Repair the file on disk (a corrupt or conflict-markered <code>.timeline.json</code>), then Retry.</div>
+          {/* Parity with SkinEditor's refused view: Retry is not the only way out. */}
+          <button data-ui-id="timeline.refused.close" data-ui-kind="button" data-ui-label="close timeline" onClick={() => useEditorStore.getState().closeTimelineEditor()} style={{ ...btn, marginTop: 10 }}>Close</button>
+        </div>
+      </div>
+    );
+  }
   if (!doc) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>Loading timeline…</div>;
 
   const sel = selectedTrack != null ? doc.tracks[selectedTrack] : null;

@@ -37,7 +37,7 @@ describe('classifyParticleFetchSuccess', () => {
 
 describe('classifyParticleFetchFailure', () => {
   it('treats a MissingAssetError as "missing" — defaults are the correct content', () => {
-    expect(classifyParticleFetchFailure(new MissingAssetError('404 for fx/new.particle.json'))).toEqual({ kind: 'missing' });
+    expect(classifyParticleFetchFailure(new MissingAssetError('404 for fx/new.particle.json', { status: 404, absent: true }))).toEqual({ kind: 'missing' });
   });
 
   it('treats a real parse failure as "refused" — must NOT be treated as missing', () => {

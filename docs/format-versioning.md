@@ -185,6 +185,16 @@ abstraction. What a site does with a `too-new` verdict is dictated by its caller
 What must be uniform is the **verdict** and the **decision table in §3** — not the plumbing. A new
 document picks a channel that fits its caller and records the choice in that table.
 
+⚠️ **The same refusal shape is reached from a second direction, and it is worth knowing they meet.**
+An asset editor must also refuse a document it could not READ AT ALL — a corrupt, truncated or
+conflict-markered file, or a failed fetch — for the identical reason a too-new one is refused here:
+these panels write with `replace: true`, so opening on a substituted document and editing one field
+replaces the file wholesale. That half is `editor/panels/assetDocLoad.ts` and is documented in
+[editor.md](editor.md) § "A failed read yields NO document"; a document with no format constant
+(`.anim.json`, `.spriteanim.json`, `.timeline.json`, `.rig2d.json` — § 3) gets only that half, since
+there is no version to classify. ⚠️ A genuinely MISSING file is neither: defaults are correct there,
+and refusing would make a brand-new asset unauthorable.
+
 ## 3. The decision table — every ENGINE-owned versioned document
 
 The corpus of documents the engine itself defines and reads/writes. A new versioned document owned

@@ -25,7 +25,21 @@ import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
   parkMetaEdit, peekPendingMeta, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths,
   peekMetaBaseline,
+  stampMetaReadPath,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+
+/** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
+ *
+ *  `parkMetaEdit` refuses a document whose read-path stamp is absent or names another path, so a
+ *  hand-built literal is refused by design: it is precisely a document nobody read. Stamping it
+ *  here is not ceremony to get past the guard — it is what makes these fixtures documents
+ *  production can actually produce. A test that parks an impossible input proves nothing about
+ *  the code path it claims to cover.
+ *
+ *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do. */
+const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string): void =>
+  parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
+
 
 registerEditorAgentOps();
 
@@ -48,7 +62,7 @@ afterEach(reset);
 
 describe('resolve-meta-park — the probe', () => {
   it('reports a parked path, and reports a clean one as clean', async () => {
-    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
+    parkAsPanel(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
 
     expect(await resolve({ paths: [TEX, MODEL] })).toMatchObject({ ok: true, parked: [TEX], discarded: [] });
     expect(await resolve({ paths: [MODEL] })).toMatchObject({ ok: true, parked: [], discarded: [] });
@@ -58,7 +72,7 @@ describe('resolve-meta-park — the probe', () => {
     // The `set_selection` lesson: a destructive-adjacent op whose bare call means "everything" is
     // one misspelled argument key away from doing it. This one refuses instead, and the refusal is
     // a copy-paste of the paths that matter — §5.
-    parkMetaEdit(TEX, { id: 'tex-guid' });
+    parkAsPanel(TEX, { id: 'tex-guid' });
     await expect(resolve({})).rejects.toThrow(/requires \{ paths/);
     await expect(resolve({ paths: [] })).rejects.toThrow(new RegExp(TEX.replace(/\//g, '\\/')));
     await expect(resolve({ paths: [''] })).rejects.toThrow(/requires \{ paths/);
@@ -88,7 +102,7 @@ describe('resolve-meta-park — the probe', () => {
 
 describe('resolve-meta-park — the discard', () => {
   it('drops the park only when asked, and reports what actually went', async () => {
-    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
+    parkAsPanel(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
 
     // Probing does not discard. This is the accept side of the discard flag: a gate that dropped
     // the park just by looking would destroy the human's edit on every refusal it issued.
@@ -102,8 +116,8 @@ describe('resolve-meta-park — the discard', () => {
   });
 
   it('discards only the paths asked about, never the whole registry', async () => {
-    parkMetaEdit(TEX, { id: 'tex-guid' });
-    parkMetaEdit(MODEL, { id: 'model-guid' });
+    parkAsPanel(TEX, { id: 'tex-guid' });
+    parkAsPanel(MODEL, { id: 'model-guid' });
 
     await resolve({ paths: [TEX], discard: true });
 
@@ -122,7 +136,7 @@ describe('resolve-meta-park — the discard', () => {
     // the discard path. The hazard is unchanged: a component may still be holding the `{}` fallback,
     // and a wholesale write of that document has no `id`, so the scanner's heal pass mints a fresh
     // GUID and every scene ref to the asset dangles.
-    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
+    parkAsPanel(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
 
     await resolve({ paths: [TEX], discard: true });
 
@@ -131,8 +145,8 @@ describe('resolve-meta-park — the discard', () => {
     // read still parks after the discard. (The refusal half is NOT asserted here — see the note in
     // "RECORDS NOTHING" above and the file header: since #880 it cannot fail for anything
     // `resolve-meta-park` does.)
-    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 128 } });
-    expect(peekPendingMeta(TEX)).toEqual({ id: 'tex-guid', texture: { maxSize: 128 } });
+    parkAsPanel(TEX, { id: 'tex-guid', texture: { maxSize: 128 } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ id: 'tex-guid', texture: { maxSize: 128 } }, TEX));
   });
 });
 
@@ -141,7 +155,7 @@ describe('discard-asset-edits does not silently imply it cleared the sidecar reg
     // `all:true` reads as a clean slate and is not one: this op owns the DIRTY-ASSET registry, and
     // a parked `.meta.json` edit survives it untouched. An agent that then re-imports still bakes
     // against the human's unsaved settings (#882) — a false success, which §0 ranks worst.
-    parkMetaEdit(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
+    parkAsPanel(TEX, { id: 'tex-guid', texture: { maxSize: 256 } });
 
     const r = await discardAssetEdits({ all: true });
 

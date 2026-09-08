@@ -269,7 +269,10 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   at all. So `parkMetaEdit(p, { id: meta.id, texture: { ...settings, ...patch } })` would be a
   plausible 19th site that satisfies the merge rule, carries no tag, and on a failed read posts
   `id: undefined` (dropped by `JSON.stringify`) — this exact destruction with the guard silent.
-  Nothing is broken today; the residual is real and unguarded.
+  Nothing is broken today. ⚠️ **That residual was closed on the PARK route by #891's read-path
+  stamp** (below): the same hypothetical site carries no stamp, so `parkMetaEdit` refuses it. It is
+  still open on the wholesale-write route, deliberately — see the stamp's own entry for why a check
+  there would refuse three correct writes.
 
   ⚠️ **There are FOUR doors onto `/api/write-meta`, and the path-keyed flag watched one.** It was consulted on
   the park, so it could not see `writeMetaWholesale` — and `EnvironmentAssetView.apply()`'s UltraHDR
@@ -324,11 +327,73 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   file generally: its raw fetch dropped the header, so `baselines` had no entry for any `.mp4`, the
   flush passed `undefined` as `ifMatch`, and `ifMatchRefusal` reads an absent `ifMatch` as *proceed*
   — the #845 precondition was **inert for that whole asset type** while looking present. The
-  exemption map now carries a declared `baseline: 'seeds' | 'none'` and a `fallback:
-  'tags' | 'aborts'`, both checked both ways by `metaReadPreferringPark.test.ts`, because a prose
-  reason cannot carry those distinctions. The generalisation the second field carries: **what an
+  exemption map now carries a declared `baseline: 'seeds' | 'none'`, a `fallback:
+  'tags' | 'aborts'` and a `readPath: 'stamps' | 'never-parks'` (#891), all checked both ways by
+  `metaReadPreferringPark.test.ts`, because a prose reason cannot carry those distinctions. ⚠️ Three
+  fields is not three coincidences: each was added one release AFTER an exemption silently dropped
+  the thing it names, which is the argument for declaring the NEXT one before it bites. The generalisation the second field carries: **what an
   exemption must not be allowed to skip is better carried by the DATA than by a call** — an exempted
   reader can forget a bookkeeping call, but it cannot half-adopt `metaReadFallback()`.
+- **A park must be built on a read OF THAT PATH** (#890/#891/#897) — the same mechanism as the
+  read-failed tag, one notch wider, and the reason both issues were one design pass rather than two
+  fixes. `readMetaPreferringPark` stamps what it returns with the path it was read for
+  (`READ_FOR_PATH`, a second `Symbol.for` in `metaReadFallback.ts`), and `parkMetaEdit` refuses a
+  document whose stamp is **absent or names another path** — one comparison covering two
+  destructions the failed-read tag is structurally blind to:
+
+  - **absent** — nothing was read for this path. `readMetaPreferringPark` deliberately does not
+    swallow a THROWN fetch, so a panel's `.catch(() => {})` leaves `meta === null` and its next
+    field change parks `{ ...(meta ?? {}), … }`: no `id`, and **no tag**, because a rejected fetch
+    produces no response to tag. Driven on `main` (#890): Flip Y toggled during an injected
+    rejection, Cmd+S, and the sidecar's `b5ad91a2-…` was replaced by a freshly minted GUID.
+  - **foreign** — asset A's document, read successfully and therefore correctly untagged, parked
+    under asset B's path because nothing remounted the panel when the selection moved. Worse than
+    the id-less case: two assets claim one id, so deleting B trashes A's generated meshes.
+
+  ⚠️ **The stamp is half of a PAIR, and either half alone is a trap.** The other half is
+  `key={selectedAsset.path}` on `<AssetInspector>` (`Inspector.tsx`), which remounts the asset panel
+  per asset. A key ALONE converts the foreign document into an id-less one — a fresh instance starts
+  at `useState(null)` — i.e. it turns #891 into #890, the same destruction and harder to notice. The
+  stamp alone leaves the panel *displaying* another asset's values with every control live, and an
+  edit there refused with only a console line. Together: the key stops the display, the stamp stops
+  anything reaching disk. The key is also what reaches the `.mat.json`-registry views (#897), whose
+  `if (!data) return <Loading…/>` gate is honest again once `data` resets — the stamp cannot see
+  that registry at all.
+
+  ⚠️ **Two producers outside the read helper re-stamp explicitly rather than being holes in the
+  guard.** `VideoAssetView` (the declared raw-read exemption — an exemption from the READ HELPER is
+  never an exemption from what the read teaches the document, which is #871's lesson for the third
+  time) and `applyMovesToParkedMeta`, where a RENAME genuinely moves a document to another path.
+  Without that second one the rename would look fine and the human's next keystroke on the renamed
+  asset would be silently refused.
+
+  ⚠️ **The check is at `parkMetaEdit` only, NOT at `writeMetaConditional`** — and that asymmetry is
+  deliberate, not an oversight to tidy later. An explicit-action wholesale writer legitimately
+  builds a document no read produced: `ModelAssetView`'s collision-mesh write posts
+  `writeMetaWholesale(glbPath, { id: modelGuid, generated: … })` for a GENERATED glb that panel
+  never read, carrying the identity the import minted — a stamp check at the endpoint would refuse
+  it. ⚠️ `modelImport`'s three writes are **not** the example, though this section said so for one
+  revision: that file POSTs the route with a raw `backendFetch` and never reaches
+  `writeMetaConditional`, so a check there could not touch it either way.
+
+  What covers the wholesale route instead is **each writer's own provenance gate — declared and
+  checked**, one entry per writer in `tests/architecture/wholesaleMetaWriteProvenance.test.ts`
+  (`'stamp' | 'loadedRef' | 'early-return' | 'fresh-doc'`, with the declared set required to equal
+  the set of files that write). ⚠️ That rule exists because the tag is NOT enough there and one
+  writer proved it: `EnvironmentAssetView.apply()` gated on `metaCameFromFailedRead(meta)`, which
+  requires `doc !== null` and so answered *false* for the one state where the panel holds no
+  document at all — a thrown read. Apply then encoded the gainmap, committed `~ultrahdr.jpg` and
+  replaced the sidecar with an id-less document: #890's destruction, through the door the park-seam
+  guard does not watch. It asks `metaReadPathOf(meta) !== path` now. The other three writers were
+  safe only because each had independently reached for *"did a read land"* rather than *"is this
+  the tagged fallback"* — three files right by coincidence, which is what the table converts into
+  one thing that is checked.
+
+  ⚠️ **What it does NOT fix, deliberately: #886** — `MaterialBatchView` parking the `{}` fallback of
+  a failed `.mat.json` read. That is the emptiness face on the dirty-asset registry, and its repair
+  is a shared read seam for asset documents, which does not exist yet. Same destruction, same
+  fail-open instinct, different seam.
+
 - **A wholesale editor write FORGETS the baseline it invalidated** (#874). Make-2D, a 9-slice or
   Sprite Save, a model import and the collision-mesh write all replace the sidecar while a panel is
   mounted on the same path. Leaving the old hash made the human's very next Cmd+S 409 under

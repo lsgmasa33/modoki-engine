@@ -33,6 +33,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
@@ -445,6 +446,240 @@ describe('build-web.mjs warns (never silently) when the project-config gate cann
     expect(branch).toMatch(/console\.warn/);
     expect(branch).not.toMatch(/process\.exit/);
   });
+});
+
+/** #827's census: `engine/scripts/**.mjs` reaches TypeScript through the ONE seam, never a
+ *  private copy of it.
+ *
+ *  This is the recurrence half of that issue, and it is the half with actual evidence behind it.
+ *  Two scripts each carried their own bundle-to-temp-and-import — `add-native-targets.mjs` and
+ *  `print-toolchain-env.mjs` — and the former's own comment said *"Same approach as
+ *  print-toolchain-env.mjs"*, citing the other copy in prose instead of importing it. Nothing was
+ *  wrong with either copy; the cost is that a fix to the seam (#714's `…Result` discriminant, the
+ *  per-clone temp-file naming) reached one of three implementations.
+ *
+ *  ⚠️ Wiring, not behaviour. A source census proves a script IMPORTS the seam; it cannot prove the
+ *  seam is reached on the path that matters, and `cliBuildClaims.test.ts:165` records the scar
+ *  where exactly that census stayed green through a deadlock. The behavioural cover is the
+ *  no-esbuild subprocess case below, plus running the two scripts by hand.
+ *
+ *  ⚠️ Scoped to `engine/scripts/**` and that scope is a CLAIM, so here is its limit. The #827
+ *  close-out sweep found ONE more instance of this exact shape repo-wide —
+ *  `games/wordweave/tools/run.mjs` (bundle to temp, `import(pathToFileURL(...))`, run) — and it is
+ *  deliberately NOT in scope: `CLAUDE.md` requires a game to be self-contained, so reaching
+ *  `engine/scripts/loadVendorPlugins.mjs` from `games/**` is a portability violation
+ *  `gamePortability.test.ts` fails on. The seam is unreachable from a game BY DESIGN, so that copy
+ *  is a legitimate second implementation rather than a member of this class. No other instance
+ *  exists: `git ls-files | xargs grep -l pathToFileURL` cross-checked against files mentioning
+ *  esbuild/outfile returns only the seam itself, the two scripts folded here, the tests, that
+ *  wordweave runner, and two non-loaders (`native-dynamic-import.ts`, `stage-vite-config.cjs`).
+ *
+ *  The allowlist is a CLAIM too, so each entry states why it is not a loader rather than just
+ *  naming a file. */
+const DIRECT_ESBUILD_ALLOWED = new Map([
+  ['engine/scripts/loadVendorPlugins.mjs',
+    'IS the seam — the one bundle-to-temp-and-import in the repo.'],
+  ['engine/scripts/build-electron.mjs',
+    'Not a loader: it esbuild-BUNDLES Electron main + the MCP entry to shippable `outfile`s. It '
+    + 'never imports what it builds, so there is nothing here to route through the seam.'],
+  ['engine/scripts/stage-vite-config.cjs',
+    'Not a loader, same category as build-electron.mjs: it esbuild-BUNDLES engine/vite.config.ts to '
+    + 'a persistent, shipped engine/vite.config.cjs for the packaged editor (#326). It never '
+    + 'imports what it builds.'],
+  ['engine/scripts/migrate-meta-sidecars.mjs',
+    'IS a third copy of the mechanism, not merely a third shape — its `execFileSync("npx", '
+    + '["esbuild", …])` writes a temp `outFile` which it then `await import(pathToFileURL(outFile))`s: '
+    + 'the same bundle-to-temp-and-import, driven through a subprocess. (Cited by SYMBOL, not line '
+    + 'number — this branch ruled in a8fb0dfca that a line number rots silently, and docCitations '
+    + 'only enforces that under docs/.) Left out of #827 DELIBERATELY (a '
+    + 'one-off migration with no preamble and no build claim), which is a scope call, not an '
+    + 'absolution: this entry exists so the next sweep reads "deferred", never "not an instance".'],
+]);
+
+describe('no engine/scripts/*.mjs rolls its own esbuild module loader (#827)', () => {
+  // Enumerated through git, not a filesystem walk — an untracked stray must not silently widen or
+  // narrow the corpus. MEASURED at 89 files today (not the "~30" an earlier version of this comment
+  // guessed — it was wrong by ~3x, and a floor set from a guess is not a floor). The corpus spans
+  // three directories: `engine/scripts`, `engine/scripts/lib`, `engine/scripts/ota`.
+  const scripts = repoFiles({
+    under: path.join(repoRoot, 'engine', 'scripts'),
+    // `.cjs` too: `engine/scripts/` is not uniformly `.mjs`, and a census that matched only one
+    // extension would let a private loader written as `.cjs` evade it entirely. Found by the #827
+    // close-out sweep — `stage-vite-config.cjs` sits in this directory and this guard could not see
+    // it. `A test file the globs do not match is silent` applies to the SUBJECT corpus too.
+    match: /\.(mjs|cjs)$/,
+    exclude: ['node_modules'],
+    floor: 70,
+  });
+
+  it('the corpus is real and includes the two scripts #827 folded', () => {
+    // Guards the guard: a filter that silently empties proves nothing about anything.
+    const rels = scripts.map((f) => f.rel);
+    expect(rels).toContain('engine/scripts/add-native-targets.mjs');
+    expect(rels).toContain('engine/scripts/print-toolchain-env.mjs');
+    // …and that the corpus reaches BELOW the top level, because the two names above are both at
+    // the top: a narrowing that dropped the subdirectories would keep them and clear the floor.
+    //
+    // ⚠️ MEASURED: that is 8 files (`lib/` 1, `ota/` 7), not the "20-odd" an earlier version of
+    // this very comment claimed — which was a guess, in the paragraph whose subject is that a
+    // guessed number is not a measurement. 8 is still worth pinning; 20-odd would have had the
+    // next reader weighting this check at 2.5x its real cover.
+    //
+    // Asserted as "some file is nested", not "lib/ exists": `lib/` holds exactly one matching file
+    // today, so pinning it by name turns this guard red on an ordinary rename for a reason that
+    // has nothing to do with census narrowing. `ota/` is pinned by name because 7 files make it a
+    // real cohort rather than a coincidence.
+    expect(rels.some((r) => r.split('/').length > 3), 'the corpus no longer reaches below the top level').toBe(true);
+    expect(rels.some((r) => r.startsWith('engine/scripts/ota/')), 'ota/ fell out of the corpus').toBe(true);
+    // The `.cjs` half of the match is load-bearing (#827 close-out) — pin that it still matches.
+    expect(rels.some((r) => r.endsWith('.cjs')), 'the .cjs half of the match stopped matching').toBe(true);
+  });
+
+  it.each(scripts.map((f) => f.rel))('%s does not name esbuild in code', (rel) => {
+    if (DIRECT_ESBUILD_ALLOWED.has(rel)) return;
+    const code = readScannedSource(path.join(repoRoot, rel)).code;
+    // ⚠️ Matches the SPECIFIER, not an import STATEMENT, and that is the whole point. The first
+    // version of this assertion was
+    //     /(?:import|require)\s*\(?\s*\{?[^}\n]*\}?\s*(?:from\s*)?['"]esbuild['"]/
+    // whose `[^}\n]*` cannot cross a newline — so `import {\n  build,\n} from 'esbuild';` evaded
+    // it completely, and a private loader came back through nothing more exotic than a formatter
+    // wrapping one line. Confirmed by planting exactly that: 124 tests passed.
+    //
+    // A bare specifier match covers far more: the multi-line import, `require`, a dynamic
+    // `import('esbuild')`, a backtick specifier, a subpath (`esbuild/lib/main.js`), the
+    // `execFileSync('npx', ['esbuild', …])` shell form, and `esbuild-wasm`. It is blunt on purpose
+    // — `readScannedSource` returns `.code` with comments STRIPPED, so prose cannot trip it, and a
+    // script with a real reason to name esbuild in CODE belongs on the allowlist above, with that
+    // reason written down.
+    //
+    // ⚠️ It is NOT airtight, and an earlier version of this comment claimed it was ("no such
+    // seam") — the exact over-claim this repo keeps re-shipping. `import('es' + 'build')` and any
+    // variable-held specifier still evade, and no regex closes that. This is a tripwire against
+    // the shape that actually recurred twice (a plain import someone reached for because the seam
+    // degraded), not a proof of absence.
+    expect(code, `${rel} names esbuild in code. Load engine TypeScript through loadVendorPlugins.mjs `
+      + '(loadEnginePluginModuleResult, or loadRequiredEngineModules when the caller cannot '
+      + 'degrade) — a private copy is #827. A genuine non-loader use goes on the allowlist above, '
+      + 'with its reason.')
+      .not.toMatch(/['"`]esbuild(?:-wasm)?(?:\/[^'"`]*)?['"`]/);
+  });
+
+  it('every allowlisted script still exists and still uses esbuild', () => {
+    // An allowlist entry for a file that stopped using esbuild is a licence nobody needs, and one
+    // for a deleted file hides the next real instance behind a stale name.
+    for (const [rel, why] of DIRECT_ESBUILD_ALLOWED) {
+      const abs = path.join(repoRoot, rel);
+      expect(fs.existsSync(abs), `${rel} is allowlisted but gone — drop the entry (${why})`).toBe(true);
+      expect(readScannedSource(abs).code, `${rel} no longer uses esbuild — drop the entry`)
+        .toMatch(/esbuild/);
+    }
+  });
+});
+
+describe('loadRequiredEngineModules THROWS instead of degrading (#827)', () => {
+  /** The opposite disposition to the describe below, and it needs its own cover for a specific
+   *  reason: the census above is a SOURCE census, so it proves the two CLI scripts *call* this
+   *  function and can say nothing about what the function does. Every mutation to the throw
+   *  survived the whole suite before these tests existed — deleting the `if (!module) throw` put
+   *  the callers straight back to the `Cannot destructure property 'detect' of 'undefined'` deref
+   *  the function was written to replace, and the suite stayed green.
+   *
+   *  `engine/tests` as the repo root is the same `emptyRepo` trick the degrade tests below use: it
+   *  contains no `plugins/*.ts`, so the load hits `no-source` without any fixture setup. */
+  const emptyRepo = path.join(repoRoot, 'engine', 'tests');
+  const rel = path.join('plugins', 'healNativeConfig.ts');
+
+  it('throws rather than returning a null the caller would deref', async () => {
+    const { loadRequiredEngineModules } = await import('../../scripts/loadVendorPlugins.mjs');
+    await expect(loadRequiredEngineModules(emptyRepo, [rel], 'a-caller.mjs')).rejects.toThrow();
+  });
+
+  it('names the caller and the CORRECT reason — the two are not interchangeable', async () => {
+    const { loadRequiredEngineModules } = await import('../../scripts/loadVendorPlugins.mjs');
+    // ⚠️ The `no-source` and `no-esbuild` branches produce different remedies, and swapping them
+    // survives every other assertion in this file while re-shipping exactly #714's confusion (a
+    // packaged editor told to check out sources it already has). So this pins WHICH branch fired,
+    // not merely that the message is non-empty.
+    await expect(loadRequiredEngineModules(emptyRepo, [rel], 'a-caller.mjs'))
+      .rejects.toThrow(/a-caller\.mjs cannot run/);
+    await expect(loadRequiredEngineModules(emptyRepo, [rel], 'a-caller.mjs'))
+      .rejects.toThrow(/is not on disk/);
+    // …and specifically NOT the other branch's remedy.
+    await expect(loadRequiredEngineModules(emptyRepo, [rel], 'a-caller.mjs'))
+      .rejects.not.toThrow(/esbuild could not be imported/);
+  });
+
+  it('stops at the FIRST unloadable entry rather than reporting the last', async () => {
+    const { loadRequiredEngineModules } = await import('../../scripts/loadVendorPlugins.mjs');
+    // Order matters for the message: a caller loading three modules must be told which one is
+    // missing. A loop that overwrote the reason, or gathered then reported, would name the wrong
+    // file — and `add-native-targets.mjs` loads two.
+    await expect(loadRequiredEngineModules(
+      emptyRepo,
+      [path.join('plugins', 'aaa-first.ts'), path.join('plugins', 'zzz-second.ts')],
+      'a-caller.mjs',
+    )).rejects.toThrow(/aaa-first\.ts/);
+  });
+
+  it('normalises a back-slashed entry path in the message (the win clone)', async () => {
+    const { loadRequiredEngineModules } = await import('../../scripts/loadVendorPlugins.mjs');
+    // Both callers build the entry with `path.join`, so on Windows it arrives back-slashed and an
+    // un-normalised message reads `engine/plugins\addNativeTarget.ts` — half one separator, half
+    // the other.
+    //
+    // ⚠️ This test is the REASON the implementation splits on a separator CLASS rather than
+    // `path.sep`. `path.sep` is `/` on POSIX, so the `path.sep` version was an identity here: it
+    // could not be exercised or falsified from a Mac, and `docs/windows.md` is explicit that the
+    // local gate cannot see Windows — so it would have shipped unverified. Splitting on either
+    // separator fixes the same message and makes the back-slashed input drivable from any box.
+    await expect(loadRequiredEngineModules(emptyRepo, ['plugins\\nope.ts'], 'a-caller.mjs'))
+      .rejects.toThrow(/engine\/plugins\/nope\.ts/);
+    await expect(loadRequiredEngineModules(emptyRepo, ['plugins\\nope.ts'], 'a-caller.mjs'))
+      .rejects.not.toThrow(/\\/);
+  });
+
+  it('returns the namespaces UNMERGED and in the requested order, when they DO load', () => {
+    // ⚠️ In a PLAIN `node` subprocess, not inline — the precedent set by the very next describe
+    // ('loadEnginePluginModule degrades instead of throwing'), for its reason plus one more. Under vitest, `import('esbuild')`
+    // inside the seam FAILS, so an inline version of this test does not exercise the success path
+    // at all: it takes the `no-esbuild` branch and throws. (Measured while writing it — the inline
+    // form failed with "esbuild could not be imported", which is the branch the tests above
+    // already cover.) A subprocess runs the real loader against the real engine sources.
+    //
+    // The array contract is what `add-native-targets.mjs` destructures POSITIONALLY, so an
+    // implementation that merged, or reversed the order, would bind the wrong module to the wrong
+    // name at that call site while every source-level assertion stayed green.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-required-modules-'));
+    try {
+      const seam = path.join(repoRoot, 'engine', 'scripts', 'loadVendorPlugins.mjs');
+      const runner = path.join(dir, 'runner.mjs');
+      fs.writeFileSync(runner, `
+        import { loadRequiredEngineModules } from ${JSON.stringify(pathToFileURL(seam).href)};
+        import path from 'node:path';
+        const mods = await loadRequiredEngineModules(
+          ${JSON.stringify(repoRoot)},
+          [path.join('plugins', 'addNativeTarget.ts'), path.join('plugins', 'load-project-config.ts')],
+          'a-caller.mjs',
+        );
+        console.log(JSON.stringify({
+          isArray: Array.isArray(mods),
+          length: mods.length,
+          firstHasScaffold: 'scaffoldNativeTarget' in mods[0],
+          secondHasUnionErrors: 'projectConfigUnionErrors' in mods[1],
+          firstLeakedSecond: 'projectConfigUnionErrors' in mods[0],
+        }));
+      `);
+      const out = JSON.parse(execFileSync(process.execPath, [runner], { encoding: 'utf8', cwd: repoRoot }));
+      expect(out.isArray).toBe(true);
+      expect(out.length).toBe(2);
+      expect(out.firstHasScaffold).toBe(true);
+      expect(out.secondHasUnionErrors).toBe(true);
+      // Unmerged: entry 0 must NOT carry entry 1's exports.
+      expect(out.firstLeakedSecond).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe('loadEnginePluginModule degrades instead of throwing', () => {

@@ -64,6 +64,16 @@ export declare function loadEnginePluginModuleResult(
   relPathFromEngineDir: string,
 ): Promise<EnginePluginLoadResult>;
 
+/** Load engine modules the caller CANNOT run without: same loader as
+ *  {@link loadEnginePluginModuleResult}, but THROWS (naming the entry and the reason) instead of
+ *  degrading to `null`. Returns the namespaces in the order requested, unmerged. See the `.mjs`
+ *  for why a required-load disposition had to exist (#827). */
+export declare function loadRequiredEngineModules(
+  repoRoot: string,
+  relPathsFromEngineDir: readonly string[],
+  purpose: string,
+): Promise<EnginePluginModule[]>;
+
 /** Load `engine/plugins/vendorPlugins.ts` by bundling it with esbuild first, or `null` when that
  *  is not possible here (no engine sources, or no esbuild — i.e. the packaged editor). */
 export declare function loadVendorPlugins(repoRoot: string): Promise<VendorPluginsModule | null>;

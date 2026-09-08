@@ -73,6 +73,59 @@ export async function loadEnginePluginModule(repoRoot, relPathFromEngineDir) {
   return module;
 }
 
+/** Why a REQUIRED load failed, as one sentence a human running a CLI script can act on. Internal:
+ *  the two degrade reasons mean different things to fix, and collapsing them into "could not load"
+ *  is what sent #714 looking for a missing source file in a packaged editor that had every one. */
+function describeRequiredLoadFailure(relPathFromEngineDir, reason, purpose) {
+  // Both callers build this with `path.join`, so on Windows it arrives back-slashed and the message
+  // would read `engine/plugins\addNativeTarget.ts` — half one separator, half the other. The
+  // message is the only consumer, so normalise here rather than constraining how callers spell it.
+  //
+  // ⚠️ A separator CLASS, not `split(path.sep)`. `path.sep` is `/` on POSIX, so that version was an
+  // identity on every non-Windows box — it could not be exercised, or falsified, from a Mac, which
+  // on this repo means it was not verified at all (`docs/windows.md`: the local gate cannot see
+  // Windows). Splitting on either separator fixes the same Windows message AND makes a
+  // back-slashed input testable everywhere.
+  const rel = relPathFromEngineDir.split(/[\\/]/).join('/');
+  const why = reason === 'no-esbuild'
+    ? `esbuild could not be imported, so engine/${rel} could not be bundled. `
+      + 'esbuild is a devDependency: a packaged editor prunes it (#714), and a fresh clone needs '
+      + '`npm install`.'
+    : `engine/${rel} is not on disk, so there is nothing to bundle. This is not an `
+      + 'engine SOURCE checkout — a tarball snapshot ships no `engine/**/*.ts`.';
+  return `${purpose} cannot run: ${why}`;
+}
+
+/** Load engine modules a caller CANNOT run without — same loader as above, opposite disposition.
+ *
+ *  The degrade-to-null contract documented at the top of this file is right for a caller whose step
+ *  is an optional convenience (every heal caller is), and wrong for a caller whose entire job IS the
+ *  module. Why that gap cost the repo two extra copies of this loader, and which callers are on
+ *  which side, is in `docs/build.md` § "Degrading is a disposition" — not restated here.
+ *
+ *  So this THROWS, naming the entry and which of the two reasons fired, rather than handing back a
+ *  null the caller derefs into `x is not a function` several lines from the real cause. `purpose`
+ *  completes the sentence "<purpose> cannot run: …" — name the script, not the step.
+ *
+ *  ⚠️ Returns the namespaces as an ARRAY, in the order requested, and deliberately does NOT merge
+ *  them: a merge resolves a name exported by two entries silently in favour of the last one. A
+ *  caller wanting one object spreads them at its own call site, where the entries being combined
+ *  are visible together.
+ *
+ *  @param repoRoot repo root (contains `engine/`).
+ *  @param relPathsFromEngineDir entry modules, each relative to `engine/`.
+ *  @param purpose what cannot run without them — used verbatim in the thrown message.
+ *  @returns {Promise<object[]>} the loaded namespaces, in the order requested. */
+export async function loadRequiredEngineModules(repoRoot, relPathsFromEngineDir, purpose) {
+  const loaded = [];
+  for (const rel of relPathsFromEngineDir) {
+    const { module, reason } = await loadEnginePluginModuleResult(repoRoot, rel);
+    if (!module) throw new Error(describeRequiredLoadFailure(rel, reason, purpose));
+    loaded.push(module);
+  }
+  return loaded;
+}
+
 /** @returns the vendorPlugins module, or null if it cannot be loaded here.
  *  Thin wrapper over {@link loadEnginePluginModule} kept for existing callers
  *  (`vendor-plugins.mjs`). */

@@ -19,6 +19,8 @@ import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUt
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
   defaultAnimationClip, normalizeAnimationClip,
@@ -91,6 +93,23 @@ export default function AnimationEditor() {
   const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingAnimationAsset);
   const nonce = useEditorStore((s) => s.animationEditNonce);
+  /** 'failed' = the file exists but could NOT be read (corrupt/truncated/conflict-markered JSON, a
+   *  dev-server 500, a network rejection). The load effect then leaves `editingAnimationClip`
+   *  null, and every editing surface below is gated on `clip`, so editing is disabled by
+   *  construction — the same shape ParticleEditor/AtlasAssetView use. A genuinely MISSING file is
+   *  NOT this: defaults are the correct content there (#896, and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
+   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
+   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
+   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
+   *  re-reading the file, leaving the panel editing normally over a document it never read. The
+   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
+   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
+   *  was this button. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingAnimationAsset');
+  }, []);
   const clip = useEditorStore((s) => s.editingAnimationClip);
   const rootId = useEditorStore((s) => s.animatorRootEntityId);
   const playhead = useEditorStore((s) => s.playheadTime);
@@ -283,6 +302,7 @@ export default function AnimationEditor() {
     setSel(new Set());
     setSelectedTracks(new Set());
     setViewport(DEFAULT_VIEWPORT);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingAnimationClip;
@@ -328,7 +348,27 @@ export default function AnimationEditor() {
         savedMarkRef.current?.(loaded);
         loadAnimationClip(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[AnimationEditor] load failed, using default', e); const fb = defaultAnimationClip(newGuid(), asset.name); savedMarkRef.current?.(fb); loadAnimationClip(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896: this used to substitute `defaultAnimationClip(newGuid(), …)` on ANY failure and
+        // mark it as the SAVED baseline. The first edit then parked a full-replace write of that
+        // fabricated clip over the authored file — and because the fabrication carries a FRESH
+        // guid, `/api/asset-write`'s id-preservation branch (`!out.id && prevDoc?.id`) never fired:
+        // the file was replaced by a document wearing a DIFFERENT id, which the scanner's heal pass
+        // cannot flag because the document looks complete. Every scene/Animator reference to the
+        // old guid dangled, silently. A genuinely MISSING file is the one case where defaults ARE
+        // correct (a brand-new clip, or a stale ref) — that distinction is the whole verdict.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[AnimationEditor] load failed (asset missing), using default', e);
+          const fb = defaultAnimationClip(newGuid(), asset.name);
+          savedMarkRef.current?.(fb);
+          loadAnimationClip(fb);
+          return;
+        }
+        console.error(`[AnimationEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);
@@ -1037,6 +1077,13 @@ export default function AnimationEditor() {
 
   return (
     <div ref={rootRef} style={wrap}>
+      {loadState === 'failed' && (
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="animation.loadBanner"
+          onRetry={retryLoad}
+        />
+      )}
       {clip && (
         <AnimationToolbar
           clipName={clip.name} onRename={rename}

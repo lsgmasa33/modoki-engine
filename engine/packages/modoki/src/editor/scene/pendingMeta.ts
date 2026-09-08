@@ -77,7 +77,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
 import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
-import { metaReadFallback, metaCameFromFailedRead } from './metaReadFallback';
+import { metaReadFallback, metaCameFromFailedRead, stampMetaReadPath, metaReadPathOf } from './metaReadFallback';
 
 /** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
@@ -103,7 +103,7 @@ const baselines = new Map<string, string>();
  *  WRITE ENDPOINT can import them without a cycle — see `metaReadFallback.ts` for the whole
  *  mechanism and why it is keyed on the document rather than the path (#880). Re-exported here
  *  because this is the module every caller already imports. */
-export { metaReadFallback, metaCameFromFailedRead } from './metaReadFallback';
+export { metaReadFallback, metaCameFromFailedRead, stampMetaReadPath, metaReadPathOf } from './metaReadFallback';
 
 /** The baseline for `path`, or `undefined` when this editor has never read it. `undefined` means
  *  UNCONDITIONAL: `ifMatchRefusal` treats an absent `ifMatch` as "proceed", which is the correct
@@ -260,7 +260,38 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
     );
     return;
   }
-  pending.set(path, meta && typeof meta === 'object' ? { ...(meta as Record<string, unknown>) } : meta);
+  // ⚠️ REFUSE a document that was not read FOR THIS PATH — absent stamp or foreign stamp, one
+  // comparison (#890/#891/#897). See `READ_FOR_PATH` for both destructions; the short version is
+  // that an unstamped document is one nobody read (so it has no `id` and the heal pass mints a new
+  // GUID) and a foreign-stamped one is asset A's document (so two assets claim one GUID, which is
+  // worse). Neither is visible to the failed-read tag above: the first has no response to tag, the
+  // second was read successfully — of the wrong file.
+  const readFor = metaReadPathOf(meta);
+  if (readFor !== path) {
+    console.error(
+      `[pendingMeta] refusing to park an import-settings edit for ${path} — `
+      + (readFor === undefined
+        ? 'this panel has no .meta.json for that path (its read threw, or has not landed yet), so '
+        + 'it is showing defaults with no GUID in hand'
+        : `this panel is still holding the document it read for ${readFor}, so parking it here `
+        + 'would write that asset\'s GUID into this one')
+      + '. Saving would replace the file wholesale and cost an asset its identity. RECOVERY: '
+      + 'reselect the asset to re-read it. Other panels showing this asset are unaffected.',
+    );
+    return;
+  }
+  // ⚠️ The registry invariant every other reader leans on: EVERY document in `pending` is stamped
+  // for the key it is under. It holds by construction — the check above establishes
+  // `readFor === path`, and this spread copies symbol keys — which is what lets
+  // `readMetaPreferringPark`'s parked branch hand the entry straight back to the panel as its next
+  // base without re-stamping it. Re-stamping there would break the `meta === pendingRef` identity
+  // contract `metaWrittenToDisk` depends on; re-stamping HERE would be a second mechanism for a
+  // property this one already guarantees, which no mutation could tell apart from a no-op.
+  //
+  // (The old `typeof meta === 'object'` ternary is gone rather than kept "just in case": the guard
+  // above already rejects every non-object — `metaReadPathOf` returns `undefined` for one — so its
+  // else branch was unreachable, and an unreachable branch reads as a case somebody handled.)
+  pending.set(path, { ...(meta as Record<string, unknown>) });
   // ⚠️ `ifMatch` is for a CROSS-PATH re-park only (a rename — `applyMovesToParkedMeta`), and an
   // omitted one PRESERVES whatever this path already had rather than clearing it. That mirrors
   // `markAssetDirty`'s rule and matters for the same reason: the 18 ordinary field-change callers
@@ -349,7 +380,11 @@ export async function readMetaPreferringPark(
   // ⚠️ The fallback is `metaReadFallback()`, never a bare `{}` — every panel spreads what it gets
   // here into its next park, and that tag is what makes the spread refusable. See
   // `FROM_FAILED_READ`.
-  const meta = r.ok ? await r.json() : metaReadFallback();
+  // ⚠️ STAMPED with the path it was read for (#890/#891). `parkMetaEdit` refuses a document whose
+  // stamp is absent or names another path, so this line is what makes an ordinary field change
+  // parkable at all — and what makes a panel still holding the PREVIOUS asset's document unable to
+  // park it under this one. See `READ_FOR_PATH`.
+  const meta = r.ok ? stampMetaReadPath(await r.json(), path) : metaReadFallback();
   return { meta, pendingRef: undefined, ok: r.ok };
 }
 

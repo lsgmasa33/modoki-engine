@@ -23,7 +23,7 @@ import {
 } from './videoAssetLogic';
 import { withCurrentValue } from './importSettingOptions';
 import {
-  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult, metaReadFallback,
+  parkMetaEdit, peekPendingMeta, flushPendingMetaFor, noteMetaReadResult, metaReadFallback, stampMetaReadPath,
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -111,7 +111,16 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
       // HELPER, never from what a failed read means: an untagged `{}` here would let this panel
       // park an id-less document and mint the asset a fresh GUID. Same shape as the baseline trap
       // one line down, which is why both now live in values this file cannot half-adopt.
-      .then((r) => { noteMetaReadResult(path, r); return r.ok ? r.json() : metaReadFallback(); })
+      // ⚠️ `stampMetaReadPath`, for the same reason as the fallback above and the baseline below:
+      // an exemption from the READ HELPER is not an exemption from what it teaches the document
+      // (#871's lesson, third instance). Without the stamp every `.mp4` park is refused, because
+      // `parkMetaEdit` cannot tell a document this file read from one no panel ever read (#890).
+      .then((r) => {
+        noteMetaReadResult(path, r);
+        return r.ok
+          ? r.json().then((m: Record<string, unknown>) => stampMetaReadPath(m, path))
+          : metaReadFallback();
+      })
       .then((m: Record<string, unknown>) => applyMeta(m))
       .catch(() => { /* keep defaults */ });
   }, [path, applyMeta]);

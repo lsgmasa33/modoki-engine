@@ -17,18 +17,24 @@
  *  preserving the asset once nothing can find it by GUID any more. */
 
 import { classifyFormatVersion } from '../../runtime/core/formatVersion';
-import { isMissingAsset } from '../../runtime/loaders/assetFetch';
+import { assetIsAbsent } from '../../runtime/loaders/assetFetch';
 
 /** What to do when fetching/parsing an existing `.mesh.json`/`.mat.json` throws. `'absent'` is a
  *  genuinely missing file — a first-time import, or a fresh override target — and minting a new
  *  GUID for it is correct, same as before this fix. Anything else (a real JSON parse failure, a
- *  network error) is `'abort'`: the caller must not treat it as absent. */
+ *  network error) is `'abort'`: the caller must not treat it as absent.
+ *
+ *  ⚠️ **`assetIsAbsent`, not `isMissingAsset` (#896).** This asked the wide predicate, which is true
+ *  for EVERY non-ok status — so a 500 on an existing `.mesh.json` read as `'absent'` and the import
+ *  MINTED A NEW GUID for a document that already had one, dangling every reference to it. Exactly
+ *  the destruction the `'abort'` verdict was introduced to prevent, reached through the branch that
+ *  was supposed to be the safe one. Found by the #896 close-out sweep, not by a report. */
 export type ExistingAssetFetchOutcome =
   | { kind: 'absent' }
   | { kind: 'abort'; reason: string };
 
 export function classifyExistingAssetFetchFailure(e: unknown): ExistingAssetFetchOutcome {
-  if (isMissingAsset(e)) return { kind: 'absent' };
+  if (assetIsAbsent(e)) return { kind: 'absent' };
   return { kind: 'abort', reason: e instanceof Error ? e.message : String(e) };
 }
 

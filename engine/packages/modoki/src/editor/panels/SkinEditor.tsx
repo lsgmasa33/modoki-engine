@@ -19,6 +19,8 @@ import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPat
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones, defaultRig2DFile } from '../../runtime/skinning/rig2dTypes';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';
@@ -166,6 +168,26 @@ function InlineNameField({ initial, onCommit, onDone, autoFocus, style, uiId }: 
 export default function SkinEditor() {
   const asset = useEditorStore((s) => s.editingSkinAsset);
   const nonce = useEditorStore((s) => s.skinEditNonce);
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingSkinDef` null and `commit` early-returns on that, so the rig shows empty (as the
+   *  #423-item-2 ruling requires) AND cannot be parked over the file (#896). A genuinely MISSING
+   *  file is NOT this — see `assetDocLoad.ts`. */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
+   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
+   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
+   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
+   *  re-reading the file, leaving the panel editing normally over a document it never read. The
+   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
+   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
+   *  was this button. */
+  /** The rig the human just CLOSED, so the retarget effect above does not re-open it. Cleared as
+   *  soon as anything is open again — an explicit re-open (double-click) is always honoured. */
+  const dismissedPath = useRef<string | null>(null);
+
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingSkinAsset');
+  }, []);
   const def = useEditorStore((s) => s.editingSkinDef);
   const activePart = useEditorStore((s) => s.activeSkinPart);
   const previewHidden = useEditorStore((s) => s.skinPreviewHidden);
@@ -211,13 +233,23 @@ export default function SkinEditor() {
   // open it — parity with the Animation/Particle editors (which follow selection), and
   // it means the panel is reachable without a double-click (e.g. from tooling). Guarded
   // to "nothing open yet" so a stray selection never hijacks an in-progress rig edit.
+  //
+  // ⚠️ …and it must not undo a CLOSE (#896 review 2). `closeSkinEditor` clears the open asset but
+  // not `selectedAsset`, and a double-click in Assets selects before it opens — so closing left the
+  // rig still selected, this effect's deps changed (asset: object → null), and it immediately
+  // re-opened the very file the human had just dismissed. Harmless-looking for a good rig (it
+  // re-renders identically); for a REFUSED one it made the refused view's only escape a no-op that
+  // silently re-fetched. `dismissedPath` is the one-shot memory that makes Close mean close.
   useEffect(() => {
-    if (asset) return;
-    if (selectedAsset?.type === 'rig2d') useEditorStore.getState().openSkinEditor(selectedAsset);
+    if (asset) { dismissedPath.current = null; return; }  // something is open → nothing dismissed
+    if (selectedAsset?.type === 'rig2d' && selectedAsset.path !== dismissedPath.current) {
+      useEditorStore.getState().openSkinEditor(selectedAsset);
+    }
   }, [selectedAsset, asset]);
 
   // ── Load the rig def when the open target changes ──
   useEffect(() => {
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
@@ -256,12 +288,31 @@ export default function SkinEditor() {
       })
       .catch((e) => {
         if (cancelled) return;
-        console.error('[SkinEditor] load failed', e);
-        // Deliberately EMPTY, not `defaultRig2DFile()` (unlike ParticleEditor/AnimationEditor/
-        // TimelineEditor's load-failure fallbacks) — owner's call, #423 item 2. A rig that failed
-        // to load should LOOK empty: a phantom `root` bone would suggest the file has content it
-        // does not, and the human could then save that fabricated bone over the broken file. Do
-        // not "fix" this to match the peers.
+        // ⚠️ The owner's #423-item-2 ruling STANDS and is unchanged: a rig that failed to load must
+        // LOOK empty, never `defaultRig2DFile()`, because a phantom `root` bone would suggest the
+        // file has content it does not. Do not "fix" that to match the peers.
+        //
+        // #896 changed only whether the empty rig is SAVABLE. It was seeded as the saved baseline
+        // and handed to the store, so the first edit parked a full-replace write of an empty rig
+        // over the authored file — which is the very thing the ruling was guarding against ("the
+        // human could then save that fabricated bone over the broken file"), reached with zero
+        // bones instead of one. On a REFUSED read the panel now holds NOTHING: `commit`
+        // early-returns on a null def, so the surface is empty (as ruled) and unsavable (as it
+        // should always have been).
+        //
+        // A genuinely MISSING file still gets the empty rig — that is what authoring a brand-new
+        // `.rig2d.json` needs, and an absent file is not a failed read.
+        //
+        // (This comment used to contrast with ParticleEditor/AnimationEditor/TimelineEditor's
+        // "load-failure fallbacks". All three refuse now too; only their MISSING branch still
+        // substitutes defaults. The shared decision lives in `assetDocLoad.ts`.)
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind !== 'missing') {
+          console.error(`[SkinEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+          setLoadState('failed');
+          return;
+        }
+        console.warn('[SkinEditor] load failed (asset missing), starting empty', e);
         const fb: Rig2DFile = { bones: [], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
         savedMarkRef.current?.(fb);
         loadSkinDef(fb);
@@ -717,6 +768,34 @@ export default function SkinEditor() {
       <button data-ui-id="skin.autoWeight.run" data-ui-kind="button" data-ui-label="auto-weight" onClick={reWeight} disabled={!verts.length || !bones.length} title="Recompute per-vertex weights for the current mesh + bones" style={{ ...btn, width: '100%', marginTop: 2, opacity: (!verts.length || !bones.length) ? 0.5 : 1 }}>Auto-weight</button>
     </div>
   );
+
+  // ⚠️ BEFORE the picker below, and that ordering is the whole point (#896 review, findings 2+3).
+  // A refusal leaves `def` null, so without this the panel fell into the `!asset || !def` branch —
+  // which (a) made the refusal banner further down unreachable, so the human saw "Double-click a
+  // .rig2d.json in Assets to edit" for a rig they had just double-clicked, and (b) OFFERED
+  // `skin.empty.autoRig` when a sprite was selected: one click regenerates `<sprite>.rig2d.json`
+  // under a fresh GUID and writes it straight to disk (`autoRigSelected` → `writeAssetFile` →
+  // `assetWrittenToDisk`), with no dialog. So refusing to load a corrupt rig handed the human a
+  // one-click button to overwrite that exact file — a WORSE outcome than the empty-rig fallback
+  // this replaced, created by the refusal itself. The refused state gets its own view, whose only
+  // actions are Retry and Close.
+  if (asset && loadState === 'failed') {
+    return (
+      <div style={panelStyle}>
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="skin.loadBanner"
+          onRetry={retryLoad}
+          style={{ margin: '0 0 8px' }}
+        />
+        <div style={{ margin: 'auto', textAlign: 'center', color: '#555' }}>
+          <div>{asset.name} could not be read, so it is not open for editing.</div>
+          <div style={{ fontSize: 10, color: '#666', marginTop: 6 }}>Repair the file on disk (a corrupt or conflict-markered <code>.rig2d.json</code>), then Retry.</div>
+          <button data-ui-id="skin.refused.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = asset.path; useEditorStore.getState().closeSkinEditor(); }} style={{ ...btn, marginTop: 12, padding: '6px 14px' }}>Close</button>
+        </div>
+      </div>
+    );
+  }
 
   if (!asset || !def) {
     const spriteSel = selectedAsset && (selectedAsset.type === 'texture' || selectedAsset.type === 'sprite') ? selectedAsset : null;

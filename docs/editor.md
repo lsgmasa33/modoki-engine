@@ -1543,9 +1543,80 @@ mechanism class is written up in [async-lifetime.md](./async-lifetime.md).
 Several assets get a dedicated editor. They share one architecture: **the live def is the
 single source of truth in `editorStore`**, so edits push to the **global** undo stack
 (shared with Hierarchy/Inspector/SceneView) and apply even when the panel is unfocused;
-consecutive same-field edits **coalesce** into one undo entry within a ~500 ms window; and
-persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
-runtime cache so any live entity referencing the asset updates next frame.
+consecutive same-field edits **coalesce** into one undo entry within a ~500 ms window; and an
+edit is **PARKED in the dirty-asset registry**, with **Cmd+S** (Save All) as the only write.
+
+⚠️ That last clause used to read "persistence is a debounced `/api/write-file` (~400 ms)", which
+**#259 removed** — the panels no longer autosave. The flush goes through `/api/asset-write`, which
+also re-seeds the relevant runtime cache so any live entity referencing the asset updates next
+frame. See `useParkedAssetDoc`'s docblock for why dropping the debounce was a fix rather than a
+simplification (its cleanup discarded the last ≤400 ms of edits on unmount).
+
+#### A failed read yields NO document — never `{}`, never `defaultX()` (#886/#896)
+
+**The invariant: an asset editor that cannot READ its document must hold nothing and disable
+editing.** Not an empty object, not a typed empty shell, not the factory default. The panel's
+editing surface is gated on that document (`{clip && …}`, or a `commit` that early-returns on a
+null def), so refusing is enforced by construction rather than by a flag threaded through every
+field — the shape `ParticleEditor` and `AtlasAssetView` already use.
+
+**Why it is an invariant and not a judgement call.** These panels persist through `dirtyAssets` →
+`/api/asset-write`, and a panel-origin flush sends `replace: true` — a FULL REPLACE that
+deliberately skips that route's dropped-field guard. A fabricated document is therefore not "a
+slightly wrong starting point"; it is the file's next contents. Five panels had it, with two
+different consequences:
+
+| Fabrication | Panels | What the flush destroyed |
+|---|---|---|
+| `defaultX(newGuid(), name)` | `AnimationEditor`, `TimelineEditor` | the document **and its GUID** — the fabrication carries an id, so `/api/asset-write`'s preservation branch (`!out.id && prevDoc?.id`) never fires and the file is replaced by one wearing a DIFFERENT id. The scanner's heal pass cannot flag it (the document looks complete), so every reference to the old guid dangles silently |
+| `{}` / `{ clips: {} }` / an empty rig | `MaterialBatchView`, `SpriteAnimEditor`, `SkinEditor` | every field except `id`, which survives |
+
+⚠️ **A MISSING file is not a failed read, and collapsing the two is the other way to get this
+wrong.** For a genuinely absent file — a brand-new asset, or a stale ref — defaults ARE the correct
+content, and refusing there makes the asset unauthorable. That distinction is why
+`classifyAssetDocFetchFailure` (`editor/panels/assetDocLoad.ts`) returns a verdict rather than a
+boolean, and it is why the fetch **must** go through `parseAssetJson`: Vite answers an unknown path
+with `200 index.html`, so "absent" and "corrupt" arrive at the same `.catch` and a raw `r.json()`
+cannot tell them apart. `MaterialBatchView` was exactly that caller and could not have classified
+its own failure if it had wanted to.
+
+⚠️ **"Did not come back" is not "is not there", and asking the wrong one of those reopens the whole
+defect.** `parseAssetJson` throws `MissingAssetError` for EVERY non-ok status, so `isMissingAsset` is
+true for a **500 on a file that exists** — and the first cut of this fix asked exactly that, which
+left `AnimationEditor`/`TimelineEditor` fabricating `defaultX(newGuid())` over an unreadable file for
+that entire error class. Two predicates, two questions:
+
+| Predicate | True for | Ask it when |
+|---|---|---|
+| `isMissingAsset(e)` | the SPA fallback, and **any** non-ok status | you will show nothing (eight readers do this, and it is right for them) |
+| `assetIsAbsent(e)` | a 404/410, or the SPA fallback | you will **substitute content** — write defaults, mint a GUID, treat the path as free |
+
+The producer is not hypothetical: `plugins/backend/writeResult.ts` answers 500 when
+`createReadStream` errors on a file `existsSync` has just confirmed — EMFILE under a scene-load
+fan-out, EACCES, EBUSY on Windows — and `electron/backendServer.ts` adds a catch-all 500 on the same
+call. Both substitution callers (`assetDocLoad.ts` and `scene/modelImportPersist.ts`, whose
+`'absent'` verdict MINTS a GUID) ask `assetIsAbsent`; `modelImportPersist` had the same defect
+pre-existing and was fixed in the same pass. An unknown status fails CLOSED — not absent — so a
+mock that means 404 has to say so.
+
+**Not a park-time guard, deliberately.** The `.meta.json` SIDECAR registry solves its half of this
+class with a tag on the document, refused at the write seams (`scene/metaReadFallback.ts`, #880).
+That shape is right there — 18 spread sites, no single load helper — and wrong here: the fabricated
+document reaches the editor store and the live preview *before* any park, so a park-time refusal
+would let a human keep editing a fabricated clip and only complain N edits later at Cmd+S. Each of
+these panels has exactly one load effect, so the failure has a single place to be named.
+
+Guarded by `tests/architecture/assetEditorRefusesUnreadableDoc.test.ts` (the corpus is DERIVED from
+`useParkedAssetDoc(`, so a sixth editor is covered the day it is written). ⚠️ **That guard proves
+the classifier is CALLED, not that both branches are handled** — the verdict's own two-sided
+behaviour is `packages/modoki/tests/editor/assetDocLoad.test.ts`, and the batch view's
+exclusion/write halves are `tests/editor/materialBatchLoad.test.ts`.
+
+⚠️ **`SkinEditor`'s fallback is EMPTY by owner ruling (#423 item 2) and stays that way** — a
+phantom `root` bone would claim content the file does not have. That ruling is about what is
+DISPLAYED and is compatible with refusing (a refused load shows nothing either); what changed in
+#896 is only that the empty rig is no longer SAVABLE, which is the thing the ruling was actually
+guarding against.
 
 #### The client write seam — one JSON body producer, one wrapper (#835)
 

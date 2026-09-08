@@ -22,7 +22,21 @@ import { renderHook, act, cleanup } from '@testing-library/react';
 import { useMetaDirty } from '../../packages/modoki/src/editor/panels/useMetaDirty';
 import {
   parkMetaEdit, clearPendingMeta, clearMetaBaselines, discardPendingMeta, flushPendingMeta,
+  stampMetaReadPath,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+
+/** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
+ *
+ *  `parkMetaEdit` refuses a document whose read-path stamp is absent or names another path, so a
+ *  hand-built literal is refused by design: it is precisely a document nobody read. Stamping it
+ *  here is not ceremony to get past the guard — it is what makes these fixtures documents
+ *  production can actually produce. A test that parks an impossible input proves nothing about
+ *  the code path it claims to cover.
+ *
+ *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do. */
+const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string): void =>
+  parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
+
 
 const A = '/assets/textures/rock.png';
 const B = '/assets/textures/grass.png';
@@ -43,7 +57,7 @@ describe('useMetaDirty — a single path', () => {
     const { result } = renderHook(() => useMetaDirty(A));
     expect(result.current).toBe(false);
 
-    act(() => { parkMetaEdit(A, { texture: { maxSize: 1024 } }); });
+    act(() => { parkAsPanel(A, { texture: { maxSize: 1024 } }); });
 
     expect(result.current).toBe(true);
   });
@@ -53,7 +67,7 @@ describe('useMetaDirty — a single path', () => {
    *  and keeps reporting "Unsaved" for a file that is on disk. */
   it('clears when a FLUSH empties the registry — nothing else re-renders the panel', async () => {
     const { result } = renderHook(() => useMetaDirty(A));
-    act(() => { parkMetaEdit(A, { texture: { maxSize: 1024 } }); });
+    act(() => { parkAsPanel(A, { texture: { maxSize: 1024 } }); });
     expect(result.current).toBe(true);
 
     await act(async () => { await flushPendingMeta(); });
@@ -65,7 +79,7 @@ describe('useMetaDirty — a single path', () => {
    *  worth its own case because it is the one a human never triggers and so never notices. */
   it('clears when an agent DISCARDS the park', () => {
     const { result } = renderHook(() => useMetaDirty(A));
-    act(() => { parkMetaEdit(A, { texture: { maxSize: 1024 } }); });
+    act(() => { parkAsPanel(A, { texture: { maxSize: 1024 } }); });
 
     act(() => { discardPendingMeta([A]); });
 
@@ -74,7 +88,7 @@ describe('useMetaDirty — a single path', () => {
 
   it('ignores a park for a DIFFERENT path', () => {
     const { result } = renderHook(() => useMetaDirty(A));
-    act(() => { parkMetaEdit(B, { texture: { maxSize: 1024 } }); });
+    act(() => { parkAsPanel(B, { texture: { maxSize: 1024 } }); });
     expect(result.current).toBe(false);
   });
 
@@ -91,14 +105,14 @@ describe('useMetaDirty — a batch view watching N paths', () => {
     const { result } = renderHook(() => useMetaDirty([A, B]));
     expect(result.current).toBe(false);
 
-    act(() => { parkMetaEdit(B, { texture: { maxSize: 512 } }); });
+    act(() => { parkAsPanel(B, { texture: { maxSize: 512 } }); });
 
     expect(result.current, 'only the SECOND of the selection is dirty').toBe(true);
   });
 
   it('stays true while any one remains, and clears only when the last does', () => {
     const { result } = renderHook(() => useMetaDirty([A, B]));
-    act(() => { parkMetaEdit(A, { n: 1 }); parkMetaEdit(B, { n: 2 }); });
+    act(() => { parkAsPanel(A, { n: 1 }); parkAsPanel(B, { n: 2 }); });
 
     act(() => { discardPendingMeta([A]); });
     expect(result.current).toBe(true);

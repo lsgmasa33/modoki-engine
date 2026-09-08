@@ -26,7 +26,21 @@ import {
 import {
   parkMetaEdit, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths, peekPendingMeta,
   peekMetaBaseline,
+  stampMetaReadPath,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+
+/** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
+ *
+ *  `parkMetaEdit` refuses a document whose read-path stamp is absent or names another path, so a
+ *  hand-built literal is refused by design: it is precisely a document nobody read. Stamping it
+ *  here is not ceremony to get past the guard — it is what makes these fixtures documents
+ *  production can actually produce. A test that parks an impossible input proves nothing about
+ *  the code path it claims to cover.
+ *
+ *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do. */
+const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string): void =>
+  parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
+
 
 const ANIM = '/assets/anim/walk.anim.json';
 const SEQ = '/assets/seq/intro.timeline.json';
@@ -283,7 +297,7 @@ describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => 
   afterEach(() => { clearDirtyAssets(); clearPendingMeta(); clearMetaBaselines(); });
 
   it('DROPS a parked meta edit when its asset is deleted — no orphan sidecar is resurrected', () => {
-    parkMetaEdit(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
+    parkAsPanel(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
 
     const notes = applyAssetPathMoves([{ from: PNG, to: null }]);
 
@@ -294,13 +308,33 @@ describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => 
 
   it('MOVES a parked meta edit when its asset is renamed — the edit follows, no orphan is written', () => {
     const to = '/assets/textures/stone.png';
-    parkMetaEdit(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
+    parkAsPanel(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
 
     applyAssetPathMoves([{ from: PNG, to }]);
 
     expect(getPendingMetaPaths()).toEqual([to]);
-    expect(peekPendingMeta(to)).toEqual({ id: 'a-guid', texture: { maxSize: 512 } });
+    expect(peekPendingMeta(to)).toEqual(stampMetaReadPath({ id: 'a-guid', texture: { maxSize: 512 } }, to));
     expect(peekPendingMeta(PNG), 'the old path must not still be parked').toBeUndefined();
+  });
+
+  /** ⚠️ #891's guard has exactly one legitimate exception, and this is it: a parked document is
+   *  stamped with the path it was READ for, `parkMetaEdit` refuses a foreign stamp, and a rename is
+   *  the one case where a document genuinely changes which path it belongs to. `applyMovesToParkedMeta`
+   *  says so by RE-STAMPING rather than the guard carrying a hole for it.
+   *
+   *  The test above pins the moved document; this one pins what a missing re-stamp actually costs —
+   *  the human's NEXT keystroke on the renamed asset would be refused, and the edit they can see in
+   *  the panel would stop reaching the registry with only a console line to say so. */
+  it('the moved edit is still EDITABLE under its new path — the re-stamp, not just the move', () => {
+    const to = '/assets/textures/stone.png';
+    parkAsPanel(PNG, { id: 'a-guid', texture: { maxSize: 512 } });
+    applyAssetPathMoves([{ from: PNG, to }]);
+
+    // The panel, now showing the renamed asset, re-spreads what it holds and parks the next edit.
+    const held = peekPendingMeta(to) as Record<string, unknown>;
+    parkMetaEdit(to, { ...held, texture: { maxSize: 1024 } });
+
+    expect(peekPendingMeta(to)).toEqual(stampMetaReadPath({ id: 'a-guid', texture: { maxSize: 1024 } }, to));
   });
 
   /** ⚠️ The CAS baseline must FOLLOW the rename, not be dropped with the old key.
@@ -315,7 +349,7 @@ describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => 
    *  ("unconditional-but-informed"). That is why the assertion is here and not just the comment. */
   it('CARRIES the CAS baseline across a rename — dropping it would silently disarm the guard', () => {
     const to = '/assets/textures/stone.png';
-    parkMetaEdit(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
+    parkAsPanel(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
     expect(peekMetaBaseline(PNG)).toBe('BASELINE-SHA');   // positive control
 
     applyAssetPathMoves([{ from: PNG, to }]);
@@ -325,7 +359,7 @@ describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => 
   });
 
   it('a DELETE drops the baseline with the park — there is no path left to describe', () => {
-    parkMetaEdit(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
+    parkAsPanel(PNG, { id: 'a-guid' }, 'BASELINE-SHA');
 
     applyAssetPathMoves([{ from: PNG, to: null }]);
 
@@ -335,7 +369,7 @@ describe('applyAssetPathMoves carries PARKED IMPORT SETTINGS too (#845)', () => 
   it('moves BOTH registries in one call, so neither can be forgotten', () => {
     const to = '/assets/textures/stone.png';
     markAssetDirty(ANIM, 'animation', { duration: 3 }, 'panel');
-    parkMetaEdit(PNG, { id: 'a-guid' });
+    parkAsPanel(PNG, { id: 'a-guid' });
 
     applyAssetPathMoves([{ from: ANIM, to: null }, { from: PNG, to }]);
 

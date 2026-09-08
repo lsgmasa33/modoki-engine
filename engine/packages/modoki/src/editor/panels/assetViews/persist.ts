@@ -107,7 +107,12 @@ export function useAssetViewRefresher(path: string, setData: (data: any) => void
 export function useAssetViewRefreshers(paths: string[], setDataFor: (path: string, data: any) => void) {
   const setDataForRef = useRef(setDataFor);
   setDataForRef.current = setDataFor;
-  const key = paths.join(' ');
+  // ⚠️ `\n`, not a space. Asset names contain spaces, so a space-joined key collides:
+  // {`/a/x y.png`, `/a/z.png`} and {`/a/x.png`, `/a/y.png z.png`} join to the same string, the
+  // effect does not re-run, and every refresher stays registered for the PREVIOUS selection — a
+  // live edit to one of the new paths then updates nothing. NUL is the one byte a path cannot
+  // contain (a newline CAN: measured, APFS accepts it), so it is the only injective separator.
+  const key = paths.join('\0');
   useEffect(() => {
     const fns = paths.map((p) => {
       const fn = (data: any) => setDataForRef.current(p, data);

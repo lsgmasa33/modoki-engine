@@ -10,7 +10,13 @@ import { MissingAssetError } from '../../src/runtime/loaders/assetFetch';
 
 describe('classifyExistingAssetFetchFailure', () => {
   it('treats a MissingAssetError as absent — a first-time import, minting a fresh guid is correct', () => {
-    expect(classifyExistingAssetFetchFailure(new MissingAssetError('404 for meshes/wall.mesh.json'))).toEqual({ kind: 'absent' });
+    expect(classifyExistingAssetFetchFailure(new MissingAssetError('404 for meshes/wall.mesh.json', { status: 404, absent: true }))).toEqual({ kind: 'absent' });
+    // ⚠️ #896: a 500 on a `.mesh.json` that EXISTS must NOT read as absent — this used to ask
+    // `isMissingAsset`, which is true for every non-ok status, so the import minted a fresh GUID
+    // for a document that already had one and dangled every reference to it.
+    expect(classifyExistingAssetFetchFailure(
+      new MissingAssetError('500 Internal Server Error for meshes/wall.mesh.json', { status: 500, absent: false }),
+    ).kind).toBe('abort');
   });
 
   it('treats a real parse failure as abort — must NOT be treated as absent', () => {

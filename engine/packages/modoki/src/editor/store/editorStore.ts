@@ -483,6 +483,22 @@ interface EditorState {
     path: string,
     name?: string,
   ) => void;
+  /** Force an open asset editor to RE-READ its file: null the loaded document and bump that
+   *  editor's nonce, so its load effect runs again and cannot take its `if (existing)` early
+   *  return. Nothing else changes.
+   *
+   *  ⚠️ **Deliberately NOT `open<X>Editor(sameAsset)`, and that distinction is the whole reason this
+   *  exists** (#896 review 2). The open actions also reset `playheadTime`, `isRecording`,
+   *  `isPreviewPlaying` and `previewOwner` — correct when the human opens a DIFFERENT asset, and
+   *  wrong for a re-read, because those last two are SHARED with the other timeline-ish panel.
+   *  `closeAnimationEditor`/`closeTimelineEditor` already guard them with `panelMayStopPreview`
+   *  (#810); the open actions clobber them unconditionally. So routing the refused-load Retry button
+   *  through an open action meant clicking Retry in a refused Timeline stopped the Animation panel's
+   *  running preview and snapped the shared playhead to 0. A re-read is not a re-open. */
+  reloadEditingAsset: (
+    field: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
+      | 'editingAnimationAsset' | 'editingTimelineAsset',
+  ) => void;
   /** Repoint the ASSET SELECTION at paths a move has changed, WITHOUT an undo entry (#867).
    *  Selection is path-keyed like the editor bindings, and a repair is not a user action — it is
    *  what keeps an existing action's result coherent, so it must not land in the history the user
@@ -939,6 +955,20 @@ export const useEditorStore = create<EditorState>((set, get) => {
     const cur = s[field];
     if (!cur) return {}; // unbound → nothing to repoint
     return { [field]: { ...cur, path, name: name ?? cur.name } } as Partial<EditorState>;
+  }),
+  /** field -> the document slot it loads into, and the nonce its load effect depends on. A table
+   *  rather than five actions: the five editors differ only in which slots they name. */
+  reloadEditingAsset: (field) => set((s) => {
+    const SLOTS = {
+      editingParticleAsset: ['editingParticleDef', 'particleEditNonce'],
+      editingSpriteAnimAsset: ['editingSpriteAnimDef', 'spriteAnimEditNonce'],
+      editingSkinAsset: ['editingSkinDef', 'skinEditNonce'],
+      editingAnimationAsset: ['editingAnimationClip', 'animationEditNonce'],
+      editingTimelineAsset: ['editingTimelineDoc', 'timelineEditNonce'],
+    } as const;
+    if (!s[field]) return {}; // unbound -> nothing to re-read
+    const [docField, nonceField] = SLOTS[field];
+    return { [docField]: null, [nonceField]: (s[nonceField] as number) + 1 } as Partial<EditorState>;
   }),
   remapSelectedAssets: (next) => set(() => next),
   loadAnimationClip: (clip) => {

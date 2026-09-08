@@ -1498,6 +1498,32 @@ reports `no-source` vs `no-esbuild`, and the warning names the cause and the rem
 packaged editor `no-esbuild` is expected, while on a source checkout it means the install is
 incomplete (`npm install` at the repo root).
 
+#### Degrading is a disposition
+
+**…not the loader's nature — and until #827 that cost two extra copies of it.** Every caller above
+treats the load as an optional convenience, so `null` is right for them. Two CLI scripts are in the
+opposite position: `add-native-targets.mjs` has nothing to scaffold with and
+`print-toolchain-env.mjs`'s entire stdout is `detect()`'s answer, so a silent degrade would leave the
+first crashing on `scaffoldNativeTarget is not a function` and the second printing an empty
+`eval`-able line that quietly leaves `JAVA_HOME` unset. Rather than reach a seam that degrades, each
+had grown its **own** bundle-to-temp-and-import copy — and `add-native-targets.mjs` said so in a
+comment (*"Same approach as `print-toolchain-env.mjs`"*), citing the other copy instead of importing
+it. `loadRequiredEngineModules` supplies the missing disposition: same loader, but it THROWS naming
+the entry and which of the two reasons fired. Both scripts now go through the one seam, guarded by a
+census in `cliNativeBuildHeals.test.ts` (no `engine/scripts/*.mjs` imports or shells `esbuild`
+directly, with an allowlist that states why each entry is not a loader).
+
+⚠️ `build-electron.mjs` and `stage-vite-config.cjs` are **not** copies and are allowlisted
+permanently: both esbuild-*bundle* to shippable `outfile`s (Electron main + the MCP entry; the
+packaged `vite.config.cjs`, #326) and never import what they build.
+
+⚠️ `migrate-meta-sidecars.mjs` **is** a third copy of the mechanism — it esbuilds `meta-sidecar.ts`
+to a temp outfile and `await import(...)`s it, the same bundle-to-temp-and-import driven through a
+subprocess. It is allowlisted as **deferred**, not as a non-instance: a one-off migration with no
+preamble and no build claim was not worth pulling into #827's slice. One further copy lives at
+`games/wordweave/tools/run.mjs` and is out of reach by design — a game importing `engine/scripts/**`
+fails `gamePortability.test.ts`.
+
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
   its tarball. Expect a re-vendor after a docs-only plugin edit.
@@ -1939,6 +1965,10 @@ exactly that (the count moves with every merged commit, so whichever clone build
 is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
 builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
 unrelated commits.
+⚠️ **"On every build" undersells when it fires: a plain `launch-editor.sh games/<id>` is enough.**
+Observed 2026-09-07 on `games/court` — launching the editor with no game build requested rewrote
+`versionCode` 6106 → 7173 and both `CURRENT_PROJECT_VERSION`s with it. Nothing is wrong when you
+see that diff after a read-only editor session; revert it rather than hunting it.
 
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,

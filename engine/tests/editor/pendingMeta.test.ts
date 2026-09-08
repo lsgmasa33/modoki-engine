@@ -32,7 +32,21 @@ import {
   readMetaPreferringPark, metaWrittenToDisk, peekMetaBaseline, clearMetaBaselines,
   writeMetaWholesale,
   noteMetaReadResult, metaReadFallback,
+  stampMetaReadPath, metaReadPathOf, metaCameFromFailedRead,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+
+/** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
+ *
+ *  `parkMetaEdit` refuses a document whose read-path stamp is absent or names another path, so a
+ *  hand-built literal is refused by design: it is precisely a document nobody read. Stamping it
+ *  here is not ceremony to get past the guard — it is what makes these fixtures documents
+ *  production can actually produce. A test that parks an impossible input proves nothing about
+ *  the code path it claims to cover.
+ *
+ *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do. */
+const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string): void =>
+  parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
+
 
 const TEX = '/assets/textures/rock.png.meta.json';
 const OTHER = '/assets/textures/grass.png.meta.json';
@@ -57,7 +71,7 @@ afterEach(() => { clearPendingMeta(); clearMetaBaselines(); vi.unstubAllGlobals(
 
 describe('parking a meta edit', () => {
   it('records the edit and writes nothing', () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     expect(isMetaDirty(TEX)).toBe(true);
     expect(hasPendingMeta()).toBe(true);
@@ -66,15 +80,15 @@ describe('parking a meta edit', () => {
   });
 
   it('last edit to a path wins', () => {
-    parkMetaEdit(TEX, { texture: { format: 'ktx2-uastc' } });
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     expect(getPendingMetaPaths()).toEqual([TEX]);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'webp' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
   });
 
   it('discard drops it without writing, and says what was not pending', () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     expect(discardPendingMeta([TEX, OTHER])).toEqual({ discarded: [TEX], notPending: [OTHER] });
     expect(hasPendingMeta()).toBe(false);
     expect(globalThis.fetch).not.toHaveBeenCalled();
@@ -92,7 +106,7 @@ describe('the editor can SEE a pending meta edit', () => {
       await import('../../packages/modoki/src/editor/scene/serialize');
 
     expect(unsavedChangeCauses().pendingImportSettings).toEqual([]);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     expect(hasUnsavedChanges()).toBe(true);
     const causes = unsavedChangeCauses();
     expect(causes.pendingImportSettings).toEqual([TEX]);
@@ -105,8 +119,8 @@ describe('the editor can SEE a pending meta edit', () => {
 
 describe('flushing', () => {
   it('writes each pending path via /api/write-meta, then clears the registry', async () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
-    parkMetaEdit(OTHER, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(OTHER, { texture: { format: 'ktx2-uastc' } });
 
     const r = await flushPendingMeta();
 
@@ -124,7 +138,7 @@ describe('flushing', () => {
 
   it('a FAILED flush RE-PARKS the entry, reports it in `failed`, and hasUnsavedChanges() stays true', async () => {
     reply = { status: 500, body: { ok: false, error: 'disk full' } };
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const r = await flushPendingMeta();
 
@@ -132,7 +146,7 @@ describe('flushing', () => {
     expect(r.saved).toEqual([]);
     expect(r.failed).toEqual([{ path: TEX, error: expect.any(String) }]);
     expect(isMetaDirty(TEX), 'a failed flush must never look like a save').toBe(true);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'webp' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
     expect(hasUnsavedChanges()).toBe(true);
   });
 
@@ -145,8 +159,8 @@ describe('flushing', () => {
         ? { ok: false, status: 500, text: async () => '', json: async () => ({ ok: false }) } as unknown as Response
         : { ok: true, status: 200, text: async () => '', json: async () => ({ ok: true }) } as unknown as Response;
     }));
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
-    parkMetaEdit(OTHER, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(OTHER, { texture: { format: 'ktx2-uastc' } });
 
     const r = await flushPendingMeta();
 
@@ -160,16 +174,16 @@ describe('flushing', () => {
     // made during the save is on screen, is not on disk, and must not be replaced by the OLDER
     // value the flush was carrying.
     reply = { status: 500, body: { ok: false, error: 'boom' } };
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     vi.stubGlobal('fetch', vi.fn(async () => {
-      parkMetaEdit(TEX, { texture: { format: 'ktx2-uastc' } }); // a newer edit lands mid-flush
+      parkAsPanel(TEX, { texture: { format: 'ktx2-uastc' } }); // a newer edit lands mid-flush
       return { ok: false, status: 500, text: async () => '', json: async () => reply.body } as unknown as Response;
     }));
 
     await flushPendingMeta();
 
     expect(peekPendingMeta(TEX), 'the newer edit was clobbered by the failed flush\'s re-park')
-      .toEqual({ texture: { format: 'ktx2-uastc' } });
+      .toEqual(stampMetaReadPath({ texture: { format: 'ktx2-uastc' } }, TEX));
   });
 
   it('flushPendingMetaFor is a no-op when nothing is pending for that path', async () => {
@@ -194,13 +208,13 @@ describe('flushing', () => {
       return { ok: true, status: 200, text: async () => '', json: async () => ({ ok: true }) } as unknown as Response;
     }));
 
-    parkMetaEdit(TEX, { v: 'old' });
+    parkAsPanel(TEX, { v: 'old' });
     const fullFlush = flushPendingMeta();
     // The full flush's write for `TEX` has already started synchronously (it is the first thing
     // reached down the await chain), and it is now blocked on `releaseOld`.
     expect(order).toEqual(['start:old']);
 
-    parkMetaEdit(TEX, { v: 'new' }); // a genuinely concurrent edit — unrelated to the batch above
+    parkAsPanel(TEX, { v: 'new' }); // a genuinely concurrent edit — unrelated to the batch above
     const forPromise = flushPendingMetaFor(TEX);
     // `flushPendingMetaFor` must be blocked on `inFlight`, not already reading `pending` — no
     // second write has been issued.
@@ -217,11 +231,11 @@ describe('flushing', () => {
 
 describe('readMetaPreferringPark', () => {
   it('returns the parked doc without hitting the network when one is parked', async () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const { meta, pendingRef } = await readMetaPreferringPark(TEX);
 
-    expect(meta).toEqual({ texture: { format: 'webp' } });
+    expect(meta).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
     expect(globalThis.fetch, 'a parked doc must be used in place of the network response').not.toHaveBeenCalled();
     // The whole mechanism `metaWrittenToDisk` keys on: this is the SAME reference `pending` holds,
     // not a structurally-equal copy — see that function's own doc for why identity is the check.
@@ -237,7 +251,9 @@ describe('readMetaPreferringPark', () => {
 
     const { meta, pendingRef } = await readMetaPreferringPark(TEX);
 
-    expect(meta).toEqual({ texture: { format: 'ktx2-uastc' } });
+    // ⚠️ Also the positive control for the READ STAMP (#891): a document off the network carries
+    // the path it was read for, which is what makes the panel's next park acceptable at all.
+    expect(meta).toEqual(stampMetaReadPath({ texture: { format: 'ktx2-uastc' } }, TEX));
     expect(pendingRef).toBeUndefined();
   });
 
@@ -264,10 +280,10 @@ describe('metaWrittenToDisk — the read-then-write-back race the parking itself
   // WHOLE doc back, then report the write so the park it already incorporated can be dropped.
 
   it('race A: a write built on the park it read drops that park, and a later flush writes nothing stale', async () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const { meta, pendingRef } = await readMetaPreferringPark(TEX);
-    expect(meta).toEqual({ texture: { format: 'webp' } }); // the write below is built on this
+    expect(meta).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX)); // the write below is built on this
 
     const dropped = metaWrittenToDisk(TEX, pendingRef);
 
@@ -280,17 +296,17 @@ describe('metaWrittenToDisk — the read-then-write-back race the parking itself
   });
 
   it('race B: a NEWER park landing before the write completes survives, and the flush writes IT, not the older read', async () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     const { pendingRef } = await readMetaPreferringPark(TEX);
 
     // The Inspector edits the SAME path again while the writer that just read `pendingRef` is
     // still mid-write (e.g. still inside `writeMetaOrWarn`'s network round trip).
-    parkMetaEdit(TEX, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'ktx2-uastc' } });
 
     const dropped = metaWrittenToDisk(TEX, pendingRef);
 
     expect(dropped, 'a newer edit must never be dropped by an older write\'s bookkeeping').toBe(false);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'ktx2-uastc' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'ktx2-uastc' } }, TEX));
 
     const r = await flushPendingMeta();
     expect(r).toEqual({ saved: [TEX], failed: [] });
@@ -305,20 +321,20 @@ describe('metaWrittenToDisk — the read-then-write-back race the parking itself
   it('refuses to drop a park that appeared AFTER a read that saw none', () => {
     // pendingRef undefined = the read fell through to disk; a park then lands strictly after —
     // same rule as race B, at the OTHER boundary (no park at read time, one now).
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     expect(metaWrittenToDisk(TEX, undefined)).toBe(false);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'webp' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
   });
 
   it('does not drop a DIFFERENT path\'s park', async () => {
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
-    parkMetaEdit(OTHER, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(OTHER, { texture: { format: 'ktx2-uastc' } });
     const { pendingRef } = await readMetaPreferringPark(TEX);
 
     expect(metaWrittenToDisk(OTHER, pendingRef)).toBe(false);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'webp' } });
-    expect(peekPendingMeta(OTHER)).toEqual({ texture: { format: 'ktx2-uastc' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
+    expect(peekPendingMeta(OTHER)).toEqual(stampMetaReadPath({ texture: { format: 'ktx2-uastc' } }, OTHER));
   });
 
   /** ⚠️ The identity stamp must survive a caller that RE-PARKS THE SAME OBJECT it mutated in
@@ -331,9 +347,17 @@ describe('metaWrittenToDisk — the read-then-write-back race the parking itself
    *  exact clobber this whole mechanism exists to close, reached through the mechanism closing
    *  it. `parkMetaEdit` copying what it is handed is what makes this impossible to write.
    *
-   *  Without that copy this test fails; the prose invariant it replaced could not fail at all. */
+   *  Without that copy this test fails; the prose invariant it replaced could not fail at all.
+   *
+   *  ⚠️ **It must NOT go through `parkAsPanel`, and that is the whole subtlety.** That helper calls
+   *  `stampMetaReadPath`, which returns a COPY — so each park would already receive a fresh object
+   *  and the identity stamp would differ whether or not `parkMetaEdit` copies. Migrating this one
+   *  test with the other 63 disarmed it: measured, the `pending.set(path, meta)` mutation went from
+   *  turning exactly this test red to turning NOTHING red across 2347 tests. So the document is
+   *  stamped ONCE, up front, and the same reference is parked twice — which is also what the real
+   *  nineteenth call site would look like. */
   it('survives a caller that re-parks the SAME object mutated in place', async () => {
-    const doc: Record<string, unknown> = { texture: { format: 'webp' } };
+    const doc: Record<string, unknown> = stampMetaReadPath({ texture: { format: 'webp' } }, TEX);
     parkMetaEdit(TEX, doc);
     const { pendingRef } = await readMetaPreferringPark(TEX);
 
@@ -343,7 +367,7 @@ describe('metaWrittenToDisk — the read-then-write-back race the parking itself
 
     // The second park is NEWER than the read, so the write that read the first must not drop it.
     expect(metaWrittenToDisk(TEX, pendingRef)).toBe(false);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'ktx2-uastc' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'ktx2-uastc' } }, TEX));
     expect(hasPendingMeta()).toBe(true);
   });
 });
@@ -387,7 +411,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     await readMetaPreferringPark(TEX);
     expect(peekMetaBaseline(TEX)).toBe('BEFORE');
 
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     await flushPendingMeta();
 
     expect(sent).toHaveLength(1);
@@ -399,7 +423,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
    *  file" is not the same claim as "this file is unchanged". */
   it('sends NO ifMatch when this editor has never read the file', async () => {
     const sent = stubWithHeader('BEFORE');
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });   // parked with no prior read
+    parkAsPanel(TEX, { texture: { format: 'webp' } });   // parked with no prior read
     await flushPendingMeta();
 
     expect(sent).toHaveLength(1);
@@ -409,7 +433,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('a 409 keeps the edit PARKED and names the conflict, rather than losing it', async () => {
     stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true, reason: 'if-match' } });
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const r = await flushPendingMeta();
 
@@ -419,7 +443,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     expect(r.failed[0].error).toMatch(/changed on disk/);
     // The whole point: the human's edit survives a refusal.
     expect(hasPendingMeta()).toBe(true);
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { format: 'webp' } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { format: 'webp' } }, TEX));
   });
 
   /** ⚠️ The regression this advance exists to stop: WE wrote the file, so a panel still mounted on
@@ -429,11 +453,11 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('advances the baseline to what the server wrote, so a second save does not conflict with itself', async () => {
     const sent = stubWithHeader('BEFORE');
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
     await flushPendingMeta();
     expect(peekMetaBaseline(TEX)).toBe('AFTER');
 
-    parkMetaEdit(TEX, { texture: { format: 'ktx2-uastc' } });
+    parkAsPanel(TEX, { texture: { format: 'ktx2-uastc' } });
     await flushPendingMeta();
 
     expect(sent).toHaveLength(2);
@@ -453,7 +477,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
       text: async () => '',
       // No `json` at all — an older backend, a proxy that strips the body, a non-JSON 200.
     } as unknown as Response)));
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const r = await flushPendingMeta();
 
@@ -477,7 +501,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('a 409 does not wedge the path — the next save is unconditional and lands', async () => {
     const sent = stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const first = await flushPendingMeta();
     expect(first.failed).toHaveLength(1);
@@ -507,7 +531,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('flushPendingMetaFor KEEPS the baseline on a conflict — its result reaches no UI', async () => {
     stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const r = await flushPendingMetaFor(TEX);
 
@@ -523,7 +547,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('flushPendingMeta marks a 409 as a CONFLICT, distinguishably from a plain failure', async () => {
     stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const conflicted = await flushPendingMeta();
     expect(conflicted.failed[0].conflict).toBe(true);
@@ -532,7 +556,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
     clearPendingMeta(); clearMetaBaselines();
     stubWithHeader('BEFORE', { status: 500, body: { ok: false } });
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     const failed = await flushPendingMeta();
     expect(failed.failed[0].conflict).toBeUndefined();
@@ -580,7 +604,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
   it('discarding a park forgets its baseline too', async () => {
     stubWithHeader('BEFORE');
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { texture: { format: 'webp' } });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
 
     discardPendingMeta([TEX]);
 
@@ -649,7 +673,7 @@ describe('an exempted raw reader still records the baseline (#871)', () => {
     // The panel parks with two args — it has no baseline of its own to hand over, and does not
     // need one: the flush reads `baselines` directly.
     const sent = stubWrite();
-    parkMetaEdit(VID, { video: { crf: 23 } });
+    parkAsPanel(VID, { video: { crf: 23 } });
     await flushPendingMetaFor(VID);
 
     expect(sent).toHaveLength(1);
@@ -662,9 +686,9 @@ describe('an exempted raw reader still records the baseline (#871)', () => {
     noteMetaReadResult(VID, res(true, 'DISK-V1'));
     const sent = stubWrite();
 
-    parkMetaEdit(VID, { video: { crf: 23 } });
+    parkAsPanel(VID, { video: { crf: 23 } });
     await flushPendingMetaFor(VID);
-    parkMetaEdit(VID, { video: { crf: 28 } });
+    parkAsPanel(VID, { video: { crf: 28 } });
     await flushPendingMetaFor(VID);
 
     expect(sent).toHaveLength(2);
@@ -685,7 +709,7 @@ describe('an exempted raw reader still records the baseline (#871)', () => {
     expect(peekMetaBaseline(VID)).toBeUndefined();
 
     const sent = stubWrite();
-    parkMetaEdit(VID, { video: { crf: 23 } });
+    parkAsPanel(VID, { video: { crf: 23 } });
     await flushPendingMetaFor(VID);
 
     expect('ifMatch' in sent[0]).toBe(false);
@@ -728,7 +752,7 @@ describe('an exempted raw reader still records the baseline (#871)', () => {
     ).toBe(false);
 
     noteMetaReadResult(VID, res(true, 'DISK-V1'));
-    parkMetaEdit(VID, { id: 'g', video: { crf: 23 } });
+    parkAsPanel(VID, { id: 'g', video: { crf: 23 } });
     expect(isMetaDirty(VID), 'a transient blip must not refuse this path forever').toBe(true);
   });
 });
@@ -801,7 +825,7 @@ describe('only a read that feeds a panel may move the baseline', () => {
     const disk = stubDisk();
     // The video panel's mount read.
     noteMetaReadResult(VID, { ok: true, headers: { get: () => disk.sha } });
-    parkMetaEdit(VID, { id: 'g', video: { crf: 23 } });
+    parkAsPanel(VID, { id: 'g', video: { crf: 23 } });
 
     disk.sha = 'EXTERNAL';                       // something rewrites the sidecar
     // The panel remounts (asset reselected) and reads raw again — the exemption's whole point.
@@ -828,7 +852,7 @@ describe('only a read that feeds a panel may move the baseline', () => {
     expect(agent.ok, 'the agent still gets a real answer').toBe(true);
 
     // The human's edit, built on the doc the panel is still showing.
-    parkMetaEdit(TEX, { id: 'g', texture: { maxSize: 1024 } });
+    parkAsPanel(TEX, { id: 'g', texture: { maxSize: 1024 } });
     const r = await flushPendingMeta();
 
     expect(r.saved, 'the agent read let the human overwrite an external change').toEqual([]);
@@ -864,7 +888,10 @@ describe('only a read that feeds a panel may move the baseline', () => {
  *  and that spread is what carries the tag. ⚠️ It is what they DO, not what anything enforces:
  *  `metaMergeNotClobber.test.ts`'s rule accepts a `...` anywhere (a nested one passes with a fresh
  *  top-level object) and accepts a literal `id:` with no spread at all, so it narrows the space a
- *  19th site can occupy without closing it. The residual is stated on `FROM_FAILED_READ`. */
+ *  19th site can occupy without closing it. The residual is stated on `FROM_FAILED_READ`.
+ *  ⚠️ Since #891 that residual is closed on the PARK route — a site that does not spread carries no
+ *  READ_FOR_PATH stamp either, and `parkMetaEdit` refuses it (see the `#890/#891/#897` block at the
+ *  bottom of this file). It remains open on the wholesale-write route, on purpose. */
 describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', () => {
   /** What `/api/read-meta` answers next. Mutated per test rather than re-stubbed, because the
    *  scenario that matters is TWO reads of one path with different outcomes. */
@@ -904,7 +931,8 @@ describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', ()
 
     okRead();
     const b = await readMetaPreferringPark(TEX);          // component B: 200 -> the real document
-    expect(b.meta, 'positive control: B really did read the file').toEqual({ id: 'GUID-1' });
+    expect(b.meta, 'positive control: B really did read the file')
+      .toEqual(stampMetaReadPath({ id: 'GUID-1' }, TEX));
 
     parkMetaEdit(TEX, { ...a.meta, model: { lodCount: 2 } });   // A's next field change
 
@@ -929,7 +957,7 @@ describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', ()
 
     parkMetaEdit(TEX, { ...b.meta, model: { lodCount: 3 } });
     expect(peekPendingMeta(TEX), "and B's own document is untouched by A's failure")
-      .toEqual({ id: 'GUID-1', model: { lodCount: 3 } });
+      .toEqual(stampMetaReadPath({ id: 'GUID-1', model: { lodCount: 3 } }, TEX));
   });
 
   /** ⚠️ THE ACCEPT SIDE, and the face of #880 that made the old guard actively harmful: the panel
@@ -954,11 +982,11 @@ describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', ()
     expect(peekPendingMeta(TEX), 'positive control: A is still refused').toBeUndefined();
 
     parkMetaEdit(TEX, { ...b.meta, postprocessor: 'outline' });
-    expect(peekPendingMeta(TEX)).toEqual({ id: 'GUID-1', postprocessor: 'outline' });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ id: 'GUID-1', postprocessor: 'outline' }, TEX));
 
     parkMetaEdit(TEX, { ...b.meta, postprocessor: 'none' });
     expect(peekPendingMeta(TEX), 'a live park must not wedge the path')
-      .toEqual({ id: 'GUID-1', postprocessor: 'none' });
+      .toEqual(stampMetaReadPath({ id: 'GUID-1', postprocessor: 'none' }, TEX));
   });
 
   /** The legitimate empty case, which is NOT a failed read: an asset whose sidecar does not exist
@@ -973,7 +1001,7 @@ describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', ()
 
     parkMetaEdit(TEX, { ...meta, texture: { maxSize: 512 } });
 
-    expect(peekPendingMeta(TEX)).toEqual({ texture: { maxSize: 512 } });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ texture: { maxSize: 512 } }, TEX));
   });
 
   /** THE SECOND DOOR (#880). `writeMetaWholesale` reaches disk without parking anything, so the
@@ -1119,14 +1147,14 @@ describe('a wholesale editor write does not leave a stale baseline (#874)', () =
     // narrated a 409 that its own fixture made impossible: deleting the mechanism turned it red
     // only at the `peekMetaBaseline` line, and deleting THAT line left it green with the
     // mechanism gone. This is the write actually reaching disk.
-    parkMetaEdit(TEX, { id: 'g', border: [1, 1, 1, 1] });
+    parkAsPanel(TEX, { id: 'g', border: [1, 1, 1, 1] });
     state.sha = 'V2';
     metaWrittenToDisk(TEX, peekPendingMeta(TEX));
     expect(peekMetaBaseline(TEX), 'the hash it just invalidated').toBeUndefined();
 
     // The human's next Inspector edit + Cmd+S. With the baseline kept, this sends `ifMatch:'V1'`
     // against a disk holding 'V2' → the 409 that names no true cause.
-    parkMetaEdit(TEX, { id: 'g', texture: { maxSize: 1024 } });
+    parkAsPanel(TEX, { id: 'g', texture: { maxSize: 1024 } });
     const r = await flushPendingMeta();
 
     expect(r.failed, 'a 409 naming no true cause — this editor changed the file').toEqual([]);
@@ -1183,16 +1211,164 @@ describe('a wholesale editor write does not leave a stale baseline (#874)', () =
   it('forgets the baseline even when the park was superseded and NOT dropped', async () => {
     const { state } = stubServer();
     await readMetaPreferringPark(TEX);
-    parkMetaEdit(TEX, { id: 'g', v: 1 });
+    parkAsPanel(TEX, { id: 'g', v: 1 });
     const refAtRead = peekPendingMeta(TEX);
     state.sha = 'V2';                                         // the wholesale write reached disk
-    parkMetaEdit(TEX, { id: 'g', v: 2 });                     // a newer edit lands mid-write
+    parkAsPanel(TEX, { id: 'g', v: 2 });                     // a newer edit lands mid-write
 
     expect(metaWrittenToDisk(TEX, refAtRead), 'the newer park must survive').toBe(false);
 
-    expect(peekPendingMeta(TEX)).toEqual({ id: 'g', v: 2 });
+    expect(peekPendingMeta(TEX)).toEqual(stampMetaReadPath({ id: 'g', v: 2 }, TEX));
     expect(peekMetaBaseline(TEX)).toBeUndefined();
     const r = await flushPendingMeta();
     expect(r.failed).toEqual([]);
+  });
+});
+
+/** #890 / #891 / #897 — the park carries the path it was READ FOR.
+ *
+ *  `FROM_FAILED_READ` (the block above) asks *"was this built on a failed read?"* and is blind to
+ *  two documents that destroy an asset just as thoroughly: one built on NO read (a thrown fetch
+ *  produces no response to tag — #890, driven, GUID replaced on disk) and one built on a
+ *  SUCCESSFUL read of another path (#891/#897, a panel still holding the previous asset's
+ *  document). `READ_FOR_PATH` answers both with one comparison.
+ *
+ *  ⚠️ Both directions, deliberately, and they are mutation-checked separately: deleting the check
+ *  turns the two refusals red and leaves the accept side green; inverting its comparison turns the
+ *  accept side red and leaves the refusals green. A suite that goes red for BOTH mutations is not
+ *  telling the halves apart, which is the shape that has hidden two defects in this module. */
+describe('a park must be built on a read OF THAT PATH (#890/#891/#897)', () => {
+  const A = '/assets/models/a.glb.meta.json';
+  const B = '/assets/models/b.glb.meta.json';
+
+  /** `/api/read-meta` answering 200 with `doc`, per path. */
+  function stubReads(docs: Record<string, unknown>): void {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const path = decodeURIComponent(String(url).split('path=')[1] ?? '');
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => '', json: async () => docs[path] ?? {},
+      } as unknown as Response;
+    }));
+  }
+
+  /** #890, and the one branch neither read-failed guard ever covered. A THROWN fetch does not
+   *  reach `metaReadFallback()` — `readMetaPreferringPark` deliberately does not swallow it — so
+   *  the panel's `.catch(() => {})` leaves `meta === null` and its next field change spreads
+   *  `{ ...(meta ?? {}) }`: no `id`, and nothing marking it as unread. */
+  it('refuses a document nobody read — the thrown-read park that destroyed a GUID', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch'); }));
+    const panelMeta = await readMetaPreferringPark(A).then((r) => r.meta).catch(() => null);
+    expect(panelMeta, 'the read really did throw rather than resolve to a fallback').toBeNull();
+
+    parkMetaEdit(A, { ...(panelMeta ?? {}), model: { lodCount: 2 } });   // the panel's field change
+
+    expect(peekPendingMeta(A), 'an id-less document must never be parked').toBeUndefined();
+  });
+
+  /** The same refusal reached without a throw — a fresh panel whose read has not landed yet. The
+   *  measured window is 1.1-1.4 ms locally (#891), which no human wins and an agent driving
+   *  `set_selection` + a field write in one `modoki_batch` does. */
+  it('refuses an edit made BEFORE the read lands, not only after one fails', () => {
+    parkMetaEdit(A, { model: { lodCount: 2 } });   // nothing has been read for A at all
+
+    expect(peekPendingMeta(A)).toBeUndefined();
+  });
+
+  /** #891 — the worse half. A's document is genuinely read and correctly untagged, so the
+   *  failed-read guard cannot see it; parking it under B writes A's GUID into B's sidecar and two
+   *  assets claim one id. */
+  it("refuses asset A's document parked under asset B's path", async () => {
+    stubReads({ [A]: { id: 'GUID-A', rig: { bones: 3 } } });
+    const a = await readMetaPreferringPark(A);
+    expect(metaCameFromFailedRead(a.meta), 'A was read successfully — no tag to catch this').toBe(false);
+
+    // The panel switched to B and its read has not landed; `meta` still holds A's document.
+    parkMetaEdit(B, { ...a.meta, model: { lodCount: 2 } });
+
+    expect(peekPendingMeta(B), "B's sidecar must not receive A's GUID").toBeUndefined();
+    expect(peekPendingMeta(A), 'and nothing was parked for A either').toBeUndefined();
+  });
+
+  /** ⚠️ THE ACCEPT SIDE — the half a "does it refuse?" test cannot reach, and the half that has
+   *  hidden two defects in this module already. If this went red the guard would be refusing every
+   *  ordinary field change, which no refusal test can tell apart from working correctly. */
+  it('ACCEPTS the ordinary field change: read this path, spread it, park it', async () => {
+    stubReads({ [A]: { id: 'GUID-A' } });
+    const { meta } = await readMetaPreferringPark(A);
+
+    parkMetaEdit(A, { ...meta, model: { lodCount: 2 } });
+
+    expect(peekPendingMeta(A)).toEqual(stampMetaReadPath({ id: 'GUID-A', model: { lodCount: 2 } }, A));
+  });
+
+  /** The second keystroke, which is where a naive stamp breaks: the panel re-spreads its OWN state
+   *  (never re-reading), and after a flush-less re-read `readMetaPreferringPark` returns the PARKED
+   *  document. Both must stay parkable, or the guard turns the first edit into the last one. */
+  it('ACCEPTS a second edit spread from panel state, and a third from the parked document', async () => {
+    stubReads({ [A]: { id: 'GUID-A' } });
+    const { meta } = await readMetaPreferringPark(A);
+
+    const afterFirst = { ...meta, model: { lodCount: 2 } };
+    parkMetaEdit(A, afterFirst);
+    parkMetaEdit(A, { ...afterFirst, model: { lodCount: 3 } });          // no re-read between edits
+
+    const reread = await readMetaPreferringPark(A);                      // returns the PARKED doc
+    parkMetaEdit(A, { ...reread.meta, postprocessor: 'outline' });
+
+    expect(peekPendingMeta(A))
+      .toEqual(stampMetaReadPath({ id: 'GUID-A', model: { lodCount: 3 }, postprocessor: 'outline' }, A));
+  });
+
+  /** The registry invariant the stored copy establishes: every document in `pending` is stamped
+   *  for the key it is under, so the parked branch of `readMetaPreferringPark` can hand it back
+   *  untouched — which it must, because that object reference IS `metaWrittenToDisk`'s stamp. */
+  it('stamps what it STORES, and the parked read hands back that same object', async () => {
+    stubReads({ [A]: { id: 'GUID-A' } });
+    const { meta } = await readMetaPreferringPark(A);
+    parkMetaEdit(A, { ...meta, model: { lodCount: 2 } });
+
+    const parked = await readMetaPreferringPark(A);
+
+    expect(metaReadPathOf(parked.meta), 'the parked document knows its own path').toBe(A);
+    expect(parked.meta, 'and it is the registry\'s own object, not a copy').toBe(parked.pendingRef);
+  });
+
+  /** ⚠️ The property the whole design rests on and a reader cannot check by looking — the same one
+   *  `FROM_FAILED_READ` needs, for the same reason: panels re-spread their own state on every
+   *  keystroke, so a stamp surviving only the first hop would fail OPEN on the second edit. */
+  it('the stamp rides spreads and Object.assign, and JSON cannot see it', () => {
+    const read = stampMetaReadPath({ id: 'GUID-A' }, A);
+    const third = { ...{ ...{ ...read, a: 1 }, b: 2 }, c: 3 };
+
+    expect(metaReadPathOf(third), 'three spreads deep').toBe(A);
+    expect(metaReadPathOf(Object.assign({}, read)), 'and through Object.assign').toBe(A);
+    expect(JSON.parse(JSON.stringify(third)), 'and it can never reach the sidecar')
+      .toEqual({ id: 'GUID-A', a: 1, b: 2, c: 3 });
+  });
+
+  /** A stamp is not something a FILE can carry: `JSON.parse` cannot produce a symbol-keyed
+   *  property, so no sidecar — corrupt, hand-edited or hostile — can forge one. The string-keyed
+   *  near-miss is what a hostile file would actually contain. */
+  it('a string key of the same name is not a stamp', () => {
+    const forged = JSON.parse('{"id":"GUID-A","modoki.pendingMeta.readForPath":"' + A + '"}');
+
+    expect(metaReadPathOf(forged)).toBeUndefined();
+    parkMetaEdit(A, { ...forged, model: { lodCount: 2 } });
+    expect(peekPendingMeta(A)).toBeUndefined();
+  });
+
+  /** The failed-read refusal still owns its own case, and its message is the more specific one —
+   *  a tagged fallback has no stamp either, so the ORDER of the two checks is what decides which
+   *  recovery the human is told about. */
+  it('a failed read is still refused as a failed read, not as an unstamped one', () => {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((m: unknown) => { errors.push(String(m)); });
+    try {
+      parkMetaEdit(A, { ...metaReadFallback(), model: { lodCount: 2 } });
+    } finally { spy.mockRestore(); }
+
+    expect(peekPendingMeta(A)).toBeUndefined();
+    expect(errors.join('\n'), 'the failed-read message, not the never-read one').toContain('read failed');
   });
 });

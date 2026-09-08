@@ -79,7 +79,18 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
   if (url.startsWith('/api/read-meta')) {
     return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
   }
-  return { ok: false };
+  // ⚠️ **`status: 404`, not a bare `ok: false`** (#896). This fallthrough stands for "the asset
+  // document is not there yet" — a first-time import, which is what almost every test here drives.
+  // Since #896 that has to be SAID: `parseAssetJson` throws `MissingAssetError` for every non-ok
+  // status, but only a 404/410 (or the SPA fallback) sets `absent`, and only `absent` lets
+  // `classifyExistingAssetFetchFailure` return `'absent'` and the import mint a GUID. A 5xx must
+  // ABORT instead, because the file may exist and minting would dangle every reference to it.
+  //
+  // A bare `ok: false` left `status` undefined, which fails CLOSED — `absent: false` → `'abort'` →
+  // every import in this file stopped writing anything (19 red). That is the right default for
+  // unknown, and a real `fetch` always populates `status`, so the mock was simply under-specified:
+  // it meant 404 and did not say so.
+  return { ok: false, status: 404 };
 });
 vi.stubGlobal('fetch', mockFetch);
 

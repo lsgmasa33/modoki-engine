@@ -10,7 +10,7 @@
  *  module decides which outcome is which; `ParticleEditor.tsx` just acts on the verdict. */
 
 import { classifyFormatVersion } from '../../runtime/core/formatVersion';
-import { isMissingAsset } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure, type AssetDocFetchFailure } from './assetDocLoad';
 import { PARTICLE_FORMAT_VERSION } from '../../runtime/particles/types';
 
 /** What to do with a successfully-fetched-and-parsed `.particle.json` body. `'load'` means the
@@ -41,12 +41,13 @@ export function classifyParticleFetchSuccess(json: unknown): ParticleFetchVerdic
 /** What to do when the fetch/parse itself threw. `'missing'` is a genuinely absent file (a
  *  brand-new asset, or a stale reference) — defaults ARE the correct content, same as before
  *  this fix (see `isMissingAsset`'s own header). Anything else — corrupt/truncated/
- *  conflict-markered JSON — is `'refused'`: the caller must not substitute defaults. */
-export type ParticleFetchFailure =
-  | { kind: 'missing' }
-  | { kind: 'refused'; message: string };
+ *  conflict-markered JSON — is `'refused'`: the caller must not substitute defaults.
+ *
+ *  ⚠️ **The definition moved to `assetDocLoad.ts` (#896) — this is an alias, not a second copy.**
+ *  Four more panels had this same defect on their own documents, so the decision is now shared and
+ *  the rule is stated once. Kept exported under this name because `ParticleEditor` and this
+ *  module's own tests read it, and because the `.particle.json` FORMAT-VERSION half above is
+ *  genuinely particle-specific and stays here — only the read-FAILURE half generalises. */
+export type ParticleFetchFailure = AssetDocFetchFailure;
 
-export function classifyParticleFetchFailure(e: unknown): ParticleFetchFailure {
-  if (isMissingAsset(e)) return { kind: 'missing' };
-  return { kind: 'refused', message: e instanceof Error ? e.message : String(e) };
-}
+export const classifyParticleFetchFailure = classifyAssetDocFetchFailure;

@@ -1853,10 +1853,39 @@ export default function Inspector() {
 
   // Asset mode — batch inspector when >1 asset selected, else single-asset.
   if (selectedAssets.length > 1 && selectedId === null) {
-    return <AssetBatchInspector assets={selectedAssets} />;
+    // ⚠️ Keyed for the same reason as the single-asset branch below, and found by that fix's own
+    // sweep. Each batch view gates its controls on `loaded`, and `loadAll` sets that false — but it
+    // runs in an EFFECT, so for one render after the selection changes `loaded` is still true from
+    // the PREVIOUS selection while `metas`/`mats` hold the previous paths' documents. Texture and
+    // Model batch then park `{ ...(metas[p] ?? {}) }` for a path they have not read: an id-less
+    // document, N of them, one click. `parkMetaEdit`'s read-path stamp refuses those, so nothing
+    // reaches disk either way; the key is what stops the panel offering the window at all, and it
+    // is what covers `MaterialBatchView`, whose registry that stamp cannot see.
+    // ⚠️ `\n`, not a space: asset names contain spaces, and a space-joined key makes
+    // {`/a/x y.png`, `/a/z.png`} and {`/a/x.png`, `/a/y.png z.png`} the SAME string — no remount,
+    // window reopens. NUL is the one byte a path cannot contain (a newline CAN: measured, APFS
+    // accepts it), so it is the only separator that makes the join injective.
+    return <AssetBatchInspector key={selectedAssets.map((a) => a.path).join('\0')} assets={selectedAssets} />;
   }
   if (selectedAsset && selectedId === null) {
-    return <AssetInspector asset={selectedAsset} />;
+    // ⚠️ `key` — this REMOUNTS the whole asset panel when the selection moves to another asset, and
+    // it is load-bearing rather than tidiness (#891 member 2, #897). Without it React reuses the
+    // instance, so every child keeps asset A's state while `path` is already asset B: `meta` /
+    // `data` still hold A's document, `metaRef`/`metaLoaded` still describe A's read, and — because
+    // these views have no loading gate that a non-null foreign document can trip — every control
+    // renders enabled and populated with A's values under B's name. An edit in that window parked
+    // A's document under B's path, GUID included.
+    //
+    // ⚠️ A key ALONE would be a trap, and #891's own thread says so: a fresh instance starts at
+    // `useState(null)` and parks an ID-LESS document instead of a foreign one (#890) — the same
+    // destruction, harder to notice. It is shipped as one half of a pair with `parkMetaEdit`'s
+    // read-path stamp (`metaReadFallback.ts` § READ_FOR_PATH), which refuses both. This half stops
+    // the panel DISPLAYING another asset's values; that half stops any of it reaching disk.
+    //
+    // Keyed here rather than on each child so it also covers this component's OWN per-asset state
+    // (the postprocessor row's `metaRef`/`metaLoaded`, which is member 1) and the `.mat.json`-side
+    // views, whose `if (!data) return <Loading…/>` gate is honest again once `data` resets.
+    return <AssetInspector key={selectedAsset.path} asset={selectedAsset} />;
   }
 
   if (selectedIds.length === 0 || traits.length === 0) {

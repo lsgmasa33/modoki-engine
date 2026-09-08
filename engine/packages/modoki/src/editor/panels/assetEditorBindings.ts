@@ -41,7 +41,7 @@ import {
   getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
 } from '../scene/dirtyAssets';
 import {
-  getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline,
+  getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline, stampMetaReadPath,
 } from '../scene/pendingMeta';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
@@ -262,7 +262,13 @@ export function applyMovesToParkedMeta(moves: Iterable<PathMove>): string[] {
     if (to === null) {
       notes.push(`dropped the unsaved import-settings edit parked for ${from} (its asset was deleted)`);
     } else if (doc !== undefined) {
-      parkMetaEdit(to, doc, carried.get(from));
+      // ⚠️ RE-STAMP. The document is stamped with the path it was READ for (#891), and `parkMetaEdit`
+      // refuses a foreign stamp — which is exactly right for a panel holding the previous asset's
+      // document, and exactly wrong here. This is the one place a document legitimately changes
+      // which path it belongs to: the file MOVED, the parked edit moves with it, and the same
+      // human's same edit is still the one being carried. Saying so by re-stamping keeps the
+      // exception at the call site that knows why, rather than as a hole in the guard.
+      parkMetaEdit(to, stampMetaReadPath(doc as Record<string, unknown>, to), carried.get(from));
       notes.push(`moved the unsaved import-settings edit parked for ${from} → ${to}`);
     }
   }

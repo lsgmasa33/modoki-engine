@@ -13,11 +13,15 @@
  * future CI job) had no way in at all.
  *
  * ── IT DELEGATES, IT DOES NOT RE-IMPLEMENT ───────────────────────────────────────────────
- * `scaffoldNativeTarget` lives in `engine/plugins/addNativeTarget.ts` and is imported here,
- * bundled with esbuild — the same pattern, for the same reason, as
- * `print-toolchain-env.mjs` (#159): a script that re-ran the five steps itself would be a
- * second implementation of a sequence that must not diverge from the one that ships. If this
- * file ever grows its own `cap add` call, that divergence has happened.
+ * `scaffoldNativeTarget` lives in `engine/plugins/addNativeTarget.ts` and is imported here
+ * through the SHARED esbuild seam, `loadVendorPlugins.mjs`: a script that re-ran the five steps
+ * itself would be a second implementation of a sequence that must not diverge from the one that
+ * ships. If this file ever grows its own `cap add` call, that divergence has happened.
+ *
+ * ⚠️ This comment used to say "the same pattern, for the same reason, as print-toolchain-env.mjs
+ * (#159)" — and that was literally true: both files carried their own bundle-to-temp-and-import
+ * copy, and this line cited the other copy instead of reusing it. #827 folded both onto the one
+ * seam. Reach for `loadRequiredEngineModules`, never a fresh `import { build } from 'esbuild'`.
  *
  * ⚠️ NOT idempotent-by-omission: a project whose platform folder is already a COMPLETE target
  * is SKIPPED rather than re-scaffolded, because `cap add` on an existing target overwrites
@@ -32,12 +36,11 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -87,18 +90,18 @@ function discoverMissing() {
   return out;
 }
 
-const {
-  scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded,
-  loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors,
-} = await loadPluginModules();
-const specs = ALL ? discoverMissing() : argv.filter((a) => !a.startsWith('--') && a !== platArg);
-if (!specs.length) {
-  console.error('usage: add-native-targets.mjs [--platform ios|android] [--dry-run] [--force] <project…> | --all-missing');
-  process.exit(2);
-}
-
-/** Bundle the plugin modules and import them — TypeScript with extensionless specifiers, which
- *  Node's ESM resolver rejects outright. Same approach as print-toolchain-env.mjs.
+/** The scaffolder and the config loader, reached through the SHARED esbuild seam in
+ *  `loadVendorPlugins.mjs` rather than a private copy of it (#827). Node cannot import these
+ *  directly even with type-stripping: they reach the toolchain layer as a bundler-style DIRECTORY
+ *  specifier, which Node's ESM resolver rejects with `ERR_UNSUPPORTED_DIR_IMPORT`.
+ *
+ *  ⚠️ `loadRequiredEngineModules`, NOT `loadEnginePluginModule`: the plain wrapper degrades to
+ *  `null` for the heal callers, whose step is optional. Nothing here is — a null would surface
+ *  as `scaffoldNativeTarget is not a function` at the bottom of the loop, a long way from the
+ *  real cause (no esbuild, or not a source checkout).
+ *
+ *  Spread at THIS call site, not merged by the loader: the two entries being combined are visible
+ *  together here, which is the only place a name exported by both would be noticed.
  *
  *  `loadProjectConfig` is bundled alongside the scaffolder for a reason worth keeping: it MERGES
  *  a project's file with `DEFAULT_PROJECT_CONFIG`, and the scaffolder reads fields (`capacitor.webDir`
@@ -106,22 +109,19 @@ if (!specs.length) {
  *  `JSON.parse(project.config.json)` instead and every scaffold died on
  *  `Cannot read properties of undefined (reading 'webDir')` — a raw config is not a ProjectConfig,
  *  it is the SPARSE OVERRIDE of one. */
-async function loadPluginModules() {
-  const stamp = `${process.pid}`;
-  const load = async (rel, name) => {
-    const outfile = path.join(os.tmpdir(), `modoki-${name}-${stamp}.mjs`);
-    await build({
-      entryPoints: [path.join(repoRoot, ...rel)],
-      outfile, bundle: true, format: 'esm', platform: 'node', target: 'node20',
-      packages: 'external', logLevel: 'silent',
-    });
-    try { return await import(pathToFileURL(outfile).href); }
-    finally { try { fs.unlinkSync(outfile); } catch { /* best effort */ } }
-  };
-  return {
-    ...(await load(['engine', 'plugins', 'addNativeTarget.ts'], 'add-native')),
-    ...(await load(['engine', 'plugins', 'load-project-config.ts'], 'load-cfg')),
-  };
+const [addNativeTargetModule, projectConfigModule] = await loadRequiredEngineModules(
+  repoRoot,
+  [path.join('plugins', 'addNativeTarget.ts'), path.join('plugins', 'load-project-config.ts')],
+  'add-native-targets.mjs',
+);
+const {
+  scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded,
+  loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors,
+} = { ...addNativeTargetModule, ...projectConfigModule };
+const specs = ALL ? discoverMissing() : argv.filter((a) => !a.startsWith('--') && a !== platArg);
+if (!specs.length) {
+  console.error('usage: add-native-targets.mjs [--platform ios|android] [--dry-run] [--force] <project…> | --all-missing');
+  process.exit(2);
 }
 
 /** The CLI's spawn wrapper — the transport-specific half `scaffoldNativeTarget` asks for.
@@ -180,7 +180,7 @@ for (const spec of specs) {
   try {
     const cfgPath = path.join(projectRoot, 'project.config.json');
     if (!fs.existsSync(cfgPath)) { results.push([spec, '-', 'SKIP: no project.config.json']); continue; }
-    // The MERGED config, not the raw file — see loadPluginModules().
+    // The MERGED config, not the raw file — see the load/destructure block near the top.
     const cfg = loadProjectConfig(projectRoot);
     // The SAME two-part check the editor's /api/add-native-target route runs (#589) — this script
     // reaches the identical scaffoldNativeTarget with no validation of its own, so a hand-edited

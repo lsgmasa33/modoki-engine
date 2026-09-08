@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 import { projectConfigUnionErrors, validateBuildConfig, loadProjectConfig, loadProjectUserConfig } from '../../plugins/load-project-config';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -81,12 +82,36 @@ describe('the two-part project-config validation actually rejects bad configs (#
 });
 
 describe('add-native-targets.mjs wires the validation in before scaffolding (#589)', () => {
-  const src = fs.readFileSync(scriptPath, 'utf8');
+  // ⚠️ `.code`, NOT `fs.readFileSync`. This file's prose says "…SEPARATE from validateBuildConfig
+  // because / validateBuildConfig sees the already-RESOLVED config…" INSIDE the span the binding
+  // check below slices, so a raw read lets a COMMENT satisfy an assertion about a binding. That is
+  // #812's rule, and its `commentStripperIsShared` detector is blind here because the path arrives
+  // through a variable rather than an inline repo-rooted literal (documented gap, that file's
+  // :235) — the exemption was never signed off in `RAW_READ_ALLOW`, it was just invisible.
+  const src = readScannedSource(scriptPath).code;
 
-  it('destructures projectConfigUnionErrors and validateBuildConfig from loadPluginModules()', () => {
-    const destructure = src.slice(0, src.indexOf('await loadPluginModules()'));
-    expect(destructure).toMatch(/projectConfigUnionErrors/);
-    expect(destructure).toMatch(/validateBuildConfig/);
+  it('binds projectConfigUnionErrors and validateBuildConfig from the shared engine-module loader', () => {
+    // ⚠️ This guard was VACUOUS until #827. It read
+    //     src.slice(0, src.indexOf('await loadPluginModules()'))
+    // and when #827 removed that private loader, `indexOf` returned -1, `slice(0, -1)` became the
+    // WHOLE file minus one character, and both assertions matched the validators' own CALL sites
+    // further down. Measured: length 13897 of 13898, both regexes true. It went green through a
+    // change that deleted the thing it names — the exact failure `docs/falsifiable-tests.md` is
+    // about. So the anchor is asserted to EXIST before anything is sliced from it.
+    const load = src.indexOf('await loadRequiredEngineModules(');
+    expect(load, 'the script no longer loads its engine modules through loadVendorPlugins.mjs (#827) '
+      + '— re-anchor this guard rather than deleting it').toBeGreaterThan(-1);
+
+    // Both validators must arrive by DESTRUCTURE from that load. The span is the load call up to
+    // the destructure's own closing `} = {`, NOT "up to the first call" — a span reaching as far as
+    // the first call swallows the intervening prose, and both names appear in it.
+    const close = src.indexOf('} = {', load);
+    expect(close, 'no destructure follows the load — re-anchor').toBeGreaterThan(-1);
+    const binding = src.slice(load, close);
+    expect(binding, 'projectConfigUnionErrors is not bound from the loaded modules')
+      .toMatch(/projectConfigUnionErrors[,\s}]/);
+    expect(binding, 'validateBuildConfig is not bound from the loaded modules')
+      .toMatch(/validateBuildConfig[,\s}]/);
   });
 
   it('calls both validators', () => {

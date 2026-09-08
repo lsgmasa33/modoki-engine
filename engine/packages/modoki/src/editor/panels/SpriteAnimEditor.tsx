@@ -18,6 +18,8 @@ import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
@@ -45,11 +47,28 @@ export default function SpriteAnimEditor() {
   // Active track is LOCAL panel state — the asset is just the clip set, it has no
   // "active clip" concept (that lives on the SpriteAnimator trait instead).
   const [active, setActive] = useState('');
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingSpriteAnimDef` null, `commit` early-returns on that, and the clip surface below is
+   *  gated on `def` — editing is disabled by construction. A genuinely MISSING file is NOT this
+   *  (#896, and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
+   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
+   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
+   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
+   *  re-reading the file, leaving the panel editing normally over a document it never read. The
+   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
+   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
+   *  was this button. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingSpriteAnimAsset');
+  }, []);
 
   // ── Load the asset def when the open target changes ──
   useEffect(() => {
     lastAction.current = null;
     lastGroup.current = undefined;
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSpriteAnimDef;
@@ -94,7 +113,24 @@ export default function SpriteAnimEditor() {
         loadSpriteAnimDef(loaded);
         setActive(Object.keys(loaded.clips)[0] ?? '');
       })
-      .catch((e) => { if (cancelled) return; console.warn('[SpriteAnimEditor] load failed', e); const fb = { clips: {} }; savedMarkRef.current?.(fb); loadSpriteAnimDef(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896: this substituted `{ clips: {} }` on ANY failure and marked it as the SAVED
+        // baseline, so the first edit parked a full-replace write of an EMPTY clip set over the
+        // authored file. The `id` survived (the route preserves it when the incoming doc omits
+        // one) — every clip did not. Only a genuinely MISSING file keeps the empty default, which
+        // is what authoring a brand-new `.spriteanim.json` needs.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[SpriteAnimEditor] load failed (asset missing), starting empty', e);
+          const fb = { clips: {} };
+          savedMarkRef.current?.(fb);
+          loadSpriteAnimDef(fb);
+          return;
+        }
+        console.error(`[SpriteAnimEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // Key on the stable path + explicit reopen nonce, not the asset object identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -203,6 +239,14 @@ export default function SpriteAnimEditor() {
     <div style={{ display: 'flex', width: '100%', height: '100%', background: '#1a1a2e', fontFamily: 'monospace', fontSize: 12, color: '#ccc' }}>
       {/* Preview */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {asset && loadState === 'failed' && (
+          <AssetLoadRefusedBanner
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="spriteAnim.loadBanner"
+            onRetry={retryLoad}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
         {clip && frames.length > 0
           ? <FlipbookPreview clip={clip} />
           : <div style={{ color: '#555' }}>{asset ? 'No frames in this clip yet' : 'Double-click a .spriteanim.json in Assets to edit'}</div>}

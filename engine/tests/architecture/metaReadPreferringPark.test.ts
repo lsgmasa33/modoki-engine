@@ -90,6 +90,20 @@ interface Exemption {
    *  `'tags'` — calls `metaReadFallback()` (asserted below). `'aborts'` — has no fallback at all
    *  because a failed read returns early, which is the stronger position and needs no tag. */
   fallback: 'tags' | 'aborts';
+  /** What this file's own SUCCESSFUL read yields (#891) — the third thing the helper does that an
+   *  exemption silently drops, and the same trap as `baseline` and `fallback` one release later
+   *  again.
+   *
+   *  `readMetaPreferringPark` stamps what it returns with the path it was read FOR, and
+   *  `parkMetaEdit` refuses a document whose stamp is absent or names another path — which is what
+   *  stops a panel parking the PREVIOUS asset's document under this one. A raw reader that does not
+   *  stamp hands its panel a document the guard cannot tell from one nobody read, so every park for
+   *  every asset only that file reads is REFUSED: not a destruction this time, but the human's edits
+   *  silently stop landing, which is the same class of silent failure pointing the other way.
+   *
+   *  `'stamps'` — calls `stampMetaReadPath()` (asserted below). `'never-parks'` — the file calls
+   *  `parkMetaEdit` nowhere, so it has nothing to stamp for (also asserted, in both directions). */
+  readPath: 'stamps' | 'never-parks';
   /** Required when `baseline` is `'none'`: what the bypass COSTS and why that is acceptable here.
    *  This is the field #871 did not exist to make anyone write. */
   costs?: string;
@@ -102,6 +116,7 @@ const EXEMPT: Record<string, Exemption> = {
   'panels/assetViews/VideoAssetView.tsx': {
     baseline: 'seeds',
     fallback: 'tags',
+    readPath: 'stamps',
     reason:
     'keeps a THIRD piece of state (`applied`) that must reflect DISK, never a still-parked edit — '
     + 'preferring the park there would compare a pending edit against itself and hide the '
@@ -117,6 +132,7 @@ const EXEMPT: Record<string, Exemption> = {
   'panels/makeTexture2D.ts': {
     baseline: 'none',
     fallback: 'aborts',
+    readPath: 'never-parks',
     costs:
     'establishes no baseline, and does not need one: it flushes this path, reads, and writes '
     + 'UNCONDITIONALLY in one synchronous body, and `writeMetaConditional`\'s own docblock names an '
@@ -168,6 +184,21 @@ function callsReadResultRecorder(code: string): boolean {
  *  cheapest kind of scar to reuse. */
 function callsMetaReadFallback(code: string): boolean {
   return /\bmetaReadFallback\s*\(/.test(code);
+}
+
+/** `true` if `code` (already comment-stripped) CALLS `stampMetaReadPath` (#891).
+ *
+ *  Same paren rule as the two detectors above, for the third time and the same reason — an import
+ *  names the symbol bare, and a detector that matched it would make the `'stamps'` rule vacuous
+ *  with the call deleted. */
+function callsReadPathStamper(code: string): boolean {
+  return /\bstampMetaReadPath\s*\(/.test(code);
+}
+
+/** `true` if `code` (already comment-stripped) CALLS `parkMetaEdit` — i.e. this file has documents
+ *  that a missing stamp would get refused. Same paren rule again. */
+function callsParkMetaEdit(code: string): boolean {
+  return /\bparkMetaEdit\s*\(/.test(code);
 }
 
 describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
@@ -376,5 +407,49 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
 
   it('a real migrated decision site (Inspector.tsx AssetInspector) has no raw fetch left', () => {
     expect(hasRawReadMetaFetch(read('panels/Inspector.tsx'))).toBe(false);
+  });
+
+  /** #891 — the `fallback` rule's twin, for the third thing an exemption drops silently.
+   *
+   *  ⚠️ Both directions, same as the two above. A `'stamps'` entry that stopped stamping means every
+   *  park for that asset type is silently refused; a `'never-parks'` entry that started parking is a
+   *  declaration gone stale — and a stale declaration is what let #871 through in the first place. */
+  it("a 'stamps' exemption really does stamp its read, and a 'never-parks' one really does not park", () => {
+    const wrong: string[] = [];
+    for (const [rel, ex] of Object.entries(EXEMPT)) {
+      const code = read(rel);
+      if (ex.readPath === 'stamps' && !callsReadPathStamper(code)) {
+        wrong.push(`${rel}: declared 'stamps' but never calls stampMetaReadPath — parkMetaEdit `
+          + 'cannot tell its document from one nobody read, so every park for every asset only '
+          + 'this file reads is REFUSED and the human\'s edits stop landing.');
+      }
+      if (ex.readPath === 'never-parks' && callsParkMetaEdit(code)) {
+        wrong.push(`${rel}: declared 'never-parks' but DOES call parkMetaEdit — it now needs to `
+          + "stamp its read; change the entry to 'stamps' and add the call.");
+      }
+    }
+    expect(wrong, wrong.join('\n')).toEqual([]);
+  });
+
+  /** The reference case the `'stamps'` rule is measured against: if the blessed reader itself
+   *  stopped stamping, every exemption would be guarding a hole — the same control the tagged
+   *  fallback gets one test up. */
+  it('the read-path stamp this rule names actually exists, and the helper uses it', () => {
+    const FALLBACK_FILE = 'scene/metaReadFallback.ts';
+    expect(read(FALLBACK_FILE)).toContain('export function stampMetaReadPath');
+    expect(callsReadPathStamper(read(HELPER_FILE))).toBe(true);
+  });
+
+  it('the stamp detector matches a CALL and not an import mention', () => {
+    expect(callsReadPathStamper('return stampMetaReadPath(m, path);')).toBe(true);
+    expect(callsReadPathStamper('  stampMetaReadPath (m, path);')).toBe(true);
+    expect(callsReadPathStamper("import { parkMetaEdit, stampMetaReadPath } from '../x';")).toBe(false);
+    expect(callsReadPathStamper('import {\n  stampMetaReadPath,\n} from "../x";')).toBe(false);
+    expect(callsReadPathStamper('const f = stampMetaReadPath;')).toBe(false);
+  });
+
+  it('the park detector matches a CALL and not an import mention', () => {
+    expect(callsParkMetaEdit('parkMetaEdit(path, updatedMeta);')).toBe(true);
+    expect(callsParkMetaEdit("import { parkMetaEdit, metaReadFallback } from '../x';")).toBe(false);
   });
 });

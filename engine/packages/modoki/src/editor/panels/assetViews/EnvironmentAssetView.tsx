@@ -23,7 +23,7 @@ import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
 import {
   parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
-  metaCameFromFailedRead,
+  metaReadPathOf,
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
@@ -104,16 +104,30 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
     // snapped the format dropdown back to `hdr`, discarding the user's choice with no toast.
     // It traded a visible sticky refusal for silent loss, which is worse.
     //
-    // The answer is decidable here, before anything is spent: if this panel's document came from
-    // a failed read it has no `id`, and a wholesale write of it would cost the asset its GUID.
-    if (metaCameFromFailedRead(meta)) {
+    // The answer is decidable here, before anything is spent: if this panel's document did not
+    // come from a read OF THIS PATH it has no `id`, and a wholesale write of it would cost the
+    // asset its GUID.
+    //
+    // ⚠️ **Ask the PROVENANCE question, not the tag question.** This guard read
+    // `metaCameFromFailedRead(meta)` for one release, and that predicate requires `doc !== null` —
+    // so it answered `false` for the one state where the panel has no document at all. A THROWN
+    // `/api/read-meta` (`loadMeta`'s `.catch(() => {})` swallows it, by design) leaves `meta` at
+    // `null`, every control here still live, and `{ ...(meta ?? {}) }` id-less: Apply then encoded
+    // the gainmap, committed `~ultrahdr.jpg`, and replaced the sidecar with a document carrying no
+    // GUID. That is #890's destruction reached through the one door #891's park-seam guard
+    // deliberately does not watch, and this was the only one of the four wholesale writers exposed
+    // to it — the other three ask "did a read land" (`metaLoadedRef`, an early return on `!ok`)
+    // rather than "is this the tagged fallback". `metaReadPathOf` IS that question, and it
+    // subsumes the tag: a `metaReadFallback()` document is unstamped too.
+    if (metaReadPathOf(meta) !== path) {
       console.error(
-        `[Inspector] not converting ${path} — its .meta.json was never read successfully, so `
-        + 'writing the result would replace the file with a document missing its GUID. Reselect '
-        + 'the asset to re-read it, then retry.',
+        `[Inspector] not converting ${path} — its .meta.json was never read successfully for this `
+        + 'asset, so writing the result would replace the file with a document missing its GUID. '
+        + 'Reselect the asset to re-read it, then retry.',
       );
       useEditorStore.getState().showToast(
-        `Cannot convert ${name} — its import settings could not be read. Reselect the asset and try again.`,
+        `Cannot convert ${name} — its import settings could not be read, or have not loaded yet. `
+        + 'Reselect the asset to re-read it, then try again.',
         'warn',
       );
       return;
@@ -289,7 +303,15 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       </div>
       <button
         data-ui-id="assetView.environment.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
-        disabled={importing}
+        // ⚠️ `meta === null` too, not just `importing`. Widening the guard below from the TAG
+        // question to the PROVENANCE question made it refuse one state it used to allow: the
+        // mount read still in flight, where the panel has no document YET. That refusal is
+        // correct for the UltraHDR branch (it would write the sidecar from a document it does
+        // not have) and needlessly conservative for the reimport one — but either way the
+        // honest answer is not to offer the button, because the remedy the toast names
+        // (reselect) is not the one that helps (wait). The guard stays as defence in depth:
+        // this is the UI, not the check.
+        disabled={importing || meta === null}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 4, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}
       >
