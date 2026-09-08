@@ -144,15 +144,35 @@ export function checkReleaseState({
     // being released) and step 4 (bump package.json to it). Told "expects release_0_6_0", the
     // operator would cut a branch for the version they are LEAVING. The fix is the bump, and the
     // message has to say so: a refusal that misdirects is worse than one that only refuses.
-    if (/^release_\d+_\d+_\d+$/.test(actual)) {
+    if (/^release_(0|[1-9]\d*)_(0|[1-9]\d*)_(0|[1-9]\d*)$/.test(actual)) {
+      // ⚠️ Which side is behind decides the advice, and an earlier version of this message did not
+      // look: it assumed the BRANCH was always ahead and told the operator to bump. On a superseded
+      // release branch (package.json already past it) that advice moves them further from a valid
+      // state, and it said "do NOT cut release_0_7_1" while release_0_7_1 was the correct branch —
+      // the same misdirection this whole case was added to remove, mirrored.
+      const [, bMaj, bMin, bPat] = /^release_(\d+)_(\d+)_(\d+)$/.exec(actual);
+      const branchVer = `${bMaj}.${bMin}.${bPat}`;
+      const br = [bMaj, bMin, bPat].map(Number);
+      const pkg = String(version).split('.').map(Number);
+      // First component that differs decides the order — the branch name and the version are both
+      // known-good triples by this point (the regex above, and parseReleaseVersion earlier).
+      const d = br.findIndex((n, i) => n !== pkg[i]);
+      const branchIsAhead = d !== -1 && br[d] > pkg[d];
+      // ⚠️ Do NOT offer "pass --version to match the branch". The only real caller always passes
+      // --manifest-version too, so that lands on `version-mismatch`, whose own advice is "drop
+      // --version" — back here. Measured: a two-cycle with no exit. Only the bump escapes.
       return {
         ok: false,
         code: 'branch-version-skew',
-        message:
-          `--release: you are on ${actual} but package.json says ${version}.\n` +
-          `  That is the gap between cutting the branch and bumping the version.\n` +
-          `  Bump it (release-version skill § 4), or pass --version to match the branch.\n` +
-          `  Do NOT cut ${expected} — that names the version you are releasing FROM.`,
+        message: branchIsAhead
+          ? `--release: you are on ${actual} but package.json still says ${version}.\n` +
+            `  That is the gap between cutting the branch and bumping the version.\n` +
+            `  Bump package.json to ${branchVer} (release-version skill § 4), then re-run.\n` +
+            `  Nothing else escapes this state: --version alone lands on version-mismatch.`
+          : `--release: you are on ${actual} but package.json is already at ${version}.\n` +
+            `  This branch is BEHIND — ${version} was bumped or released after it was cut, so\n` +
+            `  ${actual} is a superseded release branch, not the one being cut.\n` +
+            `  Check out the branch for ${version} (${expected}), or cut it per § 2b.`,
       };
     }
     return {
@@ -160,9 +180,12 @@ export function checkReleaseState({
       code: 'wrong-branch',
       message:
         `--release expects ${expected} (from version ${version}); on ${actual}.\n` +
-        `  Cut it from main first: git switch -c ${expected}\n` +
-        `  Do NOT just drop --release: --push alone still commits, force-moves the public\n` +
-        `  v${version} tag and starts the signed release builds — it only skips the checks.`,
+        `  Release branches are cut by the HUB, from main — see release-version skill § 2b, which\n` +
+        `  handles a fresh cut and a resume, and knows which of the two this is.\n` +
+        `  ⚠️ Do NOT cut ${expected} from here. A release branch created on top of another\n` +
+        `  branch's work satisfies every check below, so --push would publish THAT work as\n` +
+        `  v${version} and force-move the public tag.\n` +
+        `  Dropping --release does not help either: --push alone does all of that with no checks.`,
     };
   }
 

@@ -137,8 +137,14 @@ describe('checkReleaseState — the REJECT side, one code each', () => {
     expect(v.code).toBe('wrong-branch');
     expect(v.message).toContain('release_0_7_0');
     expect(v.message).toContain('main');
-    // And it must say how to get there — a refusal that withholds the fix costs a round trip.
-    expect(v.message).toContain('git switch -c release_0_7_0');
+    // ⚠️ This assertion used to require `git switch -c release_0_7_0` — a test DEFENDING the
+    // defect. The old expectation was wrong twice: the command fails outright (exit 128) when the
+    // branch already exists, which § 2b documents as the normal resume case; and run from a worker
+    // branch it creates a release branch on top of that branch's work, which then passes every
+    // precondition — so `--push` would publish worker bytes under the release tag. A refusal must
+    // still say how to proceed, so it now points at the ritual step that knows cut-vs-resume.
+    expect(v.message).toContain('§ 2b');
+    expect(v.message).not.toContain('git switch -c');
   });
 
   it('distinguishes a release branch for ANOTHER version from a wrong branch', () => {
@@ -164,9 +170,51 @@ describe('checkReleaseState — the REJECT side, one code each', () => {
       'wrong-branch',
     );
     // …and a branch that merely STARTS like one is not one.
-    expect(checkReleaseState({ version: '0.7.0', branch: 'release_x', dirty: false }).code).toBe(
-      'wrong-branch',
-    );
+    // ⚠️ `release_x` alone is a WEAK discriminator: loosening the test to /^release_\d/ keeps it
+    // green, because it only pins "a non-digit follows release_". The triple SHAPE needs the two
+    // below — two components and four — and without them the shape assertion is decoration.
+    for (const branch of ['release_x', 'release_0_7', 'release_0_7_0_1', 'release_']) {
+      expect(
+        checkReleaseState({ version: '0.7.0', branch, dirty: false }).code,
+        `${branch} is not a release-branch triple`,
+      ).toBe('wrong-branch');
+    }
+  });
+
+  it('reads the DIRECTION of the skew — behind is not the same as not-yet-bumped', () => {
+    // The mirror of the defect this case was added to fix: assuming the branch is always AHEAD told
+    // a superseded branch to bump (moving further away) and said "do NOT cut release_0_7_1" while
+    // release_0_7_1 was the right branch.
+    const ahead = checkReleaseState({ version: '0.6.0', branch: 'release_0_7_0', dirty: false });
+    expect(ahead.code).toBe('branch-version-skew');
+    expect(ahead.message).toContain('still says 0.6.0');
+    expect(ahead.message).toContain('Bump package.json to 0.7.0');
+
+    const behind = checkReleaseState({ version: '0.7.1', branch: 'release_0_7_0', dirty: false });
+    expect(behind.code).toBe('branch-version-skew');
+    expect(behind.message).toContain('already at 0.7.1');
+    expect(behind.message).toContain('superseded');
+    // It must NOT tell a superseded branch to bump — that is the mirrored misdirection.
+    expect(behind.message).not.toContain('Bump package.json');
+  });
+
+  it('offers no escape that loops — --version is not suggested', () => {
+    // The only real caller always passes --manifest-version, so "pass --version to match the
+    // branch" lands on version-mismatch, whose advice is "drop --version" — back to skew. A
+    // two-cycle. Measured before this assertion existed.
+    const v = checkReleaseState({ version: '0.6.0', branch: 'release_0_7_0', dirty: false });
+    expect(v.message).not.toContain('pass --version');
+  });
+
+  it('never tells the operator to cut a release branch from where they are', () => {
+    // The severe one. `git switch -c <expected>` from a worker branch creates a release branch on
+    // top of that branch's work, which then satisfies EVERY precondition — so --push would publish
+    // worker bytes under the release tag. Verified: checkReleaseState on that branch returns 'ok'.
+    const v = checkReleaseState({ version: '0.7.0', branch: 'work-ai2', dirty: false });
+    expect(v.code).toBe('wrong-branch');
+    expect(v.message).not.toContain('git switch -c');
+    // …and it must say WHY, or the next author restores the command as a convenience.
+    expect(v.message).toContain('publish THAT work');
   });
 
   it('refuses a dirty tree on the right branch', () => {
@@ -301,6 +349,28 @@ describe('releaseBranch.mjs CLI — the seam the shell publisher reads', () => {
     expect(
       run(['check', '--version', '0.7.0', '--branch', 'release_0_7_0', '--dirty']).status,
     ).toBe(2);
+  });
+
+  it('surfaces branch-version-skew through the CLI with --manifest-version present', () => {
+    // The seam test that was missing: the shell ALWAYS passes --manifest-version, so the question
+    // "can skew actually reach an operator, or does the version cross-check pre-empt it?" is about
+    // the CLI's argv, not the library. This is the exact argv publish-engine-oss.sh builds.
+    const r = run([
+      'check',
+      '--version',
+      '0.6.0',
+      '--branch',
+      'release_0_7_0',
+      '--manifest-version',
+      '0.6.0',
+    ]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('still says 0.6.0');
+    // ⚠️ Assert against the version-mismatch MESSAGE, not the code NAME: the skew message
+    // legitimately mentions `version-mismatch` when explaining which escapes do not work, so
+    // `not.toContain('version-mismatch')` failed on correct output. Testing for the string rather
+    // than the property, exactly as the review warned about the sibling assertion.
+    expect(r.stderr).not.toContain('disagrees with package.json');
   });
 
   it('refuses a missing --branch rather than defaulting to something', () => {

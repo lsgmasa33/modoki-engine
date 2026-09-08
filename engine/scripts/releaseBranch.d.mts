@@ -15,8 +15,12 @@ export type ReleaseVersion =
  *  branch for a DIFFERENT version, i.e. the gap between cutting it and bumping `package.json`; `'dirty'` —
  *  tracked files differ from HEAD; `'untracked-overlay'` — untracked files under `oss/`, which DO
  *  ship via the overlay's unfiltered rsync; `'version-mismatch'` — an explicit `--version` disagrees
- *  with `package.json`. Ordered as checked: branch before dirt, so a dirty tree on the wrong branch
- *  reports the branch. */
+ *  with `package.json`.
+ *
+ *  Checked in this order — `bad-version`, `detached`, `branch-version-skew`, `wrong-branch`,
+ *  `dirty`, `untracked-overlay`, `version-mismatch` — so a dirty tree on the wrong branch reports
+ *  the branch. (An earlier version of this list said "ordered as checked" while listing
+ *  `wrong-branch` before the skew case, which the code checks first.) */
 export type ReleaseStateCode =
   | 'ok'
   | 'bad-version'
