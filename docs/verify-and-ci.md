@@ -29,6 +29,56 @@ that is how the ~110s figure above went stale.
 Warm is the honest figure to quote: `typecheck`/`lint` cache into the gitignored
 `node_modules/.tmp` (65f5f840), so a COLD clone pays ~55s more on those two.
 
+### The gate re-installs the git hooks first (#909)
+
+`verify.mjs` runs `engine/scripts/install-git-hooks.mjs` before it launches the lanes. It costs
+milliseconds and normally prints nothing.
+
+**The reason is that `engine/scripts/git-hooks/*` is a SOURCE, and git runs a COPY of it.** The
+installer puts each hook in the git common dir's `hooks/` (not `core.hooksPath` — that would take
+the existing Git LFS hooks out with it), so **editing a hook source changes nothing until the
+installer re-runs**, and nothing said so. `prepare` covers a hook change that rides along with a
+dependency change; it does not cover a hook edited on its own, which is exactly when this bites.
+Measured 2026-09-08: two clones were both committing through a `prepare-commit-msg` from before the
+`release_*` exemption was written, and real release commits came out carrying the prefix that edit
+removed.
+
+⚠️ **It is a HEAL, not a guard, and the alternative was rejected on purpose.** A test comparing
+installed against source goes red for the state of somebody's machine rather than for anything in
+the diff under test, needs a skip for a clone that has no hooks — and `CLAUDE.md` already declined a
+blocking hook once, on the grounds that *"the discipline IS the guard"*. ⚠️ **And the two must not
+both exist**: healing immediately before such a test ran would leave a guard that cannot fail, which
+is the class being fixed here, not a belt-and-braces version of it.
+
+That is also why the installer compares before it copies and prints only on a real write. On a gate
+this runs every time, so an unconditional line per hook would be noise on every run — and the one
+run where it matters would look exactly like the hundreds where it does not.
+
+⚠️ **It writes ONLY inside this clone's own `.git/hooks`, and that is a safety decision, not an
+oversight.** `git rev-parse --git-path hooks` — where git actually *runs* hooks — honours
+`core.hooksPath`, which is typically ONE directory shared by every repo on the machine. A version of
+this installer used it as the WRITE target and replaced the developer's own hook there, in every
+repo, from a `verify` run: reproduced, reverted the same day. Where git *looks* is now only
+**reported** — when it differs, the installer says the install is INERT and names both directories.
+Two questions that read alike: *where may we write* is answered by the clone, *where does git look*
+by `--git-path hooks`.
+
+⚠️ **Silence from this preamble must mean "nothing to do", never "it failed".** The first version
+filtered the installer's output with an allow-list (`[hooks] installed …`), which also discarded its
+stack trace — measured, an unwritable hooks dir exits 1 with EACCES and `verify` printed nothing and
+went green, i.e. the heal's own reporting hiding the state the heal exists to prevent. It is a
+deny-list now (one known-noise line suppressed, everything else passed through) plus a warning on a
+non-zero exit. `gitHooksInstall.test.ts` pins both, and pins that the installer really does fail
+loudly, so the claim is about something reachable.
+
+**The falsifiable half lives elsewhere.** `engine/tests/architecture/gitHooksInstall.test.ts` drives
+the installer into a throwaway `git init` repo and asserts what LANDED — byte-identical, executable,
+a stale copy replaced and reported, a current one silent — and the behavioural `prepare-commit-msg`
+block in `releaseBranch.test.ts` now installs into its own throwaway repo and spawns the installed
+copy rather than the source. This is the general rule behind both: **verify the artifact that
+executes, not the source it was built from.** A test on the source cannot fail for the copy being
+stale, and this one stayed green through a full day of the live hook doing the old thing.
+
 ### The two lanes share ONE working tree — a test must not leave a linted file in it
 
 ⚠️ **A test that writes a linted-extension file (`.ts/.tsx/.js/.mjs/.cjs`) into a non-ignored

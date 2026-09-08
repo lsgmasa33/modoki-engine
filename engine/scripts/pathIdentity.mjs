@@ -25,28 +25,33 @@
  * Because the repo had already hand-rolled this comparison **seven** times, in four mutually
  * inconsistent recipes, and patching in place would have made eight and nine:
  *
- *   | site | recipe |
- *   |---|---|
- *   | `buildClaimsStore.sameProjectRoot`     | `resolve` + `===` (its own docblock admits the hole) |
- *   | `devServer.samePath`                   | slash-collapse + trim + lowercase |
- *   | `connectClaude.canonical`              | `resolve` → `realpathSync.native` → lowercase |
- *   | `instanceToken.rootKey`                | `resolve` + trim + lowercase |
- *   | `userDataDir.cloneId`                  | byte-identical to `rootKey` |
- *   | `userDataDir.multiProfileKey`          | `rootKey` **minus** the trailing-slash trim (already drifted) |
- *   | `projectGames.norm`                    | slash-collapse + strip LEADING slash + lowercase |
+ *   | site | recipe | status |
+ *   |---|---|---|
+ *   | `buildClaimsStore.sameProjectRoot`     | `resolve` + `===` (its own docblock admitted the hole) | migrated #869 |
+ *   | `connectClaude.canonical`              | `resolve` → `realpathSync.native` → lowercase | became this module #869 |
+ *   | `projectGames.norm`                    | slash-collapse + strip LEADING slash + lowercase | gone (no such function) |
+ *   | `devServer.samePath`                   | slash-collapse + trim, fold on **win32 only** | migrated #899 |
+ *   | `instanceToken.rootKey`                | `resolve` + trim + lowercase | migrated #899 |
+ *   | `userDataDir.cloneId`                  | byte-identical to `rootKey` | migrated #899 |
+ *   | `userDataDir.multiProfileKey`          | `rootKey` minus the trailing-slash trim | migrated #899 |
  *
  * The body below is `connectClaude.canonical`'s, adopted verbatim because it was the strongest
  * of the seven and already guarded the repo's most safety-critical boundary (the `$HOME/.mcp.json`
  * write). It is not new code; it is the copy that was already right, promoted.
  *
- * ⚠️ **That table is a TO-DO LIST, not a history — #869 replaced three of the seven, and the past
- * tense above hid the other four for two more fixes** (#899). `devServer.samePath`,
- * `instanceToken.rootKey`, `userDataDir.cloneId` and `userDataDir.multiProfileKey` are still live
- * and still hand-rolled; none of them resolves symlinks, and `pathIdentityIsShared.test.ts` can
- * see none of them, because a `.replace()`/`.toLowerCase()` chain matches none of its three banned
- * shapes. Measured 2026-09-08: `rootKey` returns two different keys for a clone and its symlink,
- * which by its own docblock 403s the user against their own editor. **Do not read this paragraph
- * as licence to add an eighth** — it is the opposite.
+ * ⚠️ **The table above was written in the past tense while four of its rows were still LIVE, and
+ * that is what hid them for two more fixes** (#899). #869 replaced three; the remaining four were
+ * `.replace()`/`.toLowerCase()` chains, so `pathIdentityIsShared.test.ts` could see none of them —
+ * none matches any of its three banned shapes, and the comparison or the hash happens on a later
+ * line. All four are migrated as of #899, and the status column exists so the next reader does not
+ * have to re-derive which rows are history and which are a to-do list.
+ *
+ * ⚠️ **`multiProfileKey`'s "already drifted" note (it lost the trailing-slash trim, so `…/x/` and
+ * `…/x` mint two profiles) was FALSE and is retired.** `path.resolve` strips a trailing separator
+ * itself, so the trim its siblings carried was dead code and its absence changed nothing —
+ * measured, and an existing test (`userDataDir.test.ts` → *"a trailing slash is the SAME project
+ * (stable key)"*) had been green on exactly that point the whole time. It was scoped as work twice
+ * on the strength of this line.
  *
  * ## The two subtleties
  *
@@ -98,9 +103,22 @@ import path from 'node:path';
  *      `claim-guard.mjs`'s `heldByThisClone` returns true for "allow" → over-matching PROCEEDS.
  *      **Fail-open**: two clone directories differing only by case, on a case-sensitive volume,
  *      would let one clone drive a phone the other holds.
+ *    - `devServer.classifyPortHolder` reads equal as "our own install", and an equal verdict plus a
+ *      dead holder editor is a **process KILL** (`reclaimPort`). ⚠️ **Added to this list by #899**,
+ *      which routed that function here from a hand-rolled recipe that folded on win32 ONLY — so on
+ *      darwin this site is newly exposed. It is the caller the polarity note in the header uses as
+ *      its example ("a port-holder check that over-matches would kill the wrong process"), and it
+ *      was NOT in the enumeration #905's acceptance was ruled against. Narrowest of the set: it
+ *      also needs the holder's editor to be dead.
  *  The exposure is narrow (it needs a case-sensitive volume AND two clones differing only by
- *  case), and it is accepted rather than fixed: making this per-volume would mean a stat per
- *  comparison on a predicate that must work for paths which do not exist.
+ *  case), and it is **accepted rather than fixed — owner ruling, 2026-09-08 (#905)**. The standing
+ *  reason is a cost/benefit call: the fix is a syscall with a platform-specific answer and a cache
+ *  to get right, bought against a hazard that has never been observed outside a volume created
+ *  deliberately to produce one.
+ *
+ *  ⚠️ **The reason it USED to give here was "a stat per comparison", and that one is DEAD** — see
+ *  the #892 note below. It is kept rather than deleted because a dead rationale still reading as a
+ *  live one is what made this need a ticket at all.
  *
  *  ⚠️ **#892 WIDENED this, and claimed the opposite while doing so.** The two spellings used to
  *  have to differ only by case; now `samePath` canonicalises through symlinks for a missing path,
@@ -116,10 +134,19 @@ import path from 'node:path';
  *  exist") is defused too: `canonicalWithMissingTail` already locates the longest EXISTING
  *  ancestor, which is a real directory a per-volume probe could run against. The rationale
  *  survives only for `pathCaseKey` used standalone (`editorPorts.backendPortForClone` folds a
- *  bare directory SEGMENT, where there is no path to probe). **So the acceptance above is now
- *  un-argued rather than justified** — it stands because changing a fail-open device-claim gate
- *  is the owner's call (#865's polarity ruling), not because the cost argument still holds.
- *  Tracked in **#905**, which carries the measurement and the three ways out. */
+ *  bare directory SEGMENT, where there is no path to probe).
+ *
+ *  ⚠️ **So the acceptance above no longer rests on that cost argument — do not repeat it.** #905
+ *  put the three ways out (probe per volume / narrow the fold / re-accept explicitly) to the
+ *  owner, who ruled **re-accept** on 2026-09-08 and closed it. The reason that stands is the one
+ *  on the acceptance above, not this retracted one.
+ *
+ *  ⚠️ **That ruling is a cost/benefit call, NOT a proof it cannot happen** — and when it does
+ *  happen it is fail-OPEN. `sameClone` is the single comparison behind all four device-claim
+ *  sites, so what is at stake is the machine-wide serialization of #149/#285. The three
+ *  preconditions (a case-sensitive volume, two clone dirs differing only by case, and post-#892 a
+ *  symlink) are what make the odds acceptable; if a case-sensitive volume ever comes into ordinary
+ *  use here, this gets RE-OPENED rather than re-argued. */
 const CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin';
 
 /** The canonical SPELLING of `p`: resolved, and realpath'd where the path exists.

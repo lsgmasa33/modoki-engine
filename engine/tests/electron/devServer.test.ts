@@ -4,9 +4,12 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import net from 'node:net';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   findFreePort, waitForServer, needsWinTreeKill,
-  parseDevServerIdentity, classifyPortHolder, samePath, exitDisposition,
+  parseDevServerIdentity, classifyPortHolder, exitDisposition,
   probeDevServerPort, isProcessAlive, startDevServer, stopChild, type DevServerIdentity,
 } from '../../electron/devServer';
 
@@ -265,7 +268,9 @@ describe('#190 — proving the server on the port is OURS', () => {
     const self = { repoRoot: ours.repoRoot, pid: OUR_EDITOR_PID };
     const dead = () => false;
     const alive = () => true;
-    const win = (isAlive: (p: number) => boolean) => ({ platform: 'win32' as const, isAlive });
+    // #899 removed `deps.platform`: it existed only to drive this file's own hand-rolled
+    // `samePath`. The comparison is the SSOT's now and reads the real platform.
+    const deps = (isAlive: (p: number) => boolean) => ({ isAlive });
 
     it('nothing on the port ⇒ free', () => {
       expect(classifyPortHolder({ state: 'empty' }, self)).toEqual({ action: 'free' });
@@ -274,20 +279,20 @@ describe('#190 — proving the server on the port is OURS', () => {
     // The #190 stray: spawned by THIS process and then lost track of. Nothing else will ever
     // clean it up, so "is its editor alive" must not be allowed to protect it — its editor is us.
     it('a stray WE spawned ⇒ reclaim, even though its editor (us) is alive', () => {
-      expect(classifyPortHolder({ state: 'modoki', identity: ours }, self, win(alive)))
+      expect(classifyPortHolder({ state: 'modoki', identity: ours }, self, deps(alive)))
         .toEqual({ action: 'reclaim', pid: 4242, projectRoot: ours.projectRoot });
     });
 
     it('a leaked server whose editor is GONE ⇒ reclaim', () => {
       const orphan = { ...ours, ppid: 99999 };
-      expect(classifyPortHolder({ state: 'modoki', identity: orphan }, self, win(dead)).action).toBe('reclaim');
+      expect(classifyPortHolder({ state: 'modoki', identity: orphan }, self, deps(dead)).action).toBe('reclaim');
     });
 
     // Same install is NOT enough. A second editor window is legitimately using its own dev
     // server, and stealing its port is the same class of harm as killing a sibling clone's.
     it('ANOTHER LIVE editor of this same install ⇒ refuse', () => {
       const otherWindow = { ...ours, ppid: 12345 };
-      const v = classifyPortHolder({ state: 'modoki', identity: otherWindow }, self, win(alive));
+      const v = classifyPortHolder({ state: 'modoki', identity: otherWindow }, self, deps(alive));
       expect(v.action).toBe('refuse');
       expect(v.action === 'refuse' && v.why).toContain('another editor of this install is running');
       expect(v.action === 'refuse' && v.why).toContain('12345');
@@ -299,7 +304,7 @@ describe('#190 — proving the server on the port is OURS', () => {
     // clone's server is still not ours.
     it('ANOTHER install/clone\'s dev server ⇒ refuse, never kill — even if its editor is dead', () => {
       const sibling = { ...ours, repoRoot: 'E:\\Projects\\modoki-ai2', pid: 999 };
-      const v = classifyPortHolder({ state: 'modoki', identity: sibling }, self, win(dead));
+      const v = classifyPortHolder({ state: 'modoki', identity: sibling }, self, deps(dead));
       expect(v.action).toBe('refuse');
       expect(v.action === 'refuse' && v.why).toContain('different install/clone');
       expect(v.action === 'refuse' && v.why).toContain('999');
@@ -314,14 +319,61 @@ describe('#190 — proving the server on the port is OURS', () => {
     });
 
     // Both sides of the comparison come from different worlds — `path` on one, JSON from
-    // another process on the other. On Windows a raw === would refuse our OWN install and
-    // turn every reclaim into a hard failure to open a project.
-    it('matches our install across separator and case differences (Windows)', () => {
-      const mixed = { ...ours, repoRoot: 'c:/program files/modoki editor/resources/app.asar.unpacked/' };
-      expect(classifyPortHolder({ state: 'modoki', identity: mixed }, self, win(alive)).action).toBe('reclaim');
-      // …and posix must stay case-SENSITIVE: there, those are genuinely different directories.
-      expect(classifyPortHolder({ state: 'modoki', identity: mixed }, self, { platform: 'linux', isAlive: alive }).action)
-        .toBe('refuse');
+    // another process on the other — so a raw === would refuse our OWN install and turn every
+    // reclaim into a hard failure to open a project.
+    //
+    // ⚠️ These two used to be ONE test that injected `platform: 'win32'` and asserted a
+    // separator/case rule from a Mac, against a path that exists on no filesystem. That could
+    // only ever test the hand-rolled string recipe #899 deleted — it could not have caught
+    // either miss below, because neither is expressible as a rule about strings. The win32
+    // spellings (drive-letter case, 8.3, subst) are the SSOT's own, covered by
+    // architecture/pathIdentity.test.ts's `it.runIf(onWin)` rows; that is a REAL loss of
+    // coverage on a Mac, and it is the right trade: those rows now run where they are true.
+    const withTmpDir = (fn: (base: string) => void) => {
+      // realpath the tmpdir itself: on macOS os.tmpdir() is /var/… , itself a symlink to
+      // /private/var/… , which would make the CONTROL side of these tests pass for the wrong
+      // reason. See pathIdentity.mjs's canonicalWithMissingTail docblock.
+      const base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'devserver-'));
+      try { fn(base); } finally { fs.rmSync(base, { recursive: true, force: true }); }
+    };
+
+    it('reclaims through a SYMLINKED spelling of our own repoRoot (#899)', () => {
+      withTmpDir((base) => {
+        const real = path.join(base, 'modoki');
+        fs.mkdirSync(real);
+        const link = path.join(base, 'link');
+        fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+        // The leaked server reports the path it was started with; we know ourselves by the link.
+        const identity = { ...ours, repoRoot: real, ppid: 99999 };
+        const v = classifyPortHolder({ state: 'modoki', identity }, { repoRoot: link, pid: OUR_EDITOR_PID }, deps(dead));
+        expect(v.action).toBe('reclaim');
+      });
+    });
+
+    it.runIf(process.platform === 'darwin' || process.platform === 'win32')(
+      'reclaims through a CASE-FLIPPED spelling on a case-insensitive platform (#899)', () => {
+        withTmpDir((base) => {
+          const real = path.join(base, 'modoki');
+          fs.mkdirSync(real);
+          const flipped = path.join(base, 'MODOKI');
+          const identity = { ...ours, repoRoot: real, ppid: 99999 };
+          const v = classifyPortHolder({ state: 'modoki', identity }, { repoRoot: flipped, pid: OUR_EDITOR_PID }, deps(dead));
+          expect(v.action).toBe('reclaim');
+        });
+      });
+
+    // The other direction, and the reason this is not just "fold everything": two genuinely
+    // different clones must still refuse, or the comparison would authorise killing a sibling.
+    it('still REFUSES a sibling clone that merely looks similar', () => {
+      withTmpDir((base) => {
+        const a = path.join(base, 'modoki');
+        const c = path.join(base, 'modoki-ai2');
+        fs.mkdirSync(a); fs.mkdirSync(c);
+        const identity = { ...ours, repoRoot: c, ppid: 99999, pid: 999 };
+        const v = classifyPortHolder({ state: 'modoki', identity }, { repoRoot: a, pid: OUR_EDITOR_PID }, deps(dead));
+        expect(v.action).toBe('refuse');
+        expect(v.action === 'refuse' && v.why).toContain('different install/clone');
+      });
     });
 
     // EPERM from `kill(pid, 0)` means the process EXISTS but is not ours to signal. Reading
@@ -333,11 +385,6 @@ describe('#190 — proving the server on the port is OURS', () => {
       expect(isProcessAlive(1.5)).toBe(false);
     });
 
-    it('samePath normalises separators and trailing slashes', () => {
-      expect(samePath('/a/b', '/a/b/', 'linux')).toBe(true);
-      expect(samePath('C:\\a\\b', 'C:/a/b', 'win32')).toBe(true);
-      expect(samePath('/a/b', '/a/bc', 'linux')).toBe(false);
-    });
   });
 
   describe('exitDisposition — a dying predecessor must not clobber its replacement', () => {

@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -195,7 +196,7 @@ export function killPackaged(appDir, name = productName()) {
 }
 
 // ── CLI (for smoke-packaged.sh) ─────────────────────────────────────────────
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isEntryPoint(import.meta.url)) {
   const [a, b] = process.argv.slice(2);
   if (a === 'kill') { killPackaged(b); process.exit(0); }
   // `binIn <appDir>` — the executable inside an app dir the caller was HANDED (release.yml points

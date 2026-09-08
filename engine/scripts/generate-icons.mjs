@@ -48,6 +48,7 @@ import { ICON_TOOL, iconColorArgs } from './iconAssets.mjs';
 import { composeSplashOverlays } from './splashCompose.mjs';
 import { writeIosIconVariants, writeAndroidIconVariants } from './iconVariants.mjs';
 import { applyAndroidSplashTheme } from './androidSplashTheme.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 /** The one directory each platform's run owns. Everything the generator writes here is its
  *  product and is kept; everything it writes elsewhere is collateral and is undone. Measured,
@@ -311,4 +312,4 @@ async function main() {
 }
 
 // Importable for tests; only the CLI entry runs main().
-if (import.meta.url === `file://${process.argv[1]}`) await main();
+if (isEntryPoint(import.meta.url)) await main();

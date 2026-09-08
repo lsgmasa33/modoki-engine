@@ -42,6 +42,7 @@ import { fileURLToPath } from 'node:url';
 import { backendUrlForClone } from './editorPorts.mjs';
 import { repoFiles } from './repoCorpus.mjs';
 import { toPosix } from './pathPosix.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' });
 const postTo = (backend) => async (path, body) => {
@@ -339,4 +340,4 @@ async function main() {
   process.exit(rejected.length ? 1 : 0);
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) await main();
+if (isEntryPoint(import.meta.url)) await main();

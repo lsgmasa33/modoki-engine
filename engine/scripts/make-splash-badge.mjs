@@ -20,6 +20,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -80,4 +81,4 @@ async function main() {
   await build(MODOKI_NAVY, path.join(REPO, 'engine', 'assets', 'splash-badge-dark.png'));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await main();
+if (isEntryPoint(import.meta.url)) await main();

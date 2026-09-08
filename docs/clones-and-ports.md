@@ -260,6 +260,23 @@ every other clone at yours.**
   shares those. `test-packaged.sh` violated this until #69, which is why it's now **enforced**
   rather than merely written down: `engine/tests/architecture/reapScoping.test.ts` fails any
   `pkill -f` pattern in `engine/scripts/**` that isn't anchored to `/` or `$`.
+  ⚠️ **An absolute path is not the same as THE path, and #908 is that gap.** A repo-scoped reap
+  compares a marker it built from its own spelling of the clone root against the command line a
+  running process was LAUNCHED with — and only one of those two sides is ours. `path.resolve` does
+  not resolve symlinks, so a clone reached through a link built a marker with the link spelling
+  while the server's command line carried the target spelling, and `dev:stop` matched nothing.
+  So: **build the marker through `engine/scripts/pathIdentity.mjs`** (`canonicalPath`), and match
+  on BOTH spellings, because canonicalising our side alone breaks the case that already worked.
+  ⚠️ **Even then it covers one direction only.** Every spelling a reap holds comes from its own
+  invocation, so stopping through the link while the server was launched by the real path is still
+  a miss — closing that means canonicalising a path extracted from a foreign `argv`, a
+  quoting-sensitive parse over a path that may contain a space. Which is why the second half of the
+  rule matters more than the first: **a reap that matched nothing must SAY so.** `dev:stop` printed
+  the same `Done.` and exit 0 for "killed it" and "found nothing", so a miss read as success and the
+  failure presented as *the app is broken* rather than *nothing was stopped* (#129's framing,
+  #908's instance). Pinned by `engine/tests/architecture/devStopPathIdentity.test.ts`, which drives
+  the real script against a FAKE repo root in a tmpdir — pointing it at a real checkout would reap
+  a developer's own dev server as a side effect of testing it.
 - **Serialize on-device builds** — only one clone at a time should install/launch on a given
   physical device (iPhone Air, Samsung); they share the hardware. **Now ENFORCED, not merely
   written down** (#149): a device is claimed machine-wide in `~/.modoki/device-claims.json`

@@ -22,6 +22,9 @@
 
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+// The ONE path-identity normalisation (#869) — see engine/scripts/pathIdentity.mjs. Until #899
+// this file hand-rolled it twice, and neither copy resolved symlinks.
+import { canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
 
 /** Product dir for the shipped editor — what `setName` was supposed to give us. */
 export const PACKAGED_DIR = 'Modoki Editor';
@@ -35,14 +38,37 @@ export const SHARED_DIR = 'Modoki';
  *  that can't collide and doesn't leak a giant path into the UI.
  *
  *  NORMALISE FIRST: this id IS the profile's identity, so any spelling drift of the same
- *  clone silently hands the user an empty profile (prefs "randomly" reset). Resolve, drop a
- *  trailing separator, and case-fold on the case-insensitive platforms — the same
- *  normalisation instanceToken.rootKey does, and for the same reason. */
+ *  clone silently hands the user an empty profile (prefs "randomly" reset).
+ *
+ *  ⚠️ **Until #899 the normalisation was hand-rolled here and resolved no SYMLINKS**, so the
+ *  drift it warns about was reachable by the most ordinary means there is: open the clone through
+ *  a symlinked path and it is a different clone, with a different profile. Driven, two ids for one
+ *  directory. It goes through the SSOT now.
+ *
+ *  ⚠️ **On POSIX the only production caller cannot actually produce a symlinked `repoRoot`, and
+ *  this docblock overstated the fix** (close-out review). `main.ts` derives dev `REPO_ROOT` from
+ *  `path.resolve(__dirname, …)`, and Node realpaths the MAIN MODULE before setting `__dirname` —
+ *  measured: a script run through a symlinked ancestor reports the resolved dir. So the reachable
+ *  half of this fix is the WINDOWS half: Node's main-module resolution uses the JS `fs.realpathSync`,
+ *  which resolves neither a `subst` mapping nor drive-letter case, and `.native` does. That half is
+ *  not driven — see docs/windows.md § Paths. `multiProfileKey` below is NOT subject to this caveat:
+ *  it takes `MODOKI_PROJECT`, a raw human-typed string that genuinely can carry a symlink.
+ *
+ *  ⚠️ **THIS ID MOVES for a symlink-reached clone, and that is deliberate — there is no migration,
+ *  and one was tried and rejected.** Measured 2026-09-08: the id is byte-identical under the old
+ *  and new recipes for every real clone path on a developer machine; the ONLY paths that move are
+ *  the ones traversing a symlink, i.e. exactly the ones that were already split across two
+ *  profiles. Such a user loses prefs ONCE and is consistent afterwards.
+ *
+ *  A fallback ("use the old dir if it still exists") was written and then deleted, because both
+ *  ways of keying it are broken and the measurement says so:
+ *    - keyed on the RAW spelling, it adopts a different old dir per spelling — so the two
+ *      profiles never converge and the fix does nothing for the only people who need it;
+ *    - keyed on the CANONICAL spelling, it is byte-identical to the new id (measured
+ *      `legacy(canonical) === next`), i.e. dead code that can never fire.
+ *  Renaming the dir instead is worse: it is a live Chromium profile holding a LevelDB lock. */
 function cloneId(repoRoot: string): string {
-  const abs = path.resolve(repoRoot);
-  const trimmed = abs.length > 1 && (abs.endsWith('/') || abs.endsWith('\\')) ? abs.slice(0, -1) : abs;
-  const norm = process.platform === 'win32' || process.platform === 'darwin' ? trimmed.toLowerCase() : trimmed;
-  return createHash('sha256').update(norm).digest('hex').slice(0, 8);
+  return createHash('sha256').update(pathCaseKey(canonicalPath(repoRoot))).digest('hex').slice(0, 8);
 }
 
 /**
@@ -61,10 +87,11 @@ function cloneId(repoRoot: string): string {
  */
 export function multiProfileKey(project: string | undefined | null): string | null {
   if (!project || !project.trim()) return null;
-  const abs = path.resolve(project.trim());
-  const norm = process.platform === 'win32' || process.platform === 'darwin' ? abs.toLowerCase() : abs;
+  // #899: canonicalPath, so a symlinked MODOKI_PROJECT is the same sub-profile — and so that the
+  // readable slug is the PROJECT's name rather than the link's. Same no-migration call as cloneId.
+  const abs = canonicalPath(project.trim());
   const slug = path.basename(abs).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
-  const hash = createHash('sha256').update(norm).digest('hex').slice(0, 8);
+  const hash = createHash('sha256').update(pathCaseKey(abs)).digest('hex').slice(0, 8);
   return `${slug}-${hash}`;
 }
 
@@ -82,6 +109,13 @@ export function multiProfileKey(project: string | undefined | null): string | nu
  * dev (the packaged app is single-instance, so it never needs sub-profiles) and only when the
  * caller passes one (MULTI + a known project), so the common single-editor case is unchanged.
  */
+/* ⚠️ #899 made this (and `multiProfileKey`) do FILESYSTEM I/O where they were pure string ops —
+ * `canonicalPath` calls `fs.realpathSync.native`. `main.ts` calls both at module load, ABOVE
+ * `initFileLog()`, because the userData decision must precede the first `app.getPath('userData')`
+ * read. So a `MODOKI_PROJECT` or repo root on a hung SMB/SSHFS mount now blocks the main process
+ * before any log file exists: no window, no log. `canonicalPath` catches throws but does not bound
+ * time. Accepted (the ordering constraint is not negotiable and a timeout here would need its own
+ * fallback identity), recorded so it is not re-diagnosed as a hang of unknown origin. */
 export function resolveUserDataDir(opts: { appData: string; isPackaged: boolean; repoRoot: string; subKey?: string | null }): string {
   if (opts.isPackaged) return path.join(opts.appData, PACKAGED_DIR);
   const base = path.join(opts.appData, DEV_DIR, cloneId(opts.repoRoot));

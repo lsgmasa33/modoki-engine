@@ -41,8 +41,10 @@ export interface BackendIdentity {
  *  compare misses a real containment — which made `identityMismatch` cry wolf on every
  *  Windows session run from a subdirectory (the MCP's own `npm --prefix` smoke was
  *  mis-logged as a benign "cwd artifact" for months). Same normalisation, and the same
- *  reason, as `normalizeWriteGuardKey` (engine/plugins/vite-asset-scanner.ts) and
- *  `instanceToken.rootKey`. No-op on POSIX paths.
+ *  reason, as `normalizeWriteGuardKey` (engine/plugins/vite-asset-scanner.ts). ⚠️ It was also
+ *  cited as the same as `instanceToken.rootKey`, and #899 made that FALSE: `rootKey` now realpaths
+ *  and folds the WHOLE path via `pathIdentity.mjs`. The next paragraph already explains why this
+ *  one must not — keeping the stale equation would have invited exactly the sweep it warns off. No-op on POSIX paths.
  *
  *  Deliberately folds ONLY the drive letter, not the whole path: full case-folding is
  *  right for an identity KEY (rootKey/cloneId, where any drift breaks it) but wrong here,

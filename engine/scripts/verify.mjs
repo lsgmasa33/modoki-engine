@@ -49,7 +49,7 @@
 // package.json for debugging an interleaving problem, in case this script's buffering ever
 // hides something real.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -168,8 +168,52 @@ process.on('SIGINT', () => {
   setTimeout(() => process.exit(1), 500).unref();
 });
 
+/** Re-copy `engine/scripts/git-hooks/*` into the hooks dir git actually reads (#909).
+ *
+ *  The hooks are a SOURCE that is COPIED; editing one changes nothing until the installer re-runs.
+ *  `prepare` covers a hook change that rides along with a dependency change, and nothing covered a
+ *  hook edited on its own — so two clones spent a day committing through a hook from before the
+ *  edit, with the suite green the whole time.
+ *
+ *  ⚠️ **A heal, not a guard, and that is the decision.** The alternative was a test comparing
+ *  installed against source, which goes red for the state of somebody's machine rather than for
+ *  anything in the diff under test, needs a skip for a clone that has no hooks, and re-opens the
+ *  argument `CLAUDE.md` already settled when it declined a blocking hook ("the discipline IS the
+ *  guard"). ⚠️ **And the two must not both exist** — healing here immediately before such a test
+ *  ran would make it a guard that cannot fail, which is the exact class (#851/#909) this is fixing.
+ *
+ *  Never fails the gate: the installer already no-ops without a git dir, and a hook that could not
+ *  be installed is not a reason to refuse to run the tests. */
+function installGitHooks() {
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'install-git-hooks.mjs')], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  // Quiet on the ONE line that would otherwise print every run — `no git hooks dir`, which a
+  // tarball extract or any non-git checkout emits — and pass everything else through.
+  //
+  // ⚠️ **Deny-list, not allow-list, and the allow-list version was a bug** (close-out review). It
+  // kept only `[hooks] installed …`, which also discarded the installer's STACK TRACE. Measured: an
+  // unwritable hooks dir makes the installer exit 1 with EACCES, and the filter reduced that to the
+  // empty string — so `verify` printed nothing, went green, and the developer kept committing
+  // through the stale hook. That is the #909 state the heal exists to prevent, with the heal's own
+  // reporting hiding it. Status is checked for the same reason: silence must mean "nothing to do",
+  // never "it failed".
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('[hooks] no git hooks dir'))
+    .join('\n');
+  if (out) console.log(out);
+  if (r.status !== 0) {
+    console.warn(`[verify] git hooks were NOT installed (exit ${r.status}) — commits from this clone `
+      + 'may be running a stale hook. This does not fail the gate; see docs/verify-and-ci.md.');
+  }
+}
+
 async function main() {
   const wallStart = Date.now();
+
+  installGitHooks();
 
   // Announce the lanes up front. Output is buffered per lane, so without this the terminal shows
   // NOTHING until the first lane finishes — on a gate people sit and watch, silence reads as a hang.

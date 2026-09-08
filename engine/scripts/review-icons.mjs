@@ -27,6 +27,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const LIGHT_GROUND = '#dcdcdc';
 const DARK_GROUND = '#1c1c1e';
@@ -251,4 +252,4 @@ async function main() {
   console.log(`[review] ${out}`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await main();
+if (isEntryPoint(import.meta.url)) await main();

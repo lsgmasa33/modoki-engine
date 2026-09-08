@@ -45,6 +45,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from './projectRoots.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -192,4 +193,4 @@ function main() {
 
 // Only run when invoked directly — the test imports SEED/needsSeed/backfillTiers and must not
 // write files.
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+if (isEntryPoint(import.meta.url)) main();

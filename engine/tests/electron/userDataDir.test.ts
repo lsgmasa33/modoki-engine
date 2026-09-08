@@ -158,6 +158,61 @@ describe('multiProfileKey (§14.4)', () => {
   );
 });
 
+/** #899 — the identity these two derive must survive a SPELLING change of the same directory.
+ *
+ *  These need a REAL filesystem (a symlink is the whole point), unlike the layout tests above
+ *  which are deliberately pure. `os.tmpdir()` is realpath'd first: on macOS it is itself a
+ *  symlink (/var -> /private/var), which would let both sides agree for the wrong reason and
+ *  make these pass against the very bug they exist to catch. */
+describe('#899 — a symlinked spelling is the SAME clone', () => {
+  let base = '';
+  let real = '';
+  let link = '';
+  beforeEach(() => {
+    base = realFs.mkdtempSync(path.join(realFs.realpathSync.native(os.tmpdir()), 'udd-899-'));
+    real = path.join(base, 'modoki-qa');
+    realFs.mkdirSync(real);
+    link = path.join(base, 'link');
+    realFs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+  });
+  afterEach(() => { realFs.rmSync(base, { recursive: true, force: true }); });
+
+  // cloneId is module-private; resolveUserDataDir is the exported wrapper that reaches it.
+  // #899 filed these two READ-ONLY because that route was not found — it is this one.
+  it('resolveUserDataDir: one profile dir, not two ("prefs randomly reset")', () => {
+    const dir = (repoRoot: string) => resolveUserDataDir({ appData: APPDATA, isPackaged: false, repoRoot });
+    expect(dir(link)).toBe(dir(real));
+  });
+
+  it('multiProfileKey: one sub-profile, and the slug names the PROJECT not the link', () => {
+    expect(multiProfileKey(link)).toBe(multiProfileKey(real));
+    expect(multiProfileKey(link)).toMatch(/^modoki-qa-[0-9a-f]{8}$/);
+  });
+
+  // The other direction. Folding two spellings together is only correct while two genuinely
+  // different clones still get different profiles — otherwise they would fight over one
+  // LevelDB lock, which is the failure this whole module exists to prevent.
+  it('still gives two DIFFERENT clones two different profiles', () => {
+    const other = path.join(base, 'modoki-ai2');
+    realFs.mkdirSync(other);
+    const dir = (repoRoot: string) => resolveUserDataDir({ appData: APPDATA, isPackaged: false, repoRoot });
+    expect(dir(other)).not.toBe(dir(real));
+    expect(multiProfileKey(other)).not.toBe(multiProfileKey(real));
+  });
+});
+
+/** ⚠️ NOT a defect, pinned so it is not "fixed" a third time. `docs/windows.md` and #899 both
+ *  stated that `multiProfileKey` had drifted from its two siblings by losing a trailing-slash
+ *  trim, and that `MODOKI_PROJECT=…/x/` and `…/x` therefore minted two profiles. `path.resolve`
+ *  strips a trailing separator itself, so the trim was dead code in the siblings and its absence
+ *  here changed nothing. A fix was scoped for this non-defect twice. */
+describe('multiProfileKey — the trailing-slash "drift" that never existed (#899)', () => {
+  it('a trailing separator was never a second profile', () => {
+    expect(multiProfileKey('/Users/me/Projects/modoki/games/court/')).toBe(
+      multiProfileKey('/Users/me/Projects/modoki/games/court'));
+  });
+});
+
 describe('resolveToolchainDir', () => {
   it('is MACHINE-level — outside userData, so a profile move costs no re-download', () => {
     const tc = resolveToolchainDir(APPDATA);

@@ -215,7 +215,12 @@ load-bearing and commented as such).
   ⚠️ **This over-claim reached its SECOND retraction before it died.** #881 retracted it inside
   `pathIdentity.mjs` and left the copy here standing, so #892 was diagnosed against a doc that said
   the hole was already closed. **A retraction has to sweep every copy of the claim** — and note the
-  fold itself is now the subject of a follow-up, #905 (it over-matches on a case-SENSITIVE volume).- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
+  fold itself over-matches on a case-SENSITIVE volume — raised as #905 and **ruled accepted by the
+  owner on 2026-09-08**, on cost/benefit rather than on the (dead) "a stat per comparison" reason.
+  The standing rationale lives in `CASE_INSENSITIVE`'s docblock in `pathIdentity.mjs`; do not
+  restate it here.
+
+- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
   `engine/scripts/pathIdentity.mjs`** — the one implementation (#869, #881), reachable from
   electron TS, `engine/plugins/**` TS and the bare-node `.mjs` CLIs alike. Before it existed the
   repo had hand-rolled this **eight** times in four mutually inconsistent recipes.
@@ -271,14 +276,53 @@ load-bearing and commented as such).
     now a guard failure, and both are strictly better on `.native`. `realDir` keeps its deliberate
     shape — it canonicalises the CONTAINING directory only, so a symlink inside the project is not
     followed out to its target.
-  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` HASH the
-    path into a PERSISTED identity** — a userData profile dir and a per-project auth token.
-    Re-normalising them relocates every existing user's profile (prefs silently reset) and 403s
-    them against their own editor. Their omission of realpath is arguably right for a stable
-    identity: a `subst` mapping can vanish and take the identity with it. ⚠️ `multiProfileKey`
-    has already drifted from the other two — it lost the trailing-slash trim, so
-    `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles. That is a real defect needing a migration
-    decision, not a sweep.
+  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` were
+    EXEMPTED here, and the exemption was wrong** (#899, fixed 2026-09-08). This entry used to say
+    they HASH the path into a persisted identity, so re-normalising them "relocates every existing
+    user's profile (prefs silently reset) and 403s them against their own editor" — and therefore
+    that their omission of realpath was "arguably right for a stable identity: a `subst` mapping
+    can vanish and take the identity with it."
+
+    ⚠️ **The relocation claim is measurably false, and it parked three live defects.** Measured
+    over the six real clone and project roots on a developer machine, the key is BYTE-IDENTICAL
+    under the old and new recipes for every one. The only paths that move are those traversing a
+    symlink — precisely the ones that already had TWO identities, which was the bug: a clone opened
+    through a symlink got a second profile ("prefs randomly reset"), and a project opened through
+    one got a second token, so `checkToken` returned `mismatch` and the user was 403'd "WRONG
+    EDITOR" against their own editor. Both driven end to end before the fix.
+
+    All three now go through the SSOT. The two halves get **opposite** migration answers, and the
+    asymmetry is deliberate:
+    - **`instanceToken` keeps a legacy-key read-through.** `readToken` consults the pre-#899 key on
+      a miss, and `ensureToken` ADOPTS that entry under the new key rather than minting a rival —
+      so Connect is a write-forward that converges the two spellings. ⚠️ **One case IS still a 403,
+      and an earlier draft of this bullet said "nobody is 403'd meanwhile"** (close-out review): a
+      user who had connected pre-#899 through BOTH spellings has two entries, and after the
+      migration `rootKey(link)` collides with `legacyRootKey(real)`, so one of the two tokens must
+      lose and an `.mcp.json` carrying the other gets `mismatch`. That is inherent to unifying two
+      identities — the cost is ONE 403, and the remedy is the one the error already prints.
+    - **`userDataDir` has NONE, and a symlink-reached clone loses its prefs once.** There is no
+      write-forward moment for a directory, and both keyings are broken: keyed on the RAW spelling
+      it adopts a different old dir per spelling, so the profiles never converge and the fix does
+      nothing for the only people who need it; keyed on the CANONICAL spelling it is byte-identical
+      to the new id — dead code that can never fire. Both measured. Renaming is worse: that dir is a
+      live Chromium profile holding a LevelDB lock.
+
+    ⚠️ **The `multiProfileKey` "already drifted" note is NARROWED, not retired.** It said the
+    missing trailing-slash trim meant `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles, and called
+    it "a real defect needing a migration decision". For ordinary paths that is false — `path.resolve`
+    strips a trailing separator, so the trim its siblings carried was dead code, and
+    `userDataDir.test.ts`'s *"a trailing slash is the SAME project (stable key)"* had been green on
+    exactly that point the whole time. ⚠️ **But an earlier draft of this bullet retracted it FLAT,
+    from a Mac, and that over-reached** (close-out review): `path.win32.resolve('C:\')` returns
+    `'C:\'` — the separator SURVIVES for a drive root — so on Windows the trim did fire and the
+    drift was real, if unreachably narrow (nobody opens a drive root as a project). Retracting a
+    Windows claim from a Mac is the mistake this section keeps repeating.
+
+    ⚠️ **Windows is INFERRED for all of the above.** Every measurement here is darwin/APFS with a
+    symlink. On win32 the fold half already worked (these recipes folded on `win32||darwin`), and
+    the half that was broken — junction, `subst`, 8.3 — is not driven. Same shape as #893, and it
+    wants the `win` clone.
 - ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
   baseline quietly encodes a second claim nobody meant to assert.
 

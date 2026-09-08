@@ -22,6 +22,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import { canonicalPath } from './pathIdentity.mjs';
 
 const repoRoot = process.argv[2] ?? process.cwd();
 
@@ -57,7 +58,32 @@ function kill(pid, force) {
   } catch { /* already gone */ }
 }
 
-const rootMarker = `${norm(path.resolve(repoRoot))}/node_modules/`;
+/** The spellings of `<repoRoot>/node_modules/` a matching command line might carry.
+ *
+ *  ⚠️ **One marker was not enough, and the failure was SILENT** (#908). `path.resolve` does not
+ *  resolve symlinks, so a clone reached through a link built a marker with the LINK spelling while
+ *  the running server's command line carried the TARGET spelling — the `includes()` missed, nothing
+ *  was stopped, and the script printed the same `Done.` and exit 0 as a successful kill. Measured
+ *  on darwin with a control: the same command through the link left the dummy alive and reported
+ *  success; through the real path it killed it.
+ *
+ *  ⚠️ **`canonicalPath` is the SPELLING canonicaliser and its own docblock says not to build a
+ *  PREDICATE on it — that is not what this is.** We are not comparing two paths; we are producing a
+ *  second literal spelling of a path that EXISTS by construction (we are running inside it), to
+ *  substring-match against a foreign process's `argv`. #892's `resolve` fallback is unreachable
+ *  here, and `samePath` is the wrong tool because there is no second path to hand it.
+ *
+ *  ⚠️ **This covers ONE of the two directions, deliberately.** Both spellings come from OUR
+ *  invocation, so stopping through the link while the server was launched by the real path is
+ *  covered, and the reverse is not — we never hold a spelling nobody handed us. Closing that would
+ *  mean extracting the vite path out of a foreign command line and canonicalising THAT, a
+ *  quoting-sensitive token parse over a path that may contain a space (`clonePortCli.test.ts`
+ *  exists because one does). The empty-match report below is what makes the residual visible
+ *  instead of silent, which is the cost that actually hurt. */
+const rootMarkers = [...new Set([
+  `${norm(path.resolve(repoRoot))}/node_modules/`,
+  `${norm(canonicalPath(repoRoot))}/node_modules/`,
+])];
 const isViteCli = (c) => c.includes('/.bin/vite') || c.includes('/vite/bin/vite.js');
 
 /** True for the Vite the ELECTRON EDITOR spawned, as opposed to the one `npm run dev`
@@ -82,7 +108,7 @@ try { procs = listProcesses(); } catch (e) {
 const mine = procs.filter((p) => {
   if (!p.pid || p.pid === process.pid || p.pid === process.ppid) return false;
   const c = norm(p.cmd);
-  return c.includes(rootMarker) && isViteCli(c);
+  return rootMarkers.some((m) => c.includes(m)) && isViteCli(c);
 });
 // Compare lowercased on EVERY platform: norm() only lowercases on win32, and the flag is
 // spelled the same everywhere.
@@ -98,7 +124,19 @@ if (editorOwned.length) {
   );
 }
 
-if (targets.length === 0) { console.log('Done.'); process.exit(0); }
+// ⚠️ **`Done.` used to be printed here too, so THREE outcomes shared one line and one exit code:
+// killed something, matched nothing, and matched only the editor's own Vite** (#908). "Nothing was
+// stopped" is the interesting one — it is what a path-spelling miss looks like, and it read as
+// success. Splitting it is separable from the identity question above and carries no design risk:
+// it does not make any miss less likely, it makes every miss legible.
+if (targets.length === 0) {
+  if (mine.length === 0) {
+    console.log(`No dev server running for this repo — nothing to stop.\n  (looked for a vite CLI under ${rootMarkers.join(' or ')})`);
+  } else {
+    console.log("Nothing to stop — the only match is the editor's own dev server, left alone above.");
+  }
+  process.exit(0);
+}
 
 console.log(`Stopping this repo's dev server: ${targets.map((t) => t.pid).join(' ')}`);
 for (const t of targets) kill(t.pid, false);           // graceful first

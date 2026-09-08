@@ -12,8 +12,12 @@
  *  3. **`scripts/publish-engine-oss.sh`'s own `--release` block** — which paths it gates, the
  *     argument handling, and that it refuses BEFORE assembling. The omission that mattered: while
  *     nothing pinned it, `--push` without `--release` published and force-moved the public tag.
- *  4. `engine/scripts/git-hooks/prepare-commit-msg` — driven for real in a throwaway repo, because
- *     a text-parse of the `case` would assert the source rather than the behaviour.
+ *  4. `prepare-commit-msg` — driven for real in a throwaway repo, because a text-parse of the
+ *     `case` would assert the source rather than the behaviour. ⚠️ **Driven as the INSTALLED copy,
+ *     not the tracked source** (#909): the hook git runs is a copy `install-git-hooks.mjs` makes,
+ *     so spawning `engine/scripts/git-hooks/prepare-commit-msg` — which this block used to do —
+ *     tests a file git never executes. It stayed green through a whole day of two clones running
+ *     the pre-exemption hook. `gitHooksInstall.test.ts` owns the installer itself.
  *
  *  ⚠️ The ACCEPT side is tested as deliberately as the reject side. A wrong derivation, or an
  *  over-eager refusal, would refuse every legitimate release — a guard that only ever rejects is
@@ -36,7 +40,7 @@ import {
 
 const REPO = path.resolve(__dirname, '../../..');
 const CLI = path.join(REPO, 'engine/scripts/releaseBranch.mjs');
-const HOOK = path.join(REPO, 'engine/scripts/git-hooks/prepare-commit-msg');
+const HOOK_INSTALLER = path.join(REPO, 'engine/scripts/install-git-hooks.mjs');
 const PUBLISHER = path.join(REPO, 'scripts/publish-engine-oss.sh');
 
 describe('releaseBranchFor', () => {
@@ -330,7 +334,10 @@ describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', (
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-symlink-'));
     try {
       const link = path.join(dir, 'repo');
-      fs.symlinkSync(REPO, link, 'dir');
+      // 'junction' needs no elevation on win32; a bare 'dir' throws EPERM without
+      // SeCreateSymbolicLinkPrivilege, reddening the lane for a machine privilege (came in from
+      // main's 6d6cde177, which predates that convention being applied here).
+      fs.symlinkSync(REPO, link, process.platform === 'win32' ? 'junction' : 'dir');
       const viaLink = path.join(link, 'engine/scripts/releaseBranch.mjs');
       const r = spawnSync(process.execPath, [viaLink, '--branch-for', '0.7.0'], {
         encoding: 'utf8',
@@ -343,15 +350,21 @@ describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', (
     }
   });
 
-  it('uses the path-identity SSOT rather than a hand-rolled compare', () => {
+  it('uses the entry-point SSOT rather than a hand-rolled compare', () => {
     // A source assertion, deliberately: the win32 half cannot be driven here, and this is the
-    // property that makes it correct on every platform at once. #910 owns generalising it to the
-    // other nine sites; this pins the one that gates a release.
-    // ⚠️ Comment-STRIPPED, via the shared reader #812 mandates. The docblock above the fix quotes
+    // property that makes it correct on every platform at once.
+    // ⚠️ This asserted `samePath(fileURLToPath(import.meta.url), process.argv[1])` — a LOCAL
+    // helper, written on main while #910 was migrating the same site on work-qa. #910 landed the
+    // shared `entryPoint.mjs` and nine callers onto it, so the property this file must hold is now
+    // "it calls the SSOT", not "it inlines that particular correct recipe". Pinning the inlined
+    // recipe would make re-inlining it the cheapest way to go green, which is the class #910 exists
+    // to close. `entryPoint.test.ts` owns the helper's own behaviour.
+    // ⚠️ Comment-STRIPPED, via the shared reader #812 mandates. The comment above the fix quotes
     // the broken idiom in order to explain it, so a raw read makes this assertion fail on correct
     // source — the guard tripping over its own subject's prose.
     const { code } = readScannedSource(path.join(REPO, 'engine/scripts/releaseBranch.mjs'));
-    expect(code).toContain('samePath(fileURLToPath(import.meta.url), process.argv[1])');
+    expect(code).toContain("import { isEntryPoint } from './entryPoint.mjs'");
+    expect(code).toContain('isEntryPoint(import.meta.url)');
     expect(code).not.toContain('`file://${process.argv[1]}`');
   });
 });
@@ -509,10 +522,17 @@ describe.skipIf(process.platform === 'win32')('prepare-commit-msg exempts releas
         execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: 'pipe' });
       git('init', '-q');
       git('checkout', '-q', '-b', branch);
+      // Install into the throwaway repo and drive what LANDED. Spawning the tracked source instead
+      // is what made this block unable to fail for a stale installed hook (#909) — and the repo is
+      // already here, so driving the real artifact costs one spawn.
+      const install = spawnSync(process.execPath, [HOOK_INSTALLER], { cwd: dir, encoding: 'utf8' });
+      expect(install.status, `${install.stdout}${install.stderr}`).toBe(0);
+      const installed = path.join(dir, '.git/hooks/prepare-commit-msg');
+      expect(fs.existsSync(installed), 'the installer put no prepare-commit-msg in .git/hooks').toBe(true);
       const msgFile = path.join(dir, 'COMMIT_EDITMSG');
       fs.writeFileSync(msgFile, `${subject}\n`);
       // $2 empty = a normal commit, which is the only source the hook acts on.
-      const r = spawnSync('sh', [HOOK, msgFile], { cwd: dir, encoding: 'utf8' });
+      const r = spawnSync('sh', [installed, msgFile], { cwd: dir, encoding: 'utf8' });
       expect(r.status).toBe(0);
       return fs.readFileSync(msgFile, 'utf8').split('\n')[0];
     } finally {

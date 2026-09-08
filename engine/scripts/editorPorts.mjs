@@ -66,7 +66,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { clonePort } from './clonePort.mjs';
-import { canonicalPath, pathCaseKey, samePath } from './pathIdentity.mjs';
+import { canonicalPath, pathCaseKey } from './pathIdentity.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 /**
  * Clone directory basename → pinned editor backend port.
@@ -231,8 +232,11 @@ export function backendUrlForClone(repoRoot) {
 // the JS `fs.realpathSync` walk, which resolves symlinks but NOT `subst` or drive-letter case. The
 // `===` folded nothing either. `samePath` is both halves, and it is the same question: "do these
 // two spellings name one FILE?"
-const invokedDirectly =
-  !!process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url));
+// #910: was `samePath`, which CASE-FOLDS. The shared helper deliberately does not — both operands
+// exist by construction, so `.native` has normalised their casing already, and folding here would
+// import #905's accepted over-match into a check whose over-match means running CLI mode on a mere
+// import. This site moved OFF that hazard rather than onto it.
+const invokedDirectly = isEntryPoint(import.meta.url);
 
 if (invokedDirectly) {
   const repoRoot = process.argv[3] ?? fileURLToPath(new URL('../..', import.meta.url));

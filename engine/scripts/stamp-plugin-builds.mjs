@@ -34,6 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -71,7 +72,11 @@ export function plannedStampDirs(repoRoot, pkgJson) {
   return buildPluginsWorkspaces(pkgJson).map((rel) => ({ rel, dir: path.resolve(repoRoot, rel) }));
 }
 
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('stamp-plugin-builds.mjs')) {
+// #910: was the `file://${argv[1]}` template OR'd with an `endsWith` fallback. The template
+// misses a symlinked/spaced/Windows path, and the fallback existed to paper over that — but it
+// matched ANY path ending in this filename, including a COPY somebody else was running. The
+// shared helper answers the question properly, so both halves go.
+if (isEntryPoint(import.meta.url)) {
   const mod = await loadVendorPlugins(repoRoot);
   if (!mod) {
     console.warn('[stamp] cannot load engine/plugins/vendorPlugins.ts (missing sources, or esbuild is not installed) — skipping. Plugin dists will be rebuilt once on first use.');

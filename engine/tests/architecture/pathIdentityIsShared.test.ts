@@ -22,11 +22,29 @@
  *  `invokedDirectly` — so it is no longer "the one site". Cited by SYMBOL because the line
  *  citation that stood here rotted inside a single change. A different defect, not this guard's.)
  *
- *  **NOT banned: the case-folding hand-rolls** in `userDataDir.cloneId`, `userDataDir.multiProfileKey`
- *  and `instanceToken.rootKey`. They do not match this shape, and that is correct: those HASH the
- *  path into a PERSISTED identity (a userData profile dir, a per-project auth token), so
- *  re-normalising them relocates every existing user's profile and 403s them against their own
- *  editor. See docs/windows.md § Paths. Do not "finish the migration" by sweeping them in.
+ *  **NO LONGER an exemption: the case-folding hand-rolls** in `userDataDir.cloneId`,
+ *  `userDataDir.multiProfileKey` and `instanceToken.rootKey`. This docblock used to exempt them
+ *  ("those HASH the path into a PERSISTED identity … Do not 'finish the migration' by sweeping
+ *  them in"), and the reason it gave was that re-normalising "relocates every existing user's
+ *  profile and 403s them against their own editor".
+ *
+ *  ⚠️ **That reason was measurably false, and it is what kept three live defects parked** (#899).
+ *  Measured 2026-09-08 over the six real clone and project roots on a developer machine: the key
+ *  is BYTE-IDENTICAL under the old and new recipes for every one of them. The only paths that move
+ *  are those traversing a symlink — exactly the ones that were already split across two identities,
+ *  which was the defect. All three are migrated; `instanceToken` carries a legacy-key read-through
+ *  so a pre-#899 `.mcp.json` keeps working (with ONE
+ *  exception: a user who connected through BOTH spellings loses one of the two tokens and is 403d
+ *  once — inherent to unifying two identities, recorded on `rootKey`), and `userDataDir` deliberately carries none
+ *  (there is no write-forward moment for a directory — see the note on `cloneId`).
+ *
+ *  ⚠️ **They still do not MATCH any pattern here**, because they are `.replace()`/`.toLowerCase()`
+ *  chains that hash on a later line — so this guard did not catch them, did not fail when they were
+ *  fixed, and would not notice an eighth written tomorrow. That gap is real and is the floor this
+ *  file already admits to. An import-level rule ("a file in these roots deriving path identity
+ *  imports pathIdentity.mjs") is the candidate fix and is deliberately NOT bundled with #899: it is
+ *  a new corpus rule with its own false-positive surface, and landing it alongside the migration
+ *  would hide whether the migration itself was sound.
  *
  *  ## Why this guard scans stripped source
  *
@@ -178,6 +196,16 @@ const BANNED_REALPATH = /\brealpathSync\s*\(/;
  *  hazard the paragraph above claims to avoid, committed in the guard that claims it. So the
  *  wrapper whitelist is exactly `pathCaseKey`, the one wrapper that preserves the question.
  *
+ *  ⚠️ **The entry-point idiom is EXEMPT here too, as it already was for `BANNED`** (#910). The
+ *  shared `entryPoint.mjs` compares `canonicalPath(fileURLToPath(moduleUrl))` against
+ *  `canonicalPath(process.argv[1])`, which is this exact banned shape — and is CORRECT, because
+ *  the ban's rationale is that `canonicalPath` falls back to `path.resolve` for a path that does
+ *  not exist. Both operands of an entry-point check exist BY CONSTRUCTION (the module is running;
+ *  `argv[1]` is what started it), so the fallback is unreachable and no missing-path comparison
+ *  can occur. Exempting by SHAPE rather than by filename keeps that judgement re-checkable, and
+ *  matches how the same idiom is already handled for `resolve(x) === y` above. The rows below pin
+ *  both directions of the exemption, because an exemption nobody tests is just a hole.
+ *
  *  ⚠️ **`canonicalClonePath` is in the pattern too** — `deviceClaimsStore` exports it as a thin
  *  alias for `canonicalPath`, so `canonicalClonePath(a) === canonicalClonePath(b)` is the same
  *  defect under a second name.
@@ -194,6 +222,31 @@ const CANONICALISER = String.raw`(?:canonicalPath|canonicalClonePath)`;
 /** An argument list with ONE level of nesting — `process.cwd()`, `path.dirname(p)`,
  *  `opts.clone ?? process.cwd()`. Deeper nesting is an accepted gap; a flat class is not. */
 const ARG = String.raw`(?:[^;()]|\([^;()]*\))*`;
+/** The entry-point exemption for the CANONICALISER shape — deliberately TIGHTER than
+ *  `ENTRYPOINT_IDIOM` above, which `BANNED` uses (#910 close-out review).
+ *
+ *  ⚠️ **`ENTRYPOINT_IDIOM` matches `import.meta.url` ALONE, and that is too loose here.**
+ *  `path.dirname(fileURLToPath(import.meta.url))` is this repo's dominant idiom for deriving a
+ *  repo root, so exempting on that token would have exempted
+ *
+ *      if (canonicalPath(projectRoot) === canonicalPath(path.dirname(fileURLToPath(import.meta.url))))
+ *
+ *  — a textbook #892 defect (one operand can be missing, so the `resolve` fallback resolves no
+ *  symlinks), which the guard caught before this exemption existed. Measured on a probe file: the
+ *  loose form let it through.
+ *
+ *  So the discriminator is `process.argv[1]`, not `import.meta.url`: an entry-point check
+ *  necessarily compares against the path Node was INVOKED with, and a comparison of two directory
+ *  roots does not mention it. (`entryPoint.mjs` names its other operand `moduleUrl` — a
+ *  parameter — so requiring `import.meta.url` on the line would have excluded the one line this
+ *  exemption exists for. That was the first attempt, and the rows below caught it.)
+ *
+ *  ⚠️ **Accepted looseness, stated:** `canonicalPath(process.argv[1]) === canonicalPath(stored)`
+ *  is exempt too. That is still the entry-point family — `argv[1]` exists by construction — and
+ *  narrowing further would need the shape of the OTHER operand, which is where a regex stops being
+ *  honest. Today `entryPoint.mjs` is the only exempt line in the three scanned roots. */
+const ENTRYPOINT_ARGV = /process\.argv\[1\]/;
+
 const BANNED_CANONICAL_COMPARE = new RegExp(
   // the canonicalisation IS the left operand, bare or folded by `pathCaseKey`
   `${CANONICALISER}\\s*\\(${ARG}\\)\\s*[!=]==`
@@ -333,12 +386,30 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     expect(BANNED_CANONICAL_COMPARE.test(line)).toBe(shouldMatch);
   });
 
+  /** The EXEMPTION's own falsifiability (#910). The negative row is the load-bearing one: if this
+   *  matched an ordinary comparison, the guard would silently stop banning the shape it exists for. */
+  /** Rows assert the SCAN's verdict — `banned && !exempt` — not the token regex in isolation.
+   *  An earlier version tested `ENTRYPOINT_IDIOM` alone, and one of its rows contained no `===`
+   *  at all, so it could not have said anything about the shape being exempted (close-out review). */
+  it.each([
+    ['the real entry-point line is exempt',
+      'return canonicalPath(fileURLToPath(moduleUrl)) === canonicalPath(process.argv[1]);', false],
+    ['⚠️ a repo root derived from import.meta.url is NOT exempt — the #892 defect the loose form let through',
+      'if (canonicalPath(projectRoot) === canonicalPath(path.dirname(fileURLToPath(import.meta.url)))) return;', true],
+    ['an ordinary directory comparison is caught',
+      'if (canonicalPath(projectRoot) === canonicalPath(repoRoot)) return;', true],
+    ['the accepted looseness: an argv[1] comparison is exempt, and that is stated not hidden',
+      'if (canonicalPath(process.argv[1]) === canonicalPath(stored)) return;', false],
+  ])('canonicalPath scan: %s', (_label, line, shouldFlag) => {
+    expect(BANNED_CANONICAL_COMPARE.test(line) && !ENTRYPOINT_ARGV.test(line)).toBe(shouldFlag);
+  });
+
   it('no file compares two canonicalPath() results (#892)', () => {
     const offenders: string[] = [];
     for (const rel of files) {
       const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
       src.split('\n').forEach((line, i) => {
-        if (BANNED_CANONICAL_COMPARE.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
+        if (BANNED_CANONICAL_COMPARE.test(line) && !ENTRYPOINT_ARGV.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
       });
     }
     expect(
