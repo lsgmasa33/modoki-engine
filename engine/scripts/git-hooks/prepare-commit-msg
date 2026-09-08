@@ -14,7 +14,12 @@ fi
 
 BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
 [ -z "$BRANCH" ] && exit 0
-[ "$BRANCH" = "main" ] && exit 0   # hub branch — not worth tagging every commit
+# Hub branches — not worth tagging every commit. `release_*` is a hub branch too (#904): a release
+# is cut in THIS clone on release_X_Y_Z, so prefixing every release commit `[release_0_7_0]` adds
+# the branch name to messages that already carry the version, and it is not a worker handoff.
+case "$BRANCH" in
+  main|release_*) exit 0 ;;
+esac
 
 FIRST_LINE=$(head -n1 "$COMMIT_MSG_FILE")
 case "$FIRST_LINE" in
