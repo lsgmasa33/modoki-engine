@@ -15,7 +15,7 @@ import { ParamField } from './MaterialAssetView';
 import { mergeRecords } from '../assetMerge';
 import { parseAssetJson } from '../../../runtime/loaders/assetFetch';
 import { loadMaterialBatch, planBatchWrite, type MatMap, type UnreadableMaterial } from './materialBatchLoad';
-import { AssetLoadRefusedBanner } from '../AssetLoadRefusedBanner';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from '../AssetLoadRefusedBanner';
 
 /** Built-in (standard/unlit) fields exposed for batch tuning — the high-value
  *  scalar/color subset. Custom-shader materials use the merged param schema instead. */
@@ -26,6 +26,9 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
   /** Members of the selection whose document could not be read — EXCLUDED from `mats` rather than
    *  represented by a placeholder, so no edit can park a document this panel never read (#886). */
   const [unreadable, setUnreadable] = useState<UnreadableMaterial[]>([]);
+  /** Members this load opened ON A PARKED EDIT rather than on the file (#902) — reported by the
+   *  loader, because the diversion is otherwise invisible and a Retry after a repair lands here. */
+  const [adopted, setAdopted] = useState<string[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [schema, setSchema] = useState<ShaderParamSchema | null>(null);
 
@@ -41,7 +44,7 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     setLoaded(false);
     // Decision extracted to `materialBatchLoad.ts` so it is testable without mounting this
     // component; this effect only supplies the I/O and applies the result.
-    const { mats: next, unreadable: bad } = await loadMaterialBatch(paths, {
+    const { mats: next, unreadable: bad, adopted: fromPark } = await loadMaterialBatch(paths, {
       // ⚠️ Per path, not per panel (#831): a batch selection can mix parked and clean materials,
       // and a parked edit is NOT on disk. Fetching one of those back would show — and re-seed the
       // cache with — the PRE-edit document while Cmd+S still writes the newer parked one. Same
@@ -57,6 +60,7 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     if (epoch !== loadEpoch.current) return; // a newer load won while this one was in flight
     setMats(next);
     setUnreadable(bad);
+    setAdopted(fromPark);
     for (const { path, message } of bad) {
       console.error(`[MaterialBatchView] excluding ${path} from this batch — could not read it: ${message}. A batch edit will not write to it.`);
     }
@@ -74,6 +78,15 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     // this path, which IS a readable document — so the member becomes writable by `planBatchWrite`
     // again, and leaving it in the banner would claim an exclusion that has stopped being true.
     setUnreadable((u) => (u.some((x) => x.path === p) ? u.filter((x) => x.path !== p) : u));
+    // ⚠️ **`adopted` is deliberately NOT touched here, and a previous version of this line was a
+    // real defect.** "A refresher fires because ANOTHER surface parked this path" is false:
+    // `persistAssetEdit` ends with `_assetViewSetters.get(path)?.(updated)` — the setter registered
+    // for that path, which is THIS panel's own — and `writeAll` calls it for every member. So one
+    // drag of the Roughness slider fired three refreshers and raised three banners saying the panel
+    // had opened on an unsaved edit it had in fact just made, each offering a Discard button that
+    // would have thrown the human's own work away. The notice's question is "did this LOAD adopt a
+    // park", and only the loader can answer it — which is exactly what `ParkAdoptedBanner`'s
+    // docblock says, reached here through a registry-derived signal that cannot tell the two apart.
   });
 
   const datas = paths.map((p) => mats[p]).filter((d): d is Record<string, unknown> => !!d);
@@ -134,14 +147,33 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     />
   ) : null;
 
+  // #902: which of these did the panel open on an UNSAVED edit rather than on the file? One notice
+  // for the batch, naming them — `path` is the discard target, so a multi-member adoption discards
+  // per member rather than wholesale.
+  const parkBanner = adopted.length > 0 ? (
+    <>
+      {adopted.map((p) => (
+        <ParkAdoptedBanner
+          key={p}
+          path={p}
+          fileName={p.split('/').pop() || p}
+          uiId={`assetView.materialBatch.parkAdopted.${p.split('/').pop() || p}`}
+          onReload={loadAll}
+          onKeep={() => setAdopted((a) => a.filter((x) => x !== p))}
+          style={{ margin: '0 0 6px' }}
+        />
+      ))}
+    </>
+  ) : null;
+
   if (!loaded) return <div style={{ color: '#666', fontSize: 11 }}>Loading {paths.length} materials…</div>;
   // Every member was excluded — say THAT, rather than falling through to the shader message below,
   // which would blame a mismatch that was never measured (`sameShader` is false on an empty set).
   if (datas.length === 0) {
-    return banner ?? <div style={{ color: '#666', fontSize: 11 }}>Nothing to edit.</div>;
+    return <>{parkBanner}{banner ?? <div style={{ color: '#666', fontSize: 11 }}>Nothing to edit.</div>}</>;
   }
   if (!sameShader) {
-    return <>{banner}<div style={{ color: '#c0392b', fontSize: 11 }}>Materials use different shaders — select same-shader materials to batch-edit.</div></>;
+    return <>{parkBanner}{banner}<div style={{ color: '#c0392b', fontSize: 11 }}>Materials use different shaders — select same-shader materials to batch-edit.</div></>;
   }
 
   const isUnlit = shaderValue === 'unlit';
@@ -150,10 +182,11 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     const params = datas.map((d) => (d.params as Record<string, unknown>) ?? {});
     const keys = schema ? Object.keys(schema) : [];
     const { merged, mixed } = mergeRecords(params, keys);
-    if (!schema) return <>{banner}<div style={{ color: '#666', fontSize: 11 }}>Loading shader parameters…</div></>;
-    if (keys.length === 0) return <>{banner}<div style={{ color: '#666', fontSize: 11 }}>This shader exposes no parameters.</div></>;
+    if (!schema) return <>{parkBanner}{banner}<div style={{ color: '#666', fontSize: 11 }}>Loading shader parameters…</div></>;
+    if (keys.length === 0) return <>{parkBanner}{banner}<div style={{ color: '#666', fontSize: 11 }}>This shader exposes no parameters.</div></>;
     return (
       <>
+        {parkBanner}
         {banner}
         {keys.map((key) => (
           <ParamField key={key} name={key} param={schema[key]} value={merged[key]} mixed={mixed.has(key)} onChange={(v) => writeParamAll(key, v)}
@@ -168,6 +201,7 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
   const isMixed = (k: string) => mixed.has(k);
   return (
     <>
+      {parkBanner}
       {banner}
       <ColorField label="Color" value={(merged.color as number) ?? DEFAULT_COLOR} mixed={isMixed('color')} onChange={(v) => writeFieldAll('color', v)} />
       {!isUnlit && <NumberField label="Roughness" value={(merged.roughness as number) ?? 1} step={0.01} wide mixed={isMixed('roughness')} onChange={(v) => writeFieldAll('roughness', v)} dataUiId="assetView.materialBatch.roughness" />}

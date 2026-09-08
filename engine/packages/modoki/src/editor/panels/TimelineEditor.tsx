@@ -20,7 +20,7 @@ import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyAssetDocFetchFailure } from './assetDocLoad';
-import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
@@ -84,6 +84,10 @@ export default function TimelineEditor() {
    *  registry — editing is disabled by construction. A genuinely MISSING file is NOT this (#896,
    *  and see `assetDocLoad.ts`). */
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
   /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
    *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
    *  opposite directions:
@@ -232,6 +236,7 @@ export default function TimelineEditor() {
     setSelectedItem(null);
     setViewport(DEFAULT_VIEWPORT);
     setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingTimelineDoc;
@@ -242,7 +247,19 @@ export default function TimelineEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'timeline')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'timeline');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadTimelineDoc } = useEditorStore.getState();
@@ -260,6 +277,9 @@ export default function TimelineEditor() {
       registerAsset(doc.id, asset.path, 'timeline');
       adoptParkedDoc(asset.path, 'timeline', doc);
       loadTimelineDoc(doc);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
@@ -724,6 +744,18 @@ export default function TimelineEditor() {
   return (
     <div ref={rootRef}
       style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#1b1b1f', color: '#cfcfd6', fontSize: 12 }}>
+      {/* #902: this load opened on an unsaved edit, not on the file. ⚠️ HERE, not in the refused
+          early return above — an adoption is not a refusal, the panel opens normally, and that is
+          precisely what makes it invisible. */}
+      {parkAdopted && (
+        <ParkAdoptedBanner
+          path={asset.path}
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="timeline.parkAdopted"
+          onReload={retryLoad}
+          onKeep={() => setParkAdopted(false)}
+        />
+      )}
       {/* Toolbar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderBottom: '1px solid #2f2f37', flexWrap: 'wrap' }}>
         <button data-ui-id="timeline.transport.play" style={btn} onClick={() => {

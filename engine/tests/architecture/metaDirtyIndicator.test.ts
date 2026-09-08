@@ -68,7 +68,12 @@ const EXEMPT: Record<string, string> = {
  *  written without one and silently matched the file's own `import` statement, going vacuously
  *  green for the single regression it existed to catch. An import names the symbol bare; a call
  *  follows it with a paren. */
-const parks = (code: string) => /\bparkMetaEdit\s*\(/.test(code);
+/** ⚠️ Two routes, one property (#903). The batch views no longer call `parkMetaEdit` themselves —
+ *  they hand a PLAN to `parkPlannedMetaEdits`, which parks each member. They park just as much as
+ *  they ever did, so a detector that names only the old route drops them OUT of the corpus below
+ *  and this guard goes silently blind to two panels. Widened rather than letting the count fall,
+ *  which is what the vacuity check caught. */
+const parks = (code: string) => /\b(parkMetaEdit|parkPlannedMetaEdits)\s*\(/.test(code);
 /** `true` if `code` RENDERS the badge. A JSX element, so `<` is the discriminator against the
  *  import and against the component's own definition. */
 const showsBadge = (code: string) => /<UnsavedMetaBadge\b/.test(code);
@@ -133,6 +138,10 @@ describe('a parked .meta.json edit is visible in the panel that made it (#870)',
   it('the detectors match a USE and not a mention', () => {
     expect(parks('parkMetaEdit(path, updated);')).toBe(true);
     expect(parks("import { parkMetaEdit } from '../scene/pendingMeta';")).toBe(false);
+    // …and the batch route, pinned the same way, so widening the detector did not widen it into
+    // matching the import too.
+    expect(parks("parkPlannedMetaEdits(next, 'TextureBatchView');")).toBe(true);
+    expect(parks("import { parkPlannedMetaEdits } from './metaBatchLoad';")).toBe(false);
     expect(showsBadge('<UnsavedMetaBadge dirty={d} dataUiId="x" />')).toBe(true);
     expect(showsBadge("import { UnsavedMetaBadge } from './UnsavedMetaBadge';")).toBe(false);
     expect(subscribes('const metaDirty = useMetaDirty(path);')).toBe(true);

@@ -110,7 +110,9 @@ function codeLines(src: string): string[] {
  *  every file in WRITERS genuinely posts to the endpoint this guard cares about — not to find
  *  and evaluate the payload. */
 function hasMetaWriteCall(src: string): boolean {
-  return codeLines(src).some((line) => /writeMetaOrWarn\(|writeMetaWholesale\(|\/api\/write-meta|parkMetaEdit\(/.test(line));
+  // ⚠️ `planMetaBatchWrite(` counts as a write call (#903): the batch views reach the sidecar
+  // through it now, and an anchor that stops matching is SILENT — this file's own #784 lesson.
+  return codeLines(src).some((line) => /writeMetaOrWarn\(|writeMetaWholesale\(|\/api\/write-meta|parkMetaEdit\(|planMetaBatchWrite\(/.test(line));
 }
 
 // ── Payload-literal extraction ──────────────────────────────────────────────────────────────
@@ -241,6 +243,37 @@ function metaPayloadLiterals(src: string): string[] {
       if (!identMatch) throw new Error(`metaPayloadLiterals: unrecognized meta write/park payload '${payload.text}'`);
       pushResolved(resolveIdentifierLiteral(codeSrc, m.index, identMatch[0]));
     }
+  }
+
+  // Shape 3: `planMetaBatchWrite(<paths>, <metas>, (m) => <payload>)` — #903 moved the two batch
+  // views' payload construction OFF their `parkMetaEdit(` call and INTO a mutate callback handed to
+  // the shared planner, which `parkPlannedMetaEdits` then parks verbatim. The clobber risk is
+  // unchanged: a mutate that returns a bare `{postprocessor}` destroys the sidecar exactly as the
+  // old bare `parkMetaEdit(p, {version, postprocessor})` did, and on EVERY selected model per click.
+  //
+  // ⚠️ Extending the detector rather than dropping the two views from WRITERS, deliberately. The
+  // views still build the payload; only the call they hand it to changed. Removing them would have
+  // turned a red gate green by making this guard BLIND to the exact destruction it exists for — the
+  // "a fix scoped to the instances someone listed reads afterwards as a fix to the class" trap this
+  // file's own header is about.
+  const planRe = /planMetaBatchWrite\(/g;
+  while ((m = planRe.exec(codeSrc))) {
+    const parenOpen = m.index + m[0].length - 1;
+    const parens = extractBalanced(codeSrc, parenOpen, '(', ')');
+    const args = splitTopLevelWithOffsets(parens.slice(1, -1), parenOpen + 1);
+    if (args.length < 3) {
+      throw new Error(`metaPayloadLiterals: planMetaBatchWrite with <3 args near index ${m.index}`);
+    }
+    const mutate = args[2];
+    // Both arrow forms are in use and both must be found: a concise body `(m) => ({ … })` and a
+    // block body `(m) => { …; return { … }; }`. Matching only one would let the other's payload
+    // ship unexamined, which is this file's #784 lesson (an anchor that stops matching is silent).
+    const body = mutate.text.match(/=>\s*\(\s*\{/) ?? mutate.text.match(/\breturn\s*\{/);
+    if (!body || body.index === undefined) {
+      throw new Error(`metaPayloadLiterals: planMetaBatchWrite mutate returns no object literal — '${mutate.text.slice(0, 80)}'`);
+    }
+    const braceRel = mutate.text.indexOf('{', body.index + body[0].length - 1);
+    literals.push(extractBalanced(codeSrc, mutate.start + braceRel, '{', '}'));
   }
 
   // Shape 2: a raw `backendFetch('/api/write-meta', { ..., body: JSON.stringify({ path, meta: <X> }) })`
@@ -384,7 +417,11 @@ describe('meta sidecar writers merge instead of replacing', () => {
     // the registry (`peekPendingMeta` → `parkMetaEdit`), so like the other two it forwards a
     // payload rather than composing one. There is no literal here to check, and the literal
     // that matters was already checked wherever the edit was originally parked.
-    const EXCLUDED = ['panels/assetViews/widgets.tsx', 'scene/pendingMeta.ts', 'panels/assetEditorBindings.ts'];
+    // ⚠️ `panels/assetViews/metaBatchLoad.ts` joins the forwarders (#903): `parkPlannedMetaEdits`
+    // parks whatever the PLANNER produced and constructs no payload of its own, exactly as
+    // `pendingMeta.ts` forwards what was parked. The literal it eventually parks is still checked —
+    // at the `planMetaBatchWrite` call site in each view (Shape 3 above), which is where it is built.
+    const EXCLUDED = ['panels/assetViews/widgets.tsx', 'scene/pendingMeta.ts', 'panels/assetEditorBindings.ts', 'panels/assetViews/metaBatchLoad.ts'];
 
     const discovered = editorSourceFiles()
       .map(({ rel }) => rel)

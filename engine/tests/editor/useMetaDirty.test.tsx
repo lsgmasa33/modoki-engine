@@ -33,8 +33,10 @@ import {
  *  production can actually produce. A test that parks an impossible input proves nothing about
  *  the code path it claims to cover.
  *
- *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do. */
-const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string): void =>
+ *  ⚠️ Tests that mean to exercise the REFUSAL call `parkMetaEdit` directly, and several below do.
+ *  The `MetaParkVerdict` is passed through rather than swallowed (#903) — an accept-side assertion
+ *  wants it, and a helper that discarded it would make the accept case unassertable here. */
+const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string) =>
   parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
 
 

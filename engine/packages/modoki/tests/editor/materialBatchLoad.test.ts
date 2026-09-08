@@ -132,3 +132,49 @@ describe('planBatchWrite', () => {
     expect(Object.keys(planBatchWrite([C, B, A], { [B]: docB }, paint).next)).toEqual([B]);
   });
 });
+
+describe('loadMaterialBatch reports which members came from the PARK (#902)', () => {
+  it('names a park-sourced member, and does not name a file-sourced one', () => {
+    // The disclosure the batch view renders. Without it the diversion is invisible: the human is
+    // told to repair the file and press Retry, the Retry adopts an agent's park, the banner clears,
+    // and Cmd+S replaces the repair.
+    const parkedA = { id: 'guid-a', shader: 'pbr', color: 99 };
+    return loadMaterialBatch([A, B], {
+      parked: (p) => (p === A ? parkedA : null),
+      fetchDoc: () => Promise.resolve(docB),
+    }).then(({ mats, adopted, unreadable }) => {
+      expect(adopted).toEqual([A]);
+      expect(mats[A]).toBe(parkedA);   // the PARK, not the file — the ordering is unchanged
+      expect(mats[B]).toEqual(docB);
+      expect(unreadable).toEqual([]);
+    });
+  });
+
+  it('reports NOTHING when every member came from the file — the accept side', async () => {
+    // A reporter that named every member would satisfy the assertion above just as happily, and
+    // would put a permanent "you are editing unsaved work" banner on every clean batch.
+    const { adopted } = await loadMaterialBatch([A, B], { parked: noPark, fetchDoc: () => Promise.resolve(docA) });
+    expect(adopted).toEqual([]);
+  });
+
+  it('reports in SELECTION order, not in whichever order the reads settled', async () => {
+    // `Promise.all` resolves concurrently, so an unsorted list reshuffles between loads and the
+    // banner's rows jump around for no reason the human can see.
+    const { adopted } = await loadMaterialBatch([A, B, C], {
+      parked: (p) => (p === A || p === C ? { id: `guid${p}`, shader: 'pbr' } : null),
+      fetchDoc: () => Promise.resolve(docB),
+    });
+    expect(adopted).toEqual([A, C]);
+  });
+
+  it('does not name a member whose park was a NON-OBJECT — it took the file path', async () => {
+    // The `typeof parked === 'object'` guard: a truthy non-object park falls through to the fetch,
+    // so claiming it was adopted would be a false statement about which document is open.
+    const { adopted, mats } = await loadMaterialBatch([A], {
+      parked: () => 3 as unknown as Record<string, unknown>,
+      fetchDoc: () => Promise.resolve(docA),
+    });
+    expect(adopted).toEqual([]);
+    expect(mats[A]).toEqual(docA);
+  });
+});

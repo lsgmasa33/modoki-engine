@@ -47,7 +47,19 @@ export type MatMap = Record<string, Record<string, unknown>>;
 /** A member of the selection that could not be read, and why — one banner line each. */
 export type UnreadableMaterial = { path: string; message: string };
 
-export type MaterialBatchLoad = { mats: MatMap; unreadable: UnreadableMaterial[] };
+export type MaterialBatchLoad = {
+  mats: MatMap;
+  unreadable: UnreadableMaterial[];
+  /** Members whose document came from the PARK rather than from the file (#902).
+   *
+   *  ⚠️ Reported rather than merely used, because the diversion is invisible otherwise and one
+   *  sequence turns that into lost work: the file is unreadable, the banner tells the human to
+   *  repair it and press Retry, an agent op parks an edit for that path meanwhile, and the Retry
+   *  then adopts the park — clearing the banner over a document that is not the repaired file.
+   *  The park still wins (discarding it is the destruction this ordering exists to prevent); what
+   *  the view owes is to SAY which document it opened, and to offer the exit. */
+  adopted: string[];
+};
 
 export type MaterialBatchLoadDeps = {
   /** The dirty-asset registry's parked document for this path, or null. Consulted FIRST: a parked
@@ -72,10 +84,12 @@ export async function loadMaterialBatch(
 ): Promise<MaterialBatchLoad> {
   const mats: MatMap = {};
   const unreadable: UnreadableMaterial[] = [];
+  const adopted: string[] = [];
   await Promise.all(paths.map(async (path) => {
     const parked = deps.parked(path);
     if (parked && typeof parked === 'object' && !Array.isArray(parked)) {
       mats[path] = parked as Record<string, unknown>;
+      adopted.push(path);   // #902 — the caller tells the human which document it opened
       return;
     }
     try {
@@ -95,7 +109,9 @@ export async function loadMaterialBatch(
       });
     }
   }));
-  return { mats, unreadable };
+  // Sorted so the banner's order is the selection's intent rather than whichever promise settled
+  // first — `Promise.all` resolves concurrently, so an unsorted list reshuffles between loads.
+  return { mats, unreadable, adopted: paths.filter((p) => adopted.includes(p)) };
 }
 
 /** Plan a batch edit: which members an edit actually reaches, and their before/after documents.

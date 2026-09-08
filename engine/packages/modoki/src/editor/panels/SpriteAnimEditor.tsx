@@ -19,7 +19,7 @@ import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyAssetDocFetchFailure } from './assetDocLoad';
-import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
@@ -52,6 +52,10 @@ export default function SpriteAnimEditor() {
    *  gated on `def` — editing is disabled by construction. A genuinely MISSING file is NOT this
    *  (#896, and see `assetDocLoad.ts`). */
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
   /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
    *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
    *  opposite directions:
@@ -84,6 +88,7 @@ export default function SpriteAnimEditor() {
     lastAction.current = null;
     lastGroup.current = undefined;
     setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSpriteAnimDef;
@@ -94,7 +99,19 @@ export default function SpriteAnimEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'spriteanim')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'spriteanim');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadSpriteAnimDef } = useEditorStore.getState();
@@ -112,6 +129,9 @@ export default function SpriteAnimEditor() {
       adoptParkedDoc(asset.path, 'spriteanim', doc);
       loadSpriteAnimDef(doc);
       setActive(Object.keys(doc.clips)[0] ?? '');
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
@@ -259,6 +279,16 @@ export default function SpriteAnimEditor() {
             fileName={asset.path.split('/').pop() || asset.name}
             uiId="spriteAnim.loadBanner"
             onRetry={retryLoad}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
+        {asset && parkAdopted && (
+          <ParkAdoptedBanner
+            path={asset.path}
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="spriteAnim.parkAdopted"
+            onReload={retryLoad}
+            onKeep={() => setParkAdopted(false)}
             style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
           />
         )}

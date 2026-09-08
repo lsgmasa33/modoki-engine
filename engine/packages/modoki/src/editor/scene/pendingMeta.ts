@@ -227,6 +227,71 @@ export function subscribePendingMeta(fn: () => void): () => void {
 /** Monotonic change counter — the `getSnapshot` for a `useSyncExternalStore` subscriber. */
 export function getPendingMetaVersion(): number { return _version; }
 
+/** Would a park of `meta` under `path` be ACCEPTED, and if not, why?
+ *
+ *  ⚠️ **This exists because two surfaces need the same answer at two different TIMES, and the
+ *  second one used to guess** (#903). `parkMetaEdit` asks it at write time; the batch views
+ *  (`metaBatchLoad`) ask it at LOAD time, to decide which members of a multi-selection an edit can
+ *  reach at all. Before this, the views did not ask — they set their local map for every selected
+ *  path and called `parkMetaEdit`, which returned `void`, so a refused member was shown as edited
+ *  and silently dropped at Cmd+S.
+ *
+ *  The fix could have been a second predicate in the views. It is one function instead, for the
+ *  reason `docs/falsifiable-tests.md` keeps finding: **two mechanisms for one property cannot be
+ *  mutation-checked apart** — break either alone and the other keeps the behaviour green, so the
+ *  day they disagree is the day it ships. The views ASK the registry rather than re-deriving what
+ *  the registry will decide.
+ *
+ *  Both refusals read the DOCUMENT, never the path, so they answer for the component that built it
+ *  and for no other — the panel next to this one, whose read succeeded, keeps editing (#880). */
+export type MetaParkVerdict =
+  /** The document is stamped for this path and was not built on a failed read — it may be parked. */
+  | { parked: true }
+  /** `FROM_FAILED_READ`: the panel is showing defaults with no GUID in hand. The write is
+   *  wholesale, so parking this costs the asset its GUID and dangles every reference to it —
+   *  refusing loses one field edit, parking loses the asset. */
+  | { parked: false; reason: 'failed-read' }
+  /** `READ_FOR_PATH` (#890/#891/#897): the document carries no stamp (nobody read it — so it has
+   *  no `id`, and the heal pass mints a new GUID) or names another path (it is asset A's document,
+   *  so two assets would claim one GUID, which is worse). Neither is visible to the failed-read
+   *  tag: the first has no response to tag, the second was read successfully — of the wrong file. */
+  | { parked: false; reason: 'foreign-read'; readFor: string | undefined };
+
+/** ⚠️ **Callers branch on `.parked`, NEVER on the return value.** A verdict object is always
+ *  truthy, so `if (!classifyMetaPark(p, m))` — and `if (!parkMetaEdit(p, m))` — is dead code that
+ *  reads exactly like a guard. That is why this is a discriminated union and not a boolean: a
+ *  boolean cannot carry the two reasons, and the two reasons are what the human is told. */
+export function classifyMetaPark(path: string, meta: unknown): MetaParkVerdict {
+  if (metaCameFromFailedRead(meta)) return { parked: false, reason: 'failed-read' };
+  const readFor = metaReadPathOf(meta);
+  if (readFor !== path) return { parked: false, reason: 'foreign-read', readFor };
+  return { parked: true };
+}
+
+/** The one wording for a refused park, so the console line and the batch views' banner cannot
+ *  drift into saying different things about the same verdict. `parkMetaEdit` prefixes it.
+ *
+ *  ⚠️ **One console string changed in the #903 merge and it was deliberate, not drift.** main's two
+ *  inline copies ended differently — the failed-read branch said "saving would replace the file with
+ *  a document missing it", the foreign-read branch "would replace the file wholesale and cost an
+ *  asset its identity". Unifying on the second is what collapsing two copies into one function
+ *  means, and both consequences are true of both branches. Nothing asserts console text, so no test
+ *  would have caught either choice; it is named here because the merge commit reconciled the TOASTS
+ *  against main byte-for-byte (they still are) and said nothing about this line. */
+export function refusalMessageFor(path: string, verdict: MetaParkVerdict): string {
+  if (verdict.parked) return `${path} can be parked`;
+  const cause = verdict.reason === 'failed-read'
+    ? "this panel's .meta.json read failed, so it is showing defaults with no GUID in hand"
+    : verdict.readFor === undefined
+      ? 'this panel has no .meta.json for that path (its read threw, or has not landed yet), so '
+        + 'it is showing defaults with no GUID in hand'
+      : `this panel is still holding the document it read for ${verdict.readFor}, so parking it `
+        + 'here would write that asset\'s GUID into this one';
+  return `refusing to park an import-settings edit for ${path} — ${cause}. Saving would replace `
+    + 'the file wholesale and cost an asset its identity. RECOVERY: reselect the asset to re-read '
+    + 'it. Other panels showing this asset are unaffected.';
+}
+
 /** Report a refused park to BOTH channels: the console, for the agent and the log, and a toast,
  *  for the human who is looking at the control right now (owner, 2026-09-08).
  *
@@ -278,15 +343,36 @@ function refuseWithToast(consoleMessage: string, toastMessage: string): void {
 }
 
 
+/** The human half of a refused park — the short sentence the toast shows, chosen by the SAME
+ *  verdict the console line is composed from.
+ *
+ *  ⚠️ **The three messages already matched the three verdicts one-for-one, by hand** — a failed
+ *  read, a document nobody read, and another asset's document. #903's `MetaParkVerdict` is that
+ *  distinction made explicit, so this reads the discriminant instead of re-deriving it from
+ *  `metaCameFromFailedRead`/`metaReadPathOf` a third time. Same reason `classifyMetaPark` exists:
+ *  one predicate, several consumers. */
+function toastMessageFor(verdict: MetaParkVerdict): string {
+  if (verdict.parked) return ''; // unreachable — callers check `.parked` first
+  if (verdict.reason === 'failed-read') {
+    return 'That edit was not saved — this asset\'s import settings could not be read. '
+      + 'Reselect the asset to re-read it, then try again.';
+  }
+  return verdict.readFor === undefined
+    ? 'That edit was not saved — this asset\'s import settings have not been read yet. '
+      + 'Reselect the asset, then try again.'
+    : 'That edit was not saved — the panel was still showing the previously selected asset. '
+      + 'Reselect this asset, then try again.';
+}
+
 /** Park a `.meta.json` edit for `path`. `meta` is the FULL sidecar object — every call site
  *  already merges onto whatever it loaded (same contract `writeMetaOrWarn` had), so this simply
  *  holds that object instead of POSTing it.
  *
  *  ⚠️ **The stored value is a SHALLOW COPY, and that copy is what makes `metaWrittenToDisk`'s
  *  reference-identity stamp correct rather than merely true today.** That stamp assumes each park
- *  produces a value distinct from the last, and the 18 call sites happen to satisfy it because
- *  every one spreads a fresh object literal. But that is an invariant held by the DISCIPLINE of
- *  eighteen unrelated call sites, enforced by nothing — and the day someone parks a
+ *  produces a value distinct from the last, and every call site happens to satisfy it because each
+ *  spreads a fresh object literal. But that is an invariant held by the DISCIPLINE of a dozen-odd
+ *  unrelated call sites, enforced by nothing — and the day someone parks a
  *  mutated-in-place object (the obvious way to write the nineteenth), `pending.get(path) ===
  *  pendingRef` starts matching a park that is genuinely NEWER than the read, so
  *  `metaWrittenToDisk` drops it and the edit is silently lost. That is the exact clobber this
@@ -294,50 +380,29 @@ function refuseWithToast(consoleMessage: string, toastMessage: string): void {
  *
  *  Copying here moves the invariant from "every caller must remember" to "the registry
  *  guarantees", for one spread. The copy is shallow on purpose: only the TOP-LEVEL identity is
- *  the stamp, so deep-cloning would cost more and buy nothing. */
-export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): void {
-  // ⚠️ REFUSE rather than park a document this editor cannot have built correctly. See
-  // `FROM_FAILED_READ`: the write is wholesale, so a park made while the panel is showing defaults
-  // from a failed read costs the asset its GUID and dangles every reference to it. Refusing loses
-  // one field edit; parking loses the asset.
-  //
-  // The refusal reads the DOCUMENT, so it answers for the component that built it and for no
-  // other. The panel next to this one, whose read succeeded, keeps editing (#880).
-  if (metaCameFromFailedRead(meta)) {
-    refuseWithToast(
-      `[pendingMeta] refusing to park an import-settings edit for ${path} — this panel's .meta.json `
-      + 'read failed, so it is showing defaults with no GUID in hand, and saving would replace the '
-      + 'file with a document missing it. RECOVERY: reselect the asset to re-read it. Other panels '
-      + 'showing this asset are unaffected.',
-      'That edit was not saved — this asset\'s import settings could not be read. '
-      + 'Reselect the asset to re-read it, then try again.',
-    );
-    return;
-  }
-  // ⚠️ REFUSE a document that was not read FOR THIS PATH — absent stamp or foreign stamp, one
-  // comparison (#890/#891/#897). See `READ_FOR_PATH` for both destructions; the short version is
-  // that an unstamped document is one nobody read (so it has no `id` and the heal pass mints a new
-  // GUID) and a foreign-stamped one is asset A's document (so two assets claim one GUID, which is
-  // worse). Neither is visible to the failed-read tag above: the first has no response to tag, the
-  // second was read successfully — of the wrong file.
-  const readFor = metaReadPathOf(meta);
-  if (readFor !== path) {
-    refuseWithToast(
-      `[pendingMeta] refusing to park an import-settings edit for ${path} — `
-      + (readFor === undefined
-        ? 'this panel has no .meta.json for that path (its read threw, or has not landed yet), so '
-        + 'it is showing defaults with no GUID in hand'
-        : `this panel is still holding the document it read for ${readFor}, so parking it here `
-        + 'would write that asset\'s GUID into this one')
-      + '. Saving would replace the file wholesale and cost an asset its identity. RECOVERY: '
-      + 'reselect the asset to re-read it. Other panels showing this asset are unaffected.',
-      readFor === undefined
-        ? 'That edit was not saved — this asset\'s import settings have not been read yet. '
-        + 'Reselect the asset, then try again.'
-        : 'That edit was not saved — the panel was still showing the previously selected asset. '
-        + 'Reselect this asset, then try again.',
-    );
-    return;
+ *  the stamp, so deep-cloning would cost more and buy nothing.
+ *
+ *  ⚠️ **There are TWO routes in now, and the second does not build its payload at the call site**
+ *  (#903). The batch views hand a PLAN to `parkPlannedMetaEdits`, which calls this per member with
+ *  `next[path]` — a fresh object built by `planMetaBatchWrite`'s mutate callback, so the freshness
+ *  invariant still holds, but it is the PLANNER that guarantees it rather than the caller. Deliberately
+ *  not stating a call-site COUNT here any more: the old "18" was already one refactor from wrong, and
+ *  a number nobody re-derives is worse than none. `grep -rn 'parkMetaEdit(' src/editor` is the answer,
+ *  and `tests/editor/metaMergeNotClobber.test.ts` is what actually holds the corpus honest. */
+export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): MetaParkVerdict {
+  // ⚠️ THE REFUSAL IS `classifyMetaPark`'s, not a second copy of it (#903). Both decisions
+  // below used to be inline here, and the batch views needed the SAME question answered at LOAD
+  // time — which is exactly the shape that drifts: two predicates for one property, and no
+  // mutation can tell them apart until they disagree in production. One implementation, two
+  // consumers; the reasons the classifier returns are what this function turns into prose.
+  const verdict = classifyMetaPark(path, meta);
+  if (!verdict.parked) {
+    // ⚠️ BOTH channels, and the split is `refuseWithToast`'s (#890/#891, owner 2026-09-08):
+    // console keeps the full diagnosis, the toast is the short human half, and the store
+    // write is deferred to a microtask because most park sites call this from inside a
+    // setState updater. Composed from the ONE verdict rather than re-deriving each side.
+    refuseWithToast(`[pendingMeta] ${refusalMessageFor(path, verdict)}`, toastMessageFor(verdict));
+    return verdict;
   }
   // ⚠️ The registry invariant every other reader leans on: EVERY document in `pending` is stamped
   // for the key it is under. It holds by construction — the check above establishes
@@ -353,8 +418,8 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
   pending.set(path, { ...(meta as Record<string, unknown>) });
   // ⚠️ `ifMatch` is for a CROSS-PATH re-park only (a rename — `applyMovesToParkedMeta`), and an
   // omitted one PRESERVES whatever this path already had rather than clearing it. That mirrors
-  // `markAssetDirty`'s rule and matters for the same reason: the 18 ordinary field-change callers
-  // pass nothing, and clearing on omission would turn the compare-and-swap off on the second
+  // `markAssetDirty`'s rule and matters for the same reason: every ordinary field-change caller
+  // passes nothing, and clearing on omission would turn the compare-and-swap off on the second
   // keystroke.
   //
   // At a NEW key the two are genuinely different questions — #854, on the sibling registry, the
@@ -363,6 +428,7 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
   // actively working on.
   if (ifMatch !== undefined) baselines.set(path, ifMatch);
   bump();
+  return verdict;
 }
 
 /** The parked `.meta.json` for `path`, or `undefined` when nothing is pending for it. A mount-time

@@ -140,6 +140,63 @@ queue rather than `persistAssetEdit` — joined them in the same issue. So the c
 a measurement rather than a flourish: **ten surfaces park, and `grep -rn "persistAssetEdit(" `
 names five of them.**
 
+### A panel that OPENS on a park must say so — and offer the way back (#902)
+
+Every parking panel asks the registry before it fetches, and that ordering is not up for debate: a
+parked write is not on disk, so re-reading the file would show — and re-seed the live cache with —
+the PRE-edit document, which is `QA-CTX-0008` / `EhE6JQkHRYttDGeGmtPK` / `1MCF9DFktot8hXsgBuWp`.
+**What the ordering owes the human is disclosure, and it did not pay it.** One sequence turns the
+silence into lost work:
+
+1. the file is corrupt or too-new, so the panel REFUSES it and tells the human to repair and Retry;
+2. an agent op parks an edit for that path — every agent op parks unconditionally under manual
+   persistence, and `pushAssetUndo`'s redo re-parks;
+3. the human repairs the file on disk and clicks **Retry**;
+4. the load takes the park branch, the banner clears, the panel opens — and Cmd+S full-replaces the
+   repaired file with the parked document.
+
+The human did exactly what the panel told them to and lost the repair.
+
+**The rule: the park still wins, and `ParkAdoptedBanner` names the state and offers both exits** —
+*Discard & reload* (`discardDirtyAssets([path])`, then the panel's own reload) and *Keep editing*.
+Discarding the park automatically is not available; it is the destruction this ordering exists to
+prevent. The principle is `AtlasAssetView`'s, already stated for a flush conflict: *both exits are
+the human's to choose — the compare-and-swap exists to stop a SILENT overwrite, not to stop a
+deliberate one, so both are offered and neither happens on the panel's own judgement.*
+
+⚠️ **The population is park-first load AND a Retry control — seven panels, not the five that park an
+asset document.** `AtlasAssetView` and `MaterialBatchView` are the two a `useParkedAssetDoc`-derived
+list misses. The Retry is what makes the panel *promise* a re-read, so a park-first panel without one
+(`MaterialAssetView`, `AnimSetAssetView`, `ShaderAssetView`) cannot reach step 1 and is out of scope —
+it still adopts silently on a remount, which is the same gap without the trap. Derived in
+`tests/architecture/parkAdoptionIsDisclosed.test.ts`.
+
+⚠️ **The "did this load adopt a park" flag is PER-COMPONENT and lives in the load effect.** The
+registry cannot answer it: a park is equally present when the panel opened on the FILE and the human
+then edited. Keying it on the PATH would be `readFailed`'s mistake a third time (see
+`metaReadFallback.ts` § `READ_FOR_PATH`) — two panels can be open on one path, and one adopting says
+nothing about the other.
+
+### A batch view must EXCLUDE the members it cannot park (#903)
+
+The `.meta.json` twin of the above, on the write side rather than the load side. `parkMetaEdit`
+refuses a document built on a failed read or stamped for another path — correctly; the write is
+wholesale and such a document costs the asset its GUID. It used to return `void`, so a batch loop
+could not tell an accepted park from a refused one, and both meta batch views set their local map for
+every selected path regardless: the control showed an edit for an unknown subset of the selection
+that Cmd+S would never write, with a `console.error` as the only trace.
+
+**The rule: a member that cannot be parked is ABSENT from the view's map**, and named in the banner.
+Absence is what makes the write path correct by construction rather than by a flag every loop must
+remember — the same repair `materialBatchLoad` made for `.mat.json` in #886.
+
+⚠️ **The exclusion predicate is ASKED, not re-derived.** `classifyMetaPark` (`scene/pendingMeta.ts`)
+is the one implementation, consulted by `parkMetaEdit` at write time and by `metaBatchLoad` at load
+time. Two predicates for one property cannot be mutation-checked apart — break either alone and the
+behaviour stays green — so they would only diverge in production. `parkMetaEdit` returns that verdict
+rather than `void`; it is a discriminated union, not a boolean, because the two refusals say
+different things to the human. ⚠️ **A verdict object is always truthy: branch on `.parked`.**
+
 ### A parked doc's staleness guarantee depends on the kind being watched
 
 A parked write is dropped as stale the moment its file changes on disk — `dropParkedWriteFor`
@@ -260,7 +317,7 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   INSPECTION, not by enforcement.** Spread and `Object.assign` copy own enumerable SYMBOL keys, so
   `{...meta, texture: next}` carries it through any number of hops with no call site aware it
   exists; `JSON.stringify` ignores symbol keys, so it cannot reach the sidecar; `Object.keys`
-  cannot see it; and it cannot collide with a schema field. Every one of the 18 park sites spreads
+  cannot see it; and it cannot collide with a schema field. Every park site spreads
   its loaded document at the TOP level today, which is what makes the tag arrive.
   ⚠️ **`metaMergeNotClobber.test.ts` narrows the space a new site can occupy but does NOT close
   it, and an earlier draft of this section claimed it did.** Its rule (`clobberingMetaPayloads`)

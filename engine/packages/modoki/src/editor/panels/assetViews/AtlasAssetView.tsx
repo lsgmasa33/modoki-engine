@@ -14,6 +14,7 @@ import {
 } from './atlasPersist';
 import { persistAssetEdit, invalidateAtlasFile, useAssetViewRefresher } from './persist';
 import { pendingAssetDoc } from '../pendingAssetDoc';
+import { ParkAdoptedBanner } from '../AssetLoadRefusedBanner';
 import {
   subscribeDirtyAssets, getDirtyAssetsVersion, getAssetFlushError, getLastFlushedAssetHash,
   peekDirtyAsset, clearAssetIfMatch, discardDirtyAssets, forgetFlushedAssetHash,
@@ -103,6 +104,10 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
    *  format version was refused, surfaced in the banner instead of the generic load-failure text. */
   const [refusalMessage, setRefusalMessage] = useState('');
   const [reloadNonce, setReloadNonce] = useState(0); // bump (Retry) to re-run the load effect
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
   const [packing, setPacking] = useState(false);
   const [blockVersion, setBlockVersion] = useState(0); // bump to re-read the manifest block
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
@@ -161,6 +166,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     setDoc(DEFAULT_DOC);
     setLoadState('loading');
     setRefusalMessage('');
+    setParkAdopted(false); // a fresh open/retry starts clean; the park branch below re-raises it
     // ⚠️ ASK THE REGISTRY BEFORE THE FILE. Since #831 an edit here is PARKED, so between the edit
     // and Cmd+S the file on disk still holds the PRE-edit document — fetching it would re-seed
     // this panel with the older doc while the newer one is still queued to be written, which is
@@ -175,6 +181,10 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
       baselineHash.current = peekDirtyAsset(path)?.ifMatch ?? null;
       setDoc(normalizeAtlasBody(parked));
       setLoadState('ok');
+      // ⚠️ SAY SO (#902). This panel already offers "Discard & reload" for a flush CONFLICT, and
+      // states the principle in that block's own comment — both exits are the human's to choose.
+      // The refused-then-parked reload is the same two-exits state and had neither.
+      setParkAdopted(true);
       return () => ac.abort();
     }
     let fetchedText: string | null = null;
@@ -319,6 +329,19 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
 
   return (
     <>
+      {/* #902: this load opened on an unsaved edit, not on the file. Distinct from the banner
+          below, which covers a failed/refused load and a failed flush — this is the state where
+          everything SUCCEEDED and the document simply is not the one on disk. */}
+      {parkAdopted && (
+        <ParkAdoptedBanner
+          path={path}
+          fileName={fileLabel}
+          uiId="assetView.atlas.parkAdopted"
+          onReload={() => setReloadNonce((n) => n + 1)}
+          onKeep={() => setParkAdopted(false)}
+          style={{ margin: '0 0 8px' }}
+        />
+      )}
       {(loadState !== 'ok' || flushError) && (
         <div data-ui-id="assetView.atlas.loadBanner" style={{ color: '#e0a06c', fontSize: '10px', lineHeight: 1.4, marginBottom: 8, padding: '3px 5px', background: '#3a2e1e', border: '1px solid #5a452a', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ flex: 1 }}>

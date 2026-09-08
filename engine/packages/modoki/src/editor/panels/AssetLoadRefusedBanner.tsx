@@ -19,6 +19,7 @@
  *  thing that must not fork is the DECISION, and that is shared regardless. */
 
 import type { CSSProperties, ReactNode } from 'react';
+import { discardDirtyAssets } from '../scene/dirtyAssets';
 
 const wrap: CSSProperties = {
   color: '#e0a06c', fontSize: 11, lineHeight: 1.4, padding: '5px 8px', margin: '6px 8px',
@@ -69,6 +70,87 @@ export function AssetLoadRefusedBanner(
         {details}
       </div>
       <button data-ui-id={`${uiId}.retry`} data-ui-kind="button" data-ui-label="Retry" onClick={onRetry} style={retryBtn}>Retry</button>
+    </div>
+  );
+}
+
+/** The banner an asset editor shows when its load OPENED ON A PARKED EDIT instead of the file
+ *  (#902) — and the two exits out of that state.
+ *
+ *  ## Why this is a defect and not merely a nicety
+ *
+ *  Every parking editor asks the registry BEFORE it fetches, and that ordering is correct: a parked
+ *  write is not on disk, so re-reading the file would show — and re-seed the live cache with — the
+ *  PRE-edit document, which is the destruction `pendingAssetDoc`'s docblock, #831/#843 and
+ *  QA-CTX-0008 all exist about. The problem is that the diversion was SILENT, and one sequence
+ *  turns that into lost work:
+ *
+ *  1. the file is corrupt or too-new, so the panel REFUSES it and tells the human to repair and Retry;
+ *  2. an agent op parks an edit for that path (every agent op parks unconditionally under manual
+ *     persistence, and `pushAssetUndo`'s redo re-parks);
+ *  3. the human repairs the file on disk and clicks **Retry**;
+ *  4. the load takes the park branch, the banner clears, the panel opens — and Cmd+S full-replaces
+ *     the repaired file with the parked document.
+ *
+ *  The human did exactly what the panel told them to and lost the repair.
+ *
+ *  ## The park still wins. What was missing is the exit.
+ *
+ *  ⚠️ **This deliberately does NOT re-open the precedence question.** Discarding a park to prefer
+ *  the file is the silent destruction the ordering exists to prevent; the answer is to SAY which
+ *  document was opened and let the human choose, which is the same answer `AtlasAssetView`'s flush
+ *  conflict already gives, in its own words:
+ *
+ *  > *"Both exits are the HUMAN's to choose — the compare-and-swap exists to stop a SILENT
+ *  > overwrite, not to stop a deliberate one — so both are offered, and neither happens on the
+ *  > panel's own judgement."*
+ *
+ *  So: **Discard & reload** is literally that panel's two calls (`discardDirtyAssets([path])`, then
+ *  the caller's reload), and **Keep editing** dismisses. Before this there was no path at all from a
+ *  refused panel back to a repaired file.
+ *
+ *  ⚠️ **Lives in this file to share the palette, not because it is a refusal.** It is not one — the
+ *  load succeeded. But `AssetLoadRefusedBanner`'s own comment warns that a hand-rolled copy of those
+ *  five colour literals is exactly what it exists to prevent, and a fifth copy is a fifth copy
+ *  whatever the semantics.
+ *
+ *  ⚠️ **The caller owns the flag, and it must be PER-COMPONENT.** Whether this load adopted a park
+ *  is knowable only inside the load effect — the registry cannot answer it, because a park is
+ *  equally there when the panel opened on the FILE and the human then edited. Keying it on the path
+ *  would be `readFailed`'s mistake a third time (`metaReadFallback`'s `READ_FOR_PATH`): two panels
+ *  can be open on one path, and one of them adopting says nothing about the other. */
+export function ParkAdoptedBanner(
+  { path, fileName, uiId, onReload, onKeep, style }: {
+    path: string;
+    fileName: string;
+    uiId: string;
+    /** Re-run this panel's load AFTER the park is discarded — the same call its Retry makes. */
+    onReload: () => void;
+    /** Dismiss the notice, keeping the unsaved edit. Keeping is already the state; this only hides. */
+    onKeep: () => void;
+    style?: CSSProperties;
+  },
+) {
+  return (
+    <div data-ui-id={uiId} style={style ? { ...wrap, ...style } : wrap}>
+      <div style={{ flex: 1 }}>
+        <span>
+          {`⚠ Opened an UNSAVED edit for ${fileName} — it is newer than the file on disk, which was `}
+          {'not re-read. Saving will replace the file with what you see here.'}
+        </span>
+      </div>
+      <button
+        data-ui-id={`${uiId}.discardAndReload`} data-ui-kind="button" data-ui-label="Discard and reload"
+        title="Throw away the unsaved edit and re-read the file as it now is on disk"
+        onClick={() => { discardDirtyAssets([path]); onReload(); }}
+        style={retryBtn}
+      >Discard &amp; reload</button>
+      <button
+        data-ui-id={`${uiId}.keep`} data-ui-kind="button" data-ui-label="Keep editing"
+        title="Keep the unsaved edit and hide this notice"
+        onClick={onKeep}
+        style={retryBtn}
+      >Keep editing</button>
     </div>
   );
 }

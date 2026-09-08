@@ -32,6 +32,7 @@ import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import CurveEditor from './particle/CurveEditor';
@@ -88,6 +89,10 @@ export default function ParticleEditor() {
   // A genuinely MISSING file (a brand-new asset) is NOT this — see `isMissingAsset` in the load
   // effect.
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
   /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
    *  `open<X>Editor(sameAsset)`.** This panel kept the local nonce when the other four moved off it
    *  (#896 review 3, finding 1), which left it the one editor still exposed to the failure the other
@@ -283,6 +288,7 @@ export default function ParticleEditor() {
     elapsedRef.current = 0; setElapsed(0);
     playingRef.current = true; setPlaying(true);
     setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on failure/refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     const existing = useEditorStore.getState().editingParticleDef;
     if (existing) {
       // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
@@ -291,7 +297,19 @@ export default function ParticleEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'particle')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'particle');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadParticleDef } = useEditorStore.getState();
@@ -310,6 +328,9 @@ export default function ParticleEditor() {
       registerAsset(doc.id, asset.path, 'particle');
       adoptParkedDoc(asset.path, 'particle', doc);
       loadParticleDef(doc);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
@@ -526,6 +547,26 @@ export default function ParticleEditor() {
             uiId="particle.loadBanner"
             onRetry={retryLoad}
             style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
+        {/* #902: this load opened on an unsaved edit, not on the file. An overlay like the banner
+            above, because this panel's viewport is `position: relative` and an in-flow block would
+            reflow the preview. */}
+        {asset && parkAdopted && (
+          <ParkAdoptedBanner
+            path={asset.path}
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="particle.parkAdopted"
+            // ⚠️ `retryLoad`, NOT a local nonce — and this is the one panel where getting it wrong
+            // is silently destructive rather than merely wrong. A bare re-run early-returns on
+            // `if (existing)`, which is truthy precisely BECAUSE the park branch just loaded the
+            // adopted doc; and with the park now discarded, that branch marks the discarded
+            // document as the saved baseline. Net: the repaired file is never read, the banner
+            // disappears, and the next edit parks a wholesale replace of the stale doc over the
+            // repair — #902's own loss, reached through the button that fixes it.
+            onReload={retryLoad}
+            onKeep={() => setParkAdopted(false)}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, alignItems: 'center', zIndex: 5 }}
           />
         )}
       </div>

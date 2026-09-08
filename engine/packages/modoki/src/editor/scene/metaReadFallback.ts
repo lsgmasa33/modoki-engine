@@ -45,7 +45,9 @@
  *
  *  ⚠️ **A SYMBOL, and every property of one is load-bearing here** (measured, not assumed):
  *   - `{...doc, field: v}` and `Object.assign` COPY own enumerable symbol keys, so the tag rides
- *     the spread all 18 park sites already do — no call site knows this exists.
+ *     the spread every park site already does — no call site knows this exists. (No count: the
+ *     old "18" went stale the first time a site was refactored, and #903 moved two of them behind
+ *     `planMetaBatchWrite`, whose mutate callback does the spread instead.)
  *     ⚠️ **That propagation is TRUE BY INSPECTION, and it is NOT fully enforced — do not read
  *     `metaMergeNotClobber.test.ts` as guaranteeing it.** That rule (`clobberingMetaPayloads`)
  *     accepts a payload containing `...` ANYWHERE — a nested `{ texture: { ...cur, ...patch } }`

@@ -519,6 +519,25 @@ question the person in front of it was actually asking.
 
 ## Panels
 
+### A panel's load/write DECISION goes in a plain `.ts` beside it, not in the `.tsx`
+
+Editor `.tsx` is not mounted in jsdom — that asserts the mock rather than the panel — so any logic
+left inside a component is testable only by a source SCAN, which sees tokens and not behaviour.
+Extract the decision and the `.tsx` keeps just the I/O and the render.
+
+The worked examples are the batch views, and they are a matched pair on purpose:
+`assetViews/materialBatchLoad.ts` (`.mat.json`, #886) and `assetViews/metaBatchLoad.ts`
+(`.meta.json`, #903). Each exports the load outcome AND the write plan from one module, because the
+two halves are a single decision: the loader's promise — *a member that could not be read is absent
+from the map* — means nothing unless the writer honours absence, and in both issues the defect was
+precisely that it did not.
+
+⚠️ **What this buys, stated as a limit rather than a benefit.** The extracted module is tested for
+behaviour; the panel is tested for DELEGATION. So a guard over the `.tsx` proves a decision is
+wired, never that it renders somewhere reachable — and that gap is real: `SkinEditor` and
+`TimelineEditor` both shipped a refusal banner *below* their own early return, where it could never
+appear, and no scan could have caught it. That half needs the live editor.
+
 ### A new dropdown in editor chrome must be DOM, not a native `<select>` (#149)
 
 A native `<select>` renders its popup in a separate OS layer that `sendInputEvent` cannot reach —
