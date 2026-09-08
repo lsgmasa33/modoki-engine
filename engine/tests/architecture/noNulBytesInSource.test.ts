@@ -24,11 +24,9 @@
  *  pattern that matches EVERY file — a false positive for the whole repo that looks like a
  *  catastrophic finding. Hold the byte in a language that can: read the buffer, use indexOf. */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-
-const repoRoot = path.resolve(__dirname, '../../..');
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Text-authored kinds only. Deliberately an allow-list rather than a deny-list of known
  *  binaries: the tracked binaries here (gradle wrapper jars, `.ogg`, `.ktx2`, a binary
@@ -40,19 +38,34 @@ const SOURCE_EXT = new Set([
   '.sh', '.yml', '.yaml', '.toml', '.swift', '.java', '.kt', '.gradle', '.podspec', '.wgsl', '.glsl',
 ]);
 
-function trackedSourceFiles(): string[] {
-  const out = execFileSync('git', ['ls-files', '-z'], { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024 })
-    .toString('utf8')
-    .split('\0')
-    .filter(Boolean);
-  return out.filter((f) => SOURCE_EXT.has(path.extname(f).toLowerCase()));
+/** Floored well under BOTH corpora this file runs against — ~6600 here, and **2610** in the public
+ *  OSS snapshot, measured by assembling a real stage.
+ *
+ *  ⚠️ The floor was 3000 for one commit, which is above the snapshot's real count and would have
+ *  gone red on the free public `ci/main` and on the hub's `verify:publish`. The mistake was the
+ *  MENTAL MODEL, not the arithmetic: `scripts/publish-engine-oss.sh` is INCLUDE-ONLY
+ *  (`git ls-files -- engine build docs` plus ~10 named root files and any `--with-demos`), so the
+ *  snapshot is not "this repo minus `games/`" — it is a much smaller, explicitly-listed subset.
+ *  Any floor added to a file under `engine/tests/**` has to clear the SNAPSHOT's count, not this
+ *  clone's, because `engine/tests/**` ships.
+ *
+ *  Deliberately NOT gated on `hasInternalGames()`: this guard is about source hygiene everywhere,
+ *  the snapshot is the only corpus the public gate has, and a gate that switches itself off there
+ *  checks nothing on the one run nobody is watching. */
+function trackedSourceFiles() {
+  return repoFiles({
+    // Includes untracked-but-not-ignored files (the `includeUntracked` default), which is wider
+    // than the name "tracked" suggests and is the behaviour we want: a NUL byte is worth catching
+    // in a file you just wrote, before it is staged, not only after.
+    match: (rel: string) => SOURCE_EXT.has(path.extname(rel).toLowerCase()),
+    floor: 1500,
+  });
 }
 
-describe('no literal NUL bytes in tracked source (#133)', () => {
+describe('no literal NUL bytes in repo source — tracked or newly written (#133)', () => {
   it('every text-authored file is text as far as git is concerned', () => {
     const offenders: string[] = [];
-    for (const rel of trackedSourceFiles()) {
-      const abs = path.join(repoRoot, rel);
+    for (const { rel, abs } of trackedSourceFiles()) {
       let buf: Buffer;
       try {
         buf = fs.readFileSync(abs);

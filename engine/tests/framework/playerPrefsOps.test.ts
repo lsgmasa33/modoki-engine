@@ -197,4 +197,484 @@ describe('a durable write the backend REJECTED is never reported as success', ()
     expect(r.code).toBe('PARTIAL');
     expect(r.pendingWrites).toEqual(['x']);
   });
+
+  it('pendingWrites comes back SORTED even when keys were dirtied out of alphabetical order', async () => {
+    // The fixture above always dirties keys already in alphabetical order, so a naive read
+    // of the test suite cannot tell the `.sort()` in the flush branch apart from `pendingKeys()`
+    // coincidentally returning insertion order. Dirty 'gems' before 'coins' — z-before-a — and
+    // the RejectingBackend's `set` keeps both pending through the flush this op performs.
+    await write({ action: 'set', key: 'gems', value: 1 });
+    await write({ action: 'set', key: 'coins', value: 2 });
+    const r = await write({ action: 'flush' });
+    expect(r.ok).toBe(false);
+    expect(r.pendingWrites).toEqual(['coins', 'gems']); // sorted, not insertion order
+  });
+});
+
+describe('player-prefs-write delete: dirty-and-absent-from-cache is not proof of a rejection', () => {
+  // The op's own reasoning was previously "absent from cache + dirty === a rejected delete,
+  // already applied". That is one true cause of the signature, but NOT the only one — an
+  // ordinary debounced delete (still inside `del()`'s 150ms window, nothing sent to the
+  // backend at all) looks identical from the op's point of view. This describe uses an
+  // ACCEPTING backend to prove the honest branch: flushing settles which one it was, and here
+  // it turns out to be "merely debounced", so the flush completes the removal.
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    await PlayerPrefs.init({ namespace: 'unit-debounced-del', backend: new InMemoryBackend() });
+  });
+
+  it('a debounced (never-attempted) delete reports ok:true, alreadyRemoved:true — not a rejection', async () => {
+    // Call PlayerPrefs directly, NOT through the op, so both writes stay debounced (no flush
+    // in between) — this is exactly what a GAME does when it calls `PlayerPrefs.delete()`
+    // itself, the scenario the brief calls out.
+    PlayerPrefs.set('k', 1);
+    PlayerPrefs.delete('k');
+    expect(PlayerPrefs.has('k')).toBe(false);       // cache already reflects the delete
+    expect(PlayerPrefs.hasPendingWrite('k')).toBe(true); // but nothing has reached the backend
+
+    const r = await write({ action: 'delete', key: 'k' });
+    expect(r.ok).toBe(true);
+    expect(r.deleted).toBe(true);
+    expect(r.saved).toBe(true);
+    expect(r.alreadyRemoved).toBe(true); // this call did the flush, not the original cache removal
+    expect(PlayerPrefs.hasPendingWrite('k')).toBe(false); // and it is now genuinely durable
+  });
+});
+
+describe('a rejected DELETE is invisible to a cache-derived pending list (#422)', () => {
+  /** `RejectingBackend` above returns `{}` from `getAll()`, so the cache hydrates empty and
+   *  a `delete` short-circuits on the op's NOT_FOUND guard before ever reaching the bug —
+   *  it never sees the key it would delete. This variant seeds ONE hydrated entry so the
+   *  delete path actually runs, and both `set`/`remove` still reject to simulate the
+   *  quota/native-I/O case. The key carries the full `mk:<namespace>:` prefix + envelope,
+   *  matching what `PlayerPrefs.init()` reads off a real backend. */
+  //  Seeds TWO keys — 'coins' and 'gems' — so the clear test (#422 finding 3) can distinguish a
+  //  key the clear itself enumerated from one that was already pending-deleted beforehand.
+  class SeededRejectingBackend implements PrefsBackend {
+    async getAll(): Promise<Record<string, string>> {
+      return {
+        'mk:unit-reject-del:coins': JSON.stringify({ v: 1, d: 10 }),
+        'mk:unit-reject-del:gems': JSON.stringify({ v: 1, d: 5 }),
+      };
+    }
+    async set(): Promise<void> { throw new Error('QuotaExceededError'); }
+    async remove(): Promise<void> { throw new Error('QuotaExceededError'); }
+  }
+
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    await PlayerPrefs.init({ namespace: 'unit-reject-del', backend: new SeededRejectingBackend() });
+  });
+
+  it('delete reports PARTIAL, not ok — the old code returned {ok:true, deleted:true, saved:true}', async () => {
+    const r = await write({ action: 'delete', key: 'coins' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    expect(r.deleted).toBe(true); // the cache removal DID happen
+    expect(r.saved).toBe(false);  // the durable remove did not
+  });
+
+  it('a follow-up flush after the rejected delete reports PARTIAL with the key pending — the headline regression', async () => {
+    await write({ action: 'delete', key: 'coins' });
+    const r = await write({ action: 'flush' });
+    // Before the fix this reported {ok: true, pendingWrites: []} — `keys().filter(hasPendingWrite)`
+    // could never see 'coins', because delete() had already dropped it from `cache`/`keys()`.
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    expect(r.pendingWrites).toContain('coins');
+  });
+
+  it('a bare read after the rejected delete surfaces the pending key even though `keys` does not have it', async () => {
+    await write({ action: 'delete', key: 'coins' });
+    const r = await read();
+    expect(r.keys).not.toContain('coins'); // gone from the cache-derived view
+    expect(r.pendingWrites).toContain('coins'); // but still pending — the authoritative view
+  });
+
+  it('clear on a rejecting backend reports PARTIAL with pendingWrites non-empty', async () => {
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    expect((r.pendingWrites as string[]).length).toBeGreaterThan(0);
+  });
+
+  it('the delete PARTIAL carries a hint — it was the only one of the three PARTIAL shapes without one (#422 finding 2)', async () => {
+    const r = await write({ action: 'delete', key: 'coins' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    expect(typeof r.hint).toBe('string');
+    expect(String(r.hint)).toMatch(/flush/);
+  });
+
+  it("read({key}) after a rejected delete reports present:false AND pendingWrite:true (#422 finding 1)", async () => {
+    await write({ action: 'delete', key: 'coins' });
+    const r = await read({ key: 'coins' });
+    // `ok:true, present:false` ALONE was #422's own failure shape on this branch — a rejected
+    // delete leaving a key still on disk reported as durably gone.
+    expect(r.ok).toBe(true);
+    expect(r.present).toBe(false);
+    expect(r.pendingWrite).toBe(true);
+  });
+
+  it('a second delete of an already-rejected-delete key reports PARTIAL, not NOT_FOUND, with a hint (#422 finding 2)', async () => {
+    await write({ action: 'delete', key: 'coins' }); // first delete: rejected, key now dirty + absent from cache
+    const r = await write({ action: 'delete', key: 'coins' }); // the retry the PARTIAL invites
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL'); // NOT NOT_FOUND — the key is neither mistyped nor gone
+    expect(r.deleted).toBe(true);
+    expect(r.saved).toBe(false);
+    expect(typeof r.hint).toBe('string');
+    expect(String(r.hint)).toMatch(/flush/);
+  });
+
+  it("clear reports a consistent count when one key was ALREADY pending-deleted before the clear ran (#422 finding 3)", async () => {
+    // 'coins' is deleted (and rejected) BEFORE the clear — it is out of the cache and dirty
+    // going in, so the clear itself never enumerates it. Only 'gems' remains in the cache for
+    // the clear to actually act on.
+    await write({ action: 'delete', key: 'coins' });
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    // The clear enumerated exactly ['gems'] — 'coins' was already gone from the cache.
+    expect(r.cleared).toBe(1);
+    expect(r.keys).toEqual(['gems']);
+    // The honest full pending set still names both keys...
+    expect(r.pendingWrites).toEqual(['coins', 'gems']);
+    // ...but the count/sentence attributed to THIS clear is 1 of 1 (gems), not "2 of 1".
+    expect(String(r.error)).toMatch(/for 1 of them: gems/);
+    expect(String(r.error)).not.toMatch(/2 of them/);
+    // 'coins' is named as pending from BEFORE this clear, not as one this clear caused.
+    expect(String(r.error)).toMatch(/coins.*already pending before this clear ran/);
+  });
+});
+
+describe('clear: the "accepted for all" message is honest when the backend actually rejects one', () => {
+  /** Rejects `remove` for exactly one key ('coins') and accepts every other write — the
+   *  mixed case the review reproduced: `failed.length === 0` must never fire beside a
+   *  non-empty `pendingWrites`, and the counts in the message must stay mutually consistent
+   *  with `cleared`/`keys`/`pendingWrites`. */
+  class SelectivelyRejectingBackend implements PrefsBackend {
+    async getAll(): Promise<Record<string, string>> {
+      return {
+        'mk:unit-mixed:coins': JSON.stringify({ v: 1, d: 10 }),
+        'mk:unit-mixed:gems': JSON.stringify({ v: 1, d: 5 }),
+      };
+    }
+    async set(): Promise<void> { /* accepted */ }
+    async remove(key: string): Promise<void> {
+      if (key.endsWith(':coins')) throw new Error('QuotaExceededError');
+    }
+  }
+
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    await PlayerPrefs.init({ namespace: 'unit-mixed', backend: new SelectivelyRejectingBackend() });
+  });
+
+  it('reports PARTIAL naming only the rejected key, never claiming a clean accept', async () => {
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PARTIAL');
+    expect(r.cleared).toBe(2); // both keys were enumerated by this clear
+    expect(r.pendingWrites).toEqual(['coins']); // only the rejected one is still dirty
+    // The message must not say "accepted for all of them" while pendingWrites is non-empty.
+    expect(String(r.error)).not.toMatch(/accepted the durable remove for all of them/);
+    expect(String(r.error)).not.toMatch(/every key this clear enumerated was durably removed/);
+    // It must name the one that failed, consistent with pendingWrites.
+    expect(String(r.error)).toMatch(/for 1 of them: coins/);
+  });
+});
+
+describe('player-prefs-write refuses mid-swap; player-prefs-read does not (#438)', () => {
+  /** A backend whose `getAll` parks on a gate the test controls, and signals — via `entered`
+   *  — the instant it is actually reached, so the test can wait until `init()` is genuinely
+   *  parked mid-`getAll` before probing the ops. Mirrors the idiom in
+   *  `playerPrefsInit.test.ts`'s `gatedBackend` (kept local here rather than shared, since
+   *  that helper isn't exported and this file reaches PlayerPrefs through a different
+   *  import path). */
+  function gatedBackend(): { backend: PrefsBackend; entered: () => Promise<void>; release: () => void } {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let enterCount = 0;
+    const enterSignals: Array<() => void> = [];
+    const backend: PrefsBackend = {
+      getAll: async () => {
+        enterCount++;
+        enterSignals.forEach((fn) => fn());
+        await gate;
+        return {};
+      },
+      set: async () => {},
+      remove: async () => {},
+    };
+    const entered = (): Promise<void> => {
+      if (enterCount > 0) return Promise.resolve();
+      return new Promise<void>((resolve) => { enterSignals.push(resolve); });
+    };
+    return { backend, entered, release };
+  }
+
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    await PlayerPrefs.init({ namespace: 'unit-swap', backend: new InMemoryBackend() });
+  });
+
+  it('a write during a parked init() is refused, and a read still succeeds', async () => {
+    const { backend: slow, entered, release } = gatedBackend();
+    const swap = PlayerPrefs.init({ namespace: 'unit-swap-2', backend: slow });
+    await entered(); // init() is now genuinely parked mid-flight inside getAll()
+
+    expect(PlayerPrefs.isSwapInFlight()).toBe(true);
+
+    const writeResult = await write({ action: 'set', key: 'coins', value: 10 });
+    expect(writeResult.ok).toBe(false);
+    expect(writeResult.code).toBe('NOT_AVAILABLE_HERE');
+    expect(String(writeResult.error)).toMatch(/swap/);
+
+    // Reads are deliberately NOT refused during the window — this pins that a later change
+    // can't over-tighten the refusal to reads too.
+    const readResult = await read();
+    expect(readResult.ok).toBe(true);
+
+    release();
+    await swap;
+  });
+
+  // DISCRIMINATOR (#438 round 5) — a round-4 fix exempted `flush` from this guard on the theory
+  // that draining the OUTGOING store mid-swap is harmless (it's what the pre-swap convergence
+  // loop in `doInit` itself does). It is not: a `flush` that is still draining when the install
+  // runs settles AFTER the swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply)
+  // answers against the already-installed INCOMING namespace — a write that never landed
+  // anywhere reports a false `{ok:true, flushed:true, pendingWrites:[]}`. ALL FOUR actions must
+  // be refused.
+  it('ALL FOUR actions — set/delete/clear/flush — are refused with NOT_AVAILABLE_HERE mid-swap', async () => {
+    PlayerPrefs.set('coins', 1); // pending
+
+    const { backend: slow, entered, release } = gatedBackend();
+    const swap = PlayerPrefs.init({ namespace: 'unit-swap-2', backend: slow });
+    await entered(); // init() is now genuinely parked mid-flight inside getAll()
+
+    expect(PlayerPrefs.isSwapInFlight()).toBe(true);
+
+    const flushResult = await write({ action: 'flush' });
+    expect(flushResult.ok).toBe(false);
+    expect(flushResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const setResult = await write({ action: 'set', key: 'k', value: 1 });
+    expect(setResult.ok).toBe(false);
+    expect(setResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const deleteResult = await write({ action: 'delete', key: 'coins' });
+    expect(deleteResult.ok).toBe(false);
+    expect(deleteResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const clearResult = await write({ action: 'clear', confirm: true });
+    expect(clearResult.ok).toBe(false);
+    expect(clearResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    release();
+    await swap;
+
+    // Once the swap has finished, flush is no longer refused.
+    const flushAfter = await write({ action: 'flush' });
+    expect(flushAfter.ok).toBe(true);
+  });
+});
+
+describe('player-prefs-write vs a protected key (#630 review findings 4 & 5)', () => {
+  /** Seeds one key under an envelope version this build has no migration for — `has()`/`keys()`
+   *  report it as absent (same as any other #630-protected key), but `isProtected()` sees it. */
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-protected:save', JSON.stringify({ v: 2, d: { fromNewerBuild: true } }));
+    await PlayerPrefs.init({ namespace: 'unit-protected', backend });
+  });
+
+  it("delete removes a protected key and reports success — set()'s own refusal message says to do exactly this", async () => {
+    // Before the fix: `has()` is false for a protected key (by design — see playerPrefs.ts), so
+    // the op's NOT_FOUND guard refused this as a missing key, and the only remaining escape
+    // hatch reachable from the agent surface was `action:'clear' confirm:true`, which wipes the
+    // whole namespace rather than the one key that needed clearing.
+    expect(PlayerPrefs.has('save')).toBe(false);
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+
+    const r = await write({ action: 'delete', key: 'save' });
+    expect(r.ok).toBe(true);
+    expect(r.deleted).toBe(true);
+    expect(r.saved).toBe(true);
+    expect(PlayerPrefs.isProtected('save')).toBe(false); // the protection is gone too
+
+    // And the escape hatch actually works end to end — a fresh set() on the same key now lands.
+    const setResult = await write({ action: 'set', key: 'save', value: { fromThisBuild: true } });
+    expect(setResult.ok).toBe(true);
+    expect((await read({ key: 'save' })).value).toEqual({ fromThisBuild: true });
+  });
+
+  it('delete of a GENUINELY absent (never-written) key still reports NOT_FOUND — the protected check must not swallow real typos', async () => {
+    const r = await write({ action: 'delete', key: 'neverWritten' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('NOT_FOUND');
+  });
+
+  it('set on a protected key reports the PROTECTED cause, not "rejected as non-JSON-serializable"', async () => {
+    // Before the fix: `has()` is false after the refused set() (same signal as the genuinely
+    // non-serializable case), and the op's own comment called that branch unreachable — so it
+    // reported a value that was perfectly valid JSON as non-serializable, a false cause stated
+    // authoritatively.
+    const r = await write({ action: 'set', key: 'save', value: { fromThisBuild: true } });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).not.toMatch(/non-JSON-serializable/);
+    expect(String(r.error)).toMatch(/newer build/);
+    expect(String(r.hint)).toMatch(/delete/);
+    // And the backend bytes are genuinely untouched — this really was refused, not merely
+    // misreported.
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+  });
+
+  it('set still reports the genuine non-serializable cause for an actual cycle (sanity: the two causes stay distinguishable)', async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const r = await write({ action: 'set', key: 'freshKey', value: cyclic });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).toMatch(/non-JSON-serializable/);
+  });
+});
+
+describe('clear: pendingWrites is sorted even when the dirty order is not alphabetical', () => {
+  class ReverseRejectingBackend implements PrefsBackend {
+    async getAll(): Promise<Record<string, string>> {
+      return {
+        'mk:unit-clear-sort:zeta': JSON.stringify({ v: 1, d: 1 }),
+        'mk:unit-clear-sort:alpha': JSON.stringify({ v: 1, d: 2 }),
+      };
+    }
+    async set(): Promise<void> { /* accepted */ }
+    async remove(): Promise<void> { throw new Error('QuotaExceededError'); } // reject everything
+  }
+
+  it('clear reports pendingWrites SORTED, not in the zeta-then-alpha dirty order', async () => {
+    resetPlayerPrefsForTest();
+    // getAll()'s own key order is zeta, then alpha — the opposite of alphabetical — so
+    // pendingKeys() drains in that same non-alphabetical order unless the op sorts it.
+    await PlayerPrefs.init({ namespace: 'unit-clear-sort', backend: new ReverseRejectingBackend() });
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.pendingWrites).toEqual(['alpha', 'zeta']); // sorted, not insertion/dirty order
+  });
+});
+
+describe('player-prefs-write: a swap landing DURING the op\'s own await is caught, not just a stale entry-time sample (#454 C)', () => {
+  // The entry-time `isSwapInFlight()` check above refuses a swap that is ALREADY in flight when
+  // the op starts. It cannot see one that starts (or starts AND finishes) while the op is
+  // parked inside one of its own `await PlayerPrefs.flush()` calls — the pending-write readback
+  // that follows would then answer against whatever namespace is installed by the time it runs,
+  // not the one this op captured at entry. `swapGeneration()` is the fix: `doInit` bumps it (and
+  // sets `isSwapInFlight()`) at its very FIRST line, before it ever touches the write this op is
+  // draining, so the op can tell a swap started even though — as here — that swap's own body is
+  // itself queued behind this op's in-flight batch and cannot complete until this op's gate is
+  // released.
+  //
+  // Constructing a swap that both OPENS and fully CLOSES strictly inside the op's await proved
+  // impossible to build against the real, serialized `init()`: any swap on an already-hydrated
+  // store must itself call `flush()` before it can install, and `flush()` shares this op's OWN
+  // `writeChain` — so a concurrent swap cannot finish before this op's gated write settles. What
+  // IS achievable, and is exactly what `swapGeneration()` is FOR, is a swap that starts (bumping
+  // the generation) while the op is parked — proving the post-await check catches it via the
+  // generation counter rather than relying on a stale isSwapInFlight() sample that could,
+  // structurally, have already flipped back to false by the time a caller resumes.
+  it('a swap starting while the flush action is parked mid-write is refused, not reported as success', async () => {
+    resetPlayerPrefsForTest();
+
+    let releaseWrite: () => void = () => {};
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    let writeStarted: () => void = () => {};
+    const writeStartedPromise = new Promise<void>((resolve) => { writeStarted = resolve; });
+    const store = new Map<string, string>();
+    const gated: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { writeStarted(); await writeGate; store.set(k, v); },
+      remove: async (k) => { store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'unit-c', backend: gated });
+    PlayerPrefs.set('coins', 5); // dirty, not yet drained
+
+    // The op's OWN internal `await PlayerPrefs.flush()` (the 'flush' action) is what parks here.
+    const opPromise = write({ action: 'flush' });
+    await writeStartedPromise; // the op's flush() is now genuinely mid-write
+
+    // A swap to another namespace, started independently of this op. `doInit` sets
+    // `swapInFlight`/bumps `swapEpoch` at its very first line — before `doInitBody` ever
+    // reaches its own `flush()` call, which is what then queues behind the op's in-flight
+    // write above. So the generation moves even though this swap cannot itself COMPLETE until
+    // the write gate below is released.
+    const swap = PlayerPrefs.init({ namespace: 'unit-c-2', backend: new InMemoryBackend() });
+    // Give `initChain`/`doInit` a couple of microtask turns to reach that first line.
+    await Promise.resolve(); await Promise.resolve();
+
+    releaseWrite(); // let the op's own write settle
+    const result = await opPromise;
+
+    // Degrades to durability-unknown, not a false success — the readback below can no longer be
+    // trusted to answer for THIS namespace once a swap has started. This test proves the check
+    // FIRES when a swap starts mid-await; whether THIS PARTICULAR swap would have corrupted the
+    // readback is NOT what this test establishes (see the block header above for why that
+    // stronger case could not be constructed against the real, serialized `init()`).
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('PARTIAL');
+    expect(result.durability).toBe('unknown');
+    expect(String(result.error)).toMatch(/swap/i);
+
+    await swap; // let the swap finish so it doesn't leak into the next test
+  });
+
+  it('a delete whose durable remove already landed is reported PARTIAL/durability-unknown, not as if nothing happened (#454 C, review finding 2)', async () => {
+    resetPlayerPrefsForTest();
+
+    let releaseRemove: () => void = () => {};
+    const removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
+    let removeStarted: () => void = () => {};
+    const removeStartedPromise = new Promise<void>((resolve) => { removeStarted = resolve; });
+    const store = new Map<string, string>();
+    const gated: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { store.set(k, v); },
+      remove: async (k) => { removeStarted(); await removeGate; store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'unit-c2', backend: gated });
+    PlayerPrefs.set('coins', 5);
+    await PlayerPrefs.flush(); // durably set, so the delete below hits a real backend.remove()
+
+    // The op's OWN internal `await PlayerPrefs.flush()` (inside the `delete` action) is what
+    // parks here, mid-`backend.remove()`.
+    const opPromise = write({ action: 'delete', key: 'coins' });
+    await removeStartedPromise; // the durable remove is now genuinely in flight
+
+    // A swap to another namespace, started independently of this op.
+    const swap = PlayerPrefs.init({ namespace: 'unit-c2-2', backend: new InMemoryBackend() });
+    await Promise.resolve(); await Promise.resolve();
+
+    releaseRemove(); // let the durable remove settle — it really lands
+    const result = await opPromise;
+    await swap; // let the swap finish so it doesn't leak into the next test
+
+    // The delete really landed — the store no longer holds the key.
+    expect(store.has('mk:unit-c2:coins')).toBe(false);
+    // And the reply never implies nothing happened: it's PARTIAL/durability-unknown, not
+    // NOT_AVAILABLE_HERE (which at entry means "nothing was done" — here it would be a lie).
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('PARTIAL');
+    expect(result.deleted).toBe(true);
+    expect(result.durability).toBe('unknown');
+  });
 });

@@ -35,7 +35,12 @@ import { loadTexture3D } from '../../packages/modoki/src/runtime/loaders/texture
 const GUID_A = '8af1c443-a4f0-4999-8f03-06c1208b4555';
 const GUID_B = '587ab689-8a8b-455a-9c97-6cf0bcfdf4b6';
 
-function makeFakeHandle(): PreviewSceneHandle {
+// `disposed` is a MUTABLE getter (not a plain `false` literal) so a test can flip it mid-test to
+// model a GPU-context-loss teardown landing on an otherwise-live handle (finding 3, third
+// adversarial review of #795) — the real `PreviewSceneHandle.disposed` is exactly this: a getter
+// over state a loss teardown can change out from under a caller already holding the handle.
+function makeFakeHandle(): PreviewSceneHandle & { setDisposedForTest: (v: boolean) => void } {
+  let isDisposed = false;
   return {
     scene: new THREE.Scene(),
     camera: new THREE.PerspectiveCamera(),
@@ -46,6 +51,8 @@ function makeFakeHandle(): PreviewSceneHandle {
     setWireframe: vi.fn(),
     clearContent: vi.fn(),
     dispose: vi.fn(),
+    get disposed() { return isDisposed; },
+    setDisposedForTest: (v: boolean) => { isDisposed = v; },
   };
 }
 
@@ -181,6 +188,49 @@ describe('Preview3DShell', () => {
   // The WebGL-unavailable path (createPreviewScene throws → graceful error message)
   // is covered in its own file — a throwing mock shared with other tests in one file
   // trips a vitest cross-test async-attribution quirk. See Preview3DShell.graceful.test.tsx.
+
+  // finding 3, third adversarial review of #795: `preview3DShellLossGuard.test.ts` only exercises
+  // `gatePopulate` as a pure function — nothing proves the PANEL actually calls it at both of its
+  // two call sites (the pre-check before `populate()` runs, and the post-check after it resolves).
+  // Mounted here (not a new file) because `Preview3DShell` is already mounted against an injected
+  // fake handle in this suite — per `CLAUDE.md` § Editor Panels this is asserting the panel's own
+  // behaviour through a seam, not asserting a mock.
+  it('stops populating a handle mid-populate once a loss disposes it (post-check gate)', async () => {
+    const handle = makeFakeHandle();
+    (createPreviewScene as Mock).mockReturnValue(handle);
+    let resolvePopulate: () => void = () => {};
+    const populate = vi.fn(() => new Promise<void>((resolve) => { resolvePopulate = resolve; }));
+    const { findByText } = render(<Preview3DShell populate={populate} resetKey="a" />);
+    await waitFor(() => expect(populate).toHaveBeenCalledTimes(1));
+    // `setWireframe` is already called once at mount (the separate [wireframe] effect applies the
+    // initial toggle) — capture the count so the assertion below is about calls the POST-check
+    // would otherwise make (`h!.setWireframe(wireframeRef.current)`), not this unrelated one.
+    const wireframeCallsBeforeLoss = (handle.setWireframe as Mock).mock.calls.length;
+
+    // The loss lands WHILE populate() is still awaiting.
+    handle.setDisposedForTest(true);
+    resolvePopulate();
+
+    expect(await findByText(/gpu context was lost/i)).not.toBeNull();
+    expect((handle.setWireframe as Mock).mock.calls.length).toBe(wireframeCallsBeforeLoss);
+    expect(handle.frameContent).not.toHaveBeenCalled();
+  });
+
+  it('never calls populate on a handle a loss already disposed (pre-check gate)', async () => {
+    const handle = makeFakeHandle();
+    (createPreviewScene as Mock).mockReturnValue(handle);
+    const populate1 = vi.fn();
+    const { rerender } = render(<Preview3DShell populate={populate1} resetKey="a" />);
+    await waitFor(() => expect(populate1).toHaveBeenCalledTimes(1));
+
+    // The handle dies WHILE idle — no populate is in flight, so only the top-of-effect
+    // pre-check (not the post-await one above) can be what blocks the next run.
+    handle.setDisposedForTest(true);
+    const populate2 = vi.fn();
+    rerender(<Preview3DShell populate={populate2} resetKey="b" />);
+
+    expect(populate2).not.toHaveBeenCalled();
+  });
 });
 
 describe('MaterialPreview', () => {

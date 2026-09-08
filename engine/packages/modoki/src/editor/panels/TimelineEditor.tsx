@@ -18,6 +18,9 @@ import { resolveDirectorRootForTimeline } from './openAssetInEditor';
 import { fireDirtyListeners, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
@@ -25,7 +28,9 @@ import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
+import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
+import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
 import {
   defaultTimeline, normalizeTimeline,
@@ -74,10 +79,51 @@ export default function TimelineEditor() {
   const hmrEpoch = useHmrEpoch();
   const asset = useEditorStore((s) => s.editingTimelineAsset);
   const nonce = useEditorStore((s) => s.timelineEditNonce);
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingTimelineDoc` null, and `commit` early-returns on that, so no edit can reach the
+   *  registry — editing is disabled by construction. A genuinely MISSING file is NOT this (#896,
+   *  and see `assetDocLoad.ts`). */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingTimelineAsset');
+  }, []);
   const doc = useEditorStore((s) => s.editingTimelineDoc);
   const rootId = useEditorStore((s) => s.directorRootEntityId);
   const playhead = useEditorStore((s) => s.playheadTime);
   const playing = useEditorStore((s) => s.isPreviewPlaying);
+  // WHICH panel's ▶ started this preview (#810 follow-up). `isPreviewPlaying` is shared with
+  // AnimationEditor, so without this both panels' preview effects run on one press and each
+  // takes the single-valued RunMode from the other — and this panel always lands SECOND (its
+  // entry sits behind an await), so it silently killed the Animation panel's playback. null =
+  // unclaimed (a programmatic setPreviewPlaying(true)); keep the old any-panel behaviour there.
+  const previewOwner = useEditorStore((s) => s.previewOwner);
   // Reactive run-mode for the transport (status text + Exit-Preview button visibility). scrub and
   // preview are the two states of the preview-session envelope; stopped = editing.
   const runMode = useSyncExternalStore(onRunModeChange, getRunMode);
@@ -126,7 +172,12 @@ export default function TimelineEditor() {
   // dispatch gates SYNCHRONOUSLY. Relying on the preview effect's cleanup alone lets one already-
   // scheduled tick fire (React defers the cleanup), advancing the playhead past the grab point (C7).
   const previewRafRef = useRef(0);
+  // The CURRENT preview effect run's guard, or null while not previewing (#810 follow-up). Lets
+  // `registerModeOwnerDisplaced`'s callback — which fires OUTSIDE this effect's closure — stop
+  // THIS run's tick without touching the shared `isPreviewPlaying` flag. See previewLoopGuard.ts.
+  const previewLoopGuardRef = useRef<PreviewLoopGuard | null>(null);
   const stopPreviewLoop = useCallback(() => {
+    previewLoopGuardRef.current?.stop();
     cancelAnimationFrame(previewRafRef.current);
     previewRafRef.current = 0;
     setTimelinePreviewActive(false); // close audio + dispatch gates now, not after the deferred cleanup
@@ -184,6 +235,8 @@ export default function TimelineEditor() {
     setSelectedTrack(null);
     setSelectedItem(null);
     setViewport(DEFAULT_VIEWPORT);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingTimelineDoc;
@@ -194,7 +247,19 @@ export default function TimelineEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'timeline')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'timeline');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadTimelineDoc } = useEditorStore.getState();
@@ -212,19 +277,39 @@ export default function TimelineEditor() {
       registerAsset(doc.id, asset.path, 'timeline');
       adoptParkedDoc(asset.path, 'timeline', doc);
       loadTimelineDoc(doc);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeTimeline(json);
+        const loaded = normalizeTimeline(json as Partial<TimelineDef>);
         if (!loaded.id) loaded.id = newGuid();
         registerAsset(loaded.id, asset.path, 'timeline');
         savedMarkRef.current?.(loaded);
         loadTimelineDoc(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[TimelineEditor] load failed, using default', e); const fb = defaultTimeline(newGuid(), asset.name); savedMarkRef.current?.(fb); loadTimelineDoc(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ #896, the AnimationEditor twin: this substituted `defaultTimeline(newGuid(), …)` on ANY
+        // failure and marked it as the SAVED baseline, so the first edit parked a full-replace
+        // write of the fabrication over the authored file — wearing a FRESH guid, which defeats
+        // `/api/asset-write`'s id preservation and leaves the heal pass nothing to flag. Every
+        // Director reference to the old guid dangled. Only a genuinely MISSING file keeps defaults.
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[TimelineEditor] load failed (asset missing), using default', e);
+          const fb = defaultTimeline(newGuid(), asset.name);
+          savedMarkRef.current?.(fb);
+          loadTimelineDoc(fb);
+          return;
+        }
+        console.error(`[TimelineEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);
@@ -465,6 +550,25 @@ export default function TimelineEditor() {
     return () => clearPreviewSaveHandler(mine);
   }, [playing, runMode]);
 
+  // ── Displacement (#810): the Animation panel taking the mode (a clip scrub/preview) ends OUR
+  // preview GLOBALLY — `RunMode` is single-valued — but nothing else tells this panel's rAF loop
+  // to stop, and its tick body never consults `getRunMode()`.
+  //
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Animation panel
+  // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
+  // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
+  // itself: Animation enters first (no notify yet), Timeline's async session-open resolves a
+  // microtask later and takes the mode, displacing Animation — whose callback (the first #810
+  // pass) then killed the flag Timeline's own just-started preview was keyed on. Confirmed live in
+  // `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS run's guard is
+  // what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole lifetime, not
+  // gated on `playing` — a displacement can arrive between preview sessions just as easily as
+  // during one, and the callback is a no-op when no guard is live.
+  useEffect(() => registerModeOwnerDisplaced('timeline', () => {
+    previewLoopGuardRef.current?.stop();
+    previewRafRef.current = 0;
+  }), []);
+
   // ── Preview playback loop ──
   // ── ▶ Preview: a real FORWARD playthrough — poses (keyframe + skeletal seek + activation) AND
   //    fires signals/audio/OnSequence via previewTimelineStep, with the sim otherwise stopped. The
@@ -472,16 +576,24 @@ export default function TimelineEditor() {
   //    audio/dispatch gates only while advancing; scrub/⏮/unmount revert. ──
   useEffect(() => {
     if (!playing) return;
-    let raf = 0;
+    if (!panelDrivesPreview(playing, previewOwner, 'timeline')) return; // the Animation panel's ▶, not ours
+    // Created synchronously (before the await below) so a displacement landing WHILE we are still
+    // opening our own session — e.g. this panel held `scrub` ownership a moment ago and gets
+    // displaced before it ever calls its own `enterPreviewMode` — is still observed once the await
+    // resolves (#810 follow-up).
+    const guard = createPreviewLoopGuard();
+    previewLoopGuardRef.current = guard;
     let last = performance.now();
     let cancelled = false;
     void (async () => {
       await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
-      if (cancelled) return;
+      if (cancelled || guard.stopped) return; // displaced before we ever took the mode ourselves
       setTimelinePreviewActive(true);      // open audio + action-dispatch gates
       enterPreviewMode(true, 'timeline');  // carry the run-mode signal (gates still read the active flag until Phase 4)
       const tick = () => {
-        raf = requestAnimationFrame(tick);
+        if (guard.stopped) return; // displaced — do not reschedule (checked BEFORE scheduling)
+        const raf = requestAnimationFrame(tick);
+        guard.arm(raf);
         previewRafRef.current = raf; // keep the ref live so scrub()/exit can cancel synchronously (C7)
         const now = performance.now();
         const dt = Math.min((now - last) / 1000, 0.05);
@@ -498,7 +610,8 @@ export default function TimelineEditor() {
         fireDirtyListeners();
         if (t >= cur.duration) useEditorStore.getState().setPreviewPlaying(false); // stop at the end (non-looping)
       };
-      raf = requestAnimationFrame(tick);
+      const raf = requestAnimationFrame(tick);
+      guard.arm(raf);
       previewRafRef.current = raf;
     })();
     // Pause/stop/unmount clears the active flag (silences audio, blocks dispatch) but KEEPS the
@@ -507,12 +620,25 @@ export default function TimelineEditor() {
     // a real teardown (unmount/world-swap/asset-switch) runs its own exit effect → stopped.
     // Guard (review L1): a scrub()/⏮ during preview flips `playing` off AND synchronously sets mode
     // 'scrub' BEFORE this cleanup runs — only freeze if we're still the live preview, else we'd
-    // clobber the just-set scrub back to 'preview'.
+    // clobber the just-set scrub back to 'preview'. Also: a DISPLACEMENT (not a scrub/exit of our
+    // own) already stopped the guard and cleared `previewRafRef` above, and does NOT flip `playing`
+    // (see the registration comment) — so this cleanup only runs here for OUR OWN teardown, never
+    // as a side effect of losing the mode to another panel. If it ever ran on displacement too, the
+    // `getRunMode() === 'preview'` check below would already read the NEW owner's mode and decline
+    // — same guard `enterPreviewMode`'s ordering relies on (see playMode.ts).
     return () => {
-      cancelled = true; cancelAnimationFrame(raf); previewRafRef.current = 0; setTimelinePreviewActive(false);
+      cancelled = true;
+      guard.stop();
+      // Release the ref only if it is still OURS. React runs this cleanup before the next run's
+      // body, so an unconditional null is safe TODAY — but "null it if it is still mine" is the
+      // exact shape #810 exists to delete, and an ordering change would make this clear a live
+      // guard with nothing to re-seat it.
+      if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null;
+      previewRafRef.current = 0;
+      setTimelinePreviewActive(false);
       if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline');
     };
-  }, [playing, rootId]);
+  }, [playing, previewOwner, rootId]);
 
   // ── Follow the live Director during real Play (Game view) ──
   // In Play mode the pipeline advances the bound Director; mirror its `time` onto the ruler playhead
@@ -539,7 +665,16 @@ export default function TimelineEditor() {
   // drag-scrub holds no session, so clear them explicitly.
   useEffect(() => () => {
     clearPreviewControls();
-    if (hasTimelinePreviewSession()) {
+    // ⚠️ The preview SESSION is shared, not ours alone — `AnimationEditor` opens it through the
+    // same `beginTimelinePreviewSession()` for its own ▶. Ending it here regardless of who owns it
+    // RELOADS the scene (`endTimelinePreviewSession` -> `SceneManager.loadScene` -> a world swap),
+    // which tears the Animation panel's live preview down as a side effect of closing this idle
+    // tab — and then this panel's own `onWorldSwap` handler below sees that swap and clears the
+    // shared flag too. Guarding the flag alone was not enough; the session is the deeper half, and
+    // the #810 E2E is what surfaced it. When the Animation panel owns the preview it also owns the
+    // session, and its own unmount (`endAnimationPreview`) ends it.
+    const owns = panelMayStopPreview(useEditorStore.getState().previewOwner, 'timeline');
+    if (owns && hasTimelinePreviewSession()) {
       const path = useEditorStore.getState().editingTimelineAsset?.path;
       void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) });
     }
@@ -548,7 +683,11 @@ export default function TimelineEditor() {
     // the run-mode reset both happened already, but `isPreviewPlaying` stayed true with no
     // panel to drive it — the same lie AnimationEditor's `isRecording` told. The binding is
     // kept on purpose so reopening the tab restores the timeline.
-    useEditorStore.getState().setPreviewPlaying(false);
+    // ⚠️ Only if the preview is OURS (or unclaimed). `isPreviewPlaying` is shared with the
+    // Animation panel, so an unguarded clear here stops ITS playback when this idle tab is merely
+    // closed or dragged to another tabset — see `panelMayStopPreview`.
+    const st = useEditorStore.getState();
+    if (panelMayStopPreview(st.previewOwner, 'timeline')) st.setPreviewPlaying(false);
   }, []);
 
   // A scene load / hot-reload swaps the world out from under the panel. Two things must happen:
@@ -562,7 +701,10 @@ export default function TimelineEditor() {
   //     scene load, hot-reload, or the mutate that triggers one. Cleanup unsubscribes on unmount.
   useEffect(() => onWorldSwap(() => {
     const st = useEditorStore.getState();
-    if (st.isPreviewPlaying || hasTimelinePreviewSession()) {
+    // Same ownership guard as the unmount cleanup above, for the same reason: on a world swap
+    // caused by the OTHER panel's session, this must not stop that panel's preview or abandon its
+    // snapshot. `exitPreviewMode` already self-guards on owner.
+    if (panelMayStopPreview(st.previewOwner, 'timeline') && (st.isPreviewPlaying || hasTimelinePreviewSession())) {
       st.setPreviewPlaying(false);
       void endTimelinePreviewSession({ restore: false });
     }
@@ -576,6 +718,25 @@ export default function TimelineEditor() {
   savedMarkRef.current = markSaved;
 
   if (!asset) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>No timeline open. Double-click a <code>.timeline.json</code> in Assets, or open a Director&apos;s timeline.</div>;
+  // ⚠️ BEFORE the `!doc` return (#896 review, finding 2). A refusal leaves `doc` null, so the
+  // banner further down was unreachable and the human saw "Loading timeline…" forever, with a
+  // console line as the only signal that the file had been refused.
+  if (loadState === 'failed') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#1b1b1f' }}>
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="timeline.loadBanner"
+          onRetry={retryLoad}
+        />
+        <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>
+          <div>Repair the file on disk (a corrupt or conflict-markered <code>.timeline.json</code>), then Retry. If an unsaved edit is parked for this asset, Retry opens that instead of the file.</div>
+          {/* Parity with SkinEditor's refused view: Retry is not the only way out. */}
+          <button data-ui-id="timeline.refused.close" data-ui-kind="button" data-ui-label="close timeline" onClick={() => useEditorStore.getState().closeTimelineEditor()} style={{ ...btn, marginTop: 10 }}>Close</button>
+        </div>
+      </div>
+    );
+  }
   if (!doc) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>Loading timeline…</div>;
 
   const sel = selectedTrack != null ? doc.tracks[selectedTrack] : null;
@@ -583,6 +744,18 @@ export default function TimelineEditor() {
   return (
     <div ref={rootRef}
       style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#1b1b1f', color: '#cfcfd6', fontSize: 12 }}>
+      {/* #902: this load opened on an unsaved edit, not on the file. ⚠️ HERE, not in the refused
+          early return above — an adoption is not a refusal, the panel opens normally, and that is
+          precisely what makes it invisible. */}
+      {parkAdopted && (
+        <ParkAdoptedBanner
+          path={asset.path}
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="timeline.parkAdopted"
+          onReload={retryLoad}
+          onKeep={() => setParkAdopted(false)}
+        />
+      )}
       {/* Toolbar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderBottom: '1px solid #2f2f37', flexWrap: 'wrap' }}>
         <button data-ui-id="timeline.transport.play" style={btn} onClick={() => {
@@ -591,7 +764,7 @@ export default function TimelineEditor() {
           // than silently no-op (common when the timeline stays open after switching scenes).
           if (!playing && rootId == null) { s.showToast('This scene has no Director bound to this timeline — nothing to preview. Open the scene that uses it (or add a Director whose timeline is this one).', 'warn'); return; }
           if (!playing && s.playheadTime >= (doc?.duration ?? 0)) s.setPlayhead(0);
-          s.setPreviewPlaying(!playing);
+          s.setPreviewPlaying(!playing, 'timeline');
         }}>{playing ? '⏸ Pause' : '▶ Play'}</button>
         <button data-ui-id="timeline.transport.rewind" style={btn} onClick={() => scrub(0)}>⏮</button>
         {/* Explicit way OUT of the preview envelope — reverts to authored (shown only while in preview). */}

@@ -72,9 +72,8 @@ claude mcp add --transport http --scope local 3daistudio https://mcp.3daistudio.
 # then, in Claude Code:  /mcp  → 3daistudio → authenticate (browser OAuth)
 ```
 
-**Local scope on purpose.** The repo's `.mcp.json` is git-tracked and mirrored into
-`.cursor/`/`.codex/` by `npm run sync:agent-configs`, and it reaches the public OSS snapshot — so a
-personal art-vendor subscription does not belong there. Local scope writes to `~/.claude.json`
+**Local scope on purpose.** The repo's `.mcp.json` is git-tracked and reaches the public OSS
+snapshot — so a personal art-vendor subscription does not belong there. Local scope writes to `~/.claude.json`
 under this project only. Promote it with `--scope project` if it should reach every clone.
 
 **Plan coverage:** `MCP Connector (Claude & ChatGPT)` is a listed feature of **Basic and Studio**

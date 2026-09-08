@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
  * PACKAGING GUARD — no hardcoded POSIX-only paths in packaged-app code.
@@ -23,19 +25,15 @@ describe('packaged-app code has no hardcoded POSIX-only paths', () => {
   const ROOTS = ['engine/electron', 'engine/toolchain'];
   const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
-  function tsFiles(dir: string, out: string[] = []): string[] {
-    const abs = path.join(repoRoot, dir);
-    if (!fs.existsSync(abs)) return out;
-    for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
-      const rel = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'dist' || e.name === 'node_modules') continue; // built/vendored
-        tsFiles(rel, out);
-      } else if (e.name.endsWith('.ts') && !e.name.endsWith('.test.ts')) {
-        out.push(rel);
-      }
-    }
-    return out;
+  /** Every `.ts` (not `.test.ts`) under `dir`, via the shared corpus producer
+   *  (#799/#771/#805 Phase 4). Floored well under the 7 measured today under the smaller of
+   *  the two ROOTS (engine/toolchain; engine/electron measures 23). */
+  function tsFiles(dir: string): string[] {
+    if (!fs.existsSync(path.join(repoRoot, dir))) return [];
+    return repoFiles({
+      under: dir, match: (rel) => rel.endsWith('.ts') && !rel.endsWith('.test.ts'),
+      exclude: ['dist', 'node_modules'], floor: 3,
+    }).map(({ rel }) => rel);
   }
 
   // Hardcoded `/tmp` — used UNCONDITIONALLY (a temp/log path on every launch) with a
@@ -51,13 +49,20 @@ describe('packaged-app code has no hardcoded POSIX-only paths', () => {
     expect(files.length).toBeGreaterThan(0);
   });
 
+  it('the comment scan is sane over every scanned file', () => {
+    for (const rel of files) {
+      const raw = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
+  });
+
   for (const rel of files) {
     it(`${rel} uses os.tmpdir()/app.getPath, not a literal /tmp`, () => {
-      const src = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
       const offenders = src
         .split('\n')
         .map((line, i) => ({ line, n: i + 1 }))
-        .filter(({ line }) => BAD.test(line) && !/^\s*(\*|\/\/)/.test(line)); // skip comments
+        .filter(({ line }) => BAD.test(line));
       expect(
         offenders,
         `hardcoded POSIX path (crashes on Windows) — use os.tmpdir() / app.getPath('temp'):\n` +
@@ -111,17 +116,15 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
     return roots;
   }
 
-  function testFiles(dir: string, out: string[] = []): string[] {
-    const abs = path.join(repoRoot, dir);
-    if (!fs.existsSync(abs)) return out;
-    for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
-      const rel = path.posix.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'node_modules' || e.name === 'dist') continue;
-        testFiles(rel, out);
-      } else if (/\.test\.tsx?$/.test(e.name)) out.push(rel);
-    }
-    return out;
+  /** Every `.test.ts`/`.test.tsx` under `dir`, via the shared corpus producer
+   *  (#799/#771/#805 Phase 4). `floor: 0` deliberately — a per-project `tests/` root can
+   *  legitimately hold as few as 1 matching file today (`games/chess`), so the real
+   *  non-vacuity pin lives in the two `it()`s below instead (`files.length > 100` and a
+   *  per-root coverage check), not in this producer's own floor. */
+  function testFiles(dir: string): string[] {
+    if (!fs.existsSync(path.join(repoRoot, dir))) return [];
+    return repoFiles({ under: dir, match: /\.test\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 0 })
+      .map(({ rel }) => rel);
   }
 
   // POSIX roots that genuinely do not exist on Windows. `/tmp` and `/var/tmp` are the ones with a
@@ -135,11 +138,16 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
     + '|createReadStream|readFileSync|readdirSync|existsSync|copyFileSync|cpSync|statSync|renameSync'
     + '|writeFile|readFile|mkdir|appendFile';
 
-  const stripComments = (src: string): string =>
-    src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
-      .map((l) => (/^\s*(\*|\/\/)/.test(l) ? '' : l)).join('\n');
+  // Comment stripping is the shared scanner (@modoki/engine/testing, #419) — imported above.
 
   const files = testRoots().flatMap((r) => testFiles(r));
+
+  it('the comment scan is sane over every scanned test file', () => {
+    for (const rel of files) {
+      const raw = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
+  });
 
   it('scans a non-empty set of test files, across engine AND project suites', () => {
     // A root that silently stops matching turns this whole block into a cheerful no-op — the

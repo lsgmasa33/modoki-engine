@@ -40,6 +40,8 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { backendUrlForClone } from './editorPorts.mjs';
+import { repoFiles } from './repoCorpus.mjs';
+import { toPosix } from './pathPosix.mjs';
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' });
 const postTo = (backend) => async (path, body) => {
@@ -235,16 +237,32 @@ async function main() {
     process.exit(2);
   }
   const APPLY = process.argv.includes('--apply');
-  const PROJECT = process.argv.slice(2).find((a) => !a.startsWith('--'));
-  const post = postTo(BACKEND);
+  const rawProjectArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
 
-  if (!PROJECT) {
+  if (!rawProjectArg) {
     console.error('usage: MODOKI_BACKEND=http://127.0.0.1:<port> node engine/scripts/migrate-legacy-scenes.mjs <project-root> [--apply]');
     process.exit(2);
   }
+  // Normalise BEFORE it is used as a git pathspec AND as the `identity.projectRoot.endsWith(...)`
+  // suffix check below — a user typing `games\sling` on Windows (backslashes) would otherwise
+  // build a pathspec matching nothing (repoFiles' `under` compares POSIX segments) while the
+  // `endsWith` check might still happen to pass, silently migrating the wrong thing or nothing.
+  const PROJECT = toPosix(rawProjectArg);
+  const post = postTo(BACKEND);
 
-  const scenes = git('ls-files', `${PROJECT}/runtime/assets/scenes/*.json`)
-    .split('\n').filter(Boolean)
+  // Enumerate the RAW scene corpus first, floored, so a broken enumeration (wrong PROJECT,
+  // git unavailable, an empty `under`) is a loud abort rather than being read as "this project
+  // legitimately has no legacy scenes". Every project ships at least one committed scene, so a
+  // floor of 1 here can only trip on a broken instrument, never on ordinary project content —
+  // exactly the distinction the old code collapsed by `process.exit(0)`-ing on an empty list
+  // regardless of WHY it was empty.
+  const rawScenes = repoFiles({
+    under: `${PROJECT}/runtime/assets/scenes`,
+    match: /\.json$/,
+    floor: 1,
+  });
+  const scenes = rawScenes
+    .map(({ rel }) => rel)
     .filter((f) => { try { return isLegacy(read(f)); } catch { return false; } });
 
   if (!scenes.length) {

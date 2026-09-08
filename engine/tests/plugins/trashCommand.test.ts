@@ -49,12 +49,43 @@ describe('trashCommand', () => {
     expect(args.slice(0, -1).join('\n')).not.toContain(nasty); // not baked into the AppleScript
   });
 
-  it('Windows: routes to the Recycle Bin via VisualBasic, paths as $args', () => {
-    const { command, args } = trashCommand(['C:/x/m.glb', 'C:/x/n.png'], 'win32');
+  /** ⚠️ This block replaces one that asserted the exact shape #875 turned out to be BROKEN —
+   *  it pinned `foreach ($p in $args)` and `args.slice(-2)` as correct. It could not fail,
+   *  because it checked the string and never ran PowerShell: `-Command` does not bind `$args`,
+   *  so the loop iterated zero times and nothing was ever recycled. The assertions below are
+   *  the inverse — they pin what must be ABSENT from argv — and `trashCommandLive.test.ts`
+   *  runs the real thing on win32, which is the half no string assertion can cover. */
+  it('Windows: paths travel on stdin, NEVER on the command line (#875)', () => {
+    const paths = ['C:/x/m.glb', 'C:/x/n.png'];
+    const { command, args, input } = trashCommand(paths, 'win32');
     expect(command).toBe('powershell');
     expect(args.join(' ')).toContain('SendToRecycleBin');
-    expect(args.join(' ')).toContain('foreach ($p in $args)'); // loops every path in one process
-    expect(args.slice(-2)).toEqual(['C:/x/m.glb', 'C:/x/n.png']);
+    // The defect: trailing argv items are re-parsed as SOURCE by `-Command`, so a path with a
+    // space targets the wrong file and a path with `;` executes. No path may reach argv.
+    for (const p of paths) for (const a of args) expect(a).not.toContain(p);
+    // …and every path must reach the script through stdin instead.
+    expect(input).toBe('C:/x/m.glb\nC:/x/n.png\n');
+    // `$args` is the broken channel — its absence is what stops the old shape coming back.
+    expect(args.join(' ')).not.toContain('$args');
+    // A directory needs DeleteDirectory; DeleteFile throws "Could not find file" on one.
+    expect(args.join(' ')).toContain('DeleteDirectory');
+    expect(args.join(' ')).toContain('DeleteFile');
+    // Non-ASCII names silently survive unless the input encoding is forced before the read.
+    expect(args.join(' ')).toContain('InputEncoding');
+    // A user profile must not be able to change what this script sees.
+    expect(args).toContain('-NoProfile');
+    expect(args).toContain('-NonInteractive');
+  });
+
+  it('Windows: refuses a path containing a newline rather than deleting the wrong thing', () => {
+    // The stdin protocol is line-based, so a newline would split one path into two and hand
+    // DeleteFile a path the caller never named. Windows forbids control characters in a
+    // filename, so this is unreachable in practice — it is a guard on the FAILURE MODE
+    // (a wrong delete), not on a reachable input.
+    expect(() => trashCommand(['C:\\x\\bad\nname.json'], 'win32')).toThrow(/newline/);
+    expect(() => trashCommand(['C:\\x\\bad\rname.json'], 'win32')).toThrow(/newline/);
+    // The other platforms pass paths as real argv, so they carry no such constraint.
+    expect(() => trashCommand(['/x/bad\nname.json'], 'darwin')).not.toThrow();
   });
 
   it('Linux/other: uses trash-put with the whole path list as args', () => {

@@ -56,8 +56,8 @@ export async function gotoEditorWithScene(page: Page, scene = SCENE, waitForEnti
   // scopes its last-scene key per project (`modoki-last-scene:<project>`), so a plain
   // `modoki-last-scene` write is silently ignored and the fixture never loads.
   await page.waitForFunction(() => !!(window as any).__modokiEditorTest, null, { timeout: 30_000 });
-  const ok = await page.evaluate((s) => (window as any).__modokiEditorTest.loadScene(s), scene);
-  if (!ok) throw new Error(`gotoEditorWithScene: loadScene('${scene}') returned false`);
+  const outcome = await page.evaluate((s) => (window as any).__modokiEditorTest.loadScene(s), scene);
+  if (outcome !== 'loaded') throw new Error(`gotoEditorWithScene: loadScene('${scene}') returned '${outcome}'`);
   await page.waitForFunction((name) => {
     const ents = (window as any).__modokiEditorTest.getAllEntities();
     return name ? ents.some((e: any) => e.name === name) : ents.length > 0;

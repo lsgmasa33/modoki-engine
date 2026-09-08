@@ -9,6 +9,11 @@ vi.mock('../../app/ecs/registerTraits', () => ({
 }));
 
 const mockRegisterManager = vi.fn();
+const mockUnregisterManagers = vi.fn();
+const mockAudioDispose = vi.fn();
+const mockDisposeAllAudioBuffers = vi.fn();
+const mockDisposeAudioContext = vi.fn();
+const mockClearLateUpdates = vi.fn();
 const mockSetPhysicsLayers = vi.fn();
 const mockSetTargetFPS = vi.fn();
 /** Returns a value that is NOT the project config's `targetFps`, deliberately — see the frame-cap
@@ -27,6 +32,11 @@ vi.mock('@modoki/engine/runtime', () => ({
   registerQualityControls: () => {},
   registerVideoControls: () => {},
   registerManager: (...args: any[]) => mockRegisterManager(...args),
+  unregisterManagers: (...args: any[]) => mockUnregisterManagers(...args),
+  audioDispose: () => mockAudioDispose(),
+  disposeAllAudioBuffers: () => mockDisposeAllAudioBuffers(),
+  disposeAudioContext: () => mockDisposeAudioContext(),
+  clearLateUpdates: () => mockClearLateUpdates(),
   timeManager: { name: 'engine.time' },
   navigationManager: { name: 'engine.navigation' },
   physics2DEventsManager: { name: 'Physics2DEvents' },

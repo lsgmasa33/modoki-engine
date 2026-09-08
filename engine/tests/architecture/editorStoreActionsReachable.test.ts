@@ -19,16 +19,23 @@
  *  reachable by a user — only that a consumer exists at all, which is exactly the bar #181
  *  failed. A stricter version would need call-graph analysis and would produce arguments
  *  about legitimate agent-op-only or test-only actions; this version produces none, and it
- *  is total today (all 76 actions pass), so it can only go red on a NEW orphan.
+ *  is total today (all 87 actions pass — the figure said 76 and had not been re-measured since
+ *  it was written), so it can only go red on a NEW orphan.
  *
  *  If this fails for an action you just added: wire it to a consumer, or don't add it yet.
  *  Adding the setter first and the UI "in the next commit" is precisely how #181 happened. */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { repoFiles, repoRoot } from '../../scripts/repoCorpus.mjs';
 
 const root = path.resolve(__dirname, '../..');
 const storeFile = path.join(root, 'packages/modoki/src/editor/store/editorStore.ts');
+// Repo-relative POSIX counterparts of storeFile/__filename, derived ONCE (not per corpus file)
+// against the SAME root repoFiles()'s own `rel` is relative to — comparing on `rel` rather than
+// on two independently-built absolute paths is the point of #849.
+const storeRel = path.relative(repoRoot(), storeFile).split(path.sep).join('/');
+const selfRel = path.relative(repoRoot(), __filename).split(path.sep).join('/');
 
 /** Directories a consumer may live in. `packages/modoki/tests` is in the list because the
  *  engine package has its OWN vitest project — leaving it out reported `closeSpriteAnimEditor`
@@ -71,29 +78,42 @@ function actionNames(block: string): string[] {
   return out;
 }
 
-function sourceFiles(): string[] {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    if (!fs.existsSync(dir)) return;
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (e.name === 'node_modules' || e.name === 'dist') continue;
-        walk(p);
-      // THIS FILE is excluded as well as the store: `knownOrphans` names the orphans as
-      // string literals, so counting itself as a corpus would make every entry look like
-      // it had acquired a consumer the moment it was listed — the allowlist would
-      // launder the very thing it documents.
-      } else if (/\.tsx?$/.test(e.name) && p !== storeFile && p !== __filename) {
-        out.push(p);
-      }
-    }
-  };
-  for (const d of consumerRoots) walk(d);
-  return out;
+/** Every `.ts`/`.tsx` under the consumer roots, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 2144 measured today.
+ *
+ *  THIS FILE is excluded as well as the store: `knownOrphans` names the orphans as string
+ *  literals, so counting itself as a corpus would make every entry look like it had acquired a
+ *  consumer the moment it was listed — the allowlist would launder the very thing it documents. */
+function sourceFiles(): Array<{ rel: string; abs: string }> {
+  return repoFiles({
+    under: consumerRoots, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 1500,
+  })
+    .filter(({ rel }) => rel !== storeRel && rel !== selfRel);
 }
 
 describe('editor store actions are reachable', () => {
+  /** NON-VACUITY (#849). Both exclusions are load-bearing and BOTH fail silently: if `storeRel` or
+   *  `selfRel` stops matching, that file re-enters the corpus, its own text satisfies every
+   *  `\bname\b` probe, and the orphan scan reports zero forever. Mutation-checked 2026-09-07: with
+   *  both pointed at paths that match nothing, the suite below was GREEN. Assert the filter removes
+   *  exactly the two files it names, rather than trusting that it did. */
+  it('the store file and this file are genuinely excluded from the corpus', () => {
+    const all = repoFiles({
+      under: consumerRoots, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 1500,
+    });
+    for (const rel of [storeRel, selfRel]) {
+      expect(
+        all.some((f) => f.rel === rel),
+        `${rel} is not in the corpus, so excluding it is a no-op — the derivation behind it has `
+        + "drifted from repoFiles()'s own `rel`",
+      ).toBe(true);
+    }
+    // No `all.length - sourceFiles().length === 2` assertion here, though the first draft had one.
+    // `rel` is unique in the corpus, so that subtraction is exactly |{storeRel, selfRel} ∩ rels|,
+    // which the loop above has already pinned at 2 — no edit can redden it without reddening the
+    // loop first. It read as independent coverage and was not (close-out review, #849).
+  });
+
   it('every function-typed EditorState member has a consumer outside editorStore.ts', () => {
     const src = fs.readFileSync(storeFile, 'utf8');
     const actions = actionNames(editorStateBlock(src));
@@ -102,7 +122,7 @@ describe('editor store actions are reachable', () => {
     // catch, reproduced in the guard itself.
     expect(actions.length).toBeGreaterThan(50);
 
-    const corpus = sourceFiles().map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+    const corpus = sourceFiles().map(({ abs }) => fs.readFileSync(abs, 'utf8')).join('\n');
     const orphans = actions.filter((name) => !new RegExp(`\\b${name}\\b`).test(corpus));
 
     const unexpected = orphans.filter((n) => !knownOrphans.has(n));

@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
+import { readScannedSource } from '@modoki/engine/testing';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -91,9 +92,8 @@ describe('/api/editor-action', () => {
   it('the teardown reasons above are the ones main.ts ACTUALLY sends (guard against drift)', async () => {
     // A hand-written list of strings rots silently — and a rotted list here fails OPEN, because an
     // unmatched message is treated as the op speaking. Read them out of the source instead.
-    const { readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const src = readFileSync(join(__dirname, '../../electron/main.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../electron/main.ts')).code;
     const sent = [...src.matchAll(/failPendingRenderer\(\s*'([^']+)'/g)].map((m) => m[1]);
     expect(sent.length, 'no failPendingRenderer calls found — did it move or get renamed?').toBeGreaterThan(0);
     for (const reason of sent) {
@@ -149,7 +149,7 @@ describe('drift guard: every literal MCP editorAction() name survives the router
   const mcpToolDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src/tools');
   const mcpSource = fs.readdirSync(mcpToolDir)
     .filter((f) => f.endsWith('.ts'))
-    .map((f) => fs.readFileSync(path.join(mcpToolDir, f), 'utf-8'))
+    .map((f) => readScannedSource(path.join(mcpToolDir, f)).code)
     .join('\n');
   const actionNames = [...mcpSource.matchAll(/editorAction\(\s*'([^']+)'/g)].map((m) => m[1]);
   const uniqueActionNames = [...new Set(actionNames)];
@@ -439,6 +439,29 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     expect(r.body.ok).toBe(false);
     expect(r.body.unsavedChanges).toBe(true);
     expect(r.body.error).toMatch(/save_all/);
+    expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
+  });
+
+  it('names the ACTUAL cause when the unsaved work is a dirty ASSET, not a fixed create_entity string (#844)', async () => {
+    // Since #831 a Material slider drag parks a dirty asset the same way create_entity parks a
+    // live-world edit — the fixed refusal string used to blame create_entity/duplicate_entity/
+    // prefab regardless, sending an agent hunting entities it never created.
+    const scenePath = tempScene();
+    const before = fs.readFileSync(scenePath, 'utf-8');
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async () => ({
+        playState: 'stopped',
+        unsavedChanges: true,
+        unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/x.mat.json'], dirtyScenes: [] },
+      })),
+    });
+    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
+    expect(r.status).toBe(409);
+    expect(r.body.unsavedChanges).toBe(true);
+    expect(r.body.error).toMatch(/\/assets\/x\.mat\.json/);
+    // The negative half is what makes this bite: the OLD fixed string must be gone, not just a
+    // new sentence added alongside it.
+    expect(r.body.error).not.toMatch(/create_entity/);
     expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
   });
 
@@ -854,6 +877,24 @@ describe('/api/project-settings is a non-destructive PATCH', () => {
     expect(r.status ?? 200).toBe(200);
     expect(readCfg().app.appName).toBe('Court');
     expect(fs.readFileSync(cfgPath(), 'utf8')).not.toContain('configErrors');
+  });
+
+  it('POST ignores a round-tripped configWarnings — the case where Apply actually broke', async () => {
+    // The sibling of the test above, and the one that was NOT covered (#821 review).
+    // ⚠️ Its reachability is the opposite of configErrors': `configErrors` makes the
+    // dialog INERT, so that post can only happen with the form disabled — whereas a
+    // WARNING deliberately leaves every control editable (ProjectSettingsDialog gates
+    // inertness on errors alone). So the banner renders, the user edits an unrelated
+    // field, presses Apply, and gets `unknown config section(s) "configWarnings" —
+    // nothing was written`: no setting saveable until the file is hand-edited, on
+    // exactly the project the warning exists for.
+    const r = (await settings({
+      app: { appName: 'Court' },
+      configWarnings: [{ path: 'rendering.web.sizeMode', message: 'not one of: fixed, responsive' }],
+    })) as { status?: number };
+    expect(r.status ?? 200).toBe(200);
+    expect(readCfg().app.appName).toBe('Court');
+    expect(fs.readFileSync(cfgPath(), 'utf8')).not.toContain('configWarnings');
   });
 
   it('rejects `null` rather than persisting it into a typed field', async () => {

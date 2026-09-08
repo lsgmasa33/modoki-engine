@@ -1,6 +1,12 @@
 /** @modoki/editor — Visual editor, dev-only. Not shipped in production builds. */
 
-export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl } from './backend/editorBackend';
+// `jsonFileBody`/`writeAssetFile` are PUBLIC because a game's own editor panels write asset
+// documents too, and reach the engine only through this barrel (CLAUDE.md: a game may not
+// import by relative path — it is copied out of the repo). Without them the only public tool
+// was raw `backendFetch`, so `games/sling`'s Level and Wave editors each hand-spelled their
+// own body and neither appended the trailing newline — #835's defect, reproduced outside the
+// engine by an export list that offered no alternative.
+export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile } from './backend/editorBackend';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
   pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
@@ -18,7 +24,7 @@ export {
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
-// GameView device simulation. Exported for the agent ops behind `modoki_game_view_device` /
+// GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
 // exist, so an op that hardcoded a table would go stale on the next device added.
 export {
@@ -75,15 +81,29 @@ export {
 // calls into, kept exported too for callers that manage their own undo entry.
 export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
-  saveScene, saveAll, serializeScene, loadScene, newScene,
+  saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
+  getLastSceneLoadFailureMessage, type SceneLoadOutcome,
 } from './scene/serialize';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
   subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
+  getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, forgetFlushedAssetHash,
   type AssetWriteOrigin,
 } from './scene/dirtyAssets';
+export {
+  markBaseSceneEdit, applyBaseSceneEdit, peekBaseSceneEdit, isBaseSceneDirty, hasPendingBaseScenes,
+  getPendingBaseScenePaths, clearPendingBaseScenes, discardPendingBaseScenes,
+  flushPendingBaseScenes, subscribePendingBaseScenes, getPendingBaseScenesVersion,
+  mutateScene, type BaseSceneFlushResult,
+} from './scene/pendingBaseScene';
+export {
+  parkMetaEdit, peekPendingMeta, isMetaDirty, hasPendingMeta, getPendingMetaPaths,
+  clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
+  subscribePendingMeta, getPendingMetaVersion, type MetaFlushResult,
+  readMetaPreferringPark, metaWrittenToDisk, metaReadFallback, type PreferredMetaRead,
+} from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';
@@ -97,6 +117,11 @@ export { resolveAnimatorRootForClip } from './panels/openAssetInEditor';
 // The create path the Assets panel's "New X" flow and the `create-registered-asset` agent op BOTH
 // run, so a kind that works for the human cannot silently differ for a tool (#288 gap 5).
 export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset';
+/** The asset-move repair seam (#867). Exported so the agent op that the /api/move-file route
+ *  calls back into can reach it — an out-of-process move (modoki_move_asset) has no other way
+ *  to repair the renderer's path-keyed state. */
+export { applyAssetPathMoves, unbindDeletedAssetEditors } from './panels/assetEditorBindings';
+export type { PathMove } from './utils/assetPaths';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';

@@ -45,6 +45,22 @@ describe('validateAssetData (warn-but-write)', () => {
   it('errors when animation.tracks is not an array', () => {
     expect(validateAssetData('animation', { tracks: 'nope' }).errors.length).toBe(1);
   });
+
+  // #784 (docs/format-versioning.md § 2a: "strictly greater only"). The old check was
+  // `obj.version !== 1`, which flagged an OLDER or ABSENT document exactly as loudly as a
+  // too-new one — every particle document a prior build ever wrote would warn the moment
+  // PARTICLE_FORMAT_VERSION moved past 1.
+  it('particle: does not warn on an older or absent version — only strictly-greater warns', () => {
+    expect(validateAssetData('particle', { version: 0 }).warnings.join('\n')).not.toMatch(/version/);
+    expect(validateAssetData('particle', {}).warnings.join('\n')).not.toMatch(/version/);
+  });
+
+  it('particle: warns (advisory only) when the version is newer than this build supports', () => {
+    const r = validateAssetData('particle', { version: 99 });
+    expect(r.errors).toEqual([]); // advisory only — never blocks the write
+    expect(r.warnings.join('\n')).toMatch(/version/);
+    expect(r.warnings.join('\n')).toContain('99');
+  });
 });
 
 describe('spriteanim schema', () => {

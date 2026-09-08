@@ -84,6 +84,18 @@ const SCRATCH_GAP = 2;
  *  generation to fit this, so the page size is now the only thing atlasMax controls. */
 const SCRATCH_SIZE = 2048;
 
+/** How many consecutive failed generations still un-stick their batch for a retry. Structural,
+ *  not a feel knob: past this the font is treated as genuinely broken rather than transiently
+ *  failing, and its glyphs settle into stable tofu instead of being re-requested every frame.
+ *  Same reasoning as the first-overflow-only retry in `generateBatch`. */
+const MAX_FLUSH_RETRIES = 2;
+
+/** First backoff step (ms) for the self-scheduled flush retry (#635). The delay doubles per
+ *  consecutive failure (`FLUSH_RETRY_BASE_MS * 2 ** (flushFailures - 1)`), and the number of
+ *  steps is bounded by {@link MAX_FLUSH_RETRIES} — same budget, just spread over wall-clock
+ *  time instead of re-entering `flush()` immediately. See {@link scheduleFlushRetry}. */
+const FLUSH_RETRY_BASE_MS = 500;
+
 /** Transparent gutter (px) between packed cells. Cells are otherwise flush, so an
  *  OFFSET atlas sample — the drop shadow's `vUv - shadowOffset`, or a wide glow/outline
  *  — reads straight into the neighbouring glyph and paints a stray sliver (the reported
@@ -215,6 +227,23 @@ export class DynamicFontProvider implements FontProvider {
   private readonly requested = new Set<number>();
   private readonly pending = new Set<number>();
   private generating = false;
+  // Bounds the flush-failure re-queue below. See `flush()`'s catch for why an UNBOUNDED
+  // re-queue is a per-frame storm rather than a retry.
+  private flushFailures = 0;
+  private warnedFlushFail = false;
+  // Arms the self-scheduled retry a failed flush promises (#635) — see `scheduleFlushRetry`.
+  // Never touched outside flush()'s catch/scheduleFlushRetry/cancelFlushRetry/dispose().
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  // The codepoints an armed `retryTimer` will re-queue, ACCUMULATED across every failing batch
+  // while the timer is pending — not just the one that first armed it. `flush()` drains ALL of
+  // `pending` into ONE batch and sets `generating` before its first `await`, so a SECOND entity
+  // that mounts during that await lands in a batch of its own; if that batch also fails,
+  // `scheduleFlushRetry` used to find `retryTimer` already armed and early-return, silently
+  // dropping the second batch — it was deleted from `requested` by the un-stick in flush()'s
+  // catch and never re-added to anything, so it never regenerated. Merging into one Set instead
+  // means a second (or third...) failing batch rides the already-armed timer instead of being
+  // lost. See `scheduleFlushRetry`/`cancelFlushRetry`.
+  private readonly retryBatch = new Set<number>();
 
   private constructor(
     id: string,
@@ -256,7 +285,15 @@ export class DynamicFontProvider implements FontProvider {
   private get pageOffset(): number { return this.baked ? 1 : 0; }
 
   private async bytes(): Promise<Uint8Array> {
-    this.fontBytesPromise ??= this.loadFontBytes();
+    if (!this.fontBytesPromise) {
+      const promise = this.loadFontBytes();
+      this.fontBytesPromise = promise;
+      // Clear the memo on failure, so a transient font fetch failure doesn't leave this
+      // font permanently unable to generate another glyph for the session (#541). The
+      // `=== promise` guard is registered after assignment so a late rejection from an
+      // older attempt can never clear a newer in-flight one.
+      promise.catch(() => { if (this.fontBytesPromise === promise) this.fontBytesPromise = null; });
+    }
     return this.fontBytesPromise;
   }
 
@@ -339,16 +376,117 @@ export class DynamicFontProvider implements FontProvider {
   private async flush(): Promise<void> {
     if (this.generating || this.pending.size === 0) return;
     this.generating = true;
+    const batch = [...this.pending];
+    this.pending.clear();
     try {
-      const batch = [...this.pending];
-      this.pending.clear();
       await this.generateBatch(batch, /* pin */ false);
+      this.flushFailures = 0; // a working generation clears the budget
+      this.warnedFlushFail = false;
     } catch (e) {
-      console.warn(`[DynamicFontProvider] generation failed for ${this.id}:`, e);
+      // Un-stick THIS batch's codepoints from `requested` so a later `ensureGlyphs` call
+      // re-queues them instead of seeing "already requested" and skipping silently forever.
+      // Without this, a transient failure here (most commonly `bytes()` rejecting) defeats
+      // #541's retry: the memo clears, but nothing ever calls `bytes()` again for these
+      // codepoints because they never leave `requested`. Scoped to `batch` (captured before
+      // the await) rather than the whole `requested` set, so an unrelated batch that already
+      // succeeded stays resolved.
+      //
+      // ⚠️ BOUNDED, and the bound is the point — same rule as the scratch-overflow path below
+      // (~:424), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
+      // FRAME for any text whose layout hash changes every frame (a countdown, a score, a
+      // typewriter reveal), so an unconditional un-stick turns a PERMANENTLY failing font
+      // (a .ttf 404 after an OTA swap) into request → fail → delete → re-request at fetch
+      // latency for the life of the page — and #541's cleared `bytes()` memo re-fetches on
+      // every lap. Past the budget the codepoints stay in `requested` and render as tofu,
+      // which is stable and diagnosable, instead of storming behind one warning.
+      this.flushFailures += 1;
+      if (!this.warnedFlushFail) {
+        this.warnedFlushFail = true;
+        console.warn(`[DynamicFontProvider] generation failed for ${this.id}:`, e);
+      }
+      if (this.flushFailures <= MAX_FLUSH_RETRIES) {
+        for (const cp of batch) this.requested.delete(cp);
+        // #635: the un-stick above is a promise this batch gets ANOTHER lap, but for STATIC
+        // text (a label whose string never changes — "TAP TO START") no lap ever arrives on
+        // its own. Both production `ensureGlyphs` call sites are gated on a layout hash whose
+        // only provider-controlled inputs (`atlasVersion`, `markTextDirty()`) move ONLY on the
+        // success path below (~:496-497) — a failed flush never touches either, so a static
+        // label's hash never changes and `ensureGlyphs` is never called again for it. Text
+        // whose hash moves every frame (a countdown, a score) recovers by accident, which is
+        // why this survived: the un-stick alone is sufficient there, but not here. Arm a timer
+        // to re-queue the batch ourselves instead of waiting on a caller that will never come.
+        //
+        // Deliberately NOT re-added to `pending` here — this catch runs inside `flush()`,
+        // whose tail (~:394, now further down) is `if (this.pending.size) void this.flush()`;
+        // re-queueing into `pending` from here would re-enter `flush()` immediately and turn
+        // the bounded retry `MAX_FLUSH_RETRIES` exists for into a per-frame storm. The re-queue
+        // happens only inside the TIMER callback, on its own backoff schedule.
+        this.scheduleFlushRetry(batch);
+      } else {
+        // Budget exhausted this lap — an armed retry from an earlier, still-within-budget
+        // failure must not outlive the budget that authorised it.
+        this.cancelFlushRetry();
+      }
     } finally {
       this.generating = false;
     }
     if (this.pending.size) void this.flush();
+  }
+
+  /** Arm the retry the un-stick in `flush()`'s catch is paying for (#635). A static label
+   *  never calls `ensureGlyphs` again on its own — see the comment at the call site — so
+   *  this provider has to re-queue the batch itself instead of waiting for a caller that
+   *  never comes. Backoff doubles per consecutive failure and is bounded by the same
+   *  `MAX_FLUSH_RETRIES` budget the un-stick itself is gated on.
+   *
+   *  Every call MERGES its `batch` into {@link retryBatch} first, unconditionally — only
+   *  whether a NEW timer gets armed is gated on `retryTimer === null`. A second (or third)
+   *  failing batch while one retry is already pending therefore rides the same timer instead
+   *  of being silently dropped (see {@link retryBatch}'s own comment for the #635 follow-up
+   *  this closes).
+   *
+   *  Self-guarding on purpose: this can fire long after the state that armed it changed
+   *  (a scene swap disposed the provider, the budget got exhausted by an unrelated batch,
+   *  or a codepoint landed some other way — e.g. a manual `ensureGlyphs` lap during the
+   *  backoff window, the SECOND independent recovery route the un-stick still provides). */
+  private scheduleFlushRetry(batch: number[]): void {
+    for (const cp of batch) this.retryBatch.add(cp);
+    if (this.disposed || this.retryTimer !== null) return;
+    const delay = FLUSH_RETRY_BASE_MS * 2 ** (this.flushFailures - 1);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.disposed || this.flushFailures > MAX_FLUSH_RETRIES) return;
+      let queued = false;
+      for (const cp of this.retryBatch) {
+        if (this.baked?.glyphs.has(cp) || this.glyphMap.has(cp)) continue; // landed some other way
+        this.requested.add(cp);
+        this.pending.add(cp);
+        queued = true;
+      }
+      this.retryBatch.clear();
+      if (queued) void this.flush();
+    }, delay);
+  }
+
+  /** Disarm a pending retry — dispose(), or a later failure that exhausts the budget.
+   *
+   *  Clearing the timer must not strand {@link retryBatch}'s codepoints in limbo: they were
+   *  already un-stuck from `requested` by the failure(s) that armed this retry, and if the
+   *  timer that would have re-queued them is being killed, nothing else ever will. Re-add
+   *  every one of them to `requested` FIRST, so they settle as stable, diagnosable tofu —
+   *  exactly what `flush()`'s catch comment already promises for the budget-exhausted case.
+   *
+   *  Deliberately unconditional on `this.disposed`: `dispose()` sets that flag BEFORE calling
+   *  this (see its own comment), and the re-add must still run — touching `requested` on a
+   *  disposed provider is harmless (nothing reads it again), but SKIPPING the re-add here would
+   *  silently reintroduce the exact limbo this method exists to close, just gated on dispose
+   *  instead of on the budget. */
+  private cancelFlushRetry(): void {
+    for (const cp of this.retryBatch) this.requested.add(cp);
+    this.retryBatch.clear();
+    if (this.retryTimer === null) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
   }
 
   /** How many glyphs one generation may ask for without overflowing the scratch atlas
@@ -373,6 +511,11 @@ export class DynamicFontProvider implements FontProvider {
     // settling into stable tofu the way a single over-large batch always did.
     const protect = new Set(cps);
     for (let i = 0; i < cps.length; i += cap) {
+      // A dispose() between chunks (e.g. a scene swap tearing down this font mid-batch) must
+      // stop the batch here rather than keep paying generator passes for a provider nothing
+      // will ever read again — see the `disposed` re-check inside generateChunk for the write
+      // side of the same guard.
+      if (this.disposed) return;
       await this.generateChunk(cps.slice(i, i + cap), pin, protect);
     }
   }
@@ -388,6 +531,12 @@ export class DynamicFontProvider implements FontProvider {
       padding: SCRATCH_GAP,
       textureSize: [SCRATCH_SIZE, SCRATCH_SIZE],
     });
+    // `dispose()` can land while `generateMsdf` is in flight (this provider's font/atlas is
+    // being torn down — a scene swap, a hot-reload). `dispose()` already cleared glyphMap/
+    // kern/pages/ctxs; writing into them here would resurrect state into a disposed provider
+    // nothing owns any more (glyphMap.set/kern.set below, `this.ctxs[cell.page]`, `this.blit`
+    // touching a canvas array that dispose() just emptied). Bail before any of that.
+    if (this.disposed) return;
     // Seeded from a bake, EVERY batch is checked (the baseline is the bake). Un-seeded, the
     // first batch establishes the baseline and later ones are checked against it.
     if (this.baked) this.checkSameFont(result.metrics);
@@ -440,7 +589,7 @@ export class DynamicFontProvider implements FontProvider {
     }
 
     this.atlasVersion++;
-    markTextDirty();
+    markTextDirty(this.id);
   }
 
   /** Warn once when the atlas is so saturated a glyph can't be placed even after
@@ -514,6 +663,7 @@ export class DynamicFontProvider implements FontProvider {
 
   dispose(): void {
     this.disposed = true;
+    this.cancelFlushRetry(); // #635: an armed retry must not fire into a disposed provider.
     // Renderer-attached per-page GPU textures clean up via their addDisposable hooks.
     for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
     this.disposables = [];

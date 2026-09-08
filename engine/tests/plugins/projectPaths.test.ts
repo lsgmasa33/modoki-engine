@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { relativiseUnderProject, planDroppedFileDest } from '../../plugins/backend/projectPaths';
+import { canonicalPath } from '../../scripts/pathIdentity.mjs';
 
 describe('relativiseUnderProject (#394)', () => {
   it('relativises a file inside the project', () => {
@@ -56,9 +57,17 @@ describe('relativiseUnderProject (#394)', () => {
     let projectRoot: string;
 
     beforeAll(() => {
-      // `realpathSync` on macOS resolves /var → /private/var, so mkdtemp's own path is already
+      // `canonicalPath` on macOS resolves /var → /private/var, so mkdtemp's own path is already
       // a symlinked one — exactly the shape this guards against.
-      tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pickpath-')));
+      //
+      // ⚠️ **Seeded with the SAME canonicaliser as the subject** (docs/windows.md § Paths, #878).
+      // `realDir` moved to `canonicalPath` (`.native`) in #881, and `fs.realpathSync` — the JS walk
+      // — disagrees with it on an **8.3 SHORT path**, which is what `mkdtemp` under `%TEMP%`
+      // routinely returns on Windows: the walk leaves it short, `.native` expands it to the long
+      // form. Seeding with the walk would build every expectation below from the short spelling
+      // while the subject returned the long one, reddening `ci/main`'s windows leg and nothing
+      // this Mac can run. That is exactly how `deviceClaimBuildGuard.test.ts` died in #878.
+      tmp = canonicalPath(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pickpath-')));
       projectRoot = path.join(tmp, 'real', 'court');
       fs.mkdirSync(path.join(projectRoot, 'art'), { recursive: true });
       fs.writeFileSync(path.join(projectRoot, 'art', 'icon.png'), 'x');

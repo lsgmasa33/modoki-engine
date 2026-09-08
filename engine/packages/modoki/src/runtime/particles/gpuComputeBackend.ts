@@ -28,7 +28,7 @@ import {
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
   positionLocal, normalLocal,
 } from 'three/tsl';
-import { renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
+import { resolveTiles, renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
 import { resolveCollider } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
@@ -36,6 +36,7 @@ import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
 import { poolRevealDue } from './gpuPoolReveal';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
+import { resolveQuadShift, computeQuadCorners, applyQuadInPlace } from './spriteBillboard';
 import { textureProvider } from '../core/textureProvider';
 import { rawNow } from '../core/clock';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -57,6 +58,85 @@ interface GPUQueueLike { onSubmittedWorkDone(): Promise<void> }
 /** Minimal view of the renderer used to dispatch compute passes. */
 interface ComputeRenderer { compute(node: unknown): void; }
 
+/** The four per-particle storage buffers a pool owns, held so they can be FREED (#717).
+ *  Before this they were locals in `build()`, reachable only from the TSL closures that
+ *  captured them — so `dispose()` ran cleanly, reported success, and freed none of them. */
+interface PoolBuffers { pos: LooseBuf; vel: LooseBuf; meta: LooseBuf; spin: LooseBuf }
+
+/**
+ * Reuse an existing pool buffer, or mint a fresh one — preserving the EXACT type the fresh
+ * branch infers. Not cosmetic: the TSL kernel below is written against these types, and both
+ * obvious spellings break it.
+ *  - A bare ternary widens to a UNION (`StorageBufferNode<'vec3'> | StorageBufferNode<'uvec4'>`,
+ *    since `ReturnType<typeof instancedArray>` defaults to uvec4 — the "one wrong instantiation"
+ *    `LooseBuf`'s comment describes), and every `.element(i)` overload stops matching.
+ *  - Annotating them `LooseBuf`/`any` instead collapses inference DOWNSTREAM: the first typed
+ *    call an `any` flows into re-types it (`sign(local)` -> `Node<'float'>`), so `sgn.y`/`sgn.z`
+ *    stop resolving inside the box-collision branch.
+ * This keeps the pre-#717 inferred types identical, so the kernel is untouched by the fix.
+ */
+function reuseOrMake<T>(reuse: boolean, prev: LooseBuf, make: () => T): T {
+  return reuse ? (prev as T) : make();
+}
+
+/**
+ * Free the GPU storage behind one `instancedArray` node.
+ *
+ * ⚠️ **three r0.184 exposes NO public API for this, and that is the whole reason #717 existed.**
+ * `instancedArray(count, type)` returns a `StorageBufferNode` whose `.value` is a
+ * `StorageInstancedBufferAttribute`. The only route to `GPUBuffer.destroy()` is
+ * `Attributes.delete(attr)` -> `backend.destroyAttribute(attr)` -> `attributeUtils.destroyAttribute`
+ * (`three/src/renderers/common/Attributes.js`), and `Renderer` has no `attributes` getter — the
+ * field is private `_attributes`. So this reaches a private field on purpose.
+ *
+ * Why the obvious alternatives do NOT work, each checked in three's source rather than assumed:
+ *  - `mesh.geometry.dispose()` cannot reach them. `Geometries.initGeometry`'s `onDispose` deletes
+ *    only `renderObject.getAttributes()` and the index; these are STORAGE bindings, never geometry
+ *    attributes (`buildMesh` sets only position/uv/index).
+ *  - `computeNode.dispose()` cannot reach them either. `Renderer.compute()` registers a dispose
+ *    listener that drops the PIPELINE, the bind groups and the node cache — `Bindings.deleteForCompute`
+ *    calls `backend.deleteBindGroupData`, which frees the binding, not the buffer behind it.
+ *
+ * Guarded at every hop and never throws: `_attributes` is three-internal and has moved before, and
+ * a failure here must degrade to "the buffer is not freed", never to a broken teardown.
+ * If a future three release adds a public free, replace the body — the call sites stay.
+ */
+function freeStorageBuffer(renderer: ComputeRenderer | null, buf: LooseBuf): void {
+  const attr = (buf as { value?: unknown } | null | undefined)?.value;
+  if (!attr || !renderer) return;
+  const attrs = (renderer as unknown as { _attributes?: { delete(a: unknown): unknown } })._attributes;
+  // ⚠️ SAY SO when the reach stops working. Without this the failure mode is the EXACT defect this
+  // function exists to fix, one level up: a three upgrade renames or `#`-privatises `_attributes`,
+  // every free silently becomes a no-op, `verify` stays green (the unit test supplies `_attributes`
+  // by construction, so it cannot catch this), and nothing in the logs changes. The public
+  // cross-check is `renderer.info.memory.storageAttributes` — the counter the #717 arms used.
+  if (!attrs) {
+    warnVocabOnce('particles', 'renderer._attributes', 'missing',
+      'GPU particle storage buffers CANNOT be freed on this three version (#717) — check renderer.info.memory.storageAttributes for unbounded growth');
+    return;
+  }
+  try { attrs.delete(attr); } catch { /* never let a teardown fail on a three-internal shape change */ }
+}
+
+/** Free all four of a pool's storage buffers. No-op when the pool was never drawn (renderer
+ *  null) — nothing was uploaded, so there is nothing on the GPU to release. */
+function freePoolBuffers(renderer: ComputeRenderer | null, bufs: PoolBuffers | null): void {
+  if (!bufs) return;
+  freeStorageBuffer(renderer, bufs.pos);
+  freeStorageBuffer(renderer, bufs.vel);
+  freeStorageBuffer(renderer, bufs.meta);
+  freeStorageBuffer(renderer, bufs.spin);
+}
+
+/** Dispose a ComputeNode, dropping its compute pipeline + bind groups.
+ *  `Renderer.compute()` wires the listener that does this (`Renderer.js`, the `dispose` closure
+ *  registered on first dispatch), so a node that was never dispatched simply has no listener and
+ *  this is inert — which is why it is safe to call unconditionally. */
+function disposeComputeNode(node: ComputeNodeT | null): void {
+  try { (node as { dispose?: () => void } | null)?.dispose?.(); }
+  catch { /* teardown must not fail on a node three never registered */ }
+}
+
 const TAU = Math.PI * 2;
 const DEG2RAD = Math.PI / 180;
 // Reused scratch for resolving scalar/vector gravity into a vec3 in applyUniforms (no per-call alloc).
@@ -71,7 +151,10 @@ const SHAPE: Record<EmitterShapeType, number> = { point: 0, cone: 1, sphere: 2, 
 const COLL = { none: 0, kill: 1, bounce: 2 } as const;
 const COLLIDER = { plane: 0, sphere: 1, box: 2, cylinder: 3 } as const;
 
-// Storage-buffer nodes are only consumed via `.toAttribute()` in the render builder.
+// Storage-buffer nodes are consumed via `.element(instanceIndex)` in both the compute kernels
+// and the render builder — a storage BINDING, not a vertex attribute. (This said `.toAttribute()`
+// until #717; that reading is what makes the buffers look like something `geometry.dispose()`
+// would free, and it does not.)
 // @types/three resolves `ReturnType<typeof instancedArray>` to one (wrong) instantiation
 // so the per-buffer types (vec3/float) don't match the params — keep them loose.
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
@@ -179,6 +262,10 @@ interface GpuEntry {
   lut: OverLifeLUT | null;
   computeInit: ComputeNodeT | null;
   computeUpdate: ComputeNodeT | null;
+  /** The pool's four storage buffers (#717). Held on the entry so `dispose()` and the rebuild
+   *  path can FREE them — nothing else can reach them, since the TSL closures that read them
+   *  are the only other reference. Null until the first `build()`. */
+  bufs: PoolBuffers | null;
   count: number;
   playing: boolean;
   inited: boolean;
@@ -299,7 +386,7 @@ export class GpuComputeBackend implements IParticleBackend {
     group.matrixAutoUpdate = false;
     const entry: GpuEntry = {
       id, def, group, mesh: null, u: makeUniforms(), lut: null,
-      computeInit: null, computeUpdate: null, count: Math.max(1, def.maxParticles),
+      computeInit: null, computeUpdate: null, bufs: null, count: Math.max(1, def.maxParticles),
       playing: true, inited: false, revealed: false, framesSinceInit: 0, readyToken: 0,
       textureRef: def.render.mode === 'mesh' ? '' : (def.render.texture ?? ''), texture: null, renderer: null,
       awaitingTexture: false, textureDeadline: 0,
@@ -318,22 +405,42 @@ export class GpuComputeBackend implements IParticleBackend {
 
   /** Allocate storage buffers, compute kernels, LUTs and the render mesh for `def`. */
   private build(entry: GpuEntry, def: ParticleEffectDef): void {
-    if (entry.mesh) this.disposeMesh(entry.mesh);
-    entry.lut?.dispose();
+    // Captured, not disposed, here — see the "free what this rebuild superseded" block below,
+    // which frees the old mesh (and LUT) LAST, after the replacements are built and assigned.
+    const prevMesh = entry.mesh;
+    const prevLut = entry.lut;
 
     const count = Math.max(1, def.maxParticles);
+    // Captured BEFORE `entry.count` is overwritten — the reuse decision is "is the new count the
+    // same as the one the existing buffers were sized for?", which is unanswerable afterwards.
+    const prevBufs = entry.bufs;
+    const prevInit = entry.computeInit;
+    const prevUpdate = entry.computeUpdate;
+    // REUSE rather than reallocate when the pool size is unchanged (#717). This is the common
+    // case by a wide margin and it is what makes the editor cheap: `maxParticles` is only ONE
+    // field of `renderBuildKey`, so every blend / tiles / sprite-mode / texture change also
+    // lands here with an identical `count` (aspect/anchor/offset changes no longer reach
+    // `build()` at all — see `renderQuadKey` and the in-place applier in `setDef`, #769).
+    // Measured on `games/3d-test` before this change: 12 blend toggles at 15k particles
+    // allocated 48 storage buffers totalling 9.36 MB, none of it ever freed.
+    // Safe because a rebuild re-inits the pool regardless — `entry.inited = false` below makes
+    // `ensurePoolReady` dispatch `computeInit`, which respawns every slot, so no stale
+    // particle state survives into the new definition.
+    const reuseBufs = prevBufs !== null && entry.count === count;
     entry.count = count;
     const u = entry.u;
     applyUniforms(u, def);
 
     // ── storage buffers ──
-    // pos/meta are read by the render shader (via toAttribute); the rest are compute-only.
+    // pos/meta are read by the render shader (via `.element(instanceIndex)`); the rest are
+    // compute-only. All four are storage bindings — see the note on `freeStorageBuffer`.
     // meta packs (age, life, size, rot) into one vec4 so render needs only 2 instanced
     // vertex attributes (pos + meta) — staying well under WebGPU's 8 vertex-buffer cap.
-    const posBuf = instancedArray(count, 'vec3');
-    const velBuf = instancedArray(count, 'vec3');
-    const metaBuf = instancedArray(count, 'vec4'); // x=age, y=life, z=size, w=rot
-    const spinBuf = instancedArray(count, 'float');
+    const posBuf = reuseOrMake(reuseBufs, prevBufs?.pos, () => instancedArray(count, 'vec3'));
+    const velBuf = reuseOrMake(reuseBufs, prevBufs?.vel, () => instancedArray(count, 'vec3'));
+    const metaBuf = reuseOrMake(reuseBufs, prevBufs?.meta, () => instancedArray(count, 'vec4')); // x=age, y=life, z=size, w=rot
+    const spinBuf = reuseOrMake(reuseBufs, prevBufs?.spin, () => instancedArray(count, 'float'));
+    entry.bufs = { pos: posBuf, vel: velBuf, meta: metaBuf, spin: spinBuf };
 
     // Per-invocation RNG. Each draw hashes a DISTINCT linear mix of instanceIndex + a salt
     // (+ time, so a slot's successive respawns differ). Critically, every hash argument
@@ -615,6 +722,30 @@ export class GpuComputeBackend implements IParticleBackend {
     entry.revealed = false;
     entry.framesSinceInit = 0;
     entry.readyToken++;
+
+    // ── free what this rebuild superseded (#717) ──
+    // LAST, deliberately — after the replacements are built and assigned, never before.
+    // `Pipelines.delete` decrements `usedTimes` and releases the compute PROGRAM when it hits
+    // zero, so disposing the old nodes first would drop a program the new (byte-identical, when
+    // nothing structural changed) kernel is about to ask for, forcing a needless recompile.
+    // Note the ordering only mitigates: `pipelines.has(computeNode)` is populated at DISPATCH
+    // time, not here, so the new nodes are not registered yet either way — this costs nothing
+    // and is the correct discipline.
+    // `disposeMesh` belongs in this set too (#769): its material carries a render pipeline with
+    // the exact same `usedTimes` bookkeeping, so disposing the OLD mesh before the new one is
+    // built and assigned risks dropping a pipeline the replacement (byte-identical, when nothing
+    // render-relevant changed) is about to ask for — the same needless recompile as the compute
+    // nodes. As with those, the ordering only mitigates: a render pipeline is registered in
+    // `Pipelines.getForRender` at DRAW time, not at mesh construction, so the new mesh has not
+    // acquired the pipeline yet either way when the old one is disposed here — this costs nothing
+    // and is the correct discipline, but it does not by itself keep `usedTimes` off zero.
+    disposeComputeNode(prevInit);
+    disposeComputeNode(prevUpdate);
+    if (prevMesh) this.disposeMesh(prevMesh);
+    prevLut?.dispose();
+    // Only when the pool was actually reallocated. On the reuse path `prevBufs` IS `entry.bufs`
+    // and freeing it would destroy the buffers the new kernel just captured.
+    if (!reuseBufs) freePoolBuffers(entry.renderer, prevBufs);
   }
 
   private buildMesh(
@@ -626,17 +757,16 @@ export class GpuComputeBackend implements IParticleBackend {
     // `instanceIndex`). Per-particle state is read from the storage buffers via
     // `.element(instanceIndex)` — a read-only storage binding, not a vertex attribute, so it
     // sidesteps WebGPU's 8 vertex-buffer cap and reads exactly what the compute pass wrote.
-    // `aspect` (width/height) makes a non-square billboard; per-instance scale drives
-    // the height, so the quad is (aspect × 1) — matches a non-square sprite-sheet cell.
-    const aspect = def.render.aspect && def.render.aspect > 0 ? def.render.aspect : 1;
+    // `aspect` (width/height) makes a non-square billboard; per-instance scale drives the
+    // height, so the quad is (aspect × 1) — matches a non-square sprite-sheet cell. index/uv
+    // come from a throwaway PlaneGeometry (invariant under aspect/anchor/offset); position is
+    // built from computeQuadCorners so this build and applyQuadInPlace's in-place rewrite
+    // (setDef, on a bare aspect/anchor/offset change) derive the same 12 floats (#769).
+    const { aspect, shiftX, shiftY } = resolveQuadShift(def.render);
     const src = new THREE.PlaneGeometry(aspect, 1);
-    // Anchor + offset baked into the quad (units of size; scaleNode multiplies later).
-    const shiftX = def.render.offset?.[0] ?? 0;
-    const shiftY = (def.render.anchor === 'bottom' ? 0.5 : 0) + (def.render.offset?.[1] ?? 0);
-    if (shiftX !== 0 || shiftY !== 0) src.translate(shiftX, shiftY, 0);
     const geo = new THREE.InstancedBufferGeometry();
     geo.index = src.index ? src.index.clone() : null;
-    geo.setAttribute('position', src.attributes.position.clone());
+    geo.setAttribute('position', new THREE.BufferAttribute(computeQuadCorners(aspect, shiftX, shiftY), 3));
     geo.setAttribute('uv', src.attributes.uv.clone());
     src.dispose();
     geo.instanceCount = count;
@@ -660,8 +790,8 @@ export class GpuComputeBackend implements IParticleBackend {
     let opacityExpr = u.startOpacity.mul(scalar.g).mul(scalar.b);
 
     if (tex) {
-      const tx = Math.max(1, Math.floor(def.render.tilesX ?? 1));
-      const ty = Math.max(1, Math.floor(def.render.tilesY ?? 1));
+      const tx = resolveTiles(def.render.tilesX);
+      const ty = resolveTiles(def.render.tilesY);
       let sampleUv: ReturnType<typeof vec2> = uv();
       if (tx > 1 || ty > 1) {
         const tileCount = tx * ty;
@@ -825,8 +955,11 @@ export class GpuComputeBackend implements IParticleBackend {
    *  such queue — and a lost device or a browser without `onSubmittedWorkDone` would otherwise
    *  leave the pool hidden forever. Capability-checked, and the counter still runs underneath.
    *
-   *  ⚠️ The token compare is load-bearing. `build()` mints fresh buffers and re-hides, so a promise
-   *  armed for the pool that was just discarded must not reveal the one that replaced it — that
+   *  ⚠️ The token compare is load-bearing, and note it does NOT depend on the buffers being fresh.
+   *  Since #717 `build()` REUSES the storage buffers when `count` is unchanged, so the replacement
+   *  pool can occupy the very same buffers; what makes the old promise stale is that `build()`
+   *  re-inits and re-hides, not that it reallocated. A promise armed for the pool that was just
+   *  discarded must not reveal the one that replaced it — that
    *  would draw full instance count against buffers whose own dispatch has not landed, i.e. the
    *  exact defect this file exists to prevent, reintroduced through a stale closure. */
   private revealWhenGpuWorkDone(e: GpuEntry): void {
@@ -905,19 +1038,22 @@ export class GpuComputeBackend implements IParticleBackend {
       || !!e.def.collision?.invert !== !!def.collision?.invert;
     // Sprite-sheet playback (mode/cycles/random-start) is baked into the render shader on the
     // GPU path, so changing it needs a rebuild. (The CPU sim computes the frame live, so it
-    // doesn't — hence this stays out of the shared renderStructuralKey.)
+    // doesn't — hence this stays out of the shared renderBuildKey.)
     const o = e.def.render, n = def.render;
     const spriteChanged =
       (o.spriteMode ?? 'once') !== (n.spriteMode ?? 'once') ||
       (o.spriteCycles ?? 1) !== (n.spriteCycles ?? 1) ||
       (o.spriteRandomStart ?? false) !== (n.spriteRandomStart ?? false);
     const structural =
-      renderStructuralKey(def) !== renderStructuralKey(e.def) ||
+      renderBuildKey(def) !== renderBuildKey(e.def) ||
       wantForces !== hadForces ||
       wantColl !== hadColl ||
       (wantColl && shapeChanged) ||
       spriteChanged ||
       texChanged;
+    // Compared against the OLD def, before it's overwritten below — a bare aspect/anchor/
+    // offset edit is applied to the existing quad in place (#769), never a rebuild.
+    const quadChanged = !structural && renderQuadKey(def) !== renderQuadKey(e.def);
     e.def = def;
     if (texChanged) { releaseTexture3D(e.texture); e.textureRef = newTexRef; e.texture = null; } // shared, refcounted (F3) — release
     if (structural) {
@@ -940,6 +1076,11 @@ export class GpuComputeBackend implements IParticleBackend {
     } else {
       applyUniforms(e.u, def);
       e.lut?.update(def);
+      // Mesh mode reads none of the quad-key fields (buildMeshParticles never touches
+      // aspect/anchor/offset) — a change there is a no-op, not a rebuild.
+      if (quadChanged && def.render.mode !== 'mesh' && e.mesh) {
+        if (!applyQuadInPlace(e.mesh.geometry, def.render)) this.build(e, def); // shape guard failed — refuse a partial write
+      }
     }
   }
 
@@ -996,6 +1137,13 @@ export class GpuComputeBackend implements IParticleBackend {
     if (e.mesh) this.disposeMesh(e.mesh);
     e.lut?.dispose();
     releaseTexture3D(e.texture); e.texture = null; // shared, refcounted (F3) — release on teardown
+    // The four storage buffers + both compute kernels (#717). Nothing else frees these: they are
+    // storage bindings, so neither `disposeMesh`'s geometry.dispose() nor the material dispose
+    // reaches them, and before this an emitter that spawned and despawned leaked
+    // count*13*4 bytes of GPU storage permanently (13, not 11 — WebGPU pads each vec3 to 16 B).
+    disposeComputeNode(e.computeInit); e.computeInit = null;
+    disposeComputeNode(e.computeUpdate); e.computeUpdate = null;
+    freePoolBuffers(e.renderer, e.bufs); e.bufs = null;
     this.entries.delete(handle.id);
   }
 

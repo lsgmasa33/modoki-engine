@@ -27,6 +27,7 @@
  *  WebGL2, so it is present wherever the engine's WebGL2 backend is. */
 
 import { rawNow } from '../core/clock';
+import { withTimeout } from '../core/abandonment';
 
 /** How long to wait for one submit to complete before declaring the clock unusable. Generously
  *  above the ramp's own `ABORT_FRAME_MS` (250) — this bounds a WEDGED fence, not a slow one. */
@@ -68,7 +69,15 @@ export function makeGpuClock(renderer: unknown): GpuClock | null {
       async awaitCompletion() {
         const started = rawNow();
         try {
-          await withTimeout(device.queue.onSubmittedWorkDone(), COMPLETION_TIMEOUT_MS);
+          await withTimeout(
+            device.queue.onSubmittedWorkDone(),
+            COMPLETION_TIMEOUT_MS,
+            'GPU clock (WebGPU onSubmittedWorkDone)',
+            // A late completion is a stale GPU duration for a measurement this call has already
+            // abandoned — it owns nothing (no resource to release) and nothing downstream is
+            // still waiting on it, so there is nothing to adopt or dispose of.
+            { discard: 'a late GPU duration for an already-abandoned measurement owns nothing' },
+          );
         } catch { return null; }
         return rawNow() - started;
       },
@@ -106,15 +115,4 @@ export function makeGpuClock(renderer: unknown): GpuClock | null {
   }
 
   return null;
-}
-
-/** Reject if `p` has not settled in `ms`. The timer is CLEARED on the happy path — an uncancelled
- *  one is exactly the bug that made this workstream believe in a phantom 8-second WebGPU timeout
- *  for a whole session (see `gpuDetect.ts`). */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('gpu clock timeout')), ms); }),
-  ]).finally(() => clearTimeout(timer)) as Promise<T>;
 }

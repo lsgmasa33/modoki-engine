@@ -1,7 +1,7 @@
 import { trait } from 'koota';
 import {
-  makeAxes, makeFlags, makePointer,
-  type Axis, type DigitalAction, type InputDevice, type InputFrame, type PointerFrame,
+  makeAxes, makeFlags, makePointer, makeGesture,
+  type Axis, type DigitalAction, type GestureFrame, type InputDevice, type InputFrame, type PointerFrame,
 } from '../core/inputActions';
 import type { World } from 'koota';
 // The sanctioned wall-clock wrapper (see the determinism guard): prediction is a PRESENTATION
@@ -31,6 +31,7 @@ export const Input = trait(() => ({
   pressed: makeFlags(),
   released: makeFlags(),
   pointer: makePointer(),
+  gesture: makeGesture(),
   lastDevice: 'none' as InputDevice,
 }));
 
@@ -82,6 +83,34 @@ export function pointerDrag(world: World): { x: number; y: number } {
   const p = getInput(world)?.pointer ?? ZERO_POINTER;
   return { x: p.dragX, y: p.dragY };
 }
+
+// ── Gesture accessors (pan / pinch / tap) ─────────────────────────────────────
+// Multi-touch, from `gestureSource`. Distinct from the pointer accessors above: those report the
+// ONE primary pointer, these report the shape of every live finger. See `GestureFrame`.
+
+const ZERO_GESTURE: GestureFrame = makeGesture();
+
+/** The full gesture snapshot. */
+export function gesture(world: World): GestureFrame { return getInput(world)?.gesture ?? ZERO_GESTURE; }
+/** Whether a two-finger pinch is live. */
+export function pinching(world: World): boolean { return getInput(world)?.gesture.pinching ?? false; }
+/** Pinch spread RATIO against the distance the gesture started at (1 = unchanged). */
+export function pinchScale(world: World): number { return getInput(world)?.gesture.pinchScale ?? 1; }
+/** Pinch spread ratio against the PREVIOUS frame — multiply into a zoom you already hold. */
+export function pinchScaleDelta(world: World): number { return getInput(world)?.gesture.pinchScaleDelta ?? 1; }
+/** Pan movement this frame, presentation-scaled like `pointerDrag`. {0,0} unless panning/pinching. */
+export function panDelta(world: World): { x: number; y: number } {
+  const g = getInput(world)?.gesture ?? ZERO_GESTURE;
+  return { x: g.panX, y: g.panY };
+}
+/** Edge: a tap completed this frame (short press that never left the slop radius). */
+export function gestureTapped(world: World): boolean { return getInput(world)?.gesture.tapped ?? false; }
+/** Where the tap went down. Only meaningful on the frame `gestureTapped` is true. */
+export function gestureTapPos(world: World): { x: number; y: number } {
+  const g = getInput(world)?.gesture ?? ZERO_GESTURE;
+  return { x: g.tapX, y: g.tapY };
+}
+
 // ── Latency compensation ──────────────────────────────────────────────────────
 /**
  * How far ahead `pointerPredictedPos` extrapolates, in milliseconds.

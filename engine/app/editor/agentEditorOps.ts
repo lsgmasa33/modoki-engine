@@ -29,11 +29,14 @@ import {
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  getPendingBaseScenePaths,
+  getLastSceneLoadFailureMessage,
   isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets, flushDirtyAssets,
+  applyAssetPathMoves, type PathMove,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
@@ -46,6 +49,7 @@ import {
   getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
+  readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
   probeKeyReach,
   DEVICE_PRESETS, findPresetByName, makeCustomPreset, validateCustomSize,
@@ -59,9 +63,11 @@ import {
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
+  getAnimSet, getSpriteMaterialProgram, isGuid,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
+  sceneManager, assetUrl, type AssetSchemaType,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -151,23 +157,50 @@ function gpuFields(): { gpu?: ReturnType<typeof getGpuFaultState> } {
  *
  *    Reported only when `free`, because a fixed device's `logical` IS the answer; and only when
  *    mounted, because nothing has measured the area otherwise.
+ *
+ *  - **`panelSize` when COLLAPSED** (#688) — and the same mistake once more, from a third side.
+ *    `gameAreaSize` is adopted by an always-on observer with no zero test, while its own sibling
+ *    observer 26 lines below in `GameView.tsx` DOES guard `width <= 0 || height <= 0`. So a
+ *    mounted-but-collapsed panel answered `panelSize: {0, 0}` with `panelMounted: true` and no
+ *    note — the exact shape the `mounted` bullet above calls "worse than not reporting it at all".
+ *
+ *    ⚠️ The fix is deliberately NOT the sibling's guard. Skipping a zero there keeps the LAST GOOD
+ *    size, which trades a degenerate answer for a stale one — and by this doc block's own standard
+ *    (the `panelSize` bullet: "Stale in precisely the transition it was added for") stale presented
+ *    as live is the worse of the two. Omitting the field plus a note reuses the shape already
+ *    proven for the unmounted case: absence an agent can see, with prose saying why.
  */
 function describeGameView() {
   const s = useEditorStore.getState();
   const sel = describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation);
   const panelMounted = s.gameViewMounted;
+  // COLLAPSED IS NOT UNMOUNTED (#688). A Game panel dragged to a zero-height splitter, or one
+  // whose tabset is squeezed flat by maximising another panel, stays mounted and keeps rendering
+  // — so `panelMounted` is honestly `true` — while `gameAreaSize` goes to {0,0}. See the note
+  // below on why this is omitted rather than floored to the last good value.
+  const panelCollapsed = panelMounted && (s.gameAreaSize.width <= 0 || s.gameAreaSize.height <= 0);
   return {
     ...sel,
-    ...(sel.free && panelMounted
+    ...(sel.free && panelMounted && !panelCollapsed
       ? { panelSize: { w: s.gameAreaSize.width, h: s.gameAreaSize.height } }
       : {}),
     panelMounted,
-    ...(panelMounted ? {} : {
+    ...(!panelMounted ? {
       panelNote: 'The Game panel is NOT mounted, so nothing derived from this selection has moved — '
         + 'the preview size, safe-area insets and letterbox rect all still describe the previous '
         + 'state. Open (and SELECT) the Game tab before attributing any layout measurement to this '
         + 'screen: an unselected tab does not mount.',
-    }),
+    } : panelCollapsed ? {
+      panelNote: 'The Game panel is mounted but COLLAPSED to zero area. Anything derived from its '
+        + 'extent — a capture size, a letterbox rect, an aim inside the preview — is unusable until '
+        + 'the panel is given room: drag its splitter open, or un-maximise whichever panel is '
+        + 'squeezing it — or, if the editor has only just started, the panel has MOUNTED but not '
+        + 'yet been measured (the store seeds this size to zero), in which case simply read again. '
+        + 'On a FREE screen `panelSize` is omitted for this reason rather than '
+        + 'reported as {0, 0}; on a fixed device `logical` is still the screen being emulated and '
+        + 'stays correct, but it no longer describes anything visible. This is NOT the same as '
+        + 'unmounted: the panel is live and still rendering.',
+    } : {}),
   };
 }
 
@@ -216,10 +249,24 @@ function readEditorState() {
     // mutate_scene, build) is looking at a DIFFERENT world while this is true. (C7)
     // Also true while a dirty asset (below) is pending — see hasUnsavedChanges()'s own comment.
     unsavedChanges: hasUnsavedChanges(),
-    // Pending 'manual'-mode particle/anim/timeline writes (mcp-persistence.md
+    // Pending 'manual'-mode writes to any ASSET_SCHEMA_TYPES doc (mcp-persistence.md
     // Phase 3) — omitted when empty (nothing pending has nothing to show). A dirty asset an
     // agent can't SEE is the same silent-loss trap `unsavedChanges` already exists to close.
     ...(getDirtyAssetPaths().length ? { dirtyAssetPaths: getDirtyAssetPaths() } : {}),
+    // #844 — ADDITIVE, alongside `unsavedChanges`/`dirtyAssetPaths` above, never replacing them:
+    // `modoki_persistence`'s tool text points agents at `dirtyAssetPaths` for wire compatibility,
+    // and `guardUnsaved` (load-scene/new-scene, below) already has its own cause-naming logic. This
+    // is the SAME `unsavedChangeCauses()` surfaced for the two OTHER refusal sites that used to
+    // blame a fixed "create_entity / duplicate_entity / prefab" string regardless of the real
+    // cause (editorBackendRouter.ts's `/api/scene-mutate` guard, and modoki_build's
+    // `unsavedChangesWarning`) — both read `get_editor_state` and had no cause to name until now.
+    // Omitted when clean, matching `dirtyAssetPaths`'s omit-when-empty convention above.
+    ...(hasUnsavedChanges() ? { unsavedCauses: unsavedChangeCauses() } : {}),
+    // Pending `baseScene` refs set in the Scene inspector on a scene the editor has NOT loaded
+    // (#831) — omitted when empty, same rule. Reported separately from `dirtyAssetPaths` because
+    // they are a different KIND of pending write (a single-field scene mutation, not a document)
+    // and `discard_asset_edits` does not reach them.
+    ...(getPendingBaseScenePaths().length ? { pendingBaseScenes: getPendingBaseScenePaths() } : {}),
     playState: getPlayState(),
     runMode: getRunMode(),   // 'stopped' | 'scrub' | 'preview' | 'playing' (preview-mode-refactor)
     advancing: isAdvancing(), // false = a frozen frame (Play paused, or a paused preview)
@@ -230,7 +277,7 @@ function readEditorState() {
     // two views publish DIFFERENT interaction handles, so without it "why does modoki_handles
     // editor=curves return nothing" is answerable only from a screenshot — an empty list is
     // otherwise indistinguishable from a clip with no tangents (#369). Set with
-    // modoki_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
+    // modoki_set_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
     // it is the single most-read field here, and every caller written against it stays correct.
     animationViewMode: s.animationViewMode,
     // The same answer WITH its qualifiers — see describeAnimationView. `animationViewMode` alone
@@ -239,7 +286,7 @@ function readEditorState() {
     // Which screen the Game panel is previewing at. Reported so a layout measurement can be
     // ATTRIBUTED to a screen size — without it, "the HUD overlaps the notch" is unfalsifiable,
     // since the reader cannot tell which device produced it (#367). Set with
-    // modoki_game_view_device; the full catalog is modoki_game_view_devices.
+    // modoki_set_game_view_device; the full catalog is modoki_game_view_devices.
     gameView: describeGameView(),
     // Which panel owns the KEYBOARD ('scene' | 'hierarchy' | 'animation-editor' | …), or null.
     // Readable as DATA on purpose: the focus ring is a CSS box-shadow, so without this the
@@ -250,7 +297,8 @@ function readEditorState() {
     // `set-focus-scope` can see what it may focus instead, without a second round trip (#301).
     openPanels: s.openPanels,
     // HMR staleness. `staleGameCode: true` means game code changed on disk but the editor
-    // could NOT reload (unsaved scene work), so this world is running the OLD build —
+    // could NOT reload (unsaved work of any kind, not only scene edits — #850), so this world
+    // is running the OLD build —
     // every measurement taken here is suspect until it reloads. `hmrUpdates` is how many
     // hot updates have landed since boot; 0 means "nothing has changed under me". Exposed
     // as DATA because the failure mode is otherwise SILENT — neither a human nor an agent
@@ -471,7 +519,7 @@ function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: stri
  *     then block the file-direct routes over an edit that no longer exists. */
 function pushAssetUndo<T>(
   label: string, before: T | null | undefined, after: T, apply: (def: T) => void,
-  path: string, type: 'particle' | 'animation' | 'timeline',
+  path: string, type: AssetSchemaType,
 ): void {
   // No prior def means this is the FIRST write to that asset — there is no state to revert TO, so
   // an entry would be a lie about what undo can do. The write itself still stands.
@@ -1105,7 +1153,7 @@ export function registerEditorAgentOps(): void {
         free: p.logicalW <= 0,
       })),
       note: "Sizes are LOGICAL (CSS points) unless named physical; layout math runs in logical space. "
-        + "Set one with modoki_game_view_device {device, orientation}, or give an explicit "
+        + "Set one with modoki_set_game_view_device {device, orientation}, or give an explicit "
         + '{logicalWidth, logicalHeight} for a size the catalog does not carry.',
     };
   });
@@ -1485,13 +1533,22 @@ export function registerEditorAgentOps(): void {
     // fixed string blamed only the first: an agent whose pending work was a dirty
     // particle/anim/timeline doc was sent looking for live entities it had never created. Both
     // clear with save_all; the difference is what `discardUnsaved:true` would discard.
-    const { sceneDirty, dirtyAssetPaths, dirtyScenes } = unsavedChangeCauses();
+    const { sceneDirty, dirtyAssetPaths, dirtyScenes, pendingBaseScenes, pendingImportSettings } = unsavedChangeCauses();
     const causes: string[] = [];
     if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
     if (dirtyAssetPaths.length) causes.push(`${dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${dirtyAssetPaths.join(', ')}`);
     // Third cause: a non-primary loaded scene still dirty (a base whose write failed in a
     // partial save_all). Without it a refusal driven by this alone would name no cause.
     if (dirtyScenes.length) causes.push(`${dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+    // Fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene the editor has
+    // not loaded. It is neither a live-world edit nor an asset document, so before this row a
+    // refusal driven by it alone named no cause at all — S3.11's failure, one population later.
+    if (pendingBaseScenes.length) causes.push(`${pendingBaseScenes.length} pending base-scene ref(s) awaiting a save: ${pendingBaseScenes.join(', ')}`);
+    // Fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked instead
+    // of written immediately. Same S3.11 reasoning as the fourth cause — it is neither a live-world
+    // edit nor an ASSET_SCHEMA_TYPES document, so without its own row a refusal driven by it alone
+    // would name no cause at all.
+    if (pendingImportSettings.length) causes.push(`${pendingImportSettings.length} pending import-setting edit(s) awaiting a save: ${pendingImportSettings.join(', ')}`);
     throw new Error(
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
       `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
@@ -1503,14 +1560,56 @@ export function registerEditorAgentOps(): void {
     const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
     guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
-    const ok = await loadScene(path);
-    if (!ok) throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
-    return { ok, ...readEditorState() };
+    // Read BEFORE the load — `loadScene()` never gets far enough to change this on a
+    // refusal/failure, but capturing it up front (mirrors `agentBridge.ts`'s runtime twin,
+    // #486 finding A) lets the message say whether the PREVIOUS scene is still what's loaded,
+    // rather than assuming it.
+    const before = getCurrentScenePath();
+    const outcome = await loadScene(path);
+    if (outcome === 'refused' || outcome === 'failed') {
+      // Carry the ACTUAL reason (docs/format-versioning.md § 2b-bis / #784 phase C3) instead of
+      // guessing one — a too-new/unreadable scene is a REFUSAL, not a missing path, and the old
+      // hard-coded "does the path exist?" message was a wrong diagnosis for a right symptom.
+      const reason = getLastSceneLoadFailureMessage();
+      const cur = getCurrentScenePath();
+      const verb = outcome === 'refused' ? 'REFUSED' : 'FAILED';
+      const why = reason ?? (outcome === 'failed' ? 'the scene was not loaded (does the path exist?)' : 'its format version is not supported by this build');
+      const stillPrevious = cur === before;
+      throw new Error(
+        `load-scene ${verb} for "${path}": ${why}. ` +
+        (stillPrevious
+          ? `The previous scene is still loaded.`
+          : `The active scene is now "${cur ?? 'null'}" — the previous scene is NOT what is loaded, because another load swapped it in while this one was failing.`),
+      );
+    }
+    if (outcome === 'superseded') {
+      // A LATER load won the swap while ours was in flight (sceneManager.ts:885-900) — our own
+      // load did not fail, and this says nothing about whether `path` exists. Mirrors the
+      // runtime twin's wording (agentBridge.ts's `load-scene`, #486 finding A).
+      return {
+        ok: false,
+        superseded: true,
+        // `sceneManager.getCurrent()`, NOT `getCurrentScenePath()`. The editor's tracked path is
+        // written by the WINNING load's own tail, so at this instant it can still hold the
+        // pre-swap value — and naming a scene that is not the live world is the same class of
+        // untruth this reply exists to correct. The scene manager is the authority on which world
+        // is actually active.
+        error: `load-scene for "${path}" was superseded — a LATER scene load won the swap, and `
+          + `"${sceneManager.getCurrent()?.path ?? 'null'}" is now the active scene. This op's own `
+          + `load did not fail; this says nothing about whether "${path}" exists.`,
+        ...readEditorState(),
+      };
+    }
+    return { ok: true, ...readEditorState() };
   });
-  registerAgentOp('new-scene', (params) => {
+  registerAgentOp('new-scene', async (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
     guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
-    newScene();
+    // Async since #853 — `newScene` now swaps the world through SceneManager instead of
+    // respawning in place, so `onWorldSwap` fires and every id-keyed cache clears. It also
+    // REFUSES during prefab edit; that throw carries its own message and propagates as this
+    // op's error, the same shape `guardUnsaved` above uses.
+    await newScene();
     setSelectionRaw(null, []);
     return readEditorState();
   });
@@ -1555,13 +1654,17 @@ export function registerEditorAgentOps(): void {
     // succeeded: a dirty BASE scene that could not be serialized or written was previously just a
     // `console.error` + `continue`, and this returned `{ok:true}`. The edit then lived only in
     // memory, and a later build — which reads FILES — shipped without it, with nothing saying why.
-    // Two independent partial-failure channels, and the op reported ok:true through BOTH:
-    // other loaded SCENES (`r.failed`) and parked ASSET writes (`r.assets.failed`, e.g. a
-    // particle/anim def whose disk write was rejected — it stays pending and hasUnsavedChanges()
-    // stays true, but the agent was told the save succeeded).
+    // THREE independent partial-failure channels, and the op reported ok:true through all of
+    // them at one time or another: other loaded SCENES (`r.failed`), parked ASSET writes
+    // (`r.assets.failed`, e.g. a particle/anim def whose disk write was rejected — it stays
+    // pending and hasUnsavedChanges() stays true, but the agent was told the save succeeded), and
+    // — since #831 — pending base-scene refs (`r.baseScenes.failed`), which `/api/scene-mutate`
+    // can refuse on its own run-mode or unsaved-work guard and which are then RE-PARKED. The
+    // third was added with the field and not with the check, which is how the second one got here.
     const sceneFails = (r.failed ?? []).map((f) => `scene ${f.path} (${f.reason})`);
     const assetFails = (r.assets?.failed ?? []).map((f) => `asset ${f.path} (${f.error})`);
-    const allFails = [...sceneFails, ...assetFails];
+    const baseSceneFails = (r.baseScenes?.failed ?? []).map((f) => `base-scene ref on ${f.path} (${f.error})`);
+    const allFails = [...sceneFails, ...assetFails, ...baseSceneFails];
     if (allFails.length) {
       throw new Error(
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
@@ -1578,6 +1681,9 @@ export function registerEditorAgentOps(): void {
         // `saved:false` was the answer when the edit was parked, and this is where that promise
         // is kept.
         ...(r.assets?.saved.length ? { savedAssets: r.assets.saved } : {}),
+        // Same promise for the base-scene refs: `setBaseScene` through the Inspector answers
+        // "parked, not written", and this is where that is squared.
+        ...(r.baseScenes?.saved.length ? { savedBaseScenes: r.baseScenes.saved } : {}),
       };
     }
     if (r.reason === 'needs-path') {
@@ -1623,18 +1729,33 @@ export function registerEditorAgentOps(): void {
     }
     if (p.paths?.length && p.all) throw new Error('discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
     const r = discardDirtyAssets(p.all ? undefined : p.paths);
+    // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
+    // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
+    // that discards "everything" and then re-imports still bakes against the human's unsaved
+    // settings (#882). Say so rather than letting `all:true` imply a clean slate it did not
+    // deliver — §0 ranks a false success as the worst outcome on this surface. Reporting, NOT
+    // discarding: widening what this op destroys would be a blast-radius change nobody asked for,
+    // and `modoki_write_asset_meta {discardUnsaved:true}` is the named exit for a park.
+    const parkedMeta = getPendingMetaPaths();
     return {
       ok: true,
       ...r,
       remaining: getDirtyAssetPaths(),
+      ...(parkedMeta.length ? { remainingImportSettings: parkedMeta } : {}),
       // Say plainly what was NOT undone. The parked write is gone; the value the editor is showing
       // is not, and an agent that reads the def back and sees its own edit must not conclude the
       // discard failed.
-      note: r.discarded.length
+      note: (r.discarded.length
         ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
           + 'def first if you need the value reverted too.'
-        : 'Nothing was pending, so nothing changed.',
+        : 'Nothing was pending, so nothing changed.')
+        + (parkedMeta.length
+          ? ` NOT covered by this call: ${parkedMeta.length} parked import-settings edit(s) (.meta.json) `
+            + `are STILL pending — ${parkedMeta.join(', ')}. They live in a separate registry; `
+            + 'modoki_save_all flushes them, or modoki_write_asset_meta {discardUnsaved:true} drops '
+            + 'the one for the path it writes.'
+          : ''),
     };
   });
 
@@ -2276,9 +2397,17 @@ export function registerEditorAgentOps(): void {
     }
     let clip = getAnimationClip(p.clipPath) as AnimationClipDef | null;
     if (!clip) {
-      const res = await fetch(p.clipPath, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`cannot load clip ${p.clipPath}`);
-      clip = normalizeAnimationClip(await res.json());
+      // Route through `assetUrl` like every other asset reader (`animationClipCache.ts` included) —
+      // a raw `fetch(path)` resolves to the wrong URL under a non-"/" BASE_URL (sub-path hosting,
+      // the packaged editor's custom scheme). Catch a REJECTING fetch (network error, dev server
+      // down) the same as a `!res.ok` one: either way it unwinds past the live-cache peek below,
+      // and the fetch is only a cache-miss fallback — the panel opening this clip, or a concurrent
+      // agent op for the same path landing mid-flight, can populate the live cache with content
+      // that is NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      const res = await fetch(assetUrl(p.clipPath), { cache: 'no-store' }).catch(() => null);
+      const live = getAnimationClip(p.clipPath) as AnimationClipDef | null;
+      if (!res?.ok && !live) throw new Error(`cannot load clip ${p.clipPath}`);
+      clip = live ?? normalizeAnimationClip(await res!.json());
     }
     // Deep-copy tracks/keys so we don't mutate the cached clip in place.
     const next: AnimationClipDef = { ...clip, tracks: clip.tracks.map((t) => ({ ...t, keys: [...t.keys] })) };
@@ -2329,9 +2458,17 @@ export function registerEditorAgentOps(): void {
     }
     let def = getTimeline(p.timelinePath) as TimelineDef | null;
     if (!def) {
-      const res = await fetch(p.timelinePath, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`cannot load timeline ${p.timelinePath}`);
-      def = normalizeTimeline(await res.json());
+      // Route through `assetUrl` like every other asset reader (`timelineCache.ts` included) — a
+      // raw `fetch(path)` resolves to the wrong URL under a non-"/" BASE_URL (sub-path hosting, the
+      // packaged editor's custom scheme). Catch a REJECTING fetch (network error, dev server down)
+      // the same as a `!res.ok` one: either way it unwinds past the live-cache peek below, and the
+      // fetch is only a cache-miss fallback — the panel opening this timeline, or a concurrent agent
+      // op for the same path landing mid-flight, can populate the live cache with content that is
+      // NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      const res = await fetch(assetUrl(p.timelinePath), { cache: 'no-store' }).catch(() => null);
+      const live = getTimeline(p.timelinePath) as TimelineDef | null;
+      if (!res?.ok && !live) throw new Error(`cannot load timeline ${p.timelinePath}`);
+      def = live ?? normalizeTimeline(await res!.json());
     }
     const target = p.target ?? '';
     const clone = JSON.parse(JSON.stringify(def)) as TimelineDef;
@@ -2388,6 +2525,37 @@ export function registerEditorAgentOps(): void {
    *  Reads the LIVE cache, not the file, and that distinction is the point: persistence is manual,
    *  so an unsaved edit exists ONLY live. A file read would report the pre-edit value and make a
    *  successful edit look like it did nothing. `source` says which the answer came from. */
+  /** Repair the renderer's path-keyed state after a move the RENDERER did not perform (#867).
+   *
+   *  `POST /api/move-file` is the one place a move happens, and until now the repair
+   *  (`applyAssetPathMoves`) was wired to the thirteen client-side CALL SITES instead — so a move
+   *  from anywhere else silently repaired nothing. `modoki_move_asset` is exactly that case, and
+   *  it is not a forgotten line: the MCP server is a different PROCESS from the renderer, so the
+   *  repair was never reachable from there at all.
+   *
+   *  The route calls this back through `requestBrowser`, the same server→renderer RPC ~20 other
+   *  routes use, which is already abstracted over both transports (Vite HMR and Electron IPC).
+   *
+   *  Applying a move twice is a no-op — `applyMove` matches on `from`, and after the first pass
+   *  nothing is at `from` any more — so the panel keeping its own synchronous call is safe. It
+   *  keeps it because ORDER matters there: the registry must be repaired before the selection
+   *  moves, since `AtlasAssetView`'s load effect keys on the selected path for its CAS baseline.
+   *  This op is the backstop for every caller that is not the panel. */
+  registerAgentOp('apply-asset-path-moves', (params) => {
+    const { moves } = (params ?? {}) as { moves?: PathMove[] };
+    if (!Array.isArray(moves) || moves.length === 0) {
+      throw new Error('apply-asset-path-moves requires { moves: [{from, to, prefix?}] }');
+    }
+    for (const m of moves) {
+      if (typeof m?.from !== 'string' || (typeof m?.to !== 'string' && m?.to !== null)) {
+        throw new Error('apply-asset-path-moves: each move needs { from: string, to: string | null }');
+      }
+    }
+    // The notes are the repair's own account of what it touched — empty when the move hit nothing
+    // bound, parked or selected, which is the overwhelmingly common case.
+    return { ok: true, notes: applyAssetPathMoves(moves) };
+  });
+
   registerAgentOp('read-asset-def', (params) => {
     const { path, type } = (params ?? {}) as { path?: string; type?: string };
     if (!path) throw new Error('read-asset-def requires { path }');
@@ -2395,7 +2563,18 @@ export function registerEditorAgentOps(): void {
     if (!kind) {
       throw new Error(
         `read-asset-def: cannot tell what kind of asset '${path}' is — pass ` +
-        "type: 'particle' | 'animation' | 'timeline' | 'spriteanim' | 'rig2d'.",
+        "type: 'particle' | 'animation' | 'spriteanim' | 'timeline' | 'rig2d' | 'shader' | 'animset'.",
+      );
+    }
+    if (kind === 'material') {
+      // material is NOT genuinely peekable — `materialCache` (meshTemplateCache.ts) holds only the
+      // BUILT `THREE.Material` once `fetchMaterial` parses the `.mat.json`; the raw JSON itself is
+      // never retained anywhere live (the panel's `invalidateMaterialFile` only invalidates the
+      // compiled material for a lazy recompile; it does not re-seed a JSON doc the way
+      // `invalidateAnimSetFile` does for animset). Refuse explicitly, matching the device surface's
+      // wording, rather than falling through to the generic "not in the live cache" refusal below.
+      throw new Error(
+        "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
       );
     }
     // PEEK, don't load. This op reports what is in the LIVE cache — it has no business fetching.
@@ -2418,10 +2597,27 @@ export function registerEditorAgentOps(): void {
       // keeps the "is it in the live cache at all?" answer identical for a rig seeded by an
       // older path that never recorded a source.
       : kind === 'rig2d' ? (getRig2DSource(path) ?? getRig2D(path, peek))
+      // shader (#842b) — `getSpriteMaterialProgram` is a bare `Map.get`, no fetch side effect on a
+      // miss, so it's exactly as peekable as the `{load:false}` getters above despite the different
+      // signature. It's keyed by GUID (whatever `Renderable.material` carried when the program
+      // compiled), not by path, so a path-shaped `path` (the common case — `inferAssetDefType`
+      // only recognizes the `.shader.json` suffix, never a bare guid) has to be turned into a guid
+      // first via the manifest's reverse lookup. `.manifest` is the authored `.shader.json` doc
+      // itself (`PixiShaderProgram.manifest: ShaderManifest`) — the compiled GL/GPU program
+      // alongside it is not part of the answer.
+      : kind === 'shader' ? (() => {
+          const guid = isGuid(path) ? path : getGuidForPath(path);
+          const program = guid ? getSpriteMaterialProgram(guid) : undefined;
+          return program ? program.manifest : null;
+        })()
+      // animset (#842b) — `getAnimSet` now takes the same `{load:false}` peek option as its
+      // siblings above, so a miss reports null without fetching or sticky-poisoning `failed`.
+      : kind === 'animset' ? getAnimSet(path, peek)
       : undefined;
     if (def === undefined) {
       throw new Error(
-        `read-asset-def: unsupported type '${kind}' (particle | animation | timeline | spriteanim | rig2d).`,
+        `read-asset-def: unsupported type '${kind}' (particle | animation | spriteanim | ` +
+        'timeline | rig2d | shader | animset).',
       );
     }
     if (def === null) {
@@ -2434,6 +2630,108 @@ export function registerEditorAgentOps(): void {
     }
     const dirty = getDirtyAssetPaths().includes(path);
     return { ok: true, path, type: kind, source: 'live', unsaved: dirty, def };
+  });
+
+  /** Read an asset's `.meta.json` sidecar, PREFERRING a parked Inspector edit over disk (#872).
+   *
+   *  The sidecar twin of `read-asset-def` above, and it exists for the same reason one layer over:
+   *  since #845 an Inspector import-settings change PARKS instead of writing, so the file on disk
+   *  is the PRE-EDIT document for as long as the park is unflushed. `modoki_get_asset_meta` was a
+   *  plain `/api/read-meta` GET straight to the Node backend — no `op:`, so it never reached the
+   *  renderer at all — and an agent therefore read a stale value with no way to know a newer one
+   *  existed. It then reasoned from it, or wrote it back.
+   *
+   *  ⚠️ The sibling registry has a safety net this one structurally cannot have. An agent
+   *  `modoki_write_asset` is reconciled by the watcher (`dropParkedWriteFor` in `agentBridge.ts`),
+   *  but `.meta.json` is invisible to `detectType` (`vite-asset-scanner.ts`), so no broadcast
+   *  fires for a sidecar and nothing reconciles anything. That is why the READ being honest
+   *  matters more here than it does for an asset doc.
+   *
+   *  `readMetaPreferringPark` is deliberately the same helper the panels use — it prefers the
+   *  park — but it is called `passive`, so it records NOTHING.
+   *
+   *  ⚠️ **That is a correction to this op's first version, which let the read seed the baseline on
+   *  the grounds that it was "a genuine read by this editor and correct to record". The inference
+   *  does not hold.** A baseline is a claim about the bytes a PANEL's displayed document came
+   *  from, and the flush conditions the human's next save on it; this read feeds no panel. Before
+   *  #872 the tool ran in the Node process and could not touch that map at all, so seeding here
+   *  was a new fail-open introduced by the fix: panel reads V1 → something external rewrites the
+   *  sidecar → the agent reads (baseline → EXTERNAL) → the human's parked edit, built on the
+   *  stale in-memory doc, is now ACCEPTED and overwrites the external change, where without the
+   *  agent's read it was correctly refused. An observer must not disarm the guard it observes.
+   *
+   *  `source` is computed BEFORE the read, from the registry, so it describes where the answer
+   *  came from rather than being inferred from its shape ({} is ambiguous — see `readMetaSidecar`,
+   *  which returns it for an absent sidecar AND an unparsable one, #778). */
+  registerAgentOp('read-asset-meta', async (params) => {
+    const { path } = (params ?? {}) as { path?: string };
+    if (!path) throw new Error('read-asset-meta requires { path } (an asset-root URL, e.g. /assets/textures/rock.png)');
+    const parked = peekPendingMeta(path) !== undefined;
+    const r = await readMetaPreferringPark(path, { passive: true });
+    return {
+      ok: true,
+      path,
+      meta: r.meta,
+      source: parked ? 'parked' : 'disk',
+      unsaved: parked,
+      // ⚠️ `ok:false` from the helper means the GET FAILED and `meta` is a `{}` FALLBACK — NOT an
+      // empty sidecar. An agent about to write this document back wholesale must abort on it, or
+      // it posts a sidecar with no `id` and the scanner's heal pass mints a NEW guid, orphaning
+      // every scene ref to the asset. Same warning `PreferredMetaRead.ok` carries; surfaced here
+      // because across the relay the caller cannot see the helper's own return.
+      read: r.ok ? 'ok' : 'failed',
+      ...(parked
+        ? { note: 'A parked Inspector import-settings edit for this path has NOT reached disk. This is that edit, not the file. modoki_save_all flushes it; modoki_get_editor_state lists it under pendingImportSettings.' }
+        : {}),
+      ...(r.ok ? {} : { note: 'The /api/read-meta GET FAILED — `meta` is an empty FALLBACK, not an empty sidecar. Do NOT write this document back: a wholesale write built on it drops the asset GUID and the scanner then mints a new one, orphaning every reference.' }),
+    };
+  });
+
+  /** Is a parked Inspector import-settings edit in the way of a Node-side sidecar operation — and,
+   *  if the caller said so, drop it. The WRITE-side counterpart to `read-asset-meta` (#872/#882).
+   *
+   *  `pendingMeta` lives HERE, in the renderer. Every `.meta.json` access that runs in the Node
+   *  backend is blind to it, and only two routes have ever asked the renderer back
+   *  (`read-asset-meta`, `apply-asset-path-moves`) — which is why this defect arrived one route at
+   *  a time: `/api/write-meta` destroys the park, `/api/reimport` bakes with the pre-edit disk
+   *  value and then loses its own fresh cache block to the park's next flush, and
+   *  `/api/duplicate-asset` copies the pre-edit document. One probe for all three, so route four
+   *  does not get to invent a fourth answer.
+   *
+   *  ⚠️ **`peekPendingMeta`, deliberately NOT `readMetaPreferringPark`.** The peek reads the map
+   *  and touches nothing; the helper records. That is the correction `read-asset-meta` already
+   *  carries as `passive` (see its header): an observer must not disarm the guard it observes.
+   *  Here it matters twice over, because a WRITE gate reading the registry has more power to
+   *  corrupt the state it is consulting than a read does, not less.
+   *
+   *  ⚠️ **Probe and discard are ONE op, not two calls.** Two round trips leave a window in which a
+   *  human's park can land between "is anything parked?" and the write that was cleared to
+   *  proceed. Node is single-threaded and so is the renderer, so answering both in one op closes
+   *  it as far as this seam can.
+   *
+   *  ⚠️ **A discard cannot make a failed-read document parkable, and since #880 that is
+   *  STRUCTURAL rather than a decision this op makes.** It used to be one: the guard was a
+   *  path-keyed `readFailed` flag, `discardPendingMeta` deliberately left it armed, and the
+   *  accepted cost was that an agent discard could leave a path WEDGED for the panel. That flag
+   *  is gone. The guard is a tag on the fallback DOCUMENT now (`scene/metaReadFallback.ts`), so
+   *  this op has nothing to clear even in principle: a component still holding the `{}` fallback
+   *  is still refused, and a component whose OWN read succeeded is no longer punished for it.
+   *  #880's second face was removed rather than traded away. */
+  registerAgentOp('resolve-meta-park', (params) => {
+    const { paths, discard } = (params ?? {}) as { paths?: unknown; discard?: unknown };
+    if (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== 'string' || !p)) {
+      throw new Error(
+        'resolve-meta-park requires { paths: [assetRootUrl, …] } — one or more non-empty asset-root '
+        + `URLs (e.g. /assets/textures/rock.png). Parked now: ${getPendingMetaPaths().join(', ') || '(none)'}`,
+      );
+    }
+    const list = paths as string[];
+    const parked = list.filter((p) => peekPendingMeta(p) !== undefined);
+    // `discarded` is reported separately from `parked` rather than inferred from it: a caller that
+    // asked to discard needs to know what actually went, and the two lists differ the moment a
+    // path is named twice or the registry is emptied concurrently.
+    const discarded = discard === true && parked.length ? discardPendingMeta(parked).discarded : [];
+    return { ok: true, parked, discarded };
   });
 }
 
@@ -2453,7 +2751,7 @@ export function registerEditorAgentOps(): void {
  *
  *  Always returns false (nothing reached disk) for the op's `saved` field. */
 async function persistOrMarkDirty(
-  path: string, type: 'material' | 'particle' | 'animation' | 'timeline', data: unknown,
+  path: string, type: AssetSchemaType, data: unknown,
 ): Promise<boolean> {
   markAssetDirty(path, type, data);
   return false;

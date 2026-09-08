@@ -112,6 +112,200 @@ load-bearing and commented as such).
 
 ## Paths
 
+- ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
+  is.** The JS lstat-walk resolves symlinks and junctions but neither `subst` drive mappings nor
+  drive-letter CASE, both of which are ordinary ways one directory acquires two spellings here.
+  Measured on `win` 2026-09-07 (#865 close-out):
+
+  | input | `realpathSync` | `realpathSync.native` |
+  |---|---|---|
+  | `Y:\` (a `subst` of another dir) | `Y:\` — unresolved | the real target |
+  | `e:\Projects\modoki` | `e:\Projects\modoki` | `E:\Projects\modoki` |
+  | `C:\Users\RUNNER~1\…` (an 8.3 SHORT path) | left short | expanded to the long form |
+
+  So a comparison that canonicalises with the JS walk still fails on a `subst`ed checkout or a
+  lower-cased drive letter. `path.resolve` repairs neither.
+
+  ⚠️ **#881 migrated nine call sites onto `.native` on darwin evidence alone; #893 drove all three
+  rows on `win` and they hold.** Measured 2026-09-08 against `backendPortForClone`, with the
+  pre-#881 lookup key (`path.basename(path.resolve(p))`) computed alongside as the control:
+
+  | case | pre-#881 key | JS walk | `.native` |
+  |---|---|---|---|
+  | `subst X: E:\Projects\modoki`, then `X:\` | `""` → **auto ports** | `""` — unresolved | `E:\Projects\modoki` ✓ |
+  | `E:\Projects\MODOKI` (case-flipped NAME) | `"MODOKI"` → **auto ports** | `"MODOKI"` — unresolved | `E:\Projects\modoki` ✓ |
+  | a junction whose own name is not a clone name | `"NOTACLONE"` → **auto ports** | resolves ✓ | resolves ✓ |
+  | `C:\Users\…\MODOKI~2` (a real dir, 8.3 alias) | `"MODOKI~2"` | **left SHORT** | `modoki83probe` ✓ |
+
+  Three things this pins that reading the table above does **not** tell you:
+  - **Row 2 of THIS table is about the directory NAME, not the drive letter** (row 2 of the
+    three-row table above *is* the drive-letter one — the two rows do not correspond). `e:\` vs
+    `E:\` never reached `backendPortForClone` at all: `path.basename` is drive-letter-independent,
+    so that lookup was always right, and no input shape changes it — `e:\Projects\modoki`,
+    `E:\Projects\modoki` and the drive-relative `e:` all key `"modoki"`. Drive case is a hazard for
+    **comparisons**, and its pre-#869 instances were the electron `resolve`+`===` guards;
+    `samePath` is what CLOSES it, via the `pathCaseKey` fold. #893's checklist expected it to move
+    the port and was looking at the wrong half.
+  - **The junction row needs *a* realpath, not specifically `.native`** — the JS walk resolves it.
+    The rows where `.native` is genuinely load-bearing are `subst`, case-flipped names, and 8.3.
+  - **8.3 is the one that would have shipped.** `samePath('…\MODOKI~2', '…\modoki83probe')` is
+    `true` under `.native` and the old JS-walk comparison returned **`false`** — #878's exact
+    failure, now measured rather than inferred.
+- ⚠️ **The `win` clone's `E:` is ReFS — so no path under the clone, or under its `%TEMP%`
+  (`E:\dev-temp`), can have an 8.3 short form at all.** The observation that establishes this is
+  `Get-Volume` (`E  ReFS`, `C  NTFS`, `D  NTFS`), **not** the two `fsutil` outputs it is tempting to
+  cite: `fsutil 8dot3name query E:` reporting creation DISABLED and `fsutil file setshortname`
+  failing *"A local NTFS volume is required"* together establish only "8.3 creation is off" and "not
+  local NTFS" — and on NTFS, disabling *creation* leaves pre-existing short names intact, so neither
+  supports the "cannot, structurally" claim. ReFS is what does. (The owner reports `E:` is a Dev
+  Drive; that designation needs elevated `fsutil devdrv query` to confirm and is immaterial here —
+  ReFS is the operative fact.) `C:` is NTFS with 8.3 **enabled**, so the short-path case IS drivable
+  on this machine — on `C:`, and with no elevation, because generation there is automatic.
+
+  This matters beyond one probe: it is a second, structural reason a short-path bug is invisible from
+  the `win` clone, on top of the account-name reason #878 recorded. A test that reaches for
+  `os.tmpdir()` to build one gets a ReFS path and silently measures nothing.
+- ⚠️ **`.native` only normalises a path that EXISTS**, and throws otherwise. That is why the
+  canonicaliser alone is not enough, and it is where #865's fix still had a hole: callers fall
+  back to `path.resolve`, which folds nothing, and **a persisted path naming a directory that is
+  gone — a stale recents entry, a stale device claim — is exactly that case.**
+
+  ⚠️ **This does NOT mean such a comparison is unfixable**, which an earlier version of this
+  section claimed. The residue belonged to the COMPARATOR, not the canonicaliser — and case-folding
+  at the comparison closed only HALF of it. The sentence that used to stand here — *"case-fold at the
+  comparison and two spellings of a missing path match again"* — was an over-claim (#892). It closes
+  the **case** half. `path.resolve` follows no symlinks either, so two spellings of a missing path
+  reached through a symlinked ancestor still compared unequal after the fold. Measured on darwin,
+  where it is not exotic: `os.tmpdir()` is `/var/…`, a symlink to `/private/var/…`.
+
+  The comparator needs **both** halves, and the shape is `canonicalWithMissingTail` — canonicalise
+  the longest ANCESTOR that exists, re-append the missing tail literally, then fold:
+
+  | | resolves links for a MISSING path | folds case |
+  |---|---|---|
+  | `path.resolve` | no | no |
+  | `canonicalPath` | no (falls back to `resolve`) | no — it returns a spelling, not a key |
+  | `canonicalWithMissingTail` + `pathCaseKey` | **yes** | **yes** |
+
+  ✅ **Both halves have landed** (#892, closed): `samePath` is now
+  `pathCaseKey(canonicalWithMissingTail(a)) === pathCaseKey(canonicalWithMissingTail(b))`. The table
+  below is the PRE-FIX measurement, kept because it is the only Windows evidence that exists and
+  because its third row names a trigger #892 never did.
+
+  **Measured on `win` 2026-09-08 (#893), `samePath` on a path that does NOT exist — before #892:**
+
+  | spelling of the missing path | `samePath` (pre-fix) | `isUnderOrSame` |
+  |---|---|---|
+  | through a `subst`ed drive | **false** ✗ | true |
+  | through a junction | **false** ✗ | true |
+  | under an 8.3 SHORT ancestor | **false** ✗ | true |
+  | drive-letter case / case-flipped name | true | true |
+
+  The last row is the case-fold working; the first three are what it could not reach, because
+  `.native` throws on a missing path and the fallback resolves no links. **#892 listed
+  `subst`/junction as *inferred* and never named the 8.3 row at all** — `win` found it by measuring.
+  The `isUnderOrSame` column is #881's `canonicalWithMissingTail` handling all four, which is exactly
+  the shape #892 then borrowed.
+
+  ⚠️ **The post-fix Windows behaviour is EXPECTED, not measured.** `samePath` now calls the same
+  helper that produced the `true` column above, so all four rows should pass — but nobody has re-run
+  the table on Windows since #892 landed, and #893 (the verification ticket) closed before it. Worth
+  one run on `win`.
+
+  ⚠️ **This over-claim reached its SECOND retraction before it died.** #881 retracted it inside
+  `pathIdentity.mjs` and left the copy here standing, so #892 was diagnosed against a doc that said
+  the hole was already closed. **A retraction has to sweep every copy of the claim** — and note the
+  fold itself is now the subject of a follow-up, #905 (it over-matches on a case-SENSITIVE volume).- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
+  `engine/scripts/pathIdentity.mjs`** — the one implementation (#869, #881), reachable from
+  electron TS, `engine/plugins/**` TS and the bare-node `.mjs` CLIs alike. Before it existed the
+  repo had hand-rolled this **eight** times in four mutually inconsistent recipes.
+  `engine/tests/architecture/pathIdentityIsShared.test.ts` bans a new `path.resolve(x) === y`; it
+  found the eighth site itself, which a hand-written census grep had missed because the call was
+  `path.resolve(path.join(...))` and nested parens defeated the pattern.
+
+  | export | answers |
+  |---|---|
+  | `canonicalPath(p)` | the canonical SPELLING — `resolve` + `.native`, falling back to `resolve` |
+  | `samePath(a, b)` | same directory or file? |
+  | `pathCaseKey(s)` | the platform's comparison KEY for a canonical path or one segment — for a **lookup** rather than a comparison |
+  | `isUnderOrSame(parent, child)` | same path, or inside it? |
+
+  ⚠️ **The module has TWO canonicalisers and only one of them is exported** (#892). Know which
+  question you are asking:
+
+  - **`canonicalPath` — a spelling you KEEP.** A human reads it (`deviceClaimsStore`'s refusal
+    message names the holding clone), a record stores it. Its `resolve` fallback for a missing
+    path is deliberate and pinned by a #865 test.
+  - **`canonicalWithMissingTail` — a space you COMPARE in.** Module-private, and **every predicate
+    here uses it**: `samePath` and `isUnderOrSame` both. It is not exported precisely because a
+    caller wanting sameness wants `samePath` and a caller wanting a value wants `canonicalPath`.
+
+  Getting this backwards is what both #881 and #892 were: a predicate built on the SPELLING
+  canonicaliser, inheriting `resolve`'s blindness to links for every path that is gone or not yet
+  created. They were found a fix apart, in the two predicates, for the same reason.
+
+  ⚠️ **The guard also bans a bare `fs.realpathSync(...)` in those roots (#881).** The census that
+  decided it found **nine** calls in **six** files still using the JS walk. (Seven is the count of
+  files the fix TOUCHED — it also edits `editorBackendRouter.ts`, which had no realpath.) `.native` is NOT
+  banned — the regex requires the paren to follow immediately, so `realpathSync.native(x)` does not
+  match — and that asymmetry is pinned in the guard's own table, because a version banning both
+  would make deleting `canonicalPath`'s realpath the cheapest way to go green.
+
+  ⚠️ **`.native` MASKS the case-fold on a path that exists, which makes a test for the fold easy to
+  write and impossible to fail.** A flipped spelling of an existing directory is resolved back to
+  its on-disk name by `.native` alone, so the fold contributes nothing there. The fold's only
+  load-bearing case is a path that is **gone or not yet created** — `.native` throws, the fallback
+  is bare `resolve`, and folding is all that is left. Two tests were written the wrong way here and
+  both stayed green with the mechanism deleted (#881 mutation checks M2 and M3); the fix is to
+  assert on a NON-EXISTENT path, and on a **symlinked** one where the link's own basename is not a
+  match in any casing.
+
+  Two things that are deliberately NOT that shape and must stay as they are:
+  - **`isUnderRepo` (`electron/projects.ts`) is correct** — `path.relative` **is case-insensitive
+    on win32**, so a containment check already folds. Measured:
+    `relative('E:\Projects\modoki', 'e:/Projects/MODOKI/games/sling')` is `'games\sling'`. This
+    asymmetry is exactly why #869's two guards were wrong and this one was not: they used `===`
+    on two absolute paths, which folds nothing.
+  - **`context-cost-guard.mjs`'s dedup key and `projectPaths.ts`'s `realDir` were migrated
+    anyway** (#881) even though neither compares two clone roots: any bare walk in these roots is
+    now a guard failure, and both are strictly better on `.native`. `realDir` keeps its deliberate
+    shape — it canonicalises the CONTAINING directory only, so a symlink inside the project is not
+    followed out to its target.
+  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` HASH the
+    path into a PERSISTED identity** — a userData profile dir and a per-project auth token.
+    Re-normalising them relocates every existing user's profile (prefs silently reset) and 403s
+    them against their own editor. Their omission of realpath is arguably right for a stable
+    identity: a `subst` mapping can vanish and take the identity with it. ⚠️ `multiProfileKey`
+    has already drifted from the other two — it lost the trailing-slash trim, so
+    `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles. That is a real defect needing a migration
+    decision, not a sweep.
+- ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
+  baseline quietly encodes a second claim nobody meant to assert.
+
+  **The discriminator, derived while sweeping for siblings of this in #881 — the hazard is narrower
+  than "the test used the wrong realpath".** It bites only when the seed is used to BUILD AN
+  EXPECTED VALUE. When the seed is merely an INPUT that the subject canonicalises on both sides,
+  the mismatch is normalised away before any comparison and the test is safe. Worked both ways:
+  - **Divergent** — `projectPaths.test.ts` seeded `tmp` with the JS walk and built every expected
+    relative path from it, while `realDir` returned `.native` output. Short-vs-long would have
+    reddened `ci/main`'s windows leg and nothing a Mac runs. Fixed in #881.
+  - **NOT divergent** — `deviceClaimBuildGuard.test.ts`'s two `#865` cases (*"matches when the
+    stored side is the real path and the own side is reached through a link"* and *"re-claims a CLI
+    owner-claim when the requester spells the same clone differently"*) also seed with the JS walk, but
+    hand both spellings to `sameClone`, which `.native`s each side before comparing. Checked
+    explicitly rather than swept in; a fix there would have been churn.
+
+  ⚠️ **That is the same FILE as the #878 failure below, and a different case in it.** #878 was its
+  drive-CASE baseline, which built an expected value from the seed and died on short-vs-long; the
+  two cases named above feed the seed in as an input and are safe. Same file, opposite verdicts,
+  and the discriminator above is what tells them apart — which is exactly why the rule is not
+  "grep the file for the wrong realpath".
+
+  So the check is *"does an assertion compare subject output against something built from the
+  seed?"* — not *"which realpath did the seed use?"* The two forms also disagree on an
+  **8.3 short path** (row 3 above), so `deviceClaimBuildGuard.test.ts` — seeding a drive-CASE
+  baseline with the JS walk against a `.native` subject — died on short-vs-long, which is not the
+  property it exists to pin (#878, fixed in `1307b2c1f`).
 - **A drive letter is a colon, and a colon means "remote host" to some tools.** GNU tar reads
   `C:\path\x.zip` as `host:path` and dies with `Cannot connect to C:`. Every drive letter, not
   just non-`C`.
@@ -139,6 +333,156 @@ load-bearing and commented as such).
     failed on `ci/main` while the Mac gate stayed green. **The prescription above is what caught
     it** — the negative assertion alone would have gone quietly green on Windows; the companion
     "the scan is not vacuously passing" test is what made the breakage loud.
+  - A fourth instance landed 2026-09-03 (`consoleRingOptionsWiring`, from the #633/#626 close-out):
+    both of its offender lists are `path.relative()` output compared against forward-slash literals,
+    so `ci/main`'s `check (windows-latest)` went red on the merge that carried it while the authoring
+    clone's Mac gate — the only gate a worker runs — was structurally unable to see it. This one
+    failed LOUDLY for the reverse of the usual reason: it asserts the offender list EQUALS a named
+    set rather than that it is empty, so broken matching over-reports instead of going quiet. The
+    sweep that followed found `updateEachFanoutGuard`'s `ALLOWLIST` keyed the same way — latent only
+    because that list is empty today, fixed in the same commit.
+  - Instances 7 and 8 landed 2026-09-06 on the `win` clone, found in a sweep the same day `main`
+    fixed instances 5-6 (`f5e40a1e9` chromeTagging, `2ed8b6035` formatVersionFromConstant):
+    `textDirtyAttribution.test.ts`'s definition-site exemption (`rel.endsWith('text/textDirty.ts')`
+    against `path.relative()` output) never fired on Windows, so the guard silently fell through
+    into the callers-only assertion instead of skipping; and `show-refs.mjs`'s
+    `full.includes('/scenes/')` never matched, so `--all` printed no scene sections at all despite
+    scene files existing. (The `entries: 0` line it also prints is the MANIFEST count, a
+    separate and NOT Windows-specific defect — issue #805, where the same file's walk root also
+    turns out to reach 2 of ~226 candidate files. It reads 0 before and after this fix.) Both fixed with the same normaliser,
+    and the guard got a non-vacuity companion assertion
+    per the prescription above (`textDirtyAttribution.test.ts` now separately asserts the scan
+    reaches the definition file AND that the skip predicate matches it).
+  - **SSOT note, which the four entries above do not say and is the reason this class keeps
+    recurring**: the normalisation itself was hand-rolled FIVE times in THREE spellings before
+    instances 7/8 — `importClosure.ts`'s exported `toPosix` (`split(/[\\/]/)`, the only one
+    previously exported — and reachable from `engine/tests/`, so that was never the barrier; the
+    real one is that it is a `.ts` helper and the plain-`.mjs` scripts cannot import it, which is
+    why a second copy had to exist at all), `materialCloneStamp.test.ts`'s local `toPosix`
+    (`split(sep)`), `consoleRingOptionsWiring.test.ts`'s `relPosix` (`split(path.sep)`), and
+    `qaCaseReferences.test.ts` / `skillReferences.test.ts`'s local `toPosix`es (both
+    `replace(/\\/g,'/')`) — plus roughly 60 more inline copies across the repo. ⚠️ Only the
+    `split(path.sep)` spelling actually MISBEHAVES (it is separator-dependent, so it leaves a
+    Windows-shaped path unnormalised on POSIX); the other two are extensionally identical, so
+    "three spellings" is a duplication problem, not three behaviours.
+    `engine/scripts/pathPosix.mjs` (`toPosix`) is now the shared one for **new** code; the existing
+    ~66 sites were deliberately left as-is — they're churn with no defect behind them, not a
+    backlog to migrate.
+  - **The corpus producer made this class RARE, not unreachable — this bullet claimed the latter
+    for about 16 hours, and instance 9 disproved it** (#799/#771/#805; corrected under #847). Guards did
+    not get better at normalising — they stopped producing paths that need it.
+    `engine/scripts/repoCorpus.mjs` returns **git's own repo-relative POSIX `rel`**, so a consumer
+    that KEEPS that `rel` and compares against `'a/b.ts'` never touches `node:path` and has no
+    backslash to forget. ⚠️ Keeping it is the consumer's CHOICE, which is the whole of limit 1
+    below. ~70 producers were migrated onto it and
+    `corpusProducerIsShared.test.ts` enforces it; the shape is documented in
+    [verify-and-ci.md](verify-and-ci.md) § "Corpus production". Instances **3, 5 and 7** above
+    (`materialCloneStamp`, `chromeTagging`, `textDirtyAttribution`) each carried a hand-rolled
+    normaliser, and all three are now dead code that `noUnusedLocals` deleted — `materialCloneStamp`
+    is the one that mattered most, since its `split(sep)` was the one genuinely broken spelling.
+    ⚠️ Four limits, so this is not read as more than it is:
+    - ⚠️ **Instance 9 (`livenessTokenIsShared`, #847) landed INSIDE this supposedly-covered
+      region** — not in the #814 gap below, where this bullet predicted the next one. The
+      producer's guarantee is **opt-out**: `repoFiles` returns `{ rel, abs }`, and a consumer
+      writing `.map(({ abs }) => abs)` throws the safe `rel` away, after which any
+      `path.relative(REPO, abs)` reconstructs the backslash the producer had removed. That is
+      what #847's guard did, and `corpusProducerIsShared.test.ts` cannot see it — the producer
+      IS shared; the consumer discarded its output. Measured 2026-09-07, repo-wide: **39 call
+      sites across 36 files** spell that `.map` (an earlier pass scoped to `engine/tests/**` alone
+      found 30 across 28 files, but `engine/packages/modoki/tests/**` is not out of scope — it
+      runs as the second half of `verify`, per `package.json`'s `verify` script — and
+      `engine/scripts/**` adds a few more), and a sweep found every other one benign — they
+      normalise before comparing, or never compare at all. ~~So the exposed population is one, not
+      thirty-nine.~~
+      ✅ **Now GUARDED — #866 closed on `win`, 2026-09-07.** `corpusConsumerPins.test.ts` enforces
+      the pin rule below over the **30** consumers that discard `rel`: a `.ts`/`.tsx`/`.mjs` under
+      `engine/tests`, `engine/packages/modoki/tests` or `engine/scripts` that spells either `.map`
+      must carry a non-vacuity assertion. `corpusProducerIsShared` enforces that you *use*
+      `repoFiles`; this enforces what you do with its output, which is where instance 9 and all
+      nine of #849's landed. The census when it landed: of 32 rel-discarding files, **29 already
+      had a pin**, 2 are migration scripts that assert nothing (a vacuous migration is a no-op,
+      not a false green — they sit in `NOT_A_GUARD`), and **1** was a real guard with none
+      (`inputSourceGuard.test.ts`, now pinned).
+      ⚠️ **What this deliberately does NOT do is detect the defect**, because #866 measured that
+      and it does not work: of the 32 files that still discard `rel`, **24** also derive their own
+      repo root, so "two derivations in one file" flags 24 benign files and does not
+      discriminate. The rule chosen instead (owner, 2026-09-07) makes the class **loud, not
+      absent** — it can still be written; it can no longer pass green having matched nothing. The
+      alternative considered and declined was making `rel` hard to drop at the `repoFiles` API,
+      which prevents it at authoring time on any platform but costs a 32-site migration; it stays
+      on the table if a tenth instance lands. Detection is not left to a human: a push to `main`
+      auto-runs the free public CI, whose `windows-latest` leg is where a vacuous guard goes red,
+      so it surfaces within one merge cycle.
+      **The underlying fix remains to thread `{ rel, abs }` through and compare on `rel`**, as
+      `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
+      ⚠️ **Re-deriving the census: append `-- ":!*.md"` to both queries.** Run verbatim they also
+      match this file — `§ Paths` quotes both patterns in order to describe them, and one of those
+      lines is matched by BOTH spellings at once — so a naive re-run reads 36 sites / 33 files and
+      looks like the class growing. It is not: code-only it is **34 sites / 32 files, unchanged
+      since `a2ddf60f6`**. A session re-running them without the pathspec drew the wrong
+      conclusion first, and nearly published it.
+      - ⚠️ **"Exposed population is one" was wrong, and the reason is worth more than the number
+        (#849, measured on the `win` clone 2026-09-07).** That census counted only the shape it had
+        just been burned by — `path.relative()` output compared against a forward-slash literal.
+        The other half of the class never involves a separator at all: **`abs` compared against a
+        separately-derived ABSOLUTE path** (`path.join(REPO_ROOT, …)` from `fileURLToPath`, a
+        `path.resolve`d TypeScript `fileNames` entry, `__filename`). Re-swept for both shapes, the
+        exposed population is **nine files**, not one — including a `urlFor` body copied into four
+        asset suites whose `startsWith` is case-SENSITIVE while `repoCorpus.mjs`'s own
+        `toUnderPrefix` compares the same directory to the git root case-INSENSITIVELY.
+        - ⚠️ **And the DENOMINATOR above ("39 call sites across 36 files") is also one spelling.**
+          It counts `.map(({ abs }) => abs)` only; `.map((f) => f.abs)` adds **4 sites across 4
+          files**, for a true population of **43 sites across 40 files** (re-derived at
+          `ac546c720`, both `git grep -cE` queries). Caught by the close-out review of the very
+          commit that added the correction above — i.e. the paragraph retracting a
+          one-spelling census published a new one. The lesson generalises past this class: **a
+          count over source is a claim about the QUERY, and the query belongs next to the
+          number.** The four extra files — `migrate-anchor-zindex.mjs`, `docCitations.test.ts`,
+          `projectDocs.test.ts`, `anchorZIndexMigrated.test.ts` — were swept and are all benign
+          (a `.filter` on `rel` before the map, the safe `split(path.sep).join('/')` spelling,
+          `path.basename` only, and a report-only string respectively).
+      - ✅ **And the prescription above is WORKING — measured, after I first claimed the opposite.**
+        Mutation-checking all nine (force the comparison to match nothing, i.e. reproduce a
+        derivation split) gives **seven LOUD, two OPEN** — not the seven-open I asserted before
+        measuring. The seven are loud for exactly the reason this section already gives: they pin
+        non-vacuity. `codeAssetRefs` is the clearest case — its main assertion DOES go vacuous, and
+        its reverse pin ("every PENDING_MIGRATION guid still fires") catches it anyway. The two that
+        failed open, `mcpErrorCodes` and `editorStoreActionsReachable`, were exactly the two with no
+        such pin; both now have one. **The lesson is not a new rule but the cost of asserting a
+        blast radius from code-reading**: "fails open" is a claim about behaviour, and behaviour has
+        to be run.
+      - ⚠️ **`path.resolve` is not the escape hatch it looks like.** It normalises separators and
+        trailing slashes but **not drive-letter case** — measured, `path.resolve('e:\\x') !==
+        path.resolve('E:\\x')`. Comparing on `rel` sidesteps the whole question because no absolute
+        path is in play; re-resolving an absolute one does not.
+    - **Instance 4 is the exception.** `consoleRingOptionsWiring`'s `relPosix` SURVIVES and is live.
+      Its two offender lists — the actual defect — now take `rel` from git, but the helper still
+      serves individually-named fixed files and a BFS trail, which are not corpus enumeration. It
+      is correct (the safe spelling, applied to `node:path` output), just not deleted.
+    - The ~66 inline sites elsewhere are untouched **by design** — the ruling two bullets up.
+    - ~~The guard covers only `engine/tests/**` + `engine/scripts/**`~~ — **CLOSED by #814
+      (2026-09-06).** `corpusProducerIsShared` now enumerates the WHOLE REPO, with a per-root
+      non-vacuity pin for each of `engine/tests/`, `engine/scripts/`, `engine/packages/modoki/tests/`,
+      `engine/plugins/`, `engine/electron/`, `games/`, `site/` and `scripts/`, so a narrowing
+      enumeration goes red instead of quiet. The widening reportedly found **18** producers
+      outside the old scope (that figure is `corpusProducerIsShared.test.ts`'s own docblock, a
+      point-in-time #814 count — carried here, not re-derived),
+      not the 15 the issue estimated, and disproved one of its two headline examples:
+      `scripts/scan-publish-safety.mjs` is **not** a rival corpus definition — it runs downstream of
+      its own `git ls-files` manifest. ⚠️ **This bullet predicted the next instance would land in
+      that gap. It did not** — instance 9 landed inside the region the bullet above called covered,
+      and this one sent the #849 reader looking in a gap that no longer exists.
+
+- **A path-valued field on a PERSISTED record is normalised by the module that owns the record, on
+  READ as well as on write — never by each caller** (#849). `deviceClaimsStore.mjs` does this
+  (`foreignClaimFor`, `ownAdbClaim`: `path.resolve(held.clone) === clone`); `buildClaimsStore.mjs`
+  did not, and compared its stored `projectRoot` raw against a resolved argument, so an equivalent
+  root spelled differently found no conflict and the build claim was granted twice. #847 patched
+  that at the four test seed sites and left a comment asking the next author to remember
+  `path.resolve` — which is the "fix that can be un-fixed" shape; the store now resolves both sides
+  and there is nothing to remember. The two stores are otherwise deliberate twins, and
+  `buildClaimsStore.mjs`'s header enumerates its three intended divergences — this was not one of
+  them, which is exactly why it went unnoticed.
 
 ## Never shell out to a platform binary whose shape you assumed
 
@@ -157,6 +501,69 @@ degrades to system npm, so a dev machine boots fine and `smoke:packaged` reporte
 its own log said `Node provisioning failed`. When testing an extractor, do not build the fixture
 with the same tool — GNU tar's `-a -cf x.zip` writes a *tar* named `.zip` that extracts happily
 and proves nothing. Assert the `PK` magic bytes instead.
+
+### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
+
+It **appends them to the command line as more source**. `$args` is empty, and the trailing items
+are re-parsed by the PowerShell parser. This is not a quoting bug you can escape your way out of;
+it is the wrong channel. Measured on `win` (#875):
+
+| invocation | `$args` |
+|---|---|
+| `-Command <script> p1 p2` | **empty** — and `p1 p2` are executed as statements |
+| `-Command "& { <script> }" p1 p2` | binds — but see below |
+
+`moveToTrash` shipped the first form for months. Three consequences, in the order they bite:
+
+1. **`foreach ($p in $args)` iterated zero times**, so the editor's "move to Recycle Bin" recycled
+   *nothing* on Windows, ever.
+2. **A path with a space splits.** `…\a file.json` became `…\a` + `file.json`, so the `& { }`
+   "fix" would have deleted `…\a` — a path the user never selected. **Binding `$args` is not the
+   fix**; it converts a no-op into a wrong-target delete.
+3. **A FILENAME can execute.** A legal NTFS name containing `; <statement>` ran that statement
+   (verified with an inert payload, exit 0, no error). The name need not be typed by anyone — it
+   can arrive in a downloaded asset pack or a cloned project.
+
+**The rule: data never travels on a PowerShell command line.** Put it on **stdin** (or an env
+var) and read it inside the script. `osascript -e … p1 p2` genuinely does bind argv (`on run
+argv`), which is why the macOS branch was correct and the comment claiming both were safe was
+half wrong — do not generalise from the mac side.
+
+Two traps in the replacement, both of which cost a measurement here:
+
+- ⚠️ **A .NET exception inside a PowerShell loop is NON-terminating: the script keeps going and
+  still EXITS 0.** So `execFileSync` does not throw and the caller reports success for work that
+  did not happen. This bit twice in one change — the fixed `moveToTrash` recycled the good paths,
+  wrote nothing for the bad one, and `/api/delete-asset` returned `{ok:true}`, unbound the asset
+  in the renderer and rebuilt the manifest for a file still on disk. Measured: one bad path among
+  two good ones exited 0.
+
+  **Count failures and `exit` non-zero.** ⚠️ Do *not* reach for `$ErrorActionPreference = 'Stop'`
+  instead — it reports the failure but abandons every remaining path, converting one bad file
+  into a half-applied batch. `try`/`catch` per item keeps the batch going *and* reports:
+
+  ```powershell
+  $failed = 0
+  foreach ($p in $paths) { try { … } catch { $failed++; [Console]::Error.WriteLine("FAILED $p") } }
+  if ($failed -gt 0) { exit $failed }
+  ```
+
+  The general form of the trap: **the loud failure is the lucky one.** The broken version of this
+  code failed loudly *by accident* (the path ran as a command and exited 1); fixing the real bug
+  removed the accident and left a silent one behind. When a fix removes an incidental error path,
+  check what was relying on it.
+- ⚠️ **`[Console]::In` decodes through the console's CODE PAGE.** On a dev box already at 65001
+  everything works and the guard looks like dead code; on a default en-US (437) or ja-JP (932)
+  console the UTF-8 bytes are mangled, the path matches nothing, and the file **silently
+  survives** — exit 0, nothing thrown. Set `[Console]::InputEncoding` to UTF-8 *before* the read.
+  A mutation check on a 65001 machine will tell you the line is unnecessary; it is lying to you,
+  and the only way to see it is to force a legacy code page (`GetEncoding(437)`) in the test.
+- **`[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile` throws `Could not find file` on a
+  directory.** Folders need `DeleteDirectory`. Branch on `Test-Path -PathType Container`.
+
+⚠️ **This was a singleton, not a class** — a sweep found the repo's four other PowerShell call
+sites (`packagedAppPaths.mjs`, `stopDevServer.mjs`, `toolchain/index.ts`, `buildStepShell.test.ts`)
+all interpolate their values into the script string and pass no trailing args. Do not "fix" them.
 
 ## Packaged-app bugs found on real Windows hardware
 
@@ -396,6 +803,13 @@ Split the failure into one of two classes before doing anything:
   diagnosable remotely. Shipping mechanism-guesses for CI to adjudicate burns rounds and lands
   wrong fixes; CI is a pass/fail **oracle, never a diagnosis**. Report the evidence, name the
   competing theories, and let a real Windows box measure it.
+
+Then ask **which Windows**. The hosted runner and a real dev box differ in ways that decide tests:
+the runner's `%TEMP%` arrives **8.3-shortened** (`C:\Users\RUNNER~1\…`), because the account name
+`runneradmin` exceeds 8 characters, while a box whose account name fits (`C:\Users\dev\…`) is
+already the long form. A canonicalisation test can therefore be red on `ci/main` and green on the `win` clone
+forever. ⚠️ **"Green on the win clone" is not evidence about CI, and the reverse holds too** — #878
+was invisible on real Windows hardware and reproduced on every runner.
 
 A worked example of the second class: an orphaned child inherits `cmd.exe`'s stdio pipes, so a
 `close` event cannot fire until the orphan dies — making an assertion unsatisfiable *by

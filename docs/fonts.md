@@ -118,6 +118,81 @@ Both traits carry the same field set (`Text3D` adds `billboard`, `Text2D` adds
 `letterSpacing`, `anchorX/Y`. All path-independent; `fontSize` is px for `Text2D` and world
 units per em for `Text3D`.
 
+⚠️ **`font`, `text`, `fontSize`, `align`, `maxWidth`, `lineSpacing` and `letterSpacing` are all part
+of Scene2D's `layoutHash` — the text-slot REBUILD KEY.** Writing any one of them per frame with a
+changing value tears down and rebuilds that entity's page meshes, geometry and GL buffers every
+frame (#677). To animate a size, animate `Transform` scale instead, never `Text2D.fontSize`. #752
+fixed the residual this workaround used to leave open: on the WebGL1-without-derivatives path
+(iPhone 8, no `fwidth`), `uScreenPxRange` now refreshes every frame from the entity's WORLD
+transform scale (inherited through parents) times the host Canvas2D's own uniform scale, instead of
+staying pinned at the authored `fontSize`. That closes it for BOTH ways a Transform scale reaches
+text: an animated scale (wordweave's flight animation) and a static one inherited from a scaled
+ancestor (wordweave's crossword glyphs, pinch-zoomed 1x→3x via their host container while spawned
+at a fixed `fontSize`). #677 is the scar that produced the workaround; #752 is the fix that made it
+exact for shading too, not just geometry.
+
+⚠️ **Two things to know before trusting that fix, both of which cut against it.**
+
+**It is verified by arithmetic, not by eye.** `uScreenPxRange` is read ONLY on the
+no-derivatives branch, so on every Mac, simulator and modern device the `fwidth` branch runs and
+this uniform is *dead*. The tests assert the uniform's VALUE; nothing here can render the branch
+that consumes it, and a screenshot proves nothing. The visual outcome remains unobserved — it needs
+an iPhone 8 or another no-derivatives WebGL1 device.
+
+**On a DOWNSCALED canvas the term is now LOWER than it was, which is softer, and that direction was
+previously deliberate.** The old code used the design-space `fontSize`, and its comment justified
+that as erring "toward a crisper edge rather than a blurry one" on a canvas rendering smaller than
+its reference. Tracking the effective size removes that margin: where `canvasScale < 1` the uniform
+now drops proportionally. This is *correct* — `spr` is meant to be actual screen pixels per
+distance-field unit — but it is a real change in appearance on exactly the device class that reads
+it, in the direction the previous author avoided on purpose. If small text looks softer on the
+iPhone 8 after #752, this is why, and the fix is to raise the font's baked `pxRange` (§2), not to
+restore the over-estimate.
+
+The full rebuild that `layoutHash`/`hash` gate is not the only path a text edit can take, on
+either backend. Both `Scene2D` and `Scene3D` split that rebuild key into two: a **build key**
+(`font`, `text`, the atlas version, the text-dirty version — the fields that decide what gets
+*allocated*, i.e. the glyph sequence and the atlas) and the full **layout key** on top of it,
+adding the fields that only *move* a quad's x/y. The two backends' layout keys differ by one
+thing: **3D's also carries `anchorX`/`anchorY`; 2D's does not**, because 2D applies the anchor as
+a container `pivot` (`Scene2D.tsx`, `container.pivot.set(...)`) rather than baking it into
+geometry, so an anchor-only edit never needs 2D's layout key to change at all. Both keys otherwise
+carry `fontSize`/`align`/`maxWidth`/`lineSpacing`/`letterSpacing`. When the layout key changes but
+the build key doesn't, neither backend rebuilds geometry or the material — it rewrites the
+existing page mesh's position attribute in place from the new layout, behind a guard
+(`canWriteTextPositionsInPlace` in `textMesh.ts`) that refuses rather than half-applies whenever
+the guard's own precondition (same glyph sequence, same page assignment, same per-page vertex
+count) doesn't hold. A refusal just falls through to the ordinary full rebuild, so a wrong guess
+costs a rebuild, not a corrupt mesh. `Scene2D.tsx`'s `meshBuildKey` and `scene3DSync.ts`'s
+`entry.buildKey` are the two build-key fields; #749 and #766 are the 2D and 3D instances of this
+fast path respectively.
+
+The full rebuild itself, on both backends, builds every replacement page mesh (and material,
+where the atlas changed) before freeing whatever it superseded — never the other order. This is
+**discipline, not a leak fix**, and it is worth being precise about why, because the tempting
+reading is wrong in both directions.
+
+On **2D** there is nothing to protect: `getMtsdfPrograms` caches one GL/GPU program pair at module
+level and never releases it — no refcount exists, so no ordering can drop one. That is also why
+`Scene2D`'s slot teardown destroys a text Shader *bare* rather than with `destroy(true)`, which
+would null the shared program's stages and kill every text mesh in the session; the comment there
+is the authority.
+
+On **3D** a real refcount does exist — three's `Pipelines` registry — but it is acquired at DRAW
+time (`getForRender`), so within one synchronous rebuild the replacement material has acquired
+nothing regardless of ordering, and the old material's dispose still takes the count to zero. The
+reorder costs nothing and matches the discipline `build()`'s "free what this rebuild superseded"
+block in `gpuComputeBackend.ts` states for the particle backend, but **on its own it does not keep
+`usedTimes` off zero.**
+
+What actually removes the churn for a layout-only edit is the fast path above: no rebuild happens
+at all, so nothing is disposed and nothing is re-acquired. A `text` change or an atlas change still
+takes the full rebuild and still hits the vendor gap #715 describes on the 3D side — that gap is
+not closed by this change. #715's app-side half has since been closed by
+`installGlProgramReleaseHatch` (`runtime/rendering/glProgramRelease.ts`), which issues the GL
+deletes three's `webgl-fallback` omits; the issue itself is **iceboxed**, because what remains is
+three upstream changes in three.js that cannot be made from this repo.
+
 **Colour** — `color` + `opacity`. A per-glyph colour animation (`TextAnimation` rainbow/fade)
 multiplies on top via a vertex attribute.
 

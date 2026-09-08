@@ -22,6 +22,17 @@ export function register(): void {}
 export function track(_name: string, _params?: Record<string, string | number>): void {}
 export function setTrackProperty(_track: string): void {}
 export function startInstallMilestones(): void {}
+/** #653 — the once-per-install AppsFlyer-forward ledger. An ad creative has no AppsFlyer SDK and
+ *  no install to track, so `hasForwardedOnce` reads `true` (fail-closed, same posture as the real
+ *  implementation off-hydration) and `markForwardedOnce` is a no-op. */
+export function hasForwardedOnce(_name: string): boolean { return true; }
+export function markForwardedOnce(_name: string): void {}
+/** #372 — the install stamp Court's welcome-back spin measures against. `null` is the real
+ *  implementation's "cannot find out", and it is the RIGHT answer here rather than a convenient
+ *  zero: an ad creative has no install record at all, and returning 0 would read as "installed at
+ *  the epoch", making every since-install reward instantly due inside a playable. The caller
+ *  already refuses on null. */
+export function installFirstOpenAt(): number | null { return null; }
 
 /** Crash reporting — a no-op for the same reason. An ad creative has no Firebase app, and the
  *  Crashlytics SDK behind the real wrapper is byte weight the cap cannot afford. Exported as a
@@ -50,6 +61,7 @@ export const ads = {
   async initAds(): Promise<void> {},
   cleanupAds(): void {},
   onRewardEarned(_handler: unknown): void {},
+  async restoreAdsAfterRealmSurvived(): Promise<void> {},
   async showBanner(): Promise<void> {},
   async hideBanner(): Promise<void> {},
   async showInterstitial(_placement: string): Promise<boolean> { return false; },
@@ -88,11 +100,24 @@ export const auth = {
   async signInWithGoogle() { return PLAYABLE_NO_AUTH; },
   async deleteAuthUser() { return PLAYABLE_NO_AUTH; },
   async currentUser() { return null; },
+  // Close-out R1 (`games/court/runtime/systems.ts`) — the SAME `ok:true, user:null` a playable's
+  // `currentUser()` above answers, in the shape `currentUserResult()`'s callers need: a playable
+  // is never native, so there is no plugin call that could fail here, and "nobody is signed in" is
+  // the only genuine answer — never the deferred `ok:false` a real transient plugin failure would
+  // produce.
+  async currentUserResult() { return { ok: true as const, user: null }; },
   async signOut(): Promise<void> {},
   async onAuthChanged(_cb: unknown): Promise<() => void> { return () => {}; },
   classifyAuthError(_e: unknown) { return 'not-configured' as const; },
   toCourtUser(_raw: unknown) { return null; },
   __resetAuthForTest(): void {},
+  // A playable ad has no signed-in user to mint a Google-signed ID token from, so `null` (the real
+  // function's own "no trusted time available" answer) is exactly right — the same reasoning
+  // `serverTime.getDateHeaderTimeMs` below already documents. `refreshTrustedClock` calls this
+  // unconditionally at boot (`courtIapBootSystem`), playable included — this was missing once and
+  // the caller's own try/catch swallowed the resulting `TypeError`, but silently: it aborted before
+  // ever trying `serverTime`'s fallback, so a playable never anchored at all (#371 close-out).
+  async getServerTimeMs() { return null; },
 };
 
 const PLAYABLE_NO_AUTH = {
@@ -102,20 +127,58 @@ const PLAYABLE_NO_AUTH = {
 };
 
 /**
+ * Trusted-time fallback — a no-op namespace, mirroring `export * as serverTime from
+ * './serverTime'` (Court's unauthenticated `Date`-header source, added alongside `auth
+ * .getServerTimeMs` for a player who has never signed in).
+ *
+ * ⚠️ **A playable DOES call this, every boot.** An earlier version of this comment said the
+ * opposite ("no store, no `courtOnGrant`, nothing that would ever call this") — false, and the
+ * exact vouching-for-a-property-the-code-lacks class #371's close-out kept finding.
+ * `courtIapBootSystem` fires `refreshTrustedClock('boot')` unconditionally, playable included, and
+ * it reaches this the moment `auth.getServerTimeMs()` returns `null` — which in a playable it
+ * always does. What IS true is that nothing downstream cares: a playable has no purchase flow, so
+ * no pass expiry is ever computed from the anchor this would have set.
+ *
+ * `null` (the real function's own "could not get a trusted time" answer) is therefore exactly right
+ * rather than a special case: every caller already treats `null` as "fall through to the next
+ * source", which for a playable ends at the ordinary `Date.now()` fallback.
+ */
+export const serverTime = {
+  async getDateHeaderTimeMs(): Promise<number | null> { return null; },
+};
+
+/**
  * Cloud save — a no-op namespace, mirroring `export * as cloudSave from './cloudSave'` (#361).
  *
  * ⚠️ `loadSave` THROWS rather than resolving `null`, and the asymmetry is deliberate. `null` means
  * "this account has no save yet", which would invite the sync protocol to treat a creative as a
  * fresh device and try to CREATE one. Throwing means "could not read", which every caller already
  * handles as a failed sync that leaves local storage alone — the correct behaviour for a session
- * that lasts seconds and must never touch a real player's document.
+ * that lasts seconds and must never touch a real player's document. `listSaveIds` throws for the
+ * same reason and the same distinction (#532 C4b): an empty list would mean "this account has no
+ * documents", which is a claim this stub is in no position to make.
+ *
+ * ⚠️ **`deleteAllSaves` returns `false`, NOT the real function's "zero documents is success".**
+ * That rule is right for a real account that genuinely has nothing left to delete; here it would
+ * assert the same thing about an account this build cannot see at all, and `false` is what makes
+ * the caller ABORT rather than walk on to delete an auth user (`systems.ts`'s
+ * `beginAccountDelete`). Fails closed, exactly as `deleteSave` above already does.
+ *
+ * ⚠️ **The signatures MIRROR the real module, `groupId` included.** `playableAppServicesStub.test.ts`
+ * (#269) checks that every member a game CALLS exists here — it cannot check arity, so a stale
+ * signature would sit here looking correct and silently drop the argument that decides WHICH
+ * document is addressed.
  */
 export const cloudSave = {
-  async loadSave(_uid: string): Promise<never> {
+  async loadSave(_uid: string, _groupId: string): Promise<never> {
     throw new Error('A playable creative has no cloud save.');
   },
-  async pushSave(_uid: string, _doc: unknown): Promise<'ok' | 'conflict' | 'failed'> { return 'failed'; },
-  async deleteSave(_uid: string): Promise<boolean> { return false; },
+  async pushSave(_uid: string, _groupId: string, _doc: unknown): Promise<'ok' | 'conflict' | 'failed'> { return 'failed'; },
+  async deleteSave(_uid: string, _groupId: string): Promise<boolean> { return false; },
+  async listSaveIds(_uid: string): Promise<never> {
+    throw new Error('A playable creative has no cloud save.');
+  },
+  async deleteAllSaves(_uid: string): Promise<boolean> { return false; },
   isConflict(_e: unknown): boolean { return false; },
   __resetCloudSaveForTest(): void {},
 };

@@ -18,6 +18,7 @@ import { keyboardSource } from './keyboardSource';
 import { gamepadSource } from './gamepadSource';
 import { pointerSource } from './pointerSource';
 import { touchControlSource } from './touchControlSource';
+import { gestureSource } from './gestureSource';
 import { registerInputPromptSources } from './inputPromptSources';
 
 export interface InputSource {
@@ -185,9 +186,31 @@ registerSource(keyboardSource);
 registerSource(gamepadSource);
 registerSource(pointerSource);
 registerSource(touchControlSource);
+// Multi-touch pan/pinch/tap. Independent of pointerSource's primary-touch latch — see its header.
+registerSource(gestureSource);
 
-/** App-scope Manager: attaches all sources on register, detaches on unregister.
- *  Replaces the old keyboard-only `inputManagerDef`. */
+/** App-scope Manager: attaches all sources on register. Replaces the old
+ *  keyboard-only `inputManagerDef`.
+ *
+ *  `dispose` is UNREACHABLE in production, and that is settled rather than pending (#534). #517
+ *  declined to wire `unregisterManager('Input')` because the registration latch was once-only, so
+ *  a teardown would leave input permanently dead. #534 built the missing inverse — a
+ *  `teardownAll()` that dropped this manager and re-armed the latch — and then removed it: this
+ *  architecture never ends an app lifetime while the realm survives (mobile kills the process, web
+ *  closes the tab, restart/OTA and the editor's project switch both go through a reload), so
+ *  there was nothing for it to serve. `'Input'` therefore stays in
+ *  `appManagerDisposeReachable.test.ts`'s allowlist permanently.
+ *
+ *  `dispose` still earns its keep: it satisfies the `ManagerDef` contract and runs under
+ *  `__resetManagersForTesting`, and `detachAll()` pairs with `attachAll()` in `init` — the source
+ *  ARRAY is untouched, so a re-attach finds all five sources still registered. That pairing is
+ *  what would make this manager safe to tear down if a SOFT restart is ever built.
+ *
+ *  ⚠️ `unregisterSource()` is a different matter and is deliberately NOT on any
+ *  teardown path. The five built-ins above are registered as a MODULE-EVAL side
+ *  effect, so unregistering one splices it out of an array nothing will refill:
+ *  irreversible for the process, and strictly worse than dropping the manager.
+ *  It stays public for sources a GAME registers and owns. */
 // Disposer for the device-prompt read sources ({confirmPrompt} etc.), registered
 // alongside the sources so device-appropriate UI prompts are available app-lifetime.
 let disposePromptSources: (() => void) | null = null;

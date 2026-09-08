@@ -6,7 +6,16 @@ import './core/instanceGuard';
 // Side-effect only — wires every core/providerSlot.ts seam (P7 C8+). See its own header.
 import './loaders/registerProviders';
 
-export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION } from './core/version';
+export { ENGINE_VERSION, SCENE_FORMAT_VERSION, ENGINE_API_VERSION, SUBGAME_MANIFEST_SCHEMA_VERSION } from './core/version';
+// The whole format-versioning module (docs/format-versioning.md § 2a), not just the unknown-field
+// bag — a PRESERVE-disposition writer (§ 2b-bis) needs the classifier and `preservedVersion` too,
+// and hand-rolling the bag is exactly what § 2b-bis warns against (wordweave did it twice in one
+// game, and review still caught a real defect in the second one, #763).
+export {
+  classifyFormatVersion, classifyJsonFormatVersion, isReadable, preservedVersion,
+  collectUnknownFields, mergeUnknownFields,
+  type FormatVerdict, type UnreadableReason, type ClassifyOptions,
+} from './core/formatVersion';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
@@ -35,6 +44,7 @@ export {
 export { parseEntryPrefabs } from './traits/UIEntries';
 export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
+export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, patchAnchorPct, type ChromeUIPatch, type ChromeTogglePatch, type ChromeAnchorPatch } from './ui/sceneChrome';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
 export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
 export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';
@@ -45,6 +55,7 @@ export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {
   registerAppServices, appServices, clearAppServices, onAppServicesRegistered,
   type AppServices, type CrashlyticsService, type AdsService, type AttributionService,
+  type NativeDialogService,
 } from './core/appServices';
 // Global JS error capture -> the `crashlytics` service (#275). The test seam
 // (`__resetGlobalErrorsForTest`) is deliberately NOT here — a test imports the module directly,
@@ -59,9 +70,27 @@ export {
 } from './core/faultProvider';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
-  type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
+  type JsonValue, type PlayerPrefsInitOptions, type PlayerPrefsInitResult, type PrefsBackend,
 } from './storage';
 export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore';
+// The cloud-sync contract (#532) — a game declares its sync-guaranteed groups against this and
+// binds a `GroupStore` per group (`createPrefsDocStore` above is the usual single-key one).
+export {
+  defineSyncGroup, emptyMarks, neverSynced, decideGroup, hasLocalWrites, scopeMarksToAccount,
+  runGroupSync, runCloudSync, resolveGroupFork, CloudSyncCoordinator,
+  type AnySyncGroup, type CloudGroup, type CloudSyncDeps, type ConflictChoice, type ForkPolicy,
+  type GroupAtomicity, type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore,
+  type GroupTransport, type LocalGroup, type PendingConflict, type ResolveForkOptions,
+  type RunSyncOptions, type RunSyncResult, type SyncFork, type SyncGroupSpec, type SyncOutcomeOf,
+  type SyncReason,
+} from './sync';
+// The account-generic contract for a game with sign-in (#675) — provider identity, the
+// sign-in/out/delete state machine, and re-auth arm selection. Deliberately carries NO
+// player-visible copy — see `account/index.ts`'s own banner for why.
+export {
+  ALL_PROVIDERS, reauthProviderFor,
+  type AccountProvider, type AccountState, type AvailableProviders, type SignInFailure,
+} from './account';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
 // Generic verbs are prefixed on the way out — the barrel is one flat namespace shared with every
@@ -71,10 +100,11 @@ export {
   configureIap, resetIap, restorePurchases, refreshEntitlements, isEntitled,
   purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
   balanceOf as iapBalanceOf, productInfo as iapProductInfo,
+  describeStoreError as iapDescribeStoreError,
   IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
   type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
-  type PurchaseOutcome, type PurchaseResult,
+  type PurchaseOutcome, type PurchaseResult, type IapGrant,
 } from './iap';
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
@@ -97,11 +127,14 @@ export { HapticSettings } from './traits/HapticSettings';
 export {
   AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
 } from './traits/AudioSettings';
+export {
+  UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
+} from './traits/UISettings';
 // Host platform / form factor — the single source of truth for "is this a handheld?", asked
 // by the renderer's quality tier AND by on-screen touch controls.
 export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';
 export {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
   UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, NO_SCROLL_REQUEST, NO_BEHAVIOR_REQUEST,
   type UIEntryPrefab, type UIEntryLengthUnit,
@@ -166,6 +199,11 @@ export {
   ANIMSET_DEFAULTS,
   type AnimSetDef, type AnimSetClipDef, type ResolvedAnimParams,
 } from './loaders/animSetCache';
+// The 2D-material (.shader.json) invalidator (#842) — agentBridge.ts's ASSET_CACHE_INVALIDATORS
+// reaches it through this barrel the same way it reaches invalidateAnimSet above.
+// `getSpriteMaterialProgram` (#842b) is a pure map read — no fetch side effect on a miss — so
+// `read-asset-def`'s shader arm can peek it exactly like the other types' `{load:false}` getters.
+export { invalidateShader, getSpriteMaterialProgram } from './loaders/spriteMaterialCache';
 export {
   getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip,
   setSpriteAnim, invalidateSpriteAnim, clearSpriteAnimCache, normalizeSpriteAnim,
@@ -221,8 +259,15 @@ export {
 } from './loaders/meshTemplateCache';
 export {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
+  ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
+// GPU-memory report (Phase 3 of #590, docs/ios-gpu-memory.md) — 3D bytes read
+// straight from `renderer.info.memory` and 2D (PixiJS) bytes computed per canvas2DPool slot
+// (compressed-format-aware), plus the live GL-context count, sampled on an interval that survives
+// a dead frame loop. `getGpuMemoryReport()` returns the most recent sample (or null before the
+// first one); sampling itself starts/stops with the game loop (`useGameLoop.ts`).
+export { getGpuMemoryReport, type GpuMemoryReport } from './loaders/gpuMemoryReport';
 export { loadGLB } from './loaders/loadGLB';
 export {
   rendererReady, setActiveRenderer, loadTexture3D, releaseTexture3D, onRendererReady,
@@ -345,7 +390,7 @@ export { getShadowCasterCapStats } from './rendering/shadowCasterCapFrame';
 // reason: verifying that a light selection REACHED the renderer needs the running instance, and a
 // direct `/@fs/` import from a debug eval can land on a second copy of the module.
 export { getLightMaskStats } from './rendering/lightMaskVariants';
-export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
+export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict, type ProbeStoreSession } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';
@@ -391,7 +436,7 @@ export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type 
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
-  clearManifest, getAllAssets, resolveSceneByName,
+  clearManifest, getAllAssets, resolveSceneByName, ASSET_MANIFEST_VERSION,
   type AssetType, type AssetEntry, type AssetManifestEntry, type AssetManifestFile, type BinaryAssetMeta,
   type AudioImportSettings,
 } from './loaders/assetManifest';
@@ -401,6 +446,14 @@ export { UIRenderer } from './ui/UIRenderer';
 // should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
 // compute WITH the inset (a reserved bottom band, a board fitted into what is left).
 export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
+// Whether a native TOUCH gesture is live anywhere in the DOM, independent of the canvas-scoped
+// `Input` resource (which deliberately excludes a press starting on DOM chrome). Touch only —
+// see the module's own header for why mouse/pointer tracking was tried and dropped. For deferring
+// expensive synchronous work off a live touch-scroll gesture on UI chrome (#579) — see the
+// module's own header before reaching for this; most input should go through `Input` instead.
+export {
+  wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
+} from './ui/domGestureTracking';
 export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
@@ -456,9 +509,11 @@ export {
   registerFrameCallback, unregisterFrameCallback,
   startFrameDriver, stopFrameDriver, stepOneFrame,
   setTargetFPS, targetFPS, getCurrentFPS, getFrameLoopHealth,
+  onFrameLoopUnrecoverable,
   PRIORITY_ECS, PRIORITY_RENDER_3D, PRIORITY_RENDER_2D,
 } from './rendering/frameDriver';
-export type { FrameLoopHealth } from './rendering/frameDriver';
+export type { FrameLoopHealth, FrameLoopUnrecoverableInfo } from './rendering/frameDriver';
+export { installUnrecoverableFrameLoopAlert } from './rendering/unrecoverableFrameLoopAlert';
 
 // ── Render settings (project-configured renderer knobs) ──
 export {
@@ -562,14 +617,24 @@ export {
   pointerPredictedPos, pointerVelocity, setPointerLeadMs, getPointerLeadMs,
   POINTER_LEAD_MS_DEFAULT, POINTER_LEAD_MS_ANDROID_60HZ,
   setPointerLeadGate, getPointerLeadGate, pointerLeadGateFactor, POINTER_LEAD_GATE_DEFAULTS,
+  // Gesture accessors — multi-touch pan / pinch / tap, from `gestureSource`.
+  gesture as inputGesture, pinching, pinchScale, pinchScaleDelta, panDelta,
+  gestureTapped, gestureTapPos,
 } from './traits/Input';
 export {
   setPointerFilterParams, getPointerFilterParams,
 } from './input/pointerSource';
 export {
+  configureGestures, getGestureConfig, DEFAULT_TAP_MAX_MS, DEFAULT_TAP_SLOP_PX, EMULATED_PINCH_SEED_PX,
+} from './input/gestureSource';
+export {
   createOneEuroFilter, oneEuroAlpha, POINTER_FILTER_DEFAULTS, type OneEuroParams,
 } from './input/oneEuroFilter';
 export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './core/clock';
+export {
+  setTrustedAnchor, trustedNow, hasTrustedAnchor, trustedAnchorSource, clearTrustedAnchor,
+  type TrustedClockSource,
+} from './core/trustedClock';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
@@ -587,6 +652,14 @@ export { rotate3DSystem } from './rendering/rotate3DSystem';
 export { materialInstanceSystem, resetMaterialInstanceClocks } from './rendering/materialInstanceSystem';
 export { resetMaterialInstanceClones } from './rendering/materialInstanceClones';
 export { animationSystem } from './animation/animationSystem';
+// #731: parseAnimClipBankResult (the safe variant that tells "no bank" apart from "malformed
+// bank") was reachable only via a deep relative import within this package — no consumer outside
+// it (a game, the app shell) could reach it at all. Exported beside its plain delegate, same shape
+// as audio/clipBank's pair above.
+export {
+  parseAnimClipBank, parseAnimClipBankResult, stringifyAnimClipBank,
+  type AnimatorClip, type AnimClipBankResult,
+} from './animation/animClipBank';
 export { spriteAnimationSystem } from './animation/spriteAnimationSystem';
 export { skin2DSystem } from './skinning/skin2DSystem';
 export {
@@ -615,7 +688,7 @@ export { clearZoneState } from './zones/zoneTriggerCore';
 export { characterInputSystem } from './input/characterInputSystem';
 export { characterInput3DSystem } from './input/characterInput3DSystem';
 export { characterAnimationSystem } from './animation/characterAnimationSystem';
-export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './audio/audioSystem';
+export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver, rearmAudioAutoplay } from './audio/audioSystem';
 export { registerAudioControls, useAudioMixStore } from './actions/audioControls';
 export { registerVideoControls } from './actions/videoControls';
 // Fullscreen cutscene layer. React + DOM only (no THREE), so exporting it here does
@@ -656,7 +729,10 @@ export {
   type CacheEntry, type AdmissionResult,
 } from './video/videoCachePolicy';
 export { cueSound, cueClip, drainAudioCues, clearAudioCues, type AudioCue } from './audio/audioCues';
-export { parseClipBank, stringifyClipBank, clipRefForKey, type ClipBankEntry } from './audio/clipBank';
+export {
+  parseClipBank, parseClipBankResult, stringifyClipBank, clipRefForKey,
+  type ClipBankEntry, type ClipBankResult,
+} from './audio/clipBank';
 export { getAudioContext, hasAudioSupport, disposeAudioContext } from './audio/audioContext';
 export {
   acquireAudio, releaseAudioForScene, disposeAllAudioBuffers, getCachedAudioBuffer, resolveAudioUrl,
@@ -682,6 +758,42 @@ export { registerInputPromptSources } from './input/inputPromptSources';
 // sibling of the game canvas) claims exclusive ownership of pointer gestures that
 // start on it, so `pointerSource` never latches them as a game gesture.
 export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } from './core/pointerBlockers';
+// UI-busy sources (#530) — a game registers a predicate once at manager init so the global UI
+// input lock (`runtime/ui/bindings.ts`) can keep blocking discrete activations while game-owned
+// async state (a sign-in, a purchase) is in flight, without every 'call' handler having to return
+// a promise. See `core/uiBusySources.ts` for the full design rationale.
+export { registerUIBusySource } from './core/uiBusySources';
+// Polls the busy predicates every frame so #530's valve OBSERVES continuity instead of inferring
+// it across discrete UI activations (#551). Registered as a system in `app/ecs/pipeline.ts`.
+export { pollUIBusyContinuity } from './core/uiBusySources';
+// Reload-on-resume (#574) — the trigger that restarts the app after a long background, plus the
+// two guards it needs. `registerReloadBlocker` is NOT the same registry as `registerUIBusySource`
+// above: the two fail in opposite directions on a throwing predicate, and Court's win screen
+// blocks a reload without being UI-busy. `consumeResumeReload` exists because the reload swallows
+// the very `appStateChange` that triggered it, so the new realm has no other way to learn it was
+// resumed rather than cold-launched. See `core/resumeReload.ts` for the full reasoning.
+export {
+  registerReloadBlocker,
+  getActiveReloadBlockers,
+  markResumeReload,
+  consumeResumeReload,
+  createResumeReloadHandler,
+  type ResumeReloadDeps,
+  type ResumeReloadHandler,
+} from './core/resumeReload';
+// Realm shutdown tasks (#587) — the seam that lets a reload destroy native SDK state (an AppLovin
+// banner/MREC/interstitial) before the reload destroys the JS realm. `runtime/**` cannot reach
+// `appServices()` (layering), so the app registers the task here and the reload sites
+// (`engine.reload`, `useResumeReload.ts`) only ever invoke the registry. `notifyRealmSurvived`
+// (#611) is the other half — the false-alarm recovery a `pagehide` backstop needs when its
+// `event.persisted === false` gate over-triggers (an Android measurement shipped on iOS, where the
+// signal is ambiguous); see `core/realmShutdown.ts`.
+export {
+  registerRealmShutdownTask,
+  runRealmShutdownTasks,
+  shutdownRealmThenReload,
+  notifyRealmSurvived,
+} from './core/realmShutdown';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
 // it is a no-op until an agent opens a watch window.
@@ -696,6 +808,7 @@ export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
   type Axis, type DigitalAction, type InputDevice, type InputFrame, type AxisMap, type FlagMap, type PointerFrame,
+  type GestureFrame,
 } from './core/inputActions';
 export {
   vecEcsToPhys, vecPhysToEcs, angEcsToPhys, angPhysToEcs, lenToPhys, packCollisionGroups,
@@ -755,7 +868,7 @@ export {
   requestActivate, resetFocus, consumePendingActivation, pickInDirection,
   type NavDir,
 } from './ui/focusManager';
-export { addDirtyListener } from './core/ecs/entityUtils';
+export { addDirtyListener, fireDirtyListeners } from './core/ecs/entityUtils';
 // Default game store (ECS→React bridge). Exported so a game imports it via
 // `@modoki/engine/runtime` instead of a repo-relative path into the app shell —
 // the latter breaks when the game is opened standalone (copied out of the repo).

@@ -15,10 +15,44 @@ Related: [editor-input.md](./editor-input.md) (the keymap contract), [debug-tool
 |---|---|
 | `games/<id>/**.ts`, `games/<id>/game.ts` (game **code**) | **Full page reload** — the only thing that can apply it |
 | `games/<id>/runtime/assets/**` (scenes, prefabs, `.mat.json`, …) | No page reload; the **world** reloads via `modoki:scene-changed` |
+| A shader **body** — `<name>.glsl` / `<name>.wgsl` | Same as above: remapped to its sibling `<name>.shader.json` and broadcast as `kind:'shader'` (#857) |
 | `games/<id>/tests/**`, `project.config.json` | Nothing (they don't affect the running editor) |
 | `editor/input/{keymap,focusScope,dispatcher}.ts`, `editor/createEditor.tsx` | **Full page reload** (registry can't survive a swap) |
 | `runtime/rendering/npr/**` | **Full page reload** (TSL nodes bake into compiled WGSL) |
 | Any other engine/editor source | Normal React Fast Refresh |
+
+### A shader is TWO files, and only one of them used to be watched
+
+A shader is authored as a `.shader.json` descriptor plus a sibling `.glsl`/`.wgsl` carrying the
+source — and the source is the file an author actually iterates on (`ShaderAssetView`'s own help
+text points at it). Until #857 the watcher gated its entire broadcast on `extname === '.json'`, so
+editing the body produced **no event at all**: the compiled program stayed cached until a scene swap,
+and the editor could be running a shader that no file on disk contained.
+
+A body write is now remapped to its sibling descriptor before classification, and broadcast as that
+descriptor's `kind:'shader'`. Three consequences worth knowing:
+
+- **The body is still not a manifest asset.** No GUID, no manifest entry, no `LiveReloadKind` of its
+  own — `assetTypeClassifier` excludes `.wgsl`/`.glsl` on purpose ("shader SOURCE … not a
+  GUID-referenced runtime asset"), and the remap is what lets that stay true.
+- **A body with no sibling descriptor broadcasts nothing.** That is deliberate, not a gap.
+- **Editing `foo.glsl` and `foo.wgsl` within one 150 ms debounce produces ONE broadcast**, because
+  the pending map is keyed by the descriptor's URL path.
+- **A body edit does NOT discard an unsaved parked edit on the descriptor.** The broadcast carries
+  `viaSibling`, and `dropParkedWriteFor` runs only for a direct write to the descriptor itself.
+  Without that distinction the remap makes the two indistinguishable, and the drop's own premise
+  ("the file on disk is now authoritative") is false when only a sibling changed — you would
+  declare a uniform in the Shader Inspector, save the `.wgsl` you added it to, and lose the
+  declaration. A direct write to the descriptor anywhere in the same debounce window still wins,
+  because the flag collapses by AND.
+
+⚠️ **There are TWO watchers, and they must not drift.** The Vite dev server has one and the Electron
+main process has an independent twin (`engine/electron/assetBackend.ts`) — the default editor
+surface, and what the `modoki` MCP drives. They have now drifted four times, each time through
+whatever line the previous fix left duplicated: the classifier, then the extension gate itself. Both
+route through one shared `pathToClassifyForChange`, and
+`engine/tests/architecture/liveReloadKinds.test.ts` enumerates watcher implementations and fails any
+that re-tests the extension itself. If you add a third watcher, it is swept in automatically.
 
 ## Why game code needs a reload
 
@@ -44,17 +78,34 @@ unregisters every UIAction the previous registration owned. A full reload sidest
 matches what Open Project already does (`electron/main.ts` → `reloadIgnoringCache()`).
 
 **Unsaved work: the reload wins, but never silently.** There is no `beforeunload` guard anywhere, so
-the reload really does destroy unsaved scene edits. That is the deliberate choice — a stale editor is
-the worse failure — but the loss is always announced:
+the reload really does destroy unsaved work — and "unsaved work" is not only the live scene: an
+Inspector edit parked in the dirty-asset registry (a material/particle/anim/timeline doc), a pending
+`baseScene` ref, or a parked `.meta.json` import-setting edit are all just as gone, because the
+registries holding them are renderer memory, not disk. That is the deliberate choice — a stale editor
+is the worse failure — but the loss is always announced, and named for what it actually is:
 
-- **Clean scene** → reload immediately.
-- **Dirty scene** → a **5s countdown banner** ("reloading in Ns; unsaved scene changes will be
-  LOST") with **Reload now** and **Cancel**. Doing nothing takes the loss.
+- **Nothing dirty** → reload immediately.
+- **Something dirty** → a **5s countdown banner** naming the actual cause(s) — e.g. "reloading in
+  Ns; unsaved scene changes will be LOST", or "…; 2 unsaved asset edits will be LOST" when the only
+  pending work is a parked material/particle edit and the scene itself is clean — with **Reload
+  now** and **Cancel**. Doing nothing takes the loss.
 - **After** such a reload → an info banner plus `discardedUnsavedEdits: true` in `get_editor_state`
-  and a `!hmr.discarded-unsaved` editor-journal event. The discard happens on a page that is about to
-  die, so it is carried across the reload in `sessionStorage` — otherwise it could never be reported.
+  and a `!hmr.discarded-unsaved` editor-journal event **whose payload carries the cause**, so a
+  post-hoc journal read can tell which kind of work was lost. The discard happens on a page that is
+  about to die, so it is carried across the reload in `sessionStorage` — otherwise it could never be
+  reported.
 - **Cancel** → `staleGameCode: true` and a persistent "Running STALE game code" banner. This is the
   one state where measurements silently lie, so it stays loud.
+
+**The cause set is ENUMERATED, not hand-listed (#850).** `app/debug/hmrStaleness.ts`'s `DirtyProbe`
+returns whatever `unsavedChangeCauses()` (`editor/scene/serialize.ts`) reports — a `Record<string,
+boolean | string[]>` — and the message builder (`describeCauses`) walks that object rather than
+naming a fixed set of keys. Before #850 the module hand-wrote "unsaved scene changes" in every
+message, which was already wrong once #831/#845 added asset, base-scene, and import-setting causes
+that can be dirty while the scene itself is perfectly clean. So a SIXTH cause added to
+`unsavedChangeCauses()` shows up in the banner/console/journal with **no edit to
+`hmrStaleness.ts`** — a cause without a hand-authored entry in its `CAUSE_LABELS` map still renders,
+humanized from its key name, rather than being silently dropped.
 
 **If you are an agent, you are usually the cause**: your write to a game `.ts` is what triggers the
 countdown, and the human may not be at the screen for it. Check `get_editor_state.unsavedChanges`
@@ -167,7 +218,8 @@ loop. If you see the reload happen twice, the edit has a real defect; it is not 
 
 `get_editor_state` reports `hmrUpdates` (hot updates since boot; absent means zero),
 `staleGameCode: true` (a game-code reload was cancelled — this editor runs the OLD build), and
-`discardedUnsavedEdits: true` (this page load dropped unsaved scene work to pick up new game code).
+`discardedUnsavedEdits: true` (this page load dropped unsaved work — scene, asset, base-scene, or
+import-setting edits, whichever was pending — to pick up new game code).
 Silence on all three means the running build is the one that booted and nothing was lost.
 
 Plugin changes (`engine/plugins/**`) are **not** hot-reloadable at all — restart the editor

@@ -24,7 +24,7 @@ let handler: TestHandler | null = null;
 
 vi.mock('../../packages/modoki/src/editor/scene/serialize', () => ({
   saveAll: vi.fn(async () => { log.push('saveScene'); return { saved: true, path: '/s.json', reason: 'ok' }; }),
-  unsavedChangeCauses: () => ({ sceneDirty, dirtyAssetPaths: [], dirtyScenes: [] }),
+  unsavedChangeCauses: () => ({ sceneDirty, dirtyAssetPaths: [], dirtyScenes: [], pendingBaseScenes: [] }),
 }));
 vi.mock('../../packages/modoki/src/editor/scene/dirtyAssets', () => ({
   flushDirtyAssets: vi.fn(async () => { log.push('flushAssets'); return { saved: ['/a.anim.json'], failed: [] }; }),

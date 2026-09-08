@@ -14,8 +14,10 @@
  *  editor, which re-reads the layout from disk — is offered then rather than up front, where
  *  it would push people at the heavier action for crashes a remount does fix.
  *
- *  The reload is confirmed in place rather than through `window.confirm`: it discards
- *  unsaved scene edits, and a blocking native dialog in the editor is its own hazard. */
+ *  The reload is confirmed in place rather than through `window.confirm`: it discards unsaved
+ *  scene edits AND parked asset/import-settings edits (#850 — the dialog at the bottom of this
+ *  file names both; this sentence used to name only the scene), and a blocking native dialog in
+ *  the editor is its own hazard. */
 
 import { Component, type CSSProperties, type ErrorInfo, type ReactNode } from 'react';
 
@@ -77,7 +79,7 @@ export default class PanelErrorBoundary extends Component<Props, State> {
           height: '100%', color: '#e74c3c', background: '#1a1a2e', textAlign: 'center', padding: 16,
         }}>
           <p style={{ fontSize: 12, marginBottom: 8 }}>{this.props.label} crashed</p>
-          <p style={{ fontSize: 10, color: '#888', marginBottom: 12, wordBreak: 'break-all' }}>{this.state.error}</p>
+          <p style={{ fontSize: 10, color: '#888', marginBottom: 12, wordBreak: 'break-all', userSelect: 'text', WebkitUserSelect: 'text' }}>{this.state.error}</p>
           {!remountFailed && (
             <button onClick={this.handleReset} style={btn} data-ui-id="panel-error.reload-panel">Reload Panel</button>
           )}
@@ -96,7 +98,7 @@ export default class PanelErrorBoundary extends Component<Props, State> {
           {remountFailed && this.state.confirming && (
             <>
               <p style={{ fontSize: 10, color: '#c9a227', marginBottom: 10, maxWidth: 320, lineHeight: 1.5 }}>
-                Reload the editor? Unsaved scene edits are discarded.
+                Reload the editor? Unsaved scene and pending asset edits are discarded.
               </p>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button onClick={() => this.setState({ confirming: false })} style={secondaryBtn} data-ui-id="panel-error.cancel-reload">Cancel</button>

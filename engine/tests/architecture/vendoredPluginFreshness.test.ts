@@ -31,7 +31,7 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { pluginContentHash, listEnginePlugins, compareTarballToSource } from '../../plugins/vendorPlugins';
+import { pluginContentHash, listEnginePlugins, compareTarballToSource, readPackedVersion, packedVersion } from '../../plugins/vendorPlugins';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
 import { hasAnyProject, hasVendoredPluginTarballs } from '../helpers/repoLayout';
 
@@ -147,7 +147,16 @@ describe('vendored engine plugins are not stale (#90)', () => {
     expect(problems, problems.length
       ? `Lockfile integrity does not match the committed tarball — \`npm ci\` will fail in CI and in `
         + `every fresh clone, while a warm node_modules hides it locally:\n  ${problems.join('\n  ')}\n\n`
-        + `Fix: \`npm install\` in each named project and commit the package-lock.json.`
+        + `⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES `
+        + `this state (it writes the new resolved+integrity into both lockfiles without extracting), and a `
+        + `tree left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` will `
+        + `not fix it either. Repair, in order:\n`
+        + `  1. delete the plugin's entry from <project>/package-lock.json ("node_modules/<plugin>" under "packages")\n`
+        + `  2. (cd <project> && npm install)   # a PLAIN install — it now re-resolves AND extracts\n`
+        + `  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json `
+        + `is ahead of the disk and nothing will re-extract:\n`
+        + `     (cd <project> && rm -rf node_modules/<plugin> && npm install)\n`
+        + `Then commit the package-lock.json.`
       : '',
     ).toEqual([]);
   });
@@ -167,7 +176,9 @@ describe('vendored engine plugins are not stale (#90)', () => {
         if (!fs.existsSync(abs)) { problems.push(`${project.id}: ${plugin.name} pins "${spec}" but ${rel} does not exist`); continue; }
         const { drift } = compareTarballToSource(abs, plugin.dir);
         checked++;
-        for (const d of drift) problems.push(`${project.id}: ${rel} — ${d.path} ${d.kind}`);
+        // `d.reason` is set only for a read/parse failure (#685 FIX 6) — a corrupt/truncated
+        // tarball that couldn't be compared at all, surfaced rather than swallowed.
+        for (const d of drift) problems.push(`${project.id}: ${rel} — ${d.path} ${d.kind}${d.reason ? ` (${d.reason})` : ''}`);
       }
     }
 
@@ -181,6 +192,94 @@ describe('vendored engine plugins are not stale (#90)', () => {
         + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project.\n`
         + `Note this compares the shipped set MINUS dist/ — the same set the tarball's NAME is `
         + `computed over — so a report here is a real content difference, never toolchain drift.`
+      : '',
+    ).toEqual([]);
+  });
+
+  // ── The PACKED version, not just the filename (#685) ──────────────────────────────────
+  // A tarball packed before packInto started writing packedVersion into the PACKED package.json
+  // still has a bare `1.0.0` inside, even though its NAME (and so the two checks above) look
+  // completely current. Measured (#685 FIX 2), correcting an earlier claim here: npm's `file:`
+  // resolver does NOT key re-vendoring detection on this field — extraction is LOCKFILE-driven,
+  // and npm never opens the committed tarball at all. What the packed version buys is
+  // IDENTIFIABILITY: it's the only thing that lets this repo tell WHICH generation of a
+  // same-named tarball is the one currently committed, which is what makes this assertion — and
+  // the tarball-vs-installed comparison in `vendorPlugins.ts` — meaningful. This is what stops it
+  // regressing: a future tarball that goes back to a bare/wrong packed version fails LOUD here
+  // even while its filename is correct.
+  //
+  // The 22-project migration (`vendor-plugins.mjs` per project) landed in the SAME commit as this
+  // assertion, so it has never actually been red in this repo — it guards against a regression
+  // from here on, not a known-red starting state.
+  it.skipIf(!hasVendoredPluginTarballs())("every pinned tarball's PACKED version is <base>-h<hash> (#685)", () => {
+    const problems: string[] = [];
+    let checked = 0;
+
+    for (const { plugin, project, spec } of pins) {
+      const rel = spec.replace(/^file:/, '');
+      const abs = path.join(project.dir, rel);
+      if (!fs.existsSync(abs)) continue; // reported by the "pins a tarball that is not there" case above
+      const hashMatch = rel.match(/-([0-9a-f]{8})\.tgz$/);
+      if (!hashMatch) { problems.push(`${project.id}: ${rel} does not look like a content-addressed tarball name`); continue; }
+      const want = packedVersion(plugin.version, hashMatch[1]);
+      const got = readPackedVersion(abs);
+      checked++;
+      if (got !== want) {
+        problems.push(`${project.id}: ${rel} — packed package.json version is "${got}" but expected "${want}"`);
+      }
+    }
+
+    expect(checked, 'no committed plugin tarball was opened — the check ran on nothing').toBeGreaterThan(0);
+    expect(problems, problems.length
+      ? `Committed plugin tarball(s) still carry a bare/stale PACKED version. npm's \`file:\` resolver `
+        + `does not read this field — re-vendoring is LOCKFILE-driven, and npm never opens the tarball `
+        + `— but this repo does: it's the only thing that lets a same-named tarball's CURRENT generation `
+        + `be told apart from a stale one, so a bare/stale version here means the next real content `
+        + `change can't be identified either (#685):\n  ${problems.join('\n  ')}\n\n`
+        + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project.`
+      : '',
+    ).toEqual([]);
+  });
+
+  // ── The COMMITTED plugin manifest must never carry packInto's TRANSIENT suffix (#685 FIX 4) ──
+  // `packInto` briefly writes a hash-suffixed version (`<base>-h<hash>`) into a plugin's OWN
+  // package.json for the duration of `npm pack`, then restores the exact original bytes in a
+  // `finally`. A SIGKILL mid-pack, or two `vendorEnginePlugins` runs racing on the SAME plugin dir
+  // (the editor's `/api/build` and a terminal build interleaving), can leave that suffix on disk
+  // PERMANENTLY — and nothing else notices: `listEnginePlugins` base-strips it, `pluginContentHash`
+  // normalizes it out, `compareTarballToSource` normalizes both sides. `npm run verify` stays
+  // green over a corrupted TRACKED file without this.
+  //
+  // This also guards a latent bug in `baseVersion`, which splits on the FIRST `-`: a genuine
+  // prerelease like `2.0.0-rc.1` would be silently erased everywhere that calls it, not just here.
+  // Banning any `-`/`+` in the committed version is deliberately stricter than plain semver (which
+  // permits a real prerelease/build-metadata suffix) — no engine plugin has ever shipped one, and
+  // the day one wants to, this assertion is what has to change on purpose, not silently absorb it.
+  it('every engine/packages/capacitor-*/package.json version has no prerelease and no build metadata', () => {
+    const pkgDir = path.join(repoRoot, 'engine', 'packages');
+    const problems: string[] = [];
+    let checked = 0;
+    if (fs.existsSync(pkgDir)) {
+      for (const entry of fs.readdirSync(pkgDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith('capacitor-')) continue;
+        const pj = path.join(pkgDir, entry.name, 'package.json');
+        if (!fs.existsSync(pj)) continue; // e.g. a plugin dir with no manifest yet
+        const pkg = JSON.parse(fs.readFileSync(pj, 'utf8')) as { version?: unknown };
+        const version = String(pkg.version ?? '');
+        checked++;
+        if (version.includes('-') || version.includes('+')) {
+          problems.push(`engine/packages/${entry.name}/package.json: version is "${version}"`);
+        }
+      }
+    }
+
+    expect(checked, 'no engine/packages/capacitor-*/package.json was checked — the check ran on nothing').toBeGreaterThan(0);
+    expect(problems, problems.length
+      ? `Committed engine plugin package.json carries a "-"/"+" in its version — that only happens `
+        + `when a \`packInto\` run (\`npm pack\`) was interrupted (SIGKILL) or two vendoring runs raced `
+        + `on the same plugin dir, leaving its transient "-h<hash>" suffix on disk instead of restoring `
+        + `the committed original (#685):\n  ${problems.join('\n  ')}\n\n`
+        + `Fix: \`git checkout -- <that file>\`.`
       : '',
     ).toEqual([]);
   });

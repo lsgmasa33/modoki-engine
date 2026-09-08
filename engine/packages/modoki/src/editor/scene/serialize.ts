@@ -1,16 +1,17 @@
 /** Serialize the ECS world to scene + materials JSON files.
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
-import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
+import { spawnEntity } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -21,7 +22,7 @@ import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities } from '../../runtime/loaders/loadSceneFile';
+import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
@@ -29,6 +30,9 @@ import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
+import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
+import { createSupersessionToken } from '../../runtime/core/liveness';
 
 // ── Types ───────────────────────────────────────────────
 
@@ -375,65 +379,30 @@ export async function serializeScene(opts?: {
   };
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
-   *  stable (QA-HIER-0002).
+   *  stable (QA-HIER-0002). The rule itself lives in `runtime/core/ecs/entityOrder.ts`,
+   *  shared verbatim with `buildEntityTree` (the panel) and the guard test over the
+   *  committed scene files; see that module for why the tiebreak is the guid and not an
+   *  ecs id, and for the churn it removes.
    *
-   *  It used to be live-world iteration order, which follows runtime ECS ids. Those are
-   *  reassigned by a delete+undo (the entity respawns at a new id) or a duplicate+delete,
-   *  so the next save re-emitted IDENTICAL data in a different order. Measured on
-   *  `games/anim-bug`: same guid set, zero entities whose content differed, and
-   *  `main.scene.json` still MODIFIED — one entity had moved within the array. That is
-   *  semantically harmless (sortOrder carries the authored intent), and it is exactly the
-   *  CLAUDE.md #18 hazard: a running editor writing to `games/**` with a contentless diff
-   *  that rides into an unrelated commit because nobody reads it. It also makes
-   *  "git status is clean" unusable as a QA cleanup check for any case touching entity
-   *  lifecycle.
-   *
-   *  Parents before their children, siblings by `sortOrder` — i.e. what the Hierarchy
-   *  shows (the owner's call: match the file to the panel, so a scene diff is readable).
-   *  The tiebreak is the GUID, not the ecs id `buildEntityTree` uses: colliding
-   *  sortOrders are ordinary (legacy entities all sit at 0) and an id tiebreak would
-   *  reintroduce exactly the churn this removes. Name is the last resort, for the
-   *  un-guidable entity `guidForId` returns '' for.
+   *  The guid passed here is `guidForId` — the LIVE lookup, which falls back to the
+   *  pre-pass's freshly-minted guids. A newly created entity's guid is not on its
+   *  `EntityInfo` record yet, so reading `info.guid` instead would sort every new
+   *  entity as '' and put it in a position the next save disagrees with.
    *
    *  This supersedes the Phase 3 (scene-loading.md) choice to reproduce ECS-ID order on
    *  the carry-respawn path: the written order no longer depends on how the scene was
    *  loaded at all, so a carried save and a cold-loaded save agree by construction rather
    *  than by keeping two paths in step. */
-  const orderedInfos = ((): typeof entityInfos => {
-    const present = new Set(entityInfos.map((e) => e.id));
-    const childrenOf = new Map<number, typeof entityInfos>();
-    const roots: typeof entityInfos = [];
-    for (const info of entityInfos) {
-      // A parent outside this scene's slice (a base-owned parent, an excluded
-      // transient) makes the entity a root here — the same rule buildEntityTree uses.
-      if (info.parentId && present.has(info.parentId)) {
-        const list = childrenOf.get(info.parentId);
-        if (list) list.push(info); else childrenOf.set(info.parentId, [info]);
-      } else {
-        roots.push(info);
-      }
-    }
-    const bySortThenGuid = (a: typeof entityInfos[number], b: typeof entityInfos[number]) =>
-      a.sortOrder - b.sortOrder
-      || guidForId(a.id).localeCompare(guidForId(b.id))
-      || a.name.localeCompare(b.name);
-    const out: typeof entityInfos = [];
-    const visit = (list: typeof entityInfos) => {
-      for (const info of [...list].sort(bySortThenGuid)) {
-        out.push(info);
-        const kids = childrenOf.get(info.id);
-        if (kids) visit(kids);
-      }
-    };
-    visit(roots);
-    // Belt-and-braces: a parent cycle would strand entities. Append anything the walk
-    // did not reach rather than silently DROPPING it from the saved scene.
-    if (out.length !== entityInfos.length) {
-      const emitted = new Set(out.map((e) => e.id));
-      for (const info of entityInfos) if (!emitted.has(info.id)) out.push(info);
-    }
-    return out;
-  })();
+  const orderedInfos = orderEntitiesForSave(entityInfos, (info) => ({
+    // A parent outside this scene's slice (a base-owned parent, an excluded transient)
+    // is not among `entityInfos`, so `orderEntitiesForSave` treats the entity as a root
+    // here — the same rule buildEntityTree uses.
+    key: info.id,
+    parentKey: info.parentId || null,
+    sortOrder: info.sortOrder,
+    name: info.name,
+    guid: guidForId(info.id),
+  }));
 
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   for (const ni of nestedInstances) {
@@ -735,8 +704,6 @@ export function collectResourceRefs(entities: SerializedEntity[]): ResourceRef[]
 
 let _currentScenePath: string | null = null;
 
-const LAST_SCENE_KEY = 'modoki-last-scene';
-
 /** Per-project localStorage key for the "last opened scene", scoped by project
  *  name so one project's scene path never leaks into another's (which would 404).
  *  Single source of truth for BOTH the writer (setCurrentScenePath) and the reader
@@ -749,6 +716,9 @@ export function lastSceneKey(configName: string | undefined): string {
 // the per-project key that createEditor restores from on the next launch.
 let _sceneProject: string | undefined;
 export function setScenePersistenceProject(name: string | undefined) { _sceneProject = name; }
+/** The active project's name, for a caller that needs to derive `lastSceneKey` itself
+ *  (prefab-edit's exit fallback) rather than persisting through this module. */
+export function getScenePersistenceProject(): string | undefined { return _sceneProject; }
 
 // Base-scene ref of the currently-loaded scene (base-scene persistence). Mirrors
 // _currentScenePath: not a live-world value, so it must be tracked as editor
@@ -763,23 +733,21 @@ export function getCurrentScenePath() { return _currentScenePath; }
 export function setCurrentScenePath(path: string | null) {
   _currentScenePath = path;
   if (path) {
-    // Global key: legacy readers (SceneView prefab-return, devTestBridge fixtures).
-    localStorage.setItem(LAST_SCENE_KEY, path);
-    // Per-project key: what createEditor restores on startup. Writing it HERE (on
-    // every scene switch, not just at boot) is the fix that makes the editor reopen
-    // the scene you were last on, not the project default.
+    // Per-project key: what createEditor restores on startup, AND what prefab-edit's
+    // exit fallback reads (`exitPrefabEditing`, scene/prefabEdit.ts). Writing it HERE
+    // (on every scene switch, not just at boot) is the fix that makes the editor
+    // reopen the scene you were last on, not the project default.
+    //
+    // #478: this used to ALSO write an unscoped `modoki-last-scene` key, kept for two
+    // "legacy readers" — SceneView's prefab-return fallback and devTestBridge. Neither
+    // exists any more (devTestBridge's own comment says E2E setup calls `loadScene()`
+    // directly instead; `exitPrefabEditing` now reads the scoped key below), so the
+    // unscoped key had exactly one reader left and it was wrong: global across every
+    // project sharing this origin, so a boot with no scene loaded still held the
+    // PREVIOUS project's path and prefab-return would try to load it. Deleted rather
+    // than fixed in place — see `lastSceneKey`.
     localStorage.setItem(lastSceneKey(_sceneProject), path);
   }
-}
-
-async function writeFileToServer(filePath: string, content: string): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content }),
-    });
-    return res.ok;
-  } catch { return false; }
 }
 
 /** Save scene to the current path (via the backend write-file API).
@@ -795,13 +763,25 @@ async function writeFileToServer(filePath: string, content: string): Promise<boo
 // The edit-version at the last successful save / load / new. Anything past it is work that
 // exists ONLY in the live world. (C7)
 let _savedAtEditVersion = 0;
-/** Mark the live world as matching disk (a successful save, or a fresh load/new). */
-export function markSceneSaved(): void { _savedAtEditVersion = getEditVersion(); }
+/** Mark the live world as matching disk (a successful save, or a fresh load/new).
+ *
+ *  `atEditVersion` is the version the written CONTENT was serialized at, and an async caller MUST
+ *  pass it. Defaulting to `getEditVersion()` is only correct when the world became the disk state
+ *  synchronously — a load, a new scene, a prefab-edit exit — because then "now" and "what was
+ *  written" are the same moment. `saveScene` is not that: it serializes, then awaits a disk write
+ *  (and on the Save-As path, a NATIVE MODAL a human can leave open indefinitely). Reading the
+ *  version after those awaits records edits made DURING them as though they had been written,
+ *  which is a silent data-loss bug — `hasUnsavedChanges()` then answers false, and per its own
+ *  doc comment below that is the flag the game-code-reload gate reads before force-reloading the
+ *  editor and discarding the live world. See docs/async-lifetime.md. */
+export function markSceneSaved(atEditVersion?: number): void {
+  _savedAtEditVersion = atEditVersion ?? getEditVersion();
+}
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from
  *  the world, the file, and the undo stack, with nothing anywhere saying why.
- *  Also true while a 'manual'-mode particle/anim/timeline edit is pending a save
- *  (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
+ *  Also true while a 'manual'-mode edit to any `ASSET_SCHEMA_TYPES` doc (assetSchemas.ts) is
+ *  pending a save (dirtyAssets.ts, mcp-persistence.md Phase 3) — those are asset-shaped work,
  *  not scene-edit-version work, so `getEditVersion()` alone can't see them.
  *
  *  THIRD cause, and the reason it can't be dropped: a still-dirty NON-PRIMARY loaded
@@ -813,7 +793,8 @@ export function markSceneSaved(): void { _savedAtEditVersion = getEditVersion();
  *  this flag before writing a `.ts` that force-reloads the editor) would then discard the
  *  human's work believing there was none. */
 export function hasUnsavedChanges(): boolean {
-  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0;
+  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0
+    || hasPendingBaseScenes() || hasPendingMeta();
 }
 
 /** WHICH kind of unsaved work exists — the three independent causes above, told apart.
@@ -829,11 +810,23 @@ export function hasUnsavedChanges(): boolean {
  *  whose edits are still only in memory — typically a base whose write failed in a
  *  partial `saveAll`. It must be reported, or a refusal triggered by it alone would name
  *  no cause at all. */
-export function unsavedChangeCauses(): { sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[] } {
+export function unsavedChangeCauses(): {
+  sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[]; pendingBaseScenes: string[];
+  pendingImportSettings: string[];
+} {
   return {
     sceneDirty: getEditVersion() !== _savedAtEditVersion,
     dirtyAssetPaths: getDirtyAssetPaths(),
     dirtyScenes: [...dirtySceneGuidsSnapshot()],
+    // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is
+    // NOT the open one. It is neither a live-world edit nor an asset document, so without its own
+    // row a refusal triggered by it alone would name no cause at all — the S3.11 failure again.
+    pendingBaseScenes: getPendingBaseScenePaths(),
+    // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
+    // instead of written immediately. Named for what a human reads in a banner ("unsaved import
+    // settings") — matching the Inspector section's own label — not for the sidecar's file
+    // extension, which means nothing to the reader of that banner.
+    pendingImportSettings: getPendingMetaPaths(),
   };
 }
 
@@ -857,13 +850,26 @@ export interface SaveResult {
    *
    *  Their dirty flags stay SET, so a later save retries them. */
   failed?: { path: string; guid: string; reason: string }[];
-  /** Parked asset docs (particle/anim/timeline/spriteanim/rig2d) flushed by this save, if any.
+  /** Pending `baseScene` refs (Scene inspector, #831) written by this save, if any.
+   *
+   *  Reported separately from `assets` because it is a different KIND of pending write — a
+   *  single-field mutation of a scene FILE, not a document — and separately from `extraSaved`
+   *  because those are live scenes the editor serialized, while these are files it never loaded.
+   *  A failure here re-parks, so the edit is still pending and a later save retries it. */
+  baseScenes?: { saved: string[]; failed: Array<{ path: string; error: string }> };
+  /** Parked asset docs (any `ASSET_SCHEMA_TYPES` type — assetSchemas.ts) flushed by this save, if any.
    *
    *  Present on a FAILED result too, and that is the point: the asset flush no longer depends on
    *  the scene write, so "the scene was refused but your 3 asset edits are on disk" is a real
    *  outcome and the caller has to be able to say so (#259). Never report a bare failure over a
    *  result that carries `assets.saved` — that is the C7 lie with the roles reversed. */
   assets?: FlushResult;
+  /** Parked `.meta.json` import-settings edits (Inspector, #845) flushed by this save, if any.
+   *
+   *  Separate from `assets` for the same reason `baseScenes` is: a sidecar is not an
+   *  `ASSET_SCHEMA_TYPES` document, so it does not go through `/api/asset-write`. Present on a
+   *  FAILED result too — this flush is unconditional, same as the asset flush above. */
+  importSettings?: MetaFlushResult;
 }
 
 export async function saveScene(opts: {
@@ -889,12 +895,16 @@ export async function saveScene(opts: {
   // The guard asks the WORLD (`isPrefabEditWorld`) rather than the store flag, which is the whole
   // point: the flag is what was out of sync. `savePrefabEdit()` is the save for this world, and the
   // Cmd+S callers route to it — this refusal is the backstop for every path that does not.
-  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone. `newScene()` wipes the ECS world and sets
-  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stays SYNTHETIC after
-  // "Create Scene" is used from the Assets panel during prefab-edit — and the bare guard then
-  // refused to write the brand-new scene, silently (neither `create()` nor `runCreate` checks the
-  // result). `_currentScenePath` is the discriminator: prefab-edit deliberately nulls it, while a
-  // real save target means the world is no longer the prefab's. Refusing needs BOTH.
+  // ⚠️ Conjunction, not `isPrefabEditWorld()` alone — and the scar is worth keeping even though
+  // #853 removed the case that caused it. `newScene()` used to wipe the ECS world and set
+  // `_currentScenePath` WITHOUT touching sceneManager, so the live path stayed SYNTHETIC after
+  // "Create Scene" was used from the Assets panel during prefab-edit, and the bare guard then
+  // refused to write the brand-new scene, silently. That route no longer exists: `newScene()`
+  // REFUSES during prefab edit (owner, 2026-09-07) and otherwise promotes a real world, so
+  // `isPrefabEditWorld()` is false by the time a save could reach here. `_currentScenePath`
+  // remains the discriminator for every OTHER path that can leave the two disagreeing:
+  // prefab-edit deliberately nulls it, while a real save target means the world is no longer
+  // the prefab's. Kept as a conjunction because nothing proves those other paths are gone.
   if (isPrefabEditWorld() && !_currentScenePath) return { saved: false, path: null, reason: 'prefab-edit' };
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
@@ -914,19 +924,24 @@ export async function saveScene(opts: {
   // Saving is the authored write that persists identity — commit minted guids
   // to the live world so subsequent refs resolve and the next save is stable.
   const scene = await serializeScene({ assignGuids: true });
-  const content = JSON.stringify(scene, null, 2);
+  const content = jsonFileBody(scene);
+  // The version `content` actually represents. Captured HERE — after serializeScene, which mints
+  // guids into the live world and so moves the version itself, and before the disk write, which is
+  // the deferral an edit can land inside. Every `markSceneSaved` below is handed this rather than
+  // re-reading the version on the other side of an await; see markSceneSaved's doc comment.
+  const savedAtEditVersion = getEditVersion();
 
   const knownPath = explicitPath || _currentScenePath;
   if (knownPath) {
     // Save to known path via dev server
-    const ok = await writeFileToServer(knownPath, content);
+    const ok = await writeAssetFile(knownPath, content);
     if (ok) {
       // scene.id is always populated by serializeScene (required field).
       registerAsset(scene.id, knownPath, 'scene');
       if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
       editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
       console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      markSceneSaved();
+      markSceneSaved(savedAtEditVersion);
       return { saved: true, path: knownPath, reason: 'ok' };
     }
     console.error(`[Editor] Failed to save scene to ${knownPath}`);
@@ -950,18 +965,80 @@ export async function saveScene(opts: {
     prompt: 'Save Scene As',
   });
   if (!target) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
-  const ok = await writeFileToServer(target, content);
+  const ok = await writeAssetFile(target, content);
   if (ok) {
     registerAsset(scene.id, target, 'scene');
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
-    markSceneSaved();
+    markSceneSaved(savedAtEditVersion);
     return { saved: true, path: target, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };
 }
+
+/** Monotonic load counter — the newest `loadScene` call owns the progress modal.
+ *  See the epoch guard inside loadScene. */
+const loadEpoch = createSupersessionToken();
+
+/** The current scene-load generation, for a caller that must survive its OWN await and then ask
+ *  "did a scene load happen while I was gone?".
+ *
+ *  Exported rather than kept private for the same reason `PlayerPrefs.swapGeneration()` is (#454 C):
+ *  a re-sampled "is a load in flight" flag structurally CANNOT see a load that started and finished
+ *  entirely inside the caller's await — it reads false on both sides. Only a monotonic count can.
+ *  `playMode.enterPlay` is the first consumer: it snapshots the world across two awaits, and a load
+ *  landing in between leaves it holding a snapshot of a scene that is no longer loaded.
+ *
+ *  ⚠️ Counts LOADS, not scene paths — a reload of the SAME path still moves it, which is the point;
+ *  comparing `currentScenePath()` would miss exactly that case. See docs/async-lifetime.md. */
+export function sceneLoadGeneration(): number { return loadEpoch.current; }
+
+/** How many `loadScene` calls are between their entry and their `finally`.
+ *
+ *  The counterpart to {@link sceneLoadGeneration}, and BOTH are needed — this is the
+ *  "use both" case docs/async-lifetime.md describes. A generation captured at the top of an
+ *  operation cannot see a load that was ALREADY in flight when that operation began: the epoch
+ *  bumped before the capture, so it reads equal on both sides. Only a live in-flight count can
+ *  answer "is one running right now". Mirrors `SceneManager.teardownInFlight`, which exists for
+ *  exactly this reason one layer down.
+ *
+ *  ⚠️ SCOPE: this counts loads through THIS wrapper only. `applyPrefabUndo` and
+ *  `prefabEdit.openPrefabForEditing` swap the world by calling `sceneManager.loadScene` directly
+ *  and touch neither this nor the epoch. A caller that needs "is the world being swapped at all"
+ *  must also consult `sceneManager.getNext()` — `playMode`'s `aSceneSwapIsHappening()` is the
+ *  worked example. */
+let _loadsInFlight = 0;
+export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
+
+/** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
+ *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
+ *  superseded in the winner's TAIL (`sceneManager.ts:885-900` — nothing left to cancel, so the
+ *  loser's own `sceneManager.loadScene` resolves successfully and throws nothing). Neither case
+ *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
+ *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
+export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
+
+/** Set alongside a `'failed'` or `'refused'` outcome PRODUCED BY THIS MODULE'S OWN `loadScene`
+ *  below — the message from the throw that caused it, since `SceneLoadOutcome` stays a bare
+ *  string (every existing caller compares it with `===`/`!==`, so widening it to an object would
+ *  ripple through all of them for no benefit). Mirrors `isSceneLoadInFlight`'s
+ *  module-state-plus-getter shape, just below. Read this immediately after a `loadScene()` call
+ *  returns 'failed'/'refused' — a LATER load overwrites it.
+ *
+ *  ⚠️ **Not a total invariant across every `'failed'`, anywhere.** `createEditor.tsx`'s
+ *  `loadFirstScene`/`tryLoad` synthesizes its OWN `'failed'` (#784 phase C adversarial review,
+ *  finding 5) when `deps.load` — normally this very `loadScene`, which never throws past its own
+ *  catch-all below — throws anyway (a defensive belt for a caller that changes that contract).
+ *  That `'failed'` does not touch this variable: it belongs to a boot-time candidate-fallback
+ *  walk, is followed by trying the NEXT candidate rather than surfacing to a caller, and nothing
+ *  reads this getter from there today. If a future caller of `getLastSceneLoadFailureMessage()`
+ *  needs to observe THAT failure too, `tryLoad`'s catch needs its own way to set this (there is
+ *  no exported setter, deliberately — this variable is module-private) rather than assuming it
+ *  is already covered. */
+let _lastLoadFailureMessage: string | null = null;
+export function getLastSceneLoadFailureMessage(): string | null { return _lastLoadFailureMessage; }
 
 /** Load a scene from a JSON file. Delegates to SceneManager which handles the
  *  full async preload + atomic swap + refcount lifecycle. The editor wrapper
@@ -972,23 +1049,33 @@ export async function saveScene(opts: {
  *  derives the game from a `/games/<id>/` path segment, but the editor boots the
  *  canonical working-copy path (`/assets/scenes/x.json`, gap #2) which carries no
  *  such segment — so the editor boot passes the project's game id explicitly.
- *  Subsequent in-editor scene opens omit it and inherit the active game. */
-/** Monotonic load counter — the newest `loadScene` call owns the progress modal.
- *  See the epoch guard inside loadScene. */
-let _loadEpoch = 0;
-
+ *  Subsequent in-editor scene opens omit it and inherit the active game.
+ *
+ *  Returns a `SceneLoadOutcome`, not a boolean — `false` is the WRONG answer for a superseded
+ *  load, for every caller that inspects it. `loadFirstScene`'s `tryLoad` (createEditor.tsx)
+ *  treats a miss as "try the NEXT boot candidate", so a superseded load reported as `false`
+ *  would load a THIRD scene over the winner. And `agentEditorOps.ts`'s `load-scene` turns
+ *  `false` into "load-scene FAILED for X — the scene was not loaded (does the path exist?)",
+ *  which is exactly the wrong-diagnosis bug fixed on the runtime twin (`agentBridge.ts`) in
+ *  #486 finding A — a superseded load's own request did not fail, and this says nothing about
+ *  whether the path exists. */
 export async function loadScene(
   scenePath: string,
   gameId?: string,
   opts?: { probing?: boolean },
-): Promise<boolean> {
+): Promise<SceneLoadOutcome> {
   // Epoch guard: SceneManager cancels an in-flight load when a newer one starts
   // (boot autoload vs an agent/menu open, or rapid scene switches). The aborted
   // load's `finally` must NOT clear the progress modal the WINNING load is
   // driving, and its late onProgress must not write stale counts — so only the
   // latest epoch touches sceneLoadStatus.
-  const epoch = ++_loadEpoch;
+  const stillLive = loadEpoch.begin();
   const setSceneLoadStatus = useEditorStore.getState().setSceneLoadStatus;
+  // Inside nothing yet, but immediately before the `try` whose `finally` decrements it — so the
+  // pairing holds however the body exits. (Kept below the store read deliberately: an increment
+  // above a statement that could throw would leak the count, and the `finally` comment would be
+  // a lie.)
+  _loadsInFlight += 1;
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
@@ -997,9 +1084,21 @@ export async function loadScene(
       // Resources acquire in parallel; each completion (on a cold cache, a finished
       // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
       onProgress: (loaded, total) => {
-        if (epoch === _loadEpoch) setSceneLoadStatus({ active: true, loaded, total });
+        if (stillLive()) setSceneLoadStatus({ active: true, loaded, total });
       },
     });
+    if (!stillLive()) {
+      // Superseded in the WINNER'S TAIL (sceneManager.ts:885-900): our own `sceneManager.loadScene`
+      // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
+      // newer `loadScene` call already won. Running the writes below now would stomp the winner:
+      // `setCurrentScenePath` would persist OUR path over the winner's (localStorage too, so the
+      // next editor launch would reopen the wrong scene), `swapHistory` would rebind the undo
+      // stack to OUR scene while the winner's world is live (the exact stale-id hazard per-scene
+      // history keying exists to prevent), and `editorEmit('!scene-load', …)` would journal our
+      // path against the winner's live entity count — corrupting the record `modoki_editor_journal`
+      // answers "who changed this" from. So: none of it runs.
+      return 'superseded';
+    }
     setCurrentScenePath(scenePath); // persists to localStorage for next editor launch
     setCurrentBaseScene(sceneManager.getCurrentBaseScene());
     // Swap to THIS scene's own undo history (empty on first visit) instead of
@@ -1016,28 +1115,57 @@ export async function loadScene(
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
     editorEmit('!scene-load', { path: scenePath, entityCount });
     console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
-    return true;
+    return 'loaded';
   } catch (e) {
-    // An AbortError means a newer load superseded this one (by design — see the
-    // epoch guard above); it's expected, not a failure worth a red console error.
-    if ((e as Error)?.name !== 'AbortError') {
-      // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
-      // normal step, not a failure — the next candidate is expected to load. Logging it at
-      // `error` made a healthy self-healing boot look broken, and because
-      // `smoke-packaged.sh` / `assert-app-renders.sh` fail on ANY renderer console error, a
-      // stale remembered scene path could fail a packaging gate for a reason unrelated to the
-      // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
-      // loadFirstScene after every candidate has missed.
-      const msg = `[Editor] Failed to load scene: ${e}`;
-      if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
-      else console.error(msg);
+    // An AbortError means a newer load superseded this one — CANCELLED early, by design (see
+    // the epoch guard above); it's expected, not a failure worth a red console error, and it's
+    // the same outcome as the tail-supersede case above: this op's own load did not fail.
+    if ((e as Error)?.name === 'AbortError') return 'superseded';
+    // A format-version refusal (docs/format-versioning.md § 2b-bis — Scene is REFUSE, #784
+    // phase C3): distinct from 'failed' because "Failed to load — check the path" is a WRONG
+    // diagnosis for a right symptom — the path exists and the bytes are fine, this build just
+    // refuses to read them. Toasted here (not just logged) because a double-click on a scene
+    // in the Assets panel has no other feedback path (openAssetInEditor.ts has no 'failed'
+    // branch either) — without this, a refused open looks like a click that did nothing, with
+    // the previous scene silently still on screen.
+    //
+    // ⚠️ The toast auto-clears after ~3.5s and is `pointerEvents:'none'` (not copyable/
+    // re-readable) — it is a heads-up, not the durable record. The console.error line below,
+    // and `getLastSceneLoadFailureMessage()` for a caller that needs the text (e.g.
+    // agentEditorOps.ts's `load-scene` op), are.
+    if (e instanceof SceneFormatRefusedError) {
+      _lastLoadFailureMessage = e.message;
+      const msg = `[Editor] Refused to load scene "${scenePath}": ${e.message}`;
+      console.error(msg);
+      useEditorStore.getState().showToast(`Scene not loaded: ${e.message}`, 'warn');
+      return 'refused';
     }
-    return false;
+    // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
+    // normal step, not a failure — the next candidate is expected to load. Logging it at
+    // `error` made a healthy self-healing boot look broken, and because
+    // `smoke-packaged.sh` / `assert-app-renders.sh` fail on ANY renderer console error, a
+    // stale remembered scene path could fail a packaging gate for a reason unrelated to the
+    // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
+    // loadFirstScene after every candidate has missed.
+    _lastLoadFailureMessage = (e as Error)?.message ?? String(e);
+    const msg = `[Editor] Failed to load scene: ${e}`;
+    if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
+    else console.error(msg);
+    return 'failed';
   } finally {
+    // Load-bearing: if anything above throws, this must still return to zero, or every later
+    // reader of `isSceneLoadInFlight()` would believe a load is running forever.
+    _loadsInFlight -= 1;
     // Only the latest load owns the modal — a superseded load must not hide the
     // winner's progress bar (its `finally` can run after the winner set active).
-    if (epoch === _loadEpoch) useEditorStore.getState().setSceneLoadStatus({ active: false });
+    if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });
   }
+}
+
+/** Thrown by `newScene()` when the editor is in prefab-edit mode. A distinct type so a
+ *  caller can tell a deliberate refusal from a genuine failure and report it as such. */
+export class NewSceneRefusedError extends Error {
+  constructor(message: string) { super(message); this.name = 'NewSceneRefusedError'; }
 }
 
 /** Start a fresh untitled scene: clear ALL entities and spawn a ready-to-use
@@ -1048,30 +1176,62 @@ export async function loadScene(
  *  as reflections alongside real lights) — without the lights a fresh scene renders
  *  everything black. Then drop the current scene path and swap to the empty
  *  bootstrap undo context (so the previous scene's stack is preserved under its own
- *  key rather than dropped globally). Shared by File → New Scene and the agent
+ *  key rather than dropped globally). Shared by Assets → Create Scene and the agent
  *  `new-scene` op so both produce the identical starting world. The caller clears
- *  editor selection (this stays free of the editor store). */
-export function newScene(): void {
-  deleteEntities(getAllEntities().map((e) => e.id));
-  const world = getCurrentWorld();
-  spawnEntity(world,
-    Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-  );
-  spawnEntity(world,
-    Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-  );
-  spawnEntity(world,
-    Transform({ x: 5, y: 10, z: 7 }),
-    Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-    EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-  );
-  spawnEntity(world,
-    Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-    EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-  );
-  setCurrentScenePath(null);
+ *  editor selection (this stays free of the editor store).
+ *
+ *  Async since #853: the content swap goes through `SceneManager.replaceWorldContent`
+ *  so `onWorldSwap` actually fires. Pass `path` when the new scene already has a file
+ *  target (Assets → Create Scene); omit it for an untitled scene.
+ *
+ *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited. */
+export async function newScene(path: string | null = null): Promise<void> {
+  // ⚠️ REFUSED while editing a prefab (owner, 2026-09-07). Before #853 this produced an
+  // ambiguous half-state that two separate guards had to work around — the prefab-edit
+  // world stayed live under a real scene path (`saveScene`'s conjunction below) and
+  // `currentSceneKey()` had to narrow to the synthetic prefix to stop Stop() reloading a
+  // blank world under the previous scene's identity. Refusing outright is what lets both
+  // of those stop being special cases. Asks the WORLD, not the store flag — the flag is
+  // the thing that goes out of sync (see `saveScene`'s guard).
+  if (isPrefabEditWorld()) {
+    throw new NewSceneRefusedError(
+      'Create Scene is not available while editing a prefab — exit prefab edit mode first, '
+      + 'then create the scene.',
+    );
+  }
+  // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
+  // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
+  // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
+  // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
+  // dependency instead of racing it.
+  setCurrentScenePath(path);
   setCurrentBaseScene(undefined);
-  swapHistory('');
+  // Replace the world CONTENT through SceneManager rather than deleting and respawning in
+  // place (#853). The in-place version was the one path in the repo that replaced every
+  // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
+  // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
+  // aliased exactly onto the incoming scene's entities.
+  await sceneManager.replaceWorldContent((world) => {
+    spawnEntity(world,
+      Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
+    );
+    spawnEntity(world,
+      Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
+    );
+    spawnEntity(world,
+      Transform({ x: 5, y: 10, z: 7 }),
+      Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
+      EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
+    );
+    spawnEntity(world,
+      Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
+      EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
+    );
+  });
+  // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
+  // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+  // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
+  swapHistory(path ?? '');
   markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
   clearAllSceneDirty();
   console.log('[Editor] New scene created');
@@ -1128,10 +1288,32 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
   // four of those five are "the human pressed Cmd+S and nothing saved their edit".
   const assets = await flushDirtyAssets();
-  const withAssets = <T extends SaveResult>(r: T): T =>
-    (assets.saved.length || assets.failed.length ? { ...r, assets } : r);
+  // Alongside the asset flush — not before or after it in any load-bearing sense (#845). Unlike
+  // `/api/scene-mutate`, `/api/write-meta` carries no unsaved-work refusal, so this flush has none
+  // of `flushPendingBaseScenes`' "must run last" constraint below. See `pendingMeta.ts`'s header.
+  const importSettings = await flushPendingMeta();
+  const withAssets = <T extends SaveResult>(r: T): T => ({
+    ...r,
+    ...(assets.saved.length || assets.failed.length ? { assets } : {}),
+    ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}),
+  });
   const primaryResult = await saveScene(opts);
-  if (!primaryResult.saved) return withAssets(primaryResult);
+  // LAST, and deliberately so — `/api/scene-mutate` refuses while `hasUnsavedChanges()` is true,
+  // and these entries are themselves part of that report. Run before the scene write and every
+  // mutation 409s against the very save trying to persist it. See `pendingBaseScene.ts`'s header;
+  // the take-first half of the same problem lives there.
+  // ⚠️ Declared AFTER `saveScene` on purpose — the textual order is what
+  // `tests/architecture/baseSceneEditIsManual.test.ts` reads, and it is the only place the
+  // "flush LAST" requirement is written down where a refactor will trip over it.
+  const withBaseScenes = async (): Promise<{ baseScenes?: SaveResult['baseScenes'] }> => {
+    const r = await flushPendingBaseScenes();
+    return r.saved.length || r.failed.length ? { baseScenes: r } : {};
+  };
+  // A refused primary does NOT skip this, for the same reason the asset flush runs unconditionally
+  // (#259): a `baseScene` ref on a scene the editor never loaded has nothing to do with the live
+  // world the refusal is about. It may still fail on its own merits — scene-mutate carries its own
+  // Play refusal — and then it stays parked.
+  if (!primaryResult.saved) return withAssets({ ...primaryResult, ...(await withBaseScenes()) });
   // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
   // those values were just written to disk. Reported AFTER the save succeeds so a refused save
   // (playing/previewing) doesn't warn about a file nothing wrote.
@@ -1159,7 +1341,7 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
       failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
       continue;
     }
-    const ok = await writeFileToServer(entry.path, JSON.stringify(sceneFile, null, 2));
+    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
     if (!ok) {
       console.error(`[Editor] Failed to save scene to ${entry.path}`);
       failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
@@ -1175,5 +1357,6 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),
     ...(failed.length ? { failed } : {}),
+    ...(await withBaseScenes()),
   });
 }

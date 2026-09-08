@@ -12,6 +12,7 @@ import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
+import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
 import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
@@ -390,6 +391,16 @@ export default defineConfig(({ command }) => {
   plugins: [
     react(),
     faviconPlugin(),
+    // Strips the inline early-console shim (#633) out of index.html when installConsoleRing.ts's
+    // gate would leave nothing to drain it — see engine/plugins/earlyConsoleShim.ts for why this
+    // mirrors that gate by hand instead of sharing it.
+    earlyConsoleShimPlugin({
+      isPlayable,
+      isDev: command === 'serve',
+      hasDebugBridge: !!process.env.VITE_DEBUG_BRIDGE,
+      isEditor: isEditorBuild,
+      isDebugBuild: debugBuildFlag,
+    }),
     assetScannerPlugin(),
     ...(externalProject ? [hostSharedDeps()] : []),
     // The web boot splash (#396). Build-only and opt-in: a project with no `app.splashSource`

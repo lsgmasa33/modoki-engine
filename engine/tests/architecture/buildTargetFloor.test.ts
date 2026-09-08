@@ -27,11 +27,12 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VITE_CONFIG = fs.readFileSync(path.join(ROOT, 'vite.config.ts'), 'utf8');
-const PROJECT_CONFIG = fs.readFileSync(path.join(ROOT, 'project-config.ts'), 'utf8');
-const HEAL = fs.readFileSync(path.join(ROOT, 'plugins', 'healNativeConfig.ts'), 'utf8');
+const VITE_CONFIG = readScannedSource(path.join(ROOT, 'vite.config.ts')).code;
+const PROJECT_CONFIG = readScannedSource(path.join(ROOT, 'project-config.ts')).code;
+const HEAL = readScannedSource(path.join(ROOT, 'plugins', 'healNativeConfig.ts')).code;
 
 /** The schema default for `build.iosMinVersion` — the floor every project inherits. */
 function defaultIosMinVersion(): number {
@@ -131,7 +132,7 @@ describe('shipped iOS floor', () => {
         const pkg = path.join(abs, entry.name, 'ios', 'App', 'CapApp-SPM', 'Package.swift');
         if (!fs.existsSync(pkg)) continue; // no iOS target — nothing to be stale
         const want = Math.trunc(projectIosMinVersion(path.join(abs, entry.name)));
-        const m = fs.readFileSync(pkg, 'utf8').match(/platforms:\s*\[[^\]]*\.iOS\(\.v(\d+)/);
+        const m = readScannedSource(pkg).code.match(/platforms:\s*\[[^\]]*\.iOS\(\.v(\d+)/);
         if (m && parseInt(m[1], 10) !== want) {
           stale.push(`${root}/${entry.name}: .v${m[1]} (its config asks for .v${want})`);
         }

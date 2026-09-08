@@ -12,8 +12,10 @@ import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
-import { serializePrefab, setPrefabCache } from './prefab';
+import { serializePrefab, setPrefabCache, type PrefabFile } from './prefab';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
+import { jsonFileBody } from '../backend/editorBackend';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 import { reportUndoFailure } from '../undo/undoFailure';
 
@@ -78,7 +80,7 @@ export async function makeRigPrefabAsset(
   deleteEntity(rootId);
   if (!prefab) return null;
 
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   if (!(await writeAssetFile(savePath, content))) return null;
   const cacheKey = prefab.id ?? savePath;
   if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
@@ -97,7 +99,14 @@ export async function makeRigPrefabAsset(
           reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not restored` });
           return;
         }
-        try { setPrefabCache(cacheKey, JSON.parse(prevContent)); } catch { setPrefabCache(cacheKey, null); }
+        // Migrate before seeding the cache — getPrefabSource returns early on a cache hit, so an
+        // un-migrated object here poisons override detection for the rest of the session (the
+        // same raw-JSON-cache-seed defect fixed in prefabEdit.ts's openPrefabForEditing).
+        try {
+          const restored = JSON.parse(prevContent) as PrefabFile;
+          for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+          setPrefabCache(cacheKey, restored);
+        } catch { setPrefabCache(cacheKey, null); }
       } else {
         if (!(await deleteAssetFile(savePath))) {
           reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not deleted` });

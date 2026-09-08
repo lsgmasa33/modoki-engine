@@ -23,7 +23,7 @@ import { Time } from '../core/traits/Time';
 import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
-import { setManualNow, restoreRealClock } from '../core/clock';
+import { setManualNow, restoreRealClock, restoreRealEpoch } from '../core/clock';
 import { advanceFixedSteps } from '../core/stepSimulation';
 import { resetTimeBaseline } from '../core/timeSystem';
 import { getPlayState, setPlayState, type PlayState } from '../core/playState';
@@ -39,6 +39,7 @@ import { clearSkeletalSeeks } from '../core/skeletalSeek';
 import { clearParticleControls } from '../core/particleControlRegistry';
 import { clearTimelineWarnings } from '../timeline/timelineSystem';
 import { resetUnresolvedSpriteWarnings } from '../loaders/textureResolver';
+import { clearTrustedAnchor } from '../core/trustedClock';
 import { setTimelinePreviewActive } from '../core/timelinePreview';
 
 /** A game system to run each frame, with its pipeline priority. */
@@ -150,6 +151,11 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       for (const n of actionNames) unregisterUIAction(n);
       for (const n of systemNames) unregisterSystem(n);
       restoreRealClock();
+      // `restoreRealClock()` only clears the manual MONOTONIC override (`_manualNow`) — clock.ts's
+      // epoch/monotonic split means a manually-pinned epoch (`setManualEpoch`, e.g. a test staging
+      // a cross-boot-staleness scenario) is a SEPARATE override that survives it. `dispose()`'s own
+      // contract above is "ALL global state", so it owns this teardown too.
+      restoreRealEpoch();
       resetTimeBaseline();
       _resetCaptureSeq();                // reset the shared cap counter (V3) for the next test
       for (const t of verboseCaptureState().types) setVerboseCapture(t, false); // close Tier-2 captures
@@ -161,6 +167,12 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       clearParticleControls();
       clearTimelineWarnings();          // warn-once sets are keyed by world-local entity ids
       resetUnresolvedSpriteWarnings();  // …as is the 2D dangling-sprite warn-once set
+      // The trusted-clock session anchor (`core/trustedClock`) is the same shape of module-level
+      // singleton as the clears above, and it MUST be reset here: it was promoted out of a game
+      // (#660), and that game kept its own teardown behind — so without this line an anchor set by
+      // one test reads back in the next, and `trustedNow()` returns a time where the contract says
+      // `null`. Registered at promotion time rather than after the first consumer trips on it.
+      clearTrustedAnchor();
       setTimelinePreviewActive(false);
       setPlayState(prevPlay);
       if (prevWorld) setCurrentWorld(prevWorld);

@@ -9,10 +9,12 @@ import { hdrLoaderCtor, makeGltfLoader, ultraHdrLoaderCtor } from './threeLoader
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getMaterialBuilder } from './materialTypes';
 import { registerBuiltinMaterialTypes } from './materialPresets';
-import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry } from './assetManifest';
+import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
+import { classifyFormatVersion } from '../core/formatVersion';
+import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
 // The `lineColor` / `nprColorPreserve` prototype accessors. Imported for its ORDERING guarantee,
 // not for NPR: this module writes both properties and must not do so before they are accessors.
 // ⚠️ From `materialExtras`, NOT from `npr/NPRPostProcess` — that module imports `three/tsl`, and
@@ -26,6 +28,7 @@ import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, res
 import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
 import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
+import { createTeardownToken } from '../core/liveness';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
@@ -35,6 +38,7 @@ import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCoun
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 import { disposeAllFontFaces } from './fontLoader';
+import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -45,6 +49,19 @@ export interface MeshTemplate {
   geometry: THREE.BufferGeometry;
   material: THREE.Material;
   name: string;
+  /** True for a template registered by GAME code via `registerRuntimeMeshTemplate`, whose
+   *  `material` is **borrowed, not owned** — typically a scene material resolved by GUID, or a
+   *  shared module-level constant (`games/sling`'s `COLLIDER_ONLY_MAT`).
+   *
+   *  ⚠️ **This flag is what stops `invalidateModel` from disposing a material it does not own
+   *  (#719).** One `cache` map holds two kinds of template with OPPOSITE material ownership: a
+   *  GLB template owns its embedded material (dispose it), a runtime one borrows (never).
+   *  Before the flag, the only thing keeping them apart was that no runtime key happened to
+   *  contain `::` — so `modelPathOfKey` indexed them under themselves and a GLB path never
+   *  matched. That is a coincidence of naming, not an invariant: one runtime key derived from a
+   *  model path (`${glbPath}::custom`) would have made `invalidateModel` dispose a live scene's
+   *  shared material. Make the ownership explicit rather than relying on the key format. */
+  runtimeOwnedMaterial?: boolean;
 }
 
 /** Hierarchy entry extracted during loadModelTemplates — stores baked world
@@ -333,8 +350,12 @@ export function decomposeLocalTransform(
 }
 
 
-/** Generation counter — incremented on full disposal to invalidate in-flight async loads. */
-let cacheGeneration = 0;
+/** Teardown token (`runtime/core/liveness.ts`) — invalidated wholesale on full disposal, to
+ *  invalidate in-flight async loads. A SEPARATE, second token from the owner-set
+ *  (`modelOwners`/`meshAssetOwners`/`materialOwners`/`prefabOwners`/`envOwners`) answering a
+ *  different question — see `disposeAllCachedResources`'s and `releaseAllForScene`'s comments for
+ *  why the two must not be merged. */
+const cacheToken = createTeardownToken();
 
 /** Dispose a Three.js material and its textures (material.dispose() alone
  *  doesn't free textures). Walks both:
@@ -438,6 +459,24 @@ export function invalidateModel(modelPath: string) {
   emitAssetInvalidated('model', modelPath, targets);
 
   const disposedGeo = new Set<string>();
+  // #719: the GLB-EMBEDDED material and its textures, which this walk used to drop on the floor.
+  // `tmpl.material` is `mesh.material` straight off the GLTFLoader parse (see `cacheSet` below),
+  // carrying the model's base-colour / normal / ORM textures — and textures dominate GPU bytes,
+  // so the outgoing model's whole texture set used to survive every scene swap. MEASURED on
+  // `games/3d-test` before this change: swapping tropical-island <-> empty leaked +9 textures and
+  // +75.6 MB per cycle, reaching 398 MB after four swaps — clear of the `com.apple.WebKit.GPU`
+  // jetsam band (#590) in four scene transitions.
+  //
+  // `disposeMaterial` is the walk `disposeAllCachedResources` already uses: it disposes a material
+  // AND its textures, releasing refcounted shared ones and directly disposing the rest. GLB-embedded
+  // textures are never in the shared cache (`isSharedTexture` is stamped only inside `loadTexture3D`,
+  // which a GLTFLoader parse never goes through), so they take the direct-dispose branch — exactly
+  // what `riggedModelCache.disposePrototype` already does for its own GLB prototypes.
+  //
+  // Both dedupes are load-bearing: several templates in one model share a material, and several
+  // materials share a texture.
+  const disposedMat = new Set<string>();
+  const disposedTex = new Set<string>();
   for (const target of targets) {
     // O(meshes-in-model) via the per-model index instead of scanning all keys.
     for (const key of [...(modelTemplateKeys.get(target) ?? [])]) {
@@ -446,9 +485,21 @@ export function invalidateModel(modelPath: string) {
         tmpl.geometry.dispose();
         disposedGeo.add(tmpl.geometry.uuid);
       }
+      // `runtimeOwnedMaterial` = the material is borrowed (a scene material, or a shared
+      // module constant). Disposing it would break a LIVE scene, so skip it — geometry above is
+      // still freed, which this cache does own.
+      if (!tmpl.runtimeOwnedMaterial && !disposedMat.has(tmpl.material.uuid)) {
+        disposeMaterial(tmpl.material, disposedTex);
+        disposedMat.add(tmpl.material.uuid);
+      }
       cacheDelete(key);
     }
     hierarchyCache.delete(target);
+    // #863: refuse an in-flight load of THIS target — without this, a load carrying the
+    // PRE-import bytes that resolves after this invalidate re-caches the stale template on top
+    // of whatever re-import follows. Per-key (not `invalidateAll()`, which is full teardown's
+    // job): invalidating one LOD path must not also refuse an unrelated in-flight load.
+    cacheToken.invalidateKey(target);
     // Loading keys are `${path}` (runtime) or `${path}:${postprocessorId}`
     // (editor hook-applied) — see loadModelTemplates. Asset paths contain no ':',
     // so split on the last ':' and exact-match the path: this matches both shapes
@@ -466,9 +517,12 @@ export function invalidateModel(modelPath: string) {
   for (const [path, asset] of meshAssetCache) {
     if (asset === MESH_FAILED) continue;
     const assetModelPath = refToPath(asset.model);
-    if (assetModelPath === modelPath) meshAssetCache.delete(path);
+    if (assetModelPath === modelPath) {
+      meshAssetCache.delete(path);
+      cacheToken.invalidateKey(path); // refuse an in-flight fetch of this .mesh.json's OLD bytes
+    }
   }
-  console.log(`[MeshCache] Invalidated + disposed cache for ${modelPath} (${targets.size} GLBs, ${disposedGeo.size} geometries)`);
+  console.log(`[MeshCache] Invalidated + disposed cache for ${modelPath} (${targets.size} GLBs, ${disposedGeo.size} geometries, ${disposedMat.size} materials, ${disposedTex.size} textures)`);
 }
 
 /** Load a GLB and extract mesh templates into the cache.
@@ -509,22 +563,28 @@ export function loadModelTemplates(
   const key = applyPostprocessorHooks ? `${path}:${postprocessorId}` : path;
   if (loading.has(key)) return loading.get(key)!;
 
-  // Snapshot the cache generation so a GLB that resolves AFTER a
-  // disposeAllCachedResources (which clears cache/loading and bumps the
-  // generation) doesn't `cache.set` owner-less geometry into the freshly-cleared
+  // Snapshot cache liveness so a GLB that resolves AFTER a
+  // disposeAllCachedResources (which clears cache/loading and invalidates the
+  // token) doesn't `cache.set` owner-less geometry into the freshly-cleared
   // map — it would survive until the NEXT teardown as a stranded GPU leak. Mirrors
   // the material + HDR + rigged-cache guards. (F11)
-  const gen = cacheGeneration;
+  // Captured on PATH, not `key` — invalidateModel works in path space, so the liveness key
+  // must meet it there (#863: a per-key invalidate must also refuse an in-flight load).
+  const stillLive = cacheToken.capture(path);
 
   const promise = new Promise<void>((resolve, reject) => {
     const onGltf = async (gltf: { scene: THREE.Group }) => {
       try {
         const model = gltf.scene;
 
-        // Disposed (teardown / scene-swap) while this GLB was loading → promote
-        // nothing, dispose everything we just parsed, and bail. Without this the
-        // templates below would land in the now-cleared cache with no owner. (F11)
-        if (gen !== cacheGeneration) {
+        // Disposed (disposeAllCachedResources — full teardown, NOT a scene swap;
+        // releaseAllForScene does not invalidate cacheToken) while this GLB was
+        // loading → promote nothing, dispose everything we just parsed, and
+        // bail. Without this the templates below would land in the
+        // now-cleared cache with no owner. (F11) The scene-swap case (an
+        // aborted load whose owner was released mid-await) is handled instead
+        // by acquireModel's post-await owner guard (#520).
+        if (!stillLive()) {
           const droppedTex = new Set<string>();
           model.traverse((child) => {
             const m = child as THREE.Mesh;
@@ -765,7 +825,10 @@ export function registerRuntimeMeshTemplate(key: string, geometry: THREE.BufferG
   }
   const prev = cache.get(key);
   if (prev && prev.geometry !== geometry) prev.geometry.dispose();
-  cacheSet(key, { geometry, material, name: key });
+  // `runtimeOwnedMaterial` marks the material as BORROWED — see `MeshTemplate`. Without it,
+  // `invalidateModel` would treat this like a GLB template and dispose a material this cache
+  // does not own.
+  cacheSet(key, { geometry, material, name: key, runtimeOwnedMaterial: true });
 }
 
 /** Remove a runtime mesh template registered via `registerRuntimeMeshTemplate` and
@@ -926,15 +989,41 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
   if (meshAssetCache.has(meshPath)) return Promise.resolve();
   if (meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
 
+  // Same per-key liveness as its sibling fetchers (#863 close-out). This cache had none at all,
+  // and it IS invalidated per-key: `invalidateModel` drops every meshAssetCache entry whose
+  // `asset.model` resolves to the re-imported GLB, so without this an in-flight fetch of the
+  // PRE-import `.mesh.json` re-seats the stale asset on top of the refetch. Outside #863's own
+  // sweep only because that one enumerated `invalidate*` functions and there is no
+  // `invalidateMeshAsset` — the cache is invalidated through the model's name, not its own.
+  const stillLive = cacheToken.capture(meshPath);
+
   const promise = (async () => {
     try {
       const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT);
+      if (!stillLive()) return;
       if (!res.ok) {
         meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
         return;
       }
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       const asset = await parseAssetJson(res, meshPath) as { id?: string } & MeshAsset;
+      // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
+      // `.mesh.json` is a machine-generated sidecar, not player data — REFUSE, not PRESERVE. A
+      // too-new or unreadable document is not cached (so callers keep getting `undefined`,
+      // exactly like a permanently-failed load) and its bytes are never read further.
+      const verdict = classifyFormatVersion(asset, MESH_FORMAT_VERSION);
+      if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+        console.error(
+          verdict.kind === 'too-new'
+            ? `[MeshCache] refusing ${meshPath}: format version ${verdict.version} is newer than ` +
+              `this build's MESH_FORMAT_VERSION (${MESH_FORMAT_VERSION}) — not caching it.`
+            : `[MeshCache] refusing ${meshPath}: version field is unreadable (${verdict.reason}) — not caching it.`,
+        );
+        if (!stillLive()) return;
+        meshAssetCache.set(meshPath, MESH_FAILED);
+        return;
+      }
+      if (!stillLive()) return;
       meshAssetCache.set(meshPath, asset);
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
@@ -985,6 +1074,67 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
 const materialCache = new Map<string, THREE.Material | typeof MATERIAL_FAILED>(); // path → material
 /** In-flight material fetches, keyed by .mat.json path. Awaitable for the refcount API. */
 const materialLoadPromises = new Map<string, Promise<void>>();
+
+/** Shader → material reverse index (#864). `type:'custom'` materials name their shader by ref
+ *  (`fetchMaterial`'s `data.shader`), but nothing indexed the other direction — so a
+ *  `space:'3d'` file shader's `.shader.json` had no way to find the materials built from it.
+ *  `spriteMaterialCache`'s `invalidateShader` is 2D-only and reaches this 3D cache only through
+ *  the `assetInvalidation` event edge (see that module's `shader` doc) — this is the 3D side.
+ *  `materialToShader` is the reverse pointer, kept so a `.mat` RE-IMPORTED to point at a
+ *  DIFFERENT (or no) shader prunes its stale forward edge in O(1) instead of leaving a wrong one
+ *  behind — `recordShaderEdge` below is the one place both maps are written, together.
+ *
+ *  ⚠️ **Keyed by shader GUID, not path.** Everything else in the shader system is GUID-keyed
+ *  (`spriteMaterialCache`'s `programs` and `liveness`, the `.mat`'s own `shader` ref), and a GUID
+ *  survives what a path does not: MOVE or RENAME a `.shader.json` in the asset browser without
+ *  touching the `.mat`, and a path-keyed edge recorded at fetch time no longer matches the path
+ *  resolved at invalidation time — the 3D material would keep its stale compiled NodeMaterial
+ *  while the 2D half, being GUID-keyed, recovered. Failing that way would ALSO be silent, not
+ *  fail-safe: `invalidateShader`'s unresolved-guid branch falls back to a wholesale
+ *  `clearSpriteMaterialCache()` for 2D, but a missed lookup here just finds nothing. */
+const shaderToMaterials = new Map<string, Set<string>>(); // shader GUID → matPaths built from it
+const materialToShader = new Map<string, string>();       // matPath → the shader GUID it currently names
+
+/** The one place `shaderToMaterials`/`materialToShader` are written. `shaderGuid` is the file
+ *  shader this material currently names, or `undefined` when it doesn't (rebuilt as a non-custom
+ *  type, a code-registered shader, or an unresolved ref) — passing `undefined` is what prunes a
+ *  material's edge on re-import or eviction. */
+function recordShaderEdge(matPath: string, shaderGuid: string | undefined): void {
+  const prev = materialToShader.get(matPath);
+  if (prev === shaderGuid) return;
+  if (prev !== undefined) {
+    const set = shaderToMaterials.get(prev);
+    if (set) {
+      set.delete(matPath);
+      if (set.size === 0) shaderToMaterials.delete(prev);
+    }
+  }
+  if (shaderGuid !== undefined) {
+    let set = shaderToMaterials.get(shaderGuid);
+    if (!set) { set = new Set(); shaderToMaterials.set(shaderGuid, set); }
+    set.add(matPath);
+    materialToShader.set(matPath, shaderGuid);
+  } else {
+    materialToShader.delete(matPath);
+  }
+}
+
+/** #864: a `space:'3d'` file-shader invalidation (`spriteMaterialCache.invalidateShader`, routed
+ *  through the shared `assetInvalidation` registry since this module must not import that 2D-only
+ *  one — see its `shader` kind doc) invalidates every material recorded against it. Copy the set
+ *  before iterating: `invalidateMaterial` calls `recordShaderEdge(matPath, undefined)`, which
+ *  mutates THIS SAME set mid-loop. */
+onAssetInvalidated((kind, path) => {
+  if (kind !== 'shader') return;
+  // The event carries the shader's PATH (assetInvalidation's contract: "the source asset path
+  // whose bytes changed"), while this index is GUID-keyed — resolve across that seam here rather
+  // than weakening either side. `path` can already BE a guid on `invalidateShader`'s guid branch.
+  const shaderGuid = isGuid(path) ? path : getGuidForPath(path);
+  if (!shaderGuid) return;
+  const matPaths = shaderToMaterials.get(shaderGuid);
+  if (!matPaths) return;
+  for (const matPath of [...matPaths]) invalidateMaterial(matPath);
+});
 
 /** Invalidate a cached material so it will be re-fetched on next resolve. */
 /** Every texture a material binds — the same walk `disposeMaterial` uses (enumerable texture
@@ -1037,6 +1187,12 @@ export function invalidateMaterial(matPath: string) {
   if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+  // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+  // re-caches the stale material on top of whatever refetch follows.
+  cacheToken.invalidateKey(matPath);
+  // #864: this path is being evicted, so its shader edge (if any) would otherwise outlive the
+  // material entry it describes. A successful refetch re-records a fresh edge via `fetchMaterial`.
+  recordShaderEdge(matPath, undefined);
 }
 
 /** Materials evicted while a live mesh still bound them (see {@link invalidateMaterial}).
@@ -1140,27 +1296,81 @@ function fetchMaterial(matPath: string): Promise<void> {
   if (materialCache.has(matPath)) return Promise.resolve();
   if (materialLoadPromises.has(matPath)) return materialLoadPromises.get(matPath)!;
 
-  const gen = cacheGeneration; // capture to detect disposal during async load
+  const stillLive = cacheToken.capture(matPath); // per-key: detects disposal OR a per-path invalidate during async load
 
   const promise = (async () => {
     try {
       const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT);
       if (!res.ok) {
+        // Liveness-guarded like every other write in this function (#863 residual, found by
+        // #864's close-out): MATERIAL_FAILED is a PERMANENT sentinel — `resolveMaterial` returns
+        // undefined for it forever — so a stale continuation stamping it over a material that was
+        // re-imported and refetched successfully kills that material for the session.
+        if (!stillLive()) return;
         materialCache.set(matPath, MATERIAL_FAILED); // cache failure — don't retry
         return;
       }
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the untyped `res.json()` this replaces
       const data = await parseAssetJson(res, matPath) as any;
+      // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
+      // `.mat.json` is a machine-generated sidecar, not player data — REFUSE, not PRESERVE. A
+      // too-new or unreadable document is not built into a material and lands in the SAME
+      // permanent `MATERIAL_FAILED` sentinel the "unknown material type" branch below uses, so a
+      // refused document also gets the visible pink-material fallback rather than a silent hang.
+      const verdict = classifyFormatVersion(data, MATERIAL_FORMAT_VERSION);
+      if (verdict.kind === 'too-new' || verdict.kind === 'unreadable') {
+        console.error(
+          verdict.kind === 'too-new'
+            ? `[MeshCache] refusing ${matPath}: format version ${verdict.version} is newer than ` +
+              `this build's MATERIAL_FORMAT_VERSION (${MATERIAL_FORMAT_VERSION}) — not building it.`
+            : `[MeshCache] refusing ${matPath}: version field is unreadable (${verdict.reason}) — not building it.`,
+        );
+        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
+        materialCache.set(matPath, MATERIAL_FAILED);
+        return;
+      }
       // Self-register so future ref-by-guid resolves to this path
       if (typeof data.id === 'string') registerAsset(data.id, matPath, 'material');
 
       // Dispatch to the appropriate builder based on `type`. Defaults to 'pbr'
       // for legacy .mat.json files with no type field.
       const type = (data.type as string) ?? 'pbr';
+
+      // #864: record (or prune) this material's shader edge — `type:'custom'` naming a ref that
+      // resolves to a `.shader.json` FILE shader (a code-registered shader, e.g. "outline", stays
+      // undefined here: `refToPath` passes a non-guid/non-path name through unchanged, so it never
+      // ends in `.shader.json`). Recorded regardless of whether the build below actually succeeds,
+      // so a material that failed for an unrelated reason still recovers once the shader it names
+      // is fixed and re-invalidated.
+      const shaderRefRaw = type === 'custom' ? (data.shader as string | undefined) : undefined;
+      const shaderPath = shaderRefRaw !== undefined ? refToPath(shaderRefRaw) : undefined;
+      // Same liveness guard as every other write here, and for the same reason: the edge is
+      // METADATA ABOUT the cache entry, so it must be written under the entry's own guard or the
+      // two can disagree. Concretely — `invalidateMaterial` clears `materialLoadPromises`, so two
+      // fetches for one matPath can overlap (#863); if the STALE one records last, the edge names
+      // the OLD shader and this material stops responding to invalidations of the shader it
+      // actually uses. Found by #864's close-out, not by its tests.
+      // Guards the EDGE WRITE only — deliberately not an early `return`. Bailing out here would
+      // skip the build below, and with it the `disposeMaterial` on the losing load that
+      // `materialInvalidationRetires` + `acquireMaterialPrefabMidLoadGuard` pin: "freed, not
+      // orphaned" is the property those tests exist for, and a fix for a DIFFERENT defect must not
+      // quietly retire it by making the allocation never happen.
+      if (stillLive()) {
+        recordShaderEdge(
+          matPath,
+          shaderPath?.endsWith('.shader.json')
+            // Prefer the ref itself when it is already a guid (the GUID-only invariant means it
+            // almost always is); fall back to the manifest for a legacy path-shaped ref.
+            ? (isGuid(shaderRefRaw) ? shaderRefRaw : getGuidForPath(shaderPath))
+            : undefined,
+        );
+      }
+
       const builder = getMaterialBuilder(type);
       if (!builder) {
         console.warn(`[MeshCache] Unknown material type "${type}" in ${matPath}. Falling back to a pink material.`);
+        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
         materialCache.set(matPath, MATERIAL_FAILED);
         return;
       }
@@ -1256,7 +1466,7 @@ function fetchMaterial(matPath: string): Promise<void> {
       }
 
       // If cache was disposed while we were loading, discard this material
-      if (gen !== cacheGeneration) { disposeMaterial(mat); return; }
+      if (!stillLive()) { disposeMaterial(mat); return; }
       // An invalidate mid-flight clears `materialLoadPromises`, so a SECOND fetch for this path
       // can already have landed here — `fetchMaterial` dedupes on that map alone. Retire the
       // incumbent instead of letting `set` silently orphan it: orphaned, it is unreachable to
@@ -1282,6 +1492,14 @@ function fetchMaterial(matPath: string): Promise<void> {
       fireDirtyListeners();
     } catch (e) {
       console.warn(`[MeshCache] Failed to load material ${matPath}:`, e);
+      // The FOURTH post-await MATERIAL_FAILED write, and the most reachable of them in dev:
+      // `parseAssetJson` THROWS (MissingAssetError on the dev-server SPA fallback, a plain Error
+      // on a bad parse), so a missing or half-written .mat.json lands HERE, not in the `!res.ok`
+      // branch above. Same guard as its three siblings and for the same reason — the sentinel is
+      // PERMANENT and `fetchMaterial` short-circuits on `materialCache.has`, so a stale
+      // continuation stamping it over a successfully refetched material kills that material for
+      // the session with nothing to retry it.
+      if (!stillLive()) return;
       materialCache.set(matPath, MATERIAL_FAILED);
     } finally {
       materialLoadPromises.delete(matPath);
@@ -1298,9 +1516,15 @@ function fetchMaterial(matPath: string): Promise<void> {
  *  ⚠️ **IT DOES NOT KNOW ABOUT MATERIAL CLONES, AND IT CANNOT.** Tint, MaterialInstance,
  *  light-mask, video and prewarm clones all hold this cache's materials as their base and share
  *  their texture references (#318, `rendering/derivedMaterials.ts`), and this function releases
- *  every one of those textures unconditionally. It cannot drain them itself: those caches live in
- *  `rendering/` (L2) and this module is `loaders/` (L3), so reaching them would invert the layer
- *  contract.
+ *  every one of those textures unconditionally. It cannot sensibly drain them itself: it does not
+ *  know which entities are bound to what, and the invalidation LISTENER on the rendering side does
+ *  (that is where #719's `retireVariantsOf` call lives).
+ *
+ *  ⚠️ **This used to say reaching those caches "would invert the layer contract". That is wrong,
+ *  and it was repeated into #719's first draft before being caught in review.** `loaders` is in
+ *  `L3_FOLDERS` and `rendering/scene3DSync.ts` is in `L3_RECLASSIFIED_FILES`
+ *  (`engine/eslint.config.js`) — both L3-unrestricted, so the import would be legal in either
+ *  direction. The reason is ownership and knowledge, not layering.
  *
  *  Today that is harmless because **nothing in production calls this** — `releaseAllForScene` is
  *  the release entry point app/editor code uses (see CLAUDE.md § Resource Management), and the
@@ -1313,7 +1537,7 @@ function fetchMaterial(matPath: string): Promise<void> {
  *  down this file is exactly the caller that would otherwise free textures out from under a live
  *  clone. */
 export function disposeAllCachedResources() {
-  cacheGeneration++; // invalidate in-flight async material fetches
+  cacheToken.invalidateAll(); // invalidate in-flight async material fetches
 
   const disposedGeo = new Set<string>();
   const disposedMat = new Set<string>();
@@ -1352,6 +1576,9 @@ export function disposeAllCachedResources() {
   }
   materialCache.clear();
   materialLoadPromises.clear();
+  // #864: the shader→material reverse index dies with the materials it describes.
+  shaderToMaterials.clear();
+  materialToShader.clear();
   // Retired materials too: their sweep runs from `syncSceneRenderables3D`, so a surface that
   // stops rendering (or a build with no 3D surface) would otherwise strand them. Everything
   // binding them is torn down with this generation anyway.
@@ -1362,15 +1589,15 @@ export function disposeAllCachedResources() {
   retiredMaterialPaths.clear();
 
   // Dispose any cached HDR environments and clear env owners — they're tied
-  // to the same cacheGeneration / scene lifetime as everything else here.
-  for (const [, tex] of envCache) tex.dispose();
+  // to the same cacheToken / scene lifetime as everything else here.
+  for (const [, tex] of envCache) { runEnvDisposeHooks(tex); tex.dispose(); } // #739: PMREM dies with its source
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
   // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
   // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
   // Everything binding them is being torn down with this generation anyway.
-  for (const tex of retiredEnvs) tex.dispose();
+  for (const tex of retiredEnvs) { runEnvDisposeHooks(tex); tex.dispose(); } // #739
   retiredEnvs.clear();
 
   // Clear refcount tracking
@@ -1504,6 +1731,40 @@ export async function acquireModel(sceneId: SceneId, glbRef: string, postprocess
   } else {
     await loadModelTemplates(glbPath, undefined, postprocessorId);
   }
+
+  // Post-await guard, mirroring acquireMesh's (#485, :1552). releaseAllForScene is
+  // synchronous and can land inside the load above; the owner we added at :1487 is
+  // gone by the time we resume, and nothing will ever release this sceneId again.
+  //
+  // ⚠️ The OUTER check ("was I released") is currently subsumed by the inner one
+  // ("does anyone still own it") and no test can tell them apart — an empty owner set
+  // trivially implies not-a-member, and this guard is the function's last statement, so
+  // the early `return` changes nothing. Verified by mutation: deleting the outer check
+  // leaves the whole suite green, deleting the inner one turns the second-live-scene
+  // test red. It is kept deliberately — it states the question this guard is actually
+  // asking, mirrors `acquireMesh`'s established shape, and stops being redundant the
+  // moment anything is added after it. Do not "simplify" it away on the strength of a
+  // green suite; the suite cannot see this one.
+  if (!modelOwners.get(glbPath)?.has(sceneId)) {
+    if (!modelOwners.get(glbPath)?.size) {
+      // Re-seat the snapshot releaseModelByPath deleted (:1522) so invalidateModel
+      // finds the LOD siblings without depending on manifest state.
+      //
+      // ⚠️ This only CHANGES anything when the manifest no longer carries the model's
+      // lodPaths — otherwise invalidateModel's manifest fallback (:432-434) finds the
+      // siblings on its own and the re-seat is a no-op. Its test has to clear the
+      // manifest to reach the branch at all: re-registering the asset does NOT drop a
+      // previously-registered modelCache block (assetManifest.ts:299-311 preserves it
+      // when the type is unchanged), so a test that merely re-registers goes green
+      // whether or not this line is here. Whether production can reach that state is
+      // NOT established — treat the line as defensive, and do not read its test as
+      // proof that the manifest is ever actually gone here.
+      if (lodPaths && lodPaths.length > 0) modelLodSnapshots.set(glbPath, [...lodPaths]);
+      invalidateModel(glbPath);
+      modelLodSnapshots.delete(glbPath);
+    }
+    return;
+  }
 }
 
 /** Release a GLB model for a scene. Disposes mesh templates when refcount hits zero. */
@@ -1532,6 +1793,32 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
 
   // Fetch the .mesh.json (cached). After this, meshAssetCache has the entry.
   await fetchMeshAsset(meshPath);
+
+  // Released mid-load → drop the result, mirroring riggedModelCache.ts:177 and
+  // audioBufferCache.ts:206. releaseAllForScene is synchronous and can land
+  // inside this await (SceneManager aborts an in-flight load and releases its
+  // sceneId at sceneManager.ts:279-280; that abort doesn't reach this fetch,
+  // which isn't abortable) — and once it has, nothing will ever call
+  // releaseAllForScene for this sceneId again, so any hold re-added below would
+  // pin the geometry, material and textures for the process lifetime. Evict the
+  // owner-less cache entry too (releaseMeshByPath's wasLast branch already did
+  // this; fetchMeshAsset just repopulated it on resume) — but only if nobody
+  // else owns it, so a second, still-live scene acquiring the same mesh
+  // concurrently keeps its entry.
+  // NOTE: this does not cover fetchMeshAsset loading model templates inside
+  // this same await — geometry can already be resident with no owner at all by
+  // the time we bail here. Triaged under #488: that's site 1 (acquireMesh's
+  // MODEL owner, as opposed to its MESH owner above), and it's won't-fix — see
+  // docs/scene-loading.md for why. Site 2 (acquireModel's own post-await
+  // window) IS fixed, at acquireModel's post-await guard above. Site 3 (the F6
+  // sync render-path resolver) is working-as-designed. A fourth window — this
+  // function's OWN transitive-model acquisition below, reached whenever a
+  // release lands inside THAT await rather than this one — is fixed at its own
+  // post-await guard below (#552).
+  if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
+    if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
+    return;
+  }
 
   const asset = meshAssetCache.get(meshPath);
   if (!asset || asset === MESH_FAILED) return; // load failed; nothing to transitively acquire
@@ -1565,6 +1852,21 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
         await Promise.allSettled(lodPaths.map(p => loadModelTemplates(p, undefined, asset.postprocessor || 'none')));
       } else {
         await loadModelTemplates(modelPath, undefined, asset.postprocessor || 'none');
+      }
+
+      // Post-await guard, mirroring acquireModel's (#488 site 2, :1512). releaseAllForScene
+      // is synchronous and can land inside the awaits above; the owner added at :1613 is
+      // gone by the time we resume, and nothing will ever release this sceneId again. Both
+      // conditions are load-bearing — see the note at acquireModel's mirror of this guard.
+      if (!modelOwners.get(modelPath)?.has(sceneId)) {
+        if (!modelOwners.get(modelPath)?.size) {
+          // Re-seat the snapshot releaseModelByPath deleted so invalidateModel finds the
+          // LOD siblings without depending on manifest state.
+          if (lodPaths && lodPaths.length > 0) modelLodSnapshots.set(modelPath, [...lodPaths]);
+          invalidateModel(modelPath);
+          modelLodSnapshots.delete(modelPath);
+        }
+        return;
       }
     }
   }
@@ -1608,6 +1910,24 @@ export async function acquireMaterial(sceneId: SceneId, matRef: string): Promise
   if (!matPath || !matPath.endsWith('.mat.json')) return;
   addOwner(materialOwners, matPath, sceneId);
   await fetchMaterial(matPath);
+
+  // Released mid-load → discard the result, mirroring the post-await guards in
+  // `acquireMesh` and `acquireModel`. releaseAllForScene is synchronous and can
+  // land inside the await above (SceneManager aborts an in-flight load at
+  // SceneManager.ts:279 and releases its sceneId at :280; that abort doesn't
+  // reach fetchMaterial, which isn't abortable) — and every LATER
+  // releaseAllForScene for this sceneId is a no-op, because those only visit
+  // paths whose owner set still contains the id, which is exactly what this one
+  // just drained. (SceneManager.ts:926 really does re-release these ids from the
+  // aborted load's catch — it simply cannot see the entry fetchMaterial is about
+  // to re-seat.) So without this the material, and every texture it holds, is
+  // pinned until app teardown. Retire rather than dispose (#317) — a live mesh
+  // may still bind it for a frame or two after the swap. Only if nobody else
+  // owns it, so a second, still-live scene sharing the load keeps its entry. (#520)
+  if (!materialOwners.get(matPath)?.has(sceneId)) {
+    if (!materialOwners.get(matPath)?.size) invalidateMaterial(matPath);
+    return;
+  }
 }
 
 /** Release a .mat.json material for a scene. Disposes when refcount hits zero. */
@@ -1632,6 +1952,19 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
   if (!prefabPath) return;
   addOwner(prefabOwners, prefabPath, sceneId);
   await fetchPrefab(prefabPath);
+
+  // Released mid-load → discard the result, same shape as acquireMaterial above,
+  // and see that comment for why a later releaseAllForScene cannot recover this
+  // (#520). fetchPrefab isn't abortable either, so SceneManager's abort at
+  // SceneManager.ts:279 does not reach it. A plain cache delete is the whole
+  // disposal answer here — parsed JSON, no GPU resource — and fetchPrefab's
+  // `finally` has already cleared prefabLoadPromises by the time this runs, so
+  // there is no resolved promise left to short-circuit the next fetch. Only if
+  // nobody else owns it, so a second, still-live scene sharing the load keeps it.
+  if (!prefabOwners.get(prefabPath)?.has(sceneId)) {
+    if (!prefabOwners.get(prefabPath)?.size) prefabCache.delete(prefabPath);
+    return;
+  }
 }
 
 // ── Environment (HDR) ────────────────────────────────────
@@ -1679,6 +2012,36 @@ export async function acquireEnvironment(sceneId: SceneId, hdrRef: string): Prom
   if (!hdrPath) return;
   addOwner(envOwners, hdrPath, sceneId);
   await fetchEnvironment(hdrPath);
+
+  // Released mid-load → discard the result, mirroring the post-await guards in
+  // acquireMesh/acquireModel/acquireMaterial/acquirePrefab above. releaseAllForScene is
+  // synchronous and can land inside the await (SceneManager aborts an in-flight load and
+  // releases its sceneId; that abort doesn't reach fetchEnvironment, which isn't abortable)
+  // — and every LATER releaseAllForScene for this sceneId is a no-op, because it only visits
+  // paths whose owner set still contains the id, which is exactly what this one just drained.
+  // invalidateEnvironment retires rather than deletes outright (#315) — a live render surface
+  // may still bind the just-cached texture for a frame or two after the swap. Only if nobody
+  // else owns it, so a second, still-live scene sharing the load keeps its entry.
+  //
+  // ⚠️ Currently SUBSUMED by fetchEnvironment's own inner check (`!envOwners.has(hdrPath)`,
+  // ~:1904) for every path this function can actually reach: `releaseAllForScene` itself calls
+  // `releaseEnvironmentByPath` (not just a bookkeeping removal), so a mid-load release already
+  // retires/evicts the cache entry directly — this guard's `return` is never observably
+  // different from falling through. Kept anyway, mirroring `acquireModel`'s own documented
+  // outer/inner redundancy (:1521-1529 above): it states the right invariant, matches the other
+  // four acquire* functions' shape, and stops being redundant the moment anything is added
+  // after it (e.g. a future transitive-dependency acquire on this path). Not provable red/green
+  // by a unit test today — see acquireEnvironmentMidLoadGuard.test.ts for why.
+  //
+  // `envCache.has(hdrPath)` gates the invalidate call: `invalidateEnvironment` announces via
+  // `emitAssetInvalidated`, which fires the dirty-listener wake unconditionally — calling it when
+  // the inner check already disposed-and-never-cached the arriving texture would wake every
+  // listener for a state change that never happened (resourceRefcount.test.ts's "no dirty signal
+  // when nothing was applied" pins exactly this for the inner-guard-only path).
+  if (!envOwners.get(hdrPath)?.has(sceneId)) {
+    if (!envOwners.get(hdrPath)?.size && envCache.has(hdrPath)) invalidateEnvironment(hdrPath);
+    return;
+  }
 }
 
 /** Release an HDR environment for a scene. Disposes the texture on last release. */
@@ -1724,6 +2087,9 @@ export function invalidateEnvironment(hdrRef: string): void {
   if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+  // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+  // re-caches the stale texture on top of whatever refetch follows.
+  cacheToken.invalidateKey(hdrPath);
 }
 
 /** HDR envs evicted by {@link invalidateEnvironment} while a render surface still bound them.
@@ -1746,16 +2112,55 @@ export function retiredEnvironments(): ReadonlySet<THREE.DataTexture> {
  *  `dispose()` on a retired env directly — that is the bug this exists to prevent. */
 export function disposeRetiredEnvironment(tex: THREE.DataTexture): void {
   if (!retiredEnvs.delete(tex)) return; // not retired (or already freed) — nothing to do
+  runEnvDisposeHooks(tex); // the PMREM built from this equirect is dead with its source (#739)
   tex.dispose();
+}
+
+// ── Environment derived-texture disposal hook (#739/#775/#779; indirection for #214) ─────
+//
+// The actual generation/cache/disposal of the derived environment textures — the PMREM and the
+// cube (`getEnvPMREMTexture`, `getEnvCubeTexture`, `sourceForEnvDerived`, `disposeEnvDerivedFor`)
+// — lives in `../rendering/envPmrem.ts`, not here: it needs
+// `PMREMGenerator` from `three/webgpu`, and `runtime/loaders/**` (this file) is reachable from the
+// 2D boot path, so importing that value HERE would ship the whole Three node pipeline into a
+// `render3d:false` 2D-only build (`tests/runtime/render3dBoundary.test.ts`, #214).
+//
+// But this cache must still ensure a derived texture dies with its source, without importing
+// anything three/webgpu-shaped itself. So instead of calling `disposeEnvDerivedFor` directly, it
+// fans out to a registry `envPmrem.ts` populates at module scope
+// (`registerEnvDisposeHook('envPmrem', disposeEnvDerivedFor)`)
+// — only when something ELSE (a 3D render surface) has already pulled that module in. A 2D-only
+// build never imports `envPmrem.ts`, so this set stays empty and the hook fan-out below is a no-op,
+// with nothing three-shaped ever reaching this file. ⚠️ Do not "simplify" this back into a direct
+// import — that is exactly the edge `render3dBoundary.test.ts` exists to catch.
+//
+// Keyed by string, not a bare `Set`: `envPmrem.ts` registers at MODULE SCOPE, and HMR re-evaluates
+// a module's top level on every edit without re-running the app's mount/teardown. A `Set` would
+// accumulate one closure per HMR pass, each pinning the PREVIOUS module instance's caches — and
+// (dev-only) a stale hook can dispose a render target the CURRENT module instance still has bound
+// (the #315 use-after-free shape, reborn via HMR). Re-registering under the same key REPLACES the
+// old closure instead of piling on, so only the current module instance's hook ever runs.
+const envDisposeHooks = new Map<string, (tex: THREE.DataTexture) => void>();
+
+/** Register a callback to run when a cached HDR environment texture is disposed, so a dependent
+ *  (currently: the PMREM built from it) can free itself. See the comment above for why this
+ *  indirection exists instead of a direct import, and why registration is keyed and idempotent. */
+export function registerEnvDisposeHook(key: string, fn: (tex: THREE.DataTexture) => void): void {
+  envDisposeHooks.set(key, fn);
+}
+
+function runEnvDisposeHooks(tex: THREE.DataTexture): void {
+  for (const fn of envDisposeHooks.values()) fn(tex);
 }
 
 function fetchEnvironment(hdrPath: string): Promise<void> {
   if (envCache.has(hdrPath)) return Promise.resolve();
   if (envLoadPromises.has(hdrPath)) return envLoadPromises.get(hdrPath)!;
 
-  // Snapshot the generation BEFORE the async load so a release-mid-load (or a
+  // Snapshot liveness BEFORE the async load so a release-mid-load (or a
   // full disposeAllCachedResources) is observable when the texture arrives.
-  const gen = cacheGeneration;
+  // Per-key (#863): a per-path invalidateEnvironment must also be observable, not just teardown.
+  const stillLive = cacheToken.capture(hdrPath);
 
   const promise = (async () => {
     // Load the converted variant (`~env.hdr` downscaled Radiance, or `~ultrahdr.jpg`
@@ -1776,7 +2181,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
           // If the cache was disposed or the owner released this HDR mid-load,
           // dispose the just-loaded texture instead of leaving it owner-less in
           // the cache forever.
-          if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
+          if (!stillLive() || !envOwners.has(hdrPath)) {
             texture.dispose();
             resolve();
             return;
@@ -1856,6 +2261,9 @@ export function invalidatePrefab(prefabRef: string): void {
     if (!key) continue;
     prefabCache.delete(key);
     prefabLoadPromises.delete(key);
+    // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
+    // re-caches the stale prefab on top of whatever refetch follows.
+    cacheToken.invalidateKey(key);
   }
 }
 
@@ -1863,12 +2271,27 @@ function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
 
+  // Snapshot liveness so a fetch that resolves AFTER an invalidatePrefab (or full teardown)
+  // doesn't re-seat the pre-invalidation bytes into the freshly-cleared cache (#863). Mirrors
+  // the model/material/environment guards above — this cache had none at all.
+  const stillLive = cacheToken.capture(prefabPath);
+
   const promise = (async () => {
     try {
       const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT);
       if (!res.ok) return;
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
-      const data = await parseAssetJson(res, prefabPath) as { id?: string };
+      const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };
+      // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
+      // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
+      // migration unconditionally here (cheap, idempotent) is the smallest thing that closes
+      // the same data-loss window a versioned migration closes for scenes — see
+      // uiAnchorZIndexMigration.ts. Structured walk — reaches overrides[localId][UIAnchor],
+      // added[] subtrees and nestedOverrides paths (including a prefab FILE's own nested rows,
+      // since this runs unconditionally on every row, not just non-nested ones), not just
+      // entry.traits.
+      for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+      if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {

@@ -157,11 +157,97 @@ export function remapPrefix(set: Set<string>, oldP: string, newP: string): Set<s
   return next;
 }
 
+/** What happened to a path. `to: null` means the asset is GONE (delete) → unbind; a string
+ *  means it MOVED → remap, because the asset survives (its GUID and `.meta.json` sidecar
+ *  move with it) and only its location changed. `prefix` makes it a FOLDER operation,
+ *  matching the folder itself and everything beneath it. */
+export interface PathMove {
+  readonly from: string;
+  readonly to: string | null;
+  readonly prefix?: boolean;
+  /** Replacement display name, when the caller knows it (an asset rename). */
+  readonly name?: string;
+}
+
+/** Where `path` ends up under `move`, or `undefined` if the move does not touch it.
+ *  `null` = gone. `remapPrefix` above is the sibling of this same segment-boundary rule for
+ *  a `Set<string>` of paths rather than a single one — the two coexist rather than being
+ *  unified because this one needs the three-valued (`undefined`/`null`/string) return that a
+ *  `Set` rewrite has no use for, and both now live in this leaf module so the next person
+ *  sees them together. Exported for the test that pins folder-prefix matching. */
+export function applyMove(path: string, move: PathMove): string | null | undefined {
+  if (move.prefix) {
+    // Segment-boundary match ONLY: renaming `/assets/anim` must not capture
+    // `/assets/animations/x.json`, which a bare startsWith would.
+    if (path !== move.from && !path.startsWith(move.from + '/')) return undefined;
+    if (move.to === null) return null;
+    return move.to + path.slice(move.from.length);
+  }
+  if (path !== move.from) return undefined;
+  return move.to;
+}
+
 /** Collapse a single-folder wrapper chain so redundant manifest roots (e.g. the
  *  virtual `/` named "assets" wrapping the `/assets` URL-prefix folder, also named
  *  "assets") don't render as "assets ▸ assets". Descends while a node has no files
  *  and exactly one child folder, landing on the first node that actually branches
  *  (where the category folders live). Shared by the project + Engine sections. */
+/** Is `path` a FOLDER, given what the panel knows? Three sources because a folder exists in the
+ *  UI before it exists on disk: `pendingFolders` (optimistically created, no file in it yet),
+ *  `diskFolders` (empty folders the backend reported), and — the one that covers the common case
+ *  — any folder that has assets under it, which is implied by the asset list rather than listed
+ *  anywhere.
+ *
+ *  Extracted for #867. It was written inline twice (the collision checks in `commitFolderRename`
+ *  and the new-folder path) and needed a third time by `planFilesDropMoves`, which is where the
+ *  cost of NOT having it showed up: a drag could not tell a folder from a file, so it built an
+ *  exact-path move and repaired nothing under it. */
+export function isFolderPath(
+  path: string,
+  known: { pendingFolders: ReadonlySet<string>; diskFolders: readonly string[]; assets: readonly AssetEntry[] },
+): boolean {
+  if (known.pendingFolders.has(path)) return true;
+  if (known.diskFolders.includes(path)) return true;
+  return known.assets.some((a) => a.path === path || a.path.startsWith(path + '/'));
+}
+
+/** A move that RELOCATES rather than deletes — `PathMove` with its `to: null` case ruled out.
+ *  A drag-and-drop can only ever put a file somewhere, so the planner below is total in `to`. */
+export type RelocateMove = PathMove & { to: string };
+
+/** Plan the moves a drag-and-drop into `targetFolder` should make — the PURE half of
+ *  `handleFilesDrop` (`Assets.tsx`), separated so the decision can be tested without the panel
+ *  (`docs/editor.md` § "Where a panel's LOGIC belongs").
+ *
+ *  ⚠️ **`prefix` is the whole point of this function existing** (#867). A dragged FOLDER used to
+ *  produce `{from, to}` with no `prefix`, so `applyMove` took its exact-path branch and returned
+ *  `undefined` for every descendant — the parked writes, CAS baselines, bindings and Inspector
+ *  selection under a moved folder were all left pointing into a folder that no longer existed. The
+ *  drag payload has carried `isFolder: true` since folders became draggable and **nothing ever read
+ *  it**; it is not read here either, because a multi-selection drag carries one payload for many
+ *  paths. The tree is asked about each path instead, which is right for every entry.
+ *
+ *  The skips are the pre-existing rules, unchanged: a no-op move into the current folder, dropping
+ *  a folder onto itself, and dropping a folder into its own descendant (which would orphan it). */
+export function planFilesDropMoves(
+  filePaths: readonly string[],
+  targetFolder: string,
+  isFolder: (path: string) => boolean,
+): RelocateMove[] {
+  const normalizedTarget = targetFolder === '/' ? '' : targetFolder;
+  const out: RelocateMove[] = [];
+  for (const filePath of filePaths) {
+    const originalFolder = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
+    if (targetFolder === originalFolder) continue;          // already there
+    if (targetFolder === filePath) continue;                // onto itself
+    if (targetFolder.startsWith(filePath + '/')) continue;  // into its own descendant
+    const fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
+    const to = `${normalizedTarget}/${fileName}`;
+    out.push(isFolder(filePath) ? { from: filePath, to, prefix: true } : { from: filePath, to });
+  }
+  return out;
+}
+
 export function effectiveAssetsRoot(root: FolderNode): FolderNode {
   let node = root;
   while (node.files.length === 0 && node.children.length === 1) node = node.children[0];

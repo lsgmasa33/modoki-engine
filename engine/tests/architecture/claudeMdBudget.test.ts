@@ -22,27 +22,40 @@
  *  The slack is deliberately generous (SHRINK_SLACK below). This guard exists to catch a file
  *  drifting back up over months, not to bill a commit for deleting a paragraph.
  *
- *  SCOPE: files are enumerated by walking the tree. `verify:publish` runs the shipped guards
- *  inside an assembled OSS snapshot, and that snapshot carries only a HANDFUL of `CLAUDE.md`
- *  files (the starter template, the testbed fixture, and whichever demos ship) — so a sanity
- *  floor tuned to this repo's ~27 goes red there. This guard shipped with exactly that bug for
- *  one commit; it was caught by running the publish gate, not by reasoning about it. Hence the
- *  floor below anchors on two files that exist in BOTH repos instead of on a count.
- *
- *  (`git ls-files` would in fact work there — `publish-engine-oss.sh` `git init`s the stage
- *  precisely so shipped guards can ask git. A tree walk is simply the smaller dependency, and
- *  it keeps this guard honest about untracked files too.)
+ *  SCOPE: `verify:publish` runs the shipped guards inside an assembled OSS snapshot, and that
+ *  snapshot carries only a HANDFUL of `CLAUDE.md` files (the starter template, the testbed
+ *  fixture, and whichever demos ship) — so a sanity floor tuned to this repo's ~28 goes red
+ *  there. This guard shipped with exactly that bug for one commit; it was caught by running the
+ *  publish gate, not by reasoning about it. Hence the sanity-check test below anchors on two
+ *  files that exist in BOTH repos instead of on a count (`repoFiles()`'s own `floor: 1` is a
+ *  separate, much weaker pin — see `trackedClaudeFiles()` below).
  *
  *  A file present on disk must carry a budget — that is what makes a NEW project's `CLAUDE.md`
  *  get a deliberate number rather than silently inheriting none. The reverse direction (a
  *  budget naming a file that does not exist) is only checked when this checkout really has the
  *  internal projects: the snapshot ships neither all of `games/` nor all of `demos/`, so there
  *  the missing entries are correct, not rot.
+ *
+ *  ── ENUMERATION (#799/#771/#805 Phase 3) ─────────────────────────────────────────────────────
+ *  Migrated from a hand-rolled `fs.readdirSync` walker onto the shared `repoFiles()`
+ *  (`engine/scripts/repoCorpus.mjs`). This guard's own SKIP_DIRS comment used to argue the
+ *  opposite — that "sibling guards escape [a nested worktree checkout] for free by enumerating
+ *  with `git ls-files`, which cannot see a separate checkout; this one cannot, because an
+ *  UNTRACKED CLAUDE.md is exactly what it must catch." Both halves of that premise were false,
+ *  MEASURED here rather than argued: `git ls-files --others --exclude-standard` (what
+ *  `repoFiles()` passes) DOES enumerate untracked files — a temp untracked `CLAUDE.md` was
+ *  enumerated by it — and git does NOT descend into a nested checkout (`.claude/worktrees/<id>/`
+ *  is exactly that shape, and a probe `git init` under `.claude` surfaced only the bare directory
+ *  entry, never a `CLAUDE.md` inside it, even before any file-level filtering ran). So a
+ *  git-backed walk keeps this guard's purpose intact (an untracked `CLAUDE.md` is still caught)
+ *  AND gets the worktree exclusion for free — `SKIP_DIRS` and its `.claude` entry are gone
+ *  entirely rather than migrated, because nothing here needs a skip list any more.
  */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { REPO_ROOT, hasInternalGames } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const BUDGET_FILE = path.join(__dirname, 'claude-md-budget.json');
 
@@ -53,34 +66,15 @@ function budgets(): Record<string, number> {
   return JSON.parse(fs.readFileSync(BUDGET_FILE, 'utf8')) as Record<string, number>;
 }
 
-const SKIP_DIRS = new Set([
-  'node_modules', '.git', 'dist', 'build', 'coverage', 'release', 'ios', 'android',
-  '.vite', '.gradle', 'DerivedData', 'subgame-dist', 'ads',
-  // ⚠️ `.claude` holds AGENT SCRATCH, not repo content — in particular `.claude/worktrees/<id>/`,
-  // a full second checkout that a subagent launched with `isolation: 'worktree'` lives in. This
-  // walker is a raw `fs.readdirSync`, so without this entry every CLAUDE.md in that checkout is
-  // reported as un-budgeted and `npm run verify` goes RED for as long as any worktree agent runs —
-  // i.e. during exactly the fan-out workflow CLAUDE.md recommends. (Measured: one review agent
-  // produced 20+ offenders and a red gate that had nothing to do with the change under test.)
-  // Sibling guards escape this for free by enumerating with `git ls-files`, which cannot see a
-  // separate checkout; this one cannot, because an UNTRACKED CLAUDE.md is exactly what it must catch.
-  '.claude',
-]);
-
-/** Every `CLAUDE.md` in the tree, repo-relative and POSIX-separated. */
-function claudeFiles(dir = REPO_ROOT, prefix = ''): string[] {
-  const found: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.isDirectory()) {
-      if (SKIP_DIRS.has(e.name)) continue;
-      found.push(...claudeFiles(path.join(dir, e.name), prefix ? `${prefix}/${e.name}` : e.name));
-    } else if (e.name === 'CLAUDE.md') {
-      found.push(prefix ? `${prefix}/CLAUDE.md` : 'CLAUDE.md');
-    }
-  }
-  return found.sort();
+/** Every `CLAUDE.md` in the repo, repo-relative and POSIX-separated — tracked or untracked-but-
+ *  not-ignored, sourced from git rather than a filesystem walk. `floor: 1` because a genuinely
+ *  broken enumeration (0 CLAUDE.md files in this whole repo) can never be a legitimate result. */
+function trackedClaudeFiles(): string[] {
+  return repoFiles({
+    match: (rel: string) => rel === 'CLAUDE.md' || rel.endsWith('/CLAUDE.md'),
+    floor: 1,
+  }).map(({ rel }) => rel).sort();
 }
-const trackedClaudeFiles = () => claudeFiles();
 
 describe('CLAUDE.md size budget (context an agent pays on every turn)', () => {
   it('finds the files at all — a zero-file sweep would pass every assertion below', () => {

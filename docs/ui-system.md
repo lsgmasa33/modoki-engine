@@ -9,7 +9,8 @@ UI scene graph — the ECS world *is* the UI document.
 This page documents the runtime UI traits, the renderer, the projection/dirty-flag
 model that keeps it off the per-frame path, anchor positioning, directional
 controller/keyboard focus, text animation, nine-slice backgrounds, fonts, an image-ref
-gotcha, and the per-game custom-React-UI escape hatch.
+gotcha, the per-game custom-React-UI escape hatch, and the cross-game
+[dialog-dismissal rule](#dialog-dismissal--the-house-rule-for-every-game).
 
 Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md) ·
 [Prefabs](./prefabs.md) · [Materials & Textures](./textures.md) · [Visual Editor](./editor.md)
@@ -47,7 +48,8 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
   `overflow`
   (`visible | hidden | scroll`), `scrollbarStyle` (`auto | tinted | hidden`) with
-  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below).
+  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below),
+  `swallowClicks` (see below).
 
   **The scrollbar skin is `scrollbar-color` + `scrollbar-width` and nothing else**, because these
   are INLINE styles and `::-webkit-scrollbar` is a pseudo-element that cannot be written inline at
@@ -61,6 +63,64 @@ Field groups (representative fields, verified against `UIElement.ts`):
   ⚠️ `'hidden'` removes an **affordance**, not just a decoration: with no bar, nothing on screen
   says the content continues below the fold. Use it only where something else already does.
 
+  **Scroll anchoring** (`runtime/ui/scrollAnchor.ts`, wired into `UINode`) keeps a
+  `overflow: 'scroll'` box's content still when its content SIZE changes — a child appearing,
+  vanishing, or changing height — the same job Chromium's own `overflow-anchor` does, done by us
+  so it happens on every engine. That split is why this class of bug was invisible in the editor:
+  Chromium and Firefox self-correct a scroll-position clamp when content shrinks, WebKit never
+  has, so a shipped iOS WKWebView could drift permanently while the same scene in the Electron
+  editor read as fine (#531 — Court's store shelf lost its purchase-target alignment after a
+  cancelled purchase, because the "Done" button unmounting while buying shrank the shelf and
+  nothing restored the clamped offset: `scrollTop` 303 -> 251, every row 52px lower, permanently).
+  See `scrollAnchor.ts`'s header comment for the mechanism and the two failure modes
+  (`isIntentfulScroll`) it has to tell apart.
+  ⚠️ **The hook owns `overflow-anchor` itself, at runtime, and only where it can act.**
+  `scrollAnchor.ts` sets `style.overflowAnchor = 'none'` only on a box with two or more flow
+  children — the condition under which it can actually anchor to something — rather than `UINode`
+  stamping it unconditionally. A box with exactly one flow child — notably any `UIEntries`
+  virtualized view, whose pooled rows all live under a single `__uiEntriesContent` wrapper — keeps
+  the BROWSER's anchoring instead: our mechanism would degrade to restoring the raw offset there,
+  and taking away Chromium's working behaviour to replace it with an inert one would be a
+  regression on Court's `LevelScroll` and `DailyScroll`.
+  ⚠️ **Known residual, measured separately from #531:** when the anchored child is itself the one
+  removed, the restore falls back to the first surviving child below it and lands within about one
+  flex `gap` of exact — measured 8px on Court's shelf, against ~111px of drift before the fix in
+  that same scenario. The primary case — content removed above or below the viewport while the
+  anchored child survives — is pixel-exact.
+
+  ⚠️ **A third failure mode, orthogonal to `isIntentfulScroll`'s two impostors (#579):** `restore()`
+  writes `scrollTop` directly, and nothing stopped it firing while the PLAYER'S OWN FINGER was mid-
+  drag on the same box — a content-size change (a row mounting/unmounting under `syncStoreChrome`,
+  say) racing a live touch gesture reads as "I scrolled down and it snapped back on release", a
+  genuine competition over the same `scrollTop` rather than a resize bug. The hook now tracks a
+  live `pointerdown`→`pointerup`/`pointercancel` gesture (`window`-level release listeners, a
+  same-shape-as-`scheduleResync` safety timeout in case neither fires) and DEFERS any pending
+  restore until the gesture ends, rather than fighting it. See `scrollAnchor.ts`'s header comment.
+
+  ⚠️ **A fourth, UNRELATED mechanism that read identically on old hardware — now RESOLVED, not
+  merely mitigated (#579 → #612):** none of the above actually explained a freeze measured live
+  on an iPhone 8 (iOS 16.7.16) — `touchmove` kept firing the whole gesture; only the resulting
+  scroll position stopped updating. Root cause was `runtime/ui/safeArea.ts`'s
+  `getSafeAreaInsets()`: past its own 250ms cache throttle it re-measured by appending a hidden
+  probe and reading `getComputedStyle()` on it — a forced synchronous layout by construction,
+  REGARDLESS of when in the frame it ran (confirmed: deferring the call to
+  `requestAnimationFrame`, the fix that class of problem usually takes, only reduced the damage
+  here — inserting a fresh element and immediately querying it forces a layout for that element
+  no matter the timing). Court called it from six per-frame chrome-sync functions that this
+  codebase deliberately never gates on a dirty flag, so the forced reflow fired continuously —
+  including with a modal or the menu covering the board entirely, where none of it was visible.
+  Cheap enough to be invisible on modern hardware; enough to desync WebKit's native touch-scroll
+  compositor on the iPhone 8.
+
+  **The #612 rewrite fixed the mechanism itself, so there is no call-site gate left to
+  describe.** `safeArea.ts` no longer forces a layout at all — `getSafeAreaInsets()` is a plain
+  field read (see "Game code reads the insets through `getSafeAreaInsets()`" below) — so Court's
+  gesture-gated wrapper (`boardSafeAreaInsets()`, which used to skip the call while a touch
+  gesture was live anywhere on the page) has been deleted, and all six chrome-sync call sites now
+  call the engine function directly. The `#579` history above is kept because it is why this
+  file's scroll-anchoring code looks the way it does; the bug itself is resolved at its source,
+  not routed around.
+
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
   gaps do not has a viewport size below which an item silently reflows onto the next row — the
@@ -68,6 +128,37 @@ Field groups (representative fields, verified against `UIElement.ts`):
   is wrong with the data: Court's 5x5 attack reference (five 5vh cells, four 4px gaps, a 29.6vh
   row) needed 98.95px of a 98.26px row on a short window and drew 4-wide by 7 rows deep. Mixed
   units are only safe where the row COUNT carries no meaning.
+
+  ⚠️ **`min*`/`max*` default to `px` while `width`/`height` default to `%` — and until #549 you
+  could not SEE which.** `minWidth`/`maxWidth`/`minHeight`/`maxHeight` default their unit to
+  `'px'`; `width`/`height` (and every `padding*`/`margin*`) default theirs to `'%'`. So authoring
+  `width: 5.4` beside `maxWidth: 3.5` — the obvious reading being "5.4% wide, never more than
+  3.5% wide" — clamps to 3.5 **pixels**. Nothing errors and the element silently collapses;
+  Court's `RulesClose` shipped that way and drew its label entirely outside itself (#529).
+
+  The defaults are deliberately NOT aligned: of the 50 authored `min*`/`max*` values in the repo
+  that rely on the px default, ~47 are genuinely pixels (`maxWidth: 460`, the `minWidth: 44` tap
+  targets), so flipping them would break the many to rescue the few — and would break scenes
+  authored outside this repo. What was actually broken is that the four `*Unit` companions were
+  read by the renderer (`UINode.tsx`, `canvas2DLayout.ts`) but registered in **no trait metadata**,
+  so the Inspector never showed them and no author could change one; the value fields' tooltips
+  meanwhile asserted "(px)", false at the 114 sites using `vh`/`%`/`vmin`. #549 registered them and
+  added them to `UNIT_FIELD_MAPS`, so they now render inline with their value like every other
+  length. **Every non-px value in the repo predating that was set by an agent or by hand-editing
+  JSON** — a good illustration of the CLAUDE.md rule that a field the renderer reads and the author
+  cannot reach is worse than no field at all.
+
+  A dev-only warning (`runtime/ui/lengthUnitWarning.ts`) now flags an axis sized in a relative unit
+  whose own `min*`/`max*` is left in px at a value `<= 20`. ⚠️ It lives in **`uiTreeStore`'s
+  tree-build pass, not in `UINode`'s render**, and must stay there: `UINodeInner` early-returns on
+  `!node.isVisible` before recursing into children, so a render-time check cannot see inside a
+  closed dialog — which is exactly where the two entities that motivated this warning (Court's
+  `RulesClose`/`RulesLine4`, both inside the How-to-Play dialog) sat unnoticed until #529 reached a
+  device. `tests/runtime/uiTreeLengthUnitWarning.test.ts` pins that by spawning a suspect under a
+  hidden parent. **Both of those entities were fixed on `main` by #529** (which removed their
+  size fields entirely), so a fresh sweep of the corpus now finds **zero live positives** — this
+  warning ships as a **preventative guard for the next one**, not as an active catch.
+
 
   ⚠️ **`fontSize` carries a unit too, since #245 — and it did NOT until then.** It was unitless px
   while every other length had a unit, so an element whose HEIGHT comes from its text could not
@@ -97,12 +188,279 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `textOpacity` (folded into the `textColor` picker), `textAlign`, `lineHeight`,
   `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
-  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`),
-  `maxLines`.
+  (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis` — honoured
+  both when `maxLines > 0` (the clamp wrapper below) and on a SINGLE-LINE element (`maxLines: 0`):
+  `text-overflow` does not apply to the flex container the host always is, so the same wrapper the
+  clamp uses is mounted for a single-line `ellipsis` too, carrying `overflow`/`text-overflow`/
+  `white-space` instead of the host (#725)) — **but NOT unconditionally: it stays inert on a
+  single-line element that also carries `autoFitText` or a `textAnim`** (see the residual-gap
+  callout below) — `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
+
+  ⚠️ **`autoFitText` is SHRINK-ONLY (#614)** — off by default; when on, the effective font size is
+  reduced, never grown past the authored `fontSize`, until the text fits its box on one line, down
+  to `fontSizeMin`. Below that floor, `maxLines`/`textOverflow` take over exactly as they would
+  with the field off — auto-fit is the shrink-FIRST step, not a replacement for them. `fontSizeMin`
+  is authored in `fontSizeUnit` — the SAME unit as `fontSize`, deliberately with no separate unit
+  field of its own (same reasoning as `letterSpacingUnit` above: a floor in a different unit than
+  the size it bounds can't be compared without a second layout read). `0` means "no explicit
+  floor" — the effective floor is half the authored `fontSize`. It does nothing on
+  `elementType: 'input'` (player-entered text, not an authored label — see `UIElement.ts`). Fit
+  math: `runtime/ui/autoFitText.ts`; DOM measurement: `UINode.tsx`'s `AutoFitText`.
+
+  ⚠️ **The clamp lives on an INNER WRAPPER, never on the entity div (#655).** It used to be set
+  on the host, and `-webkit-box` is not a flex container — so `justifyContent`, `alignItems`,
+  `flexDirection` and `gap` authored on that same entity silently stopped working, while
+  `getComputedStyle` went on reporting them (`center`). That is the "unwired field is a lie with
+  a tooltip" class, and #646 is what took it from theoretical to reachable by making the clamp
+  actually engage. `UINode.tsx` now builds a `clampStyle` and mounts a wrapper `<div>` around the
+  text — **only when `maxLines > 0`, or when `maxLines === 0` and `textOverflow === 'ellipsis'`
+  (#725)** — so every other text node keeps byte-identical DOM. The wrapper carries `UI_PAINT_ATTR`:
+  `isPaintOpaque` (`editor/panels/uiPreviewPick.ts`) credits an entity with paint via a DIRECT
+  text-node child, and without the marker a clamped label would read as decorative and a SceneView
+  click would fall through it.
+
+  ⚠️ **The single-line `ellipsis` wrapper must STRETCH to fill the host, not shrink-wrap (#727
+  fixup).** A flex item stops stretching the moment either cross-axis margin is `auto` (CSS
+  Flexbox §8.3), so a `shrinkWrapAlign(node.textAlign)` spread on this wrapper — which returns
+  exactly such a margin for `center`/`right` — disables the very stretch the ellipsis needs, and
+  the wrapper falls back to fit-content: for `white-space: nowrap` text that is the WHOLE line,
+  spilling past the host uncropped (`overflow: hidden` lives on the wrapper, not the host).
+  Measured live (120px host, 24px text, `textAlign: 'center'`): 345.1px wide, no ellipsis, 225px of
+  overflow. `text-align` still inherits onto a stretched block, so alignment survives dropping the
+  spread; `maxWidth: '100%'` additionally caps the wrapper against a host authoring a non-stretch
+  `alignItems`. The `maxLines > 0` clamp wrapper above keeps `shrinkWrapAlign` — it WRAPS, so its
+  fit-content collapses to the available width and the auto margin is harmless there; this is a
+  `nowrap`-only difference, not an inconsistency to "fix" by symmetry.
+
+  ⚠️ **The NO-WRAPPER path — the common case, no `maxLines`/`ellipsis`/`autoFitText`/`textAnim` —
+  gets the same `shrinkWrapAlign` treatment as the wrapper paths above (#742).** `style.textAlign`
+  is written onto the HOST, whose `display: 'flex'` is forced unconditionally; with no wrapper, the
+  text content is a bare string, i.e. an anonymous flex item. `align-items` other than the default
+  `stretch` (or a `row` host, where the text sits on the MAIN axis instead) shrink-wraps that box to
+  its content, and a shrink-wrapped box has no leftover inline space for `text-align` to work with
+  — the same mechanism #657 fixed for `AnimatedText`, one element over. `UINode.tsx` now mounts the
+  same `clampStyle`/wrapper-`<div>` machinery for this case too, carrying `shrinkWrapAlign
+  (node.textAlign)`, but ONLY when: `textAlign` is `'center'`/`'right'` (`shrinkWrapAlign('left')`
+  is `{}`, so a wrapper would be pure DOM churn); the box actually shrink-wraps
+  (`alignItems !== 'stretch'` or `flexDirection === 'row'`); and the text is a genuine bare string
+  (`!autoFitText` and no resolved `textAnim` — both mount their own span with their own handling).
+  Safe to reuse `shrinkWrapAlign` here despite the #725→#727 stretch-disabling trap above precisely
+  *because* of the shrink-wrap condition: this branch only ever fires when the box is already not
+  being stretched, so disabling `stretch` is a no-op. Measured blast radius (Court + Wordweave):
+  82 entities meet the conditions, and every one of them ALSO authors `alignItems: 'center'` with
+  `textAlign: 'center'` — a degenerate combination where `align-items: center` already centres the
+  shrink-wrapped box exactly where `text-align: center` would put the glyphs, so this is a
+  zero-pixel change in both shipping games today; other games' alignment is left as-is until a
+  problem is actually seen there.
+
+  ⚠️ **Two residual gaps #742 does NOT close, left deliberately:**
+  - **The parent-shrink-wrap case.** An entity whose OWN `alignItems` is `stretch` (so its text box
+    stretches to fill its own div) but whose DIV is itself a content-sized flex item of ITS parent
+    (e.g. a `flexDirection: 'row'` parent holding several text children) hits the identical
+    "no leftover inline space" problem one level up — not decidable from the node's own fields, so
+    this fix cannot reach it.
+  - **`textAlign: 'left'` under a centring `alignItems`** still renders centred (`shrinkWrapAlign`
+    returns `{}` for `'left'`, so the wrapper doesn't help without a `marginRight: 'auto'` arm).
+    Left alone on purpose: `'left'` is the trait default, and a scene save strips an authored field
+    equal to its default (see the memory-index scar on this), so an authored `'left'` is
+    indistinguishable in the JSON from "never touched the field" — adding the arm would silently
+    change nodes nobody explicitly configured.
+
+  ⚠️ **`minWidth: 0` on the single-line `clampStyle` was believed load-bearing and was a no-op
+  (#727 review).** `clampStyle` always carries `overflow: hidden`, which makes the wrapper a SCROLL
+  CONTAINER — and a scroll container's automatic minimum size is already 0 (CSS Flexbox §4.5), so
+  `min-width: auto` never entered the picture. Measured both ways in a row host: wrapper 120,
+  scrollWidth 345, ellipsizes — identical. Removed; the shrink is entirely explained by the
+  scroll-container minimum.
+
+  ⚠️ **Known residual gap, not fixed:** single-line `ellipsis` stays inert when the node also
+  carries `autoFitText` or a `textAnim`. Either wraps the text in a span authored `display: block;
+  white-space: pre-wrap` (`AutoFitText`/`AnimatedText`), and that inner `pre-wrap` overrides this
+  wrapper's `nowrap` — `text-overflow` only ellipsizes inline content laid out directly in the
+  block container, not a nested block's overflow. Measured: a bare string ellipsizes at 28px (one
+  line); the same text through either wrapper renders 84px (three wrapped lines, no ellipsis).
+  Confirmed not a regression of #725/#727 — it measured 84px before either change too.
+
+  ⚠️ **`textOverflow: 'clip'` — the field's DEFAULT — is honoured by a HEIGHT CAP, not by
+  line-clamp (#656).** `-webkit-line-clamp` paints its own ellipsis unconditionally and never
+  consults `text-overflow`, so `clip` was unhonourable: an author who chose it, or who never
+  touched the field, got an ellipsis they could not turn off (`demos/postfx-demo`'s Caption is a
+  live instance — ⚠️ its `text` is written at RUNTIME by `renderCaption()` in that demo's
+  `setup.ts`, NOT authored in the scene, so a stopped editor shows nothing and the scene JSON
+  alone makes the claim look wrong). The clip path therefore uses `display: block` + `overflow: hidden` +
+  `max-height`. `textOverflow: 'ellipsis'` still takes the `-webkit-box` path, on the wrapper.
+
+  ⚠️ **A HEIGHT CAP ON THE WRAPPER IS NOT EQUIVALENT TO COUNTING LINES**, because `lh`/`em` resolve
+  against the WRAPPER's font size while `AutoFitText` writes a SHRUNK `font-size` onto its own
+  inner span, one level down. Measured: host 42px, span floored at 16px, `max-height: 1lh` on the
+  WRAPPER = 48px against an 18px line box, i.e. **2.67 lines where 1 was authored**. The fix (#727)
+  is not a different cap on the same element — it moves the cap to the element whose font size
+  actually determines the line box: `AutoFitText` takes an optional `clampLines` prop and puts
+  `max-height: ${clampLines}lh` + `overflow: hidden` on its OWN span, where `lh` resolves against
+  whatever `fit()` actually wrote there, tracking a shrink exactly instead of over- or
+  under-capping. No explicit `line-height` is set anywhere to make this work — `line-height`
+  inherits, so authoring one would change the shrunk text's line spacing, a visual change nobody
+  asked for. So:
+
+  | authored | mechanism | why it is correct |
+  |---|---|---|
+  | `lineHeight` set | `lineHeight × maxLines` px, on the wrapper | a px `line-height` INHERITS as a fixed value, so the span's line boxes stay that tall whatever the font does |
+  | no `lineHeight`, no `autoFitText` | `${maxLines}lh`, on the wrapper | nothing below changes the font, so `lh` is exact |
+  | no `lineHeight` + `autoFitText` | `${maxLines}lh`, on `AutoFitText`'s own span (`clampLines` prop) | `lh` there resolves against the size `fit()` actually wrote — exact whatever the shrink lands on, and `clip` is honoured instead of falling back to an unwanted ellipsis (#727) — **but #727 traded away the `-webkit-line-clamp` fallback this row used to fall back to: pre-#727 it silently accepted the unwanted ellipsis on a browser too old for `lh`, which worked everywhere WebKit/Blink ships; post-#727 there is no fallback at all, so the `lh`/Safari-16.4 caveat below now covers TWO of these three rows, not one |
+
+  ⚠️ `lh` needs Safari 16.4, *exactly* this repo's iOS floor — and note **Android WebView's version
+  is independent of the OS floor**, so an in-support Android device on a stale WebView can miss it.
+  Below it the declaration is dropped and the text renders unclamped: more text than asked for,
+  never a sliver. `-webkit-line-clamp`, which this replaced for the default, goes back to Chrome 6.
+
+  ⚠️ `maxLines: 1` + `clip` + `autoFitText` + a vertical `textAnim` (bounce/wave/jitter) has less
+  travel room than before #727: the old `-webkit-line-clamp` box was one line box at the AUTHORED
+  size (~48px) around shrunk content (~18px), leaving ~30px of slack the animation's translate
+  lived in; the exact `${clampLines}lh` cap on the shrunk span removes that slack, so the animation
+  is now clipped by `overflow: hidden` at the shrunk size — the same cost the non-autoFit `lh` row
+  already pays.
+
+  ⚠️ **`maxLines` clamps LINE BOXES only — a `display: inline-block` text child defeats it
+  (#646).** The wrapper's `-webkit-box` is Chromium's legacy clamp mechanism, which only splits
+  BLOCK-level descendant content into lines. A plain text child works; a wrapper `<span>` around
+  the text (`AutoFitText`, `AnimatedText`) does not if it is `inline-block` — the clamp treats it
+  as one atomic inline-level box (like an image) and does nothing, leaving `overflow: hidden` on
+  a box whose height has collapsed (a ~12px sliver, or the full unclamped height without an
+  accompanying flex-shrink squeeze). Both wrapper spans are `display: 'block'` for exactly this
+  reason — verified this does not reopen #614's flex-stretch measurement bug: under this
+  entity's normal `display: flex` (no `maxLines`), a flex item's `inline-block` is *blockified*
+  to `block` regardless of what is authored, so `block` and `inline-block` compute identically
+  there. Two non-flex contexts escape that blockification, not one, and both need the authored
+  value to already be `block`: the `-webkit-box` WRAPPER (exactly the `maxLines` case), and
+  `AutoFitText`'s own span — itself `display: 'block'`, never flex — whenever it wraps
+  `AnimatedText` (both `autoFitText` and a `TextAnimation` authored on the same node). That
+  nesting makes the animation span a child of a plain block box instead of a flex item,
+  independently of whether `maxLines` is even set.
+
+  ⚠️ **The fit converges by RE-MEASUREMENT, never by the model (#614 follow-up).** The first
+  estimate (`authoredPx * availablePx / naturalPx`) is exact only when width passes through the
+  origin — real text is affine: `games/text_demo`'s "UI TEXT ANIMATION" (42px, `letterSpacing:
+  3px`) measured `width = 9.344 * fs + 54.46`, an intercept from the px `letterSpacing` (17 x 3px)
+  that does not scale with the font. The estimate predicted 30.03px would fit a 319.59px box;
+  30.03px actually measures 336.06px. `refineFontSizePx` re-measures and refines from there
+  (bounded by `MAX_FIT_PASSES`), and the fit/no-fit verdict comes from the final MEASURED width,
+  never the model's prediction. Any size-independent term — px letter/word-spacing, a text stroke,
+  a px-padded inline child — creates that intercept; with none, the proportional model is exact,
+  which is why it's right on every simple fixture and wrong on a real screen.
+
+  ⚠️ **The invariant that makes a bad measurement safe.** Auto-fit may only change the rendering
+  while ACTIVELY shrinking — it reduced the font AND the reduced size measured back as fitting.
+  Every other outcome (already fits, an unmeasurable reading, or floored short of a fit) renders
+  identically to `autoFitText: false`, so a wrong measurement can only fail to shrink — never leave
+  a box worse than the feature being off. Concretely: an earlier version held `white-space: nowrap`
+  unconditionally, and on a content-sized parent that turned a correct 2-line wrap (229px) into one
+  non-wrapping line 199px outside its 200px parent.
+
+  ⚠️ **Why the DOM measurement is shaped the way it is.** `UIElement` authors
+  `flexDirection`/`alignItems` on every node, so the measuring span is a flex ITEM: `inline-block`
+  is blockified to `block` and `align-items: stretch` sizes it to the container, so a plain
+  `getBoundingClientRect()` reads the AVAILABLE width, not the natural one (measured 319.59px vs a
+  real 446.93px) — fixed with a temporary `width: max-content` scaffold that overrides the stretch,
+  cleared before paint. And `availablePx` must be captured BEFORE that scaffold: `UIElement.width`
+  defaults to `0` (auto), so a content-sized parent is the default case, and the scaffold inflates
+  the PARENT too — read after it, `availablePx` converges on `naturalPx` and the fit concludes "it
+  fits" every time. Same contaminated-measurement bug, one level up.
+
+  ⚠️ **Cost: a re-fit is a synchronous layout read, and a BOUND label re-fits every time its text
+  changes.** `text` is resolved through `resolveTemplate` (`UINode.tsx`), so a label with a
+  `textBinding` onto a per-frame store field (a score, a timer, an fps readout) produces a new
+  string every frame and re-fits every frame — 2 reads when it already fits, up to
+  `MAX_FIT_PASSES + 1` when it shrinks. That is CORRECT (its width really did change) but it is
+  not free, and it is the one case where `autoFitText` costs something a static label never pays.
+  Prefer it for the case it was built for: a fixed string that overflows at some viewport or
+  locale. For a fast-changing bound readout, author a `fontSize` that fits the widest value
+  instead.
+
+  Testing: jsdom reports every rect as 0x0, so the decision function is unit-tested
+  (`engine/packages/modoki/tests/ui/autoFitText.test.ts`) while the DOM behaviour is pinned by an
+  e2e (`engine/tests/e2e/editor-ui-autofit.spec.ts`) whose fixture deliberately carries a px
+  `letterSpacing` — without that intercept the proportional model is exact and the spec cannot
+  fail. Mounting `UINode` in jsdom to assert this would assert the mock.
+  ⚠️ **The DOM collapses runs of whitespace, and every instrument that would normally catch a
+  content bug agrees with the collapsed version.** Two, three or twenty consecutive spaces in
+  `text` render as ONE — this is default CSS (`white-space: normal`), not a `UINode` bug — so it is
+  invisible to `element.textContent` (already collapsed by the time you read it back), invisible to
+  the AUTHORED trait value (`text` still holds the extra spaces; nothing strips them there), and
+  invisible to a string-EQUALITY test comparing two authored strings that both got mangled the same
+  way. **If spacing between two pieces of text is meant to be visible, it must be LAYOUT — a flex
+  `gap` between two separate elements or a fixed-width spacer — never extra space characters inside
+  one `text` string.** This bites hardest when porting a string from a canvas-rendered origin (a
+  PixiJS/2D `Text2D`, which does NOT collapse whitespace — every space character it is given draws):
+  the ported copy can carry a multi-space run that read correctly on the 2D layer and silently loses
+  its spacing the moment the same string becomes a DOM `text` field. Sweep a ported string for
+  multi-space runs before trusting it, or replace the gap with layout at the same time.
+  ⚠️ **The same collapse eats authored NEWLINES, and that half is easier to miss** (#676). `\n` is
+  whitespace to `white-space: normal` exactly as a space run is, so a four-line credits block
+  authored as one `text` renders as one run-on paragraph. It hid longer than the space-run case
+  because the damage is not "slightly tighter" but "the line structure is gone", which reads as a
+  layout bug rather than a string bug and sends the reader to the wrong file. Three entities
+  carried it — `audio-demo`'s `CreditsBody`, `alien-animal`'s `Credits Body`, `ota-test`'s `Title`
+  — all now split into sibling text elements in a column with an authored `gap`.
+  ⚠️ **Whitespace preservation here is an accident of an unrelated feature flag, and that is worth
+  knowing before you "fix" it the easy way.** `AnimatedText`'s typewriter span and `AutoFitText`'s
+  span both set `white-space: pre-wrap`; every other path — the plain text path (#742's no-wrapper
+  branch) AND the `maxLines`-clamp span (it caps height only — `overflow`/`-webkit-box`/`maxHeight`
+  — and sets no `white-space` of its own) — sets nothing. So the SAME string renders differently
+  depending on whether autofit or the `TextAnimation` trait happens to be on, and a positive
+  `maxLines` does NOT buy that escape. Making the plain path `pre-wrap` to match was considered and
+  **declined** (owner, 2026-09-07): it would also un-collapse every accepted space-run site,
+  including `games/court`'s shipping How-to-Play rules lines, so a credits fix would silently
+  restyle a shipping game. The standing direction stays "spacing is layout", not "preserve the
+  whitespace".
+  **Where each half is enforced, and why they differ:** newlines are checked by
+  `collapsedNewlineWarnings` in `sceneValidation.ts`, which runs on a dev hot-reload and through
+  `/api/validate-scene` / `modoki_validate_scene` — never on a production runtime load — and they
+  have no accepted instances, so they can afford to be loud. Space runs are checked only by the
+  corpus guard (`engine/tests/assets/uiAuthoredValues.test.ts`) against a written exemption ledger,
+  because twelve accepted sites warning on every dev hot-reload or validate call against a shipping
+  game is how a check gets muted and takes the useful half down with it. The newline arm
+  deliberately skips any entity on a genuine `pre-wrap` path (`autoFitText`, or the `TextAnimation`
+  trait), where authoring a newline is correct — a false positive on legitimate multi-line text
+  costs more than a miss.
+
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
   `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`).
+
+⚠️ **`text` and most text STYLING do nothing on four of these shapes, and DEV now says so (#745).**
+Two holes, same class as everything else on this page — the Inspector shows every field and
+nothing errors:
+
+1. **`text` itself is dropped** on `Canvas2D`, `UIToggle`, `input` and `range` nodes: the Canvas2D
+   return renders the nine-slice/video/canvas/children layers and never `textContent`, the toggle
+   return draws only track + knob, and a form control takes its value from `inputBinding`. But the
+   STYLING built for that text — `fontSize`, `color`, `textAlign`, and since #725 the clamp
+   wrapper — still lands on the box, so devtools and the Inspector show a fully-styled text element
+   that paints nothing.
+2. **The text-style group is dropped on `input`/`range`** even with no text: the whole style block
+   is gated on `UIElement.text`. Silently lost on both: `textAlign`, `lineHeight`, `letterSpacing`,
+   `fontStyle`, `textShadow*`, `textStroke*`, `textOverflow`, `maxLines`.
+   ⚠️ **The two controls do NOT drop the same set.** The `input` branch re-emits `fontSize`,
+   `fontWeight` and `color`; the `range` branch re-emits none of those three — its only style write
+   is `accentColor` from `textColor` — so a slider additionally drops them, plus `textOpacity` (the
+   colour survives as an OPAQUE accent, so the colour is honoured and its alpha is not). The DEV
+   warning is per element type for exactly this reason: naming `fontSize` as honoured on a range
+   would point an author away from the real cause of their missing font size.
+   ⚠️ **`fontFamily` is in neither dropped set**, and an earlier version of this paragraph said it
+   was. It is emitted unconditionally near the top of `UINode`, far above the branch split — so a
+   container can set the typeface for its subtree — and therefore reaches a `range` like any other
+   node. A second trap in the same place: `uiTreeStore` normalises `fontSize: ui.fontSize || 16`,
+   so that field is never falsy by the time the check runs, and "did the author set this?" must be
+   a comparison against the default rather than a truthiness test. Both halves are pinned by RENDER
+   tests that assert the real DOM against the reported list, because the pure-helper tests that
+   preceded them only ever asserted the author's model of the branch.
+
+These stay **unwired on purpose** — a form control's text rendering is the platform's, not ours —
+so the fix is a DEV warning naming what you authored and will not get, in the same family as the
+three `UINode` already carried for the neighbouring mistakes (canvas2D + `elementType`, toggle +
+canvas2D/children, video + `elementType`). ⚠️ **The combination with no warning was the one where
+the field vanished silently**, which is why it was the one worth fixing first.
 
 Colors are stored as packed hex integers (e.g. `0xffffff`) and converted to CSS at
 render time. Numeric+unit pairs are converted by `UINode`'s `cssVal()` helper, which
@@ -118,7 +476,8 @@ subtree reports the scaled number. Consequences, both measured on 2026-08-20:
 
 - A **ratio** of two measured values is safe: the scale cancels. That is why the game-side
   helpers that must survive this emit **percentages** (see `games/court/runtime/sceneChrome.ts`,
-  whose patchers refuse px for exactly this reason).
+  whose position/size patchers refuse px for exactly this reason — those stayed game-side when the
+  generic core moved to the engine; see § "Pushing live values onto scene-authored chrome" below).
 - A **length** derived from a measured rect and then handed back as a style value is scaled
   twice. Court computed HUD font sizes that way and got `41.6px` where `22.8px` was intended —
   1.83x, the preview's own factor — which pushed the HUD through the board on nine of twelve
@@ -179,6 +538,35 @@ number straight into a field with zero game code.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
+⚠️ **A click only fires a node's bindings when the PRESS that produced it also started on that
+node** (`pressOrigin.ts`, #664). A DOM `click` fires on the nearest common ancestor of the
+`pointerdown` and `pointerup` targets, so a drag whose two ends straddle a panel's edge resolves to
+an ANCESTOR of that panel — which is how a horizontal swipe to page wordweave's dictionary was
+dismissing it, by landing on the scrim that owns the close binding. `pressBelongsTo` gates the
+runtime click branch on both ends mapping back to the same node, using
+`closest('[data-press-origin]')`. ⚠️ **Per-control `stopPropagation` cannot cover this** — the
+technique the `range` and text-input branches use works only while the release stays ON the
+control, because then that control's own handler is the one that runs. When the release leaves,
+no descendant handler is invoked at all and there is nothing to stop the bubble from. ⚠️ The gate
+**fails OPEN** when no pointer pair was recorded, so a programmatic or assistive-technology
+activation is never suppressed; controller/keyboard activation does not reach it either way,
+because `focusManager` calls `applyBindings` directly rather than through a DOM click.
+⚠️ **It protects a panel only where that panel is ALREADY interactive.** The marker goes on nodes
+with a click binding **or `UIElement.swallowClicks`** (#728), so a panel carrying neither is
+transparent to `closest()` and the press resolves past it to the dismissing scrim. Authoring a
+swallow — either way — is what OPTS a panel in. ⚠️ **Which panels are covered is a property, not a
+roster**: it is whatever carries a binding or `swallowClicks` right now, and a grep for
+`swallowClicks` across the scenes answers it — an enumeration here went stale the same day #728
+landed. Court's dialog bodies were the known uncovered group and are covered as of 2026-09-05
+(#729); wordweave's `HelpPanel` and `ResultPanel` were the last holdouts — each sat under a
+scrim that dismissed on click and carried neither a binding nor `swallowClicks`, while
+`DictionaryPanel` beside them already did — and both now author `swallowClicks: true` too
+(#741). Do not read this
+paragraph as a roster in either direction: it names where the question was last ASKED, and the grep
+is what answers it. Stamping
+the marker on `overflow: 'scroll'` nodes would generalise it, at the cost of changing what a tap on
+empty list space does — a feel call, not a refactor.
+
 #### Engine built-in `UIAction`s
 
 Four stateless lifecycle/animator handlers are registered once at startup by
@@ -202,6 +590,102 @@ Four stateless lifecycle/animator handlers are registered once at startup by
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
 [Managers & Systems](./managers-and-systems.md)).
+
+#### Global input lock (#466)
+
+`applyBindings` guards every **discrete activation** (`click`, `submit`, a `UIToggle`'s
+`change`) with a single **global** lock: while one is being handled, EVERY other discrete
+activation anywhere in the UI is swallowed whole — before the click cue, so a blocked
+second tap makes no sound. Not per-button: a fast tap on a different button is also
+swallowed, by design.
+
+The click cue is gated on the **same** discrete/continuous predicate as the lock, not on
+the event name (#528) — it used to test `event === 'click'`, which silenced every
+`UIToggle` (a toggle activates through `'change'`, not `'click'`) while the lock correctly
+treated it as a press: two mechanisms meant to agree, disagreeing. **`submit` (Enter in a
+text field) is discrete and still takes the input lock like any other discrete
+activation, but is deliberately exempt from the cue** (owner, 2026-09-01) — Enter follows
+typing, where a tap sound reads as a keyboard click rather than a button press. Don't
+"unify" this away as an inconsistency; it's a deliberate exception, not a bug.
+
+The real gate is the action **completing** — every promise a `kind:'call'` binding's
+handler returns is awaited before the lock releases — not a timer; `UISettings`'s
+`inputLockMinMs` (default 300ms) is only a floor under that, for a synchronous handler
+that settles instantly. `0` disables the floor entirely (action-completion only), the
+escape hatch for a rapid-fire button. A safety valve, `inputLockMaxMs` (default 10000ms),
+force-releases a lock that outlives it and `console.warn`s the still-pending action(s), so
+a hung async handler can't brick the UI permanently.
+
+**The completion gate is a silent opt-in, and that is arguably why #530 went unnoticed.**
+It works by duck-typing a `call` handler's return value (`trackLockPromise`) — only a
+thenable holds the lock open. A game whose handlers are synchronous wrappers (Court's
+`registerUIAction(name, () => fireTap(target))`, returning `void`) gets nothing from it:
+no error, no warning, no failing test — the lock just falls back to the `inputLockMinMs`
+floor as if the handler had always been instant.
+
+**A third gate (#530): a registered busy predicate.** `registerUIBusySource(name, isBusy)`
+(`runtime/core/uiBusySources.ts`, re-exported from the runtime barrel) lets a game tell the
+lock that some asynchronous state it owns should keep input blocked, without rewriting its
+handlers to return promises. It is a predicate the engine ASKS — polled every FRAME since #551
+(`pollUIBusyContinuity`, not just at a discrete activation) — not a `begin`/`end` pair the game
+TELLS — a push/pop scope leaks if the operation throws between
+the two calls, and Court's `beginSignIn` is a bare fire-and-forget async IIFE with no
+`finally`, so a throw between `begin` and `end` would have bricked every button in the game
+until its own 60s watchdog finally fired. `isInputLockActive` consults this gate first, even
+when no lock is currently held — the busy period can start outside any UI activation at all
+(a sign-in flow kicked off from a menu button, not a chrome tap).
+
+**It carries its own safety valve, mirroring `inputLockMaxMs`**, because a predicate stuck
+true would otherwise brick input forever — the exact failure the lock's own valve exists to
+prevent. A throwing predicate degrades to "not busy" and logs once per THROW STREAK (deduped via
+`erroredSinceRecovery`, cleared the moment the predicate stops throwing) rather than once per
+call — since #551 the predicate is polled every frame, so an un-deduped log would flood at ~60Hz
+instead of firing once; a bad game-side read still can't starve input either.
+
+**Both knobs are read fresh from `UISettings` on every discrete activation, never cached
+(#543).** They used to be snapshotted into module-level `lockMinMs`/`lockMaxMs` by
+`acquireLock()` — but the busy gate above is consulted BEFORE the acquire, and when it
+blocks, `applyBindings` returns early so `acquireLock()` is never reached. A busy episode
+beginning before the session's first unblocked activation therefore ran the valve on the
+module DEFAULT for its whole duration, with no path to learn the authored value while it
+kept blocking; the first episode after a world swap ran on the OUTGOING scene's value.
+`readLockWindow(world)` is now the single place either knob is read and clamped, so there
+is no cached copy for a swap or a first activation to leave stale.
+
+**The valve measures OBSERVED busy time, and continuity is now observed on a frame cadence, not
+inferred between discrete activations (#551).** `pollUIBusyContinuity()`
+(`runtime/core/uiBusySources.ts`) runs every frame as a system registered at `SYSTEM_PRIORITY.GAME`
+(`app/ecs/pipeline.ts`), and accumulates the delta between adjacent polls whenever the busy set is
+non-empty. `isInputLockActive()` in `bindings.ts` no longer tracks any of this itself — it just
+reads the accumulated total (`getBusyAccumulatedMs()`) and compares it to `lockWindow.maxMs`. This
+replaced an earlier version that could only sample the busy predicates at a discrete UI
+activation, so it had to INFER continuity between samples via a tuned gap threshold
+(`BUSY_OBSERVATION_GAP_MS`) — ambiguous by construction, because one tap N seconds after the last
+was indistinguishable between "still stalled" and "an unrelated new episode". Polling every frame
+removes that ambiguity: two polls are (almost always) genuinely adjacent frames, so the delta
+between them is a decidable fact, not a guess.
+
+⚠️ **The pipeline does not always tick, though, so the poll-to-poll delta still needs a clamp.** A
+gap between two polls can exceed a normal frame (editor Pause, a backgrounded tab where rAF halts,
+a long synchronous stall like a scene load or shader compile) with nothing observed across it.
+`MAX_POLL_GAP_MS` (250ms, `uiBusySources.ts`, mirroring `timeSystem.ts`'s `MAX_DELTA` clamp for
+the same class of problem) treats a gap larger than that as unwatched: the accumulator resets to a
+fresh episode instead of crediting the full gap, so a real in-flight operation surviving a pause
+doesn't get force-released on the very next poll after resume — the #530 regression this clamp
+exists to prevent.
+
+A **continuous** event stream passes `continuous: true` to `applyBindings` and is exempt both
+ways: it neither takes nor respects the lock. Two streams qualify, not one: a range slider's
+`change` (fires on every pixel of drag — locking it would freeze the slider mid-drag) and a
+controlled text input's `change` (fires once per KEYSTROKE — locking it would DROP characters,
+since the binding write is what produces the field's value, so a swallowed keystroke is lost,
+not merely delayed). The Enter/`submit` handler and a `UIToggle`'s `change` stay discrete.
+
+⚠️ A `call` handler must not synchronously trigger a second **discrete** activation (e.g. call
+`applyBindings` itself, or another path that re-enters it, for a different `click`/`submit`/toggle
+event) — the lock the outer activation just acquired is still held, so the re-entrant call is
+silently swallowed. No such caller exists in-tree today; this is a trap for game code to avoid,
+not a live defect.
 
 ### `UIToggle` — an on/off switch
 
@@ -235,6 +719,50 @@ The knob is positioned by flex (`justifyContent` flips between the two ends) and
 the track's own height via `aspectRatio`, so a switch works at any authored size with no
 measurement and no second render pass.
 
+⚠️ **At any authored size — and the UNAUTHORED one used to render nothing (#744).** `height: 100%`
+resolves against the containing block's height, and `UIElement.height` defaults to 0 (auto), so an
+unsized track was a flex container of indefinite height: the knob's height resolved to `auto` → 0,
+and `aspect-ratio` derived a zero WIDTH from it. An invisible knob, in the shape an author reaches
+first. The repo's only toggle (`games/court`, 56×32) escaped it by having authored a size, i.e. by
+chance — the working configurations were the accident and the default was the failure.
+
+The track now carries `minWidth`/`minHeight` fallbacks (44×24, the 1.75:1 capsule proportion of
+Court's toggle) and the knob a matching floor of its own. **`min-*` rather than `width`/`height`,
+and that is the load-bearing part**: a definite size would have overridden every shape sized from
+somewhere other than `UIElement.height`, and two of those work — an anchor-stretched toggle, and a
+toggle in a `flexDirection: 'row'` parent where `alignItems` defaults to `stretch` and a sibling
+label's line box makes the height definite (the ordinary settings-row shape). Measured in headless
+Chromium at `knobInset` 3: 26×26 authored / 27×27 row-stretched / 74×74 anchor-stretched are
+byte-identical before and after, with the default shape going 0×0 → 18×18. (At the trait's default
+`knobInset` of 2 that floor is 20×20 — arithmetic from `toggleKnobFloor`, not a separate
+measurement.)
+
+⚠️ **"A `min-*` can only raise a size" is necessary but NOT sufficient, and the first cut of this
+fix got that wrong.** A min can still raise a *definite* size that happens to be smaller than it —
+every shape measured above was simply larger than 44×24. So the fallback is additionally **skipped
+per-axis when something else already sizes that axis**: a definite CSS size (the authored case, and
+the pooled `UIEntries` row root that `entriesSystem` pins to `entryW`/`entryH` in px — where a min
+would silently reintroduce the border-box desync that pin exists to prevent, invisible to its own
+`warnAuthoredOverride`), or an anchor-stretched axis, via the shared `isSizeInert`. A `%` size does
+**not** count as definite — that is the indeterminate case the whole fix is about — and an authored
+px `maxWidth`/`maxHeight` **clamps** the floor rather than losing to it, since CSS resolves `min-*`
+above `max-*` — clamping by the SMALLER of the two effective floors, because the knob is square with
+`flexShrink: 0` and must fit the track's content box on both axes (a height-only clamp let an
+authored `maxWidth` spill the knob past its own capsule).
+
+The one residual, stated rather than papered over: a flex CROSS-axis stretch is not visible from
+the node data, so a settings row whose label is under 24px tall now gets a 24px toggle instead of a
+~14px one. That size was accidental rather than authored, and the measured realistic case (a 28px
+label → 33px line box) is unaffected.
+
+⚠️ **The knob needs its OWN floor — the track's `minHeight` cannot reach it**, because a percentage
+height resolves against the containing block's *computed* height and a `min-height` does not make
+an `auto` height computed. **`alignSelf: 'stretch'` instead of `height: '100%'` does NOT fix this
+and was measured failing**: it gives the knob the track's used cross size, so the height came out
+right at 18px and the width stayed **0** — a flex item's main size is resolved before cross-axis
+stretching, so `aspect-ratio` has no definite cross size to derive width from yet. Do not
+reintroduce it.
+
 ⚠️ **Keyboard support is the DOM's, not `UIFocusable`'s.** The track is focusable
 (`tabIndex`) and Space/Enter flip it. Routing a toggle through the controller-nav focus
 manager is a **follow-up**: that path activates by firing `click` bindings with no event
@@ -253,7 +781,8 @@ parent (`UIAnchor.ts`):
   the four corners (`top-left` … `bottom-right`), and the stretch variants
   (`top-stretch`, `h-stretch`, `v-stretch`, etc.).
 - `top`/`left`/`right`/`bottom` (+ units), `pivotX`/`pivotY` (0..1 pivot relative to the
-  element's own box), `zIndex`.
+  element's own box). Stacking order is `UIElement.zIndex` — `UIAnchor` carried its own copy
+  until v13 unified them (see § sortOrder).
 - `safeArea` — clear the notch / home indicator. **Defaults to TRUE** — an absent field
   in a scene JSON is ON, not off. It takes ONE OF TWO ARMS, decided by the anchor, and
   they are mutually exclusive by construction so nothing can be inset twice:
@@ -268,6 +797,26 @@ parent (`UIAnchor.ts`):
   - **`center` is a genuine no-op** — it reaches no edge. It is the only anchor for which
     the Inspector greys the checkbox out.
 
+  ⚠️ **The padding arm moves FLOW children — it does nothing for the element's own box, and
+  nothing for an absolutely-positioned (anchored) child either.** A stretched element's safe-area
+  padding pushes normal-flow children in off the edge, the same way any CSS padding does; it does
+  not move the element's own box, and a child that carries its own `UIAnchor` (root-only by
+  convention, but nothing stops one being authored deeper) resolves against the padding **box**,
+  not inside it, so the padding never reaches it either. Reading `safeArea: true` off the trait
+  therefore tells you nothing by itself — the question is what KIND of children the element has.
+  `games/wordweave`'s `AdBannerSlot` (`bottom-stretch`) is the worked negative: its only child
+  `AdBannerLabel` is POINT-anchored, so nothing about the slot was inset by anything, and it
+  shipped rendering UNDER the iOS home indicator — measured on an iPhone Air, the slot spanned
+  device y 829–912 against the indicator's own 878–912, while reading "safe-area aware" from the
+  trait alone. The fix was to author `safeArea: false` on the slot and LIFT its box at runtime
+  (`patchAnchorPct`), not to trust the padding. `games/wordweave`'s `BottomButtonRow` used to be the
+  worked CONTRAST here — `bottom-stretch` with its two buttons as FLOW children (no `UIAnchor` of
+  their own), so the same padding arm lifted them correctly with no runtime code at all. #666 renamed
+  it `GapButtonRow` and moved it into the split gap on a `top-stretch` anchor re-anchored every frame
+  by its own runtime code (`syncGapButtonRow`, `games/wordweave/runtime/systems.ts`), so it no longer
+  illustrates the no-runtime-code case — see that game's own `../games/wordweave/docs/feel.md` for
+  why it moved.
+
   ⚠️ **The anchor MODE is a proxy for "which edges this element reaches", and an authored
   or runtime-driven offset can falsify it.** An element anchored `top-stretch` but pushed
   to the bottom of the screen still takes a top inset — the inset is static CSS and cannot
@@ -276,6 +825,24 @@ parent (`UIAnchor.ts`):
 
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
+
+⚠️ **It is the trait's PRESENCE, not its values, that makes a child absolutely positioned** — a
+child with no `UIAnchor` at all flows in its parent; a child carrying a `UIAnchor` authored at every
+field's own default (`anchor: 'stretch'`, `top: 0`, `pivotX: 0`, …) is a DIFFERENT, absolutely
+positioned element that just happens to resolve to the same box. And a scene save **strips a trait
+field equal to its default** (the editor's own save path — a scene diff reads as data loss until you
+know this), so a `UIAnchor` authored at all-defaults serialises to `"UIAnchor": {}` — **byte-identical
+to what a
+`UIAnchor` authored with one non-default field but otherwise defaulted also produces for those other
+fields**, and structurally indistinguishable from "some other trait happens to be `{}`". The one
+fact that never disappears is the KEY: an absent `UIAnchor` has no `"UIAnchor"` entry in `traits` at
+all, while a present-at-defaults one does. **Any check for "is this element anchored" must ask
+`'UIAnchor' in traits`, never "does its `UIAnchor` differ from the defaults"** — the latter is `false`
+for a deliberately-anchored element as often as for an unanchored one, and cannot tell them apart.
+This is not a hypothetical: `games/wordweave`'s `ZoomControl` subtree (#628 Phase 5 of its DOM UI
+port) is six flex children that all carry an authored `UIAnchor` — some at genuinely default values,
+because what matters for a `center`-pivoted inner glyph like `ZoomMagnifierRing` is that it IS
+positioned relative to its parent, not that any one field differs from its default.
 
 ⚠️ **The app root is FULL-BLEED and must stay that way** (`engine/app/App.css`). It
 carried a blanket `padding: env(safe-area-inset-top/bottom)` from the initial commit,
@@ -292,7 +859,7 @@ unverified and had to be reverted (`c6e570f6` → `6f495a0d9`).
 
 So the inset is emitted as `var(--ui-sa-<edge>, env(safe-area-inset-<edge>))`
 (`runtime/ui/anchorCss.ts`), and the editor's device preview publishes `--ui-sa-*` from
-the selected device preset. Three things about that shape are load-bearing:
+the selected device preset. Four things about that shape are load-bearing:
 
 - **A shipped build never sets the var** and falls through to the real `env()`. There is
   no `isEditor` branch in the runtime and only one expression, so the two cannot drift.
@@ -306,6 +873,9 @@ the selected device preset. Three things about that shape are load-bearing:
   (34); rotated, it has **no top inset at all** (0 top, 21 bottom, 62 on both sides).
   Deriving one from the other by swapping w/h — which `resolveLogicalSize` legitimately
   does for the screen box — invents a top inset the device does not have.
+- **An Android tablet preset carries zero insets in both orientations** (no display cutout,
+  both system bars hidden) — but unlike the phone row's measured 28, this one is REASONED,
+  not measured, and awaits a real tablet to confirm it.
 
 The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), always on
 with a device preset: simulating an inset without showing it trades one invisible failure
@@ -320,15 +890,132 @@ it. It reports px **and percentages of the UI root**; use the percentages, becau
 px by your own `getBoundingClientRect` mixes a pre-transform inset with a post-transform box and
 is wrong in editor previews only.
 
-⚠️ **The read REFRESHES ITSELF on a throttle, and that is not defensive coding.** An inset can
-change with no resize to announce it: under `setDecorFitsSystemWindows(false)` an Android window
-keeps its size when the system bars hide, so only the insets move and no `ResizeObserver` fires
-— and `env()` changing fires no event of its own, so there is nothing to subscribe to. A value
-captured at mount stuck at a 48px nav-bar inset the device had already dropped to 0, which lifted
-Court's ad band off the bottom edge *and* shortened its paper (one number, two bug reports).
-A **detached** root is skipped rather than measured: a removed node answers empty computed styles
-and `clientHeight` 0, so refreshing off one would silently zero every inset when a viewport
-unmounts.
+**`getSafeAreaInsets()` is now a plain field read — no throttle, no measurement, no DOM access,
+and therefore nothing a per-frame caller has to be careful about (#612).** Freshness comes from a
+PUSH signal instead of a poll: two **persistent** probe elements live inside the UI root, and a
+`ResizeObserver` on them fires whenever an inset actually moves. The callback writes the new value
+straight off `contentRect` — no forced layout, nothing to bound, nothing to arm.
+
+⚠️ **The probes are SIZED BY the inset, and that is the whole mechanism — the obvious
+implementation silently never fires.** `ResizeObserver` reports the CONTENT box by default. The
+previous probe was `width:0; height:0` with the inset in its PADDING (a shape chosen to stay out
+of flow and clamp negatives to 0 for free), so its content box was 0×0 before and after every
+transition, forever — bolting an observer onto it would pass review, ship, and fail on device with
+no error. Each new probe's `width`/`height` IS one edge's inset instead (one probe carries
+top+left, the other bottom+right — `contentRect` delivers both edges in one observation). Measured
+on the device this whole mechanism exists for (Galaxy A23 / Android 13, Court, real WebView, bars
+driven by `SystemBars`): `SystemBars.show()` (top 28→32px, bottom 0→48px) fired the sized probes'
+observer ~108ms later with the correct values; `SystemBars.hide()` (32→28, 48→0) fired them
+~105ms later; a background→resume cycle (Court re-applying immersive mode) fired them again.
+Across the whole session the sized probes fired 10 times; the old padding-shaped probe fired
+exactly **once** — its initial observation — and never on a change.
+
+⚠️ **That measurement corrects a claim this doc used to make here, and it is the sentence that
+kept this design unexplored across four issues (#273 → #579 → #592 → #600): "under
+`setDecorFitsSystemWindows(false)` an Android window keeps its size when the system bars hide, so
+only the insets move and no `ResizeObserver` fires."** The first half is true and now measured:
+`innerWidth`/`innerHeight` stayed a constant 384×832 through every transition above and **zero**
+`resize` events fired, so an observer on the UI ROOT genuinely never fires. The second half does
+not follow from the first and was false as stated — it is true only of an observer on the root,
+whose size genuinely does not change. A probe whose own size *is* the inset resizes exactly when
+the inset does, independent of whatever its ancestor does; the fix was never "make something else
+emit an event", it was "observe a different element."
+
+⚠️ **A sized probe is MORE dangerous than a padding one in one specific way.** `padding` clamps a
+negative to 0 and cannot be `auto`; `height` can be both. Measured in Chromium and WebKit: an
+`env()` name the engine does not know makes the whole size declaration invalid, so height falls
+back to `auto` and the probe reports its OWN content height as the inset — a confident, wrong,
+non-zero number, measured at 18px in both engines. `max()` does not save that; the guard is the
+explicit `0px` fallback *inside* `env(...)`, measured to give 0 in both engines. This deliberately
+differs from `anchorCss.ts`'s `var(--ui-sa-<edge>, env(safe-area-inset-<edge>))`, which has no
+inner fallback and needs none: there the expression sits inside `max(<padding>, …)` on a `padding`
+property, where an invalid value just drops the declaration and yields no padding — safe. Don't
+"align" the two.
+
+⚠️ **A probe whose ancestor is `display:none` reports a confident 0×0, and the callback has to
+reject it rather than write it through** — the same failure `getSafeAreaInsets` guards against on
+the read side (a detached root), arriving through the other door. Measured in both engines:
+`isConnected` stays **true** and `getComputedStyle().height` still reports the correct value, so
+neither can tell a hidden probe from a genuine zero-inset device. `getClientRects().length` is the
+discriminator: a real zero-inset device still has one rect, and so does a root with no box yet —
+only a non-rendered subtree reports none. Detaching the root outright fires nothing at all, in
+either engine, so only the hidden case reaches this guard.
+
+**One synchronous measurement still happens, but only at REGISTRATION** — a mount, a resize, or a
+scene swap handing the module a fresh root (`measureSafeAreaInsets`, called by `UIRenderer`) — to
+get a correct value in place before the first observation arrives. That forced layout is the only
+one left in this module, paid once per registration instead of on a 250ms poll for the life of the
+session.
+
+A **detached** root is refused on both sides. On the read side it is released rather than measured
+(a cheap `isConnected` flag check, not a forced layout): `UIRenderer`'s unmount path never hands
+this module a null, so the stale reference would otherwise keep pointing at a removed node —
+releasing it is also what stops the whole removed subtree being retained. On the **write** side
+`measureSafeAreaInsets` refuses a detached element outright, because `UIRenderer` rAF-defers the
+call that registers a root: a container unmounting in the frame it mounted (a scene swap's
+empty-tree beat, an editor panel closing mid-resize) otherwise lands a registration with a removed
+node, and `getComputedStyle` on a detached probe answers empty strings — every inset rewritten to
+0, which is #273's symptom exactly. `UIRenderer` also cancels that queued frame, so the two guards
+meet in the middle. The last known insets are kept either way: a device's insets do not change
+because some UI unmounted.
+
+⚠️ **A root with no LAYOUT BOX must never become the denominator, and the two guards above do not
+stop it — REGISTRATION screens on neither.** `getSafeAreaInsets` discriminates on `isConnected` and
+`onProbeResize` on `getClientRects()`; the registration path needs neither in order to read the raw
+insets, which is precisely what makes it the open door. `flexlayout-react` maximises a panel by
+setting `display: none` on every other tabset container, and on the tabs of every non-maximised
+tabset (read in 0.8.19's bundled `dist/index.js`; both writes are guarded on
+`getMaximizedTabset(...) !== undefined && !isMaximized()`), and the editor mounts one `UIRenderer`
+per viewport — so maximising the Game panel
+leaves SceneView's root **connected but not rendered**. `isConnected` passes it through;
+`getComputedStyle(probe).height` still answers the correct length under `display: none` (the same
+measurement that forces `onProbeResize` to use `getClientRects` instead), so the raw px insets are
+measured perfectly; only `clientWidth`/`clientHeight` are 0. `recompose`'s `total > 0 ? … : 0` then
+rewrites all four `*Pct` to a confident **zero** — the one value a consumer cannot tell from a real
+measurement, and the only fields `patchAnchorPct` and Court's six per-frame call sites read. The CSS
+arm is immune because it is a `var()` with no arithmetic; only the JS arm divides.
+
+Measured 2026-09-04: `games/wordweave`'s ad banner silently lost its 34px home-indicator lift the
+moment the Game panel was maximised, `AdBannerSlot.UIAnchor.bottom` written as 0 while
+`--ui-sa-bottom` still read `34px` and the padding arm on `HUD Root` stayed correct. Guarding it
+restored the lift — bottom moved 966.75 → 931.39. ⚠️ Those are **device** px off the scaled preview,
+so the 35.36 delta is post-transform and must not be equated with the 34px **logical** inset (the
+exact trap the `*Pct` fields exist to prevent). It establishes that the lift returned, not its
+magnitude.
+
+So **both** writers of the denominator — registration (`applyMeasurement`) and the observer's
+re-read (`onProbeResize`) — adopt the new box **per axis, only when it is greater than zero**,
+keeping the last good one otherwise. That is this module's existing rule for a root it cannot
+measure, applied to the case where the root is still there and only its box is missing. Per-axis
+because a root can legitimately lose one dimension and keep the other; a real box always replaces
+the retained one, so rotation and resize still work. Only the registration door has been observed
+live — the observer's read sits behind the `rendered` bail, which does cover `display: none`, and is
+guarded for consistency and against a root that is *rendered* with a zero box. That case is narrow:
+only under the **`Free`** preset is GameView's UI root `position: absolute; inset: 0` over a `flex: 1`
+area and able to be squeezed flat while still rendering (a flexlayout tabset's minimum is 1px, not 0
+— but a 1px tabset holding a 32px toolbar still leaves the area at 0). Under a fixed device preset
+the root is a `deviceW × deviceH` box and cannot collapse. A scene swap's empty→refill beat is the
+same shape.
+
+⚠️ **The retained box is not necessarily the current root's, and that is deliberate.** `rootW`/`rootH`
+are module state and survive `releaseRoot()`, so a second root registering with no box divides *its*
+insets by the *previous* root's dimensions. Clearing them on a root change would put the confident
+zero straight back for the case above whenever the alternation lands that way — the editor's two
+viewports alternate, so the poisoned registration **can be** a root change; which it is depends on
+which viewport registered last, and that is not deterministic. Half the time is enough to disqualify
+clearing. A foreign-but-plausible denominator also degrades far better than
+a zero, which does not merely read wrong but *moves* things (Court's `syncMenuIconBar` is
+change-gated, so a transient zero moves the icon bar and moves it back). Both viewports publish the
+same `safeAreaCssVars(gameViewSafeArea)` and are normally sized alike, so the divergence window is
+about a frame under the `Free` preset. If this ever has to be exact, the answer is a per-root box,
+not clearing.
+
+⚠️ **The percentages are recomputed against the CURRENT root box on every observation, not against
+the one cached at registration** — a rotation moves the root and the insets together, and the probe
+observation is delivered a frame BEFORE `UIRenderer`'s rAF-deferred re-registration. Measured:
+384×832 → 832×384 with a bottom inset of 48 gives `bottomPct` 5.77 against the stale height where
+12.5 is correct. It self-corrects a frame later, but Court reads these percentages every frame at
+six sites, so the banner, board and narration band would all pop for that frame.
 
 ⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
 **physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a
@@ -447,6 +1134,53 @@ The failure mode this guards: `games/court`'s `NarrationBand` carries `width: 90
 `bottom-stretch` anchor whose `left: 5%` + `right: 5%` offsets independently produce 90%.
 It looks deliberate and correct, and editing that field to `50%` would change nothing.
 
+### Margin is inert on an anchored element, whatever the anchor mode (#757)
+
+`applyAnchorStyle` clears **all four** `UIElement` margins on an anchored element, so an authored
+`marginTop`/`marginRight`/`marginBottom`/`marginLeft` is discarded. **Anchor offsets are the one
+way to inset an anchored box.**
+
+Note how this differs from the size rule above: size dies only on a *stretched axis*, and the axes
+are independent. Margin dies on **any** anchor, in every mode, on all four sides at once — so the
+predicate is `isElementMarginInert` (*"does this entity have an anchor at all?"*), not a per-axis
+question, and the Inspector's gate is `selectionMarginGate` rather than `selectionSizeGate`. The
+same three surfaces agree through that one predicate: the layout clears the margins, the Inspector
+greys the four fields (naming the responsible anchor, unanimous-or-nothing across a selection as
+above), and the scene validator warns on an authored non-zero one — including a prefab instance's
+overridden fields. Zero is excluded from the warning for the same noise-budget reason `0` and
+`100%` are excluded from the size one: the margin defaults ARE 0, so reporting them would fire on
+nearly every anchored element.
+
+⚠️ **`selectionMarginGate` exists rather than reusing `selectionAnchorGate`, which is behaviourally
+identical today.** `selectionAnchorGate` carries its OWN inline copy of the condition, so routing
+margin through it made "one predicate, three surfaces" false for the decision that actually sets
+`readOnly` — narrow `isElementMarginInert` and the layout would stop clearing margins while the
+Inspector kept the fields greyed, leaving an author unable to type a value that had started working.
+The two also answer different questions (self-placement vs. margin) and may legitimately diverge.
+Caught in #757's own close-out review, after the first cut of this section claimed the guarantee it
+did not yet have.
+
+⚠️ **An absent length unit in scene JSON means `%`, not `px`** — every `UIElement` length unit
+defaults to `'%'` and a scene save strips a field equal to its default, so the number-with-no-unit is
+the common on-disk shape for a percentage. The validator read it as `px` until #757's close-out,
+which made `isNeutralSize` miss `width: 100` and produced **10 false positives across the 143
+tracked scene/prefab files** — four in `games/court`, three in `games/sling`, two in
+`games/wordweave`, one in `demos/particle-demo`, every one of them a full-bleed `100` the editor
+itself writes. Zero after the fix, with a genuine `90` (i.e. 90%) still reported.
+
+⚠️ **This one is a DECISION, and the code comment used to overstate it as an observation.** It read
+*"margin does not affect position — the pivot sits at the anchor point regardless"*, which is true
+of the pivot but not of the box: on a stretched axis (`top: 0; bottom: 0` with `height: auto`) CSS
+margins genuinely participate in the over-constrained resolution and would inset it. Put to the
+owner and upheld (2026-09-05): a second way to produce the same gap means an author has to know
+which one the previous author used, so anchor offsets stay the only one. This also matches why the
+Inspector's **Margin section is collapsed by default** — margin is deliberately de-emphasised, so
+the right direction for a fix here is to make its limits louder, never to give it a second job.
+
+Same ruling #746 made for the (now-unified) `zIndex` fields in the § sortOrder table below: the
+defect was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape
+when this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
+
 ---
 
 ## `UIRenderer` — ECS → DOM
@@ -493,6 +1227,30 @@ putting the catcher on top instead buried Skip inside the band's stacking contex
 silently unclickable. Neither ordering works, because the two controls need opposite answers —
 `pointerThrough` is what breaks the tie.
 
+#### `swallowClicks` — its opposite number
+
+`UIElement.swallowClicks` (#728) is the same *kind* of field pointing the other way: where
+`pointerThrough` says "let taps through to what is behind me", `swallowClicks` says "**stop the tap
+here, but I am not a button**" — the shape the structural rules equally cannot express, because the
+only way to consume a tap used to be to author a click binding, and that makes the node a button.
+
+The rule it is defined by, rather than a list of the panels using it: **any container that must
+consume a tap it has no behaviour for** — canonically a modal card whose scrim dismisses on tap,
+where without it a tap on the card's own text falls through and closes the dialog.
+
+The full treatment — what it costs to hand-roll instead, why the node must also be stamped as a
+press origin, and the two authoring combinations — is in
+[§ Dialog dismissal](#dialog-dismissal--the-house-rule-for-every-game), which owns this fact. The
+two rules worth having here, next to its sibling:
+
+- **`pointerThrough` WINS if both are authored** — it sets `pointer-events: none` later in the
+  cascade, so no handler on the node can run and `swallowClicks` is silently inert. That
+  combination is an authoring error, not a meaning.
+- **A real click binding alongside it is REDUNDANT, not lost.** An interactive node's handler
+  already calls `stopPropagation()` unconditionally, so the tap is stopped either way; the binding
+  still runs and the cursor stays `pointer`. `swallowClicks` means precisely "swallow *even though
+  I have no binding of my own*".
+
 `UINode` (`runtime/ui/UINode.tsx`) translates one `UINodeData` into a styled DOM
 element, applying the trait fields in order (layout → box style → image → text →
 anchor → click handler), then recurses into children. It is wrapped in `React.memo`.
@@ -505,6 +1263,33 @@ in `runtime/ui/uiTreeStore.ts` (`buildTree()`): it queries all
 `sortOrder` for each, then links children to parents. The builder is **cycle-safe**:
 any node whose parent chain doesn't terminate within `nodes.size` hops is treated as a
 root and logged in dev (so the editor can flag a bad `parentId`).
+
+⚠️ **`sortOrder` is NOT the stacking authority for anything anchored.** `sortOrder` decides DOM
+order among siblings (`buildTree`'s `sortChildren`, ascending — later siblings paint over earlier
+ones). But `UIElement.zIndex` is written by `UINode` as a real CSS `z-index` alongside
+`position: absolute`, and **CSS z-index beats DOM order** — `sortOrder` is only the tiebreak
+between elements at the SAME z-index. Two root-level anchored elements therefore stack purely by
+`zIndex`, whatever their `sortOrder` says.
+
+This bites because a scene can carry two ordering tables that disagree, and only one of them is
+real. Court's modal group is the worked example (2026-08-31): by `sortOrder` it reads
+`AccountModal` 39 → `ConflictModal` 41 → `BusyOverlay` 42 → `StoreModal` 43, with the store on top;
+by `zIndex` — what actually paints — `StoreModal` (50) is the BOTTOM of that group and
+`ConflictModal` (55) and `BusyOverlay` (56) are above everything. A session diagnosing a stacking
+bug there read the `sortOrder` column, "fixed" it by authoring a higher `sortOrder`, watched the
+correct behaviour on device, and concluded the edit had worked — when the pre-existing `zIndex`
+had always guaranteed it and the edit changed nothing. **Read the `zIndex` column, and when you
+assert a stacking fix, verify it by perturbing the value you actually changed.**
+
+**History: there used to be a THIRD table here.** `UIAnchor` carried its own `zIndex` that
+`applyAnchorStyle` copied over `UIElement.zIndex` whenever it was truthy (#746 gave the silent
+shadowing a warning and an Inspector tooltip, since the precedence itself was correct — an
+out-of-flow box's stacking authority — and the defect was only that nothing said so). The two
+fields wrote the same CSS property onto the same DOM node, so one of them could only ever be a
+duplicate; this was unified onto `UIElement.zIndex` alone (scene format v13), and `UIAnchor` no
+longer has a `zIndex` field at all. A migration carries a truthy old `UIAnchor.zIndex` onto
+`UIElement.zIndex` (the anchor's value is what rendered, so it wins on a conflict) — see
+`docs/scene-loading.md`'s migration table.
 
 ---
 
@@ -532,6 +1317,70 @@ The store is updated by `uiTreeProjection(world)`, an ECS system registered at
 This replaced an older architecture that re-queried ECS and diffed ~50 fields per node
 every frame. See [Architecture](./architecture.md) for where PROJECTION sits in the
 frame pipeline.
+
+---
+
+## Pushing live values onto scene-authored chrome (`runtime/ui/sceneChrome.ts`)
+
+A game's HUD, overlays and menus are **authored in the scene**, not built in code — the position,
+size, colour and font of every panel live in scene JSON where the owner can reach them (see
+CLAUDE.md § "Author values in the SCENE and the PREFAB"). What code still has to do is push the
+*live* values through: the score, whether the pause overlay is showing, which entrance animation
+just fired. `runtime/ui/sceneChrome.ts` is the seam for exactly that, and nothing else.
+
+| Export | What it does |
+|---|---|
+| `patchUI(world, name, patch)` | Write `ChromeUIPatch` fields onto the `UIElement` of the scene entity called `name`. Returns whether anything actually changed. |
+| `patchToggle(world, name, patch)` | The same for `UIToggle`. |
+| `restartClip(world, name)` | Play the entity's authored `Animator` clip from the top. |
+| `readChromeUI(world, name)` | Read the element back — for a test or a check, not a render path. |
+| `findChromeEntity(world, name)` | The name lookup on its own. |
+| `resetSceneChromeCache()` | Drop the name cache; tests call it in `afterEach`. |
+
+Four properties of this module are load-bearing, and each exists because of a defect:
+
+- **Writes are DIFFED.** An unchanged `UIElement` write costs a whole UI-projection rebuild (see
+  § "Projection & the dirty flag" above), so `patchUI`/`patchToggle` compare first and call
+  `markUIDirty()` only on a real change. `restartClip` is the deliberate exception — it must
+  rewind a playhead that may already sit at the target, so callers edge-detect instead.
+- **A present-but-`undefined` key means "leave it alone".** koota's SoA setter tests `'key' in
+  value`, not whether the value is defined, so `{ isVisible: flags.show }` with an undefined
+  `flags.show` would otherwise write a real `undefined` — blanking the element *and its whole
+  subtree*, permanently, since the next identical call diffs as unchanged and never recovers.
+- **The name lookup is cached but self-validating.** A hit is O(1); a miss costs one pass over
+  every `EntityAttributes` entity (a few hundred in a real game). That cost is why chrome pushes
+  are gated on a CHANGE rather than run per frame.
+- **The cache clears on world swap**, registered lazily on first lookup — never at module scope,
+  which would fire on import in every test that mocks `core/ecs/world`.
+
+⚠️ **Several `UIElement` style fields are inert without a companion field that defaults to 0** —
+`backgroundColor` needs `backgroundOpacity`, `borderColor` needs `borderWidth`. `ChromeUIPatch`
+exposes both halves of each pair for that reason. The canonical statement of the trap, and the
+full list, is on the trait itself (`runtime/traits/UIElement.ts`) — cite it rather than restating
+it here.
+
+**Position and size are NOT in this module's remit.** A game that needs to move authored chrome
+does it in percentages, from its own code — see the `%`-vs-px warning under `UIElement` above, and
+`games/court/runtime/sceneChrome.ts`, which keeps exactly those game-specific patchers as a thin
+layer over these engine functions.
+
+⚠️ **A DOM element (this `ui` layer) and a 2D canvas element (the `2d` layer, PixiJS) cannot be
+spaced against each other by LAYOUT — only by a runtime patcher that composes both coordinate
+spaces explicitly, the way `patchUI`/`patchAnchorPct` do here.** A DOM node's position is a `%` of
+the HOST viewport; anything drawn on the 2D canvas is a `%` of the DESIGN box the canvas is
+`contain`-fitted into. **The two boxes coincide exactly only at the design aspect ratio and in the
+editor's default preset** — so a DOM control positioned by eye to sit flush against a canvas-drawn
+element looks pixel-perfect on the machine it was authored on and drifts on any real device whose
+aspect ratio differs, with nothing in the editor able to show the mismatch (Court's own `CLAUDE.md`
+records the identical rule for a `%`-of-host value sized against a design-space one — cross-reference
+rather than re-deriving it if you land here from that direction). The fix is always a function like
+`games/wordweave`'s `designToHostPct` (`runtime/systems.ts`) that explicitly composes the canvas's
+own letterbox scale/offset AND the safe-area inset into one host-percentage answer, called every
+frame from the game's own system — never a static authored offset guessed from one screenshot.
+`games/wordweave`'s `ZoomControl` (#628) is the worked example: it re-anchors to the crossword
+panel's own corner, computed in DESIGN space and converted through `designToHostPct` every frame,
+specifically because no authored `UIAnchor` offset could track a 2D-canvas-drawn panel that itself
+moves with the `board`/`crossword` ScreenBand flex weights (#773) and the device aspect.
 
 ---
 
@@ -659,12 +1508,40 @@ scrolling shop strip is a lie an author reads past forever.
 
 | Trait | Owns |
 |---|---|
-| `UIScrollView` | the box: `axis`, `snap`, `snapStop`, `overscroll`, plus engine-written `scrollX/Y`, viewport + content size |
+| `UIScrollView` | the box: `axis`, `snap`, `snapStop`, `overscroll`, plus engine-written `scrollX/Y` and viewport size — and content size, which the engine writes and only a reader consumes (see "Rules that bite") |
 | `UIEntries` | what it shows: `prefabs` (a JSON bank of `{name, prefab}`), entry size, `gap`, `overscan`, `countX/countY`, `epoch`, `source` |
 | `UIEntry` | stamped by the engine on each pooled instance: the **data** index, the slot, and `live` |
 
 `UIElement.overflow: 'scroll'` is still what makes the box scroll — `UIScrollView` supplies the
 position and the motion fields, and does not override what the author wrote.
+
+⚠️ **That sentence was FALSE until #743, and it failed into a half-working box rather than an
+inert one.** `scrollViewStyle` emits a cross-axis pin (`overflowY: 'hidden'` for a horizontal
+view, `overflowX` for a vertical one) to stop an off-axis scrollbar stealing cross-axis space — a
+real, measured fix — and that pin was merged onto the host style AFTER the `overflow` write. Per
+CSS, **when one of `overflow-x`/`overflow-y` is not `visible`, the other computes to `auto`**, so
+the axis the author left `visible` silently became `auto` and the box scrolled. Meanwhile
+`UINode`'s scrollbar skin and its `pointerEvents: 'auto'` force both stayed gated on `overflow ===
+'scroll'` — so what you got was a box that scrolled, with unstyled native scrollbars, that could
+not receive the wheel under the `pointer-events: none` root. One forgotten field away, from docs
+that told you the field was a no-op.
+
+The pin is now gated on the author having opted the box into scrolling, which is the only case its
+justification covers. `scrollSnapType`/`overscrollBehavior`/`scrollbarWidth` stay unconditional —
+none of them changes how `overflow` computes.
+
+⚠️ **`overflow: 'hidden'` is NOT the same as `'visible'` here, and only `'visible'` is inert.**
+`hidden` still establishes a scroll CONTAINER — a scrollable overflow region with no user-facing
+scrolling UI — and `useScrollView` gates on the TRAIT, not on overflow, so `pendingScrollTo` →
+`el.scrollTo()` still drives it and `scrollSnapType`/`overscrollBehavior` genuinely apply. That is
+a real design: a `scrollToEntry`- or button-driven pager that deliberately suppresses
+finger-dragging. `visible` is the genuinely inert one — no scroll container, so `scrollTo` moves
+nothing and snap has nothing to apply to.
+
+So, because "inert" is indistinguishable from "not wired yet", `UINode` **warns once per entity in
+DEV** when a `UIScrollView` sits on an `overflow: 'visible'` element — the same way a binding-less
+`UIToggle` is reported — and says nothing on `'hidden'`, whose remedy would have been to re-enable
+the drag its author suppressed on purpose.
 
 ### The contract: the engine asks, the game answers
 
@@ -673,23 +1550,36 @@ The engine decides WHICH pooled instance shows entry (x, y); the game answers WH
 (`'Tile3/Solved/Num'`, `''` for the root); values are **trait-keyed** (`{ UIElement: { text } }`).
 
 - A path must be FULL and match exactly one member — **ambiguity is an error, not a fan-out**.
-  `level-tile.prefab.json` carries three entities named `Num`, so a leaf-name match would write
-  all three and look like it worked. This differs deliberately from Court's `patchUIInInstance`,
-  which writes every match by design.
+  `level-tile.prefab.json` USED to carry three entities named `Num`, so a leaf-name match would
+  have written all three and looked like it worked (⚠️ #344 collapsed that prefab to a single
+  face — four entities, one `Num` — so the rule outlived its worked example). This differs
+  deliberately from Court's former
+  `patchUIInInstance`, which wrote every match by design — deleted in #316 with its last caller,
+  so this is the only mechanism of its kind now.
 - Trait-keyed with no shorthand, because a flat field map would have to *guess* a trait — a
   resolver returning a `UIToggle.value` would then silently write nothing.
 - Bump **`epoch`** when content changes but the window does not (a level gets solved; an async
   manifest arrives). Without it the resolver is only called when the window moves.
 - The member-path walker is **new engine code over the `parentId`/`localId` chain**, not a
-  promotion of Court's `findAllInInstance`. `rootInstanceId` is stamped on a prefab's OWN
-  members only — never inner members — so `findAllInInstance`'s flat `rootInstanceId ===
-  rootEcsId` scan reaches zero of a page prefab's 25 nested tile instances.
-- The scene's generated `resources` manifest only seeds what it is told is a ref:
-  `UIEntries.prefabs[].prefab` must be registered in `REF_FIELDS_BY_TRAIT`
-  (`loaders/sceneValidation.ts`) and in `SCALAR_RESOURCE_TYPE_BY_FIELD` as a `prefab`-typed ref,
-  or the entry prefab is invisible to the manifest — the #53 "assets the build cannot see"
-  class, silent in dev (which serves everything off disk) and broken only once shipped. Once
-  registered, the entry prefab's own assets need nothing further: `SceneManager`'s transitive
+  promotion of Court's former `findAllInInstance` (deleted in #316). `rootInstanceId` is stamped
+  on a prefab's OWN members only — never inner members — so that helper's flat `rootInstanceId
+  === rootEcsId` scan would have reached zero of a page prefab's 25 nested tile instances, which
+  is why it was not the thing to promote.
+- The scene's generated `resources` manifest only seeds what it is told is a ref, and if
+  `UIEntries.prefabs[].prefab` were missed the entry prefab would be invisible to the manifest —
+  the #53 "assets the build cannot see" class, silent in dev (which serves everything off disk)
+  and broken only once shipped.
+  ⚠️ **It is NOT registered in `REF_FIELDS_BY_TRAIT` or `SCALAR_RESOURCE_TYPE_BY_FIELD`, and must
+  not be** — this paragraph said the opposite until 2026-09-07 and sent at least two readers
+  (including a session working #671) looking for an entry that was never there. Both tables are
+  **scalar-only** by construction; `prefabs` is a JSON-string bank, the same shape as
+  `Animator.clips` and `AudioSource.clips`. It is parsed EXPLICITLY in two places instead:
+  `loaders/loadSceneFile.ts` (`collectResourceRefsFromEntities`, which emits the manifest entry)
+  and `plugins/asset-tree-shaker.ts` (the build keep-walk, which labels the edge
+  `UIEntries.prefabs[].prefab` — the label `/api/find-references` and the Inspector's entry-prefab
+  note both key off). What the tables genuinely did NOT cover is the VALIDATOR, which is why
+  `entryBankWarnings` exists. Once collected, the entry prefab's own assets need nothing further:
+  `SceneManager`'s transitive
   worklist walks its entities with the same collector used for scene entities, so a textured
   entry prefab, a font, or a prefab nested inside it are all acquired and scene-refcounted.
 
@@ -754,6 +1644,87 @@ input at all. Scroll is exogenous; `first` is the response. The accumulator rese
 pool actually re-drives, so it stays "the distance the pool has to cover", dropped frames folded
 in.
 
+### The engine OWNS a pooled row's box — fourteen authored fields are inert there (#651, #761)
+
+`entriesSystem` pins the resolved entry box onto every pooled entry root every tick, across five
+groups (`uiAuthoring.POOLED_ROW_PINNED_GROUPS`, the one place this list lives — the equality
+guard, the warn loop, the `entity.set` and the Inspector note all derive from it). ⚠️ **This claim
+was FALSE for `entity.set` until #764** — its `pinned` literal was hand-typed separately from the
+constant, so a field added there (an `opacity: 0`, say) pinned in total silence with every test
+green; `uiAuthoring.buildPooledRowPin` is now the one place the pinned VALUES are typed, called
+by `entity.set`, and `uiAuthoring.test.ts` asserts its keys SET-EQUAL
+`POOLED_ROW_PINNED_FIELDS` — a check that fails on a field added to either side, not just one
+dropped:
+
+| Group | Fields | Forced to |
+|---|---|---|
+| size | `width`, `widthUnit`, `height`, `heightUnit` | the scroll view's resolved box, in px |
+| margin | `marginTop/Right/Bottom/Left` | `0` |
+| min/max size | `minWidth`, `maxWidth`, `minHeight`, `maxHeight` | `0` |
+| flex shrink | `flexShrink` | `0` |
+| visibility | `isVisible` | the slot's live/parked state |
+
+Margin and min/max size exist for the same reason and attack the stride from opposite sides:
+
+- **Margin sits OUTSIDE the border box.** An authored margin on the entry prefab root makes the
+  real on-screen stride `entrySize + gap + marginStart + marginEnd`, while the whole scroll
+  geometry is solved from `stride = entrySize + gap`. Unlike a one-off offset this is **per item
+  and accumulates linearly with the index**: 200 entries at `entryHeight: 120`, `gapY: 8`,
+  `marginBottom: 4` puts entry 199 at `199 × 132 = 26268` while `scrollToEntry(199)` writes
+  `199 × 128 = 25472` — 796px, six entries short, and `padLeading` drifts by the same amount so
+  pooled slots walk off their snap points the deeper you scroll.
+- **A min/max constraint overrides the definite size from INSIDE it.** The pin writes a definite
+  `width`/`height`; a `maxWidth` smaller than it silently wins, and the stride desyncs the same
+  way. These four were missed by the original margin fix and are the same defect.
+
+⚠️ **Size, flex shrink and visibility were pinned in TOTAL SILENCE until #761** — no warning, no
+Inspector mention, for six of the fourteen fields. The naive extension of the existing warning
+(`cur !== pinned`) is actively wrong for these: `flexShrink` defaults to `1` but pins to `0`, so
+`cur !== pinned` would warn on every untouched row; `isVisible` defaults to `true` but pins to the
+slot's live state, so it would warn on every freshly-parked slot too. The rule that avoids both
+false-positive storms: **warn only when the authored value differs from BOTH the pin AND the
+trait's own default** — the default means "the author never touched this field". For the eight
+fields whose pin already equals their default (margin, min/max size — all pinned and defaulted to
+`0`) this is exactly the pre-#761 behaviour; it only changes anything for the six #761 added.
+`width`/`height` fold their companion unit into ONE warning per axis (`width=50%`) rather than two.
+
+⚠️ **This is an "authored field that does nothing" — CLAUDE.md's partially-wired-authoring-surface
+class — and the mitigations are deliberately incomplete.** `entriesSystem` warns once per slot per
+field when it discards an authored value by the rule above (keyed `viewGuid:slot:field`, **not**
+`entity.id()`, because koota recycles ids and a retired id would swallow a real mistake), and the
+Inspector shows a "pooled row" note on the `UIElement` section, gated on the sibling `UIEntry`
+trait via `selectionPooledRowGate`.
+
+**The Inspector note used not to reach the case that matters, and now does (#671, 2026-09-07).**
+`UIEntry` is stamped by the engine on the LIVE pooled instance at spawn, so the note appears when
+you select a running row. The entry **prefab** — the thing you actually open and author — carries
+no such marker, and inventing one on the asset was never necessary: **the relationship already
+exists in the SCENE**, as `UIEntries.prefabs`, and was simply resolved by nothing on the authoring
+side. Two surfaces now resolve it:
+
+- **The validator** (`entryPrefabRootWarnings` in `loaders/sceneValidation.ts`) joins each
+  `UIEntries` view to its entry prefab through the caller-injected `getPrefab` resolver and reports
+  the authored box fields the pin will discard, so the finding reaches scene load,
+  `/api/validate-scene` and `modoki_validate_scene`.
+- **The Inspector** shows the same note in prefab-edit mode, resolving the edge through
+  `/api/find-references` (which already walked the bank for the build) rather than a new index.
+  Gated on `isPrefabEditWorld()` rather than the `editingPrefab` store flag, which can go stale,
+  and on the prefab ROOT entity only — the pin only ever touches the row root, so firing on a
+  child would claim something false.
+
+⚠️ **The size half of the rule is CONDITIONAL, and this is the part that makes the edge necessary
+rather than merely convenient.** On an axis the view DELEGATES (`entryWidth`/`entryHeight` of 0)
+the prefab root's own size IS read, by `entryPrefabProvider.rootSize` — that is the
+single-source-of-truth path the trait docs prescribe. Warning there would tell the author to stop
+doing the correct thing. Only a non-delegated axis is discarded, and no per-prefab rule can know
+which, because the answer lives on a different entity.
+
+⚠️ **A lookup that fails must not assert the negative.** `entryKindUsesOf` returns `null` on any
+failure, missing endpoint or malformed body — never `[]` — and the note stays silent on `null`.
+`[]` means "genuinely not an entry kind"; a failed request must not be able to say that. The note
+only ever ADDS information and never disables a field, so silence on no evidence is the correct
+failure direction. (Same rule `makeTexture2D.textureRefCount` already states for its own count.)
+
 ### Measured on the low-end target
 
 Galaxy A23 (Mali-G57 MC2), the shipped web build of `games/scroll-demo`, driven by real touch
@@ -815,6 +1786,29 @@ found two engine defects this harness had not.
 `entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
 is not a second copy of a number the prefab already states; `%` resolves against the viewport,
 which is how a pager is expressed.
+
+⚠️ **The prefab root's size carries its own UNIT, and until #765 that unit was dropped.**
+`entryPrefabProvider.rootSize` read the root's `UIElement.width`/`height` and ignored
+`widthUnit`/`heightUnit`, so a root authored `width: 50, widthUnit: '%'` was pinned as **50px**.
+The asymmetry is the tell: the view's own authored size had its `%` resolved against the viewport
+and the prefab's did not — on the one branch whose entire purpose is deferring to the prefab.
+`resolveEntrySize` now takes the prefab's unit as a **required** parameter (a default would let a
+future call site silently keep the bug) and both branches convert through one shared helper, so
+the view's axis and the prefab's axis cannot drift apart again.
+
+⚠️ **An ABSENT unit here means `%`, not px** — every `UIElement` length unit defaults to `'%'` and
+a save strips a field equal to its default, so number-with-no-unit is the ordinary on-disk shape
+for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
+keys, i.e. `100%`); it never tripped the bug only because `DictionaryPager` authors both axes
+explicitly at `100%`, so the `0` branch is never taken. Deleting those two redundant fields — which
+is precisely what the single-source-of-truth rule above tells an author to do — would have turned
+its cards into 100px squares, silently. That is why the bug was worth fixing while still latent.
+
+⚠️ **Every entry-sizing test FAKED the provider**, which is why nothing saw this for so long; the
+one test touching the real one (`resourceRefcount.test.ts`) said so in its own docblock. There are
+now fixtures driving the REAL `entryPrefabProvider.rootSize` against a `%`-unit root, a no-unit-key
+root and an explicit-px root. A fake that models behaviour the real dependency lacks makes the
+guard defend the bug.
 
 ### Motion is CSS, and the vocabulary matches
 
@@ -887,6 +1881,75 @@ rebuild and is never per-frame.
   `entity.set`, bypassing the `markUIDirty` hook, so a scroll frame that does not move the window
   costs one field write. Routing it through a dirtying helper rebuilds the whole tree at fling
   frequency.
+- **The editor mounts `UIRenderer` TWICE, and the measurement is keyed by GUID (#413).** One in
+  the Game panel, one in SceneView's UI preview — two real React trees over one ECS world, so a
+  scroll view has two DOM elements, two `ResizeObserver`s, and ONE `UIScrollView` slot to write.
+  The element inside a hidden dock tab measures 0x0, and with `entryWidth` authored in `%` a zero
+  viewport makes every entry zero-wide, the window empty and the pool zero-slot — a blank view
+  with **every diagnostic silent**, because the prefab is cached and the source is registered.
+  Court's calendar and level selector both sat blank on this. `push()` therefore refuses to record
+  a measurement from an element that generates no box (`readScrollMeasurement`): a zero-extent view
+  can display no entries either way, so declining costs nothing, while accepting it destroys the
+  only good measurement. ⚠️ The device-size gap this used to warn about can't actually happen —
+  SceneView sizes its preview from GameView's own size, so both mounts share one logical device
+  size by construction; the residual hazard is a MIXED measurement instead — a real viewport from
+  one mount paired with `scrollX: 0` from the other while the two trees disagree on scroll offset,
+  which can still land the pool's window outside the visible band and blank the view.
+- **`viewportWidth`/`viewportHeight` are the CEIL of the box's true fractional size (#665)** —
+  `Math.ceil` applied inside `readScrollMeasurement`, so the trait can never hold a fractional
+  viewport. The true size comes from `readPreciseBoxSize` (`getComputedStyle`) — every UI node is
+  `boxSizing: 'border-box'`, so `cs.width` there is ALREADY the border-box width (padding included)
+  and must NOT have padding added back; borders and the scrollbar gutter (`offsetWidth -
+  clientWidth`) are subtracted instead, so the result is the fractional equivalent of `clientWidth`,
+  not of the content box. ⚠️ `Math.ceil(el.clientWidth)` would be a no-op, because `clientWidth` is
+  ALREADY rounded to nearest, which is the whole reason the precise read exists. It is refreshed on
+  the RESIZE path only and cached — `push` runs on every `scroll` event and `getComputedStyle`
+  forces a style recalc, the path #677 reports as frame-rate critical.
+
+  Why ceil rather than the true fractional value: an entry at `entryWidth: 100%` is a percentage of
+  `viewportWidth`, so ceil makes `entryW === viewportWidth` exactly (keeping `round(scrollX /
+  viewportWidth)` page indexing exact) while guaranteeing `entry >= the real box`, so no neighbour
+  can sit inside the clip. The accepted cost is up to ~1px of the CURRENT entry clipped at its right
+  edge — an owner decision, taken 2026-09-05.
+
+  ⚠️ **A FRACTIONAL `viewportWidth` was built, measured live, and REVERTED — do not "improve" this
+  back to it.** Chrome parks a scroll offset on an INTEGER CSS pixel here: a `scrollTo({left:
+  598.1875})` issued by `consumeEntryRequest` landed at exactly `598`, and the page-3 request at
+  `897.28125` landed at `897`. A fractional stride therefore misses every offset the scroller can
+  rest on, converting a CONSTANT 0.109px sliver of the NEXT entry into a per-page 0.19-0.28px sliver
+  of the PREVIOUS one — worse than the defect it set out to fix. Two further limits found the same
+  way: Chrome quantises a used width to its 1/64px LayoutUnit (an authored 299.109375 renders as
+  299.09375), so exact entry/viewport equality is unreachable through CSS px anyway; and
+  `offsetLeft`/`scrollWidth` are integer-rounded DOM APIs, so neither can measure the residue — only
+  `getBoundingClientRect` and `getComputedStyle` can.
+
+  ⚠️ **Ceil alone does NOT make the sliver invisible, and box geometry cannot tell you so.** With the
+  stride exact, the next entry's box lands at precisely 0px past the clip — and the compositor still
+  rounds its clip out to a device-pixel boundary. If the entry's own content is flush to its edge,
+  what that rounding exposes is a GLYPH, which `getBoundingClientRect` reports as "not inside" at any
+  precision. The other half of the fix is authored per entry: give the entry prefab horizontal
+  padding so a bleed shows background instead (wordweave's `DictionaryCard` uses 4px, guarded in its
+  `sceneChrome.test.ts`). ⚠️ Assert the UNIT — `paddingLeftUnit` defaults to `'%'`, and a percentage
+  padding resolves against WIDTH here. Court's `level-page`/`daily-month` entries are NOT exposed:
+  their roots centre a fixed-width child, so nothing reaches the edge.
+- **`contentWidth`/`contentHeight` are DIAGNOSTICS the engine writes and does not read (#414).** They
+  carry the box's `scrollWidth`/`scrollHeight` — its full content extent — and every consumer in the
+  repo is a human or an agent reading the trait through Percept: `contentWidth === viewportWidth`
+  while `countX: 5` is the observation that first said "this view is sized for one page" in #413. No
+  engine code derives anything from them. `entriesSystem` and `scrollApi` use only the **viewport**
+  pair, and a pooled view's own extent is the PADDING `writeLayout` computes from the entry stride,
+  which is a separately-computed quantity. This is deliberate, not an oversight: they are also the
+  intended source for the extent-derived features a pooled view cannot supply — a scrollbar thumb
+  (`viewport / content`), edge fades, a "can this scroll?" affordance, scroll-to-end, near-the-end
+  prefetch, and the upper clamp `scrollByEntry` still lacks — it clamps at `0` only, so a wheel past
+  the last entry arms a request off the end, `consumeEntryRequest` hands that target back, and
+  **this frame's pooled window is planned for a place the view never reaches** before the DOM clamps
+  the offset. The view lands right; the pool spent a frame elsewhere, and nothing in the engine can
+  answer "already at the end" for a caller wanting to grey the arrow out (Court's `level-page`
+  handler clamps for itself with `clampPage`). All of those are `content − viewport`, and on a
+  `UIScrollView` carrying **no** `UIEntries` there is no other source for it.
+  ⚠️ **Scope the measurement to one owning tree before building behaviour on them** — they come from
+  whichever of the two editor mounts fired, which is exactly the mixed-measurement hazard above.
 - **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
   included. This is NOT the same as `isVisible: false`, which stays addressable.
 - **Every pooled instance shares the prefab's authored `sortOrder`**, so ties fall to koota
@@ -1054,7 +2117,9 @@ entry afterwards (`entriesFocus.ts`).
   `resolveMemberPathIn`'s name path: that walker calls an ambiguous segment an ERROR by design,
   which is right for an authored resolver key and wrong here — this path is DERIVED from an
   entity that provably exists, so refusing it would mean declining to re-target focus that is
-  demonstrably sitting somewhere (`level-tile.prefab.json` alone carries three `Num`s). And it
+  demonstrably sitting somewhere (the worked example was `level-tile.prefab.json` carrying three
+  `Num`s — ⚠️ #344 collapsed it to one, so the reasoning stands but that prefab no longer shows
+  it). And it
   must not be **name + ordinal among siblings**, which is the tempting fix and is unsound: that
   order comes from `buildChildIndex` iterating `world.entities`, which is koota's `dense` array,
   which `releaseEntity` maintains by **swap-pop** — destroying any entity moves the world's LAST
@@ -1096,7 +2161,7 @@ So the content child is a **column of auto-width rows**: an auto-width box sizes
 | the scroll box | `overflow`, `scroll-snap-type`, `overscroll-behavior` |
 | `__uiEntriesContent` (column) | the **Y** offset as `padding-top`/`bottom`, and the **Y** gap as `gap` |
 | `__uiEntriesRow` (row, auto width) | the **X** offset as `padding-left`/`right`, and the **X** gap as `gap` |
-| the pooled entry | the resolved entry size in px, `flex-shrink: 0`, and `scroll-snap-align` |
+| the pooled entry | the resolved entry size in px, `flex-shrink: 0`, `margin: 0`, and `scroll-snap-align` |
 
 Three things fall out of the split rather than needing their own rule: `UIElement`'s single `gap`
 field serves both axes (a column's gap is the Y gap, a row's is the X gap); wrap disappears, so
@@ -1109,6 +2174,14 @@ needs; and `padLeading + rendered + padTrailing` lands exactly on `count × stri
 of the authored value — it *is* the authored value resolved (`%` against the live viewport, `0`
 read back from the prefab root), and a definite box is what a `%`-sized prefab root needs once
 its parent is an auto-width row.
+
+⚠️ **The pooled root's margin is zeroed too, for the same reason `flex-shrink: 0` is (#651).**
+`stride = entrySize + gap` is the whole model — every offset above (`padLeading`/`padTrailing`,
+`scrollToEntry`'s px conversion) is `index × stride`. Margin sits OUTSIDE the border box, so an
+authored margin on the entry prefab root would make the REAL on-screen stride
+`entrySize + gap + marginStart + marginEnd`, a term the model never carries — and unlike a single
+intercept, this one is per-entry and compounds linearly with index, drifting every pooled slot
+further off its scroll-snap point the deeper the list goes.
 
 ⚠️ **Two things change the window without moving its origin, and both are in the invalidation
 test.** A viewport RESIZE leaves `first` put while every padding value changes — without that the
@@ -1131,8 +2204,23 @@ DOM, and the reason this paragraph exists.
 nowhere is unspecified. More sharply: a scroll container needs a **definite** cross-axis size,
 and `UIElement.height` defaults to `0` = auto — so an un-anchored scroll view in flex flow grows
 forever and never scrolls, with **no error at all**. Author an explicit height (or anchor the
-view); there is no diagnostic for this yet. Nested scroll views get `overscroll` (which only
-governs chaining) and have no inner-viewport measurement story.
+view); there is no diagnostic for this yet.
+
+⚠️ **Nested scroll views WORK — read the sentence below as a scoped gap, not a prohibition.** A
+horizontal snap pager whose pages are each their own vertical scroller was proved to work, both in
+the editor (driven programmatically: the inner card reached `scrollTop 101` fully scrolled while the
+outer pager landed exactly on page 3, `scrollLeft 704` = 2 x 352, snapping intact) and **on device**
+(iPhone 8 / iOS 16.7, owner-confirmed by finger in Mobile Safari, "it works well") — `games/wordweave`'s
+dictionary panel ships exactly this shape. The outer pager needs `overscroll: 'contain'` (the field
+that stops the inner scroller chaining out to the page swipe) and the definite cross-axis size the
+paragraph above already requires. The one real gap is narrower than it reads: nested scroll views get
+`overscroll` (which only governs chaining) and have no inner-viewport measurement story — meaning
+the ENGINE's `UIScrollView.viewportHeight`/`contentHeight` read-back is not wired for the INNER view,
+which matters only if you want scroll-hint chevrons or want to drive `UIEntries` pooling off the
+inner scroller's own scroll position. A plain inner scroller holding a block of content needs
+neither and has no open question. (One real trade worth knowing going in: a pager forces UNIFORM
+page size — equal stride is what makes snapping and pooling work — so a paged panel cannot hug each
+page's own content height; that is a feel trade, not a bug.)
 
 ### Open questions
 
@@ -1440,6 +2528,89 @@ UI font ref is followed by the same walk as every other ref (and its family's ot
 with it). What remains is a family named from a place no static scan can read — a stylesheet or a
 runtime code string — which is what `shipSource: 'always'` exists for.
 
+#### Registration is not application: where a scene's UI font is APPLIED (#803)
+
+The two subsections above answer "is the face loaded" — REGISTRATION. This one answers a different
+question they cannot: "does anything on screen ask for it" — APPLICATION. A face can be fully
+registered, correctly mapped, and still render nothing anywhere, because nothing on a node's
+ancestor chain names it.
+
+**`UIRenderer` mounts every UI-layer ROOT entity** (`EntityAttributes.layer === 'ui'`,
+`parentId === ''`) **as a SIBLING inside one shared container div** (`runtime/ui/UIRenderer.tsx`).
+CSS `font-family` inheritance follows the DOM tree, and that tree stops at each root's own
+subtree — a root does not inherit anything from a sibling root, only from the shared container
+above all of them (and, failing that, from `body`).
+
+That mechanism produced a concrete bug in `games/court`: exactly 1 of its 10 UI roots (`Intro`)
+authored a `UIElement.fontFamily`; the other nine (`PurchaseNoticeCard`, `CoinShortfallCard`,
+`BonusModal`, `RulesModal`, `AccountModal`, `AccountDeleteModal`, `ConflictModal`, `BusyOverlay`,
+`StoreModal`) authored none, so each fell through to `body { font-family: system-ui, -apple-system,
+sans-serif }`, set by `engine/app/App.css` — and that inheritance chain ships in the production build,
+not just the editor. `games/wordweave`, by contrast, happened to be correct: it has only 4 UI roots
+and authored the font on all of them by hand. That is not evidence the per-root shape was fine — it
+is diligence standing in for a missing mechanism, and diligence does not scale past a handful of
+roots authored by different people at different times, which is exactly what Court's ten became.
+
+**Why #253/#276 could not have caught this.** Both are about whether a `FontFace` exists in
+`document.fonts` and stays current under re-import — REGISTRATION. This bug's face was loaded,
+current, and correctly resolved from its GUID; the failure was that no CSS declaration on the
+affected nodes' ancestor chain ever referenced that family, which `document.fonts` has no way to
+observe. The only probe that sees it is `getComputedStyle(node).fontFamily` on the actual node in
+question (art.md's rule, unchanged by this fix) — not the registry, and not "is `Intro` correct",
+since `Intro` being correct proved nothing about the other nine roots.
+
+**The fix is a scene-wide default, not a tenth per-root author.** `UISettings` (the existing
+resource-trait singleton, alongside `HapticSettings`/`AudioSettings`) gained `fontFamily` +
+`systemFont` fields, resolved in the UI projection and set on the ONE shared container div —
+so every UI root inherits it unless a root's own `UIElement.fontFamily`/`systemFont` overrides it
+by ordinary CSS cascade. One authored value now backs every root a scene has, present or future,
+instead of a per-root field that a new modal can simply forget to set.
+
+⚠️ **The load-bearing wiring most likely to silently regress — and it is TWO tables in two files,
+which is why the first attempt at this fix wired only one and was dead code.**
+`collectResourceRefsFromEntities` consults `loadSceneFile.ts`'s `SCALAR_RESOURCE_TYPE_BY_FIELD`
+(field → resource TYPE) *only for fields already listed per trait* in `sceneValidation.ts`'s
+`REF_FIELDS_BY_TRAIT` (trait → its ref FIELDS). So both need
+`UISettings.fontFamily`: the type map alone never gets reached, and the field registry alone leaves
+the ref untyped. Miss either and the GUID authored only on `UISettings`
+is never collected as a scene resource, never reaches `loadFontFamilyForRef`, and is never
+FontFace-registered — the field renders as fully authored data in the Inspector while doing
+nothing, the exact "unwired field is a lie with a tooltip" failure CLAUDE.md warns about, and it
+renders IDENTICALLY to the original #803 bug (system-ui everywhere except wherever a root still
+authors its own font).
+
+⚠️ **A second way the same failure can hide**: `SceneManager` acquires a scene's resources from
+BOTH its saved `resources` array (written by the last save) AND a fresh
+`collectResourceRefsFromEntities` pass over the current entities. If the collector's wiring above
+broke, a scene whose `resources` array still carries a stale `{type:'font-family', path:'<guid>'}`
+entry from before the break would keep working at runtime — masking the break entirely — right up
+until the next editor save regenerates `resources` from the (broken) collector and silently drops
+the entry, and with it the font, from every root that depended on the scene-wide default.
+
+⚠️ **The production BUILD is a third, separate wiring — do not assume the two above cover it.**
+`plugins/asset-tree-shaker.ts` walks `REF_FIELDS_BY_TRAIT` too, but it deliberately SKIPS both font
+fields there (`DEDICATED_REF_FIELDS`) and reaches them through its own `'font-family'` handler,
+because the registry's generic `'asset'` push keeps only the ONE file a GUID names — dropping the
+family's other VARIANTS, so an authored `fontWeight: 700` ships as a browser-synthesized fake bold.
+`UISettings.fontFamily` therefore has to be added in BOTH places in that file: the skip set and the
+handler. Measured, not assumed: deleting the `REF_FIELDS_BY_TRAIT` entry leaves all 65 tree-shaker
+tests green while the runtime collector's test reds — the two halves fail independently, so a green
+build gate says nothing about the runtime seam and vice versa.
+
+⚠️ **The saved-`resources[]` masking applies to the BUILD too — but it behaves the OPPOSITE way
+round there, and getting that backwards is easy.** `processSceneOrPrefab` pushes
+`type:'font-family'` from the saved array as well as walking entities, so a scene carrying the entry
+— Court's does — keeps shipping the font with the shaker wiring removed. Unlike the collector case
+above, **that mask never lifts**: a save regenerates the same entry *from* the collector, which is
+wired. So for any scene the editor has saved, a shaker-only break is masked indefinitely, and
+"it still works after a save" says nothing.
+
+What the shaker's own wiring therefore buys is narrower than "Court's font ships": it is the
+independent second guard, the one still standing when the COLLECTOR is what broke and there is no
+`resources[]` entry to fall back on — plus variant-keeping.
+`tests/plugins/assetTreeShaker.test.ts` pins it against a scene whose ONLY font ref is
+`UISettings.fontFamily` and which authors NO `resources[]` entry, which is that shape.
+
 ### MSDF world-text atlases (`Text2D`/`Text3D`)
 
 World-space text renders from a signed-distance-field atlas, not a `FontFace`.
@@ -1476,6 +2647,76 @@ any dispose can interleave — which is exactly why the shared contract, rather 
 Pixi `.then()`, is where this belongs. Pinned by `fontTexturePixi.test.ts` § "a provider disposed
 mid-load must not leave its texture in the cache", which asserts the cache entry, the
 `Assets.unload`, and the contract on both provider classes.
+
+##### The other edge of that contract: a texture destroyed before it is returned (#481)
+
+Immediate-invoke has a second-order consequence, and it cuts the opposite way. The **dynamic**
+(canvas) path in `getDynamicFontTexturePixi` mints a `Texture`, caches it, then registers a
+disposer that evicts it and `destroy(true)`s it. On an already-disposed provider that disposer
+runs **synchronously, before the `return`** — so the function could hand its caller a corpse in
+the same call, and `Scene2D`'s `if (!ptex) continue` did not catch it: **a destroyed `Texture` is
+still truthy.** It went into `makeMtsdfPixiShader` and a `Mesh` that the same pass renders,
+against a `TextureSource` whose GPU teardown had already run.
+
+Guarded on both sides, because they are different contracts: the producer returns `null` when the
+texture it just minted is already destroyed (and evicts a destroyed cache hit, so the function is
+total rather than trusting the disposer's evict-before-destroy ordering forever), and the consumer
+reads `destroyed` as not-ready — `if (!ptex || ptex.destroyed) continue`, the same posture #455's
+fix took in `videoTextureSync2D.detach`.
+
+**Both paths, and the second one is not merely latent.** The dynamic (canvas) path above is the
+one #481 filed, and it *is* latent — every disposer also removes the provider from the `providers`
+map and Scene2D only obtains one via `getLoadedFont`, so no disposed provider has a route to it.
+The **baked/image** path had the same two holes and a describable route:
+
+- Its cache hit (`const existing = cache.get(key)`) returned without a `destroyed` check.
+- Its disposer is registered *inside* the async `.then()`, so on an already-disposed provider it
+  evicts the entry cached one line earlier, and the code then wakes every waiter into an empty
+  cache. **That one is NOT a defect, and the close-out initially "fixed" it and was wrong** — the
+  episode is recorded here because the wrong fix is the intuitive one:
+
+  > Settling those waiters with `wake: false` looks right (there is no texture to draw, same as
+  > the `.catch` path) and is a regression. `waiters` is keyed by the font **GUID**, so it
+  > outlives the provider *instance* while the cache entry does not: the set can hold a waiter
+  > belonging to the live **successor**, because `invalidateFont` disposes P1 and re-acquires P2
+  > under the same guid, and a repaint in that window queues P2's `markDirty` behind P1's
+  > still-in-flight load. Not waking strands that renderer — reproducing the very
+  > "texts are not rendered until I click the entity" bug the waiters set was added to fix. The
+  > `.catch` may settle without waking only because no successor is stranded there; the analogy
+  > between the two paths is false.
+  >
+  > The feared load/unload storm cannot happen either: a woken repaint resolves its provider via
+  > `getLoadedFont(guid)`, and every disposal path deletes from `providers` in the same
+  > synchronous block, so the retry gets the live P2 or no provider at all — never the disposed
+  > P1. Bounded at one iteration.
+
+  The code carries this as a **do-not-change** comment rather than a guard, because the correct
+  behaviour here is the absence of one.
+
+The route into the cache-hit hole runs through `Assets`, not through a disposed provider:
+**`Assets.unload` destroys a texture's source EAGERLY but removes the cache entry asynchronously**
+— measured on a live renderer 2026-08-10 and documented on `evictSourcelessEntry` in
+`pixiTextureLoad.ts`. A re-acquire of the same guid landing in that window (a baked↔dynamic mode
+flip with an unchanged asset hash yields the same `?v=` url) can therefore repopulate this
+module's own cache with a texture the in-flight teardown then destroys. That shim protects
+`Assets.cache`; `fontTexturePixi`'s map is its own, and was not covered by it.
+
+Two entity-level consumers, not one: `Scene2D.tsx`'s per-page loop **and** its readiness gate
+(`if (!getFontTexturePixi(provider, 0, …)) return`), which decides whether the entity renders at
+all. Only the loop was guarded at first. A corpse passing the gate admits the entity to
+`activeIds` and stamps `meshFrameKey` while every page is then skipped — the string renders as
+nothing, and for a **baked** provider that is permanent rather than transient, because
+`BakedFontProvider.atlasVersion` is `readonly = 0` and the loop's "rebuilds on atlasVersion bump"
+consolation can never fire for it.
+
+⚠️ `fontTextureThree.ts` is deliberately untouched and carries a comment saying so. It has the
+same *shape* and none of the hazard: THREE exposes no `.destroyed`/`.disposed` flag, and
+`dispose()` only drops the renderer's cached `WebGLTexture` while `.image` survives, so the next
+bind re-uploads. Porting the Pixi guard there would blank text that renders correctly today.
+
+The test's fake mirrors `BakedFontProvider.addDisposable`'s real disposed-branch exactly. A fake
+that queued the callback instead would have modelled behaviour the real provider does not have,
+and vouched for the bug.
 
 ---
 
@@ -1533,6 +2774,69 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 
 ---
 
+## Dialog dismissal — the house rule for every game
+
+**Owner's ruling, 2026-09-05. This is a cross-game convention, not a per-game style choice** — it
+was settled on Court (#722) and applies to any modoki game that puts a dialog over the screen.
+
+1. **Pressing the ✕ dismisses the dialog.**
+2. **Tapping outside the dialog dismisses it — UNLESS the dialog has an explicit dismiss button of
+   its own besides the ✕.**
+3. **Do not put an ✕ on a dialog that already has a dedicated dismiss button.**
+
+The shape underneath the three rules: the ✕ is the *explicit* affordance, tapping outside is a
+*convenience shortcut*, and a dialog that exists to make the player decide something gets neither
+shortcut nor a second way to say "no". A destructive confirm therefore has exactly two exits, both
+of them worded and deliberate.
+
+⚠️ **A tap on the dialog BODY must do nothing** — it is neither the ✕ nor "outside". This is the
+part the engine cannot yet express cleanly: see the gap below before you author it.
+
+### Why a dialog body dismisses today, if nothing is done about it
+
+`UINode.tsx` treats a node as interactive only if it carries a click binding — `isInteractive` is
+unchanged by #728 — but a SEPARATE flag now also earns the same click plumbing:
+
+```ts
+const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
+const swallowsClicks = node.swallowClicks === true && !node.pointerThrough;
+const takesClick = isInteractive || swallowsClicks;
+```
+
+⚠️ The `!node.pointerThrough` half is load-bearing and CSS cannot express it — `pointer-events: none`
+stops this node being hit-tested but does not remove it from the event path of a click starting on a
+descendant with `auto`. It was added in #728's close-out, after this block had shipped without it.
+
+`e.stopPropagation()` in the click handler, and the #664 press-origin stamp, now key off
+`takesClick`, not `isInteractive` alone — so a node with `UIElement.swallowClicks` gets both
+without carrying any `UIAction` binding at all (and without the finger cursor, the click cue, or the
+input lock `isInteractive` also implies — see the next section). A panel with **neither** a
+`UIAction` **nor** `swallowClicks` is still *transparent*: a tap on the dialog body bubbles to the
+scrim behind it and triggers the scrim's dismiss. Authoring the panel with neither is not "no
+behaviour" — it is "the scrim's behaviour".
+
+⚠️ **Both halves are needed, and neither is sufficient alone** (measured live in wordweave, #662/#664):
+- a **swallow** on the panel body fixes the plain TAP;
+- the **press-origin gate** (`runtime/ui/pressOrigin.ts`) fixes the SWIPE that presses inside the
+  panel and releases on the scrim — the browser resolves that click to the common ancestor, so the
+  panel's own handler never runs and a swallow cannot see it.
+
+### The swallow is `UIElement.swallowClicks` — do not hand-roll it (#728)
+
+**The gap this section used to describe is CLOSED.** `UIElement.swallowClicks` is the supported way
+to make a container swallow a tap without being a button: it stops propagation and stamps the press
+origin directly, with no `UIAction` binding at all.
+
+The retired workaround — giving the container a no-op `call` binding — should not be authored
+anymore, and the reason it was bad is worth keeping even though the workaround itself is gone:
+`bindings.ts` charges every discrete activation the same way whether or not the handler does
+anything, so a no-op binding took the global input lock (`UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS`,
+300 ms) and fired the click cue for nothing. A hand-rolled swallow made **the middle of a dialog
+play the button click sound**, and swallowed the next discrete tap for 300 ms — a control tapped
+straight after the body read as dead. `swallowClicks` takes neither the lock nor the cue, because it
+never routes through `applyBindings`. Sliders are unaffected either way — a range drag is
+`continuous` and takes neither the lock nor the cue.
+
 ## Quick reference
 
 | Concern | Where |
@@ -1543,6 +2847,8 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 | Tree build + dirty flag | `runtime/ui/uiTreeStore.ts` (`buildTree`, `markUIDirty`, `uiTreeProjection`) |
 | Selector hook | `runtime/ui/useUIEntities.ts` |
 | Action registry + engine built-ins | `runtime/core/actionRegistry.ts`, `runtime/actions/engineActions.ts` |
+| Global input lock + its authored settings | `runtime/ui/bindings.ts` (`applyBindings`), `runtime/traits/UISettings.ts` |
+| UI-busy-source registry (the lock's third gate) | `runtime/core/uiBusySources.ts` (`registerUIBusySource`) |
 | Binding resolver | `runtime/ui/bindingResolver.ts` |
 | Anchor math | `runtime/ui/anchorLayout.ts` |
 | Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/ui/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |

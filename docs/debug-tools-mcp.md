@@ -340,6 +340,73 @@ host — a first-wins plugin refuses an extra client by dropping the socket with
 byte-for-byte what a dead device end looks like through a forward — so `explainConnectFailure` names
 both rather than guessing, and the connect no longer keeps its hardware claim when it fails.
 
+⚠️ **The #164 release is guarded on a generation counter, and the guard is one line from being
+silently disabled (#506).** `connect()` ends with
+`if (landed !== 'connected' && generation === this.sessionGeneration) this.releaseClaim();`, and
+`sessionGeneration` is bumped by `disconnect()` **as well as** by `connect()`. Since `connect()`
+calls `await this.disconnect()` at its own head, **the capture must sit BELOW that teardown.** Move
+it back above — which reads like a harmless tidy-up, since "bump at the head of every connect" is
+what the field originally meant — and the capture is stale on *every* connect rather than only a
+raced one, so the comparison can never be true and #164's release never fires again.
+
+Nothing errors when that happens. Failed connects simply stop handing the hardware back, the
+machine-wide claim stands, and the retry is refused as busy **naming this very clone** — so the
+caller's own dead attempt looks exactly like a sibling clone hogging the phone, which is the single
+most misleading shape this subsystem can fail in. `deviceConnectionReentrancy.test.ts` carries a
+regression test whose only job is to fail if the capture moves.
+
+**A superseded continuation must never reclaim the adb forward.** The same #506 fix originally
+unwound a superseded rediscovery with `adbRunner.removeForward(port, serial)`, which review caught
+before it shipped. `port` is the per-clone host-port **constant** and `removeForward` is
+host-port-scoped, with an ownership check that *passes* for a same-manager supersede — so the loser
+tore out the **winner's** live tunnel. The end state is the worst kind: manager, claims file and
+editor panel all report `connected` while every `device_*` call fails, the reconnect loop retries a
+dead port forever, and the claim is still held so no sibling clone can take the phone either.
+Reclaiming a forward belongs to whoever OWNS the session — `disconnect()` already does it for its
+own — never to a stale continuation.
+
+**`disconnect()`'s teardown order satisfies three pulls at once (#527/#506).** Every write to
+manager state (`client`, `transport`, `target`, `claimedDeviceId`, …) happens **before** the one
+`await client.disconnect()`, so a teardown suspended there can never clobber a newer `connect()`'s
+already-published session — before #527 the nulling ran only after that await resolved, so a
+resumed teardown wiped whatever a newer connect had installed by then, orphaning a lease socket
+`disconnect()` could never reach again (it only ever hangs up `this.client`). The machine-wide
+**claim**, though, is held ACROSS the hangup on purpose — `releaseDevice()` runs only after it. An
+early release would empty the claims file while `DeviceLeaseAuthority` still records this guid as
+live owner, so a sibling passes the #149 claim gate and reaches `{ok:false, reason:'busy'}` —
+documented as needing a human, not a retry — for up to `REQUEST_TIMEOUT_MS` (5s) plus
+`LEASE_GRACE_MS` (5s). Holding the claim instead refuses the sibling at the claim level, naming the
+clone that holds it — the good failure #149 exists to produce. `adbRunner.removeForward` runs
+after the hangup but *before* the claim is handed back: a sibling that re-claimed and re-forwarded
+the same host port to the same serial would otherwise pass `removeForward`'s ownership check, and
+a later removal here would strip its live rule instead of ours.
+
+The release is additionally gated on **ownership**, not merely on holding a claim id:
+`releaseDevice` drops by `(deviceId, pid)`, not by guid, and every `DeviceConnectionManager`
+session in the backend shares one pid — so a stale continuation holding the *old* `claimId` in a
+local can still call `releaseDevice(claimId)` after a newer `connect()` on the same manager has
+re-claimed that same device. `disconnect()` guards this with `this.claimedDeviceId !== claimId`
+(a newer claim → skip), not a generation check — a generation check is wrong here because a second
+bare `disconnect()` (no reconnect after) has its own `claimId` already null and would wrongly skip
+releasing a still-valid claim.
+
+⚠️ **#527's own premise turned out to be wrong, and it is worth recording so it doesn't get
+re-hunted.** The issue blamed the un-gated publish of `this.transport`/`this.client`/`this.target`
+in `connectInner` (before its own `await client.connect()`) — but that shape is already safe: a
+second `connect()` landing while the first is suspended there is handled, because the second's
+head `await this.disconnect()` hangs up the first's mid-handshake client. The real defect was in
+`disconnect()`'s field-write ordering, above. The negative result is pinned as a regression test —
+`deviceConnectionReentrancy.test.ts` › "two racing connect() calls (#527)" › "a second connect()
+landing mid-handshake leaves no orphaned socket" — precisely so this shape does not get
+re-investigated.
+
+Also: `connect()` now **joins** an in-flight identical request rather than starting a second
+attempt (keyed by `connectRequestKey`) — the trigger, per the `sessionGeneration` docblock, is an
+agent retrying a slow `device_connect`. Scoped to an identical request on purpose; a differing
+request (a genuine re-target) still races straight through. The key treats an *omitted*
+`useAdb`/`serial`/`port` as distinct from every explicit value (including explicit `null`/`''`),
+because `connectInner` branches on `=== undefined` for each of those fields.
+
 **When the OPEN PROJECT ships `build.debugBuild: false`, the message says so first (#239)** — that
 flag means no TCP server was compiled in, which explains "nothing is listening" outright, and the
 advice below (reopen the project so heal syncs the flag) *cannot work* while the flag is off,
@@ -384,7 +451,7 @@ that cannot contain the answer:
 |---|---|---|
 | Where it reads | `OSLogStore(.currentProcessIdentifier)` **inside the app** (`GameDebugPlugin.swift`), logcat in-process on Android | **host-side**: `ios syslog` over USB (iOS) / `adb logcat -d` (Android) |
 | Direction | **backward** — a query over stored logs, `seconds` looks back | **iOS: forward** (a stream; `seconds` is how long it captures, and you wait it out). **Android: backward** (a ring-buffer dump; `seconds` is ignored) |
-| Needs | the app running **and** the debug lease connected | nothing: no lease, no claim, app may be dead or uninstalled |
+| Needs | the app running **and** the debug lease connected | no lease, no claim; app may be dead or uninstalled. ⚠️ Not *required* is not *ignored*: a lease that IS held and names a different phone is respected — see "Which iPhone these two ops read" |
 | Sees | only this process's own logging | everything the device logs, including what the system says *about* us |
 
 ⚠️ **That direction split is real, not an inconsistency to smooth over.** logcat is a ring buffer
@@ -441,6 +508,37 @@ includes **`<pkg>:sub` processes**, because a Capacitor game's WebView runs in i
 Deliberately not used: `adb bugreport` (tens of MB, a minute-plus, for a superset that mostly does
 not answer "why did my app die") and `/data/tombstones` (root-only on a production device).
 
+### Which iPhone these two ops read (#670)
+
+`device_native_logs source:'system'` and `device_crash_reports` are host-side and can read ANY
+attached iPhone, not just the leased one. Getting this wrong looks exactly right — the same-shaped
+log/report comes back, just about the wrong device. `pickGoIosDevice` (`goIosDevice.ts`) picks, in
+order:
+
+1. `MODOKI_IOS_DEVICE_UDID` — wins even over a contradicting lease.
+2. A lease naming a hardware model → the attached device whose `ProductType` confirms it. If every
+   attached device is identified and none confirms → **refuses**, naming the lease's model and
+   every candidate, rather than reading the wrong phone.
+3. Exactly one candidate that could not be identified at all (the info probe returned no
+   `ProductType`) → used, with an `unverified` field on the response — a device that cannot be
+   described can never be confirmed, but must never be treated as a contradiction either.
+4. A lease that reports no hardware (a bridge older than #146) → guesses from what's attached,
+   also flagged `unverified`.
+5. No lease at all, one attached device → used with no warning, exactly as before — no lease means
+   no wrong-phone risk.
+
+⚠️ **An `unverified` field means the answer is about "the phone that happened to be attached," not
+provably the leased one.** Weigh a log/crash-report answer accordingly when you see it — both
+`device_native_logs` and `device_crash_reports` render it as a `[⚠️ …]` line prepended to the reply
+text, so it isn't an HTTP-body-only field you'd otherwise have to know to check.
+
+⚠️ **No lease is not the same as a contradicting lease.** With no lease at all, one attached iPhone
+answers as cleanly as it always has (case 5 above). With a lease naming a DIFFERENT model, these ops
+now refuse instead of silently reading that phone — don't read "needs no lease" (the table above) as
+"never consults the lease."
+
+This is unit-tested (`pickGoIosDevice`'s own test suite), not confirmed against two live iPhones.
+
 ### Which phone a host-side op talks to — ask the TRANSPORT
 
 On Android these read through `adb`, targeted by the LEASE's serial when there is one, else the
@@ -456,10 +554,12 @@ asking Apple's tools whether go-ios can reach something is asking the wrong part
 The rule generalises: **resolve a device through the transport the op will use.** A build still
 resolves through `devicectl`/`xctrace` — correctly, because `xcodebuild` targets *that* listing.
 
-Selection order is the usual one: `MODOKI_IOS_DEVICE_UDID` → the only attached device → the one
-whose `ProductType` matches the leased app's reported model (the lease never learns a UDID by
-design, #146) → **refuse, naming every candidate**. Reading logs off the wrong phone produces a
-confidently wrong answer that looks right.
+Which device, once the transport is settled, is **"Which iPhone these two ops read" above** — not
+repeated here. That order used to be written out in this paragraph as *"pin → the only attached
+device → the one whose `ProductType` matches"*, and the middle step was the #670 defect itself: the
+count shortcut ran **before** the lease was ever consulted, so one iPhone on USB was returned
+whatever the lease said. Reading logs off the wrong phone produces a confidently wrong answer that
+looks right, which is why the lease is now consulted first and a contradiction is refused.
 
 **The same rule binds the PLATFORM, and that was a real defect** (close-out review). These ops exist
 for when the app has died — which is exactly when the lease is gone and cannot say what platform it
@@ -585,7 +685,7 @@ Two mechanisms now close it, and they are deliberately different in reach:
 
 - **`engine/scripts/device.mjs`** — a standalone CLI (`npm run device:claim|release|list|run`) that
   takes the SAME machine-wide claim the editor does. It is the universal path: it works for a human
-  in a terminal, for Codex/Cursor/Antigravity, and inside scripts. Because a CLI process exits
+  in a terminal, for tooling that is not a Claude session, and inside scripts. Because a CLI process exits
   immediately, its claim cannot be pid-owned — it carries an **owner token** (`cli:<clone path>`) and
   is expired purely by a **90-minute TTL**, far shorter than the pid-claim's 12h backstop for the
   reason spelled out on `CLI_CLAIM_TTL_MS`: a pid-claim has a second, independent expiry and an
@@ -598,6 +698,10 @@ Two mechanisms now close it, and they are deliberately different in reach:
   `npm run device:claim <id>` so the remedy costs one command. Read-only calls (`adb devices`,
   `getprop`, `logcat -d`, `devicectl device info`) are always allowed — the claim arbitrates
   interference, not curiosity, and a guard that refused listings would be routed around.
+
+A different `PreToolUse` hook, `engine/scripts/context-cost-guard.mjs`, warns (never blocks) on a
+large unbounded `Read` or an unbounded verbose `Bash` call — see
+[docs/agent-context-cost.md](./agent-context-cost.md).
 
 ⚠️ **Wireless adb: the TRANSPORT verbs are carved out, because the fail-safe default was
 unsatisfiable for them.** `adb connect` / `disconnect` / `pair` address a device as `HOST:PORT` and
@@ -793,6 +897,19 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   and `list_traits {name:'Transform'}` for the one field schema you need before a `setTrait` (an unknown
   name errors with a did-you-mean rather than an empty object). `all:true` on either forces the full dump.
 
+  ⚠️ **`list_traits` answers from a schema the RENDERER pushes, not from a live query** — so it can be
+  stale in a way no other read is, and it fails by being confidently incomplete rather than by
+  erroring. It served an incomplete registry for months (#459) — not a race: game traits register
+  before engine traits, DETERMINISTICALLY, but with an awaited dynamic import in the gap (a game's
+  own `editorPanels()` hook). The pusher stopped at the first non-empty registry, so opening a game
+  with a slow hook could serve only its game traits forever. `games/sling` is the only game with such
+  a hook and answered with its own 8 traits and `NOT_FOUND` for `Transform` while 94 entities in the
+  loaded scene carried it; `games/3d-test`, which has no hook, always answered with the complete 83.
+  The pusher (`engine/app/debug/schemaPusher.ts`) now polls for the full boot window instead of
+  settling early, re-sending on every trait-set change. **If a trait you can see on an entity is
+  missing here, that is this class of bug again — compare against `get_scene_state`, which reads the
+  live world.**
+
 **Full editor parity (do/see everything a human can — dev AND the DMG).** These give the agent the
 same actions + state a person has in the editor. They relay to the renderer over the SAME bridge
 (Vite HMR in dev, Electron IPC in the DMG), so they behave identically in both:
@@ -826,7 +943,7 @@ same actions + state a person has in the editor. They relay to the renderer over
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
   particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
-  `modoki_reparent_entity`, `modoki_set_selection`, `modoki_gizmo`, `modoki_focus_entity`,
+  `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,
   `modoki_history {undo|redo}`. `modoki_prefab {instantiate|create|detach|overrides|apply|revert}`.
   `modoki_set_transform` sets position/rotation/scale in ONE call (partial merge) and — unlike a
   plain `setTrait` — routes a prefab INSTANCE's edit into its overrides instead of being silently
@@ -937,6 +1054,21 @@ What that means per tool:
   renormalized, v1 promoted to v2 parts). Reporting that was a real trap: the float32 weights it
   handed back were read as the editor corrupting a rig on load (QA-ASSET-0015), and the actual disk
   churn was somewhere else entirely.
+  ⚠️ **A cache miss must re-check the cache after its disk fetch resolves, not just before it**
+  (#521). `anim-add-key` and `timeline-add-clip` (`engine/app/editor/agentEditorOps.ts`) fall back
+  to fetching the file from disk when the live cache doesn't have it yet — but a cache entry can
+  appear WHILE that fetch is in flight (the human opened the clip/timeline in its panel, or a
+  concurrent op for the same path landed), and that entry is newer than what just came off disk.
+  Both ops re-read the cache after the fetch and rebase onto it if present, falling back to the
+  fetched content only if the cache is still empty. Skipping that second check silently writes
+  `{disk contents at fetch time} + this op's own item` over the concurrent edit, and `save_all`
+  then persists the truncated document.
+  ⚠️ **A live cache entry wins over a FAILED or REJECTING disk fetch too**, not just over a
+  successful one — a missing/unreachable file no longer necessarily fails the op. Both ops catch a
+  rejecting `fetch` (network error, dev server down) the same as a `!res.ok` response, then peek
+  the cache before treating either as fatal: if the panel has the asset open (or a concurrent op
+  landed) the op composes onto that live entry instead of throwing, even though the disk read itself
+  never succeeded.
 - **`write_asset` / `create_asset` / `import_file` / `reimport_asset`** always write. They are
   explicit "write this file" tools, not live-state edits.
 - **The live-world entity/prefab tools** (`create_entity`, `duplicate_entity`, `delete_entities`,
@@ -1111,7 +1243,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
 | `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
-| `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
+| `modoki_get_asset_meta` | GET `/api/asset-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
 | `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
 | `modoki_get_layout_bounds` | GET `/api/layout-bounds` | read-only | editor + renderer | — | *(no args)* |
@@ -1192,14 +1324,10 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
-| `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
 | `modoki_exit_pose_envelope` | POST `/api/editor-action` `exit-pose-envelope` | live | editor + scene | — | *(no args)* |
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
-| `modoki_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
-| `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
 | `modoki_hit_regions` | GET `/api/hit-regions` | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
@@ -1217,9 +1345,13 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_pose_clip` | POST `/api/editor-action` `pose-clip` | live | editor + scene | — | `{"t":0}` |
 | `modoki_profiler` | GET `/api/profiler` *(method varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
-| `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_select_sprite_slice` | POST `/api/editor-action` `select-sprite-slice` | session | editor | — | *(no args)* |
+| `modoki_set_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
+| `modoki_set_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
+| `modoki_set_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
+| `modoki_set_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
+| `modoki_set_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
 | `modoki_set_skin_mode` | POST `/api/editor-action` `set-skin-mode` | session | editor | — | `{"mode":"rig"}` |
 | `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
@@ -1494,7 +1626,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
   **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
   Only errors inside `errorWindowMs` (5 min) gate `ok` — otherwise one benign load-time error sits
-  in the 500-entry ring and pins `ok:false` forever. But everything older is COUNTED and timestamped
+  in the shared console ring (1000 entries in the editor, 512 on a debug device build) and pins
+  `ok:false` forever. But everything older is COUNTED and timestamped
   in `olderErrors {count, oldestTs, newestTs}`, and the summary names it, because for a while the
   window silently DROPPED them: at 30s, boot errors could never be seen (nobody connects a device,
   attaches an agent and asks a question that fast), and `consoleErrors: []` + `ok:true` + "No issues
@@ -1503,27 +1636,179 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   last `errorWindowMs`". Read the rest with `modoki_get_console_logs level=error`.
 
   **On DEVICE it read the wrong buffer entirely, and the window was never what hid boot errors
-  (#157).** There are two console rings — `bridge.ts`'s `consoleRing` (populated on device by
-  `patchConsole()`) and `agentBridge.ts`'s `consoleBuffer` (populated in the editor by
-  `installConsoleCapture()`) — and `diagnose` read the second. That call sits *after*
-  `initAgentBridge()`'s `if (!hot && !bridge) return;`, and a shipped build has no
-  `import.meta.hot` while a phone has no Electron bridge, so on every real device the buffer stayed
-  empty for the life of the process. Measured on a Samsung SM-S901U1: the ring held 5 errors
-  including a `[frameDriver]` stall, and `device_diagnose` answered `ok:true, consoleErrors:0,
-  "No issues detected."` A clean device diagnose was **structurally guaranteed, not observed** — on
-  the one surface CLAUDE.md tells you to run it first, because the Android screenshot is black on
-  WebGPU. The writer now publishes its ring through `app/debug/consoleSource.ts` and the reader asks
-  for it, preferring its own buffer whenever `consoleHooked` (so the editor path is unchanged).
-  Deliberately a seam and NOT a second `installConsoleCapture()`: hoisting that call would patch
-  `console.*` twice on device and carry a second copy of every line, on exactly the low-end hardware
-  whose frame budget is #154. Two things fixed alongside it, both required before a device boot error
-  is actually *readable*: the device now captures `[uncaught]` errors and `[unhandledrejection]`s
-  (those listeners lived only in the skipped block, so a failed dynamic import or a throw in scene
-  loading was silent), and `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)`
-  is the usual way to report a failure, and it was reaching `diagnose` as an empty object.
+  (#157).** At the time, there were two console rings — `bridge.ts`'s `consoleRing` (populated on
+  device by `installDeviceConsoleCapture()`, in `app/debug/deviceConsoleCapture.ts`) and
+  `agentBridge.ts`'s `consoleBuffer` (populated in the editor by its own, identically-shaped
+  `installConsoleCapture()` — deleted in #596/#597 Stage 3a, see below) — and `diagnose` read the
+  second. That call sits *after* `initAgentBridge()`'s `if (!hot &&
+  !bridge) return;`, and a shipped build has no `import.meta.hot` while a phone has no Electron
+  bridge, so on every real device the buffer stayed empty for the life of the process. Measured on a
+  Samsung SM-S901U1: the ring held 5 errors including a `[frameDriver]` stall, and `device_diagnose`
+  answered `ok:true, consoleErrors:0, "No issues detected."` A clean device diagnose was
+  **structurally guaranteed, not observed** — on the one surface CLAUDE.md tells you to run it
+  first, because the Android screenshot is black on WebGPU. The writer now publishes its ring
+  through `app/debug/consoleSource.ts` and the reader asks for it. (The `consoleHooked` flag that
+  used to arbitrate here is gone since #596/#597 — with one shared ring there is no longer a "which
+  buffer" question, and the seam now just carries the device projection.) Deliberately a seam and NOT a second
+  `installConsoleCapture()`: hoisting that call would patch `console.*` twice on device and carry a
+  second copy of every line, on exactly the low-end hardware whose frame budget is #154. Two things
+  fixed alongside it, both required before a device boot error is actually *readable*: the device
+  now captures `[uncaught]` errors and `[unhandledrejection]`s (those listeners lived only in the
+  skipped block, so a failed dynamic import or a throw in scene loading was silent), and
+  `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)` is the usual way to
+  report a failure, and it was reaching `diagnose` as an empty object.
+
+  **The device ring's install itself used to race App.tsx's mount (#591), fixed since.**
+  `installDeviceConsoleCapture()` used to be reachable only through `initDebugBridge()`, behind
+  `main.tsx`'s ASYNC dynamic `import('./debug/bridge')` — React could mount, and run its own mount
+  effects, before that chunk was guaranteed to have resolved, so whether a boot-time log was
+  captured depended on chunk-load speed (the same build caught it on an iPad mini 5 and missed it on
+  a Galaxy S22). `main.tsx` now installs it EAGERLY, from a side-effect import
+  (`./installDeviceConsoleCapture`) placed above `./App.tsx`, so it runs before React's mount effects
+  deterministically rather than racing them — a mount-time line is captured on every launch now, so
+  its absence is finally evidence of something rather than a coin flip. Device-verified on a Galaxy
+  S22 (2026-09-03) with a TEMPORARY probe line added to the installer for the measurement — the
+  shipped build logs nothing at install time, so do not expect a `[console-capture]` line in a real
+  ring and do not read its absence as the install having failed.
+  ⚠️ **It does NOT reach a module-eval log inside App.tsx's graph** — measured on the same run, and
+  the reason is bundling, not source order: rolldown emits the installer in a shared chunk the entry
+  imports after chunks from App.tsx's own graph. The very first lines of a boot still belong to
+  `device_native_logs` (logcat/OSLog), not to this ring.
+
+  **`frameLoop` answers "are frames actually being pumped right now?" structurally, instead of
+  leaving it to a console string (#682).** Both stalls above reached `diagnose` only *because* the
+  frame driver happens to `console.error` — an accidental tell, and one that a loop going `idle`
+  (refCount 0) does not even produce. The block is sourced from `getFrameLoopHealth()`
+  (`runtime/rendering/frameDriver.ts`) and follows the editor's healthy-means-silent convention
+  (`agentEditorOps.ts`'s `frameLoopFields`): absent while `status === 'running'`, present with a
+  ready-to-read `detail` the moment it is not. **A `stalled` or `unrecoverable` loop now fails `ok`
+  and is named in the summary** — `ok:true` above a `frameLoop.status:'stalled'` block was the same
+  self-contradiction the `zeroScale` note already fixed once. Alongside it, `perf.currentFps` comes
+  from `getCurrentFPS()`, which self-zeroes after `STALL_MS`; `perf.frame.fps` is a median over a
+  sample ring that STOPS FILLING when frames stop, so on a dead loop it reports the last healthy
+  value indefinitely. Read `currentFps` when the question is liveness.
+
+  ⚠️ **The same signal now gates INPUT, and the refusal lives at the router, not in the page.** A
+  dead rAF chain means `inputSystem` never samples, so a tap is delivered to the DOM and received by
+  nothing — the transport is `setTimeout`-based and answers happily either way, which made
+  `ok … [input:synthetic]` over a frozen world the worst available reply. The guard sits in
+  `/api/device/request` (`editorBackendRouter.ts`) *before* CDP/WDA discovery, because
+  `tryDeviceCdpInput`/`tryDeviceWdaInput` return before anything in `app/debug/bridge.ts` is
+  reached: a guard in the page would have covered the synthetic path only, and missed `press-key`
+  entirely (CDP dispatches it with no coordinate resolution at all). It fails OPEN on an unreadable
+  reply — an old bridge or a transport hiccup must not block input. Frame-fed READS
+  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `scene_query`, profiler, watch, and the
+  enact/resolve-point ops the trusted routes aim from) carry a staleness note on the existing
+  `warnings` array rather than a new payload shape.
+
+  **The bridge's OWN `[debug-bridge]` chatter is deliberately NOT in this ring**, and that is load-
+  bearing rather than tidiness: one line per `device_tap`/`drag`/`pointer`/`press_key`/`type_text`
+  would let a burst of input ops evict the device ring's whole rolling tail (512 entries, 128
+  pinned, since #596/#597 — a smaller, unpinned 200-entry ring at the time this concern was first
+  written) — the tool doing the reading would erase what you came to read. `bridge.ts`'s `_log`
+  therefore goes through `unpatchedLog` (a pristine
+  `console.log` bound before the patch) and reaches logcat/OSLog only; `_err` stays on live
+  `console.error` on purpose, so bridge FAILURES do land in the ring. Verified on a Galaxy A23
+  (2026-09-03): zero `[debug-bridge]` lines in the ring, app logs all present. ⚠️ This broke once
+  already — the #591 eager install inverted the binding order and put the chatter IN the ring, which
+  read as success in the first device measurement. `deviceConsoleCaptureInstallOrder.test.ts` pins it.
+
+  **#591 was one of FOUR rings with the same defect. #596/#597 collapsed three of them into one,
+  and #626 closed the last gap by folding the fourth in too.** The device ring was fixed in
+  isolation; the other three — `agentBridge`'s `consoleBuffer`, `runtime/debug`'s in-game ring, and
+  the editor Console panel's `logBuffer` — each installed "as early as its own module loads", which
+  reads as eager and is not. Measured in the editor (`games/sling`) with three planted
+  `console.warn` probes: the device ring caught `App.tsx` module eval at nav+276 ms and React mount
+  at nav+305 ms; the other three all began at nav+1462 ms. A **~1.16 s blind window**, holding
+  exactly the failed-dynamic-import / scene-boot-throw class each ring exists to catch.
+  `runtime/core/consoleRing.ts` is now the ONE CAPTURE RING **all four** consumers share —
+  `agentBridge`, `deviceConsoleCapture`, `runtime/debug`, and (as of #626) the editor Console panel
+  itself — are all projections; none of them patches `console.*` or listens on `window` any more.
+  ⚠️ **The old justification for keeping the panel separate does not hold up** — it claimed the
+  panel's lazily-built stacks and its capture-phase resource-load-error handling "aren't modelled by
+  the shared ring." Both turned out to be solvable without a second ring: the capture-phase listener
+  (resource-load errors, plus the ResizeObserver-loop swallow) was a *listener* concern, not a
+  *buffer* one, and moved wholesale to `engine/app/debug/uncaughtCapture.ts` as a second,
+  capture-phase `window` `error` listener registered from the shared ring's own install gate
+  (`engine/app/installConsoleRing.ts`). The lazy call-site stack turned out to be an opt-in the ring
+  itself could carry: `installConsoleRing({ retainCallSite })`, on for `__MODOKI_EDITOR__` only, off
+  on a device — so #154's low-end budget still pays nothing for it. The one genuine cost — retaining
+  a live `Error` per entry — is exactly what that flag gates, nothing more. Verified live on
+  `games/sling`: after the change, the panel showed `18/18` and `modoki_get_console_logs` reported
+  `ringTotal: 18` — the two now agree exactly, closing the gap the divergence measurement above
+  documents. Clearing the panel took it to `0/0` while `modoki_get_console_logs` still reported
+  `ringTotal: 18, dropped: 0` — Clear is a per-consumer watermark (`clearEditorLogs()` in
+  `consoleCapture.ts`), not a truncation of the shared ring, so the other three consumers' history
+  survives it.
+  ⚠️ Not the ONLY code touching `console.*` anywhere: `globalErrors.ts`'s Crashlytics mirror and two
+  temporary noise filters (`warnSuppress.ts`, `warnFilter.ts`) wrap `console.error`/`warn` for
+  reasons that have nothing to do with capture and feed none of these rings — see
+  [mcp-response-budget.md](./mcp-response-budget.md)'s console-producer note for the citations.
+
+  **#633 — and even an EAGER install is not early enough in a BUNDLED build.** #596/#597 moved the
+  ring's install to a side-effect import above `./App.tsx` in `main.tsx`, which is the earliest
+  construct source order offers. It still missed a top-level `console.info` in `games/sling/game.ts`.
+  ⚠️ **The cause is NOT chunk reordering**, which is what the issue and
+  `installDeviceConsoleCapture.ts`'s own comment both claimed: rolldown **inlines** all four
+  side-effect module bodies into the ENTRY CHUNK's body, and by ES semantics an entry body runs only
+  after every static import has evaluated. The bundler converts the side-effect IMPORT — the one
+  construct `main.tsx`'s `import './installDeviceConsoleCapture'` says runs early enough — into a
+  body STATEMENT, which those same comments say is too late. Measured on a `--target web` build:
+  install call at entry byte ~188k, last static import ends at ~4.7k, the game's chunk is
+  import #25 of 25.
+  - **A wrong theory worth keeping:** "trim the installer's imports so the bundler stops deferring
+    it." The install graph is already minimal (`consoleRing` → `clock`) and trimming changes nothing,
+    because the body still runs last. Any fix that depends on chunk-assignment behaviour is a fix a
+    future bundler change reopens silently.
+  - The fix is the inline `<script>` in `engine/index.html` (`modoki:early-console:*` markers) — the
+    only thing no emitted chunk can precede. `engine/plugins/earlyConsoleShim.ts` strips it wherever
+    the ring gate is false, so a release build carries no buffer nothing drains.
+  - ⚠️ **It DISARMS, it never unwraps.** By drain time `installGlobalErrorHandlers` has wrapped
+    AROUND the shim (measured: globalErrors patches first, the ring second), so restoring the
+    original `console.*` would clobber that wrapper and silently stop Crashlytics console reporting.
+    The issue prescribed the unwrap; it would have been a regression.
+  - ⚠️ **The shim stamps each line at CALL time.** Replaying them through the ring's own clock would
+    give every boot line the DRAIN timestamp — collapsing exactly the nav+ms table above onto one
+    value while looking plausible. A bad measurement is worse than no measurement.
+  - ⚠️ **This cannot be reproduced or verified in the dev editor.** Vite serves unbundled modules, so
+    source order holds and the defect does not exist there. A green dev run is not evidence; it takes
+    a real `--target web`/native build plus a probe.
+
+  ⚠️ **The method matters more than the fix: a missing log is only evidence if something else caught
+  it.** The device ring recording all three probes on the same boot is what turned "the buffer looks
+  short" into a measurement. Without that positive control, an empty ring and a probe that never ran
+  are indistinguishable — the same trap `modoki_capture_viewport` sets for render bugs.
+
+  ⚠️ **A wrong theory worth keeping**, because the code still invites it: #597 argued the in-game ring
+  was "the latest of the three by a wide margin" because `App.tsx`'s `DebugMenu` reaches it through
+  `lazy(() => import('@modoki/engine/runtime/debug'))`. It is not — it was **tied** with agentBridge's.
+  `editor/rendering/GameView.tsx`'s `import { DebugMenu } from '../../runtime/debug'` imports
+  that same barrel **STATICALLY**, so in the editor it was never lazy at all. Two import paths
+  to one module, and only one of them was read.
+
+  Three traps this fix had to route around, each of which passed a test first:
+  - **A shared ring must not be gated more narrowly than any consumer it serves.** Backfilling from
+    the device ring — the obvious design — is INERT in a debug WEB build, where the device gate
+    (`__MODOKI_DEBUG_BUILD__ && isNativePlatform()`) is false while the in-game ring is present. The
+    eager installer carries its own union gate, and `deviceConsoleCaptureInstallOrder.test.ts` pins
+    that it is deliberately NOT byte-identical to the bridge's.
+  - **Never route a synthetic ring entry back through `console.error`.** `globalErrors.ts`'s
+    `installGlobalErrorHandlers` wraps it for Crashlytics, and `captureConsoleError` dedups only
+    on a sole `Error` OBJECT, so a synthetic STRING files a SECOND issue per uncaught fault — the
+    "two issues per fault" regression `alreadyReported`'s comment measures.
+    `recordConsoleRingEntry()` writes straight in.
+  - **Clear is a per-consumer watermark, never a truncation.** The in-game Console tab's Clear button
+    would otherwise wipe the buffer behind `modoki_get_console_logs`/`diagnose` — on device, the only
+    usable log surface — so a human tidying a screen would destroy the agent's evidence.
+
+  **Sizing: a pinned boot prefix, not just a bigger buffer.** The first 128 entries are never
+  evicted; the rest rolls. No cap survives an error loop, and an error loop is precisely when the
+  boot lines are wanted, so size alone cannot deliver the guarantee. 1000 entries in the editor, 512
+  on a debug device build (matching the 200+300 it replaced).
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
   same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
-  `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the
+  `ringTotal`+`byLevel` (the WHOLE ring — 1000 entries in the editor, 512 on a debug device build
+  since #596/#597 — regardless of the filter). That last part is the
   point — a `level:'warn'` read still tells you whether any errors exist. It used to build the
   histogram over the already-filtered array, so "are there errors?" answered *no* (S3.8). Error
   entries carry full stacks, so the whole ring can exceed 20k tokens.
@@ -1576,7 +1861,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     screen rect. Prefer `guid`: runtime ids are reassigned on every scene reload. A `name` matching
     several entities is **refused**, not first-matched.
     - ⚠️ **A 2D/3D aim REQUIRES `surface`** (`game-3d` | `game-2d` | `scene-view`) — a UI aim
-      refuses it. One entity is often on screen more than once: with the Scene and Game panels both
+      accepts it too, and it becomes REQUIRED once that entity resolves to more than one DOM node
+      (the editor mounts a UI renderer in both the Scene panel's preview frame and the Game panel).
+      One entity is often on screen more than once: with the Scene and Game panels both
       open, `Scene3D` and `SceneView` each measure every 3D entity through their own camera
       (measured: `47x45 at (755,312)` vs `496x372 at (76,-63)`, same id, both `onScreen`). It is
       required **even when only one viewport has it**, because otherwise the call succeeds without
@@ -1667,9 +1954,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   handle is `offScreen`, `modoki_scroll` the panel until it's aimable rather than silently missing.
 - **Openers/mode-setters that unblock editors trusted input can't reach** (a native `<select>` popup or
   a modal that only mounts when its tab/asset is active is a separate OS layer `sendInputEvent` can't
-  touch): `modoki_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
-  only live in `ui`/2D mode), `modoki_collider_edit {on}` (the toolbar "Points" toggle),
-  `modoki_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
+  touch): `modoki_set_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
+  only live in `ui`/2D mode), `modoki_set_collider_edit {on}` (the toolbar "Points" toggle),
+  `modoki_set_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
   views, and only **Curves** publishes `curves:key:*` and the tangent handles `curves:tan:in|out:*` —
   the default is Dopesheet, so `modoki_handles editor=curves` is empty until you switch, which reads
   as "this clip has no tangents"; it does NOT open or reload a clip, unlike
@@ -1695,6 +1982,17 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   → `modoki_history undo` to revert. Registry twin of `screenBounds.ts`:
   `runtime/rendering/interactionHandles.ts` + `app/debug/handlesDump.ts`; raw modalities in
   `engine/electron/rendererOps.ts`; DnD synth in `engine/app/debug/domDnd.ts`.
+
+### Aiming — why `surface` is mandatory, and what `occlusionScope` can actually see
+
+The rationale lives in exactly two places already — the `entity`-aiming bullets above (this
+section, "A 2D/3D aim REQUIRES `surface`" and "`occlusionScope` qualifies `occluded`") and,
+canonically, [docs/enact.md](enact.md) (`### `surface` — WHICH on-screen copy of the entity`,
+`### A covered aim is refused on EVERY scope (2026-08-19)`). This heading exists only so the trimmed tool
+descriptions in `engine/tools/modoki-mcp/src/shapes.ts` — paid on every `tools/list` request, see
+`docs/mcp-response-budget.md` § "Definition surface" for the measured cost — have a stable link
+(#456) to the "why" they no longer carry in full. Read those two locations — this section carries
+no separate content of its own.
 
 ## Electron CDP (when the MCP/Percept surface can't answer)
 

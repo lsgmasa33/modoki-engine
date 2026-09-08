@@ -8,7 +8,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { CSSProperties } from 'react';
-import { applyAnchorStyle, type AnchorCssData } from '../../src/runtime/ui/anchorCss';
+import { applyAnchorStyle } from '../../src/runtime/ui/anchorCss';
 import { resolveAnchorRect, isSizeInert, type AnchorData, type SafeAreaPx } from '../../src/runtime/ui/anchorLayout';
 
 const VPW = 400, VPH = 800, ELW = 100, ELH = 40;
@@ -117,7 +117,7 @@ function resolveCssRect(style: CSSProperties): { x: number; y: number; w: number
   return { x, y, w: rw, h: rh };
 }
 
-function cssRect(a: AnchorCssData) {
+function cssRect(a: AnchorData) {
   const style: CSSProperties = {};
   applyAnchorStyle(style, a);
   return resolveCssRect(style);
@@ -247,13 +247,13 @@ describe('UIAnchor CSS ↔ pixel-rect parity (F4)', () => {
 describe('isSizeInert agrees with the CSS path that clears the authored size', () => {
   it.each(MODES)("'%s': width inert ⇔ applyAnchorStyle drops the CSS width", (mode) => {
     const style: CSSProperties = { width: ELW, height: ELH };
-    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorCssData);
+    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorData);
     expect(isSizeInert(mode, 'width')).toBe(style.width === undefined);
   });
 
   it.each(MODES)("'%s': height inert ⇔ applyAnchorStyle drops the CSS height", (mode) => {
     const style: CSSProperties = { width: ELW, height: ELH };
-    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorCssData);
+    applyAnchorStyle(style, anchorData({ anchor: mode }) as AnchorData);
     expect(isSizeInert(mode, 'height')).toBe(style.height === undefined);
   });
 

@@ -24,6 +24,7 @@ public final class OtaCoreSelfTest {
   private static final String[] VECTOR_FILES = {
     "test-vectors/ota-golden-vectors.json",
     "test-vectors/ota-gate-vectors-phase3.json",
+    "test-vectors/ota-subgame-vectors-553.json",
   };
 
   public static void main(String[] args) throws Exception {
@@ -51,6 +52,23 @@ public final class OtaCoreSelfTest {
       }
       total += scenarios.size();
     }
+
+    // Its OWN loader/runner, deliberately separate from the loop above — this vector file
+    // has a different shape (expected/actual/expect, no op/bundle/state, no constants
+    // block) and is NOT in VECTOR_FILES; see that file's header comment.
+    total += runStageVerifyVectors(root);
+
+    // Same deal — state/bundle/onDisk/expect.prune, no `op`, no `constants`, NOT in
+    // VECTOR_FILES; see ota-prune-vectors.json's header comment.
+    total += runPruneVectors(root);
+
+    // Same deal — state/shellName/expect.bundlesToPrune, no `op`, no `constants`, NOT in
+    // VECTOR_FILES; see ota-bundles-to-prune-vectors.json's header comment (F2).
+    total += runBundlesToPruneVectors(root);
+
+    // #571 anti-rollback — self-contained checks, no vector file (a new, small pure
+    // function; see OtaCoreTests.swift's twin assertions for the same contract).
+    total += runRecordSeqChecks();
 
     if (failures > 0) {
       System.err.println(failures + " scenario(s) FAILED");
@@ -127,8 +145,25 @@ public final class OtaCoreSelfTest {
       check(name, "target", expected, result.target);
       checkState(name, expect.get("state"), result.state);
     } else if ("confirm".equals(op)) {
-      OtaCore.State result = OtaCore.confirm(state, bundle);
+      // `version` absent = the shell's unversioned confirm (every Phase 1 vector); present =
+      // the #553 versioned one. One call serves both, so back-compat rides the same corpus.
+      OtaCore.State result = OtaCore.confirm(state, bundle, (String) raw.get("version"));
       checkState(name, expect.get("state"), result);
+    } else if ("loadFailed".equals(op)) {
+      String dispositionRaw = (String) raw.get("disposition");
+      OtaCore.LoadFailure disposition;
+      if ("fatal".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.FATAL;
+      else if ("transient".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.TRANSIENT;
+      else if ("notEvidence".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.NOT_EVIDENCE;
+      else throw new RuntimeException("unknown disposition " + dispositionRaw);
+      OtaCore.BootResult result = OtaCore.loadFailed(state, bundle, (String) raw.get("version"), disposition, folderExists);
+      @SuppressWarnings("unchecked")
+      Map<String, Object> expectTarget = (Map<String, Object>) expect.get("target");
+      OtaCore.Target expected = "embedded".equals(expectTarget.get("kind"))
+        ? OtaCore.Target.embedded()
+        : OtaCore.Target.version((String) expectTarget.get("name"), (String) expectTarget.get("version"));
+      check(name, "target", expected, result.target);
+      checkState(name, expect.get("state"), result.state);
     } else if ("resetForNewBinary".equals(op)) {
       String currentBinaryVersion = (String) raw.get("currentBinaryVersion");
       OtaCore.State result = OtaCore.resetForNewBinary(state, currentBinaryVersion);
@@ -146,7 +181,10 @@ public final class OtaCoreSelfTest {
     Map<String, Integer> confirmedBoots = intMap((Map<String, Object>) obj.getOrDefault("confirmedBoots", new HashMap<>()));
     Map<String, List<String>> rejected = stringListMap((Map<String, Object>) obj.getOrDefault("rejected", new HashMap<>()));
     String lastSeenBinaryVersion = (String) obj.get("lastSeenBinaryVersion");
-    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion);
+    // Absent (no vector fixture sets this yet) parses as 0 — same "never seen anything"
+    // contract OtaPlugin.java's jsonToState follows (#571).
+    int highestSeenSeq = obj.get("highestSeenSeq") instanceof Number ? ((Number) obj.get("highestSeenSeq")).intValue() : 0;
+    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, highestSeenSeq);
   }
 
   @SuppressWarnings("unchecked")
@@ -180,6 +218,156 @@ public final class OtaCoreSelfTest {
     @SuppressWarnings("unchecked")
     OtaCore.State expected = stateFromJson((Map<String, Object>) expectStateRaw);
     check(scenarioName, "state", expected, actual);
+  }
+
+  // ---- Stage verification (#556) ----
+
+  /** Loads + replays ota-stage-verify-vectors.json against OtaCore.verifyStagedFiles.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runStageVerifyVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-stage-verify-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-stage-verify-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      Map<String, String> expected = stringMap((Map<String, Object>) raw.get("expected"));
+      Map<String, String> actual = stringMap((Map<String, Object>) raw.get("actual"));
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      OtaCore.VerifyProblem result = OtaCore.verifyStagedFiles(expected, actual);
+      String kind = (String) expect.get("kind");
+      switch (kind) {
+        case "ok":
+          check(name, "verify", null, result);
+          break;
+        case "missing":
+          checkVerifyProblem(name, OtaCore.VerifyProblem.missing((String) expect.get("path")), result);
+          break;
+        case "unexpected":
+          checkVerifyProblem(name, OtaCore.VerifyProblem.unexpected((String) expect.get("path")), result);
+          break;
+        case "hashMismatch":
+          checkVerifyProblem(
+            name,
+            OtaCore.VerifyProblem.hashMismatch((String) expect.get("path"), (String) expect.get("expectedHash"), (String) expect.get("actualHash")),
+            result
+          );
+          break;
+        default:
+          throw new RuntimeException("unknown expect.kind " + kind);
+      }
+    }
+    return scenarios.size();
+  }
+
+  // ---- Prune (#563) ----
+
+  /** Loads + replays ota-prune-vectors.json against OtaCore.pruneVersions.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runPruneVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-prune-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-prune-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      String bundle = (String) raw.get("bundle");
+      List<String> onDisk = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) raw.get("onDisk")) onDisk.add((String) v);
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      List<String> expectedPrune = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) expect.get("prune")) expectedPrune.add((String) v);
+
+      Object stateRaw = raw.get("state");
+      OtaCore.State state = stateRaw == null ? null : stateFromJson((Map<String, Object>) stateRaw);
+
+      List<String> result = OtaCore.pruneVersions(state, bundle, onDisk);
+      check(name, "prune", expectedPrune, result);
+    }
+    return scenarios.size();
+  }
+
+  // ---- Bundles to prune (F2) ----
+
+  /** Loads + replays ota-bundles-to-prune-vectors.json against OtaCore.bundlesToPrune.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runBundlesToPruneVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-bundles-to-prune-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-bundles-to-prune-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      String shellName = (String) raw.get("shellName");
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      List<String> expected = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) expect.get("bundlesToPrune")) expected.add((String) v);
+
+      Object stateRaw = raw.get("state");
+      OtaCore.State state = stateRaw == null ? null : stateFromJson((Map<String, Object>) stateRaw);
+
+      List<String> result = OtaCore.bundlesToPrune(state, shellName);
+      check(name, "bundlesToPrune", expected, result);
+    }
+    return scenarios.size();
+  }
+
+  private static void checkVerifyProblem(String scenarioName, OtaCore.VerifyProblem expected, OtaCore.VerifyProblem actual) {
+    boolean ok = actual != null && actual.kind == expected.kind && java.util.Objects.equals(actual.path, expected.path)
+      && java.util.Objects.equals(actual.expectedHash, expected.expectedHash) && java.util.Objects.equals(actual.actualHash, expected.actualHash);
+    if (!ok) {
+      failures++;
+      System.err.println("[" + scenarioName + "] verify mismatch:\n  expected: " + expected + "\n  actual:   " + actual);
+    }
+  }
+
+  // ---- Anti-rollback (#571) ----
+
+  /** Twin of OtaCoreTests.swift's testRecordSeq/testHighestSeenSeq/testResetForNewBinaryPreservesHighestSeenSeq checks. */
+  private static int runRecordSeqChecks() {
+    check("recordSeq/fromNilState", "highestSeenSeq", 5, OtaCore.recordSeq(null, 5).highestSeenSeq);
+
+    OtaCore.State advanced = new OtaCore.State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null, 3);
+    check("recordSeq/advances", "highestSeenSeq", 7, OtaCore.recordSeq(advanced, 7).highestSeenSeq);
+
+    // Never regresses: a lower seq than what's already recorded must not move the
+    // high-water mark backwards — that would reopen the exact replay window it exists to close.
+    OtaCore.State high = new OtaCore.State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null, 10);
+    check("recordSeq/neverRegresses", "highestSeenSeq", 10, OtaCore.recordSeq(high, 3).highestSeenSeq);
+
+    // Preserves every other field.
+    Map<String, String> active = new HashMap<>();
+    active.put("shell", "v1");
+    Map<String, java.util.List<String>> rejected = new HashMap<>();
+    rejected.put("shell", java.util.Arrays.asList("v0"));
+    OtaCore.State withData = new OtaCore.State(active, new HashMap<>(), new HashMap<>(), new HashMap<>(), rejected, null, 1);
+    OtaCore.State recorded = OtaCore.recordSeq(withData, 9);
+    check("recordSeq/preservesActive", "active", active, recorded.active);
+    check("recordSeq/preservesRejected", "rejected", rejected, recorded.rejected);
+    check("recordSeq/preservesHighestSeenSeq", "highestSeenSeq", 9, recorded.highestSeenSeq);
+
+    // Survives a binary reset, same as `rejected` — see resetForNewBinary's doc comment.
+    OtaCore.State beforeReset = new OtaCore.State(active, new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), "1", 12);
+    OtaCore.State afterReset = OtaCore.resetForNewBinary(beforeReset, "2");
+    check("resetForNewBinary/preservesHighestSeenSeq", "highestSeenSeq", 12, afterReset.highestSeenSeq);
+    check("resetForNewBinary/stillWipesActive", "active", new HashMap<>(), afterReset.active);
+
+    return 8; // the number of check(...) calls above — keep in sync
   }
 
   private static void check(String scenarioName, String field, Object expected, Object actual) {

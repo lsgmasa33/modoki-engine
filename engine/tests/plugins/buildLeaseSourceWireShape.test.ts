@@ -21,11 +21,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const SRC = path.join(__dirname, '../../plugins/vite-asset-scanner.ts');
-const src = fs.readFileSync(SRC, 'utf8');
+const src = readScannedSource(SRC).code;
 
 /** The `platform === 'android'` serial-resolution block, sliced out so the assertions below cannot
  *  be satisfied (or broken) by an unrelated mention of these names elsewhere in a 2600-line file. */
@@ -41,7 +41,8 @@ function androidSerialBlock(): string {
   expect(end, 'the end anchor moved — re-aim this guard').toBeGreaterThan(start);
   // Comments stripped: that block DOCUMENTS the wrong call in order to warn against it, and a
   // guard that cannot tell code from prose about code would fail on its own warning.
-  return src.slice(start, end).split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  // Already stripped at the read (#816) — the `//` filter matched nothing.
+  return src.slice(start, end);
 }
 
 describe('android build lease source', () => {

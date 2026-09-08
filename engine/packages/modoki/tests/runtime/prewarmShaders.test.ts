@@ -52,7 +52,7 @@ function makeRigPrototype(): THREE.Object3D {
 const disposeRetiredEnvironment = vi.fn();
 const disposeRetiredMaterial = vi.fn();
 
-async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
+async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
@@ -72,9 +72,25 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
     retiredMaterials3D: () => opts.retiredMats ?? new Set(),
     disposeRetiredMaterial,
   }));
+  // `getEnvPMREMTexture`/`getEnvCubeTexture`/`sourceForEnvDerived` moved to `./envPmrem`
+  // (#739, #775, #779) — mocked separately now. All three must be present: `scene3DSync.ts`
+  // imports all three by name, and an explicit-export-list mock missing one breaks the import
+  // BINDING, not an assertion.
+  vi.doMock('../../src/runtime/rendering/envPmrem', () => ({
+    // #739: PMREM binding. Most tests here leave `pmrem` unset, so `getEnvPMREMTexture` returns
+    // undefined and the callers fall back to the raw `cached` texture — which is what those tests
+    // assert on. Setting `pmrem` exercises the real binding.
+    getEnvPMREMTexture: vi.fn(() => opts.pmrem ?? undefined),
+    // #775/#779: this suite exercises `prewarmShadersForWorld`'s environment mirror only — it
+    // never sets a prewarm-scene BACKGROUND (deliberately, see `scene3DSync.ts`'s comment at the
+    // mirror), so `getEnvCubeTexture` returning undefined (falling back to `cached`, unused here)
+    // is enough.
+    getEnvCubeTexture: vi.fn(() => undefined),
+    sourceForEnvDerived: vi.fn(),
+  }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),
-    ensureRiggedModelLoaded: vi.fn(),
+    ensureRiggedModelLoaded: vi.fn(), ensureRiggedModelLoadedFor: vi.fn(),
   }));
   // A primitive factory that returns a REAL mesh, so the dedupe test can count the
   // placeholders that actually reached the compile. Each call yields a fresh object,
@@ -316,6 +332,23 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
   it('mirrors the environment on HIGH — the variant the render will use', async () => {
     const { compiledEnv, envTexture } = await prewarmWithEnv(HIGH);
     expect(compiledEnv).toBe(envTexture);
+  });
+
+  /** #739. This hook is registered with `registerBeforeSwap`, so it runs on EVERY scene swap.
+   *  Binding the raw equirect here would make three's `PMREMNode` build its own generator — the
+   *  exact per-swap leak #739 fixes — re-entering through the prewarm door and quietly undoing the
+   *  fix, while every other test here still passed. It also has to mirror the PMREM for the reason
+   *  the mirror exists at all: that is now the texture the real render path binds. */
+  it('mirrors the PMREM rather than the raw equirect, so the leak cannot re-enter via the prewarm', async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' };
+    const pmremTexture = { isTexture: true, name: 'fake-pmrem' };
+    const { world, sync } = await setup({ env: envTexture, pmrem: pmremTexture });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer, compiledEnvironments } = makeRendererStub();
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+    expect(compiledEnvironments[0]).toBe(pmremTexture);
+    expect(compiledEnvironments[0]).not.toBe(envTexture);
   });
 
   it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {

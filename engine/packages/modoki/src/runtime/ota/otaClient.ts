@@ -19,6 +19,7 @@
  *  built-in `crypto` for the same reason, on the platform where that built-in exists. */
 
 import { ed25519 } from '@noble/curves/ed25519.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 export interface OtaFileEntry {
   hash: string;
@@ -39,6 +40,17 @@ export interface OtaRelease {
   bundles: Record<string, string>;
   mandatory: boolean;
   minEngineApi: number;
+  /** sha256 of each bundle's CURRENT-version manifest, canonically serialized (#570,
+   *  additive — a release without it is still valid). See
+   *  {@link manifestHashPayload} and `checkForUpdate`'s `manifest-untrusted` outcome. */
+  manifests?: Record<string, string>;
+  /** Monotonic publish counter (#571, additive — a release without it is treated as `0`),
+   *  bumped by `ota-publish.mjs` on every publish. `checkForUpdate` refuses a release whose
+   *  `seq` is lower than the highest this device has already recorded — closing the
+   *  anti-rollback gap #570 explicitly left open (a validly-signed but OLDER release.json,
+   *  replayed by an attacker with bucket write, is otherwise indistinguishable from a
+   *  legitimate one). See docs/ota-updates.md "The trust chain". */
+  seq?: number;
   sig: string;
 }
 
@@ -110,6 +122,22 @@ export function validateRelease(release: unknown): string[] {
     fail('release.minEngineApi must be a positive integer');
   }
   if (typeof r.sig !== 'string' || !r.sig) fail('release.sig must be a non-empty string (base64url Ed25519 signature)');
+  if (r.manifests !== undefined) {
+    if (r.manifests == null || typeof r.manifests !== 'object' || Array.isArray(r.manifests)) {
+      fail('release.manifests must be an object keyed by bundle name');
+    } else {
+      for (const [name, hash] of Object.entries(r.manifests as Record<string, unknown>)) {
+        if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+          fail(`release.manifests["${name}"] must be a lowercase hex sha256 (64 chars)`);
+        }
+      }
+    }
+  }
+  if (r.seq !== undefined) {
+    if (typeof r.seq !== 'number' || !Number.isInteger(r.seq) || r.seq < 0) {
+      fail('release.seq must be a non-negative integer');
+    }
+  }
   return errors;
 }
 
@@ -123,13 +151,46 @@ export function signingPayload(release: OtaRelease | Omit<OtaRelease, 'sig'>): s
 function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {
-    const sorted: Record<string, unknown> = {};
+    // Object.create(null), NOT `{}` — MUST match engine/scripts/ota/schema.mjs's
+    // sortKeysDeep byte-for-byte, comment ported verbatim: a plain object literal's
+    // `__proto__` is an ACCESSOR inherited from Object.prototype, so `sorted['__proto__']
+    // = ...` would silently write through the setter (mutating `sorted`'s own prototype)
+    // instead of storing an own property, and that key would vanish from the
+    // JSON.stringify output entirely. That let two materially different documents (one
+    // with a top-level `__proto__` key, one without) canonicalize to byte-identical
+    // strings — a signature meant for one would vouch for the other. A null-prototype
+    // object has no inherited `__proto__` setter to intercept the assignment, so it
+    // becomes an ordinary own property like any other key. Output is unaffected for
+    // every document that doesn't use `__proto__` as a key: JSON.stringify only ever
+    // looks at own enumerable properties, never the prototype.
+    const sorted: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
     }
     return sorted;
   }
   return value;
+}
+
+/** MUST match engine/scripts/ota/schema.mjs's `manifestHashPayload` byte-for-byte — the
+ *  canonical (sorted-key) JSON of a manifest, same treatment {@link signingPayload} gives
+ *  a release. Canonical rather than raw file bytes so this hash survives `res.json()`
+ *  round-tripping the manifest — the client never needs `res.text()`. */
+export function manifestHashPayload(manifest: OtaManifest): string {
+  return JSON.stringify(sortKeysDeep(manifest));
+}
+
+/** Lowercase-hex sha256 of a UTF-8 string, via `@noble/hashes` — a `dependencies` entry
+ *  alongside `@noble/curves` (see engine/packages/modoki/package.json), so this adds no
+ *  new library. Deliberately NOT `crypto.subtle.digest`: that is async (it would turn this
+ *  synchronous canonical-hash step into a promise for no benefit) and is gated on a secure
+ *  context, which is a property of however the host WebView is configured rather than
+ *  something this module can rely on. Exported (not module-private) so the canonicalization
+ *  parity test can assert this hashing path agrees with Node's `createHash('sha256')` on
+ *  the publisher side, instead of duplicating this exact logic in the test. */
+export function sha256Hex(s: string): string {
+  const bytes = sha256(new TextEncoder().encode(s));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** A single file to fetch individually by content hash (Phase 2 delta transfer) — as
@@ -143,17 +204,38 @@ export interface OtaDeltaDownload {
 
 /** The native plugin surface this client depends on — a structural (not nominal) type so
  *  tests can pass a plain mock without importing `@capacitor/core`. */
+/** A single target-manifest file, as handed to native for whole-tree post-stage
+ *  verification (#556) — see `OtaNativePlugin.stageUpdate`/`stageUpdateDelta`. */
+export interface OtaFileRef {
+  path: string;
+  hash: string;
+}
+
 export interface OtaNativePlugin {
-  stageUpdate(opts: { name: string; version: string; zipUrl: string; expectedZipHash: string; expectedZipSize: number }): Promise<{ ok: boolean }>;
+  /** `files` (#556): the target manifest's full path→hash map. Native verifies the staged
+   *  tree against it (strict set equality) after writing, before the atomic rename — see
+   *  the plugin's own doc comment (definitions.ts) for why the whole-zip hash alone isn't
+   *  enough. */
+  stageUpdate(opts: { name: string; version: string; zipUrl: string; expectedZipHash: string; expectedZipSize: number; files: OtaFileRef[] }): Promise<{ ok: boolean }>;
   /** Phase 2 delta staging: copy `copy` (unchanged relative paths) from the
    *  already-on-disk `baseVersion` folder, download only `download` (new/changed files,
    *  each independently hash-verified) into the new `version` folder. Native must refuse
    *  to activate a folder built this way if any copy source is missing (self-heal to
    *  `stageUpdate`'s whole-zip path is the CALLER's job, not native's — see
-   *  `checkForUpdate`'s fallback). */
-  stageUpdateDelta(opts: { name: string; version: string; baseVersion: string; copy: string[]; download: OtaDeltaDownload[] }): Promise<{ ok: boolean }>;
+   *  `checkForUpdate`'s fallback). `files` (#556): same whole-tree verification as
+   *  `stageUpdate` — `copy` entries are never individually hashed, so this is what catches
+   *  a locally-corrupt base file. */
+  stageUpdateDelta(opts: { name: string; version: string; baseVersion: string; copy: string[]; download: OtaDeltaDownload[]; files: OtaFileRef[] }): Promise<{ ok: boolean }>;
   activate(opts: { name: string; version: string }): Promise<{ ok: boolean }>;
   getState(): Promise<{ stateJSON: string }>;
+  /** #571 anti-rollback: persists `seq` as the device's new high-water mark, monotonically
+   *  — native takes `max(existing, seq)`, so this is safe to call with a `seq` that turns
+   *  out not to be an increase (a repeat check against the same release.json). Called by
+   *  `checkForUpdate` right after signature verification, BEFORE any up-to-date/staging
+   *  decision — an up-to-date check is the common case, and skipping it there would leave
+   *  the high-water mark stuck at its last-staged value while a device stays current for a
+   *  long stretch, reopening exactly the replay window this exists to close. */
+  recordSeq(opts: { seq: number }): Promise<{ ok: boolean }>;
 }
 
 /** Pure diff: which of `target`'s files are byte-identical (by content hash) to a file at
@@ -182,6 +264,29 @@ export type OtaCheckResult =
   | { outcome: 'signature-invalid' }
   | { outcome: 'engine-api-too-old'; required: number; running: number }
   | { outcome: 'manifest-invalid'; errors: string[] }
+  /** The fetched manifest is well-formed (passed `validateManifest`) but its canonical
+   *  hash does NOT match the signed release's `manifests[bundleName]` entry — the bundle's
+   *  CONTENTS don't match what the release.json commits to. Distinct from
+   *  `manifest-invalid` (malformed shape): this manifest parses fine, it just isn't the
+   *  one the signature vouches for, which means the bucket served tampered or stale
+   *  bytes. Nothing is staged when this fires. */
+  | { outcome: 'manifest-untrusted'; version: string; expected: string; actual: string }
+  /** The fetched manifest is well-formed but names a DIFFERENT bundle or version than the
+   *  one requested — the client asked for `bundles/<name>/<version>/manifest.json` and got
+   *  a manifest for something else. A CDN misroute, a stale edge, or a bucket write. This
+   *  is a DATA-identity failure, not a format or compatibility one, so it is not "about the
+   *  host": nothing is staged, nothing is quarantined, and the next check retries. Matters
+   *  most where `manifests[bundleName]` coverage is absent — `docs/ota-updates.md` records
+   *  that coverage "starts empty" and that a pre-#570 publisher disarms it for every bundle,
+   *  which is exactly the window where name/version are the only identity signal. */
+  | { outcome: 'manifest-identity-mismatch'; version: string; expectedName: string; actualName: string; expectedVersion: string; actualVersion: string }
+  /** #571 anti-rollback: the release's `seq` is LOWER than the highest this device has
+   *  already recorded — a validly-signed but stale release.json, most plausibly an
+   *  attacker with bucket write replaying an old capture (see docs/ota-updates.md "The
+   *  trust chain"). Checked before any bundle-version comparison, so a replay is refused
+   *  outright rather than merely reported as `up-to-date`. Nothing is staged when this
+   *  fires; the device stays on whatever it's already running. */
+  | { outcome: 'seq-rollback'; version: string; seq: number; highestSeenSeq: number }
   | { outcome: 'no-bundle-zip-in-manifest' }
   /** The release's target version is one this device already PROVED bad — it exhausted
    *  its boot attempts and the watchdog reverted it (Phase 3a quarantine). Staging it
@@ -190,7 +295,11 @@ export type OtaCheckResult =
    *  treat this as "no update available" and let the player keep playing the working
    *  bundle — blocking here is what turns a stale app into a permanent brick. */
   | { outcome: 'version-rejected'; version: string }
-  | { outcome: 'staged'; version: string; delta?: boolean; mandatory: boolean };
+  | { outcome: 'staged'; version: string; delta?: boolean; mandatory: boolean }
+  /** The target version is already STAGED natively (`pending`) and is waiting for a restart to be
+   *  served — the device is NOT running it yet. Distinct from `up-to-date` (which means `active`
+   *  already IS the target) precisely so a mandatory gate can hold. */
+  | { outcome: 'pending-restart'; version: string; mandatory: boolean };
 
 /** Browser-safe base64url decode — this module runs in the WebView shell, where
  *  `Buffer` does not exist (unlike Node, where the test suite happens to run it). Uses
@@ -260,6 +369,11 @@ export interface CheckForUpdateOptions {
    *  non-`staged` outcome — the caller is expected to un-arm its gate whenever the
    *  final outcome isn't `staged`, not rely on this ever being "undone". */
   onWillStage?: (info: { version: string; mandatory: boolean }) => void;
+  /** Called when a delta stage failed and the client fell back to a whole-bundle download
+   *  (#556). Optional, but worth wiring: this path silently turns a small delta into a full
+   *  download, and an unexplained bandwidth spike is precisely the thing nobody can diagnose
+   *  after the fact. */
+  onDeltaFallback?: (info: { version: string; reason: string }) => void;
 }
 
 export interface FetchReleaseOptions {
@@ -322,16 +436,57 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
   const { stateJSON } = await opts.native.getState();
   const state = parseNativeState(stateJSON);
-  const currentActive = state?.active?.[opts.bundleName];
-  const currentPending = state?.pending?.[opts.bundleName];
-  if (currentActive === targetVersion || currentPending === targetVersion) {
-    return { outcome: 'up-to-date' };
+
+  // Anti-rollback (#571). Checked before any bundle-version comparison below — a replayed
+  // release is refused wholesale, not merely folded into an `up-to-date` outcome that
+  // would (correctly, but silently) skip recording it. `highestSeenSeq` is read HERE, from
+  // the state fetched above, before `recordSeq` (if called) can advance it — so the
+  // comparison is always against what this device knew BEFORE this release was seen.
+  const releaseSeq = release.seq ?? 0;
+  const highestSeenSeq = state?.highestSeenSeq ?? 0;
+  if (releaseSeq < highestSeenSeq) {
+    return { outcome: 'seq-rollback', version: targetVersion, seq: releaseSeq, highestSeenSeq };
+  }
+  if (releaseSeq > highestSeenSeq) {
+    // Recorded unconditionally on every signature-valid, non-rollback release — including
+    // an up-to-date one. Skipping this on the up-to-date fast path (the common case) would
+    // leave the high-water mark stuck at whatever it was when a bundle last actually
+    // staged, so a device that stays current for a long stretch would still accept a
+    // replay of any release published in between — exactly the gap this exists to close.
+    // Swallowed on failure (disk full, IPC error): this function's contract is to never
+    // throw on an OTA check (an OTA check failing must never crash a game that's already
+    // running fine) — same reasoning as every other `catch` in this function. Losing one
+    // recordSeq write only delays the high-water mark's advance to the NEXT check; it does
+    // not weaken the rollback check itself, which still compares against whatever the
+    // native side actually has persisted.
+    try {
+      await opts.native.recordSeq({ seq: releaseSeq });
+    } catch {
+      // best-effort — see comment above
+    }
   }
 
-  // Quarantine gate (Phase 3a). Checked AFTER the up-to-date short-circuit above, so a
-  // version that somehow reached `active` despite being listed still reports up-to-date —
-  // `rejected` vetoes STAGING, never a bundle that is already booting fine (mirrors
-  // OtaCore's boot-side rule; see ota-gate-vectors-phase3.json).
+  const currentActive = state?.active?.[opts.bundleName];
+  const currentPending = state?.pending?.[opts.bundleName];
+  if (currentActive === targetVersion) return { outcome: 'up-to-date' };
+  if (currentPending === targetVersion) {
+    // ⚠️ `pending` alone does NOT mean "waiting for a restart" — it survives the restart, because
+    // promotion to `active` needs TWO confirmBoots across TWO launches (OtaCore.requiredConfirms).
+    // `bootAttempts` is the discriminator: `activate()` clears it when staging, and the native boot
+    // hook increments it when it SERVES the pending bundle, before the WebView loads. So 0 means
+    // this device has never run the staged version and a restart is genuinely owed; >= 1 means we
+    // are running it right now, and holding a mandatory gate here would block the game forever on
+    // the very update it has already applied.
+    const alreadyServed = (state?.bootAttempts?.[opts.bundleName] ?? 0) > 0;
+    if (alreadyServed) return { outcome: 'up-to-date' };
+    return { outcome: 'pending-restart', version: targetVersion, mandatory: release.mandatory };
+  }
+
+  // Quarantine gate (Phase 3a). Checked AFTER the up-to-date/pending-restart short-circuits
+  // above, so a version that somehow reached `active` (or is already `pending`) despite being
+  // listed still reports up-to-date/pending-restart — `rejected` vetoes STAGING, never a bundle
+  // that is already booting fine or already staged (mirrors OtaCore's boot-side rule; see
+  // ota-gate-vectors-phase3.json).
   if (state?.rejected?.[opts.bundleName]?.includes(targetVersion)) {
     return { outcome: 'version-rejected', version: targetVersion };
   }
@@ -357,9 +512,47 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
   const manifestErrors = validateManifest(manifest);
   if (manifestErrors.length > 0) return { outcome: 'manifest-invalid', errors: manifestErrors };
+
+  // The manifest was fetched from `bundles/<bundleName>/<targetVersion>/manifest.json` —
+  // a well-formed document at that URL naming a DIFFERENT bundle/version is a CDN
+  // misroute, a stale edge, or a bucket write, not a fact about this host. Checked here,
+  // regardless of whether `expectedManifestHash` coverage exists below — the identity
+  // check is cheap and should fire even when hash coverage is absent (docs/ota-updates.md:
+  // coverage "starts empty", and a pre-#570 publisher disarms it for every bundle).
+  if (manifest.name !== opts.bundleName || manifest.version !== targetVersion) {
+    return {
+      outcome: 'manifest-identity-mismatch',
+      version: targetVersion,
+      expectedName: opts.bundleName,
+      actualName: String(manifest.name),
+      expectedVersion: targetVersion,
+      actualVersion: String(manifest.version),
+    };
+  }
+
+  // Chain the manifest into the SIGNED release (#570): release.json is Ed25519-signed
+  // and `manifests[bundleName]` is a field on it like any other, so an attacker with
+  // bucket write cannot alter/replace manifest.json without invalidating that signature.
+  // Checked here — after shape validation, before the engineApi gate below — so a
+  // tampered-but-well-formed manifest never reaches staging. Optional: an older
+  // release.json with no `manifests` field (or one missing this bundle) skips the check
+  // entirely, same non-breaking contract `validateRelease` gives the field.
+  const expectedManifestHash = release.manifests?.[opts.bundleName];
+  if (typeof expectedManifestHash === 'string') {
+    const actualManifestHash = sha256Hex(manifestHashPayload(manifest));
+    if (actualManifestHash !== expectedManifestHash) {
+      return { outcome: 'manifest-untrusted', version: targetVersion, expected: expectedManifestHash, actual: actualManifestHash };
+    }
+  }
+
   if (manifest.engineApi > opts.runningEngineApi) {
     return { outcome: 'engine-api-too-old', required: manifest.engineApi, running: opts.runningEngineApi };
   }
+
+  // The target manifest's full path→hash map, handed to native so it can verify the
+  // staged tree against it (strict set equality) before the atomic rename — #556. Built
+  // once here and passed to whichever staging path actually runs.
+  const files: OtaFileRef[] = Object.entries(manifest.files).map(([path, e]) => ({ path, hash: e.hash }));
 
   // Delta path: diff against whatever's ALREADY on disk — an active OTA version if one
   // exists, otherwise the bundle embedded in the app binary itself (so even the very
@@ -368,34 +561,87 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   // update outright — delta is an optimization, not a requirement for the update to
   // succeed (an older build with no embedded manifest, or a CDN blip, must still work).
   const baseVersion = currentActive ?? EMBEDDED_BASE_VERSION;
-  const baseManifest = currentActive
+  let baseManifest = currentActive
     ? await tryFetchManifest(doFetch, opts.baseUrl, opts.bundleName, currentActive)
     : await tryFetchEmbeddedManifest(doFetch, opts.embeddedManifestUrl ?? 'ota-embedded-manifest.json');
+  // The delta BASE fetch is deliberately hash-unverified (see tryFetchManifest's doc) —
+  // name/version are the ONLY identity signal here. A mismatched base is not a corrupt
+  // base (that's the fetch/validate failure already handled inside tryFetch*), it is
+  // evidence the response is for a DIFFERENT bundle/version than the one asked for — same
+  // CDN-misroute/stale-edge class as the target-manifest check above. This is an
+  // optimization loss, not an update failure: treat it as "no usable base" and fall
+  // through to the existing whole-download path, same as a fetch/validate failure would.
+  // This check applies ONLY to the network-fetched base (`currentActive` set) — the
+  // misroute risk it guards against is a CDN/bucket problem (a stale edge or a wrong
+  // bucket handing back manifest bytes for a different bundle/version than requested).
+  // The embedded manifest is a LOCAL file shipped inside the app binary; it was never
+  // fetched from the bucket and cannot be misrouted, so the check buys nothing there
+  // and only costs a false alarm plus a lost delta optimization on every sub-game's
+  // very first stage (the embedded manifest's `name` is the SHELL's bundle name, never
+  // the sub-game's — see ota-embed-manifest.mjs — so this fired on every one of them).
+  if (baseManifest && currentActive) {
+    const identityMismatch = baseManifest.name !== opts.bundleName || baseManifest.version !== currentActive;
+    if (identityMismatch) {
+      opts.onDeltaFallback?.({
+        version: targetVersion,
+        reason: `base manifest identity mismatch: expected ${opts.bundleName}@${baseVersion}, got ${baseManifest.name}@${baseManifest.version}`,
+      });
+      baseManifest = null;
+    }
+  }
   if (baseManifest) {
     const { copy, download } = diffManifests(baseManifest, manifest);
     const downloadWithUrls: OtaDeltaDownload[] = download.map((d) => ({
       ...d,
       url: `${opts.baseUrl}/bundles/${opts.bundleName}/${targetVersion}/files/${d.hash}`,
     }));
-    await opts.native.stageUpdateDelta({
-      name: opts.bundleName,
-      version: targetVersion,
-      baseVersion,
-      copy,
-      download: downloadWithUrls,
-    });
-    await opts.native.activate({ name: opts.bundleName, version: targetVersion });
-    return { outcome: 'staged', version: targetVersion, delta: true, mandatory: release.mandatory };
+    // Delta is an optimization, not a requirement — #556 closes the hole in the #550
+    // quarantine ruling: a delta-staged bundle's `copy` entries are taken byte-for-byte
+    // off disk and hashed by nobody, so "re-staging would fetch identical broken bytes"
+    // (true for a whole-zip download) does NOT hold here — a locally corrupt base file
+    // can make native's own whole-tree verification (definitions.ts) throw even though
+    // the PUBLISHED bytes are perfectly good. Falling through to a whole-zip stage rather
+    // than failing the update outright means a bad local copy on this one device never
+    // blocks a good published version — same "optimization, not requirement" contract the
+    // base-manifest fetch above already has.
+    let deltaStaged = false;
+    try {
+      await opts.native.stageUpdateDelta({
+        name: opts.bundleName,
+        version: targetVersion,
+        baseVersion,
+        copy,
+        download: downloadWithUrls,
+        files,
+      });
+      deltaStaged = true;
+    } catch (err) {
+      // Reported, not swallowed — see `onDeltaFallback`.
+      opts.onDeltaFallback?.({ version: targetVersion, reason: err instanceof Error ? err.message : String(err) });
+      // fall through to whole-zip below
+    }
+    if (deltaStaged) {
+      // Deliberately OUTSIDE the try above: an `activate` failure is not a STAGING failure.
+      // Inside it, a failed activate would fall through and re-download the whole bundle for
+      // a version that had already staged correctly — and the retry would hit the same
+      // activate again anyway.
+      await opts.native.activate({ name: opts.bundleName, version: targetVersion });
+      return { outcome: 'staged', version: targetVersion, delta: true, mandatory: release.mandatory };
+    }
   }
 
   if (!manifest.bundleZip) return { outcome: 'no-bundle-zip-in-manifest' };
 
+  // No fallback here, deliberately: a whole-zip staging failure must reject and leave
+  // `activate()` uncalled — nothing staged, nothing activated, device stays on its
+  // working bundle. This is the caller's LAST resort; there is nowhere further to fall.
   await opts.native.stageUpdate({
     name: opts.bundleName,
     version: targetVersion,
     zipUrl: `${opts.baseUrl}/bundles/${opts.bundleName}/${targetVersion}/bundle.zip`,
     expectedZipHash: manifest.bundleZip.hash,
     expectedZipSize: manifest.bundleZip.size,
+    files,
   });
   await opts.native.activate({ name: opts.bundleName, version: targetVersion });
 
@@ -404,7 +650,28 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
 /** Fetches + validates a bundle's manifest.json, returning null (never throwing) on any
  *  failure — used for the delta path's BASE manifest, where failure means "fall back to
- *  whole-zip", not "fail the update". */
+ *  whole-zip", not "fail the update".
+ *
+ *  Deliberately UNVERIFIED against `release.manifests` (unlike the TARGET manifest in
+ *  `checkForUpdate` above): the signed release only commits to the CURRENT version's
+ *  manifest, and this function (and {@link tryFetchEmbeddedManifest}) supply the delta
+ *  BASE — either an older already-active version, or the manifest shipped inside the app
+ *  binary itself. A lying/tampered base manifest cannot forge the update's contents:
+ *  native verifies the whole staged tree against `files`, which is built from the
+ *  now-authenticated TARGET manifest. A bad base can only make that whole-tree
+ *  verification fail and fall back to the whole-zip path (see #556) — not an integrity
+ *  hole, just a wasted delta.
+ *
+ *  ⚠️ That "cannot forge contents" guarantee holds ONLY on a device whose native plugin is
+ *  #556-or-later. `OtaPlugin.swift`'s `stageUpdate` and `OtaPlugin.java`'s counterpart both
+ *  SKIP the staged-tree-vs-`files` verification entirely when `files` is absent from the
+ *  call (logging a loud warning and proceeding exactly as pre-#556 code did) — that's a
+ *  deliberate compatibility fallback for a caller built before #556, not a bug. But native
+ *  plugin code cannot itself be OTA-updated: an app installed with an older plugin binary
+ *  keeps running that older plugin FOREVER, regardless of how many JS-side OTA updates it
+ *  applies. So on such an already-installed app, a tampered/lying base manifest CAN still
+ *  force a stale local file to be copied into the new staged tree completely unverified —
+ *  the "native verifies the whole tree" backstop above simply isn't there to catch it. */
 async function tryFetchManifest(
   doFetch: typeof fetch,
   baseUrl: string,
@@ -444,6 +711,17 @@ interface NativeState {
   /** Phase 3a quarantine — versions this device proved bad. Absent on a state.json
    *  written by a Phase 1/2 binary, hence optional. */
   rejected?: Record<string, string[]>;
+  /** Per-bundle launch count since a pending version was last SERVED. `activate()` clears
+   *  this when it writes `pending` (staging), and the native boot hook increments it when
+   *  it actually serves the pending bundle, before the WebView loads — so 0/absent means
+   *  "staged, never run" and >= 1 means "we are running the pending version right now".
+   *  The discriminator that distinguishes those two `pending === target` cases below. */
+  bootAttempts?: Record<string, number>;
+  /** #571 anti-rollback — the highest release `seq` this device has ever recorded, a
+   *  single device-wide counter (not per-bundle: it is a property of `release.json` as a
+   *  whole, one publish counter shared by every bundle it lists). Absent on a state.json
+   *  written by a pre-#571 binary, hence optional; treated as `0`. */
+  highestSeenSeq?: number;
 }
 
 function parseNativeState(json: string): NativeState | null {

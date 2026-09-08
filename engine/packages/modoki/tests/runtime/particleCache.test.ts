@@ -172,6 +172,41 @@ describe('setParticleEffect / invalidateParticleEffect', () => {
     expect(cache.getParticleEffect('fx/x.particle.json')!.maxParticles).toBe(555);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('invalidateParticleEffect mid-flight refuses a fetch that resolves with the OLD def (#487 item 8)', async () => {
+    const { cache } = await setup();
+    let resolveOld: (v: unknown) => void = () => {};
+    const fetchFn = vi.fn(() => new Promise((r) => { resolveOld = r; }));
+    vi.stubGlobal('fetch', fetchFn);
+
+    expect(cache.getParticleEffect('fx/race.particle.json')).toBeNull(); // kicks off the in-flight load
+    cache.invalidateParticleEffect('fx/race.particle.json');               // re-import lands mid-flight
+
+    resolveOld(await completeResponse({ ok: true, json: async () => ({ version: 1, maxParticles: 999 }) }));
+    await flush();
+
+    // Genuinely EMPTY (peek, no new fetch) — not merely shadowed by a fresher value.
+    expect(cache.getParticleEffect('fx/race.particle.json', { load: false })).toBeNull();
+  });
+
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateParticleEffect`
+  // that bumped it would refuse every OTHER key's in-flight load too. Must FAIL against the
+  // module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED effect while A is in flight leaves A cacheable', async () => {
+    const { cache } = await setup();
+    let resolveA: (v: unknown) => void = () => {};
+    const fetchFn = vi.fn(() => new Promise((r) => { resolveA = r; }));
+    vi.stubGlobal('fetch', fetchFn);
+
+    expect(cache.getParticleEffect('fx/cross.a.particle.json')).toBeNull(); // kicks off A's load
+    cache.invalidateParticleEffect('fx/cross.b.particle.json');               // UNRELATED path
+
+    resolveA(await completeResponse({ ok: true, json: async () => ({ version: 1, maxParticles: 7 }) }));
+    await flush();
+
+    expect(cache.getParticleEffect('fx/cross.a.particle.json')?.maxParticles).toBe(7); // must be cached
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('clearParticleCache (scene swap)', () => {
@@ -242,6 +277,59 @@ describe('getParticleEffect load:false (peek)', () => {
     const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({ version: 1, maxParticles: 7 }) }));
     expect(cache.getParticleEffect('/assets/particles/lazy.particle.json')).toBeNull();
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Format-version handling (#784, docs/format-versioning.md). `.particle.json` is REFUSE
+// disposition: a too-new/unreadable document must not be cached, and the loader must never
+// re-stamp this build's version over bytes it did not fully understand.
+describe('particleCache — format-version REFUSE (#784)', () => {
+  it('refuses a too-new document: not cached, `failed` is permanent, error logged (not warn)', async () => {
+    const { cache } = await setup();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchFn = mockFetch(async () => ({ ok: true, json: async () => ({ version: 99, maxParticles: 5 }) }));
+
+    expect(cache.getParticleEffect('fx/future.particle.json')).toBeNull(); // kicks off fetch
+    await flush();
+
+    expect(cache.getParticleEffect('fx/future.particle.json')).toBeNull(); // refused, not cached
+    await flush();
+    expect(fetchFn).toHaveBeenCalledTimes(1); // `failed` set — no retry
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(String(err.mock.calls[0][0])).toContain('99');
+    err.mockRestore();
+  });
+
+  it('a too-new document leaves the cache empty even on a load:false peek', async () => {
+    const { cache } = await setup();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockFetch(async () => ({ ok: true, json: async () => ({ version: 2 }) }));
+    expect(cache.getParticleEffect('fx/future2.particle.json')).toBeNull();
+    await flush();
+    expect(cache.getParticleEffect('fx/future2.particle.json', { load: false })).toBeNull();
+  });
+
+  it('a stored version SURVIVES normalization instead of being re-stamped to PARTICLE_FORMAT_VERSION', async () => {
+    // 1b: normalizeParticleDef used to build `{ ...d, ...json, version: 1 }` — the trailing key
+    // clobbered whatever the document said, on EVERY load. A document from a future build (still
+    // `ok`/`absent`, not `too-new`, if its version is ≤ this build's constant) must read back with
+    // its own version, and any top-level field this build does not model must survive too (the
+    // particle normalizer spreads the whole document, unlike the enumerated-field normalizers).
+    const { cache } = await setup();
+    mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ version: 1, maxParticles: 5, someFutureField: { kept: true } }),
+    }));
+    expect(cache.getParticleEffect('fx/survive.particle.json')).toBeNull();
+    await flush();
+    const def = cache.getParticleEffect('fx/survive.particle.json')!;
+    expect(def.version).toBe(1);
+    expect((def as unknown as Record<string, unknown>).someFutureField).toEqual({ kept: true });
+    // The bar is the BYTES a save would produce, not just the in-memory shape (§ 5.7) — a
+    // JSON round trip (what `useParkedAssetDoc`'s write path does) must not drop either field.
+    const roundTripped = JSON.parse(JSON.stringify(def));
+    expect(roundTripped.version).toBe(1);
+    expect(roundTripped.someFutureField).toEqual({ kept: true });
   });
 });
 

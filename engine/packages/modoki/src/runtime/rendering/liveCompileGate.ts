@@ -20,6 +20,8 @@
  *  The hold is normally SHORT — everything the prewarm got right is already in three's pipeline
  *  cache, so the live compile is a walk over cache hits. It costs what the prewarm missed. */
 
+import { createSupersessionToken } from '../core/liveness';
+
 /** Injected so tests drive it without a clock, per the determinism rules. Production passes
  *  `rawNow` — this is a real-time deadline (a compile is wall-clock work), never sim time. */
 export interface LiveCompileGateOpts {
@@ -47,11 +49,11 @@ export function createLiveCompileGate(opts: LiveCompileGateOpts): LiveCompileGat
   let armed = false;
   let pending = false;
   let deadline = 0;
-  /** Bumped per kick. A compile still in flight across a SECOND swap must not clear the newer
+  /** Begun per kick. A compile still in flight across a SECOND swap must not clear the newer
    *  hold when it lands — its promise closure holds the OLD scene, and releasing the frame on it
    *  would draw the new scene with the old scene's pipelines missing. Same token shape
    *  `frameDriver` and `gpuTimings` use, for the same reason. */
-  let generation = 0;
+  const compileEpoch = createSupersessionToken();
 
   return {
     arm() { armed = true; },
@@ -59,7 +61,7 @@ export function createLiveCompileGate(opts: LiveCompileGateOpts): LiveCompileGat
     tick(kick: () => Promise<void>): boolean {
       if (armed) {
         armed = false;
-        const gen = ++generation;
+        const stillLive = compileEpoch.begin();
         pending = true;
         deadline = opts.now() + opts.maxHoldMs;
         // `.then(…, …)` rather than `.finally`: a rejected compile must release the frame too.
@@ -74,10 +76,10 @@ export function createLiveCompileGate(opts: LiveCompileGateOpts): LiveCompileGat
         let work: Promise<void>;
         try { work = kick(); } catch (e) { work = Promise.reject(e); }
         work.then(
-          () => { if (gen === generation) { pending = false; opts.onSettled?.(); } },
+          () => { if (stillLive()) { pending = false; opts.onSettled?.(); } },
           (e) => {
             opts.onError?.(e);
-            if (gen === generation) { pending = false; opts.onSettled?.(); }
+            if (stillLive()) { pending = false; opts.onSettled?.(); }
           },
         );
       }

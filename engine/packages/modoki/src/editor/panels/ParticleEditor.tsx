@@ -8,16 +8,23 @@
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { makeWebGPURenderer } from '../../runtime/rendering/scene3DSync';
 import { setActiveRenderer } from '../../runtime/loaders/textureResolver';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
+import { makePreviewLossPolicy } from './previewLossPolicy';
+import { canApplyParticleDef, handleParticleLossTeardown } from './particle/particlePreviewLoss';
 import { particleBackend } from '../../runtime/particles/particleBackend';
-import { defaultParticleEffect, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
+import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
@@ -25,6 +32,7 @@ import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import CurveEditor from './particle/CurveEditor';
@@ -67,6 +75,46 @@ export default function ParticleEditor() {
   const [playing, setPlaying] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [sceneReady, setSceneReady] = useState(false);
+  // 'failed' = the on-disk document could not be loaded (corrupt JSON) or was REFUSED (a
+  // too-new/unreadable format version, docs/format-versioning.md § 2b-bis — `.particle.json`
+  // is a machine-generated sidecar, not player data, so REFUSE not PRESERVE). Mirrors
+  // AtlasAssetView's `loadState`/`editingDisabled` pattern: on 'failed' the load effect below
+  // never calls `loadParticleDef`, so `def` stays unset and the whole properties panel (gated
+  // on `{def && (...)}`) stays unrendered — editing is disabled by construction, not a flag
+  // threaded through every field.
+  // ⚠️ **"Stays unset" holds for THIS panel's own paths, not against the store** (#896 review 4):
+  // `applyParticleDef` writes `editingParticleDef` whenever the open path matches, with no
+  // reference to `loadState`, so an agent `particle_set` on a refused asset mounts the properties
+  // panel BESIDE this banner. Do not read this line as "nothing can edit a refused file".
+  // A genuinely MISSING file (a brand-new asset) is NOT this — see `isMissingAsset` in the load
+  // effect.
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** This panel kept the local nonce when the other four moved off it
+   *  (#896 review 3, finding 1), which left it the one editor still exposed to the failure the other
+   *  four were fixed for: the load effect early-returns on `if (existing)` BEFORE it fetches, so an
+   *  agent `particle_set` landing a def in the store while this panel is refused (`applyParticleDef`
+   *  writes it, because the path matches) meant Retry cleared the banner without re-reading — and the
+   *  panel then edited, and Cmd+S flushed, whatever document was already in the store.
+   *  `open<X>Editor` is the other wrong answer: it clobbers preview state shared with the sibling
+   *  panel.
+   *
+   *  ⚠️ **Nulling the doc removes the early return; it does NOT guarantee a disk read** (#896 review
+   *  4). The next branch is `pendingAssetDoc`, which adopts a PARKED document before any `fetch` —
+   *  deliberately, since a park is unsaved work newer than the file. Retry re-reads the FILE only
+   *  when nothing is parked for this path. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingParticleAsset');
+  }, []);
+  // Set once a GPU-context/device loss tears the viewport down (finding 7, third adversarial
+  // review of #795). Before this, a loss correctly blocked the zombie apply-effect (finding 1) but
+  // showed the user NOTHING — `sceneReady` has no overlay consumer, so the surface just went
+  // console.error + a frozen last frame, unlike ModelPreview/Preview3DShell's visible error state.
+  const [lost, setLost] = useState(false);
   const [showFloor, setShowFloorState] = useState(loadParticleEditorShowFloor);
   const setShowFloor = (next: boolean | ((prev: boolean) => boolean)) => {
     setShowFloorState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveParticleEditorShowFloor(on); return on; });
@@ -80,19 +128,57 @@ export default function ParticleEditor() {
     let raf = 0;
     let resizeRaf = 0;
     const timer = new THREE.Timer(); // THREE.Clock is deprecated in r184
+    // Detach for this run's own GPU-context-loss listeners (#795, #802) — wired directly rather
+    // than relying on `setActiveRenderer`'s global-slot detection, which is conditional on
+    // winning a slot it can lose (that separate defect is #802, not fixed here). Reassigned once
+    // the renderer exists; called from `cleanupRef.current` below.
+    let detachLoss: () => void = () => {};
 
     (async () => {
       let renderer: Awaited<ReturnType<typeof makeWebGPURenderer>>;
       try { renderer = await makeWebGPURenderer(container); }
       catch (e) { console.error('[ParticleEditor] renderer init failed', e); return; }
       if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
-      await setActiveRenderer(renderer); // async since #254 — imports three's KTX2Loader
+      const disposeActiveRenderer = await setActiveRenderer(renderer); // async since #254 — imports three's KTX2Loader
       // RE-CHECK: `setActiveRenderer` became a real await in #254 (it fetches the KTX2Loader
       // chunk), so the panel can unmount HERE — after the check above. `cleanupRef.current` is
       // not assigned until the rAF loop is already running below, so bailing without this leaves
       // the effect's cleanup a no-op and the renderer + loop + ResizeObserver alive forever.
-      if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
+      if (disposed) { disposeActiveRenderer(); renderer.dispose(); renderer.domElement.remove(); return; }
       rendererRef.current = renderer;
+      // #858. The two `await` bails above are guarded — this file's own comment at the second one
+      // spells out exactly why ("`cleanupRef.current` is not assigned until the rAF loop is
+      // already running below, so bailing without this leaves the effect's cleanup a no-op"). What
+      // that guard cannot cover is the ~85 SYNCHRONOUS lines from here to the assignment: no
+      // `disposed` re-check is possible in them and there is no try/catch, so a throw in
+      // `attachRendererLossHandling`, `new OrbitControls` or `new ResizeObserver` left
+      // `cleanupRef.current` null and the renderer permanently on `activeRenderer`'s registrant
+      // stack — `getActiveRenderer()` then hands every consumer a dead ParticleEditor renderer for
+      // the rest of the session. Seeding the scope here closes that window.
+      const scope = createTeardownScope('ParticleEditor');
+      cleanupRef.current = scope.dispose;
+      // Pushed FIRST so LIFO drains it LAST — the position it held as the closure's final lines.
+      scope.add(() => { disposeActiveRenderer(); renderer.dispose(); renderer.domElement.remove(); });
+      detachLoss = attachRendererLossHandling(
+        { canvas: renderer.domElement, device: (renderer as unknown as { backend?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.backend?.device },
+        { label: 'ParticleEditor', isStale: () => disposed, ...makePreviewLossPolicy({
+          label: 'ParticleEditor',
+          // Beyond the renderer/handle disposal below, a mid-mount loss must also clear the
+          // state the "apply def" effect gates on (finding 1, adversarial review of #795) — or
+          // this panel stays mounted as a zombie that recreates a particle handle on whatever
+          // renderer now owns the active-renderer slot the next time a slider moves.
+          teardown: () => {
+            disposed = true;
+            setLost(true); // give the user a visible state instead of a frozen, silent viewport (finding 7)
+            handleParticleLossTeardown(
+              { setSceneReady, clearScene: () => { sceneRef.current = null; } },
+              () => { cleanupRef.current?.(); cleanupRef.current = null; },
+            );
+          },
+        }) },
+      );
+
+      scope.add(() => detachLoss());
 
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0x14141f);
@@ -122,6 +208,7 @@ export default function ParticleEditor() {
       controls.enableDamping = true;
       controls.dampingFactor = 0.1;
       controls.target.set(0, 1.6, 0);
+      scope.add(() => controls.dispose());
 
       // Defer resize work to rAF so setSize() doesn't reflow synchronously inside the
       // observer callback (that re-triggers the observer → "ResizeObserver loop" warning).
@@ -134,6 +221,7 @@ export default function ParticleEditor() {
         });
       });
       ro.observe(container);
+      scope.add(() => ro.disconnect());
 
       setSceneReady(true);
 
@@ -159,16 +247,16 @@ export default function ParticleEditor() {
       };
       loop();
 
-      // expose cleanup via closure captured below
-      cleanupRef.current = () => {
+      // Pushed LAST, so LIFO runs it FIRST. The five releases that moved out of it (the loss
+      // listener, the controls, the resize observer and the renderer triple) drain after it, in
+      // reverse acquisition order. Only `detachLoss` changes position relative to the old body;
+      // it is safe there because its `isStale` reads `disposed`, which both teardown paths set
+      // before calling this.
+      scope.add(() => {
         cancelAnimationFrame(raf);
         cancelAnimationFrame(resizeRaf);
-        ro.disconnect();
-        controls.dispose();
         if (handleRef.current) { particleBackend.dispose(handleRef.current); handleRef.current = null; objRef.current = null; }
-        renderer.dispose();
-        renderer.domElement.remove();
-      };
+      });
     })();
 
     return () => { disposed = true; cleanupRef.current?.(); cleanupRef.current = null; };
@@ -199,6 +287,8 @@ export default function ParticleEditor() {
     let cancelled = false;
     elapsedRef.current = 0; setElapsed(0);
     playingRef.current = true; setPlaying(true);
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on failure/refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     const existing = useEditorStore.getState().editingParticleDef;
     if (existing) {
       // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
@@ -207,7 +297,19 @@ export default function ParticleEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'particle')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'particle');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadParticleDef } = useEditorStore.getState();
@@ -226,13 +328,29 @@ export default function ParticleEditor() {
       registerAsset(doc.id, asset.path, 'particle');
       adoptParkedDoc(asset.path, 'particle', doc);
       loadParticleDef(doc);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeParticleDef(json);
+        // REFUSE a too-new / unreadable format version (docs/format-versioning.md § 2b-bis)
+        // BEFORE normalizing — `normalizeParticleDef` no longer stamps a version (see its own
+        // comment), so a refused doc would otherwise load, edit, and re-save wearing a version
+        // this build does not fully implement. This is #778's mechanism on this document: the
+        // OLD code below substituted `defaultParticleEffect()` on ANY load failure (including a
+        // conflict-markered or truncated file) and marked it as the SAVED baseline — so the
+        // first edit parked a full-replace write of the defaults over the authored file.
+        const verdict = classifyParticleFetchSuccess(json);
+        if (verdict.kind === 'refused') {
+          console.error(`[ParticleEditor] refusing to open ${asset.path}: ${verdict.message}.`);
+          setLoadState('failed');
+          return;
+        }
+        const loaded = normalizeParticleDef(json as Partial<ParticleEffectDef>);
         // Legacy/new effect with no in-file guid: assign + register one so scenes and sub-emitters
         // can reference it by guid (survives move/rename). The saved-baseline is the doc WITH the
         // id — deliberately not an id-less twin. That trick existed to make the autosave notice the
@@ -246,28 +364,47 @@ export default function ParticleEditor() {
         savedMarkRef.current?.(loaded);
         loadParticleDef(loaded);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[ParticleEditor] load failed, using default', e); const fallback = defaultParticleEffect(); savedMarkRef.current?.(fallback); loadParticleDef(fallback); });
+      .catch((e) => {
+        if (cancelled) return;
+        // A genuinely MISSING file (a brand-new asset, or a stale reference) is NOT an unreadable
+        // one — defaults are the CORRECT content here, same as before this fix. Only a real parse
+        // failure (corrupt/truncated/conflict-markered JSON) must stop short of substituting
+        // defaults — see the header comment above for what got that backwards once (#778).
+        const failure = classifyParticleFetchFailure(e);
+        if (failure.kind === 'missing') {
+          console.warn('[ParticleEditor] load failed (asset missing), using default', e);
+          const fallback = defaultParticleEffect();
+          savedMarkRef.current?.(fallback);
+          loadParticleDef(fallback);
+          return;
+        }
+        console.error(`[ParticleEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+        setLoadState('failed');
+      });
     return () => { cancelled = true; };
     // Intentionally key on the asset PATH, not the `asset` object: the store
     // hands back a stable ref, and we only want to re-load when the path (or the
-    // explicit reopen `nonce`) changes — not on incidental identity churn.
+    // explicit reopen `nonce`, which a Retry bumps through `reloadEditingAsset`) changes — not on incidental
+    // identity churn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce, dropHandle]);
 
   // ── Apply def to the live preview + shared cache ──
   useEffect(() => {
-    if (!def || !sceneReady || !asset) return;
-    const scene = sceneRef.current;
-    if (!scene) return;
+    // Shared with the loss-teardown test (finding 1) so the exact condition a mid-mount loss must
+    // block is pinned in one place, not re-derived here and in the test.
+    if (!canApplyParticleDef({ sceneReady, scene: sceneRef.current }, !!def, !!asset)) return;
+    const scene = sceneRef.current!;
+    const d = def!; // non-null: canApplyParticleDef's `hasDef` arg above is exactly `!!def`
     if (!handleRef.current) {
       // create on the fresh handle (getObject3D is valid here)
-      const h = particleBackend.create(def);
+      const h = particleBackend.create(d);
       const obj = particleBackend.getObject3D(h);
       scene.add(obj);
       handleRef.current = h;
       objRef.current = obj;
     } else {
-      particleBackend.setDef(handleRef.current, def); // live edit (store already updated the shared cache)
+      particleBackend.setDef(handleRef.current, d); // live edit (store already updated the shared cache)
     }
     // `asset` is only read for a truthiness guard; we key on its stable path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -342,7 +479,7 @@ export default function ParticleEditor() {
     if (!path) return;
     const guid = newGuid();
     const def = { ...defaultParticleEffect(), id: guid };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(def, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(path, jsonFileBody(def));
     if (!ok) return;
     // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
     // see it — so the file is authoritative: drop any parked write for that path, or the next save
@@ -373,6 +510,14 @@ export default function ParticleEditor() {
       {/* Viewport */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+        {/* A GPU-context/device loss tore the viewport down (finding 7, third adversarial review
+            of #795) — without this the panel went silent (console.error + a frozen last frame)
+            while ModelPreview/Preview3DShell both show a visible error for the same event. */}
+        {lost && (
+          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#e88', fontSize: 11, padding: 8, textAlign: 'center', background: 'rgba(20,20,31,0.85)' }}>
+            Particle preview unavailable — GPU context was lost. Reopen the panel to rebuild it.
+          </div>
+        )}
         {/* Timeline toolbar */}
         {def && (
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>
@@ -390,6 +535,39 @@ export default function ParticleEditor() {
             <div>Double-click a .particle.json in Assets to edit</div>
             <button data-ui-id="particle.empty.new" data-ui-kind="button" onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
           </div>
+        )}
+        {/* Load-failure / refusal banner (#784, mirrors AtlasAssetView's loadBanner) — this panel
+            never calls `loadParticleDef` on a refusal, so the properties panel below does not mount
+            from THIS path.
+            ⚠️ It is not "there is no edit path", which this comment used to say: `applyParticleDef`
+            can seat a def from an agent op regardless of `loadState` (#896 review 4). */}
+        {asset && loadState === 'failed' && (
+          <AssetLoadRefusedBanner
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="particle.loadBanner"
+            onRetry={retryLoad}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
+        )}
+        {/* #902: this load opened on an unsaved edit, not on the file. An overlay like the banner
+            above, because this panel's viewport is `position: relative` and an in-flow block would
+            reflow the preview. */}
+        {asset && parkAdopted && (
+          <ParkAdoptedBanner
+            path={asset.path}
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="particle.parkAdopted"
+            // ⚠️ `retryLoad`, NOT a local nonce — and this is the one panel where getting it wrong
+            // is silently destructive rather than merely wrong. A bare re-run early-returns on
+            // `if (existing)`, which is truthy precisely BECAUSE the park branch just loaded the
+            // adopted doc; and with the park now discarded, that branch marks the discarded
+            // document as the saved baseline. Net: the repaired file is never read, the banner
+            // disappears, and the next edit parks a wholesale replace of the stale doc over the
+            // repair — #902's own loss, reached through the button that fixes it.
+            onReload={retryLoad}
+            onKeep={() => setParkAdopted(false)}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, alignItems: 'center', zIndex: 5 }}
+          />
         )}
       </div>
 
@@ -423,8 +601,8 @@ export default function ParticleEditor() {
             </div>
             {(def.emission.bursts ?? []).map((b, i) => (
               <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center', paddingLeft: 8 }}>
-                <NumInput title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
-                <NumInput title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
+                <NumInput uiId={`particle.bursts.row.${i}.time`} uiLabel="burst time" title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
+                <NumInput uiId={`particle.bursts.row.${i}.count`} uiLabel="burst count" title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
                 <button data-ui-id={`particle.bursts.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
               </div>
             ))}
@@ -487,10 +665,10 @@ export default function ParticleEditor() {
                   <button data-ui-id={`particle.forces.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove force" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <NumInput title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
-                  <NumInput title="y" value={f.y} step={0.1} on={(n) => updForce(i, { y: n })} width={44} />
-                  <NumInput title="z" value={f.z} step={0.1} on={(n) => updForce(i, { z: n })} width={44} />
-                  <NumInput title="strength (+attract / −repel for point)" value={f.strength} step={0.1} on={(n) => updForce(i, { strength: n })} width={54} />
+                  <NumInput uiId={`particle.forces.row.${i}.x`} uiLabel={`${f.type} force x`} title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.y`} uiLabel={`${f.type} force y`} title="y" value={f.y} step={0.1} on={(n) => updForce(i, { y: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.z`} uiLabel={`${f.type} force z`} title="z" value={f.z} step={0.1} on={(n) => updForce(i, { z: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.strength`} uiLabel={`${f.type} force strength`} title="strength (+attract / −repel for point)" value={f.strength} step={0.1} on={(n) => updForce(i, { strength: n })} width={54} />
                 </div>
               </div>
             ))}
@@ -553,7 +731,8 @@ export default function ParticleEditor() {
               </>
             ) : (
               <>
-                <AssetRefField label="Texture" hint="Sprite/texture asset ref (.png/.webp). Drag a texture from the Assets panel, or use the locate button. Empty = a soft round particle." accept={['.png', '.jpg', '.jpeg', '.webp']} placeholder="drop a texture, or paste a GUID" value={def.render.texture ?? ''} onChange={(v) => patch({ render: { ...def.render, texture: v || undefined } })} />
+                <AssetRefField label="Texture" hint="Sprite/texture asset ref (.png/.webp). Drag a texture from the Assets panel, or use the locate button. Empty = a soft round particle." accept={['.png', '.jpg', '.jpeg', '.webp']} placeholder="drop a texture, or paste a GUID" value={def.render.texture ?? ''} onChange={(v) => patch({ render: { ...def.render, texture: v || undefined } })}
+                  dataUiId="particle.render.texture" dataUiLabel="Texture" />
                 <Num label="Aspect" hint="Billboard width/height ratio. 1 = square; <1 = tall (e.g. 0.5 for a tall lightning bolt); >1 = wide. Size sets the height; width = height × aspect. Match a non-square sprite cell to avoid distortion/padding." v={def.render.aspect ?? 1} min={0.05} step={0.05} on={(v) => patch({ render: { ...def.render, aspect: v } })} />
                 <Enum label="Anchor" hint="Billboard pivot. Center = sprite centered on the particle. Bottom = bottom edge sits at the particle position and grows upward — keeps a ground strike's base planted (place the emitter on the ground)." v={def.render.anchor ?? 'center'} options={['center', 'bottom']} on={(v) => patch({ render: { ...def.render, anchor: v as 'center' | 'bottom' } })} />
                 <Num label="Offset X" hint="Horizontal sprite offset from the anchor, in units of Size (+ = right). Fine-tunes art placement." v={def.render.offset?.[0] ?? 0} step={0.05} on={(v) => patch({ render: { ...def.render, offset: [v, def.render.offset?.[1] ?? 0] } })} />
@@ -572,9 +751,9 @@ export default function ParticleEditor() {
                 <Check label="Soft" hint="Fade particles where they intersect opaque geometry, hiding hard clip edges (smoke against the ground). Use the ▦ floor toggle to preview." v={def.render.softParticles ?? false} on={(v) => patch({ render: { ...def.render, softParticles: v } })} />
               </>
             )}
-            <Check label="Trail" hint="Draw a ribbon behind each particle from its recent position history. CPU sim only (forces a GPU effect to fall back)." v={def.trail?.enabled ?? false} on={(v) => patch({ trail: { enabled: v, segments: def.trail?.segments ?? 8 } })} />
+            <Check label="Trail" hint="Draw a ribbon behind each particle from its recent position history. CPU sim only (forces a GPU effect to fall back)." v={def.trail?.enabled ?? false} on={(v) => patch({ trail: { enabled: v, segments: resolveTrailSegments(def.trail?.segments) } })} />
             {def.trail?.enabled && (
-              <Num label="Trail Seg" hint="History points retained per particle (≥2). More = longer, smoother trail at higher cost." v={def.trail?.segments ?? 8} min={2} step={1} on={(v) => patch({ trail: { enabled: true, segments: Math.max(2, Math.round(v)) } })} />
+              <Num label="Trail Seg" hint="History points retained per particle (≥2). More = longer, smoother trail at higher cost." v={resolveTrailSegments(def.trail?.segments)} min={2} step={1} on={(v) => patch({ trail: { enabled: true, segments: resolveTrailSegments(Math.round(v)) } })} />
             )}
           </Section>
 
@@ -590,13 +769,14 @@ export default function ParticleEditor() {
                     <option value="birth">birth</option>
                     <option value="death">death</option>
                   </select>
-                  <NumInput title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.count`} uiLabel={`${s.trigger} sub-emitter count`} title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
                   <button data-ui-id={`particle.subEmitters.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove sub-emitter" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
-                <AssetRefField label="effect" hint="Child .particle.json fired by this sub-emitter. Drag a particle effect from the Assets panel, or use the locate button." accept={['.particle.json']} placeholder="drop a particle effect, or paste a GUID" value={s.effect} onChange={(val) => updSub(i, { effect: val })} />
+                <AssetRefField label="effect" hint="Child .particle.json fired by this sub-emitter. Drag a particle effect from the Assets panel, or use the locate button." accept={['.particle.json']} placeholder="drop a particle effect, or paste a GUID" value={s.effect} onChange={(val) => updSub(i, { effect: val })}
+                  dataUiId={`particle.subEmitters.row.${i}.effect`} dataUiLabel={`${s.trigger} sub-emitter effect`} />
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <NumInput title="probability 0..1" value={s.probability ?? 1} min={0} max={1} step={0.05} on={(n) => updSub(i, { probability: n })} width={56} />
-                  <NumInput title="inherit velocity 0..1" value={s.inheritVelocity ?? 0} step={0.05} on={(n) => updSub(i, { inheritVelocity: n })} width={56} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.probability`} uiLabel={`${s.trigger} sub-emitter probability`} title="probability 0..1" value={s.probability ?? 1} min={0} max={1} step={0.05} on={(n) => updSub(i, { probability: n })} width={56} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.inheritVelocity`} uiLabel={`${s.trigger} sub-emitter inherit velocity`} title="inherit velocity 0..1" value={s.inheritVelocity ?? 0} step={0.05} on={(n) => updSub(i, { inheritVelocity: n })} width={56} />
                   <span style={{ color: '#666', fontSize: 9, alignSelf: 'center' }}>prob / inherit-v</span>
                 </div>
               </div>

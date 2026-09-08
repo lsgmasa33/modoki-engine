@@ -88,6 +88,37 @@ describe('createPixiParticles', () => {
     obj.dispose();
   });
 
+  it('setQuad rewrites aspect/offset (applied on the next commit) and anchorY (applied immediately) (#769)', () => {
+    const obj = createPixiParticles(4, render({ blend: 'normal', aspect: 1, anchor: 'center', offset: [0, 0] }));
+    const { outputs } = obj;
+
+    outputs.offsets[0] = 10; outputs.offsets[1] = 20; outputs.offsets[2] = 0;
+    outputs.scales[0] = 2;
+    outputs.colors[0] = 1; outputs.colors[1] = 1; outputs.colors[2] = 1;
+    outputs.opacities[0] = 1;
+    outputs.rotations[0] = 0;
+    obj.commit(1);
+
+    const p0 = obj.container.particleChildren[0];
+    expect(p0.scaleX).toBe(2); // aspect=1: scaleX === scaleY === size
+    expect(p0.anchorY).toBe(0.5); // center anchor
+
+    obj.setQuad(render({ blend: 'normal', aspect: 2, anchor: 'bottom', offset: [3, 5] }));
+
+    // anchorY is written straight onto the pooled particle — no commit needed.
+    expect(p0.anchorY).toBe(1);
+    // aspect/offset are mapping options, consumed only on the NEXT commit.
+    expect(p0.scaleX).toBe(2); // unchanged yet
+    expect(p0.x).toBe(10);
+
+    obj.commit(1); // re-commit the same live particle to pick up the new mapping options
+    expect(p0.scaleX).toBe(4); // scale(2) * new aspect(2)
+    expect(p0.x).toBe(10 + 3 * 2); // offsets.x + offsetX(3) * scale(2)
+    expect(p0.y).toBe(20 + 5 * 2); // offsets.y + offsetY(5) * scale(2)
+
+    obj.dispose();
+  });
+
   it('dispose does not throw', () => {
     const obj = createPixiParticles(8, render({ blend: 'additive' }));
     expect(() => obj.dispose()).not.toThrow();

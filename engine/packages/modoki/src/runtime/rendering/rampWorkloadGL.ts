@@ -80,6 +80,7 @@
 import { rawNow } from '../core/clock';
 import { makeGpuClock, type GpuClock } from './gpuClock';
 import type { RampKind } from './rampProbe';
+import { noteGpuContextCreated } from '../core/gpuContextTracking';
 
 /** Dependent texture reads per fragment in the heavy shader. Kept identical to
  *  `probeHeavyShader.SHADE_TAPS` — the number models a tier's worth of per-fragment work (IBL is
@@ -266,6 +267,10 @@ export function createGlProbeSurface(cw: number, ch: number, mark: (stage: strin
     failIfMajorPerformanceCaveat: false,
   }) as WebGL2RenderingContext | null;
   if (!gl) { mark('gl-context-failed'); return null; }
+  // Phase 3 of #590 (docs/rendering.md): this raw WebGL2 context was
+  // invisible to the soft GPU-context budget — noted here, right after creation is confirmed,
+  // paired with the one-shot `dispose()` below.
+  const releaseContextCount = noteGpuContextCreated();
 
   let vs: WebGLShader | null = null;
   let cheapProgram: WebGLProgram | null = null;
@@ -274,6 +279,7 @@ export function createGlProbeSurface(cw: number, ch: number, mark: (stage: strin
   let vao: WebGLVertexArrayObject | null = null;
 
   const dispose = () => {
+    releaseContextCount();
     try {
       if (cheapProgram) gl.deleteProgram(cheapProgram);
       if (heavyProgram) gl.deleteProgram(heavyProgram);

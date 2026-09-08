@@ -49,18 +49,22 @@ const UI_DEFAULTS = {
 const ANCHOR_DEFAULTS = {
   anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
   bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
-  pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0,
+  pivotX: 0, pivotY: 0, safeArea: false,
 };
 
 function makeWorld(ui: Record<string, unknown>, anchor: Record<string, unknown> | null) {
   return {
+    // No `UISettings` entity: `uiTreeProjection` reads the scene-wide default font through
+    // `queryFirst` (#803), so this fake must answer it. `undefined` = no default authored,
+    // which is what these fixtures assert against.
+    queryFirst: () => undefined,
     query: () => ({
       updateEach: (cb: (data: unknown[], entity: unknown) => void) => {
         const data = new Map<unknown, unknown>();
         data.set(UIEL, { ...UI_DEFAULTS, ...ui });
         data.set(ATTR, { parentId: 0, sortOrder: 0, guid: 'g1' });
         if (anchor) data.set(ANC, { ...ANCHOR_DEFAULTS, ...anchor });
-        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
+        const entity = { id: () => 1, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
         cb([data.get(UIEL)], entity);
       },
     }),

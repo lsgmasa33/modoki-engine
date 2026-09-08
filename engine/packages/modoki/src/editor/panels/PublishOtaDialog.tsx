@@ -1,9 +1,10 @@
-/** "Publish OTA Update…" dialog (docs/plans/mobile-ota-updates-plan.md Phase 5a) —
+/** "Publish OTA Update…" dialog (docs/ota-updates.md) —
  *  the primary Build → OTA action. Shows what's LIVE on the bucket right now vs what
  *  this project would publish, collects a version string + mandatory flag, then drives
  *  GET /api/ota/publish (SSE) to completion. That endpoint already carries the safety
- *  rails (fresh build from the current project.config.json, version-collision refusal,
- *  CORS preflight) — this dialog is just the human-facing surface over it.
+ *  rails (fresh build from the current project.config.json, CORS preflight) and defers
+ *  the version-collision decision to engine/scripts/ota-publish.mjs (#577) — this dialog
+ *  is just the human-facing surface over it.
  *
  *  Gated by editorStore.otaPublishOpen (opened from Build → Publish OTA Update…). */
 
@@ -44,7 +45,11 @@ export default function PublishOtaDialog() {
 
   const [bundleName, setBundleName] = useState('shell');
   const [version, setVersion] = useState('');
-  const [mandatory, setMandatory] = useState(false);
+  // Tri-state, matching the server's sticky-mandatory contract (ota-publish.mjs):
+  // 'unchanged' sends no `mandatory` param (inherits the live release's value), 'set'
+  // sends 1, 'clear' sends 0. Defaults to 'unchanged' so a routine publish can never
+  // silently clear a live mandatory release.
+  const [mandatory, setMandatory] = useState<'unchanged' | 'set' | 'clear'>('unchanged');
   const [key, setKey] = useState('');
 
   const [publishing, setPublishing] = useState(false);
@@ -109,7 +114,8 @@ export default function PublishOtaDialog() {
     const qs = new URLSearchParams({ version: version.trim() });
     if (bundleName.trim()) qs.set('bundleName', bundleName.trim());
     if (key.trim()) qs.set('key', key.trim());
-    if (mandatory) qs.set('mandatory', '1');
+    if (mandatory === 'set') qs.set('mandatory', '1');
+    else if (mandatory === 'clear') qs.set('mandatory', '0');
 
     const es = backendEventSource(`/api/ota/publish?${qs}`);
     esRef.current = es;
@@ -150,9 +156,10 @@ export default function PublishOtaDialog() {
       }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 4 }}>Publish OTA Update</div>
         <div style={{ color: '#888', fontSize: 11, marginBottom: 12 }}>
-          Builds fresh from the current project settings, refuses a version already
-          published, verifies bucket CORS, then publishes. Players on a routine (non-
-          mandatory) update pick it up next launch.
+          Builds fresh from the current project settings, verifies bucket CORS, then
+          publishes. Republishing the same version resumes if the contents match, and is
+          refused if they differ or if the bucket can't be read. Players on a routine
+          (non-mandatory) update pick it up next launch.
         </div>
 
         {!enabled && (
@@ -194,17 +201,37 @@ export default function PublishOtaDialog() {
             <input data-ui-id="ota.publish.signingKey" data-ui-kind="field" data-ui-label="Signing key name" type="text" style={inputStyle} value={key} disabled={publishing}
               onChange={(e) => setKey(e.target.value)} placeholder="default" />
           </div>
-          <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
-              <input data-ui-id="ota.publish.mandatory" data-ui-kind="toggle" data-ui-label="Mandatory" data-ui-state={mandatory ? 'checked' : 'unchecked'} type="checkbox" checked={mandatory} disabled={publishing} onChange={(e) => setMandatory(e.target.checked)} />
-              Mandatory (blocks with a restart gate)
-            </label>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>
+              Mandatory {!loading && (
+                <span style={{ color: '#666' }}>(currently: {release?.mandatory ? 'mandatory' : 'not mandatory'})</span>
+              )}
+            </div>
+            <select
+              data-ui-id="ota.publish.mandatory" data-ui-kind="select" data-ui-label="Mandatory" data-ui-state={mandatory}
+              style={inputStyle} value={mandatory} disabled={publishing}
+              onChange={(e) => setMandatory(e.target.value as 'unchanged' | 'set' | 'clear')}
+            >
+              <option value="unchanged">Leave unchanged</option>
+              <option value="set">Mandatory (blocks with a restart gate)</option>
+              <option value="clear">Not mandatory</option>
+            </select>
           </div>
         </div>
 
         {(publishing || done || failed) && (
           <div style={{ marginBottom: 10 }}>
-            <div style={{ color: failed ? '#e74c3c' : done ? '#2ecc71' : '#ddd', fontSize: 12, marginBottom: 4 }}>
+            {/* `pre-wrap` so a multi-line failure keeps its breaks — a collision refusal ends
+             *  with `Try v19.` and used to collapse into one run-on paragraph. But bound the
+             *  height with it: on failure `statusLine` carries up to 1500 chars of the child's
+             *  interleaved stdout+stderr, and honouring every newline turns ~18 wrapped lines
+             *  into 40+. This container is a flex column with no `overflowY`, so an unbounded
+             *  status pushes the footer — including the Retry button — out of the modal on the
+             *  one screen whose whole purpose is retrying. Scroll it, like the log panel below. */}
+            <div style={{
+              color: failed ? '#e74c3c' : done ? '#2ecc71' : '#ddd', fontSize: 12, marginBottom: 4,
+              whiteSpace: 'pre-wrap', maxHeight: 160, overflowY: 'auto',
+            }}>
               {statusLine}
             </div>
             <div style={{

@@ -15,6 +15,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createDeviceToolDef, type DeviceToolResult } from './registry.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
+// Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
+// `timeoutMs` and the device's own internal step budget can never independently drift (#822).
+import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -27,7 +30,7 @@ import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
   deviceFail, caughtFailure, deviceReplyFailure,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -169,6 +172,16 @@ type DeviceStatusReply = {
  *  the real interface without re-parsing this file's type declaration. */
 export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial'] as const;
 
+/** The `type` values `device_read_asset_def` accepts — the 7 of the 9 `ASSET_SCHEMA_TYPES` that
+ *  `read-asset-def` (agentBridge.ts) actually serves; `material` is deliberately absent (that op
+ *  refuses it — a material's live cache holds only the compiled THREE.Material). `atlas` is also
+ *  absent: the op has no `atlas` branch, and atlas holds no engine-side cache to read back
+ *  (`assetInvalidation.ts` — "atlas frames are read straight off the manifest"; `persist.ts`'s
+ *  `invalidateAtlasFile` is a documented no-op). Exported so `assetTypeParity.test.ts` pins this
+ *  enum against the op instead of letting it drift again like #842/#843 (five types kept here
+ *  after the op widened to seven). */
+export const DEVICE_READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'] as const;
+
 // ── GET /api/device/list (#149) ───────────────────────────────────────────
 // A local mirror of the route's reply shape (`editorBackendRouter.ts`'s `/api/device/list` handler,
 // `DeviceClaim` from `deviceConnection.ts` § deviceClaims.ts) — same reason as `DeviceStatusReply`
@@ -198,8 +211,7 @@ type DeviceListReply = {
   note?: string;
 };
 
-/** Which device the lease currently points at, as a comparable key ("adb" / "192.168.1.5:8095"),
- *  or null when nothing is connected.
+/** WHY the lease is stamped onto a measurement at all.
  *
  *  `adbScreenInfo` converts screenshot pixels to device pixels for `device_tap`/`device_drag`, and
  *  it was only invalidated by taking ANOTHER screenshot. So a lease that changed in between — the
@@ -208,21 +220,39 @@ type DeviceListReply = {
  *  it landed somewhere else entirely and reported success. Stamping the dims with the lease they
  *  were measured under makes that detectable rather than silent, and covers the human path too
  *  (this MCP is not told when the panel reconnects). */
+/** Pure: turn a status reply into a comparable lease key, or null when nothing is connected.
+ *  Exported so it can be unit-tested directly and so `leaseAdbTarget()` (#471) can derive its own
+ *  key from the SAME reply it read `useAdb`/`serial` from, rather than a second, later fetch.
+ *
+ *  #471 (this fix): `serial` (#149) IS carried on an adb lease's `target`, so two adb leases on
+ *  this machine now key distinctly (`adb:SERIAL_A` vs `adb:SERIAL_B`) instead of colliding on the
+ *  literal string 'adb'. The remaining honest limit: a USB phone physically swapped WITHOUT the
+ *  lease being reconnected still reports the OLD serial — the status route only knows what it
+ *  resolved at connect time, not what's plugged in right now. A serial-less adb lease (a status
+ *  shape that doesn't carry one) degrades to the constant key `'adb:'`, i.e. today's pre-#149
+ *  behaviour — no worse than before, just no longer the *only* case. */
+export function statusLeaseKey(s: DeviceStatusReply | null | undefined): string | null {
+  if (s?.state !== 'connected' || !s.target) return null;
+  return s.target.useAdb ? `adb:${s.target.serial ?? ''}` : `${s.target.host}:${s.target.port}`;
+}
+
+/** Which device the lease currently points at, as a comparable key
+ *  (`adb:R5CT30…` / `192.168.1.5:8095`), or null when nothing is connected or the backend is
+ *  unreachable. One status fetch; the key shape itself is `statusLeaseKey` above. */
 async function leaseKey(): Promise<string | null> {
   try {
-    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    if (s?.state !== 'connected' || !s.target) return null;
-    // NOTE the honest limit here (independent review, 2026-07-30). This used to read
-    // `t.serial ?? t.deviceId` and claim it closed the USB-device-swap case — but neither field
-    // exists on `DeviceConnectStatus` (see DEVICE_STATUS_TARGET_FIELDS below, drift-guarded), so
-    // every adb lease keyed to the literal string 'adb:' and the check it feeds could never fire.
-    // A guard that cannot fire is worse than none: its comment tells the next reader the case is
-    // covered. The status route does not carry a device identity, so the stamp cannot distinguish
-    // two adb leases; say so rather than imply otherwise. Swapping the USB phone WITHOUT
-    // reconnecting can still leave the previous device's capture dims live — to close that
-    // properly the lease has to report a serial, which is a deviceConnection change, not one here.
-    return s.target.useAdb ? 'adb' : `${s.target.host}:${s.target.port}`;
+    return statusLeaseKey((await backendGet('/api/device/status')) as DeviceStatusReply);
   } catch { return null; }
+}
+
+/** The measured dims are only usable if the lease did not move during the capture (#471). `before`
+ *  is the lease key read BEFORE the (1-3s) capture, `after` is read AFTER — stamping `after` onto
+ *  dims measured under `before` would launder a stale entry into one that looks fresh. Two
+ *  `null`s ("unknown" on both sides) do NOT count as a match — a naive `before === after` gets
+ *  this wrong, since `null === null` is true in JS but neither read actually observed a lease. */
+export function screenInfoIfLeaseHeld<T>(before: string | null, after: string | null, dims: T): (T & { lease: string }) | null {
+  if (before === null || before !== after) return null;
+  return { ...dims, lease: before };
 }
 
 /** The adb screenshot dims IF they were measured under the lease that is live right now.
@@ -358,12 +388,17 @@ async function leaseUsesAdb(): Promise<boolean> {
  *  because a lease that changed between two separate fetches (the human reconnecting mid-call)
  *  could answer the two questions inconsistently. Used only by `device_screenshot`'s adb branch,
  *  which is the one place that needs to hand a serial down to `adbAvailable`/`adbScreencap`; every
- *  other adb gate in this file only needs the boolean and keeps using `leaseUsesAdb()` above. */
-async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string }> {
+ *  other adb gate in this file only needs the boolean and keeps using `leaseUsesAdb()` above.
+ *
+ *  `lease` (#471) is `statusLeaseKey()` of this SAME reply — so the serial handed to
+ *  `adbScreencap` and the key stamped onto the pre-capture measurement provably describe the same
+ *  lease, rather than the key being re-read after the 1-3s capture (during which the lease can
+ *  move to a different device). */
+async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string; lease: string | null }> {
   try {
     const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial };
-  } catch { return { useAdb: false }; }
+    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial, lease: statusLeaseKey(s) };
+  } catch { return { useAdb: false, lease: null }; }
 }
 
 // ── Backend HTTP helpers ─────────────────────────────────────
@@ -449,6 +484,16 @@ async function deviceRequest(method: string, params: Record<string, unknown> = {
  *  to workflows. */
 async function deviceRequestFull(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   return (await backendPost('/api/device/request', { method, params })) as Record<string, unknown>;
+}
+
+/** The `⚠️` caveat line for a host-side reply the router could not tie to the lease
+ *  (`unverified` on the `crashReports`/`nativeLogs` route bodies — editorBackendRouter.ts,
+ *  `pickGoIosDevice`). Same tone/shape as `wdaLauncher.ts`'s `launchWarning`: reported, not
+ *  refused, and stated plainly so the answer isn't mistaken for one confirmed against the leased
+ *  device — it may be about a different phone. '' when the field is absent (the common,
+ *  confirmed case), so callers can prepend it unconditionally. */
+function unverifiedNote(body: Record<string, unknown>): string {
+  return typeof body.unverified === 'string' ? `[⚠️ ${body.unverified}]\n` : '';
 }
 
 // ── Tool registration ────────────────────────────────────────
@@ -901,7 +946,10 @@ export function registerTools(server: McpServer) {
   tool('device_player_prefs',
     'READ the game\'s PlayerPrefs store on the connected device — the durable per-key JSON save ' +
       'data (progress, settings, unlocks) as the INSTALLED app actually holds it.\n\n' +
-      'CALLED BARE it returns the key INDEX plus `pendingWrites`; pass `key` for that key\'s ' +
+      'CALLED BARE it returns the key INDEX plus `pendingWrites`. `pendingWrites` is NOT a subset ' +
+      'of `keys` — a key can be pending and absent from `keys` (a delete whose durable remove has ' +
+      'not been accepted yet — rejected, or merely still debounced), so it may still be on disk. ' +
+      'Pass `key` for that key\'s ' +
       'value. Every reply names its `namespace` — on a device that is the game\'s own (typically ' +
       'the appId), NOT the editor\'s `<gameId>@editor` sandbox, so this is the only place you can ' +
       'read what a player would see.\n\n' +
@@ -929,7 +977,13 @@ export function registerTools(server: McpServer) {
       '`set` and `delete` FLUSH before replying, so `saved:true` means the backend accepted the ' +
       'durable write rather than merely that the in-memory cache changed — a rejected write keeps ' +
       'its value in the cache, so a read-back still shows it while nothing survives a restart. ' +
-      'Such a write is reported PARTIAL, never as success.',
+      'Such a write is reported PARTIAL, never as success.\n\n' +
+      'ALL FOUR actions, flush included, are refused while a game/namespace swap is in flight — ' +
+      'a write or flush that is still settling when the install runs can land in (or answer ' +
+      'about) the OUTGOING namespace after this op has already moved on, so it cannot truthfully ' +
+      'report where or whether it landed; retry once the swap finishes. device_player_prefs reads ' +
+      'are NOT refused during the same window — a read answers truthfully about the (still fully ' +
+      'hydrated) outgoing store.',
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
@@ -1266,12 +1320,21 @@ export function registerTools(server: McpServer) {
         const adbTarget = await leaseAdbTarget();
         if (adbTarget.useAdb && await adbAvailable(adbTarget.serial)) {
           const cap = await adbScreencap(savePath, inline, adbTarget.serial);
-          adbScreenInfo = { imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH, lease: (await leaseKey()) ?? 'adb' };
+          // The lease can move DURING the 1-3s capture — a claim is machine-wide, so any sibling clone's
+          // device_connect can take it (#471). Stamping the POST-capture key onto PRE-capture dims would
+          // launder a stale entry into one that passes currentScreenInfo's guard, so re-read and discard
+          // the measurement when it moved. `adbScreenInfo = null` is the established "we don't know" answer.
+          adbScreenInfo = screenInfoIfLeaseHeld(adbTarget.lease, await leaseKey(), {
+            imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH,
+          });
           // Same VITEST guard as `renderScreenshot` — this branch needs adb + an adb lease, so no
           // test reaches it TODAY, but it is the identical defect and one adb-path test away from
           // opening Preview windows during `npm test`.
           if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
-          const info = `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`;
+          const info = adbScreenInfo
+            ? `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`
+            : `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). ⚠️  The device lease changed DURING this capture — ` +
+              `these pixels are NOT a valid aim space for device_tap/device_drag, and the image may be of the PREVIOUS device. Re-take the screenshot.`;
           return inline
             ? { content: [{ type: 'image' as const, data: cap.base64, mimeType: cap.mimeType }, { type: 'text' as const, text: info }] }
             : { content: [{ type: 'text' as const, text: describeScreenshot(info, cap.path, cap.bytes) }] };
@@ -1701,7 +1764,15 @@ export function registerTools(server: McpServer) {
     },
     async ({ frames, scale, timeoutMs }) => writeCall('device_step', 'sim-step', {
       ...(frames !== undefined ? { frames } : {}), ...(scale !== undefined ? { scale } : {}),
-      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      // ALWAYS forward a timeoutMs, even when the caller omitted one (#822). The editor backend's
+      // `/api/device/request` route reads `params.timeoutMs` GENERICALLY to size the transport's
+      // round-trip deadline (deliberately so, #153) — an omitted value fell back to a flat 5s
+      // regardless of how many frames were requested, while the DEVICE derived its own, much
+      // larger budget from `frames` independently. `device_step {frames:600}` — the max this tool
+      // itself advertises — always timed out at the transport while the device kept faithfully
+      // stepping. Deriving it here with the SAME formula the device uses means the two can never
+      // diverge again.
+      timeoutMs: timeoutMs ?? simStepDefaultTimeout(frames ?? 1),
     }, 'step the paused device game by N frames', [
       'pause first: device_set_timescale {scale:0}',
     ]),
@@ -1723,7 +1794,9 @@ export function registerTools(server: McpServer) {
 
   tool('device_read_asset_def',
     'Read an asset definition AS THE RUNNING BUILD RESOLVED IT (#166 P7) — a particle/animation/' +
-      'timeline/spriteanim/rig2d def straight out of the live cache on the phone. This is not a ' +
+      'timeline/spriteanim/rig2d/shader/animset def straight out of the live cache on the phone. ' +
+      'NOT .mat.json — a material\'s live cache holds only the compiled THREE.Material, the ' +
+      'authored JSON is discarded once built, so read that file directly instead. This is not a ' +
       'file read: it answers "what did THIS build actually load", which is the observe-don\'t-infer ' +
       'rule applied to assets, and it is the only way to tell a shipped/OTA build apart from the ' +
       'source on your disk. PEEKS ONLY — it never triggers a fetch, so asking about an absent asset ' +
@@ -1731,7 +1804,7 @@ export function registerTools(server: McpServer) {
       'empty def.',
     {
       path: z.string().describe('Asset path, e.g. /games/x/assets/fx/spark.particle.json'),
-      type: z.enum(['particle', 'animation', 'timeline', 'spriteanim', 'rig2d']).optional()
+      type: z.enum(DEVICE_READ_ASSET_DEF_TYPES).optional()
         .describe('Override the kind. Inferred from the filename suffix when omitted.'),
     },
     async ({ path, type }) => writeCall('device_read_asset_def', 'read-asset-def',
@@ -2029,22 +2102,49 @@ async function coordScaleOrRefusal(
       level: z.enum(['log', 'warn', 'error', 'info']).optional(),
     },
     async ({ limit, level }) => {
+      const what = 'read the captured console output from the device';
       try {
         const raw = await deviceRequest('consoleLogs', { limit: limit ?? 50, ...(level ? { level } : {}) });
         // The device signals a handler failure by RETURNING an `Error: …` STRING, which the transport
         // resolves as a normal result (that is why `isDeviceError` exists). Without this check the
-        // string fell through to `result.map(...)`, threw "result.map is not a function", and
-        // `caughtFailure` classified the throw as a TRANSPORT failure — so a device-side refusal was
-        // reported as "the device app may have been backgrounded or killed; relaunch it". Wrong
-        // cause, wrong remedy. Found by the Phase-8 table-driven device sweep.
-        if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', 'read the captured console output from the device', raw);
-        const result = parseReply<Array<{ level: string; args: string[]; timestamp: number }>>(raw);
-        const text = !result || result.length === 0
+        // string fell through to the shape parser below, misread as an unrecognised reply — a
+        // device-side refusal would be reported with the wrong remedy. Found by the Phase-8
+        // table-driven device sweep.
+        if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', what, raw);
+        // #644: `bridge.ts`'s `handleConsoleLogs` returns `{logs, dropped}` today but returned a
+        // BARE ARRAY before `6f5e81b48` — and this MCP server is a LONG-LIVED process that does not
+        // pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against
+        // the NEW bridge shape (or vice versa). This used to blindly destructure `{logs, dropped}`
+        // and call `.map` on whatever came out, which threw `result.map is not a function` on the
+        // other shape — a version-skew crash, misclassified by `caughtFailure` as a TRANSPORT
+        // failure ("the device app may have been backgrounded or killed; relaunch it"), which sent
+        // the reporter chasing the wrong fix. `parseConsoleLogsReply` tolerates both wire shapes
+        // (plus a quiet/empty ring) and reports anything else as a shape mismatch, not a crash.
+        const parsed = parseConsoleLogsReply(raw);
+        if (!parsed.ok) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            tool: 'device_console_logs',
+            what,
+            why: `the device answered, but not in a shape this tool understands (${parsed.got}). ` +
+              'The lease is fine — this is a version skew between this MCP server and the console bridge inside the app.',
+            options: [
+              'restart the MCP server — it is a LONG-LIVED process started with the session and does NOT pick up a rebuilt tree, so a git pull or a branch switch mid-session leaves it running the old reply parser (this is what produced #644)',
+              'if the APP is the old side, rebuild and redeploy it — engine/app/debug/bridge.ts handleConsoleLogs is the other half of this contract',
+              "device_status still answers, and device_native_logs source:'system' reads the device log from the HOST with no bridge involved",
+            ],
+          });
+        }
+        // `dropped` is how many entries were evicted from the ring's tail BETWEEN the pinned boot
+        // prefix and this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so
+        // a non-zero value means the log below has a real gap in it, not that boot was quiet.
+        const gapNote = parsed.dropped > 0 ? `\n(${parsed.dropped} earlier ${parsed.dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
+        const text = (parsed.logs.length === 0
           ? 'No console logs.'
-          : result.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n');
+          : parsed.logs.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')) + gapNote;
         return { content: [{ type: 'text' as const, text }] };
       } catch (e) {
-        return caughtFailure('device_console_logs', 'read the captured console output from the device', e);
+        return caughtFailure('device_console_logs', what, e);
       }
     },
   );
@@ -2078,14 +2178,16 @@ async function coordScaleOrRefusal(
         // result, and `raw:true` legitimately returns a string too — so without this check a refusal
         // would be handed back as if it were the report text.
         if (isDeviceError(result)) return deviceReplyFailure('device_crash_reports', 'read the device crash reports', result);
-        // `raw` — the route already appends its own truncation marker to the text, so nothing to add.
-        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: result }] };
+        // `raw` — the route already appends its own truncation marker to the text, so nothing to add
+        // beyond the unverified caveat (still worth stating: a raw report is exactly as likely to be
+        // about the wrong phone as a summarized one).
+        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: unverifiedNote(body) + result }] };
         // A listing says what it HID. "19 reports" when 99 exist is a different answer from "19
         // reports exist", and only one of them is true.
-        const note = Array.isArray(result)
+        const note = (Array.isArray(result)
           ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
-          : '';
-        return { content: [{ type: 'text' as const, text: note + JSON.stringify(result, null, 2) }] };
+          : '') + unverifiedNote(body);
+        return { content: [{ type: 'text' as const, text: note + encodeStructuredResult(result) }] };
       } catch (e) {
         return caughtFailure('device_crash_reports', 'read the device crash reports', e);
       }
@@ -2124,18 +2226,48 @@ async function coordScaleOrRefusal(
         // Same class as device_console_logs above: an `Error: …` reply would be String()'d straight
         // into the payload and read as log CONTENT.
         if (isDeviceError(raw)) return deviceReplyFailure('device_native_logs', 'read the native device logs', raw);
-        const result = parseReply<string[]>(raw);
-        const text = (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.';
+        // #648: DECODE, don't cast. This was `parseReply<string[]>(raw)` followed by
+        // `Array.isArray(result) ? join : String(result)` — so any non-array reply was
+        // String()'d into the payload and read as log CONTENT (an object would have rendered
+        // as the literal "[object Object]").
+        const parsed = parseNativeLogsReply(raw);
+        if (!parsed.ok) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            what: 'read the native device logs (logcat / os_log)',
+            why: `the device answered a shape this MCP cannot read: ${parsed.got}. This says NOTHING about whether the device has logs.`,
+            options: [
+              'restart the MCP server — it is a LONG-LIVED process and does NOT pick up a rebuilt tree',
+              'the installed app binary may predate this MCP; rebuild and redeploy it',
+            ],
+          });
+        }
+        // A native-side failure is a REFUSAL, never an empty log list. `{logs: [], error:
+        // 'OSLogStore denied'}` used to arrive as "No logs.", i.e. could-not-look reported as
+        // nothing-is-there — the two lead to opposite next moves.
+        if (parsed.error && parsed.logs.length === 0) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            what: 'read the native device logs (logcat / os_log)',
+            why: `the native log reader refused: ${parsed.error}`,
+            options: ['check the app has the entitlement/permission its platform needs for os_log / logcat'],
+          });
+        }
+        // A partial read (some logs AND an error) keeps the logs and states the error — dropping
+        // either half would be the same collapse in the other direction.
+        const text = (parsed.error ? `[⚠️ the native log reader also reported: ${parsed.error}]\n` : '')
+          + (parsed.logs.join('\n') || 'No logs.');
         // Say what the read actually WAS when it was a forward capture — an empty system result is
         // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
         // opposite next moves. Truncation is stated for the same reason.
-        const note = source !== 'system' ? ''
+        const note = (source !== 'system' ? ''
           // Android dumps a ring buffer (backward); iOS streams (forward). Saying WHICH read you
           // got is the difference between "nothing was logged" and "nothing happened while I
           // watched", and those lead to opposite next moves.
           : body.backward
             ? `[system log (logcat dump, backward)${body.device ? ` · ${String(body.device)}` : ''}${body.clamped ? ' · limit capped at 400 lines (response budget)' : ''}]\n`
-            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`;
+            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`)
+          + unverifiedNote(body);
         return { content: [{ type: 'text' as const, text: note + text }] };
       } catch (e) {
         return caughtFailure('device_native_logs', 'read the native device logs (logcat / os_log)', e);

@@ -28,6 +28,7 @@ vi.mock('../../src/runtime/ui/UINode', () => ({
 }));
 
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
+import { resetSafeAreaInsets } from '../../src/runtime/ui/safeArea';
 import { DebugMenu } from '../../src/runtime/debug/DebugMenu';
 import { __resetDebugMenuRegistry } from '../../src/runtime/debug/debugMenuRegistry';
 
@@ -58,6 +59,10 @@ beforeEach(() => {
   (globalThis as { ResizeObserver?: unknown }).ResizeObserver = FakeRO;
 });
 afterEach(() => {
+  // UIRenderer registers its container with safeArea (module state, #612), so an unmounted
+  // container would otherwise stay registered — with its probes and observer — for the rest of
+  // this file. Nothing here reads the insets; this keeps it that way by construction.
+  resetSafeAreaInsets();
   cleanup();
   pointerSource.detach();
   clearPointerBlockers();

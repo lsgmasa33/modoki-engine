@@ -31,6 +31,142 @@ concave-shapes, platformer). **Deferred (optional, none blocking)** — pick up 
 - **Harness:** loading a real scene FILE headlessly in `createTestWorld` (a general
   verification-harness follow-up, not physics-specific).
 
+## Version pin: stay on rapier 0.19.3 — 0.20.0 panics on a routine gameplay op (#750)
+
+**Both `-compat` packages are deliberately held at `^0.19.3`, pinned in
+`engine/packages/modoki/package.json` — not the root manifest.** Do not bump them to 0.20.0 without
+re-running the case below. The caret will not take you there on its own (npm reads `^0.19.3` as
+`>=0.19.3 <0.20.0`, so a 0.x minor is out of range), but a hand-edit or a "let's get current" pass
+will.
+
+⚠️ **A naive `grep` for the installed version misleads.** The root `node_modules/@dimforge/rapier3d-compat`
+is **0.12.0** — a types-only transitive of `@types/three`, which pins `~0.12.0` — and is *not* what
+the loaders resolve. The runtime 3D copy is nested under `engine/packages/modoki/node_modules/`;
+the 2D one hoists to the root because nothing else claims that path. Both are 0.19.3.
+
+**The blocker: removing a collider a dynamic body is TOUCHING makes rapier 0.20.0 panic**
+(`RuntimeError: unreachable`, raised from inside `stepWithEvents` on a subsequent step, with no
+Rust panic message because the shipped wasm is a release build). That is not an exotic operation —
+it is *destroy the platform something is standing on*, and it is reachable from any game that
+removes or reshapes a `Collider2D`/`Collider3D` at runtime.
+
+The bump produced **8 failing tests across 5 files** (out of 10,735). Counted honestly, because the
+split is the useful part:
+
+| # | Failure | Cause |
+|---|---|---|
+| 5 | `physics2D` / `physics2DEvents` mid-scene structural-edit + lifecycle cases | the panic, and its aftermath |
+| 2 | `physics2DCcd` / `physics3DCcd` — *"a fast ball tunnels through a thin wall with CCD off"* | CCD default flip (below) — a real assertion diff, got 294 where it wanted >400, and 2.90 where it wanted >4 |
+| 1 | `physics3DSystem` — a box resting on a floor | resting depth moved 0.0086 against a 0.005 tolerance |
+
+Within the first group, only the `unreachable` panic is a distinct bug: the accompanying
+`EventQueue.free()` throws (`null pointer passed to rust`, `attempted to take ownership of a Rust
+value while it was borrowed`) are wasm-bindgen's symptoms **after** the panic has poisoned the
+module. Chasing them as independent failures wastes a session.
+
+### The upstream root cause is KNOWN — do not re-derive it, and do not file it again
+
+**[dimforge/rapier#985](https://github.com/dimforge/rapier/issues/985)** (open) has it diagnosed in
+Rust, by a reporter who ported it out of wasm and reproduced it natively:
+
+In `rapier2d` 0.35.0, the `CcdTargets::FixedList` arm of `handle_candidate` in
+`src/dynamics/ccd/sweeps.rs` dereferences a stale collider handle held by `CCDSolver`'s
+`fixed_targets_cache`, panicking with `No element at index` from the arena.
+
+The cache persists across steps and is rebuilt only when `scene_changed` is true — but that
+invalidation is **only acted on when a CCD pass actually runs**, i.e. when some body is moving fast
+that step. So removing a fixed body's colliders on a quiet step drops the invalidation, and the next
+time anything moves fast the sweep iterates the stale list and indexes a freed arena slot.
+
+⚠️ **That is what makes it a 0.20.0 regression rather than a latent bug we happened to trip.** The
+fast-body sweep now runs **whether or not any body has CCD enabled** — the "sweep-based CCD on by
+default" line in the changelog — so 0.19.3 simply never built the cache in these scenes. Our
+0.19.3-vs-0.20.0 control agrees: identical scenario, 0.19.3 passes every case.
+
+It also explains every discriminator in the table below, which is why they are recorded as
+*observations* and not as a theory: contact-then-removal is required because that is what puts the
+collider in the cache; the gravity/step-size threshold is the falling body reaching sweep speed
+(g=9.81 and dt=1/120 never get there); and sleep is irrelevant because the sweep pass does not
+consult it. Note #985's own title still says `ConvexPolygon` — its author has since shown convex
+shapes are incidental and proposed a retitle, so **searching for "convex" will not find it.**
+
+**When 0.20.x claims a fix, the check is the repro below, not the changelog.**
+
+**Reproduced in pure rapier, with no engine code involved**, and controlled against 0.19.3 running
+the identical scenario: 0.19.3 passes every case, 0.20.0 panics. What the sweep established:
+
+| Ingredient | Needed? |
+|---|---|
+| The removed collider is **in contact** with a dynamic body at removal | **Yes** — a collider that never touched anything is always safe to remove |
+| Sufficient gravity / step size | **Yes** — g=20 at dt=1/60 panics; g=9.81 does not, and dt=1/120 or 1/240 does not |
+| The body being **asleep** | **No** — `setCanSleep(false)` still panics. Sleep correlates (0.20.0's rewritten sleeping puts bodies to sleep where 0.19.3 left them awake) but is not the cause |
+| `ActiveEvents.COLLISION_EVENTS`, or an `EventQueue` | **No** — panics without either |
+
+⚠️ **There is no workaround at the rapier API level.** All of these still panic: `wakeUp()` before
+the removal, `wakeUp()` plus a step before it, `wakeUp()` after it, `removeCollider(col, false)`,
+and `setCanSleep(false)` at body creation. Our own call already passes `wakeUp = true`, so the
+obvious "wake it first" fix is the one thing that was already in place.
+
+The root cause says why none of them could have worked: the dropped invalidation is gated on a body
+being **fast** on the removal step, not on it being **awake**. Waking a body it is resting on leaves
+it moving at ~0, so the CCD pass still does not run and the cache still is not rebuilt. The only
+thing that would suppress it is a body already at sweep speed during that same step — which is not
+something a game can arrange on demand, and would be a coincidence rather than a fix. Treat this as
+blocking until upstream lands a change.
+
+**The repro, so the next attempt can re-run it instead of rebuilding it.** No engine code; save as
+`.mjs` and run from the repo root (bare specifiers resolve there). On 0.19.3 every row prints `ok`;
+on 0.20.0 the `resting=true` rows panic. It is deliberately NOT a committed test — it crashes the
+wasm module rather than failing an assertion, which is not a thing `npm test` should carry.
+
+```js
+import RAPIER from '@dimforge/rapier2d-compat';
+await RAPIER.init();
+console.log('version', RAPIER.version());
+for (const settle of [5, 20, 40, 60, 100, 150]) {
+  const w = new RAPIER.World({ x: 0, y: 20 });      // ECS convention: +y down, ppm 100
+  w.timestep = 1 / 60;
+  const fb = w.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, 3));
+  const fc = w.createCollider(RAPIER.ColliderDesc.cuboid(2, 0.2), fb);
+  const bb = w.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(0, 0));
+  w.createCollider(RAPIER.ColliderDesc.ball(0.15), bb);
+  for (let i = 0; i < settle; i++) w.step();
+  const y = bb.translation().y, resting = y > 2 && y < 3;
+  w.removeCollider(fc, true);                        // wakeUp = true, as the engine does
+  let out = 'ok';
+  try { for (let i = 0; i < 180; i++) w.step(); } catch (e) { out = 'CRASH ' + e.message; }
+  console.log(`settle=${settle} resting=${resting} -> ${out}`);
+}
+```
+
+To control against 0.19.3, `npm pack @dimforge/rapier2d-compat@0.19.3`, extract, and import
+`package/rapier.mjs` by path — note 0.19.3 has no `exports` map and its entry sits at the package
+root, whereas 0.20.0 moved it to `dist/`.
+
+**Two other 0.20.0 changes worth knowing, neither of them blocking:**
+- **Sweep-based CCD is ON by default against fixed colliders.** A fast body with CCD *disabled* no
+  longer tunnels through a thin wall — which flips the premise of both `physics2DCcd` /
+  `physics3DCcd` anti-tunneling tests. Arguably an improvement, but it is a behaviour change games
+  can feel.
+- **`solverContactPoint` became `(i, target?) => Vector | null`** (was `=> Vector`). That half is
+  **verified against the 0.20.0 artifact** and `tsc` catches it — it is the one compile break the
+  upgrade actually produces here. The changelog *also* says it now returns the **midpoint** of the
+  two per-body surface points rather than one body's; that half is **not** verifiable from the
+  shipped package (`dist/geometry/contact.d.ts` still documents it only as "the world-space position
+  of the `i`-th solver contact point", and the impl forwards straight to wasm), so treat it as an
+  upstream claim, not an observation. Confirming it needs a perturbing measurement against a known
+  contact geometry.
+
+**What is NOT a reason to stay** — these were checked and are all clear, so do not re-derive them:
+`World.contactPair` did **not** gain the `RigidBodySet` third argument (only `NarrowPhase.contactPair`
+did, and both our call sites go through the `World` wrapper); `contactPairsWith` is unchanged;
+`minIslandSize` / `solverContactFriction` / `solverContactRestitution` have zero uses here; and the
+`-compat` relocation into `dist/` is invisible to us because both loaders use a bare specifier via
+dynamic `import()` and nothing deep-imports the package.
+
+The upgrade audit, the re-derived version table and the measured re-baseline surface are in **#750**,
+which stays open for the day 0.20.x fixes this.
+
 ## Why Rapier2D
 
 The selection criterion is **determinism**, because the engine is built to verify game logic
@@ -236,7 +372,7 @@ green on enter, reverts on exit, and logs a `zone` journal event).
 The enter/exit fan-out is dimension-agnostic and lives in ONE module,
 `runtime/physics/physicsContactEvents.ts` (`collectContactEvents` / `routeContactEvents` /
 `routePair` /
-`synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
+`collectContactExits` / `routeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
 `runtime/physics/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
@@ -255,10 +391,14 @@ read by `captureManifold*` at DRAIN time (it is gone after the next `world.step`
 comes from the ECS velocities AFTER the pull — see the substep note above.
 
 Two removal subtleties: Rapier emits **no stop event** when a collider is freed/rebuilt, so
-`synthesizeContactExits` walks the still-overlapping pairs and fires the missing `exit` **before**
+`collectContactExits` walks the still-overlapping pairs and stages the missing `exit` **before**
 the free — otherwise a despawn-inside-a-trigger (or a geometry rebuild) leaves a subscriber's
-overlap state stuck 'entered'. And a `concave`/compound collider can fire **multiple** events per
-logical contact (one per convex piece / child collider) — dedupe by entity id if it matters.
+overlap state stuck 'entered'. `collectContactExits` is called from inside the body-reconcile
+`updateEach` (both dimensions), so it only COLLECTS; routing (which reaches game code) is deferred
+to `routeContactExits`, called once the query closes (#445 — `updateEach` clobbers a write a
+handler makes synchronously to a queried trait). And a `concave`/compound collider can fire
+**multiple** events per logical contact (one per convex piece / child collider) — dedupe by entity
+id if it matters.
 
 ### Contact index (Percept — "what is this body touching NOW?")
 
@@ -512,6 +652,11 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 - **Init once at boot:** `await RAPIER.init()` before the pipeline's first run (app boot path; a
   global `beforeAll` in tests). Physics system no-ops until the module reports ready — same gate
   pattern as PixiJS `onInit`.
+- **`initRapier2D`/`initRapier3D` memoize the WASM init in a single-slot `initPromise`, and the
+  slot is CLEARED on failure so a transient import/init error can be retried** — a successful init
+  stays memoized forever, because `initPromise` itself is the memoization and there is no separate
+  ready-check short-circuit at the call site. Same class as #522 (`sharedRegistry.ts`); see the
+  `.catch` in `rapierLoader.ts`/`rapier3DLoader.ts` for the rationale rather than restating it here.
 - **Per-koota-World Rapier world:** the Rapier world is keyed by the **koota World** in a module
   `Map`, created lazily on the first physics tick. `SceneManager` creates a **fresh koota world per
   scene load** and destroys the old one, so the physics world is effectively scene-scoped for free.

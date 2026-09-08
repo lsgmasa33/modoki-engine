@@ -15,6 +15,15 @@ import {
   isSelfPlacementDisabled,
   selectionSizeGate,
   selectionAnchorGate,
+  selectionPooledRowGate,
+  isElementMarginInert,
+  MARGIN_KEYS,
+  POOLED_ROW_PINNED_GROUPS,
+  POOLED_ROW_PINNED_FIELDS,
+  POOLED_ROW_GENERIC_WARN_FIELDS,
+  buildPooledRowPin,
+  pooledRowNoteText,
+  pooledRowNoteSegments,
   type UiPreset,
 } from '../../src/runtime/ui/uiAuthoring';
 
@@ -144,5 +153,187 @@ describe('selectionAnchorGate (self-placement props, #34)', () => {
     expect(selectionAnchorGate(['', ''])).toBe('inert');
     expect(selectionAnchorGate(['', null])).toBe('mixed');
     expect(selectionSizeGate(['', ''], 'width')).toBe('live');
+  });
+});
+
+describe('selectionPooledRowGate (UIEntries pooled-row Inspector note, #651)', () => {
+  it('is live when nothing in the selection is a pooled row', () => {
+    expect(selectionPooledRowGate([false, false])).toBe('live');
+    expect(selectionPooledRowGate([])).toBe('live');
+  });
+
+  it('is inert only when EVERY selected entity is a pooled row', () => {
+    expect(selectionPooledRowGate([true, true])).toBe('inert');
+    expect(selectionPooledRowGate([true])).toBe('inert');
+  });
+
+  it('is mixed when only part of the selection is a pooled row, regardless of order', () => {
+    expect(selectionPooledRowGate([true, false])).toBe('mixed');
+    expect(selectionPooledRowGate([false, true])).toBe('mixed');
+  });
+});
+
+/**
+ * #757 — `applyAnchorStyle` clears all four UIElement margins on an anchored element, so an
+ * authored value is discarded with no signal. #746's shape, found by sweeping for the pattern.
+ * The predicate is shared with `anchorCss` and the Inspector gate so they cannot drift.
+ */
+describe('isElementMarginInert (#757)', () => {
+  it('any anchor kills margin — EVERY mode, not just the stretching ones', () => {
+    // The contrast with isSizeInert is the whole point: size dies only on a stretched axis, margin
+    // dies on all four sides under any anchor at all. A per-mode predicate here would be wrong.
+    for (const a of ['center', 'top-left', 'bottom-right', 'stretch', 'top-stretch', 'left-stretch']) {
+      expect(isElementMarginInert(a)).toBe(true);
+    }
+  });
+
+  it('no anchor leaves margin live — this is flow layout, where margin is the real mechanism', () => {
+    expect(isElementMarginInert(null)).toBe(false);
+    expect(isElementMarginInert(undefined)).toBe(false);
+  });
+
+  it("an unreadable mode ('') still counts as ANCHORED — a missing mode is not a missing anchor", () => {
+    // Same distinction selectionAnchorGate draws, and the opposite of selectionSizeGate, where ''
+    // correctly stretches nothing. Getting this backwards would leave the field live on an element
+    // whose margins are in fact being cleared.
+    expect(isElementMarginInert('')).toBe(true);
+  });
+
+  it('MARGIN_KEYS names exactly the four UIElement margin fields', () => {
+    expect([...MARGIN_KEYS]).toEqual(['marginTop', 'marginRight', 'marginBottom', 'marginLeft']);
+  });
+});
+
+describe('selectionAnchorGate drives the margin fields (#757)', () => {
+  // Margin needs no gate of its own: "is every selected entity anchored?" is exactly the condition,
+  // and selectionAnchorGate already answers it. Pinned here so a later reader does not add a
+  // redundant selectionMarginGate, and so the unanimous-or-nothing rule (#34) is covered for margin
+  // specifically rather than only for zIndex and size.
+  it('unanimous anchored → inert (dim + read-only)', () => {
+    expect(selectionAnchorGate(['center', 'stretch', ''])).toBe('inert');
+  });
+
+  it('none anchored → live', () => {
+    expect(selectionAnchorGate([null, undefined])).toBe('live');
+  });
+
+  it('MIXED stays editable — blocking it would strand the flow-layout entities', () => {
+    expect(selectionAnchorGate(['center', null])).toBe('mixed');
+  });
+});
+
+describe('POOLED_ROW_PINNED_FIELDS / POOLED_ROW_PINNED_GROUPS (#761)', () => {
+  it('flattens to exactly the fourteen fields entriesSystem pins', () => {
+    expect(POOLED_ROW_PINNED_FIELDS).toEqual([
+      'width', 'widthUnit', 'height', 'heightUnit',
+      'marginTop', 'marginRight', 'marginBottom', 'marginLeft',
+      'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
+      'flexShrink', 'isVisible',
+    ]);
+  });
+
+  it('every field appears in exactly one group — no drift between the flat list and the groups', () => {
+    const seen = new Set<string>();
+    for (const g of POOLED_ROW_PINNED_GROUPS) {
+      for (const f of g.fields) {
+        expect(seen.has(f), `'${f}' appears in more than one group`).toBe(false);
+        seen.add(f);
+      }
+    }
+    expect([...seen].sort()).toEqual([...POOLED_ROW_PINNED_FIELDS].sort());
+  });
+
+  it('buildPooledRowPin writes EXACTLY the POOLED_ROW_PINNED_FIELDS key set — bidirectional #764 guard', () => {
+    // #761's own drift guard (entriesSystem.test.ts) only checked "every field the constant
+    // names is actually corrected" — it caught a field DROPPED from the pin, but not one ADDED to
+    // it: a reviewer added `opacity: 0` to the pin's hand-typed literal and all 95 tests stayed
+    // green. Routing the literal through `buildPooledRowPin` and asserting a SET-EQUALS here
+    // (not a superset check) closes that hole — this must go red the moment the builder's
+    // returned keys stop matching the constant in EITHER direction.
+    const pin = buildPooledRowPin({ live: true, wantW: 100, wantH: 50 });
+    expect(new Set(Object.keys(pin))).toEqual(new Set(POOLED_ROW_PINNED_FIELDS));
+  });
+});
+
+describe('POOLED_ROW_GENERIC_WARN_FIELDS (#764)', () => {
+  it('is POOLED_ROW_PINNED_FIELDS minus the four specially-handled fields', () => {
+    const specially_handled = new Set(['isVisible', 'width', 'widthUnit', 'height', 'heightUnit']);
+    const expected = POOLED_ROW_PINNED_FIELDS.filter((f) => !specially_handled.has(f));
+    expect([...POOLED_ROW_GENERIC_WARN_FIELDS].sort()).toEqual([...expected].sort());
+  });
+});
+
+describe('pooledRowNoteText (#761 — widened from margin/min-max to all fourteen fields)', () => {
+  it('mentions every group label from POOLED_ROW_PINNED_GROUPS, not just margin and min/max size', () => {
+    const text = pooledRowNoteText(false);
+    for (const g of POOLED_ROW_PINNED_GROUPS) expect(text).toContain(g.label);
+  });
+
+  it('the mixed-selection text also mentions every group label', () => {
+    const text = pooledRowNoteText(true);
+    for (const g of POOLED_ROW_PINNED_GROUPS) expect(text).toContain(g.label);
+  });
+
+  it('mentions all five labels AND all five forced-to descriptions (#764 — was only 2 of 5)', () => {
+    // A prior version of this test asserted only the label loop above and the two non-constant
+    // forced-to strings ("scroll view's resolved box", "whether the slot is live") — it never
+    // pinned the three plain "0" descriptions (margin, min/max size, flex shrink) to anything, so
+    // renaming `POOLED_ROW_PINNED_GROUPS['flex shrink']`'s label (#764's reviewer mutation) broke
+    // the text (an `undefined` forced-to) without breaking this suite.
+    const text = pooledRowNoteText(false);
+    expect(POOLED_ROW_PINNED_GROUPS).toHaveLength(5);
+    for (const g of POOLED_ROW_PINNED_GROUPS) {
+      expect(text, `label '${g.label}' missing from the note`).toContain(g.label);
+      expect(text, `forcedTo '${g.forcedTo}' (for '${g.label}') missing from the note`).toContain(g.forcedTo);
+    }
+    expect(text).not.toContain('undefined');
+  });
+
+  it('does not claim "forced to 0" for size or visibility — they are forced to a resolved value', () => {
+    // The old two-group text said "forced to 0"; size and visibility are pinned to the scroll
+    // view's resolved box and the slot's live state respectively, neither a constant.
+    const text = pooledRowNoteText(false);
+    expect(text).toContain("scroll view's resolved box");
+    expect(text).toContain('whether the slot is live');
+  });
+
+  it('mixed text says fields stay editable, and non-mixed text says they are forced', () => {
+    expect(pooledRowNoteText(true)).toContain('stay editable');
+    expect(pooledRowNoteText(false)).toContain('forces');
+  });
+});
+
+describe('pooledRowNoteSegments (#764 — structured note, restores Inspector bolding)', () => {
+  it('returns one {label, forcedTo} item per POOLED_ROW_PINNED_GROUPS entry, in order', () => {
+    const { items } = pooledRowNoteSegments('inert');
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('the mixed variant carries the same items — a mixed selection still names which fields are at stake', () => {
+    const { items } = pooledRowNoteSegments('mixed');
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('intro text matches pooledRowNoteText\'s tone for each mode', () => {
+    expect(pooledRowNoteSegments('mixed').intro).toContain('stay editable');
+    expect(pooledRowNoteSegments('inert').intro).toContain('forces');
+  });
+});
+
+describe('pooledRowNoteSegments — entry-prefab mode (#671)', () => {
+  // The prefab-edit-mode signal: a prefab some UIEntries view spawns as an entry kind carries no
+  // live UIEntry sibling (runtimeOnly, stamped at spawn — never present in a .prefab.json), so
+  // neither 'inert' nor 'mixed' can ever fire there. 'entry-prefab' is the third case that gives
+  // the entry prefab's root a signal at all.
+  it('also carries one {label, forcedTo} item per POOLED_ROW_PINNED_GROUPS entry, in order', () => {
+    const { items } = pooledRowNoteSegments('entry-prefab');
+    expect(items).toEqual(POOLED_ROW_PINNED_GROUPS.map((g) => ({ label: g.label, forcedTo: g.forcedTo })));
+  });
+
+  it('intro is future-tense ("will force"), not the present-tense pooled-row wording', () => {
+    const { intro } = pooledRowNoteSegments('entry-prefab');
+    expect(intro).toContain('Entry prefab');
+    expect(intro).toContain('will force');
+    expect(intro).not.toContain('stay editable'); // not the mixed wording
   });
 });

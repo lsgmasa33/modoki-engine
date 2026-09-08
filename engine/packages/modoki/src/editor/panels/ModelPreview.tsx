@@ -17,10 +17,16 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { lodUrlSuffix } from '../../runtime/loaders/modelSettings';
 import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
-import { needsGLBConversion, loadSourceModel } from '../scene/convertToGLB';
+import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
+import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
+import { createTeardownScope } from '../../runtime/core/teardownScope';
+import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
+import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
+import { collectMaterialResources, disposeOwnedResources } from './modelPreviewResources';
+import { gateModelLoad, shouldAttachLoadedModel } from './modelPreviewLoss';
 
 interface Props {
   /** Source GLB URL — e.g. `/games/.../island.glb`. Suffixes are computed
@@ -64,11 +70,25 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls;
     modelRoot: THREE.Group;
+    /** Set only on the OBJ/FBX/DAE preview path — its meshes are ALSO in
+     *  ownedGeometries/ownedMaterials, but disposeSourceModel additionally sweeps the
+     *  textures a freshly-parsed source model carries (sibling .mtl maps). Calling it
+     *  alongside the geometry/material/texture dispose loops below is redundant, not
+     *  wrong: both target the same objects and dispose() is idempotent. */
+    sourceRoot: THREE.Object3D | null;
     envTexture: THREE.Texture | null;
     ownedMaterials: Set<THREE.Material>;
     ownedGeometries: Set<THREE.BufferGeometry>;
+    /** THREE.Material.dispose() does not free the textures hanging off it (map,
+     *  normalMap, emissiveMap, …) — those leak unless collected and disposed separately. */
+    ownedTextures: Set<THREE.Texture>;
     raf: number | null;
     activeLevel: LodChoice;
+    /** Set by `teardown()` (finding 3a, adversarial review of #795) — the signal an in-flight
+     *  "load the model" effect has no other way to receive, since that effect's OWN `cancelled`
+     *  flag is set only by ITS cleanup, which does not run when `teardown` fires from a
+     *  GPU-context loss instead of an unmount or a [hasLods] re-run. */
+    aborted: boolean;
     /** Render-on-demand flag (F7). The tick loop only submits a GPU frame when
      *  this is set — by the OrbitControls 'change' event (orbit/zoom/pan +
      *  damping settle) or by content changes (model load, wireframe, reframe).
@@ -98,93 +118,177 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     const container = containerRef.current;
     if (!container) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(PREVIEW_W, PREVIEW_H);
-    renderer.setClearColor(0x1a1a1a, 1);
-    // Match the main viewport's color/tone conventions (ACESFilmic @ exposure 1.2,
-    // sRGB output) via the single shared config `makeWebGPURenderer` also applies, so
-    // imported PBR materials read the same here as in the live scene.
-    applyRendererColorConfig(renderer);
-    container.appendChild(renderer.domElement);
+    // #858: the release path, before the first acquisition. This effect has NO try/catch and
+    // `teardown` is only defined ~120 lines below the WebGL context it releases — so a throw in
+    // between (`pmrem.fromScene` is a real GPU op) propagated out of the effect callback and
+    // React registered NO cleanup at all for this run: the GL context, its canvas and the
+    // `gpuContextTracking` live count all leaked, and unlike the other four sites in this class
+    // there was not even a stale closure left behind to call.
+    const scope = createTeardownScope('ModelPreview');
+    try {
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      // Fix 3 of #590's adversarial review (docs/rendering.md): this is
+      // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
+      // context, and an editor session with several previews/viewports open is exactly the surface
+      // that approaches `SOFT_CONTEXT_LIMIT`. Noted after a successful construction (never before
+      // — see `noteGpuContextCreated`'s doc). Its matching release goes straight onto the scope,
+      // so it is paired from the instant the context exists rather than ~120 lines later inside a
+      // closure a throw in between would prevent from ever being built (#858).
+      scope.add(noteGpuContextCreated());
+      // Pushed at the acquisition site. LIFO drains it AFTER `teardown` below — the position these
+      // steps held as that closure's last lines: the owned geometries/materials/textures must go
+      // before the renderer that allocated them.
+      scope.add(() => {
+        // forceContextLoss BEFORE dispose: dispose() does NOT release the GL context — see
+        // previewScene.ts for the full explanation. This effect re-runs on [hasLods] flips too,
+        // not just unmount, so a missing call strands a context per flip.
+        renderer.forceContextLoss();
+        renderer.dispose();
+        try { container.removeChild(renderer.domElement); } catch { /* already gone */ }
+      });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(PREVIEW_W, PREVIEW_H);
+      renderer.setClearColor(0x1a1a1a, 1);
+      // Match the main viewport's color/tone conventions (ACESFilmic @ exposure 1.2,
+      // sRGB output) via the single shared config `makeWebGPURenderer` also applies, so
+      // imported PBR materials read the same here as in the live scene.
+      applyRendererColorConfig(renderer);
+      container.appendChild(renderer.domElement);
+      // Loss detection (#795) — wired as soon as the context exists. `stateRef.current === null`
+      // doubles as the stale check: `teardown` below nulls it BEFORE doing anything else, and
+      // React always runs this effect's cleanup (which calls `teardown`) before a later run of
+      // this same effect (the [hasLods] re-run) attaches its own listener, so a stale event from a
+      // superseded renderer can never reach a live `stateRef.current`.
+      const detachLoss = attachRendererLossHandling(
+        { canvas: renderer.domElement },
+        {
+          label: 'ModelPreview', isStale: () => stateRef.current === null,
+          // This panel is embedded in the Model Inspector (`ModelAssetView`, mounted with no `key`)
+          // — selecting a different model re-populates THIS SAME instance rather than unmounting it,
+          // so the default "reopen the panel" hint is wrong (finding 6, third adversarial review of
+          // #795; same shape as `previewScene.ts`'s Mesh/Material Preview3DShell, finding 2).
+          // ⚠️ `scope.dispose()`, NOT `teardown()`. This panel has TWO entry points into teardown
+          // — this one and the effect's own cleanup — and the renderer's `forceContextLoss`/
+          // `dispose`/`removeChild` live on the scope now, so calling `teardown` alone would tear
+          // down the state and leave the dead context uncounted, undisposed and still in the DOM.
+          // LIFO drains `teardown` first anyway, so this is a superset, not a different order.
+          // `previewScene` (`dispose()`) and `ParticleEditor` (`cleanupRef.current?.()`) both
+          // already route their loss path through the scope; this was the odd one out.
+          ...makePreviewLossPolicy({ label: 'ModelPreview', teardown: () => scope.dispose(), recoverHint: REOPEN_INSPECTOR_HINT }),
+        },
+      );
 
-    const scene = new THREE.Scene();
-    // IBL: a neutral RoomEnvironment gives MeshStandardMaterial the indirect
-    // light it needs so metallic/rough surfaces show form instead of flat white.
-    // The main scene uses HDR envs via a shared cache; for this standalone
-    // preview a procedural RoomEnvironment is the standard drop-in equivalent.
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    const envTexture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    pmrem.dispose();
-    scene.environment = envTexture;
-    // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
-    // highlights aren't blown out. Key/fill directionals keep directional form.
-    scene.add(new THREE.AmbientLight(0xffffff, 0.25));
-    const key = new THREE.DirectionalLight(0xffffff, 1.0);
-    key.position.set(2, 3, 2);
-    scene.add(key);
-    const fill = new THREE.DirectionalLight(0xffffff, 0.3);
-    fill.position.set(-2, 1, -1);
-    scene.add(fill);
+      const scene = new THREE.Scene();
+      // IBL: a neutral RoomEnvironment gives MeshStandardMaterial the indirect
+      // light it needs so metallic/rough surfaces show form instead of flat white.
+      // The main scene uses HDR envs via a shared cache; for this standalone
+      // preview a procedural RoomEnvironment is the standard drop-in equivalent.
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      const roomEnv = new RoomEnvironment();
+      const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
+      roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
+      pmrem.dispose();
+      scene.environment = envTexture;
+      // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
+      // highlights aren't blown out. Key/fill directionals keep directional form.
+      scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+      const key = new THREE.DirectionalLight(0xffffff, 1.0);
+      key.position.set(2, 3, 2);
+      scene.add(key);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.3);
+      fill.position.set(-2, 1, -1);
+      scene.add(fill);
 
-    const camera = new THREE.PerspectiveCamera(45, PREVIEW_W / PREVIEW_H, 0.05, 1000);
-    camera.position.set(2, 2, 2);
-    camera.lookAt(0, 0, 0);
+      const camera = new THREE.PerspectiveCamera(45, PREVIEW_W / PREVIEW_H, 0.05, 1000);
+      camera.position.set(2, 2, 2);
+      camera.lookAt(0, 0, 0);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.1;
-    controls.target.set(0, 0, 0);
-    // Render-on-demand: OrbitControls fires 'change' on every camera move
-    // (user orbit/zoom/pan AND each damping-settle step inside update()), so
-    // this is the single source for "the view moved → redraw".
-    const onControlsChange = () => { if (stateRef.current) stateRef.current.needsRender = true; };
-    controls.addEventListener('change', onControlsChange);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.1;
+      controls.target.set(0, 0, 0);
+      // Render-on-demand: OrbitControls fires 'change' on every camera move
+      // (user orbit/zoom/pan AND each damping-settle step inside update()), so
+      // this is the single source for "the view moved → redraw".
+      const onControlsChange = () => { if (stateRef.current) stateRef.current.needsRender = true; };
+      controls.addEventListener('change', onControlsChange);
 
-    const modelRoot = new THREE.Group();
-    scene.add(modelRoot);
+      const modelRoot = new THREE.Group();
+      scene.add(modelRoot);
 
-    stateRef.current = {
-      renderer, scene, camera, controls, modelRoot, envTexture,
-      ownedMaterials: new Set(), ownedGeometries: new Set(),
-      raf: null, activeLevel: hasLods ? 'auto' : 0,
-      needsRender: true, // draw the first frame
-    };
+      stateRef.current = {
+        renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
+        ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
+        raf: null, activeLevel: hasLods ? 'auto' : 0, aborted: false,
+        needsRender: true, // draw the first frame
+      };
 
-    const tick = () => {
-      const s = stateRef.current;
-      if (!s) return;
-      // update() returns true while damping is still settling; it also dispatches
-      // 'change' (→ needsRender) on any movement. Render only when something changed.
-      const moving = s.controls.update();
-      if (s.needsRender || moving) {
-        s.needsRender = false;
-        s.renderer.render(s.scene, s.camera);
-      }
-      s.raf = requestAnimationFrame(tick);
-    };
-    stateRef.current.raf = requestAnimationFrame(tick);
+      const tick = () => {
+        const s = stateRef.current;
+        if (!s) return;
+        // update() returns true while damping is still settling; it also dispatches
+        // 'change' (→ needsRender) on any movement. Render only when something changed.
+        const moving = s.controls.update();
+        if (s.needsRender || moving) {
+          s.needsRender = false;
+          s.renderer.render(s.scene, s.camera);
+        }
+        s.raf = requestAnimationFrame(tick);
+      };
+      stateRef.current.raf = requestAnimationFrame(tick);
 
-    return () => {
-      const s = stateRef.current;
-      stateRef.current = null;
-      if (!s) return;
-      if (s.raf !== null) cancelAnimationFrame(s.raf);
-      s.controls.removeEventListener('change', onControlsChange);
-      s.controls.dispose();
-      for (const g of s.ownedGeometries) g.dispose();
-      for (const m of s.ownedMaterials) m.dispose();
-      s.scene.environment = null;
-      s.envTexture?.dispose();
-      s.renderer.dispose();
-      try { container.removeChild(s.renderer.domElement); } catch { /* already gone */ }
-    };
+      // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context, so a
+      // loss tears the preview down exactly the same way an unmount would. Idempotent by
+      // construction: `stateRef.current` is nulled FIRST, so a second call sees `s === null` and
+      // returns immediately.
+      const teardown = () => {
+        const s = stateRef.current;
+        stateRef.current = null;
+        if (!s) return;
+        // Signal any in-flight "load the model" effect to stop attaching/collecting onto this dead
+        // scene (finding 3a, adversarial review of #795) — that effect closes over THIS SAME state
+        // object, so it can observe the flip even though `stateRef.current` above is already null.
+        s.aborted = true;
+        detachLoss();
+        if (s.raf !== null) cancelAnimationFrame(s.raf);
+        s.controls.removeEventListener('change', onControlsChange);
+        s.controls.dispose();
+        disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
+        // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
+        // comment) — kept because disposeSourceModel is the one place that also walks a
+        // freshly-parsed source model's own hierarchy, not just the sets collected from it.
+        if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
+        s.scene.environment = null;
+        s.envTexture?.dispose();
+        // The renderer's own `forceContextLoss()`/`dispose()`/`removeChild` used to close this
+        // body; they moved onto the scope above so they are reachable from a partial bring-up.
+        // They still run immediately after this closure — see the LIFO note there.
+      };
+      // Pushed the MOMENT it exists, not at the end of the effect: between `stateRef.current = {…}`
+      // above and this line there is a live rAF driving `renderer.render()`, so a throw in that
+      // window used to drain a scope that did not contain `teardown` — leaving a non-null
+      // `stateRef.current` with `aborted: false` and a frame loop running on a force-lost renderer,
+      // which `gateModelLoad` would then read as a healthy scene to populate.
+      scope.add(teardown);
+    } catch (e) {
+      // Whatever this run took is released; the effect returns a cleanup either way, so React
+      // is never left holding nothing.
+      console.error('[ModelPreview] preview bring-up failed; releasing what it had taken:', e);
+      scope.dispose();
+    }
+    return () => { scope.dispose(); };
   }, [hasLods]);
 
   // ── Load / reload the model when the source or LOD choice changes ────────
   useEffect(() => {
-    const s = stateRef.current;
-    if (!s) return;
+    const s0 = stateRef.current;
+    // `!s0` means the mount effect's teardown already ran (unmount, or #795's GPU-loss path) —
+    // this used to return BEFORE `setLoading(true)`, so the NEXT model selection after a loss
+    // silently left `loading: false, error: null`: a permanently empty box reporting success
+    // (finding 3b, adversarial review of #795).
+    const gate = gateModelLoad(!!s0);
+    if (!gate.proceed) { setLoading(false); setError(gate.error); return; }
+    const s = s0!; // non-null from here down — every use below is unchanged from before finding 3
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -199,10 +303,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // Clear any previously loaded geometry/materials before fetching the next one.
     const clearModel = () => {
       while (s.modelRoot.children.length > 0) s.modelRoot.remove(s.modelRoot.children[0]);
-      for (const g of s.ownedGeometries) g.dispose();
-      for (const m of s.ownedMaterials) m.dispose();
-      s.ownedGeometries.clear();
-      s.ownedMaterials.clear();
+      disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
+      // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
+      // comment) — kept because disposeSourceModel is the one place that also walks a
+      // freshly-parsed source model's own hierarchy, not just the sets collected from it.
+      if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
     };
 
     // Built on first use, not up front: three's GLTFLoader/meshopt/KTX2 modules are imported
@@ -230,7 +335,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     const prepMaterial = (mat: THREE.Material) => {
       const std = mat as THREE.MeshStandardMaterial;
       if (std.emissive) std.emissive.setScalar(0);
-      s.ownedMaterials.add(mat);
+      collectMaterialResources(s.ownedMaterials, s.ownedTextures, mat);
     };
     const collectMaterials = (m: THREE.Mesh) => {
       s.ownedGeometries.add(m.geometry);
@@ -241,11 +346,25 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
 
     const buildSingle = (gltf: { scene: THREE.Group }) => {
       const root = gltf.scene;
-      s.modelRoot.add(root);
+      // A GPU-loss teardown (finding 3a) means there is no NEXT `clearModel()` coming to sweep
+      // whatever gets collected below — collecting into `s.ownedGeometries`/`ownedMaterials` would
+      // leak them forever. Dispose the parsed document directly instead and stop here — the same
+      // `disposeSourceModel` helper used for the OBJ/FBX/DAE path below, not a second sweep (an
+      // earlier version of this fix grew its own geometry/material-only copy that leaked every
+      // texture, finding 1, second adversarial review of #795).
+      if (s.aborted) { disposeSourceModel(root); return; }
+      // Collect FIRST and unconditionally (for the ORDINARY cancel case below): a cancelled run's
+      // parsed document must still be owned, or it leaks (#537 — this is the path that leaked).
       root.traverse((child) => {
         const m = child as THREE.Mesh;
         if (m.isMesh) collectMaterials(m);
       });
+      // ATTACHING is what must be conditional. The next effect run calls clearModel()
+      // synchronously before its own await, so a cancelled run adding here would leave BOTH
+      // models as children of modelRoot, rendering together until the next clear. (`s.aborted` is
+      // always false past the early return above, so `shouldAttachLoadedModel` no longer takes it
+      // — finding 7, third adversarial review of #795.)
+      if (shouldAttachLoadedModel(cancelled)) s.modelRoot.add(root);
     };
 
     const buildLodAuto = async () => {
@@ -255,11 +374,10 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       for (let i = 0; i < lodCount; i++) {
         const url = bust(assetUrl(sourceUrl + lodUrlSuffix(i)));
         const gltf = await (await getLoader()).loadAsync(url);
-        // Bail between LOD loads on cancellation. Any later LODs that would
-        // have run produce wasted bytes; the already-loaded gltf gets disposed
-        // by the cleanup-time clearModel() pass via ownedGeometries.
-        if (cancelled) return;
         const root = gltf.scene;
+        // Same reasoning as `buildSingle` (finding 3a) — a GPU-loss teardown leaves no next
+        // `clearModel()` to sweep a collected-but-never-attached level, so dispose it directly.
+        if (s.aborted) { disposeSourceModel(root); return; }
         // Switch distance: we don't know the model's lodDistances here without
         // an extra fetch; use linearly-spaced placeholders so orbit-back/forward
         // visibly switches levels. The "Auto" option is for visual verification,
@@ -270,6 +388,17 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           const m = child as THREE.Mesh;
           if (m.isMesh) collectMaterials(m);
         });
+        // Collect BEFORE bailing on cancellation: this LOD's geometries/materials/
+        // textures are now owned, so the next clearModel() disposes them WHEN THE EFFECT
+        // RE-RUNS. On unmount, the mount effect's cleanup runs first and already disposed
+        // + nulled state, so a late resolve here collects into sets nobody sweeps — CPU-side
+        // only, since the renderer is already gone. Only LATER LODs are skipped.
+        //
+        // Note: `lod` is attached to modelRoot BEFORE this loop's first await, unlike
+        // buildSingle's root. Don't "fix" that by symmetry — the next run's clearModel()
+        // detaches this same THREE.LOD group, so a cancelled run's later addLevel() calls
+        // land on an orphan, never visible.
+        if (cancelled) return;
       }
       frameCamera();
     };
@@ -288,14 +417,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // imported. (LODs never apply pre-import, so this path ignores lodChoice.)
     const buildFromSource = async () => {
       const obj = await loadSourceModel(sourceUrl);
-      if (cancelled) {
-        obj.traverse((child) => {
-          const m = child as THREE.Mesh;
-          if (m.isMesh) { m.geometry?.dispose(); const mm = m.material; (Array.isArray(mm) ? mm : [mm]).forEach((x) => x?.dispose()); }
-        });
-        return;
-      }
+      // `s.aborted` (finding 3a) joins the existing `cancelled` check here — same disposal, two
+      // different reasons nothing else will ever attach or sweep this parsed model.
+      if (cancelled || s.aborted) { disposeSourceModel(obj); return; }
       s.modelRoot.add(obj);
+      s.sourceRoot = obj;
       obj.traverse((child) => {
         const m = child as THREE.Mesh;
         if (m.isMesh) collectMaterials(m);
@@ -315,16 +441,20 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           const level = hasLods ? (lodChoice as number) : 0;
           const url = bust(hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl));
           const gltf = await (await getLoader()).loadAsync(url);
-          if (cancelled) return;
           buildSingle(gltf as { scene: THREE.Group });
+          if (cancelled || s.aborted) return;
           frameCamera();
         }
-        if (cancelled) return;
+        // `s.aborted` (finding 3, adversarial review of #795) joins `cancelled` in every one of
+        // these post-await checks: a loss can land after any of the branches above already
+        // started, and reaching `setLoading(false)` here would report a successfully-loaded model
+        // for a scene that stopped drawing when the loss teardown ran.
+        if (cancelled || s.aborted) return;
         applyWireframe();
         s.needsRender = true; // new geometry/materials are in the scene
         setLoading(false);
       } catch (e) {
-        if (cancelled) return;
+        if (cancelled || s.aborted) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       }

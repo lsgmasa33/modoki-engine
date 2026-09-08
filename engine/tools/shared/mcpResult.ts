@@ -272,3 +272,25 @@ export function isFailureBody(body: unknown): string | null {
   // scene-mutate `hint` that explains an unsaved live-world entity.
   return `${detail}\n\nfull response: ${JSON.stringify(body)}`;
 }
+
+/** A short, content-free description of a value's shape — for error text that must never echo
+ *  what the value actually held (it may be a log line, and log lines can carry secrets; it may
+ *  be a scene op, and those carry authored strings).
+ *
+ *  Lives HERE rather than in either server because it is the shared vocabulary of the
+ *  blind-reply-shape guards (#644 → #647/#648): every decoder that refuses an unrecognised wire
+ *  shape reports it the same way, so a reader who has seen one refusal can read them all. It was
+ *  written once in `game-debug-mcp/src/reply.ts` and promoted when a third and fourth caller
+ *  appeared — the §9 anti-drift rule this module exists for.
+ *
+ *  ⚠️ KEYS ONLY, never values. That is the whole point, not a detail to optimise away: these
+ *  strings are shown to an agent and land in transcripts. */
+export function describeShape(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'an array';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v as object).slice(0, 8);
+    return keys.length ? `an object with keys: ${keys.join(', ')}` : 'an empty object';
+  }
+  return `a ${typeof v}`;
+}

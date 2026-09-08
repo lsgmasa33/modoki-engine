@@ -92,7 +92,9 @@ async function ensure(keys: string[]): Promise<void> {
     if (!loader) return Promise.resolve();
     let promise = pending.get(key);
     if (!promise) {
-      promise = loader().then((ns) => { modules[key] = ns; });
+      promise = loader()
+        .then((ns) => { modules[key] = ns; })
+        .finally(() => { pending.delete(key); });
       pending.set(key, promise);
     }
     return promise;

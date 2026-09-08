@@ -14,12 +14,15 @@
  *  are follow-ups; bone POSING already lives in the SceneView. */
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
-import { backendFetch } from '../backend/editorBackend';
+import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
-import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
+import { coerceRigBones, defaultRig2DFile } from '../../runtime/skinning/rig2dTypes';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';
 import { computeAutoWeights } from '../../runtime/skinning/rig2dAutoWeights';
 import { loadSpriteAlphaMask } from './spriteAlphaMask';
@@ -165,6 +168,52 @@ function InlineNameField({ initial, onCommit, onDone, autoFocus, style, uiId }: 
 export default function SkinEditor() {
   const asset = useEditorStore((s) => s.editingSkinAsset);
   const nonce = useEditorStore((s) => s.skinEditNonce);
+  /** 'failed' = the file exists but could NOT be read. The load effect then leaves
+   *  `editingSkinDef` null and `commit` early-returns on that, so the rig shows empty (as the
+   *  #423-item-2 ruling requires) AND cannot be parked over the file (#896). A genuinely MISSING
+   *  file is NOT this — see `assetDocLoad.ts`. */
+  const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
+  /** This load OPENED ON A PARKED EDIT rather than on the file (#902). Per-COMPONENT, set inside
+   *  the load effect: the registry cannot answer it, because a park is equally present when the
+   *  panel opened on the FILE and the human then edited. */
+  const [parkAdopted, setParkAdopted] = useState(false);
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
+  /** The rig the human CLOSED, so the selection-retarget effect below does not immediately
+   *  re-open it. ⚠️ Stamped with the SELECTED path, not the open one — they differ (single-click rig
+   *  B while rig A is open, or an agent `open_skin_editor` that touches no selection), and stamping
+   *  the open path made ✕ SWAP to the selected rig instead of closing (#896 review 4). What the
+   *  human means by ✕ is "leave this panel empty", so what must be suppressed is whatever the
+   *  retarget effect would open next. Cleared as soon as anything is open, or the selection moves —
+   *  it suppresses ONE auto-open, not the rig forever (#896 review 3, finding 3: the first version
+   *  cleared only on `asset`, so closing a rig and then re-selecting it in Assets never re-opened
+   *  it, silently killing the single-click retarget this panel exists to offer). */
+  const dismissedPath = useRef<string | null>(null);
+
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingSkinAsset');
+  }, []);
   const def = useEditorStore((s) => s.editingSkinDef);
   const activePart = useEditorStore((s) => s.activeSkinPart);
   const previewHidden = useEditorStore((s) => s.skinPreviewHidden);
@@ -206,17 +255,36 @@ export default function SkinEditor() {
   const [testPose, setTestPose] = useState<Record<number, { x: number; y: number; rot: number }>>({});
   useEffect(() => { setTestPose({}); }, [asset?.path, paintMode]);
 
-  // Retarget on selection: if the panel is EMPTY and a .rig2d asset gets selected,
-  // open it — parity with the Animation/Particle editors (which follow selection), and
-  // it means the panel is reachable without a double-click (e.g. from tooling). Guarded
-  // to "nothing open yet" so a stray selection never hijacks an in-progress rig edit.
+  // Retarget on selection: if the panel is EMPTY and a .rig2d asset gets selected, open it — so the
+  // panel is reachable without a double-click (e.g. from tooling). Guarded to "nothing open yet" so
+  // a stray selection never hijacks an in-progress rig edit.
+  //
+  // ⚠️ This said "parity with the Animation/Particle editors (which follow selection)". They do not:
+  // `grep selectedAsset` across all five asset editors returns hits in THIS FILE ONLY. The claim was
+  // load-bearing in the wrong direction — it reads as licence to add selection-following elsewhere,
+  // and as a hint that those panels need the same dismissal guard. This panel is the only member.
+  //
+  // ⚠️ …and it must not undo a CLOSE (#896 review 2). `closeSkinEditor` clears the open asset but
+  // not `selectedAsset`, and a double-click in Assets SELECTS before it opens — so closing left the
+  // rig still selected, this effect's deps changed (asset: object → null), and it re-opened the very
+  // file the human had just dismissed. Both Close buttons set `dismissedPath` for that reason.
+  //
+  // ⚠️ **It is NOT "harmless for a good rig", which this comment claimed on nothing but inference.**
+  // `openSkinEditor` also resets `activeSkinPart` and `skinPreviewHidden` and bumps `skinEditNonce`,
+  // forcing a fresh disk fetch — so hide three parts, select part 5, click ✕, and the panel comes
+  // back with the rig still open and that state gone. The refused view made it worse (its only
+  // escape became a no-op that silently re-fetched), not different in kind.
   useEffect(() => {
-    if (asset) return;
-    if (selectedAsset?.type === 'rig2d') useEditorStore.getState().openSkinEditor(selectedAsset);
+    if (asset) { dismissedPath.current = null; return; }        // something open → nothing dismissed
+    if (selectedAsset?.type !== 'rig2d') { dismissedPath.current = null; return; } // moved off → forget
+    if (selectedAsset.path === dismissedPath.current) return;   // the one the human just closed
+    useEditorStore.getState().openSkinEditor(selectedAsset);
   }, [selectedAsset, asset]);
 
   // ── Load the rig def when the open target changes ──
   useEffect(() => {
+    setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
+    setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
@@ -227,7 +295,19 @@ export default function SkinEditor() {
       // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
       // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
       // it returns HERE and never reaches the pendingAssetDoc branch below.
-      if (!pendingAssetDoc(asset.path, 'rig2d')) savedMarkRef.current?.(existing);
+      // ⚠️ #902: RE-RAISE the notice here, do not just let it stay lowered. This branch keeps a
+      // document the panel already holds and performs no read — so if a park is live, what is on
+      // screen is unsaved work that differs from disk, which is exactly what the notice says. The
+      // effect lowers it unconditionally above; without this line a bare REMOUNT (tab away and
+      // back) or the rename path named below would clear a statement that is still true.
+      //
+      // ⚠️ Narrow on purpose: the wording claims the panel opened on an unsaved edit, NOT that
+      // someone else made it — true here for the human's own park as much as an agent's, and both
+      // exits are correct for either. What must never happen is raising it on the SAME tick as an
+      // edit, which is the shape that made MaterialBatchView's refresher a defect.
+      const parkedNow = pendingAssetDoc(asset.path, 'rig2d');
+      if (!parkedNow) savedMarkRef.current?.(existing);
+      else setParkAdopted(true);
       return;   // either way the loaded doc stays — that is what this branch is for
     }
     const { loadSkinDef } = useEditorStore.getState();
@@ -241,18 +321,52 @@ export default function SkinEditor() {
       registerAsset(parked.id, asset.path, 'rig2d');
       adoptParkedDoc(asset.path, 'rig2d', parked);
       loadSkinDef(parked);
+      // ⚠️ SAY SO (#902). The park winning is correct; the swap being silent is not. A human who
+      // was told to repair the file and press Retry lands here and sees a clean, open panel.
+      setParkAdopted(true);
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
-      .then((json: Rig2DFile) => {
+      .then((r) => parseAssetJson(r, asset.path))
+      .then((json) => {
         if (cancelled) return;
-        if (!json.id) { json.id = newGuid(); }
-        registerAsset(json.id!, asset.path, 'rig2d');
-        savedMarkRef.current?.(json);
-        loadSkinDef(json);
+        const doc = json as Rig2DFile;
+        if (!doc.id) { doc.id = newGuid(); }
+        registerAsset(doc.id!, asset.path, 'rig2d');
+        savedMarkRef.current?.(doc);
+        loadSkinDef(doc);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[SkinEditor] load failed', e); const fb: Rig2DFile = { bones: [], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] }; savedMarkRef.current?.(fb); loadSkinDef(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        // ⚠️ The owner's #423-item-2 ruling STANDS and is unchanged: a rig that failed to load must
+        // LOOK empty, never `defaultRig2DFile()`, because a phantom `root` bone would suggest the
+        // file has content it does not. Do not "fix" that to match the peers.
+        //
+        // #896 changed only whether the empty rig is SAVABLE. It was seeded as the saved baseline
+        // and handed to the store, so the first edit parked a full-replace write of an empty rig
+        // over the authored file — which is the very thing the ruling was guarding against ("the
+        // human could then save that fabricated bone over the broken file"), reached with zero
+        // bones instead of one. On a REFUSED read the panel now holds NOTHING: `commit`
+        // early-returns on a null def, so the surface is empty (as ruled) and unsavable (as it
+        // should always have been).
+        //
+        // A genuinely MISSING file still gets the empty rig — that is what authoring a brand-new
+        // `.rig2d.json` needs, and an absent file is not a failed read.
+        //
+        // (This comment used to contrast with ParticleEditor/AnimationEditor/TimelineEditor's
+        // "load-failure fallbacks". All three refuse now too; only their MISSING branch still
+        // substitutes defaults. The shared decision lives in `assetDocLoad.ts`.)
+        const failure = classifyAssetDocFetchFailure(e);
+        if (failure.kind !== 'missing') {
+          console.error(`[SkinEditor] failed to load — editing disabled so the file is not overwritten: ${failure.message}`, e);
+          setLoadState('failed');
+          return;
+        }
+        console.warn('[SkinEditor] load failed (asset missing), starting empty', e);
+        const fb: Rig2DFile = { bones: [], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
+        savedMarkRef.current?.(fb);
+        loadSkinDef(fb);
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);
@@ -549,8 +663,8 @@ export default function SkinEditor() {
     const path = await saveAssetDialog({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', prompt: 'Create Rig2D' });
     if (!path) return;
     const guid = newGuid();
-    const doc: Rig2DFile = { id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const doc: Rig2DFile = { id: guid, ...defaultRig2DFile() };
+    const ok = await writeAssetFile(path, jsonFileBody(doc));
     if (!ok) return;
     assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park
     registerAsset(guid, path, 'rig2d');
@@ -585,7 +699,7 @@ export default function SkinEditor() {
     const rigGuid = newGuid();
     const rig = autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside });
     const rigPath = sel.path.replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.rig2d.json';
-    const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rigPath, content: JSON.stringify(rig, null, 2) }) }).then((r) => r.ok).catch(() => false);
+    const ok = await writeAssetFile(rigPath, jsonFileBody(rig));
     if (!ok) return;
     // ⚠️ The one path where this REALLY matters: `rigPath` is DERIVED from the sprite, so
     // auto-rigging the same sprite twice regenerates over a rig that may already have unsaved
@@ -677,10 +791,10 @@ export default function SkinEditor() {
           <div style={inspectorTitle}><span>Transform</span>
             <InfoDot tip="The selected bone's transform. In Rig mode this edits the bind pose (undoable); in Weights mode it's a transient TEST pose to preview the deform (not saved)." /></div>
           <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>pos</span>
-            <span style={lbl}>x</span><BufferedNumberInput value={posed.x} step={1} onChange={(v) => setBoneField('x', v)} style={{ ...inputStyle, width: 50 }} />
-            <span style={lbl}>y</span><BufferedNumberInput value={posed.y} step={1} onChange={(v) => setBoneField('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
+            <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.inspector.bone.x" dataUiLabel="bone pos x" dataUiKind="field" value={posed.x} step={1} onChange={(v) => setBoneField('x', v)} style={{ ...inputStyle, width: 50 }} />
+            <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.inspector.bone.y" dataUiLabel="bone pos y" dataUiKind="field" value={posed.y} step={1} onChange={(v) => setBoneField('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
           <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>rot°</span>
-            <BufferedNumberInput value={+(posed.rot * 180 / Math.PI).toFixed(2)} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
+            <BufferedNumberInput dataUiId="skin.inspector.bone.rot" dataUiLabel="bone rotation" dataUiKind="field" value={+(posed.rot * 180 / Math.PI).toFixed(2)} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
         </div>
       </>
     );
@@ -705,6 +819,38 @@ export default function SkinEditor() {
     </div>
   );
 
+  // ⚠️ BEFORE the picker below, and that ordering is the whole point (#896 review, findings 2+3).
+  // A refusal leaves `def` null, so without this the panel fell into the `!asset || !def` branch —
+  // which (a) made the refusal banner further down unreachable, so the human saw "Double-click a
+  // .rig2d.json in Assets to edit" for a rig they had just double-clicked, and (b) OFFERED
+  // `skin.empty.autoRig` when a sprite was selected: one click regenerates `<sprite>.rig2d.json`
+  // under a fresh GUID and writes it straight to disk (`autoRigSelected` → `writeAssetFile` →
+  // `assetWrittenToDisk`), with no dialog. So refusing to load a corrupt rig handed the human a
+  // one-click button to overwrite that exact file — a WORSE outcome than the empty-rig fallback
+  // this replaced, created by the refusal itself. The refused state gets its own view, whose only
+  // actions are Retry and Close.
+  if (asset && loadState === 'failed') {
+    return (
+      <div style={panelStyle}>
+        <AssetLoadRefusedBanner
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="skin.loadBanner"
+          onRetry={retryLoad}
+          style={{ margin: '0 0 8px' }}
+        />
+        <div style={{ margin: 'auto', textAlign: 'center', color: '#555' }}>
+          <div>{asset.name} could not be read, so it is not open for editing.</div>
+          {/* ⚠️ Does NOT say "then Retry re-reads the file" — Retry adopts a PARKED edit for this
+              path if one exists, before it ever fetches (#896 review 4). Promising a disk read
+              here was wrong in the one case where it matters: repair the file, Retry, and get the
+              parked doc instead. */}
+          <div style={{ fontSize: 10, color: '#666', marginTop: 6 }}>Repair the file on disk (a corrupt or conflict-markered <code>.rig2d.json</code>), then Retry. If an unsaved edit is parked for this asset, Retry opens that instead of the file.</div>
+          <button data-ui-id="skin.refused.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} style={{ ...btn, marginTop: 12, padding: '6px 14px' }}>Close</button>
+        </div>
+      </div>
+    );
+  }
+
   if (!asset || !def) {
     const spriteSel = selectedAsset && (selectedAsset.type === 'texture' || selectedAsset.type === 'sprite') ? selectedAsset : null;
     return (
@@ -726,8 +872,24 @@ export default function SkinEditor() {
 
   return (
     <div style={panelStyle}>
+      {/* #902: this load opened on an unsaved edit, not on the file. ⚠️ HERE, not in the refused
+          early return above — an adoption is not a refusal, the panel opens normally, and that is
+          precisely what makes it invisible. */}
+      {parkAdopted && (
+        <ParkAdoptedBanner
+          path={asset.path}
+          fileName={asset.path.split('/').pop() || asset.name}
+          uiId="skin.parkAdopted"
+          onReload={retryLoad}
+          onKeep={() => setParkAdopted(false)}
+          style={{ margin: '0 0 8px' }}
+        />
+      )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexShrink: 0 }}>
-        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
+        {/* ⚠️ `dismissedPath` here too, not only on the refused view's Close (#896 review 3): this
+            is the ✕ people actually use, and without it closing a rig opened from Assets reopens it
+            immediately — see the retarget effect's comment. */}
+        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
         {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
         <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
@@ -935,7 +1097,8 @@ export default function SkinEditor() {
                   <RigSpriteThumb guid={ap.sprite ?? ''} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ ...sectionLabel, margin: '0 0 2px' }}>Source art</div>
-                    <AssetRefField label="" value={ap.sprite ?? ''} onChange={setSprite} accept={['sprite']} placeholder="pick (▦) or drop a sprite" />
+                    <AssetRefField label="" value={ap.sprite ?? ''} onChange={setSprite} accept={['sprite']} placeholder="pick (▦) or drop a sprite"
+                      dataUiId="skin.inspector.sourceArt" dataUiLabel="Source art" />
                   </div>
                 </div>
                 {/* Transform (needs a mesh) */}
@@ -944,13 +1107,13 @@ export default function SkinEditor() {
                     <div style={inspectorTitle}><span>Transform</span>
                       <InfoDot tip="The active part's placement — baked into the mesh verts (a part has no transform node). Position = mesh center; Rotation + Size read from the UV→vertex map. Edit here or with the canvas Parts gizmo. Size is width/height in px." /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>pos</span>
-                      <span style={lbl}>x</span><BufferedNumberInput value={+c.x.toFixed(1)} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
-                      <span style={lbl}>y</span><BufferedNumberInput value={+c.y.toFixed(1)} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
+                      <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.part.center.x" dataUiLabel="part center x" dataUiKind="field" value={+c.x.toFixed(1)} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
+                      <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.part.center.y" dataUiLabel="part center y" dataUiKind="field" value={+c.y.toFixed(1)} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>rot°</span>
-                      <BufferedNumberInput value={rotDeg} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
+                      <BufferedNumberInput dataUiId="skin.part.rotation" dataUiLabel="part rotation" dataUiKind="field" value={rotDeg} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
                     <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>size</span>
-                      <span style={lbl}>w</span><BufferedNumberInput value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
-                      <span style={lbl}>h</span><BufferedNumberInput value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>w</span><BufferedNumberInput dataUiId="skin.part.size.w" dataUiLabel="part width" dataUiKind="field" value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>h</span><BufferedNumberInput dataUiId="skin.part.size.h" dataUiLabel="part height" dataUiKind="field" value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
                       <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>
@@ -962,8 +1125,8 @@ export default function SkinEditor() {
                   <div style={inspectorTitle}><span>Mesh · {verts.length}v · {Math.floor(tris.length / 3)}t</span>
                     <InfoDot tip="The deformable grid over the sprite. cols×rows = density (more bends smoother, costs more CPU). Re-tessellate keeps the part where it sits. Trim to alpha drops fully-transparent cells so the mesh hugs the opaque shape." /></div>
                   <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>cols</span>
-                    <BufferedNumberInput value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
-                    <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
+                    <BufferedNumberInput dataUiId="skin.part.tessellate.cols" dataUiLabel="tessellation cols" dataUiKind="field" value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
+                    <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput dataUiId="skin.part.tessellate.rows" dataUiLabel="tessellation rows" dataUiKind="field" value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: '#aaa', fontSize: 11, marginBottom: trimAlpha ? 3 : 4 }}>
                     <input data-ui-id="skin.part.trimAlpha" data-ui-kind="toggle" data-ui-label="trim to alpha" type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
                   {trimAlpha && (

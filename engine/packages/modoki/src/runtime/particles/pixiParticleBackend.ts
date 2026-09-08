@@ -18,7 +18,7 @@ import { Container } from 'pixi.js';
 import type { Matrix4 } from 'three';
 import {
   TEXTURE_WAIT_BUDGET_MS,
-  renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps,
+  renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps,
   type IParticleBackendCore, type ParticleEffectDef, type ParticleHandle,
 } from './types';
 import { rawNow } from '../core/clock';
@@ -271,9 +271,12 @@ export class PixiParticleBackend implements IParticle2DBackend {
     const newTexRef = def.render.texture ?? '';
     const texChanged = newTexRef !== e.textureRef;
     const structural =
-      renderStructuralKey(def) !== renderStructuralKey(e.def) ||
+      renderBuildKey(def) !== renderBuildKey(e.def) ||
       (def.worldSpace ?? false) !== (e.def.worldSpace ?? false) ||
       texChanged;
+    // Compared against the OLD def, before it's overwritten below — a bare aspect/anchor/
+    // offset edit is applied in place (#769), never a rebuild.
+    const quadChanged = !structural && renderQuadKey(def) !== renderQuadKey(e.def);
     // Timing fields drive the emission clock; changing them while keeping accumulated `time`
     // straddles the old/new cycle boundary (spurious/missed burst). Re-baseline instead (F5).
     const timingChanged =
@@ -300,6 +303,15 @@ export class PixiParticleBackend implements IParticle2DBackend {
       }
     } else {
       e.sim.setDef(def);
+      if (quadChanged) {
+        e.obj.setQuad(def.render); // no rebuild, no texture reload, no hidden-wait re-arm
+        // `aspect`/`offsetX`/`offsetY` only take effect on the next commit, but `update()`
+        // returns before committing while paused/stopped — commit here too so an edit made
+        // while stopped applies in full immediately instead of only moving `anchorY` (which
+        // `setQuad` writes straight onto the pooled particles) and leaving aspect/offset stale
+        // until play resumes.
+        e.obj.commit(e.sim.aliveCount);
+      }
       // renderOrder is a cheap live tweak on the wrapper (what the Canvas2D sorts) — no rebuild.
       if (def.render.renderOrder != null) e.wrapper.zIndex = def.render.renderOrder;
       if (timingChanged) {

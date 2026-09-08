@@ -18,10 +18,16 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 import {
-  withTimeout, escapableIntervalMs, runRamp, runBootRampProbe, runCpuRamp,
+  escapableIntervalMs, runRamp, runBootRampProbe, runCpuRamp,
 } from '../../src/runtime/rendering/rampProbeRunner';
 import { createGlProbeSurface } from '../../src/runtime/rendering/rampWorkloadGL';
 import { ESCAPE_MULTIPLE, ABORT_FRAME_MS } from '../../src/runtime/rendering/rampProbe';
+// STATIC import, deliberately — this file's `afterEach` calls `vi.resetModules()`, which only
+// affects FUTURE dynamic imports. `createGlProbeSurface` above is already bound (at file-load
+// time) to one fixed `rampWorkloadGL` module instance and therefore one fixed
+// `gpuContextTracking` instance; a `await import(...)` of that module INSIDE a test could resolve
+// to a DIFFERENT, disconnected instance post-reset and silently read 0 forever.
+import { liveGpuContextCount } from '../../src/runtime/core/gpuContextTracking';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -73,22 +79,9 @@ function fakeGl() {
   return { gl, calls };
 }
 
-describe('withTimeout', () => {
-  it('resolves with the inner value when it settles before the deadline', async () => {
-    await expect(withTimeout(Promise.resolve('ok'), 1_000)).resolves.toBe('ok');
-  });
-
-  it('REJECTS a promise that never settles, once the deadline elapses', async () => {
-    vi.useFakeTimers();
-    const never = new Promise<string>(() => { /* never resolves — the case a fast mock cannot prove */ });
-    const pending = withTimeout(never, 1_000);
-    // Attach the rejection assertion before advancing — otherwise the rejection could fire
-    // "unhandled" between the advance and the `expect`, which vitest treats as a test failure.
-    const assertion = expect(pending).rejects.toThrow(/timed out after 1000ms/);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await assertion;
-  });
-});
+// `withTimeout`'s own mechanism (timeout wins vs. settles-in-time, timer cleared, etc.) used to be
+// tested HERE against a local copy. It now lives in `runtime/core/abandonment.ts`, shared by every
+// call site, with its coverage in `abandonment.test.ts` — nothing left here to test redundantly.
 
 // ⚠️ **`awaitOrDispose` AND ITS THREE TESTS WERE DELETED HERE (#203), AND THE HAZARD WITH THEM.**
 // It existed because `runBootRampProbe` raced `makeWebGPURenderer` against a 5 s timeout, and
@@ -260,12 +253,29 @@ describe('the cpu ramp respects a budget already spent (close-out 2026-08-13)', 
     // exhaust PROBE_TOTAL_BUDGET_MS — the pathological launch that budget exists for. The GPU path
     // had this guard; the cpu path ran three JIT warm-up passes and a first ramp step first.
     const marks: string[] = [];
-    const started = performance.now();
     const reading = runCpuRamp((m: string) => marks.push(m), -1);
-    expect(marks).toContain('cpu:deadline-before-start');
     expect(reading.bound).toBe('none');
-    // The warm-up alone is documented at "a millisecond or two"; bailing must be far under that.
-    expect(performance.now() - started).toBeLessThan(5);
+    // ⚠️ **THE MARK SEQUENCE IS THE ASSERTION, NOT A CLOCK READING (#751).** This line used to be
+    // `expect(performance.now() - started).toBeLessThan(5)`, reasoning that the warm-up is
+    // documented at "a millisecond or two" so a bail must come in far under it. That measured the
+    // MACHINE, not the code: it failed the engine lane of `npm run verify` twice in one session on
+    // the Windows clone (5.8 ms, then 12.2 ms) and passed in isolation both times, and because
+    // `verify` aborts the lane, a green run yielded no verdict at all about the change under test.
+    // Nothing in `runCpuRamp` got slower between a pass and a fail seconds apart.
+    //
+    // `toEqual` on the whole array is strictly MORE discriminating than the timing bound ever was.
+    // `runCpuRamp` emits `cpu:warm` unconditionally after its `CPU_WARMUP_PASSES` and one
+    // `cpu:<load>` per ramp step, so deleting the deadline guard — the exact regression this test
+    // exists to catch — makes those marks appear and fails this line. The clock reading could only
+    // ever say "that was fast", which a fast machine satisfies with the guard gone.
+    //
+    // Deliberately NOT solved with the manual clock (`setManualNow`, runtime/core/clock.ts): it
+    // would pin `rawNow()` so the deadline compare stays deterministic, but a pinned clock cannot
+    // express "elapsed under N ms" either, so it buys nothing here. The property wanted is "no work
+    // happened", and the marks state that directly. See also `tests/helpers/sourceScanner.ts`,
+    // which already forbids direct `performance.now()` in `runtime/**` — this was the same hazard
+    // one level up, in the tests.
+    expect(marks).toEqual(['cpu:deadline-before-start']);
   });
 
   it('⭐ the probe discards CPU_WARMUP_RAMPS cpu passes and classifies the one after (#205)', async () => {
@@ -368,6 +378,44 @@ describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () 
       const narrow = createGlProbeSurface(40, 480, () => {});
       expect(narrow!.shadeRegionPixels).toBe(40 * 100);
       narrow!.dispose();
+    });
+  });
+
+  // Phase 3 of #590 (docs/rendering.md): this raw WebGL2 probe context was
+  // invisible to the shared GL/GPU-context counter until this phase.
+  describe('GPU-context tracking (Phase 3 of #590)', () => {
+    it('notes the context created, then destroyed on dispose()', () => {
+      withFakeGl(() => {
+        const before = liveGpuContextCount();
+        const s = createGlProbeSurface(640, 480, () => {});
+        expect(s).not.toBeNull();
+        expect(liveGpuContextCount()).toBe(before + 1);
+        s!.dispose();
+        expect(liveGpuContextCount()).toBe(before);
+      });
+    });
+
+    it('a repeated dispose() does not decrement twice', () => {
+      withFakeGl(() => {
+        const before = liveGpuContextCount();
+        const s = createGlProbeSurface(640, 480, () => {});
+        s!.dispose();
+        s!.dispose(); // careless double-teardown — must not go negative
+        expect(liveGpuContextCount()).toBe(before);
+      });
+    });
+
+    it('notes nothing when the context fails to acquire (gl-context-failed)', () => {
+      const before = liveGpuContextCount();
+      const canvas = { width: 0, height: 0, getContext: () => null };
+      const spy = vi.spyOn(document, 'createElement').mockReturnValue(canvas as never);
+      try {
+        const s = createGlProbeSurface(640, 480, () => {});
+        expect(s).toBeNull();
+        expect(liveGpuContextCount()).toBe(before);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 });

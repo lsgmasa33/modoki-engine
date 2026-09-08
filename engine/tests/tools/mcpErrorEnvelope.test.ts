@@ -16,12 +16,18 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadSurface, realRequests, STUB_BACKEND, type Surface } from './mcpSurface';
 import { ERROR_CODES, type ErrorCode } from '../../tools/modoki-mcp/src/result';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
+import { readScannedSource } from '@modoki/engine/testing';
+
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'docs/mcp-tool-conventions.md is Markdown prose — checking each code is documented by name',
+} as const;
 
 let surface: Surface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -135,6 +141,38 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(eJunk.code).toBe('REFUSED_BY_OP');
   });
 
+  it('a route-authored `options` list survives to the caller, like `code` already does (#872)', async () => {
+    // The park gate authors its refusal SERVER-side, because only the renderer knows whether an
+    // Inspector import-settings edit is parked. Its `code` already travelled; its OPTIONS did not,
+    // and options are the half that converts a dead end into the agent's next move (§5). A refusal
+    // that says "no" and not "here is how" is the failure this rule exists to prevent.
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/write-meta'
+        ? {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'REQUIRES_SAVE',
+            error: 'write-meta refused: a parked edit exists for /assets/textures/rock.png',
+            options: ['modoki_save_all — flush it first', 'discardUnsaved:true — destroy it and write'],
+          },
+        }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_write_asset_meta', { path: '/assets/textures/rock.png', meta: { id: 'g' } }));
+
+    expect(e.code).toBe('REQUIRES_SAVE');
+    expect(e.options?.join(' ')).toContain('modoki_save_all');
+    expect(e.options?.join(' ')).toContain('discardUnsaved:true');
+  });
+
+  it('…and a body with no `options` still gets the status-derived ones', async () => {
+    // The accept side: the passthrough must not have displaced the generic advice for every other
+    // route, which is the easy way to "fix" this and lose the 403/404 guidance.
+    const s = (surface = loadSurface(() => ({ status: 403, body: { error: 'token mismatch' } })));
+    const e = envelope(s, await s.call('modoki_get_editor_state'));
+    expect(e.options?.join(' ')).toContain('modoki_identity');
+  });
+
   it('V3 — a 200 answering the SPA HTML is NOT_AVAILABLE_HERE, never an answer', async () => {
     // Measured on the default backend: a missing `/api` route falls through to the editor page and
     // answers 200 with index.html, which the transport happily reported as a successful read whose
@@ -235,12 +273,98 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(s.requests.some((r) => r.path.startsWith('/api/ota/publish'))).toBe(true);
   });
 
+  // The `mandatory` query param is read as a TRI-STATE by the route (vite-asset-scanner.ts):
+  // '1' sets it, '0' clears it, ABSENT inherits the existing release's value — matching
+  // ota-publish.mjs's sticky-mandatory CLI contract. `if (mandatory) qs.set('mandatory', '1')`
+  // silently collapsed `mandatory:false` into "absent" (inherit), so an agent asking for a
+  // ROUTINE update on a currently-mandatory release shipped it mandatory anyway, with the success
+  // echo printing `mandatory=unchanged` and nothing contradicting the caller.
+  it('ota_publish sends the mandatory tri-state faithfully: true, false and omitted are THREE distinct wire states', async () => {
+    const s = (surface = loadSurface());
+    await s.call('modoki_ota_publish', { version: 'v10', mandatory: true, force: true });
+    expect(s.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path).toContain('mandatory=1');
+
+    const s2 = (surface = loadSurface());
+    await s2.call('modoki_ota_publish', { version: 'v10', mandatory: false, force: true });
+    expect(s2.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path).toContain('mandatory=0');
+
+    const s3 = (surface = loadSurface());
+    await s3.call('modoki_ota_publish', { version: 'v10', force: true });
+    const omittedPath = s3.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path;
+    expect(omittedPath).not.toContain('mandatory=');
+  });
+
   it('a no-op the caller asked to CHANGE is refused, not reported as done', async () => {
     const s = (surface = loadSurface());
     const e = envelope(s, await s.call('modoki_set_transform', { entity: { name: 'Capsule' }, space: 'local' }));
     expect(e.code).toBe('REFUSED_BY_OP');
     expect(e.expected).toContain('position');
     expect(s.requests.some((r) => r.path === '/api/scene-mutate')).toBe(false);
+  });
+});
+
+// #648 — `modoki_list_assets`/`modoki_list_traits` read `/api/scan-assets`/`/api/trait-schema`
+// through RAW `call()` (not getJson), because each wants a caller-facing §5 label (`read the
+// project asset manifest` / `read the live trait registry`) getJson's generic `read ${path} from
+// the editor backend` label would blur, and getJson's `transform` throwing into its own catch
+// would recreate the exact bug being fixed here. So — unlike every getJson/postJson tool covered
+// above — they had to apply the SPA-fallthrough guard and a body-shape guard BY HAND, and until
+// this fix neither did: an absent route (or a wrongly-shaped 200) read as a clean, empty answer
+// ("this project has no assets/traits") instead of the failure it actually is.
+describe('§648 — the raw call() list tools need the same guards getJson gives for free', () => {
+  it('modoki_list_assets against SPA HTML is a failure, NOT a clean "zero assets"', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets'
+        ? { status: 200, body: '<!DOCTYPE html><html><body>editor</body></html>' }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_list_assets'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(e.why).toContain('NOT');   // "…This is NOT an empty result." / "NOT 'this project has no assets'"
+  });
+
+  it('modoki_list_assets against a body whose `assets` is not an array refuses, and never echoes its content', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { status: 200, body: { assets: 'SECRET_MARKER_NOT_AN_ARRAY' } } : undefined));
+    const r = await s.call('modoki_list_assets');
+    const e = envelope(s, r);
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    // describeShape reports KEYS/shape only — the body's actual content must never appear.
+    expect(s.text(r)).not.toContain('SECRET_MARKER_NOT_AN_ARRAY');
+  });
+
+  it('modoki_list_assets against a body with no `assets` key at all refuses the same way', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { status: 200, body: { totally: 'unrelated', field: 1 } } : undefined));
+    const e = envelope(s, await s.call('modoki_list_assets'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+  });
+
+  it('modoki_list_traits against SPA HTML is a failure, NOT a clean "zero traits"', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema'
+        ? { status: 200, body: '<!DOCTYPE html><html><body>editor</body></html>' }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_list_traits'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(e.why).toContain('NOT');
+  });
+
+  it('modoki_list_traits against a body whose `traits` is not an object refuses, and never echoes its content', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema' ? { status: 200, body: { traits: 'SECRET_MARKER_NOT_AN_OBJECT' } } : undefined));
+    const r = await s.call('modoki_list_traits');
+    const e = envelope(s, r);
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(s.text(r)).not.toContain('SECRET_MARKER_NOT_AN_OBJECT');
+  });
+
+  it('modoki_list_traits against a body whose `traits` is an ARRAY (not a Record) refuses too', async () => {
+    // `Array.isArray` narrowly passes `typeof === 'object'` — the class of bug this guard exists
+    // to catch, one type up from a bare string.
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema' ? { status: 200, body: { traits: [] } } : undefined));
+    const e = envelope(s, await s.call('modoki_list_traits'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
   });
 });
 
@@ -365,7 +489,7 @@ describe('§5 — no tool may bypass the envelope', () => {
   it('no tool module hand-rolls a failure result', () => {
     const offenders: string[] = [];
     for (const f of files) {
-      const src = readFileSync(join(TOOLS_DIR, f), 'utf8');
+      const src = readScannedSource(join(TOOLS_DIR, f)).code;
       // `fail(...)` / `httpFailure(...)` are the only sanctioned constructors; both live in the
       // context. A literal `isError` in a tool module means a failure that skipped the envelope.
       if (/isError\s*:/.test(src)) offenders.push(f);
@@ -377,10 +501,10 @@ describe('§5 — no tool may bypass the envelope', () => {
     // Keeping it "as an escape hatch" is how the surface diverged: nothing forced a call site to
     // supply a code, a cause, or the options, so most supplied none of the three. Its absence is
     // what makes §5 enforced by the type checker rather than by this file.
-    const ctxSrc = readFileSync(join(TOOLS_DIR, '../context.ts'), 'utf8');
+    const ctxSrc = readScannedSource(join(TOOLS_DIR, '../context.ts')).code;
     expect(ctxSrc).not.toMatch(/^\s*err:\s*\(msg/m);
     for (const f of files) {
-      expect(readFileSync(join(TOOLS_DIR, f), 'utf8'), `${f} still destructures err from ctx`)
+      expect(readScannedSource(join(TOOLS_DIR, f)).code, `${f} still destructures err from ctx`)
         .not.toMatch(/\berr\s*,/);
     }
   });
@@ -388,7 +512,7 @@ describe('§5 — no tool may bypass the envelope', () => {
   it('every code in the closed set is spelled the same in the conventions doc', () => {
     // A code the doc doesn't list is a code nobody can look up; a code the doc lists but the
     // surface can't emit is a promise the surface doesn't keep.
-    const doc = readFileSync(join(__dirname, '../../../docs/mcp-tool-conventions.md'), 'utf8');
+    const doc = readScannedSource(join(__dirname, '../../../docs/mcp-tool-conventions.md'), DOC_AS_PROSE).raw;
     for (const code of ERROR_CODES) expect(doc, `${code} is not documented`).toContain(code);
   });
 });
@@ -618,7 +742,16 @@ describe('S3.21 — the over-cap hint names the CALLED tool\'s own filters', () 
   it('every filter a capped response advertises is a real parameter of that tool', async () => {
     // The guard that makes the fix durable: the hint is built from the contract table, which can go
     // stale. Intersecting with the schema means a stale declaration cannot advertise a dead param.
-    const s = (surface = loadSurface(() => ({ body: huge(2000) })));
+    //
+    // `modoki_list_assets` gets its OWN, well-formed reply here (#648): it reads `/api/scan-assets`
+    // through a body-shape guard now (a wrongly-shaped 200 is a structured FAILURE, not a silent
+    // "zero assets" — see mcpSummarize/context tests), so handing it the same `{logs:[...]}` shape
+    // the other two tools use to blow the cap would make it refuse instead of returning a hint —
+    // this test is checking the hint text names real params, not exercising the cap itself for
+    // this tool (a BARE list_assets call never echoes its `assets` count anyway; it always answers
+    // the same small "Counts only" hint, which is what `advertised` is really checking below).
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { body: { assets: [] } } : { body: huge(2000) }));
     for (const name of ['modoki_get_console_logs', 'modoki_list_assets', 'modoki_get_scene_state']) {
       const r = s.json(await s.call(name)) as { hint?: string };
       const advertised = [...(r.hint ?? '').matchAll(/([a-zA-Z]+)=/g)].map((m) => m[1]);

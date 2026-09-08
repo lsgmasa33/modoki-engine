@@ -2,8 +2,10 @@ import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'r
 import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
-import { App as CapacitorApp } from '@capacitor/app';
+import { useAudioResumeRearm } from './useAudioResumeRearm';
+import { useBackgroundFlush } from './useBackgroundFlush';
+import { useResumeReload } from './useResumeReload';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -14,14 +16,15 @@ import { runPipeline } from './ecs/pipeline';
 import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
-import { audioDispose, audioResume } from '@modoki/engine/runtime';
+import { audioDispose } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { onTierSwitchOverlay } from '@modoki/engine/runtime';
-import { checkAppOtaUpdate, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
+import { checkAppOtaUpdate, confirmShellBoot, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
 import { findGame as findGameInRegistry } from './gameRegistry';
+import { waitTwoFramesBounded } from './bootFrameWait';
 import './App.css';
 
 // NOTE: the app shell no longer reaches into a specific game (it used to eagerly
@@ -37,6 +40,12 @@ import './App.css';
 // below is dead-code-eliminated and the ~800 KB editor chunk never ships.
 // (Previously gated on VITE_GAME_ONLY, which only the web-DEPLOY step set — so a
 // plain `MODOKI_PROJECT=… npm run build` leaked the whole editor into the bundle.)
+// The ceiling on both `waitTwoFramesBounded` boot waits below (#682) — reuses
+// `SCENE_PAINT_MAX_WAIT_MS`, the ceiling the adjacent `waitForScenePaint` gate already uses (and
+// this file already imports), so the two halves of "there is something under the overlay" time
+// out on the same budget without a second literal to drift out of sync with it.
+const TWO_FRAME_WAIT_TIMEOUT_MS = SCENE_PAINT_MAX_WAIT_MS;
+
 const GAME_ONLY = !__MODOKI_EDITOR__;
 const EditorApp = GAME_ONLY ? null : lazy(() => import('./editor/setup').then(m => m.createGameEditor()));
 
@@ -129,6 +138,44 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
   const [tierSwitchMessage, setTierSwitchMessage] = useState<string | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
   /**
+   * A game whose teardown has STARTED but whose destructive half has not finished (#516).
+   *
+   * ⚠️ `activeGameIdRef` cannot answer this, and that gap is the bug. It is written only on the
+   * success path, so between "A's systems are unregistered" and "B is loaded" it still says A —
+   * and an A→B→A swap-back therefore took the `activeGameIdRef.current === gameId` early return
+   * and re-registered nothing, leaving A on screen with its systems, projections and managers
+   * gone for the rest of the session while the loading overlay was dismissed over the top.
+   *
+   * So a teardown publishes itself here BEFORE its first await, and `activeGameIdRef` is nulled
+   * at the same moment: a half-torn-down game is not loaded, and must not be treated as loaded.
+   *
+   * ⚠️ It holds the unregister PROMISE, not a boolean, because the re-entry must JOIN the
+   * teardown rather than repeat it. `unregisterSystems` is a `GameDefinition` hook, and the
+   * once-per-load contract documented on `configReadyRef` above is exactly the rule that a
+   * second call would break — while merely skipping it would race the still-running first call
+   * against the re-registration below it.
+   */
+  const teardownRef = useRef<{ gameId: string; systems: Promise<unknown> } | null>(null);
+  /**
+   * Which game currently OWNS registered engine state — systems, projections, managers,
+   * app-services — as opposed to which one finished booting.
+   *
+   * ⚠️ The two are not the same, and using the second for the first is #516's other half. A boot
+   * cancelled AFTER `registerSystems()` has run leaves that game's systems live while it never
+   * reaches the success path, so a guard written on success alone names nobody, the next swap
+   * tears down nothing, and the incoming game boots on top of the outgoing one's still-running
+   * systems. Written immediately BEFORE the first registration and cleared only when a
+   * teardown's destructive half has completed.
+   *
+   * ⚠️ "Registered state" starts at `registerPostprocessors`, the first hook below that registers
+   * anything — not at `registerSystems`. So a boot cancelled between the two leaves this naming a
+   * game that owns postprocessors but no systems, and the next swap will call its
+   * `unregisterSystems`. That is safe because every shipped `unregisterGameSystems` opens with an
+   * `if (!registered) return;` latch, and it is the right bias: naming a game that owes nothing
+   * costs a no-op call, while failing to name one that does is #516.
+   */
+  const registeredGameIdRef = useRef<string | null>(null);
+  /**
    * Mirrors of `configReady` / `initialized` for the LOAD EFFECT to read (#267).
    *
    * ⚠️ THE EFFECT BELOW SETS BOTH OF THOSE STATE VALUES MID-BODY, so reading the state
@@ -209,10 +256,16 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     }
     if (activeGameIdRef.current === gameId) {
       // Already the loaded game, so there is no transition in progress — and saying so is
-      // load-bearing, not tidiness. A→B→A while B is still in flight cancels B's run before
-      // it can reach either `setTransitioning(false)` below, and lands here, where the old
-      // early return left `transitioning` stuck TRUE for the rest of the session: the
-      // opaque LoadingOverlay covers a game that is running perfectly well underneath.
+      // load-bearing, not tidiness: the old early return left `transitioning` stuck TRUE for
+      // the rest of the session, an opaque LoadingOverlay over a game running perfectly well
+      // underneath.
+      //
+      // ⚠️ This guard NO LONGER catches the A→B→A swap-back (#516). `activeGameIdRef` is nulled
+      // the moment A's teardown starts, so a game that is mid-teardown is not "already loaded"
+      // and the swap-back falls through to finish the teardown and re-boot it. Reaching here
+      // now means what it says — the game is loaded and intact — which is the only reading that
+      // makes `return` safe. Restoring the old "written on success only" behaviour would put
+      // #516 straight back: A on screen, systems gone, overlay dismissed.
       setTransitioning(false);
       return; // no-op re-render
     }
@@ -241,10 +294,68 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Tear down previous game's systems before registering the new game's.
         // Without this, projection systems from prior games keep running and
         // operating on the wrong world state.
-        const prevGameId = activeGameIdRef.current;
-        if (prevGameId && prevGameId !== gameId) {
+        // A teardown already in flight names the previous game even after `activeGameIdRef` has
+        // been nulled — and it makes the block below run even when the incoming game IS that
+        // game (the A→B→A case), because A is in pieces and owed the rest of its teardown before
+        // it can be booted again.
+        // ⚠️ SECOND reachability of the `prevGameId === gameId` skip below, beyond the
+        // parked-boot case the tests cover: a teardown that REJECTED nulls `teardownRef` but
+        // leaves `registeredGameIdRef` naming a fully registered game, and the error screen's
+        // `#/` link does not unmount GameShell (it falls back to `GAMES[0]`), so that tap is a
+        // real gameId change back to the game that owns everything. It re-boots without
+        // `clearAppServices()`. Benign today — every shipped `registerGameSystems` is latched,
+        // `registerFrameCallback` is Map-keyed, and pre-fix that navigation stuck on the error
+        // screen forever — but it is the branch to re-examine if a game's register half ever
+        // stops being idempotent.
+        const pendingTeardown = teardownRef.current;
+        const prevGameId = pendingTeardown?.gameId ?? registeredGameIdRef.current;
+        if (prevGameId && (pendingTeardown !== null || prevGameId !== gameId)) {
           const prevDef = findGame(prevGameId);
-          if (prevDef?.unregisterSystems) await prevDef.unregisterSystems();
+          // Start the teardown, or join one a cancelled run already started. Publishing it
+          // BEFORE the await is what makes the swap-back see a game that is not loaded; awaiting
+          // the SAME promise is what keeps the hook called exactly once.
+          let systems = pendingTeardown?.systems;
+          if (!systems) {
+            systems = Promise.resolve(prevDef?.unregisterSystems ? prevDef.unregisterSystems() : undefined);
+            activeGameIdRef.current = null;
+            teardownRef.current = { gameId: prevGameId, systems };
+          }
+          try {
+            await systems;
+          } catch (e) {
+            // ⚠️ A REJECTED teardown must not be memoized. `teardownRef` holds the promise so a
+            // re-entry can join it, and a rejection would otherwise be joined forever: every
+            // later swap re-awaits the same dead promise, rethrows A's original failure, and NO
+            // GAME EVER BOOTS AGAIN — with the error text naming a game the player left long
+            // ago. Reachable, not theoretical: every real `unregisterSystems` is
+            // `() => import('./runtime/setup').then(...)`, a dynamic chunk import, which rejects
+            // on a chunk 404 after a deploy or on a flaky network — exactly the OTA sub-game
+            // seam this effect serves. Clearing the record restores the pre-#516 behaviour of
+            // retrying the teardown on the next swap; the throw still surfaces the failure.
+            teardownRef.current = null;
+            throw e;
+          }
+          // ⚠️ CANCELLATION CHECK BEFORE THE DESTRUCTIVE HALF, and it is load-bearing since #511
+          // gave `clearAppServices()` a real teardown (it calls the outgoing game's
+          // `ads.cleanup()`, not just `registered = {}`). A→B→A while B is suspended on the
+          // await above — the exact path this effect's header comment documents as hit for real
+          // — resumes here with `cancelled` already set. Without this line B's dead continuation
+          // would tear down the ads of a game whose boot is being restarted right now, racing
+          // the re-entry's own teardown-and-re-register of the same services.
+          //
+          // Returning here is not a leak, and that is what #516 changed: `teardownRef` is still
+          // set, so the swap-back JOINS this teardown and performs the destructive half itself
+          // before booting. Previously that re-entry hit an early return, nothing finished the
+          // teardown, and the game stayed on screen with its systems gone.
+          //
+          // The tierBoot module is imported HERE, above the check, so that no `await` remains
+          // between the check and the end of this block — an await after it would reopen the
+          // hole one step later (the swap-back landing during the dynamic import, teardown
+          // already done, `cancelled` observed too late).
+          const tierBoot = no3DTierLoopRef.current
+            ? await import('@modoki/engine/runtime/rendering/tierBoot')
+            : null;
+          if (cancelled) return;
           clearAppServices(); // drop the previous game's services before the next registers
           // ⚠️ AND THE 2D TIER-CALIBRATION LOOP, which the no-3D boot path below registers on the
           // frame driver (#203). It was exported with a teardown and never given one: swapping a
@@ -253,14 +364,23 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           // the session. Stopped unconditionally here and restarted below only if the NEW game
           // needs it, so the pair is symmetric rather than conditional at both ends — a
           // conditional teardown is what produced the leak.
-          if (no3DTierLoopRef.current) {
-            const { stopTierCalibrationForNo3DProject } =
-              await import('@modoki/engine/runtime/rendering/tierBoot');
-            stopTierCalibrationForNo3DProject();
+          if (tierBoot) {
+            tierBoot.stopTierCalibrationForNo3DProject();
             no3DTierLoopRef.current = false;
           }
+          // The destructive half is done, so nothing is owed any more. Cleared HERE rather than
+          // on the success path far below: everything after this point is the NEW game's boot,
+          // and a failure there must not make the next swap re-tear-down a game that is already
+          // fully torn down.
+          teardownRef.current = null;
+          registeredGameIdRef.current = null;
         }
         if (cancelled) return;
+        // ⚠️ Claim ownership BEFORE the first registration, not after the last. Everything below
+        // registers engine state, and any of it can be cancelled part-way — a game that got as
+        // far as `registerSystems` owns systems whether or not it ever finishes booting, and the
+        // next swap has to know that in order to tear them down.
+        registeredGameIdRef.current = gameId;
         if (def.registerPostprocessors) await def.registerPostprocessors();
         if (cancelled) return;
         if (def.registerSystems) await def.registerSystems();
@@ -287,7 +407,13 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Scene3D, so this await must stay ahead of it — move it after and a player's chosen tier
         // silently reads as null on every launch, falling back to the project setting with no
         // error anywhere.
-        await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        if (prefsInit.discardedPending.length > 0) {
+          console.error(
+            `[App] PlayerPrefs.init() discarded pending write(s) while swapping from ` +
+              `"${prevGameId || '(none)'}" to "${gameId}": ${prefsInit.discardedPending.join(', ')}`,
+          );
+        }
         if (cancelled) return;
         if (def.resetPhase) setActiveResetPhase(def.resetPhase);
 
@@ -362,6 +488,20 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         if (cancelled) return;
 
 
+        // Did a `waitTwoFramesBounded` call EVER see the rAF chain actually deliver a frame during
+        // this boot? Gates `confirmShellBoot()` below (#682 close-out, LOW 6): that call used to
+        // fire unconditionally once boot reached it, so a dead rAF chain — the very thing
+        // `bootFrameWait.ts`'s header describes as "a permanent black screen and a bundle the
+        // native watchdog then rolls back" — instead got CONFIRMED as a good boot 5s later,
+        // exactly backwards. Starts false and needs a real 'frames' outcome to flip.
+        // ⚠️ A window that is HIDDEN for a while (an OTA relaunch that lands backgrounded, or one
+        // that never gets foregrounded in time) is NOT treated as a dead loop below — see
+        // `bootFrameWait.ts`'s header. `waitTwoFramesBounded` pauses its own ceiling while hidden
+        // and re-arms a fresh one on `visibilitychange`, so `'timeout'` here still means what the
+        // two `console.warn`s below say it means: the document was visible and the chain genuinely
+        // never delivered, not merely that the tab wasn't in front.
+        let bootFramesConfirmed = false;
+
         // Mount renderers BEFORE scene load so their registerBeforeSwap hooks
         // (Scene3D shader prewarm, Scene2D sprite preload) are registered in
         // time. configReady gates the mount; the opaque LoadingOverlay covers
@@ -373,7 +513,13 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           // run (registering beforeSwap hooks). Two rAFs to cover PixiJS
           // Application async init. If hooks aren't registered in time, the
           // existing async fallbacks (makeSprite, syncRenderables) handle it.
-          await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+          // Bounded (#682): a dead rAF chain must not hang the whole boot sequence forever.
+          const mountWait = await waitTwoFramesBounded(TWO_FRAME_WAIT_TIMEOUT_MS);
+          if (mountWait === 'timeout') {
+            console.warn('[GameShell] renderer-mount two-frame wait hit its ceiling — the frame loop may be dead; continuing boot anyway');
+          } else {
+            bootFramesConfirmed = true;
+          }
           if (cancelled) return;
         }
 
@@ -471,7 +617,15 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // time, so the paint above cannot have included it), and the submitted frame has to reach
         // the swapchain. Kept as well as the wait above, not replaced by it — they cover different
         // halves of "there is something under the overlay".
-        await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        // ⚠️ Bounded (#682): on a 2D/UI-only project (no3D, or no bootScenePath) this is the ONLY
+        // gate before the OTA boot-confirm and the overlay dismissal below — a dead rAF chain here
+        // used to be a PERMANENT black screen and a bundle the native watchdog then rolls back.
+        const renderWait = await waitTwoFramesBounded(TWO_FRAME_WAIT_TIMEOUT_MS);
+        if (renderWait === 'timeout') {
+          console.warn('[GameShell] post-render two-frame wait hit its ceiling — the frame loop may be dead; dismissing the loading overlay anyway');
+        } else {
+          bootFramesConfirmed = true;
+        }
         if (cancelled) return;
 
         // OTA boot-watchdog confirm (docs/ota-updates.md):
@@ -481,17 +635,18 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // failure here must never block the game the player is already looking at, and
         // web has no OTA mechanism to confirm anything for (ModokiOtaWeb no-ops it
         // anyway, but skip the dynamic import entirely rather than pay for it on web).
+        // ⚠️ NOT an unconditional confirm. `checkAppOtaUpdate()` above can have staged and
+        // activated a new version DURING this launch, so `pending` may name a version that is
+        // not the one rendering — confirming it credits the new bundle with the old one's
+        // successful boot. `confirmShellBoot` decides that and names the version it confirms;
+        // see its doc comment (found by #553's close-out sweep).
+        // ⚠️ ALSO gated on `bootFramesConfirmed` (#682 close-out, LOW 6): neither
+        // `waitTwoFramesBounded` call above ever saw a real frame means this boot never painted
+        // anything, and confirming it anyway is the exact regression `bootFrameWait.ts`'s own
+        // header warns about — see the two call sites above for detail.
         if (Capacitor.isNativePlatform()) {
-          import('capacitor-modoki-ota')
-            .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
-            .catch((e) => {
-              // A project without the OTA native plugin rejects this on EVERY launch, so a warn
-              // here files a Crashlytics issue per session for a non-event. A real confirmBoot
-              // failure still warns — on a project that ships OTA it is what the rollback
-              // watchdog keys on. See `isPluginUnimplemented`.
-              if (isPluginUnimplemented(e)) console.log('[GameShell] no OTA plugin on this platform — confirmBoot skipped');
-              else console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e);
-            });
+          if (bootFramesConfirmed) void confirmShellBoot();
+          else console.warn('[GameShell] skipping confirmShellBoot() — no frame rendered during boot (the frame loop may be dead); the native watchdog should not confirm this bundle');
         }
 
         // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
@@ -606,10 +761,63 @@ function App() {
   // Run ECS pipeline every frame (needed by both game and editor for Scene3D rendering)
   useGameLoop(runPipeline);
 
-  // Cleanup native SDK listeners + audio context on unmount (prevents
-  // accumulation on HMR and error-boundary recovery).
+  // Cleanup native SDK listeners + the audio node graph — registered as a REALM-SHUTDOWN task, not
+  // as unmount cleanup.
+  //
+  // ⚠️ An unmount-cleanup effect here EFFECTIVELY NEVER RUNS, and that is by design rather than an
+  // oversight (#534). In a shipped web/native build there is one `createRoot` (main.tsx) that is
+  // never unmounted; in dev the only unmount is StrictMode's mount -> unmount -> remount, which is
+  // SYNCHRONOUS within the commit and therefore lands before either `registerAll()` site (both sit
+  // downstream of awaits).
+  //
+  // So do NOT grow this into an app teardown. #534 built exactly that -- a `teardownAll()`
+  // inverting `registerAll()` -- and it was removed once measured: every end-of-lifetime in this
+  // architecture is a REALM DEATH, not a teardown (process kill on mobile, tab close on web,
+  // `location.reload()` for restart/OTA, `webContents.reload()` for the editor's project switch).
+  // Nothing survives those to be cleaned up. `docs/managers-and-systems.md` carries the reasoning.
+  //
+  // That REALM-DEATH ruling is exactly why this work moved off `useEffect`'s unmount and onto
+  // `registerRealmShutdownTask` (#587): a reload is a realm death that this component's unmount
+  // never sees, so a native ad SDK (AppLovin banner/MREC/interstitial) that was only torn down on
+  // unmount survived every reload — still refreshing and monetising with no JS listener attached,
+  // undercounting `ad_revenue`. `engine.reload` and `useResumeReload`'s reload path now both call
+  // `runRealmShutdownTasks()` before tearing the realm down, so this task actually runs on the path
+  // that matters. Still not a general app-teardown seam — one task, one job, same restraint as above.
   useEffect(() => {
-    return () => { appServices().ads?.cleanup(); audioDispose(); };
+    return registerRealmShutdownTask(
+      'app.cleanup',
+      () => { appServices().ads?.cleanup(); audioDispose(); },
+      {
+        // #611: re-init ads if the "shutdown" turns out to have been a false alarm (the
+        // `pagehide` backstop below over-triggering on iOS, or `shutdownRealmThenReload()`'s
+        // throwing route re-arming the latch while leaving ads dead — a pre-existing gap this
+        // also closes, since nothing else ever called `ads.init()` a second time). Gated the same
+        // way as the boot-time init above (`Capacitor.isNativePlatform()`, line ~389) — off-device
+        // `ads.init()` is already a no-op, but mirroring the gate keeps the two call sites reading
+        // the same.
+        //
+        // Audio DOES need recovery here, and it used to say the opposite. The GRAPH rebuilds
+        // lazily on next use (`graphOrNull()` in the audio service), reapplying mute + bus mix —
+        // but PLAYBACK does not: `audioDispose()` ends every live handle, and `audioSystem`'s
+        // `autoplayed` guard then blocks autoplay from ever re-declaring intent, so an authored
+        // `loop + autoplay` source (music, ambience) is silent for the rest of the session with
+        // nothing to explain it (see `rearmAudioAutoplay`'s own doc comment). Re-arming it here
+        // makes the next tick restart those sources from the top — the same place a real reload
+        // would have left them.
+        onRealmSurvived: () => {
+          // #631: `ads.init()` alone under-restores — it never re-registers a reward handler
+          // set through `onRewardEarned`, nor re-shows a banner that was on screen, both torn
+          // down by the `cleanupAds()` that already ran above. Prefer the dedicated recovery hook
+          // when the registered service exposes one; fall back to plain `init()` for a service
+          // that doesn't (most games have nothing to restore).
+          if (Capacitor.isNativePlatform()) {
+            const ads = appServices().ads;
+            void (ads?.restoreAfterRealmSurvived ? ads.restoreAfterRealmSurvived() : ads?.init());
+          }
+          rearmAudioAutoplay(getCurrentWorld());
+        },
+      },
+    );
   }, []);
 
   // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game
@@ -624,49 +832,16 @@ function App() {
     void loadStagedSubgames();
   }, []);
 
-  // Make pending PlayerPrefs writes durable when the app is backgrounded/hidden —
-  // debounced writes would otherwise be lost to an OS kill. Native fires
-  // appStateChange; web fires visibilitychange/pagehide. (atomic ≠ durable; this
-  // closes the durability gap the store documents.)
-  useEffect(() => {
-    const flush = () => { void PlayerPrefs.flush(); };
-    const onVisibility = () => { if (document.visibilityState === 'hidden') flush(); };
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('pagehide', flush);
-    let appListener: { remove: () => void } | undefined;
-    let cancelled = false; // cleanup may run before the async addListener resolves
-    if (Capacitor.isNativePlatform()) {
-      void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
-        if (!isActive) flush();
-      }).then((h) => { if (cancelled) h.remove(); else appListener = h; });
-    }
-    return () => {
-      cancelled = true;
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('pagehide', flush);
-      appListener?.remove();
-      flush(); // final flush on teardown (HMR / error-boundary recovery)
-    };
-  }, []);
+  useBackgroundFlush();
 
-  // Unlock the AudioContext on the first user gesture (mobile/WebView autoplay
-  // policy suspends it until then). One-shot: the listeners remove themselves.
-  useEffect(() => {
-    const unlock = () => {
-      audioResume();
-      for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-        window.removeEventListener(evt, unlock);
-      }
-    };
-    for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-      window.addEventListener(evt, unlock, { once: false });
-    }
-    return () => {
-      for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-        window.removeEventListener(evt, unlock);
-      }
-    };
-  }, []);
+  useAudioResumeRearm();
+
+  // Reload the app on resume after a long background (#574). A no-op unless the project authors
+  // `runtime.reloadAfterBackgroundMinutes`. Registered AFTER `useBackgroundFlush` above deliberately:
+  // Capacitor dispatches `appStateChange` in registration order, so the background flush is
+  // already queued by the time this samples the reload blockers. The trigger awaits its own
+  // `PlayerPrefs.flush()` before reloading regardless — this ordering is belt, not braces.
+  useResumeReload();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {

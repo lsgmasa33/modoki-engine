@@ -3,6 +3,7 @@ import {
   registerPointerBlocker,
   registerPointerPassthrough,
   isPointerBlocked,
+  isInsideGameSurface,
   clearPointerBlockers,
 } from '../../src/runtime/core/pointerBlockers';
 
@@ -187,5 +188,58 @@ describe('pointerBlockers — passthrough surfaces', () => {
     expect(isPointerBlocked(canvas)).toBe(false); // nothing registered at all now
     registerPointerBlocker(uiRoot);
     expect(isPointerBlocked(canvas), 'the exemption did not survive the clear').toBe(true);
+  });
+});
+
+/** ── isInsideGameSurface (#595) ──
+ *
+ *  `domGestureTracking.ts` needs "is this touch on the game's own DOM at all, chrome or canvas"
+ *  rather than the nearest-ancestor block-vs-pass question `isPointerBlocked` answers — this is a
+ *  plain union-of-registries membership test with no precedence between the two registries. */
+describe('pointerBlockers — isInsideGameSurface', () => {
+  it('is true for a target inside a registered blocker', () => {
+    const root = new FakeNode();
+    registerPointerBlocker(root);
+    expect(isInsideGameSurface(root)).toBe(true);
+  });
+
+  it('is true for a target inside a registered passthrough surface', () => {
+    const surface = new FakeNode();
+    registerPointerPassthrough(surface);
+    expect(isInsideGameSurface(surface)).toBe(true);
+  });
+
+  it('is false for an element in neither registry (both registries non-empty)', () => {
+    const root = new FakeNode();
+    const surface = new FakeNode();
+    const other = new FakeNode();
+    registerPointerBlocker(root);
+    registerPointerPassthrough(surface);
+    expect(isInsideGameSurface(other)).toBe(false);
+  });
+
+  it('fails OPEN — true when both registries are empty', () => {
+    const other = new FakeNode();
+    expect(isInsideGameSurface(other)).toBe(true);
+  });
+
+  /** A real DOM `Node.contains()` throws `TypeError` per WebIDL when its argument isn't a Node —
+   *  that's the whole reason `containing()` in `pointerBlockers.ts` wraps its call in `try/catch`.
+   *  `FakeNode.contains()` above is forgiving (it just returns `false`), so it cannot exercise that
+   *  catch — a stub that throws the way a real `Node` does is required to actually measure it. */
+  class ThrowingNode {
+    contains(): boolean { throw new TypeError('not a Node'); }
+  }
+
+  it('a non-Node target (e.g. window) must not throw, and reports false once something is registered', () => {
+    const root = new ThrowingNode();
+    registerPointerBlocker(root);
+    expect(() => isInsideGameSurface({})).not.toThrow();
+    expect(isInsideGameSurface({})).toBe(false);
+  });
+
+  it('a non-Node target with nothing registered still fails open to true, and must not throw', () => {
+    expect(() => isInsideGameSurface({})).not.toThrow();
+    expect(isInsideGameSurface({})).toBe(true);
   });
 });

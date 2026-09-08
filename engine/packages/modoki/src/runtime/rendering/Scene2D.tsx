@@ -29,20 +29,20 @@
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
 import type { World } from 'koota';
-import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Container, Buffer, BufferUsage, type Shader } from 'pixi.js';
+import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
-import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha } from '../traits';
+import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha, Mask2D } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
-import { makeMtsdfPixiShader, updateMtsdfPixiStyle } from './text/mtsdfPixiShader';
+import { makeMtsdfPixiShader, updateMtsdfPixiStyle, canReuseMtsdfPixiShader, updateMtsdfPixiMetrics } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
-import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
+import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import type { TextQuad } from './text/layoutText';
 import { getTextDirtyVersion, onTextDirty } from './text/textDirty';
 import type { MtsdfStyle } from './text/mtsdfStyle';
@@ -52,7 +52,7 @@ import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
 import { isImagePath, isVideoRef, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
-import { syncVideoTextures2D, disposeVideoTextures2D } from './videoTextureSync2D';
+import { syncVideoTextures2D, disposeVideoTextures2D, flushPendingVideoDestroy2D } from './videoTextureSync2D';
 /** Shared empty result for the video pass when the module is excluded — a fresh [] per frame
  *  would allocate for a subsystem that isn't even in the build. */
 const EMPTY_IDS: number[] = [];
@@ -60,19 +60,23 @@ import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColl
 import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
-import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuilder';
+import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
+import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
 import { computeGroupAlpha } from './groupAlpha';
-import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
+import { computeMaskGroups } from './maskGroups';
+import { buildMaskRamp } from './maskRamp';
+import { maskOffsetWorld } from './maskPlacement';
+import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker, orphan2DFallbackKey } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
 import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
 import { isSimRunning, onPlayStateChange } from '../core/playState';
-import { Canvas2DPool, defaultPool } from './canvas2DPool';
+import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
@@ -92,6 +96,14 @@ type DisplayKind = 'graphics' | 'sprite' | 'mesh' | 'text' | 'material';
 // geometry — Scene2D re-uploads positions only when skin2DSystem bumps it. -1 for
 // non-mesh slots. For a mesh slot `spriteRef` holds the rig ref (change detection).
 interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; spriteRef: string; textureUrl: string; hasFrame: boolean; builtEpoch: number; meshVersion: number; meshFrameKey?: string;
+  // Text slots only (#749): the QUAD-SET half of `meshFrameKey` — [font, text, atlasVersion,
+  // textDirtyVersion], a subset of the fields in `layoutHash`. `meshFrameKey` changing but
+  // `meshBuildKey` NOT (a fontSize/align/maxWidth/lineSpacing/letterSpacing-only edit) means the
+  // quad sequence is provably unchanged (see `canWriteTextPositionsInPlace`), so positions can be
+  // written into the existing page geometry instead of rebuilding it. Undefined on a fresh slot,
+  // which can never equal a real key (same sentinel reasoning as `meshFrameKey` below), so a
+  // first build always takes the full rebuild path.
+  meshBuildKey?: string;
   // Skinned-mesh slots (kind 'mesh'): obj is a Container holding one Mesh per rig part.
   meshes?: Mesh[]; partUrls?: string[];
   // Text slots (kind 'text'): obj is a Container holding one Mesh per atlas PAGE (in
@@ -108,16 +120,50 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // on deactivation; `animStart` is the smoothedElapsed captured at (re)activation so
   // each Play restarts the effect from t=0.
   baseQuads?: TextQuad[]; pageNums?: number[]; wasMotion?: boolean; wasColored?: boolean; animStart?: number; animEffect?: string;
+  // Text slots only: consecutive failed rebuild attempts (see the `meshFrameKey` sentinel
+  // comment below) — bounds the retry so a PERMANENT failure degrades to a quiet blank
+  // instead of churning every frame forever.
+  textRebuildFails?: number; textRebuildFailHash?: string;
   // Material slots (kind 'material'): obj is a Mesh (quad geometry + a per-entity
   // pixiShaderBuilder Shader) sampling the entity's OWN sprite bitmap as `uTexture`
   // (or Texture.WHITE when it has no sprite). `matGuid` is the bound 2D-material GUID;
-  // `matSig` gates a rebuild (size/pivot AND the resolved sprite-texture url, so the
-  // Mesh re-mints with the real texture the frame it lands). `textureUrl` holds the
-  // retained sprite url (shared spriteTextureRefs — released in disposeSlot). The shader
-  // is also registered in Scene2DRenderer.entityShaders for MaterialInstance driving.
+  // `matBuildSig` gates a full Mesh+Shader+Geometry rebuild (the resolved sprite-texture url and
+  // the extra-sampler set — see `matBuildSig` at its use site). `matQuadSig` gates a cheaper
+  // in-place resize of just the quad's 8 position floats (size/pivot only, #692) — split from
+  // `matBuildSig` because a Shader rebuild adds two permanent entries to WebGPU's
+  // `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707), so an
+  // animated size must never force one. `textureUrl` holds the retained sprite url (shared
+  // spriteTextureRefs — released in disposeSlot). The shader is also registered in
+  // Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
   // (additional samplers) — each retained on build + released in disposeSlot, like textureUrl.
-  matShader?: Shader; matGuid?: string; matSig?: string; materialTexUrls?: string[] }
+  // `matSpriteRef` is the SAMPLED sprite ref (`spriteRef` is taken — it holds the material GUID
+  // on this kind). It is deliberately NOT in `matBuildSig`, so an atlas frame swap within one
+  // sheet shows up as "sig equal, ref moved" and takes the one-uniform fast path instead of a full
+  // Mesh+Shader+Geometry rebuild (#698). `builtEpoch` tracks the sampled sprite's re-slice epoch
+  // here (the sprite path's meaning), so re-slicing the sheet invalidates the slot even when the
+  // url is unchanged.
+  // `matGen` is the koota GENERATION of the entity this Shader's uniform state belongs to (#873).
+  // On the SLOT for the same reason `geomSig` below is: slot lifetime === Shader lifetime, and the
+  // reset has to key off the thing being reset. It must NOT be read out of `entityShaders`, which
+  // CAN BE DROPPED WHILE THE SLOT SURVIVES — the per-frame purge deletes that stamp on any frame
+  // the material pass skips the entity, and the sprite pass adds the id to `activeIds` and can then
+  // early-return (its `if (!resolved) return`, which sits BEFORE its kind check) without replacing
+  // the slot: a material still compiling plus a sprite ref with no 2D variant does it. Keyed there,
+  // the reset silently skipped exactly the case it exists for; caught in #873's own close-out
+  // review. (Not "strictly shorter" in both directions — the sprite pass disposes a material slot
+  // without deleting the map entry, which the purge tidies later the same frame. Harmless, and not
+  // what the argument needs.)
+  // ⚠️ Inherits the 8-bit generation wrap `sprite2DMaterialBroker` documents: 256 destroy+spawn
+  // cycles on one index between two frames restore the stamped value and the reset would not fire.
+  // Worse here than at the broker (a wrapped read there merely grants access), but no system in
+  // this repo respawns one index 256 times in a frame — pools reuse entities rather than respawn.
+  matShader?: Shader; matGuid?: string; matBuildSig?: string; matQuadSig?: string; materialTexUrls?: string[]; matSpriteRef?: string; matGen?: number;
+  // 'graphics' slots only (#684): the last geometry signature ISSUED into this Graphics. Lives on
+  // the SLOT, not on the `lastRender` snapshot, because slot lifetime === Graphics lifetime — a
+  // freshly built or rebuilt slot has `geomSig === undefined` and therefore always draws, with no
+  // dependence on whichever rebuild path created it.
+  geomSig?: string }
 
 // ── SHARED texture refcount (global — tracks the global Assets cache) ──
 // Per-URL refcount for PixiJS Assets. When the last sprite using a URL is
@@ -137,7 +183,54 @@ const spriteTextureRefs = new Map<string, number>();
 // a genuine last release still frees the VRAM one tick later.
 const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
 
+// ── EDITOR-PANEL holds on a sprite url (#701) ──
+// Deliberately a SECOND map rather than more entries in `spriteTextureRefs`, because that one is
+// SCENE-scoped by design (F3: "no texture accounting survives a scene") and `unloadAllSpriteTextures`
+// erases it wholesale on world swap / last-renderer stop. An editor panel showing a preview outlives
+// any number of world swaps, so folding its hold into the scene map would have the swap unload a
+// texture the panel is still displaying — the mirror image of the hazard #701 exists to avoid.
+// A panel hold therefore VETOES the unload instead of participating in the scene refcount.
+const panelTextureRefs = new Map<string, number>();
+
+/** Hold a sprite url on behalf of a long-lived editor panel. Pair with {@link releasePanelTexture}. */
+export function retainPanelTexture(url: string): void {
+  if (!url) return;
+  const pending = pendingTextureUnloads.get(url);
+  if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  panelTextureRefs.set(url, (panelTextureRefs.get(url) ?? 0) + 1);
+}
+
+/** Drop a panel's hold. Frees the texture only when no OTHER panel and no scene slot holds it —
+ *  a blind `Assets.unload` here would evict a texture another live panel (or the viewport) is
+ *  still sampling, which is exactly why #701 could not be fixed with a matching unload. */
+export function releasePanelTexture(url: string): void {
+  if (!url) return;
+  const n = (panelTextureRefs.get(url) ?? 0) - 1;
+  if (n > 0) { panelTextureRefs.set(url, n); return; }
+  panelTextureRefs.delete(url);
+  if ((spriteTextureRefs.get(url) ?? 0) > 0) return;   // a scene slot still samples it
+  deferUnload(url);
+}
+
+/** Arm the deferred unload shared by both release paths. Deferred rather than immediate for the
+ *  reason `pendingTextureUnloads` documents above: a release landing in the same tick as a
+ *  refcount trough on a shared url would otherwise destroy the source out from under the rebuild
+ *  about to re-retain it. Cancels itself if EITHER a scene slot or a panel re-retains meanwhile. */
+function deferUnload(url: string): void {
+  if (pendingTextureUnloads.has(url)) return;
+  const handle = setTimeout(() => {
+    pendingTextureUnloads.delete(url);
+    if ((spriteTextureRefs.get(url) ?? 0) > 0 || panelTextureRefs.has(url)) return;
+    unloadSpriteTextureNow(url);
+  }, 0);
+  pendingTextureUnloads.set(url, handle);
+}
+
 function unloadSpriteTextureNow(url: string) {
+  // A panel hold vetoes every unload path — both `releaseSpriteTexture`'s deferred timer and
+  // `unloadAllSpriteTextures`'s wholesale sweep funnel through here, so this one check covers
+  // both without either needing to know panels exist.
+  if (panelTextureRefs.has(url)) return;
   if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
 }
 
@@ -150,14 +243,7 @@ function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
-    if (pendingTextureUnloads.has(url)) return;
-    const handle = setTimeout(() => {
-      pendingTextureUnloads.delete(url);
-      // Re-retained while we waited (the same-frame rebuild case) — the hold is live again.
-      if ((spriteTextureRefs.get(url) ?? 0) > 0) return;
-      unloadSpriteTextureNow(url);
-    }, 0);
-    pendingTextureUnloads.set(url, handle);
+    deferUnload(url);
   } else {
     spriteTextureRefs.set(url, n);
   }
@@ -194,6 +280,13 @@ function unloadAllSpriteTextures() {
  *  console line, against the alternative of the silence this whole change exists to end. */
 const ORPHAN_2D_WARN_FRAMES = 1;
 
+// A Text2D rebuild that keeps throwing (malformed atlas, a font provider stuck not-ready)
+// gets this many consecutive attempts before giving up for the current layout hash — see
+// the `textRebuildFails` catch in the Text2D draw pass below. Small on purpose: a
+// transient failure (the common case — a texture arriving next frame) clears in one or
+// two, so this exists only to cap the PERMANENT case, not to smooth over real flakiness.
+const TEXT_REBUILD_MAX_RETRIES = 3;
+
 // ── Trait metadata cache (global — the trait registry is process-wide) ──
 let traitsCached = false;
 let canvas2dMeta: any;
@@ -214,18 +307,38 @@ function makeGraphics(container: Container): Graphics {
   return g;
 }
 
+/** The 8 position floats of a material quad (two triangles, top-left origin at the pivot),
+ *  written into `out`. The ONE derivation shared by {@link buildMaterialQuad} and
+ *  {@link resizeMaterialQuad} — a second copy would drift the moment a pivot rule changes. */
+function writeMaterialQuadPositions(out: Float32Array, w: number, h: number, px: number, py: number): void {
+  const { ox, oy } = computePivotOffset(w, h, px, py); // top-left corner in local space
+  const x0 = ox, y0 = oy, x1 = ox + w * 2, y1 = oy + h * 2;
+  out[0] = x0; out[1] = y0; out[2] = x1; out[3] = y0; out[4] = x1; out[5] = y1; out[6] = x0; out[7] = y1;
+}
+
 /** A pivot-offset quad (two triangles) sized to a Renderable2D's width/height, with
  *  0..1 UVs — the geometry a 2D-material Mesh is drawn on. Matches the primitive
  *  convention (width/height are half-extents; full size is ×2), so a material quad
  *  lines up with the same entity rendered as a primitive. */
 export function buildMaterialQuad(w: number, h: number, px: number, py: number): MeshGeometry {
-  const { ox, oy } = computePivotOffset(w, h, px, py); // top-left corner in local space
-  const x0 = ox, y0 = oy, x1 = ox + w * 2, y1 = oy + h * 2;
+  const positions = new Float32Array(8);
+  writeMaterialQuadPositions(positions, w, h, px, py);
   return new MeshGeometry({
-    positions: new Float32Array([x0, y0, x1, y0, x1, y1, x0, y1]),
+    positions,
     uvs: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
     indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
   });
+}
+
+/** Resize an EXISTING material quad in place (#692). Only the 8 position floats move: the uvs,
+ *  the indices, the texture bindings and the shader are all independent of the quad's size, so a
+ *  size/pivot edit never needs a new Mesh — and never needs a new Shader, which is the part that
+ *  matters, because every Shader rebuild adds two permanent entries to WebGPU's
+ *  `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707).
+ *  Same in-place shape the skinned-mesh deform and the text animation passes already use. */
+export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: number, py: number): void {
+  writeMaterialQuadPositions(geo.positions as Float32Array, w, h, px, py);
+  geo.getBuffer('aPosition').update();
 }
 
 /** Build the per-slot texture for a sprite: the base texture for a whole image, or a
@@ -246,6 +359,23 @@ function frameTexture(base: Texture, r: ResolvedSprite): Texture {
   return new Texture({ source: base.source, frame: new Rectangle(x, y, w, h) });
 }
 
+/** Mint what a material Mesh samples, from an already-resolved ref: the base texture for a whole
+ *  image, a framed WRAPPER for an atlas slice.
+ *
+ *  ⚠️ EVERY call that mints a wrapper allocates a `Texture` the shared long-lived `TextureSource`
+ *  then holds via a `source.on('resize')` backref — so the wrapper is NOT collectable once
+ *  dropped. Call this ONLY where a wrapper is actually kept: a Mesh build, or a frame swap that
+ *  stores it on the slot. The material pass used to call the resolver (which minted inline) once
+ *  per material entity per FRAME and drop the result on the floor. Only an ATLAS-SLICED sprite
+ *  allocated — a whole image borrows the base texture and always did — so the cost was 482 bytes
+ *  per frame per sliced material entity, ~1.65 MB/min (#697, measured in Node against the
+ *  vendored pixi; LATENT today because no such entity is authored in any current project). The
+ *  sprite path never had this bug: its `needResolve` guard resolves only when the ref or the
+ *  re-slice epoch actually moved. */
+function mintMaterialTexture(r: { base: Texture; resolved: ResolvedSprite | null; hasFrame: boolean }): Texture {
+  return r.hasFrame && r.resolved ? frameTexture(r.base, r.resolved) : r.base;
+}
+
 /** Collect an entity's per-instance 2D-material TEXTURE overrides — `MaterialInstance`
  *  overrides with `kind:'texture'` — as a Map<param target, sprite/texture GUID>. These
  *  override the shader's texture-param manifest DEFAULT for this instance (an extra-sampler
@@ -262,13 +392,57 @@ function readTextureOverrides(entity: any): Map<string, string> | undefined {
   return out;
 }
 
+/** Record the scale that maps a mask Sprite's texture onto the authored half-extents.
+ *
+ *  A texture whose size is not yet known (an async sprite load still in flight — `Texture.EMPTY`
+ *  is 0x0 or 1x1) would divide to a garbage factor, so this leaves the base at 1 and lets the
+ *  next rebuild fix it once the bitmap has landed; `makeSprite` calls `markDirty` on load, which
+ *  is what brings that frame around. */
+function setMaskBaseScale(slot: MaskSlot, sp: Sprite, d: MaskData) {
+  const tw = sp.texture?.width ?? 0;
+  const th = sp.texture?.height ?? 0;
+  slot.baseScaleX = tw > 1 ? (d.width * 2) / tw : 1;
+  slot.baseScaleY = th > 1 ? (d.height * 2) / th : 1;
+}
+
+/** Whether two sparse entityId → maskId maps agree. Both are SPARSE (only masked entities
+ *  appear), so the common case — no masks anywhere, or a stable set — is a size check against
+ *  two empty maps and returns immediately. */
+function sameGrouping(a: ReadonlyMap<number, number>, b: ReadonlyMap<number, number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [id, mask] of a) if (b.get(id) !== mask) return false;
+  return true;
+}
+
+/** The ONLY place a Pixi `Geometry` is destroyed. PixiJS 8.19.0's `Geometry.destroy()` calls
+ *  `removeAllListeners()` BEFORE it calls `unload()`, so the GC hook that actually frees the GL
+ *  VAO — `GlGeometrySystem.onGeometryUnload`, the only `gl.deleteVertexArray` call site, reached
+ *  only via `GCManagedHash`'s `item.once("unload", …)` registration — is torn off before
+ *  `unload()` ever fires, permanently orphaning the VAO. `destroy(true)` alone does not fix it:
+ *  `buffers.forEach` still runs before `unload()` inside the same call. `Buffer`, `TextureSource`,
+ *  `GraphicsContext` and `ViewContainer` all order `unload()` before `destroy()` correctly —
+ *  `Geometry` is the one Pixi class that inverts it, so this is a workaround for an upstream
+ *  quirk, not a local convention.
+ *
+ *  Guards against a second call on the same Geometry: `destroy(true)` nulls `buffers` (so
+ *  `Geometry.destroy`'s own `this.buffers.forEach(...)` would run on a null next time), so a
+ *  double release now THROWS where the old bare `geo.destroy()` was a silent no-op. The
+ *  `!g.buffers` check below is load-bearing, not defensive noise — a caller that releases the
+ *  same geometry twice (e.g. two dispose paths racing on the same slot) must still land here
+ *  safely. */
+export function releaseGeometry(g: Geometry | undefined | null): void {
+  if (!g || !g.buffers) return;
+  g.unload();
+  g.destroy(true);
+}
+
 function disposeSlot(slot: Slot) {
   slot.obj.removeFromParent();
   // Skinned mesh: a Container holding one Mesh per rig part. Release each part's shared
   // base texture (retained like a sprite) and destroy each per-part geometry (Mesh.destroy()
   // does not free it), then the container.
   if (slot.kind === 'mesh') {
-    for (const m of slot.meshes ?? []) { const geo = m.geometry; m.destroy(); geo?.destroy(); }
+    for (const m of slot.meshes ?? []) { const geo = m.geometry; m.destroy(); releaseGeometry(geo); }
     for (const u of slot.partUrls ?? []) if (u) releaseSpriteTexture(u);
     slot.obj.destroy();
     return;
@@ -289,7 +463,14 @@ function disposeSlot(slot: Slot) {
     // texture (hasFrame=false), and a spriteless material samples Texture.WHITE — never destroyed.
     const tex = slot.hasFrame ? (mesh.texture as Texture | undefined) : undefined;
     mesh.destroy();
-    geo?.destroy();
+    releaseGeometry(geo);
+    // ⚠️ BARE `destroy()` ON PURPOSE — Pixi's `Shader.destroy(destroyPrograms = false)` leaves the
+    // shared program alone, and (post-#716) `pixiShaderBuilder`'s program cache is MODULE-scope,
+    // shared by every entity using that material across every canvas, for the rest of the session
+    // — not just a per-GUID cache `ensureSpriteMaterial` itself owns. Changing this to
+    // `destroy(true)` would free a GlProgram that other live Meshes STILL IN THE GRAPH point at,
+    // from inside the pass that renders them — the #455 class, with a worse blast radius than the
+    // mask that found it. Same for the text shaders below.
     slot.matShader?.destroy();
     if (tex && tex !== Texture.WHITE) tex.destroy(false);
     if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);
@@ -302,7 +483,12 @@ function disposeSlot(slot: Slot) {
   // shader. The atlas textures are owned by the font (fontTexturePixi, freed on font
   // release) — never destroy them here.
   if (slot.kind === 'text') {
-    for (const m of slot.pageMeshes ?? []) { const geo = m.geometry; m.destroy(); geo?.destroy(); }
+    for (const m of slot.pageMeshes ?? []) { const geo = m.geometry; m.destroy(); releaseGeometry(geo); }
+    // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader above, now shared by
+    // EVERY text entity: `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one
+    // program for the whole file, not one per Shader instance), so `destroy(true)` here would call
+    // `destroyPrograms` and null the SHARED program's `vertex`/`fragment` — killing every text mesh
+    // in every canvas for the rest of the session, not just this slot's.
     for (const s of slot.textShaders ?? []) s.destroy();
     slot.obj.destroy();
     return;
@@ -341,6 +527,72 @@ interface RenderSnap {
   blend: string;
 }
 
+/** A `Mask2D`'s authored fields plus its resolved WORLD transform, copied flat for the frame.
+ *  Flat copies rather than the koota trait object because both are recycled: the trait row and
+ *  `getWorldTransform2D`'s return are each shared storage that the next read overwrites. */
+interface MaskData {
+  mode: 'rect' | 'texture';
+  width: number; height: number; pivotX: number; pivotY: number;
+  cornerRadius: number; feather: number; sprite: string;
+  /** The clip rect's centre, in the mask entity's own LOCAL space (design px) — see Mask2D's
+   *  `offsetX`/`offsetY` doc. Applied on top of the entity's WORLD transform below, not composed
+   *  into it, so the entity itself can stay at identity while the rect sits elsewhere. */
+  offsetX: number; offsetY: number;
+  x: number; y: number; rz: number; sx: number; sy: number;
+}
+
+/** Per-`Mask2D`-entity render state (#449).
+ *
+ *  The PixiJS tree this renderer builds is otherwise FLAT — every display object goes straight
+ *  onto its Canvas2D slot container — but a Pixi mask applies to ONE display object, so masking a
+ *  subtree needs a real container to hang it on. Each enabled `Mask2D` gets exactly one:
+ *  `container` holds every display object the mask clips, and `maskObj` is what clips them.
+ *
+ *  ⚠️ `container` stays at IDENTITY transform. Children already carry fully-composed WORLD
+ *  transforms (see the `getWorldTransform2D` writes below), so a container that transformed
+ *  anything would apply it twice. It exists only to be something a mask can attach to.
+ *
+ *  ⚠️ A masked group therefore becomes a contiguous z-BAND: `sortableChildren` sorts within the
+ *  container, and the container itself sorts among its siblings by the mask entity's own paint
+ *  index. Entities outside the group cannot interleave with entities inside it. That is a real
+ *  authoring constraint, documented on the trait.
+ *
+ *  `kind` records which Pixi pipe the mask resolved to, because it decides teardown: Pixi picks
+ *  `AlphaMask` for a `Sprite` and `StencilMask` for any other `Container`, tested in that order
+ *  (`pixi.js/lib/rendering/init.mjs` registers `AlphaMask, ColorMask, StencilMask`). An alpha mask
+ *  owns a generated or loaded Texture that has to be released; a stencil `Graphics` does not.
+ *
+ *  `sig` is the geometry+mode signature the mask object was last built from — rebuilding is
+ *  expensive for the alpha path (it rasterises a ramp), so it happens only when this changes, or
+ *  (texture mode) when `forceAll` fires while the sprite is still showing an unsized placeholder
+ *  bitmap (`stillPlaceholder`, below). Deliberately excludes `offsetX`/`offsetY`/the compensation
+ *  factor — nothing the rebuild reads depends on them; they only feed the per-frame placement
+ *  writes further down, so folding them in would rasterise a fresh ramp on every Inspector drag. */
+interface MaskSlot {
+  container: Container;
+  maskObj: Graphics | Sprite;
+  kind: 'stencil' | 'alpha';
+  sig: string;
+  canvasId: number;
+  /** Sprite-texture URL retained for an alpha mask in `texture` mode, '' otherwise. Released on
+   *  rebuild and on dispose so the shared sprite-texture refcount balances. */
+  textureUrl: string;
+  /** A Texture this slot GENERATED (the feathered ramp) and therefore owns outright. Distinct
+   *  from `textureUrl`, which names a shared, refcounted asset this slot merely borrows. */
+  ownedTexture: Texture | null;
+  /** Scale that maps the mask OBJECT's intrinsic size onto the authored half-extents, before the
+   *  entity's own world scale is applied.
+   *
+   *  ⚠️ This exists because Pixi implements `sprite.width = n` AS A SCALE against the texture's
+   *  pixel size — so the per-frame `scale.set(worldScale)` below would silently undo the sizing
+   *  done at build, and an alpha mask would collapse to its raw texture dimensions. (Measured:
+   *  the crossword's 984x751 design-px clip shrank to the ~256px ramp and masked away all but a
+   *  sliver of the grid, with every unit test and the typecheck green.) A `Graphics` mask draws
+   *  its geometry in design units already and keeps 1. */
+  baseScaleX: number;
+  baseScaleY: number;
+}
+
 /** Per-entity snapshot for the SkinnedSprite2D (mesh) pass — mirrors RenderSnap but
  *  keyed on what a deformable mesh's output depends on: its world transform, tint/
  *  alpha, flips, paint order, AND the skin deform version (bumped by skin2DSystem). */
@@ -363,6 +615,11 @@ interface TextSnap {
    *  frame of a fade. It still has to be COMPARED here — the block early-returns when
    *  nothing changed, so a parent fading over a static label would otherwise never paint. */
   groupAlpha: number;
+  /** The host canvas's own uniform `scale` (#752), feeding `uScreenPxRange`'s effScale. Tracked
+   *  SEPARATELY from `compX`/`compY`: a uniform window resize moves `scaleX`/`scaleY` together
+   *  while `compX`/`compY` stay 1 (they cancel out), so without this field a canvas-only resize
+   *  would leave `changed` false and the uniform stuck at the pre-resize size. */
+  canvasScale: number;
 }
 
 /** Per-entity snapshot for the 2D-material (Mesh) pass — the inputs that determine the
@@ -447,7 +704,12 @@ export class Scene2DRenderer {
   // Live per-entity 2D-material Shaders (kind 'material'), keyed by entity id — the
   // Scene2D-owned registry MaterialInstance's 2D driver writes uniforms into (Phase 3),
   // the minimal analog of the 3D materialBroker. Populated/cleared with the slot.
-  readonly entityShaders = new Map<number, Shader>();
+  // ⚠️ The value carries the entity's koota GENERATION (#848): the key is the masked index,
+  // which a respawn reclaims LIFO, and the driver reads this through the broker at ECS
+  // priority BEFORE the purge below runs at render priority. Deletes/purges are unaffected —
+  // they only ever use keys — so this stays in the same key space as `slots`/`activeIds`/
+  // `last*Render`, which the shared sweep deletes alongside it.
+  readonly entityShaders = new Map<number, Entity2DShaderEntry>();
   // Pooled per-frame set of entity ids drawn by the material pass — used to purge stale
   // entityShaders entries without a per-frame allocation.
   private readonly _materialIdsScratch = new Set<number>();
@@ -487,14 +749,50 @@ export class Scene2DRenderer {
   // can't stomp each other's scratch; renderers also run sequentially via frame callbacks).
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
+  // Every entity id alive THIS frame (built from the same EntityAttributes query as
+  // parentOfEntity, so it's effectively "every scene entity"). Feeds `orphan2D.prune` — see
+  // there for why `activeIds` (canvas-routed entities only) is the WRONG set: an entity still
+  // orphaned this frame is alive but never enters `activeIds`, and pruning against that set
+  // would erase its in-progress warn-frame count every single frame.
+  private readonly liveEntityIds = new Set<number>();
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
   /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
    *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
    *  every read falls through to 1. */
   private groupAlphaOf = new Map<number, number>();
+  /** entityId → the `Mask2D` entity clipping it (#449). SPARSE, exactly like `groupAlphaOf`: a
+   *  scene with no mask keeps an empty map and every lookup falls through to "no mask". */
+  private maskGroupOf = new Map<number, number>();
+  /** maskId → its nearest ANCESTOR mask, so mask containers nest and their clips INTERSECT. */
+  private parentMaskOf = new Map<number, number>();
+  /** maskId → its live container + mask object. Persists across frames; entries are built on
+   *  first sight and dropped by the end-of-frame sweep when the mask entity goes away. */
+  private readonly maskSlots = new Map<number, MaskSlot>();
+  /** Mask display objects + generated ramp textures whose destroy is DEFERRED by one frame (#455).
+   *
+   *  ⚠️ Destroying a mask's Sprite / owned ramp texture in the SAME pass as the `pool.renderAll`
+   *  at the end of it leaves PixiJS's `AlphaMaskPipe` holding a bind group whose resource is now
+   *  null, and `renderer.render()` throws mid-pass. `renderAll` swallows that throw — but the
+   *  aborted render has already CLEARED the surface, so the canvas presents a BLANK frame and then
+   *  never redraws, because the per-frame dirty set was consumed by the failed attempt. Measured on
+   *  a wordweave level advance, which builds the new crossword clip and disposes the old one in one
+   *  frame: dispose at t+3ms, render throws at t+4ms, canvas blank until an unrelated edit.
+   *  Flushed at the TOP of the next renderFrame, by which time that render has completed. */
+  private readonly pendingMaskDestroy: Array<{ obj: Container; tex: Texture | null }> = [];
+  /** Mask entity ids seen THIS frame — the sweep's liveness set, mirroring `activeIds`. */
+  private readonly activeMaskIds = new Set<number>();
+  /** `${maskId}|${sprite}` keys that already logged the unresolved-texture-ref warning, so a
+   *  `texture`-mode mask with a bad `sprite` ref warns ONCE rather than on every `forceAll`
+   *  rebuild. Keyed on the REF too, not just the mask id (round 2, Fix 5) — keying on id alone
+   *  missed two cases: an author fixes bad GUID A then mistypes GUID B (no warning, since A
+   *  already "used up" the warn-once slot), and koota recycling a deleted mask's id onto a new
+   *  mask that also happens to have a bad ref (no warning, inherited from the dead entity). */
+  private readonly warnedMaskIds = new Set<string>();
   private readonly canvasOfEntity = new Map<number, number>();   // entityId → canvas2D entityId (cached)
   private readonly canvasEntityIds = new Set<number>();          // all Canvas2D entity IDs this frame
-  private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
+  // canvasEntityId → shape compensation + the canvas's own uniform `scale` (#752 — the latter
+  // feeds the Text2D pass's scale-aware `uScreenPxRange` refresh; see the effScale comment there).
+  private readonly canvasCompensate = new Map<number, { x: number; y: number; scale: number }>();
   // Reused out-param so the path-caching walk allocates nothing per call.
   private readonly ancestorPath: number[] = [];
   // Visible Renderable2D entities skipped for want of a Canvas2D ancestor: id → consecutive
@@ -510,12 +808,19 @@ export class Scene2DRenderer {
 
   // ── 2D particle emitters ──
   private particleState2D: ParticleSync2DState | null = null;
-  private readonly _oneComp = { x: 1, y: 1 };
+  private readonly _oneComp = { x: 1, y: 1, scale: 1 };
   private readonly particleCtx: ParticleSync2DCtx;
 
   // ── Collider debug overlay (editor-only) ──
   private readonly colliderOverlays = new Map<number, Graphics>();
   private _showColliders = false;
+  // Whether the collider overlays currently hold any drawn outline (#684). `Graphics.clear()` is
+  // NEVER free — `GraphicsContext.clear()` has no empty early-out, it unconditionally calls
+  // `onUpdate()` (dirty = true + emit 'update'), which is exactly the view change that forces a
+  // full instruction rebuild of the whole render group. So clearing an ALREADY-EMPTY overlay
+  // re-batched every canvas that had ever shown colliders, on EVERY frame, for the rest of the
+  // session — with the display switched OFF, which is when it cost the most and helped least.
+  private _colliderOverlaysDrawn = false;
   // Collider-ONLY mode: sprites hide entirely and every Collider2D outline draws (in purple),
   // regardless of `_showColliders` — the 2D counterpart of the 3D SceneView's collider-only
   // toggle. Implies `_showColliders` is effectively on too (see isShowColliders()/drawColliderOverlays).
@@ -583,7 +888,7 @@ export class Scene2DRenderer {
    *  never happens on the healthy path — see `Orphan2DTracker`. */
   private orphan2DKey(entityId: number): string {
     const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
-    return ((attrs?.guid as string) || '') || `id:${entityId}`;
+    return ((attrs?.guid as string) || '') || orphan2DFallbackKey(entityId);
   }
 
   /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
@@ -615,6 +920,285 @@ export class Scene2DRenderer {
     return result;
   }
 
+  /** The container a display object belongs in: its mask group's, or the canvas's when unmasked.
+   *
+   *  Every pass routes its `addChild` through here so the five of them cannot drift — the sprite,
+   *  material, skinned-mesh and text passes each used to name `canvasSlot.container` directly, and
+   *  a mask that only some of them honoured would clip a rig but not its label. */
+  private containerFor(canvasSlot: Canvas2DSlot, entityId: number): Container {
+    const maskId = this.maskGroupOf.get(entityId);
+    if (maskId === undefined) return canvasSlot.container;
+    const ms = this.maskSlots.get(maskId);
+    // No slot yet (or the mask lost its canvas) ⇒ fall back to the canvas container rather than
+    // dropping the object. An unmasked frame is a cosmetic miss; a missing parent is invisible
+    // content, and the mask slot is normally built earlier in this same frame.
+    return ms ? ms.container : canvasSlot.container;
+  }
+
+  /** Build/refresh one container + mask object per enabled `Mask2D` (#449).
+   *
+   *  ⚠️ Ordering is load-bearing twice over. It runs AFTER canvas slots are allocated (a mask
+   *  needs the container it hangs under) and BEFORE the renderable passes (they look their mask
+   *  container up through `containerFor`). Within itself it walks masks OUTERMOST-FIRST, so a
+   *  nested mask's parent container already exists when it is parented — the nesting is what
+   *  makes overlapping masks intersect instead of the innermost simply winning. */
+  private syncMaskSlots(maskDataOf: ReadonlyMap<number, MaskData>, forceAll: boolean) {
+    if (maskDataOf.size === 0) return;
+
+    // Depth = how many masks enclose this one. `parentMaskOf` is a strict-ancestor chain and
+    // `computeMaskGroups` guarantees it is acyclic, but the bound is kept anyway: this runs every
+    // frame on scene data an author can edit, and a hang here takes the whole render loop with it.
+    const depthOf = (id: number): number => {
+      let d = 0;
+      for (let p = this.parentMaskOf.get(id); p !== undefined && d <= maskDataOf.size; p = this.parentMaskOf.get(p)) d++;
+      return d;
+    };
+    const ordered = [...maskDataOf.keys()].sort((a, b) => depthOf(a) - depthOf(b));
+
+    for (const maskId of ordered) {
+      const d = maskDataOf.get(maskId)!;
+      const canvasId = this.findCanvasAncestor(maskId);
+      // A mask outside every Canvas2D clips nothing, because the things it would clip are
+      // themselves unrenderable. Drop any slot it had rather than leaving an orphan container.
+      if (canvasId == null) { this.disposeMaskSlot(maskId); continue; }
+      const canvasSlot = this.pool.getSlot(canvasId);
+      if (!canvasSlot) { this.disposeMaskSlot(maskId); continue; }
+
+      this.activeMaskIds.add(maskId);
+      const comp = this.canvasCompensate.get(canvasId) ?? this._oneComp;
+      // `texture` mode also depends on state that isn't a MaskData field: the sprite's slice
+      // epoch (bumped by a re-import/re-slice — same source ordinary sprite slots key on, see
+      // `builtEpoch !== spriteEpoch` below) and whether the GUID currently resolves at all (a bad
+      // ref that later resolves, or vice versa). Neither is folded into `stillPlaceholder` —
+      // that only covers an in-flight ASYNC load of an already-resolved sprite — so without this
+      // a re-slice or a fixed/broken ref would never trigger a rebuild (round 2, Fix 2).
+      const texResolves = d.mode === 'texture' && !!resolveSprite(d.sprite);
+      const texSig = d.mode === 'texture' ? `${getSpriteEpoch(d.sprite)}|${texResolves ? 1 : 0}` : '';
+      // #692 — WHERE the size lands decides whether a resize needs a rebuild at all:
+      //  · stencil (`rect`, feather 0): baked into the geometry — `roundRect(ox, oy, w*2, h*2, r)`
+      //    with an ABSOLUTE `cornerRadius` clamped to `min(w,h)`, so a resize genuinely changes the
+      //    shape and is not a uniform scale.
+      //  · feathered ramp: `buildMaskRamp(w, h, ...)` rasterises a bitmap OF THAT SIZE (~50k
+      //    iterations plus a fresh GPU upload).
+      //  · resolved `texture` mode: the size only ever reaches `slot.baseScaleX/Y` via
+      //    `setMaskBaseScale` — a matrix. Rebuilding there destroyed the Sprite, dropped and
+      //    re-took the texture refcount and re-resolved the ref, all to change two scale floats.
+      // So the size is in the signature for the first two and applied in place for the third.
+      // `texResolves` is exactly the discriminator: an UNRESOLVED texture mask falls through to the
+      // ramp/stencil below, which do bake the size — and it is already in `texSig`, so a change in
+      // resolvability forces a rebuild and the two can never disagree about which path is live.
+      const sizeSig = texResolves ? '' : `${d.width}|${d.height}`;
+      const sig = `${d.mode}|${sizeSig}|${d.pivotX}|${d.pivotY}|${d.cornerRadius}|${d.feather}|${d.sprite}|${texSig}`;
+
+      let slot = this.maskSlots.get(maskId);
+      if (!slot) {
+        const container = new Container();
+        container.sortableChildren = true;
+        slot = { container, maskObj: new Graphics(), kind: 'stencil', sig: '', canvasId, textureUrl: '', ownedTexture: null, baseScaleX: 1, baseScaleY: 1 };
+        this.maskSlots.set(maskId, slot);
+      }
+
+      // Rebuild the mask object only when its SHAPE changed — the alpha path rasterises a ramp
+      // (~50k iterations) and does a fresh GPU upload, which is far too expensive to redo on every
+      // `forceAll` frame (an editor trait write or gizmo drag on ANY entity, not just this mask).
+      // `forceAll` alone earns a rebuild in exactly ONE case: a `texture`-mode mask's sprite is
+      // still showing the unsized/placeholder texture (`Texture.EMPTY`, or a 0/1px bitmap) an
+      // async load hasn't landed for yet — `makeSprite` calls `markDirty()` on that load, which
+      // raises `_externalDirty` → `forceAll` on the very next frame, so this still gets rebuilt
+      // once the real bitmap (and its size, for `setMaskBaseScale`) is available.
+      const stillPlaceholder = slot.kind === 'alpha' && (() => {
+        const tex = (slot.maskObj as Sprite).texture;
+        return !tex || tex === Texture.EMPTY || tex.width <= 1 || tex.height <= 1;
+      })();
+      if (slot.sig !== sig || (forceAll && stillPlaceholder)) {
+        this.rebuildMaskObject(slot, d, maskId);
+        slot.sig = sig;
+        this.dirtyCanvases.add(canvasId);
+      }
+      // Size-as-scale for the resolved-texture path (#692 — see the signature note above). Cheap
+      // (two divisions) and unconditional for that path, so it is also what settles `baseScale`
+      // once an async load replaces the placeholder with a real bitmap, rather than depending on
+      // the rebuild to do it. The `kind` guard is belt-and-braces: `texSig` already forces a
+      // rebuild when resolvability flips, so a resolving texture mask is always an 'alpha' slot.
+      if (texResolves && slot.kind === 'alpha') setMaskBaseScale(slot, slot.maskObj as Sprite, d);
+
+      // Re-home the container if its canvas or its enclosing mask changed.
+      const parentMaskId = this.parentMaskOf.get(maskId);
+      const parentSlot = parentMaskId !== undefined ? this.maskSlots.get(parentMaskId) : undefined;
+      const wantParent = parentSlot ? parentSlot.container : canvasSlot.container;
+      if (slot.container.parent !== wantParent) {
+        slot.container.removeFromParent();
+        wantParent.addChild(slot.container);
+        this.dirtyCanvases.add(canvasId);
+        if (slot.canvasId !== canvasId) this.dirtyCanvases.add(slot.canvasId); // the canvas it left redraws too
+        slot.canvasId = canvasId;
+      }
+
+      // The group's z-band: the mask entity's own paint index places the WHOLE group among its
+      // siblings (see MaskSlot's doc — entities outside cannot interleave with those inside).
+      const paint = this.paintOrderOf.get(maskId) ?? 0;
+      if (slot.container.zIndex !== paint) { slot.container.zIndex = paint; this.dirtyCanvases.add(canvasId); }
+
+      // Place the mask object itself. It lives INSIDE the container it masks (the ordinary Pixi
+      // arrangement — Pixi marks a mask non-renderable), and the container is identity, so the
+      // mask is positioned in the same fully-composed WORLD design space as the children.
+      //
+      // `offsetX`/`offsetY` (Mask2D's escape from the "moving the entity moves everything it
+      // clips" trap) are authored in the mask entity's own LOCAL space, so they need the SAME
+      // rotate+scale that carries a local vector into world space before adding it to the
+      // entity's world position — a bare `d.x + d.offsetX` would be right only for an unrotated,
+      // unit-scale mask.
+      const { ox, oy } = maskOffsetWorld(d.offsetX, d.offsetY, d.rz, d.sx, d.sy, comp.x, comp.y);
+      const wantX = d.x + ox, wantY = d.y + oy;
+      const obj = slot.maskObj;
+      const px = obj.position.x, py = obj.position.y;
+      // ⚠️ SCALE belongs in this comparison (#692). It was absent, which was invisible only because
+      // every input to it forced a rebuild that marked the canvas dirty itself: a mask animating
+      // `Transform.scale` alone already failed to repaint, and dropping the size out of `sig` above
+      // would have added a resized texture mask to that. Both are covered by comparing what is
+      // about to be WRITTEN, rather than the fields it is derived from.
+      const wantSX = slot.baseScaleX * d.sx * comp.x, wantSY = slot.baseScaleY * d.sy * comp.y;
+      if (px !== wantX || py !== wantY || obj.rotation !== d.rz
+        || obj.scale.x !== wantSX || obj.scale.y !== wantSY) this.dirtyCanvases.add(canvasId);
+      obj.position.set(wantX, wantY);
+      obj.rotation = d.rz;
+      obj.scale.set(wantSX, wantSY);
+    }
+  }
+
+  /** Build the cheap hard-edged path: a `Graphics` rounded-rect, resolved to a `StencilMask`. Its
+   *  own method because two callers reach it — the ordinary `feather: 0` rect mask, and a
+   *  `texture`-mode mask whose sprite ref hasn't resolved and whose feather is 0 too (see the
+   *  fallback below), which has no business paying for an alpha ramp it can't even source from. */
+  private buildStencilMask(slot: MaskSlot, d: MaskData) {
+    const g = new Graphics();
+    const { ox, oy } = computePivotOffset(d.width, d.height, d.pivotX, d.pivotY);
+    const r = Math.max(0, Math.min(d.cornerRadius, Math.min(d.width, d.height)));
+    g.roundRect(ox, oy, d.width * 2, d.height * 2, r);
+    g.fill(0xffffff);
+    slot.container.addChild(g);
+    slot.maskObj = g; slot.kind = 'stencil';
+    slot.baseScaleX = 1; slot.baseScaleY = 1; // geometry is already in design units
+    slot.container.mask = g;
+  }
+
+  /** (Re)build a mask slot's mask object for the shape `d` describes, releasing whatever the slot
+   *  held before. Which Pixi pipe this lands in is decided ENTIRELY by the object's class:
+   *  `Sprite` ⇒ AlphaMask (soft, a filter pass), anything else ⇒ StencilMask (hard, cheap).
+   *  `maskId` is only for `warnedMaskIds` — throttling the unresolved-ref warning below to once per
+   *  mask entity PER REF, rather than once per rebuild. */
+  private rebuildMaskObject(slot: MaskSlot, d: MaskData, maskId: number) {
+    slot.maskObj.removeFromParent();
+    // DEFERRED, not destroyed here — see `pendingMaskDestroy`. Destroying the outgoing mask object
+    // and its ramp texture in this pass makes the render at the end of it throw (#455).
+    this.pendingMaskDestroy.push({ obj: slot.maskObj, tex: slot.ownedTexture });
+    slot.ownedTexture = null;
+    if (slot.textureUrl) { releaseSpriteTexture(slot.textureUrl); slot.textureUrl = ''; }
+
+    const wantsAlpha = d.mode === 'texture' || d.feather > 0;
+    if (!wantsAlpha) { this.buildStencilMask(slot, d); return; }
+
+    if (d.mode === 'texture') {
+      const resolved = resolveSprite(d.sprite);
+      if (resolved) {
+        const sp = this.makeSprite(resolved, slot.container); // retains the texture + handles async load
+        sp.anchor.set(d.pivotX, d.pivotY);
+        // The authored half-extents drive the size regardless of the source bitmap's dimensions:
+        // a mask is a SHAPE, and letting the image's pixel size decide its extent would make the
+        // clip silently depend on which PNG got dropped in. Recorded as a BASE scale rather than
+        // written to `.width`, which the per-frame world-scale write would overwrite.
+        setMaskBaseScale(slot, sp, d);
+        slot.maskObj = sp; slot.kind = 'alpha'; slot.textureUrl = resolved.url;
+        slot.container.mask = sp;
+        return;
+      }
+      // Unresolvable GUID ⇒ fall through rather than leaving the subtree unmasked — a mask that
+      // vanishes on a bad ref shows content that was meant to be clipped, which reads as a
+      // rendering bug somewhere else entirely. Warn once per mask entity PER REF, not once per
+      // rebuild — this ref stays unresolved across every `forceAll` frame until an author fixes
+      // it, and keying on the ref too means a later mistyped ref still warns.
+      const warnKey = `${maskId}|${d.sprite}`;
+      if (!this.warnedMaskIds.has(warnKey)) {
+        console.warn(`[Scene2D] Mask2D texture ref did not resolve: ${d.sprite}`);
+        this.warnedMaskIds.add(warnKey);
+      }
+      // A hard edge doesn't need an alpha ramp it has no source image for — fall through to the
+      // cheap Graphics stencil instead. The trait's own default is `sprite: ''`, so switching
+      // `mode` to 'texture' in the Inspector before picking a sprite hits this every time.
+      if (d.feather <= 0) { this.buildStencilMask(slot, d); return; }
+    }
+
+    // The feathered ramp is rasterised analytically (`buildMaskRamp`, a rounded-box SDF) rather
+    // than by blurring a rect: no dependency on Canvas2D `filter`, deterministic, and unit-tested
+    // as a pure function. It goes through a canvas because Pixi's Texture source wants an image
+    // element, not a bare ImageData; `createImageData` + `set` also avoids the ImageData
+    // constructor's array-type overloads.
+    const ramp = buildMaskRamp(d.width, d.height, d.cornerRadius, d.feather);
+    const cv = document.createElement('canvas');
+    cv.width = ramp.width; cv.height = ramp.height;
+    const ctx = cv.getContext('2d');
+    if (!ctx) {
+      // No 2D context (a headless or context-starved host) — there is no bitmap to rasterise the
+      // feather into. `Texture.WHITE` used to stand in here, but it's 1×1 and `setMaskBaseScale`'s
+      // `tw > 1` guard leaves `baseScale` at 1 for a 1px texture — so it clipped the WHOLE subtree
+      // to nothing, the opposite of "shows too much rather than too little". Fall back to the
+      // hard-edged Graphics stencil instead: it needs no texture at all, so the mask still clips
+      // to the right RECT — it just loses the feather. Losing softness is a far better failure
+      // than losing the content.
+      console.warn('[Scene2D] Mask2D feather ramp: no 2D context; falling back to an unfeathered mask');
+      this.buildStencilMask(slot, d);
+      return;
+    }
+    const img = ctx.createImageData(ramp.width, ramp.height);
+    img.data.set(ramp.data);
+    ctx.putImageData(img, 0, 0);
+    const tex = Texture.from(cv);
+    const sp = new Sprite(tex);
+    sp.anchor.set(d.pivotX, d.pivotY);
+    setMaskBaseScale(slot, sp, d);
+    slot.container.addChild(sp);
+    // This texture was generated right above (the no-context case returned early into the
+    // stencil fallback instead), so unlike a loaded sprite texture it's owned outright here.
+    slot.maskObj = sp; slot.kind = 'alpha'; slot.ownedTexture = tex;
+    slot.container.mask = sp;
+  }
+
+  /** Destroy the mask objects/textures queued by the previous frame (#455). Called at the TOP of
+   *  renderFrame and from the renderer's own teardown — never mid-pass, which is the whole point. */
+  private flushPendingMaskDestroy() {
+    if (this.pendingMaskDestroy.length === 0) return;
+    for (const p of this.pendingMaskDestroy) {
+      if (!p.obj.destroyed) p.obj.destroy();
+      if (p.tex) p.tex.destroy(true);
+    }
+    this.pendingMaskDestroy.length = 0;
+  }
+
+  /** Tear one mask group down: unmask, detach, destroy the container WITHOUT its children, and
+   *  release whatever texture the mask object held.
+   *
+   *  ⚠️ `{ children: false }` is the load-bearing half. The container's children are live display
+   *  objects owned by entity slots that may well still exist — destroying them here would take
+   *  out sprites whose entities are perfectly alive, and they would come back only on a full
+   *  rebuild. They are re-homed to the canvas container by `containerFor` on the next frame. */
+  private disposeMaskSlot(maskId: number) {
+    const slot = this.maskSlots.get(maskId);
+    if (!slot) return;
+    slot.container.mask = null;
+    for (const child of [...slot.container.children]) {
+      if (child !== slot.maskObj) child.removeFromParent();
+    }
+    // DEFERRED, not destroyed here — see `pendingMaskDestroy` (#455).
+    slot.maskObj.removeFromParent();
+    this.pendingMaskDestroy.push({ obj: slot.maskObj, tex: slot.ownedTexture });
+    slot.ownedTexture = null;
+    if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);
+    slot.container.removeFromParent();
+    slot.container.destroy({ children: false });
+    this.maskSlots.delete(maskId);
+    this.dirtyCanvases.add(slot.canvasId);
+  }
+
   private makeSprite(resolved: ResolvedSprite, container: Container): Sprite {
     const sp = new Sprite(Texture.EMPTY);
     sp.anchor.set(0.5);
@@ -624,7 +1208,7 @@ export class Scene2DRenderer {
     // ⚠️ Presence in the cache is NOT the same as being usable, and this used to test only
     // `has(url)`. An entry whose source was destroyed by an in-flight `Assets.unload` is still
     // PRESENT — binding it yields a sprite that draws nothing, forever, because this branch
-    // never kicks a load. `resolveMaterialTexture` already validates `source` for the same
+    // never kicks a load. `resolveMaterialTextureRef` already validates `source` for the same
     // reason; the sprite path did not, which is the whole of Court's invisible pen marks.
     // Evict the dead entry first, or `Assets.load` would hand back the same corpse.
     const cachedBase = Assets.cache.has(url) ? (Assets.get(url) as Texture | undefined) : undefined;
@@ -638,6 +1222,11 @@ export class Scene2DRenderer {
         // a ref change disposes the slot (sp.destroy()) + makes a FRESH Sprite, so an
         // in-flight load for the OLD url always resolves onto an already-destroyed object
         // and is dropped here; disposeSlot already released its refcount.
+        // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is now DEFERRED
+        // (`pendingMaskDestroy`, #455), so a load landing in that window resolves onto a
+        // live-but-doomed detached sprite and this guard does NOT catch it. Consequence is
+        // benign — a spurious `markDirty` redraw on an object about to be destroyed anyway,
+        // never a wrong texture landing on screen.
         if (sp.destroyed) return;
         sp.texture = frameTexture(base, resolved);
         // The texture's size feeds the sprite's scale — force a redraw so the gate
@@ -674,10 +1263,10 @@ export class Scene2DRenderer {
    *  atlas slice (`resolved.frame`) becomes a framed WRAPPER (`hasFrame`) whose
    *  textureMatrix maps the quad's 0..1 UVs into the sub-rect, so the shader samples the
    *  right pixels; a whole image borrows the base texture. */
-  private resolveMaterialTexture(spriteRef: string, wholeOnly = false): { tex: Texture; url: string; hasFrame: boolean } {
-    if (!isImagePath(spriteRef)) return { tex: Texture.WHITE, url: '', hasFrame: false };
+  private resolveMaterialTextureRef(spriteRef: string, wholeOnly = false): { base: Texture; resolved: ResolvedSprite | null; url: string; hasFrame: boolean } {
+    if (!isImagePath(spriteRef)) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
     const resolved = resolveSprite(spriteRef);
-    if (!resolved) return { tex: Texture.WHITE, url: '', hasFrame: false }; // guid not in manifest yet
+    if (!resolved) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false }; // guid not in manifest yet
     const url = resolved.url;
     if (Assets.cache.has(url)) {
       // A cached texture can still be mid-decode (or stale after a prior unload) with a
@@ -690,7 +1279,7 @@ export class Scene2DRenderer {
         // whole image → the base texture directly. `wholeOnly` (extra samplers) always
         // borrows the base, so there's no per-slot wrapper to track/destroy for them.
         const framed = !wholeOnly && resolved.frame != null;
-        return { tex: framed ? frameTexture(base, resolved) : base, url, hasFrame: framed };
+        return { base, resolved, url, hasFrame: framed };
       }
       // ⚠️ Sourceless-but-cached is TERMINAL unless the entry is evicted. `markDirty` alone only
       // re-runs this same branch, which re-reads the same dead entry — a livelock that renders
@@ -708,7 +1297,7 @@ export class Scene2DRenderer {
           console.warn(`[Scene2D] Material sprite texture load failed: ${url}`, e);
         });
     }
-    return { tex: Texture.WHITE, url: '', hasFrame: false };
+    return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
   }
 
   private destroyColliderOverlay(canvasId: number) {
@@ -719,12 +1308,23 @@ export class Scene2DRenderer {
   private clearAllColliderOverlays() {
     for (const g of this.colliderOverlays.values()) if (!g.destroyed) g.destroy();
     this.colliderOverlays.clear();
+    this._colliderOverlaysDrawn = false; // nothing left to clear — and nothing left to clear INTO
   }
 
   /** Draw (or clear) collider outlines for every Collider2D entity, into a per-canvas
    *  overlay Graphics. Called at the end of renderFrame; marks touched canvases dirty. */
   private drawColliderOverlays(world: World) {
-    for (const g of this.colliderOverlays.values()) if (!g.destroyed) g.clear();
+    // Only clear an overlay that actually has something in it (#684 — see `_colliderOverlaysDrawn`).
+    // The canvases being emptied must redraw, so mark them here rather than relying on the toggle's
+    // own `_externalDirty`: this also fires when the last Collider2D entity leaves the scene, which
+    // no setter observes.
+    if (this._colliderOverlaysDrawn) {
+      for (const [canvasId, g] of this.colliderOverlays) {
+        if (!g.destroyed) g.clear();
+        this.dirtyCanvases.add(canvasId);
+      }
+      this._colliderOverlaysDrawn = false;
+    }
     if (!this._showColliders && !this._collidersOnly) return;
 
     world.query(Transform, Collider2D).updateEach(([tf, col]: [any, any], entity: any) => {
@@ -747,11 +1347,19 @@ export class Scene2DRenderer {
       const cos = Math.cos(wt.rz), sin = Math.sin(wt.rz);
       const xf = (lx: number, ly: number) => ({ x: wt.x + lx * cos - ly * sin, y: wt.y + lx * sin + ly * cos });
       drawColliderOutlineGfx(g, col, this._collidersOnly ? COLLIDER_ONLY_STROKE : OUTLINE_STROKE, xf, wt.rz, { sx: wt.sx ?? 1, sy: wt.sy ?? 1 });
+      this._colliderOverlaysDrawn = true;
       this.dirtyCanvases.add(canvasId);
     });
   }
 
   renderFrame() {
+    // Deferred mask teardown queued by the previous frame (#455) — must run BEFORE anything
+    // renders, and never in the same pass as the destroy itself. The video queue drains here
+    // too, for the same reason: both sit ABOVE the idle-frame skip below, so a clip that ends
+    // right as the sim goes idle still gets its detached decoder + GPU texture freed instead
+    // of stranded until the surface tears down (#476 follow-up).
+    this.flushPendingMaskDestroy();
+    if (__MODOKI_MODULE_VIDEO__) flushPendingVideoDestroy2D(this);
     const world = getCurrentWorld();
     if (!traitsCached) cacheTraits();
     if (!traitsCached) return;
@@ -771,14 +1379,20 @@ export class Scene2DRenderer {
     // would drop the one signal that says "everything on this surface must be drawn again",
     // leaving it blank behind a perfectly healthy context.
     if (this.pool.consumeRebuildFlag()) this._externalDirty = true;
+    // Same reasoning as the rebuild flag above, for the same reason it is read HERE and not below
+    // the skip: a slot whose last render THREW owes a redraw, and the idle skip returns before
+    // `renderAll` is reached, so while the sim is stopped/paused nothing would ever deliver it and
+    // the blank frame the aborted render presented would stand (#455).
+    if (this.pool.hasRedrawOwed()) this._externalDirty = true;
 
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;
-    const forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
+    let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
     this.activeIds.clear();
+    this.activeMaskIds.clear();
     this.parentOfEntity.clear();
     this.sortOrderOfEntity.clear();
     this.canvasOfEntity.clear();
@@ -786,12 +1400,34 @@ export class Scene2DRenderer {
     this.canvasCompensate.clear();
     this.currentCanvasIds.clear();
     this.dirtyCanvases.clear();
+    this.liveEntityIds.clear();
 
     // Step 1: Build parentId + sortOrder maps from all entities with EntityAttributes
     world.query(attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
       this.parentOfEntity.set(entity.id(), attr.parentId || 0);
       this.sortOrderOfEntity.set(entity.id(), attr.sortOrder || 0);
+      this.liveEntityIds.add(entity.id());
     });
+    // ⚠️ `liveEntityIds` must also cover every entity `noteOrphan2D` can reach, not just the ones
+    // with EntityAttributes: `orphan2DKey` already falls back to an `id:`-prefixed key when
+    // EntityAttributes is absent or guid-less (see that method), and an entity missing
+    // EntityAttributes entirely is exactly the one the query above skips. Without this, a LIVE
+    // such entity would have its frame count deleted by `prune` below on every single frame — the
+    // #700-adjacent gap, but for `frames` rather than `warned`. `Transform` is what every pass that
+    // can call `noteOrphan2D` (Renderable2D/SkinnedSprite2D/Text2D, all queried as `Transform + X`
+    // below) actually requires, so this one query is a superset covering all three without having
+    // to touch each pass — and it must run HERE, before `prune`, not inside those passes: they run
+    // after `prune` this same frame, so an addition made there would only ever help NEXT frame's
+    // prune, one frame too late.
+    // `updateEach` deliberately NOT used: it opens the trait stores and runs koota's change
+    // detection over every Transform in the scene, and all we want is the id set. A QueryResult IS
+    // a readonly Entity[], so plain iteration reads nothing and marks nothing.
+    for (const entity of world.query(Transform)) this.liveEntityIds.add(entity.id());
+    // Forget any orphan-warn bookkeeping for an id that no longer names a live entity — koota
+    // recycles ids, so an entity that died while still orphaned must not leave a stale count for
+    // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
+    // set is fully built and before any pass below calls `note`/`clear` on it.
+    this.orphan2D.prune(this.liveEntityIds);
     // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
     const orderInLayerOfEntity = new Map<number, number>();
@@ -812,6 +1448,43 @@ export class Scene2DRenderer {
       if (g.alpha !== 1) groupAlphaOfEntity.set(entity.id(), g.alpha);
     });
     this.groupAlphaOf = computeGroupAlpha(groupAlphaOfEntity, this.parentOfEntity);
+    // 2D masking (#449): which Mask2D clips which entity, and how masks nest. Same sparse-walk
+    // shape as the group alpha above and skipped entirely when nothing carries the trait — a
+    // scene with no mask pays one `.size` check. `isEnabled: false` is dropped HERE rather than
+    // at draw time, so a disabled mask contributes no group at all and its would-be children
+    // route straight to the canvas container, which is what "disabled" has to mean.
+    const maskIds = new Set<number>();
+    const maskDataOf = new Map<number, MaskData>();
+    world.query(Transform, Mask2D).updateEach(([tf, m]: any[], entity: any) => {
+      if (!m.isEnabled) return;
+      const mid = entity.id();
+      maskIds.add(mid);
+      // ⚠️ `getWorldTransform2D` returns a SHARED module singleton (see renderUtils' alias
+      // hazard note) — copy the six numbers out NOW. Holding the object would leave every mask
+      // in this map pointing at whichever entity happened to be read last.
+      const mwt = getWorldTransform2D(mid, tf);
+      maskDataOf.set(mid, {
+        mode: m.mode === 'texture' ? 'texture' : 'rect',
+        width: m.width, height: m.height, pivotX: m.pivotX, pivotY: m.pivotY,
+        cornerRadius: m.cornerRadius, feather: m.feather, sprite: m.sprite,
+        offsetX: m.offsetX, offsetY: m.offsetY,
+        x: mwt.x, y: mwt.y, rz: mwt.rz, sx: mwt.sx, sy: mwt.sy,
+      });
+    });
+    const masking = computeMaskGroups(maskIds, this.parentOfEntity);
+    // ⚠️ A change in WHICH mask clips an entity has to force a full redraw, and this is the only
+    // place that can notice. Every pass below early-returns on an unchanged per-entity snapshot
+    // and only re-parents AFTER that guard, so an entity that entered or left a mask without
+    // otherwise changing — a mask toggled off, a subtree reparented, a level rebuilt — would keep
+    // its old container forever and render clipped by a mask that no longer owns it.
+    //
+    // Folded into `forceAll` rather than threaded as a field through the sprite/material/skinned/
+    // text snapshots: four parallel `changed` tests is four chances to miss one, and this costs a
+    // single full redraw on a frame where group membership moved, which is a scene-build event
+    // rather than a per-frame one. Compared BEFORE step 2 so the flag reaches every consumer.
+    if (!sameGrouping(this.maskGroupOf, masking.groupOf)) forceAll = true;
+    this.maskGroupOf = masking.groupOf;
+    this.parentMaskOf = masking.parentMaskOf;
 
     // Step 2: Collect Canvas2D entity IDs and set up their pool slots + scaler. A
     // canvas is dirty when its scaler output changed (resize / referenceWidth /
@@ -829,6 +1502,7 @@ export class Scene2DRenderer {
         const refW = c2d.referenceWidth || 1080;
         const refH = c2d.referenceHeight || 1920;
         const mode = c2d.scaleMode || 'fitH';
+        const maxRefW = c2d.maxReferenceWidth || 0;
         // The container this scale/offset positions lives in the Pixi renderer's
         // logical `screen` space, NOT necessarily the canvas's backing-pixel size —
         // those diverge once a project pins `rendering.pixi.resolution` > 0 (which
@@ -836,11 +1510,13 @@ export class Scene2DRenderer {
         // pre-init (screen isn't available yet, and at that point they're equal).
         const actualW = slot.app.renderer?.screen?.width || slot.canvas.width;
         const actualH = slot.app.renderer?.screen?.height || slot.canvas.height;
-        const { scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
-          computeCanvasScale(refW, refH, actualW, actualH, mode);
+        const { scale, scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
+          computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
-        this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY });
+        // `scale` (min(scaleX, scaleY)) rides along with the shape compensation (#752) — it's
+        // the canvas's own uniform on-screen factor, needed by the Text2D pass's effScale.
+        this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY, scale });
 
         const prev = this.lastCanvasScale.get(canvasEntityId);
         if (forceAll || !prev || prev.sx !== scaleX || prev.sy !== scaleY ||
@@ -851,6 +1527,11 @@ export class Scene2DRenderer {
         }
       },
     );
+
+    // Mask groups (#449): one container + mask object per enabled Mask2D. MUST run after the
+    // canvas slots above (a mask needs a container to hang under) and before every renderable
+    // pass below (each routes its addChild through `containerFor`, which reads these slots).
+    this.syncMaskSlots(maskDataOf, forceAll);
 
     // Step 3: Query all Renderable2D entities, find their Canvas2D ancestor, and —
     // when their render inputs changed since last frame — redraw.
@@ -960,7 +1641,7 @@ export class Scene2DRenderer {
 
         // Compute this frame's render inputs.
         const px = rend.pivotX, py = rend.pivotY;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
         // Effective alpha = the entity's own opacity × its GroupAlpha ancestry (#211). The
@@ -996,10 +1677,11 @@ export class Scene2DRenderer {
         this.dirtyCanvases.add(canvasId);
         if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId); // left a canvas → it redraws too
 
-        // Ensure display object is in the right container
-        if (displaySlot.obj.parent !== canvasSlot.container) {
+        // Ensure display object is in the right container — its mask group's when one clips it.
+        const wantParent = this.containerFor(canvasSlot, id);
+        if (displaySlot.obj.parent !== wantParent) {
           displaySlot.obj.removeFromParent();
-          canvasSlot.container.addChild(displaySlot.obj);
+          wantParent.addChild(displaySlot.obj);
         }
         // Stack by hierarchy paint order (sortableChildren re-sorts on render).
         displaySlot.obj.zIndex = paint;
@@ -1013,15 +1695,29 @@ export class Scene2DRenderer {
 
         if (displaySlot.kind === 'graphics') {
           const gfx = displaySlot.obj as Graphics;
-          gfx.clear();
-          // Pivot offset + shape vertices come from the shared render2DUtils helpers so
-          // the runtime (Pixi) and editor Canvas2D preview derive geometry from one
-          // source and can't silently drift (F7).
-          if (colliderMode) {
-            drawColliderFillGfx(gfx, entity.get(Collider2D) as never, rend.color);
-          } else {
-            const { ox, oy } = computePivotOffset(rend.width, rend.height, px, py);
-            drawPrimitiveShapeGfx(gfx, resolvePrimitiveShape(rend.sprite), rend.width, rend.height, ox, oy, rend.color);
+          // #684 — a primitive's geometry depends on shape/size/pivot/colour ONLY, never on its
+          // transform, yet the `changed` gate above trips on x/y/rz/sx/sy (and on `forceAll`, i.e.
+          // an editor trait write on ANY entity). Re-issuing the shape for a pure move is not
+          // merely wasted tessellation: `gfx.clear()` emits GraphicsContext 'update' →
+          // Graphics.onViewUpdate → RenderGroup.onChildViewUpdate → the VIEW list, where
+          // `validateRenderable` returns true for anything batchable (GraphicsPipe.js:34-42) →
+          // `structureDidChange` → `_buildInstructions` for the WHOLE render group
+          // (RenderGroupSystem.js:104-108). One drifting square re-batches every sibling around it.
+          // PixiJS is right to do that with a view change — we were manufacturing the view change.
+          // `geomSig` lives on the SLOT, so a rebuilt slot (undefined) always draws.
+          const geomSig = `${colliderMode ? 'c' : rend.sprite}|${rend.width}|${rend.height}|${px}|${py}|${rend.color}|${colliderSig}`;
+          if (displaySlot.geomSig !== geomSig) {
+            gfx.clear();
+            // Pivot offset + shape vertices come from the shared render2DUtils helpers so
+            // the runtime (Pixi) and editor Canvas2D preview derive geometry from one
+            // source and can't silently drift (F7).
+            if (colliderMode) {
+              drawColliderFillGfx(gfx, entity.get(Collider2D) as never, rend.color);
+            } else {
+              const { ox, oy } = computePivotOffset(rend.width, rend.height, px, py);
+              drawPrimitiveShapeGfx(gfx, resolvePrimitiveShape(rend.sprite), rend.width, rend.height, ox, oy, rend.color);
+            }
+            displaySlot.geomSig = geomSig;
           }
         } else {
           const sp = displaySlot.obj as Sprite;
@@ -1072,6 +1768,7 @@ export class Scene2DRenderer {
         if (!program) return; // still loading / failed → Step 3 drew the default; nothing here
 
         const id = entity.id();
+        const gen = entity.generation();
         const canvasId = this.findCanvasAncestor(id);
         if (canvasId === null) return;
         const canvasSlot = this.pool.getSlot(canvasId);
@@ -1084,12 +1781,15 @@ export class Scene2DRenderer {
         // Sample the entity's own sprite as uTexture (Texture.WHITE + url='' while it
         // loads or when it has no image sprite). The resolved url is part of matSig so
         // the Mesh re-mints with the real texture the frame it becomes resident.
-        const { tex, url: texUrl, hasFrame: matHasFrame } = this.resolveMaterialTexture(rend.sprite);
+        // Resolve WITHOUT minting a wrapper (#697) — `matSig` only needs the url and the frame
+        // identity, and the framed `Texture` is allocated below, once per build/frame-swap.
+        const matRef = this.resolveMaterialTextureRef(rend.sprite);
+        const texUrl = matRef.url, matHasFrame = matRef.hasFrame;
         // Never hand a source-less texture to the shader — makePixiShaderInstance reads
         // `texture.source.style` and would throw, killing the whole 2D frame callback.
-        // resolveMaterialTexture already falls back to Texture.WHITE (a live source), so
+        // resolveMaterialTextureRef already falls back to Texture.WHITE (a live source), so
         // this only trips if even WHITE isn't ready yet; skip + retry next frame.
-        if (!tex.source) { this.markDirty(); return; }
+        if (!matRef.base.source) { this.markDirty(); return; }
         // Resolve the shader's extra `texture` params (additional samplers). The value is the
         // param's manifest default GUID, OR a per-instance `kind:'texture'` MaterialInstance
         // override on that target (a static ref — MaterialInstance sources drive only scalar
@@ -1099,21 +1799,28 @@ export class Scene2DRenderer {
         // must retain/release; the override ref is part of matSig (via extraSig's url) so an
         // inspector edit that swaps the texture rebuilds the Mesh with the new one.
         const texOverrides = readTextureOverrides(entity);
-        const extraTextures: Record<string, Texture> = {};
+        const extraRefs: [string, { base: Texture; resolved: ResolvedSprite | null; hasFrame: boolean }][] = [];
         const matTexUrls: string[] = [];
         let extraSig = '';
         for (const [key, param] of program.textureParams ?? []) {
           const ref = texOverrides?.get(key) ?? (coerceParamValue(param, undefined) as string);
-          const { tex: etex, url: eurl } = this.resolveMaterialTexture(ref, true);
-          extraTextures[key] = etex;
-          if (eurl) matTexUrls.push(eurl);
-          extraSig += `|${key}=${eurl}`;
+          // `wholeOnly` → `hasFrame` is always false for these, so minting one below never
+          // allocates; they are resolved per frame only to keep `extraSig` current.
+          const eref = this.resolveMaterialTextureRef(ref, true);
+          extraRefs.push([key, eref]);
+          if (eref.url) matTexUrls.push(eref.url);
+          extraSig += `|${key}=${eref.url}`;
         }
-        // matSig carries the sprite REF (not just texUrl): two atlas slices of one sheet share a
-        // url but need different frames, so a frame swap must force a rebuild (re-mints the wrapper
-        // + its uv matrix). texUrl still flips '' → url when an async load lands. extraSig moves
-        // when an extra sampler's texture becomes resident, forcing a rebuild that binds the real one.
-        const matSig = `${rend.width}|${rend.height}|${px}|${py}|${rend.sprite}|${texUrl}${extraSig}`;
+        // Split in two (#692). `matBuildSig` is what genuinely forces a new Mesh+Shader: the
+        // resolved sprite url and the extra-sampler set. The quad's SIZE/PIVOT is not in it —
+        // resizing a quad moves 8 position floats and nothing else, so it is applied in place
+        // below instead of rebuilding (a Shader rebuild is what grows #699/#707 without bound).
+        // Neither carries the sprite REF (#698) — that lives in `slot.matSpriteRef`.
+        const matBuildSig = `${texUrl}${extraSig}`;
+        const matQuadSig = `${rend.width}|${rend.height}|${px}|${py}`;
+        // The sampled sprite's re-slice epoch — re-slicing the sheet must invalidate the slot even
+        // when the url is unchanged, which the ref-in-sig form could not express.
+        const matSpriteEpoch = getSpriteEpoch(rend.sprite);
         let slot = this.slots.get(id);
         // Rebuild the slot when the kind changed (was a sprite/graphics while loading),
         // the bound material GUID changed, the quad size/pivot changed, or the sampled
@@ -1134,7 +1841,8 @@ export class Scene2DRenderer {
         // so retain-before-release covers the shared-url cases for the sprite AND the samplers.
         const newUrls = texUrl ? [texUrl, ...matTexUrls] : matTexUrls;
         let preRetained = false;
-        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matSig !== matSig)) {
+        if (slot && (slot.kind !== 'material' || slot.matGuid !== rend.material || slot.matBuildSig !== matBuildSig
+          || slot.builtEpoch !== matSpriteEpoch)) {
           for (const u of newUrls) retainSpriteTexture(u);
           preRetained = true;
           disposeSlot(slot); this.slots.delete(id); this.entityShaders.delete(id);
@@ -1142,22 +1850,142 @@ export class Scene2DRenderer {
           slot = undefined;
         }
         let built = false;
+        // FRAME SWAP (#698) — the material analogue of the sprite path's fast path above. The slot
+        // survived the gate, so the material, size, pivot, resolved url, samplers and re-slice
+        // epoch are all identical and only the atlas sub-rect moved. `makePixiShaderInstance`
+        // binds `uTexture: texture.SOURCE` (and `uSampler: source.style`), which are the SAME
+        // object across slices of one sheet — the only thing a sub-rect change actually moves is
+        // `uTextureMatrix`. So the whole swap is one wrapper + one uniform write, in place: no
+        // Mesh, no Shader, no Geometry, and no texture refcount churn (the url is unchanged, so
+        // retain/release would cancel out anyway). Same in-place-uniform shape as
+        // `updateMtsdfPixiMetrics`, which is how #690 decoupled the text shader.
+        if (slot && slot.matSpriteRef !== rend.sprite) {
+          // ⚠️ `uTextureMatrix` is not an optimisation here — it is the ONLY thing that makes the
+          // swap visible. Both Pixi mesh adaptors (`GlMeshAdaptor` / `GpuMeshAdapter`) refresh the
+          // uTexture/uSampler/uTextureMatrix bindings ONLY inside `if (!shader)`, and a material
+          // slot always sets one, so `mesh.texture = newTex` alone changes nothing on screen.
+          // Hence: if the uniform group is not reachable, DO NOT take the fast path — fall through
+          // to a full rebuild, which re-mints the shader with the right `mapCoord`. Swapping the
+          // texture and skipping the uniform would animate the ECS while rendering frame 0
+          // forever, with nothing failing — the "mechanism that cannot fire" shape this whole
+          // batch of fixes is about, reintroduced by the fix for it.
+          const tu = (slot.matShader?.resources as any)?.textureUniforms?.uniforms as Record<string, unknown> | undefined;
+          if (tu) {
+            const swapMesh = slot.obj as Mesh;
+            const oldTex = swapMesh.texture;
+            const newTex = mintMaterialTexture(matRef);
+            swapMesh.texture = newTex;
+            tu.uTextureMatrix = newTex.textureMatrix?.mapCoord ?? new Matrix();
+            // Destroy the previous per-slot framed WRAPPER only. A whole-image borrow
+            // (hasFrame=false) is the SHARED base texture and must never be destroyed, and
+            // `destroy(false)` leaves the source alone in either case.
+            if (slot.hasFrame && oldTex && oldTex !== Texture.EMPTY && oldTex !== newTex) oldTex.destroy(false);
+            slot.matSpriteRef = rend.sprite;
+            slot.hasFrame = matRef.hasFrame;
+            built = true;   // the quad samples different pixels now — it must redraw
+          } else {
+            for (const u of newUrls) retainSpriteTexture(u);
+            preRetained = true;
+            disposeSlot(slot); this.slots.delete(id); this.entityShaders.delete(id);
+            this.lastRender.delete(id);
+            slot = undefined;
+          }
+        }
         if (!slot) {
+          const tex = mintMaterialTexture(matRef);
+          const extraTextures: Record<string, Texture> = {};
+          for (const [key, eref] of extraRefs) extraTextures[key] = mintMaterialTexture(eref);
           const shader = makePixiShaderInstance(program, tex, undefined, extraTextures);
           const mesh = new Mesh({ geometry: buildMaterialQuad(rend.width, rend.height, px, py), texture: tex, shader });
-          canvasSlot.container.addChild(mesh);
+          this.containerFor(canvasSlot, id).addChild(mesh);
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
-          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: 0, meshVersion: -1, matShader: shader, matGuid: rend.material, matSig, materialTexUrls: matTexUrls };
+          slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: matSpriteEpoch, meshVersion: -1, matShader: shader, matGuid: rend.material, matBuildSig, matQuadSig, materialTexUrls: matTexUrls, matSpriteRef: rend.sprite, matGen: gen };
           this.slots.set(id, slot);
-          this.entityShaders.set(id, shader);
+          this.entityShaders.set(id, { shader, gen });
           built = true; // fresh/rebuilt Mesh → must draw at least once
+        }
+
+        // ⚠️ RESET the reused Shader's uniform STATE (#873). Placed above the re-stamp block to read
+        // in the order the two things happen conceptually, NOT because anything requires it: the
+        // driver reads that map at ECS priority 0 of the NEXT frame, never between these two
+        // statements, so the order is free and swapping it fixes nothing.
+        // `matUniforms` is allocated only in `makePixiShaderInstance`, i.e.
+        // only on a BUILD, and `applyOverrides2D` is its only other writer — so a slot that survived
+        // into a new generation still holds the DEAD entity's last driven values. Permanent when the
+        // newcomer carries no `MaterialInstance` at all; one wrong frame when it drives the same
+        // targets. THE INVARIANT: a respawn renders identically whether or not it reclaimed a dead
+        // entity's index.
+        //
+        // ⚠️ Keyed on the SLOT's own `matGen`, deliberately NOT on `entityShaders` — see the field's
+        // comment. That map is purged on any frame this pass skips the entity, while the slot
+        // survives, so a reset keyed there skips the very case it exists for.
+        //
+        // ⚠️ RESET, not rebuild — the one place in this file where this diverges from the
+        // `physics2DSystem` shape. `docs/engine-concepts.md` requires ACTING on a generation
+        // mismatch; rebuilding is one way to obey that and resetting is the other, and here the
+        // rebuild is itself the leak: every `new Shader` mints two `UniformGroup`s with fresh
+        // `_resourceId`s, so Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn
+        // and is cleared only at renderer teardown (#699 — still live upstream, carried as #694
+        // defect 5). Recycled ids ARE the pooled-VFX path, the last place to put unbounded growth;
+        // see the #692 note above on `matBuildSig`. The in-place write is the shape
+        // `updateMtsdfPixiMetrics` (#690) and the frame swap (#698) already use — bare into the
+        // group's `uniforms`, no dirty bump, which reaches the GPU on BOTH backends only because
+        // these groups are built with Pixi's default `isStatic: false` (`UboSystem` and
+        // `GlUniformGroupSystem` both re-read `uniforms[name]` per draw and skip their `_dirtyId`
+        // early-out). ⚠️ Constructing ANY of them with `isStatic: true` silently strands EVERY bare
+        // uniform write in the 2D layer — see `docs/rendering.md` for the full list; it is not
+        // limited to the ones this file happens to name.
+        //
+        // The reset set is `matUniforms` and NOTHING else, because every other per-entity thing a
+        // surviving slot carries is already covered: the Mesh's placement/appearance is rewritten
+        // unconditionally below, the quad by `matQuadSig`, the sampled texture by `matBuildSig` +
+        // `builtEpoch`, `uTextureMatrix` by the frame swap, and the extra samplers by `extraSig`
+        // (which folds in this entity's own `kind:'texture'` overrides). Add per-entity state to a
+        // material slot and this is the enumeration you have to extend.
+        if (slot.matGen !== gen) {
+          const u = (slot.matShader?.resources as any)?.matUniforms?.uniforms as Record<string, unknown> | undefined;
+          if (u) {
+            const seed = buildUniformValues(program, undefined);
+            for (const k in seed) u[k] = seed[k].value;
+            built = true;   // the uniforms moved — this canvas must redraw, or the reset is invisible
+          }
+          slot.matGen = gen;
+        }
+
+        // ⚠️ Re-stamp the driver's entry whenever this entity renders as a material — NOT only on a
+        // fresh build (#848). A respawn reclaiming this id with the SAME material GUID and texture
+        // passes the rebuild gate above, so the slot (and its Shader) are reused; a build-only write
+        // would leave the DEAD entity's generation on a Shader the renderer is actively drawing, and
+        // the broker's generation check would then refuse the driver access to it. Permanently, not
+        // for a frame: the per-frame purge below KEEPS this entry, because this id is in
+        // `materialIds` — the newcomer is rendering. The symptom is a respawned entity frozen at the
+        // dead one's last uniform values, with no redraw ever armed.
+        // ⚠️ This restores the driver's ACCESS to the reused Shader; the block above is what resets
+        // its VALUES. Two separate mechanisms with two different lifetimes — conflating them is
+        // exactly the defect #873's close-out review caught.
+        // Allocation-free once settled: it writes only when the shader or the generation changed.
+        const shaderNow = slot.matShader;
+        if (shaderNow) {
+          const prev = this.entityShaders.get(id);
+          if (!prev || prev.shader !== shaderNow || prev.gen !== gen) {
+            this.entityShaders.set(id, { shader: shaderNow, gen });
+          }
+        }
+
+        // Quad size/pivot changed but nothing that needs a new Mesh did (#692) — resize in place.
+        // Placed after the build block so a freshly built slot (already at the right size, with
+        // `matQuadSig` stamped at construction) skips it.
+        if (slot.matQuadSig !== matQuadSig) {
+          resizeMaterialQuad((slot.obj as Mesh).geometry as MeshGeometry, rend.width, rend.height, px, py);
+          slot.matQuadSig = matQuadSig;
+          built = true;   // the quad covers different pixels now — the canvas must redraw
         }
 
         // Ensure parented to the right canvas (an entity can move between canvases).
         const mesh = slot.obj as Mesh;
-        if (mesh.parent !== canvasSlot.container) { mesh.removeFromParent(); canvasSlot.container.addChild(mesh); }
+        { const wp = this.containerFor(canvasSlot, id); if (mesh.parent !== wp) { mesh.removeFromParent(); wp.addChild(mesh); } }
 
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
         const fx = rend.flipX ? -1 : 1, fy = rend.flipY ? -1 : 1;
@@ -1182,9 +2010,17 @@ export class Scene2DRenderer {
         // pass). A static-uniform material (no driver, or a driver holding a constant / a
         // stopped clock) now costs zero redraws once settled.
         const snap = this.lastMaterialRender.get(id);
-        const changed = forceAll || built || isEntity2DMaterialDirty(id) || !snap ||
+        const changed = forceAll || built || isEntity2DMaterialDirty(id, gen) || !snap ||
           snap.canvasId !== canvasId || snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz ||
-          snap.sx !== wt.sx || snap.sy !== wt.sy || snap.color !== rend.color || snap.opacity !== rend.opacity ||
+          // ⚠️ `alpha`, NOT `rend.opacity` — the snapshot STORES the product below (#211), so
+          // comparing the raw field made the two halves disagree. Both directions were wrong: a
+          // material entity under a `GroupAlpha` of 0.5 read as "changed" on every frame forever
+          // (a full GPU pass per frame with nothing moving — the exact cost this gate exists to
+          // avoid), while a group FADE over a still `rend.opacity` read as unchanged and never
+          // marked the canvas dirty, so the fade was written to `mesh.alpha` and never presented.
+          // The sprite (`snap.opacity !== alpha`) and skinned passes always had this right; the
+          // material pass was the lone outlier, under a comment pointing at the sprite path.
+          snap.sx !== wt.sx || snap.sy !== wt.sy || snap.color !== rend.color || snap.opacity !== alpha ||
           snap.blend !== blend || snap.paint !== paint || snap.flipX !== rend.flipX || snap.flipY !== rend.flipY ||
           snap.compX !== comp.x || snap.compY !== comp.y;
         if (changed) {
@@ -1290,14 +2126,14 @@ export class Scene2DRenderer {
             meshes.push(mesh);
             partUrls.push(part.url);
           }
-          canvasSlot.container.addChild(container);
+          this.containerFor(canvasSlot, id).addChild(container);
           slot = { kind: 'mesh', obj: container, meshes, partUrls, spriteRef: ss.rig, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: sig };
           this.slots.set(id, slot);
         }
 
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
         const deform = buf.version;
         const alpha = ss.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
 
@@ -1316,7 +2152,7 @@ export class Scene2DRenderer {
 
         const container = slot.obj as Container;
         const meshes = slot.meshes ?? [];
-        if (container.parent !== canvasSlot.container) { container.removeFromParent(); canvasSlot.container.addChild(container); }
+        { const wp = this.containerFor(canvasSlot, id); if (container.parent !== wp) { container.removeFromParent(); wp.addChild(container); } }
 
         // Re-upload each part's deformed positions only when the skin version advanced.
         if (slot.meshVersion !== deform) {
@@ -1376,12 +2212,19 @@ export class Scene2DRenderer {
         if (!provider) return;
         // Page-0 texture readiness gates the entity (baked atlas still loading, or a
         // dynamic provider before its first page). Per-page textures fetched below.
-        if (!getFontTexturePixi(provider, 0, () => this.markDirty())) return;
+        // ⚠️ `.destroyed` as well as null — a destroyed Pixi Texture is truthy (#481), and this
+        // gate is the one that decides the entity is renderable AT ALL. Letting a corpse through
+        // here admits the entity to `activeIds` and stamps `meshFrameKey`, while the per-page
+        // guard below then skips every page: the string renders as nothing. For a BAKED provider
+        // that is permanent, not transient — `atlasVersion` is `readonly = 0`, so the
+        // "rebuilds on atlasVersion/textDirty bump" consolation below cannot fire for it.
+        const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
+        if (!gate || gate.destroyed) return;
 
         this.activeIds.add(id);
 
         const layoutHash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
-          t.letterSpacing, provider.atlasVersion, getTextDirtyVersion()].join('|');
+          t.letterSpacing, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
         const styleHash = [t.color, t.opacity, t.weight, t.outlineColor, t.outlineWidth, t.outlineOpacity,
           t.glowColor, t.glowSize, t.glowStrength, t.shadowColor, t.shadowOpacity,
           t.shadowOffsetX, t.shadowOffsetY, t.shadowSoftness].join('|');
@@ -1405,44 +2248,190 @@ export class Scene2DRenderer {
         // is a single page. All page meshes are children of the slot Container, so the
         // anchor/pivot/transform below apply to the whole block at once.
         if (!slot || slot.meshFrameKey !== layoutHash) {
-          provider.ensureGlyphs(textCodepoints(t.text));
-          const layout = layoutText(provider, t.text, {
-            fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
-            lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
-          });
-          const style = textStyle2D(t);
           if (!slot) {
             const container = new Container();
-            canvasSlot.container.addChild(container);
-            slot = { kind: 'text', obj: container, spriteRef: t.font, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: layoutHash, pageMeshes: [], textShaders: [], textW: layout.width, textH: layout.height };
+            this.containerFor(canvasSlot, id).addChild(container);
+            // `meshFrameKey` starts at the SENTINEL '', not `layoutHash` — pre-existing, not
+            // introduced by #716. The sentinel can never equal a real hash (the join always has
+            // literal `|` separators against real field values), so a slot that never reaches
+            // the real stamp below (the catch just below explains when) keeps being seen as
+            // stale and gets retried, rather than silently reading as already-built.
+            slot = { kind: 'text', obj: container, spriteRef: t.font, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: '', pageMeshes: [], textShaders: [], textW: 0, textH: 0 };
             this.slots.set(id, slot);
           }
           const container = slot.obj as Container;
-          // Rebuild all page meshes (a layout/atlas change is infrequent).
-          for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); g?.destroy(); }
-          for (const s of slot.textShaders ?? []) s.destroy();
-          slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
-          for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
-            const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
-            if (!ptex) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
-            // Pixi MeshGeometry wants a Uint32Array index buffer.
-            const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
-            const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
-            // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
-            // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
-            // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
-            geometry.addAttribute('aTextColor', {
-              buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
-              format: 'float32x4', stride: 4 * 4, offset: 0,
+          try {
+            provider.ensureGlyphs(textCodepoints(t.text));
+            const layout = layoutText(provider, t.text, {
+              fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
+              lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
             });
-            const shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
-            const mesh = new Mesh({ geometry, texture: ptex, shader });
-            container.addChild(mesh);
-            slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+
+            // #749: the QUAD-SET half of `layoutHash` — unchanged means the new layout can only
+            // differ from the old one in each quad's x/y (same count, unicodes, order, page
+            // assignment, UVs — see `canWriteTextPositionsInPlace`'s comment). Computed HERE, not
+            // per-frame — this whole branch only runs on a `meshFrameKey` miss, so the per-frame
+            // path (below, outside this `if`) gains zero string-concat allocations from this.
+            const buildKey = [t.font, t.text, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
+            let fastPathApplied = false;
+            if (slot.meshBuildKey === buildKey && slot.pageMeshes?.length && slot.pageNums) {
+              const pageMeshes = slot.pageMeshes;
+              const pagePositions = buildTextPositionsByPage(layout.quads);
+              const existing = slot.pageNums.map((page, i) => ({ page, positionsLength: pageMeshes[i].geometry.positions.length }));
+              // Same "destroyed but truthy" posture as the full-rebuild page loop below (#481) —
+              // never write positions against a dead page texture. ALSO re-checks
+              // `canReuseMtsdfPixiShader` per page: `updateMtsdfPixiMetrics` below is
+              // documented to skip `uTexSize`/`uDistanceRange`/`uHasTrueSdf` ONLY because
+              // `canReuseMtsdfPixiShader` already guarantees those are unchanged — the full
+              // rebuild path only ever calls it behind that same check, and this fast path must
+              // establish the precondition itself rather than assume it. If the atlas ever moved
+              // while `buildKey` stayed put, skipping this would render with STALE atlas uniforms
+              // AND re-stash `shader._mtsdfAtlas = atlas`, so the very next
+              // `canReuseMtsdfPixiShader` would compare new-against-new and return true —
+              // keeping the wrong shader forever, a failure that conceals itself. Every path
+              // found that moves the atlas also bumps `atlasVersion` or calls `markTextDirty`
+              // (both already inside `buildKey`), so this is believed UNREACHABLE today; checked
+              // anyway because refusing is cheap and matches this block's "never apply
+              // half-way" posture. (The fast path never re-binds `mesh.texture` either — safe
+              // only because a page Texture's identity is stable for the provider's life
+              // (`fontTexturePixi.ts` caches by provider id + page); the full rebuild path
+              // self-heals a moved texture by rebuilding the Mesh, the fast path does not.)
+              const texturesReady = slot.pageNums.every((page, i) => {
+                const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                const shader = slot!.textShaders?.[i];
+                return !!ptex && !ptex.destroyed && !!shader && canReuseMtsdfPixiShader(shader, ptex, atlas);
+              });
+              if (texturesReady && canWriteTextPositionsInPlace(pagePositions, existing)) {
+                for (const { page, positions } of pagePositions) {
+                  const mi = slot.pageNums.indexOf(page);
+                  const mesh = pageMeshes[mi];
+                  mesh.geometry.positions.set(positions);
+                  mesh.geometry.getBuffer('aPosition').update();
+                }
+                // #752: this call is now only PROVISIONAL — raw fontSize, ignoring Transform/canvas
+                // scale — because the scale-aware refresh has moved to the transform block below
+                // (it needs `wt`/`comp`, not yet in scope here), and that block always runs this
+                // same frame (a rebuild always leaves `snap.layoutHash !== layoutHash`, so its
+                // `changed` gate trips). NOT deleted, still not optional: `uScreenPxRange` must
+                // never be left at a stale PRE-rebuild atlas's value even for one frame, and this
+                // call is also what re-stashes `_mtsdfAtlas` for the later shadow-offset clamp.
+                for (const shader of slot.textShaders ?? []) updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
+                slot.meshFrameKey = layoutHash;
+                slot.textW = layout.width; slot.textH = layout.height;
+                slot.baseQuads = layout.quads;
+                // ⚠️ Do NOT touch `wasMotion`/`wasColored` here. The full rebuild below clears both
+                // because it produces new geometry AND a new `aTextColor` buffer, both at base state.
+                // This fast path writes base POSITIONS only and leaves the colour buffer untouched,
+                // so clearing `wasColored` would strand an animated colour in that buffer with
+                // nothing left to restore it. Leaving both alone lets the per-glyph animation block
+                // below do exactly what it would otherwise have done (at worst one redundant
+                // base-pose write in the frame an animation stops).
+                slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good build clears the streak
+                fastPathApplied = true;
+              }
+            }
+
+            if (!fastPathApplied) {
+              const style = textStyle2D(t);
+              // Reclaim the existing shaders BEFORE tearing anything down, indexed by PAGE
+              // NUMBER (not array index — a page can be skipped below when its texture isn't
+              // ready yet, so `pageNums` and the array index can disagree). A Shader depends
+              // only on the page texture + atlas geometry (#690); fontSize/style reach it
+              // purely through uniforms, so a plain text/fontSize edit can keep the same
+              // Shader instead of paying for a new one (and its UniformGroup — see #699).
+              // This does NOT save a GL/GPU program compile: the programs are already shared
+              // module-level via `getMtsdfPrograms` ("Program cache (fixes #590)").
+              const reusable = new Map<number, Shader>();
+              if (slot.pageNums && slot.textShaders) {
+                for (let i = 0; i < slot.pageNums.length; i++) {
+                  const s = slot.textShaders[i];
+                  if (s) reusable.set(slot.pageNums[i], s);
+                }
+              }
+              // Rebuild all page geometry (a layout/atlas change is infrequent). Bare
+              // `destroy()` — Mesh.destroy() sets `_shader = null` and does not destroy the
+              // shader, which is why a reclaimed shader survives its mesh being destroyed.
+              for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
+              slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
+              try {
+                for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
+                  const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                  // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
+                  // where a just-minted texture is torn down inside the same call (#481, an
+                  // already-disposed provider's addDisposable running synchronously). Same posture as
+                  // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
+                  if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
+                  // Pixi MeshGeometry wants a Uint32Array index buffer.
+                  const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
+                  const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });
+                  // Per-glyph colour attribute (white ⇒ no tint); animated by rainbow/fade.
+                  // Explicit Buffer with COPY_DST so per-frame .update() actually re-uploads
+                  // (addAttribute's auto-buffer is static-uploaded once, like the positions one).
+                  geometry.addAttribute('aTextColor', {
+                    buffer: new Buffer({ data: geo.colors, label: 'attribute-text-color', usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
+                    format: 'float32x4', stride: 4 * 4, offset: 0,
+                  });
+                  let shader = reusable.get(page);
+                  if (shader && canReuseMtsdfPixiShader(shader, ptex, atlas)) {
+                    reusable.delete(page);
+                    // Provisional (#752) — same reasoning as the fast-path call above: raw
+                    // fontSize only, corrected by the scale-aware refresh in the transform block
+                    // below on this same frame. Kept because reclaiming a shader must still
+                    // re-stash `_mtsdfAtlas` for the later shadow-offset clamp.
+                    updateMtsdfPixiMetrics(shader, atlas, t.fontSize);
+                  } else {
+                    shader = makeMtsdfPixiShader(ptex, atlas, style, t.fontSize);
+                  }
+                  const mesh = new Mesh({ geometry, texture: ptex, shader });
+                  container.addChild(mesh);
+                  slot.pageMeshes.push(mesh); slot.textShaders.push(shader); slot.pageNums!.push(page);
+                }
+              } finally {
+                // Destroy any shaders NOT reclaimed above (a page the text no longer touches,
+                // or whose texture/atlas changed under it).
+                // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
+                // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
+                // every text entity in the process), so `destroy(true)` here would null the SHARED
+                // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
+                // every canvas too.
+                // ⚠️ `finally`, NOT a plain trailing loop: a throw inside the page loop (context loss, a
+                // failed buffer allocation — the pass's catch below expects those) would otherwise strand
+                // every reclaimed shader, unreachable AND already removed from slot.textShaders, so
+                // disposeSlot cannot free them either. That is the exact leak #690 exists to remove.
+                for (const s of reusable.values()) s.destroy();
+              }
+              slot.meshFrameKey = layoutHash;
+              slot.meshBuildKey = buildKey; // stamp so a later layout-only edit can take the fast path
+              slot.textW = layout.width; slot.textH = layout.height;
+              slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
+              slot.textRebuildFails = 0; slot.textRebuildFailHash = undefined; // a good rebuild clears the streak
+            }
+          } catch (err) {
+            // `layoutText`/`buildTextGeometryByPage` above can throw (a font provider not
+            // ready, a malformed atlas). Left uncaught here, that throw skips `slot.meshFrameKey
+            // = layoutHash` above, so `meshFrameKey` stays at whatever it was (the sentinel, or
+            // the last successful hash) — always ≠ `layoutHash`, so the NEXT frame re-enters
+            // this whole block: destroys the page meshes/geometry just rebuilt, re-runs
+            // `layoutText`/the page loop, and throws again. For a TRANSIENT cause (a texture
+            // arriving next frame) that self-heals in a frame or two and is exactly the retry
+            // wanted. For a PERMANENT one it never terminates — silent per-frame teardown/
+            // rebuild churn on top of the silent blank (the outer catch below logs only once
+            // per session, so nothing surfaces this). Bound it: after `TEXT_REBUILD_MAX_RETRIES`
+            // consecutive failures for this hash, stamp `meshFrameKey` anyway so the retry
+            // stops and the entity settles into a quiet blank — the same outcome a permanent
+            // failure always had, just without the unbounded churn. A later change to the
+            // actual inputs (text/fontSize/atlas/textDirty) computes a different hash and gets
+            // a fresh set of attempts.
+            // The streak is per-HASH. Without this reset the counter is global to the slot, so a
+            // permanent failure that burned it to the cap would leave a genuinely DIFFERENT layout
+            // (new text, new fontSize, a grown atlas) with a single attempt before being stamped
+            // off — contradicting the paragraph above, which promises a changed input gets a fresh
+            // set. Keyed on the hash, each distinct layout gets its own budget.
+            if (slot.textRebuildFailHash !== layoutHash) { slot.textRebuildFails = 0; slot.textRebuildFailHash = layoutHash; }
+            slot.textRebuildFails = (slot.textRebuildFails ?? 0) + 1;
+            if (slot.textRebuildFails >= TEXT_REBUILD_MAX_RETRIES) slot.meshFrameKey = layoutHash;
+            throw err;
           }
-          slot.meshFrameKey = layoutHash;
-          slot.textW = layout.width; slot.textH = layout.height;
-          slot.baseQuads = layout.quads; slot.wasMotion = false; slot.wasColored = false;
         }
 
         // Per-glyph animation: recompute page positions from the base quads each frame
@@ -1491,7 +2480,7 @@ export class Scene2DRenderer {
         const container = slot.obj as Container;
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
-        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
+        const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1, scale: 1 };
 
         const groupAlpha = this.groupAlphaOf.get(id) ?? 1; // #211 — t.opacity is already in the shader
         const snap = this.lastTextRender.get(id);
@@ -1499,16 +2488,39 @@ export class Scene2DRenderer {
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
           snap.anchorX !== t.anchorX || snap.anchorY !== t.anchorY || snap.paint !== paint ||
-          snap.compX !== comp.x || snap.compY !== comp.y || snap.groupAlpha !== groupAlpha ||
+          snap.compX !== comp.x || snap.compY !== comp.y || snap.canvasScale !== comp.scale ||
+          snap.groupAlpha !== groupAlpha ||
           snap.layoutHash !== layoutHash || snap.styleHash !== styleHash;
         if (!changed) return;
 
         this.dirtyCanvases.add(canvasId);
         if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId);
 
-        if (container.parent !== canvasSlot.container) { container.removeFromParent(); canvasSlot.container.addChild(container); }
+        { const wp = this.containerFor(canvasSlot, id); if (container.parent !== wp) { container.removeFromParent(); wp.addChild(container); } }
 
         if (!snap || snap.styleHash !== styleHash) { const style = textStyle2D(t); for (const s of slot.textShaders ?? []) updateMtsdfPixiStyle(s, style); }
+
+        // #752: the fontSize-derived `uScreenPxRange` AA uniform used to be set only from the
+        // AUTHORED fontSize (mtsdfPixiShader.ts), blind to both the entity's Transform scale and
+        // the host canvas's own scale — dead everywhere `fwidth` is available, but the ONLY value
+        // used on the no-derivatives fallback (WebGL1 without OES_standard_derivatives, e.g. the
+        // iPhone 8). This is the one place per frame that has both inputs in scope, so the refresh
+        // lives here rather than in the geometry-rebuild branch above (which only ever sees the
+        // raw trait). Kept OUT of `layoutHash` deliberately — folding Transform scale into the
+        // rebuild key would resurrect #677's per-frame geometry teardown.
+        //
+        // Derivation of `effScale`: the canvas root container is scaled by (scaleX, scaleY)
+        // (~:1487 above) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
+        // `comp.x = comp.scale / scaleX` (canvas2DScaler.ts's `compensateX`), the per-axis product
+        // is `comp.scale * wt.sx` — `comp.x`/`comp.y` and `scaleX`/`scaleY` cancel EXACTLY, so the
+        // on-screen factor is the canvas's own uniform scale times the entity's WORLD scale. `comp`
+        // itself must NOT appear in this expression — including it would double-count the same
+        // cancellation. `Math.abs` because a flipped (negative) scale must not produce a negative
+        // range; `Math.max` of the two axes because an over-estimated range errs toward a crisper
+        // edge and an under-estimated one toward blurry (mtsdfPixiShader.ts's chosen direction for
+        // this file) — the deliberate rule for non-uniformly-scaled text.
+        const effScale = comp.scale * Math.max(Math.abs(wt.sx), Math.abs(wt.sy));
+        for (const s of slot.textShaders ?? []) updateMtsdfPixiMetrics(s, atlas, t.fontSize * effScale);
 
         // Anchor via pivot: (anchorX·w, anchorY·h) in local space aligns to position.
         container.pivot.set(t.anchorX * (slot.textW ?? 0), t.anchorY * (slot.textH ?? 0));
@@ -1521,11 +2533,12 @@ export class Scene2DRenderer {
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
           snap.anchorX = t.anchorX; snap.anchorY = t.anchorY; snap.paint = paint; snap.compX = comp.x; snap.compY = comp.y;
+          snap.canvasScale = comp.scale;
           snap.layoutHash = layoutHash; snap.styleHash = styleHash; snap.groupAlpha = groupAlpha;
         } else {
           this.lastTextRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y,
+            anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y, canvasScale: comp.scale,
             layoutHash, styleHash, groupAlpha,
           });
         }
@@ -1562,6 +2575,17 @@ export class Scene2DRenderer {
         this.lastRender.delete(id);
         this.lastMeshRender.delete(id);
         this.lastTextRender.delete(id);
+      }
+    }
+
+    // Drop mask groups whose Mask2D entity went away, was disabled, or lost its canvas (#449).
+    // Runs AFTER the entity sweep above so a mask and its children disappearing together tear
+    // down in dependency order. Children that OUTLIVE their mask are not destroyed with it — see
+    // `disposeMaskSlot` — and `forceAll` was already raised this frame by the grouping change, so
+    // they re-home to the canvas container on this very frame rather than blinking out for one.
+    if (this.maskSlots.size) {
+      for (const maskId of [...this.maskSlots.keys()]) {
+        if (!this.activeMaskIds.has(maskId)) this.disposeMaskSlot(maskId);
       }
     }
 
@@ -1676,15 +2700,30 @@ export class Scene2DRenderer {
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);
       for (const slot of this.slots.values()) disposeSlot(slot);
       this.slots.clear();
+      // Mask groups (#449) — after the entity slots, mirroring `stop()`'s order and its own
+      // comment: each releases its own texture, and `disposeMaskSlot` deliberately does NOT
+      // destroy the container's children (already destroyed/detached above). Left out of this
+      // block before — koota recycles entity ids across the swap, so a stale mask slot here would
+      // alias the new world's recycled id onto a dead Texture.
+      for (const maskId of [...this.maskSlots.keys()]) this.disposeMaskSlot(maskId);
+      this.maskSlots.clear();
+      this.activeMaskIds.clear();
+      this.maskGroupOf.clear();
+      this.parentMaskOf.clear();
+      this.warnedMaskIds.clear();
       this.entityShaders.clear();
       this._materialTexLoading.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
-      // gated like the texture net): clearSpriteMaterialCache only empties Maps (never
-      // destroys a GlProgram/GpuProgram), and every live per-entity Shader holds its OWN
-      // program reference, so wiping the shared cache can't strand the other viewport — both
-      // just recompile (a Pixi cache hit) next frame. Gating this on liveRenderers<=1 was the
-      // bug that left an EDITED .shader.json serving its stale compiled program on hot-reload
-      // whenever both GameView + SceneView were live (the default editor).
+      // gated like the texture net): every live per-entity Shader holds its OWN program
+      // reference, so wiping the shared cache can't strand the other viewport's already-drawn
+      // frame, AND (#716) the compiled GlProgram/GpuProgram itself now survives this clear —
+      // it's memoised at module scope in `pixiShaderBuilder`'s program cache, keyed on the
+      // manifest path, and this clear never evicts it — so the clear no longer forces a
+      // recompile at all. It ALSO bumps a generation that supersedes any in-flight compile —
+      // what keeps a sibling safe from THAT is that the clear fires the pending waiters (#523),
+      // not that it's maps-only. Gating this on liveRenderers<=1 was the bug that left an
+      // EDITED .shader.json serving its stale compiled program on hot-reload whenever both
+      // GameView + SceneView were live (the default editor).
       clearSpriteMaterialCache();
       this.activeIds.clear();
       this.prevCanvasIds.clear();
@@ -1699,6 +2738,11 @@ export class Scene2DRenderer {
       // Dispose emitter handles + clear recs (the state object stays reusable for the new scene) —
       // recycled ids must not alias stale emitters.
       if (this.particleState2D) disposeParticleSync2DState(this.particleState2D);
+      // Orphan-warn bookkeeping is WORLD-lifecycle (#700). `prune()` bounds it WITHIN a world, but
+      // across a swap koota recycles ids as the norm rather than the exception, so a surviving
+      // `id:` key would silence the new world's occupant of that id on its very first orphaning —
+      // and a surviving guid key would suppress a legitimately new warning for a re-loaded scene.
+      this.orphan2D.reset();
       this.pool.releaseAll();
       // Skin/deform buffers are WORLD-lifecycle state: recycled entity ids in the new world must
       // not alias stale buffers. clearSkin2DBuffers/clearDeform2DBuffers just empty a Map, so this
@@ -1739,11 +2783,26 @@ export class Scene2DRenderer {
     if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);   // before disposeSlot — see the onWorldSwap note
     for (const slot of this.slots.values()) disposeSlot(slot);
     this.slots.clear();
+    // Mask groups (#449) — after the entity slots, mirroring the per-frame sweep's order. Each
+    // releases its own texture, and `disposeMaskSlot` deliberately does NOT destroy the
+    // container's children: by this point they are already destroyed and detached above, and a
+    // `{ children: true }` here would double-destroy them.
+    for (const maskId of [...this.maskSlots.keys()]) this.disposeMaskSlot(maskId);
+    this.maskSlots.clear();
+    // No further frame will run for this renderer, so the deferred queue has to drain here or the
+    // ramp textures it holds leak their GPU memory (#455).
+    this.flushPendingMaskDestroy();
     this.entityShaders.clear();
     this._materialTexLoading.clear();
-    // Unconditional (see onWorldSwap): safe with a sibling renderer live — only empties Maps.
+    // Unconditional (see onWorldSwap): safe with a sibling renderer live because the clear wakes
+    // pending waiters, not because it's maps-only — this call site NEEDS that wake, since below
+    // only re-dirties the instance that's going away, not the surviving sibling.
     clearSpriteMaterialCache();
     this.activeIds.clear();
+    this.activeMaskIds.clear();
+    this.maskGroupOf.clear();
+    this.parentMaskOf.clear();
+    this.warnedMaskIds.clear();
     this.prevCanvasIds.clear();
     this.parentOfEntity.clear();
     this.canvasOfEntity.clear();
@@ -1757,6 +2816,23 @@ export class Scene2DRenderer {
     this.dirtyCanvases.clear();
     this.clearAllColliderOverlays();
     if (this.particleState2D) { disposeParticleSync2DState(this.particleState2D); this.particleState2D = null; }
+    this.orphan2D.reset();   // world-lifecycle, same reason as the onWorldSwap handler (#700)
+    // Drop this renderer's sim claim on every pool slot (#718) — same call, same position as the
+    // `onWorldSwap` handler above, and for the same reason: it must run AFTER the `disposeSlot`
+    // loop, because `releaseAll` only DETACHES children and relies on Scene2D having destroyed
+    // them already (F4). Without it `stop()` left every slot `boundBySim`, so `unmount` →
+    // `reclaimIfUnclaimed` bailed and the slot kept a live Application + GPU context with its
+    // canvas detached — and nothing could ever come back for it, because `stop()` had just
+    // unregistered the frame callback that drives `renderAll`'s shrink pass AND cleared
+    // `prevCanvasIds`, so even a later `start()` diffs against an empty set. The runtime pool
+    // masked this (`Game.tsx` calls `destroyPool()`, which opens with `releaseAll()`); the EDITOR
+    // pool has no such caller — `editorCanvas2DPool` is a module singleton whose only teardown is
+    // this method. Predicted (NOT observed on a running editor) end state: stuck slots accumulate
+    // to `MAX_SLOTS` (6), after which `allocate` refuses and warns and the 2D viewport draws
+    // nothing. That consequence is derived from `canvas2DPool.ts:508`, not measured.
+    // Idempotent: it acts only on `boundBySim` slots and clears that flag, so the runtime's
+    // existing stop-then-destroyPool sequence is unaffected.
+    this.pool.releaseAll();
     // Nuke the SHARED skin buffers + texture net only when THIS was the LAST live renderer.
     // Gating on renderer count (not `this.primary`) fixes both directions: a non-primary editor
     // stop while GameView lives must not wipe shared state, AND a primary GameView stop while the

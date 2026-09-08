@@ -34,6 +34,59 @@ both.
 They are two halves of one thing: invariant 1 chooses to risk duplicate delivery over lost money,
 and invariant 2 is what makes that trade free.
 
+### Invariant 1 covers the GAME's state too — the grant hook (#371)
+
+⚠️ **A game whose truth lives outside the ledger needs `configureIap({ onGrant })`, or invariant 1
+holds only for the engine.** `settle()` runs `verify → ledger.recordGrant → flush → confirmDurable →
+finish`, and `finish()` IS the consume. A game that writes its own coin wallet or entitlement flag
+when `purchase()` resolves writes it *after* the store has already been told to stop re-delivering —
+so a crash in that window loses the purchase with no recovery. That is invariant 1's own failure
+mode, reintroduced one layer out by wiring rather than by logic.
+
+The hook moves the consume behind the game's write:
+
+```
+verify → ledger.recordGrant → flush → confirmDurable
+       → onGrant(grant)   ← the game writes its state and CONFIRMS it durable
+       → backend.finish   ← the consume, last, and only if onGrant returned true
+```
+
+Owner, 2026-08-29: *"the flow should be purchase start, callback, increment the balance / change
+flag, save them, then consume the purchase. the consume must be called last."*
+
+Four contract points, each load-bearing:
+
+1. **Returning false — or throwing — withholds the finish.** The transaction stays unfinished and
+   the store re-delivers next launch. Same trade `confirmDurable` already makes: leaving a
+   transaction open beats finishing one we failed to record. A refusal is the safe outcome, not an
+   error path.
+2. ⚠️ **The hook runs on the ALREADY-GRANTED path too**, not only on a fresh grant. Skipping it
+   there makes the crash between the ledger write and the game's write *unrecoverable*: the
+   re-delivery would find the ledger already processed, go straight to the finish, and the game
+   would apply nothing, forever.
+3. **Therefore the hook MUST be idempotent, keyed by `IapGrant.transactionId`** — it is called once
+   per settle pass until a finish lands. It is the same key the ledger uses, which is what makes the
+   two agree by construction rather than by two people remembering the same rule.
+4. **`stillActive()` is re-checked after it returns.** The hook awaits the game's own flush, which
+   is another window a game swap can land in.
+
+**Optional, and omitting it changes nothing.** `games/iap-test` passes no hook and does not need
+one: the fixture holds no game-side state at all, reading `iapBalanceOf()` straight off the ledger,
+so for it the ledger genuinely *is* the truth. `games/court` is the first caller for which it is
+not, and `games/wordweave` is the second (its coin-pack economy, close-out b51fbe4e8..ab562d9ab).
+
+⚠️ **Wordweave's hook DIVERGES from Court's shape on point 1 above, deliberately.** Court's grant
+hook has no early "already applied" return — its value writes span three keys (wallet /
+entitlements / passes), so a re-delivery must re-run all of them (see `courtOnGrantImpl`'s own
+banner, `games/court/runtime/systems.ts`). Wordweave has exactly ONE value (`coins`), living in the
+SAME object as the idempotency marker (`StoredPurchases.iapApplied`), under ONE `PlayerPrefs` key —
+so marker-present implies coins-present by construction, and `wordweaveOnGrant` takes an early
+already-applied return that would be unsafe for Court's multi-key shape. See `creditCoins`'s own
+banner (`games/wordweave/runtime/store.ts`) for exactly when that divergence would have to reverse.
+
+Proved by five rows in `iapCrashMatrix.test.ts` — a refusing hook, a throwing hook, the
+already-granted repair, many relaunches crediting once, and the no-hook default.
+
 ### The crash matrix
 
 | Crash point | Store state | Our state | Next launch |
@@ -108,6 +161,72 @@ consumeAsync:        code=6  Server error   (2ms later, same token)
 Idempotency in the ledger cannot fix this because **the destructive step is in the store**. A
 `settling` set provides mutual exclusion per transaction id; the loser reports `already-owned`.
 
+### A game swap can outlive an await — check `stillActive()` right before the WRITE (#434)
+
+A settle spans awaits that can last minutes (a platform sheet, Face ID, a parent approving
+Ask-to-Buy), and `resetIap()`/`configureIap()` can run in that window — the editor's Open Project, or
+an OTA sub-game module. `entitled` (the module's live entitlement `Set`) is **REASSIGNED, not
+mutated**, across that swap, so a write that only checked `stillActive(c)` *before* an await can still
+land in the INCOMING game's live `Set` if the check does not happen again *after* it. **The rule is
+general, stated in `stillActive`'s own doc comment in `purchaseService.ts`: check `stillActive(c)`
+immediately before every write to module state that follows an await capable of outliving the
+session — not only before the await.** `refreshEntitlements()`'s happy path, its failure/catch
+branch, and the post-`finish()` `entitled.add()` in `settleInner` all follow it now; the failure
+branch was the gap closed on top of #434's first fix — an early return there used to hand back the
+module-global `entitled` by reference, which could already be the incoming game's `Set`.
+
+**The instance-level twin: `disposed`, guarding state a constructor's own async round-trip
+established (#487).** `stillActive(c)` answers "is this still the live *session*" — no help when
+the object being torn down is the instance itself. `CapacitorStoreBackend`'s constructor calls
+`iap().addListener('purchasesUpdated', …)` and stores the unsubscribe handle in that promise's
+`.then()`; a `dispose()` landing inside that native bridge round-trip used to null a binding that
+was still `null`, and the resumed `.then()` went on to install an unsubscribe nobody would ever
+call — the native listener outlived the game swap and drove the module-level `reconcile()` against
+whatever `cfg` was live by then. The fix is a `private disposed` flag checked in BOTH halves of the
+window: the `.then()` calls `h.remove()` directly instead of storing the handle, and the listener
+callback itself bails. Both checks are needed because **the native listener is live from the moment
+`addListener` is INVOKED, not from when its promise settles** — guarding only the handle-storage
+half leaves the callback free to fire, and drive `reconcile()`, in the exact gap the flag exists to
+close.
+
+⚠️ **`settling.delete()` in `settle()`'s own `finally` is deliberately UNGUARDED — do not add a
+`stillActive`-style check there.** `resetIap()` clears `cfg` and `entitled` but deliberately does
+NOT clear `settling`, so a settle for the same transaction id restarting in the next session still
+sees it busy via `settle()`'s in-flight check, and the stale `finally` releasing it later is correct,
+not a leak. Court's `storeInFlight` (`games/court/runtime/systems.ts`) is the mirror image and needs
+the OPPOSITE fix — a generation check IS required there — because `resetStoreUi` DOES clear its set
+on teardown, so a next-session entry can be added right after, and only a generation check stops the
+stale `finally` from deleting the NEW entry. Same shape, opposite requirement, because exactly one of
+the two teardown functions clears its set: check which before copying either fix elsewhere.
+
+**Two more sites, closed under the same rule (#487 items 3+4).** Both are post-await reads rather
+than writes, which is why #434's sweep walked past them, and both were reporting a plausible
+falsehood rather than corrupting anything:
+
+- **`confirmDurable` after `ledger.flush()`.** `confirmDurable` reads back through PlayerPrefs, which
+  the incoming game has already RE-NAMESPACED, so a swap inside the flush makes the read-back miss a
+  write the backend genuinely took. The path then journalled `iap.durability-unconfirmed` at ERROR
+  level — blaming storage quota or native I/O for a torn-down session. The money outcome was never
+  in doubt (both arms decline to finish, which is the conservative direction); only the attribution
+  was wrong, and an error-level journal line that names the wrong subsystem is how a session gets
+  spent chasing PlayerPrefs. One `stillActive(c)` between the two now returns `tornDown` instead.
+- **`restorePurchases`'s entitlement trace.** `reconcile()` spans a settle and so can outlive the
+  session, and `entitled` is reassigned — so `[...entitled]` could name the INCOMING game's
+  purchases as this restore's result. ⚠️ **The obvious fix — capture the Set before the await — is
+  wrong here**, and this is the interesting part: `reconcile()` itself calls `refreshEntitlements()`,
+  which REPLACES `entitled` on its happy path, so a pre-await snapshot reports the set from *before*
+  the restore, which is precisely the number this trace exists not to report. And once a swap has
+  happened, this session's own refreshed Set has already been dropped on the floor — there is no
+  truthful list left to name. So the swap case journals `tornDown: true` at `warn` instead of a set:
+  a restore reporting nothing *because it was torn down* is a different event from one reporting
+  nothing because the player owns nothing, and that line is what a "restore did not give me back
+  what I own" report gets read against.
+
+  The general lesson, worth more than either fix: **a capture-before is not automatically the answer
+  to a post-await read.** It is right when the await cannot legitimately change the value
+  (`refreshEntitlements`), and wrong when the awaited work is *supposed* to change it. Ask which
+  before copying the pattern.
+
 ### `StoreBackend` — the port that makes any of this testable
 
 The interface is the only thing that differs between a phone and a headless test. It also earns its
@@ -174,13 +293,82 @@ Accepted with the owner's eyes open:
 ⚠️ **Durability is checked by asking whether the write was ACCEPTED, never by reading it back.**
 `PlayerPrefs.set()` writes into an in-memory cache and queues the real write; a rejected backend
 write (quota exceeded, a native I/O error) is caught, re-queued and warned about, `flush()` still
-settles *fulfilled*, and `get()` keeps serving the cached value. So a read-back check confirms
+settles *fulfilled*, and `get()` keeps serving the cached value. (Since #619 the re-queue also
+schedules its own bounded retry, so the write is genuinely re-attempted — but that changes *when* it
+may land, not whether this check can be trusted, and `hasPendingWrite` stays the only honest read.) So a read-back check confirms
 itself — it re-reads the very cache the failed write already updated, and cannot fail for the
 failure modes it exists to catch. `confirmDurable()` therefore consults
 `PlayerPrefs.hasPendingWrite(key)` (surfaced through `PrefsDocStore.durable()`) *before* the
 read-back. Get this wrong and `settle()` concludes "durable", calls `finish()`, and the store stops
 re-delivering a purchase whose record vanishes on the next launch — the player's money, with no
 recovery path, which is the exact failure invariant 1 exists to prevent.
+
+### A rejection carries a diagnosis, not just prose (#499)
+
+`call.reject(message)` alone is not enough on either platform, because the message is the one thing
+that does NOT distinguish the cases. Both plugins pass Capacitor's full reject payload:
+
+| Field | iOS | Android |
+|---|---|---|
+| `error.code` | `storekit.networkError`, `purchase.purchaseNotAllowed`, … falling back to `<NSError domain>:<code>` | `billing.<BillingResponseCode>` |
+| `error.data.storeError` | `{ domain, code, description, failureReason?, underlying? }`, nested up to 3 deep | `{ domain: 'BillingResponseCode', code, description }` |
+
+**Read it through `describeStoreError` (exported to games as `iapDescribeStoreError`), never by
+hand.** The two fields live at different depths and the mistake is silent:
+
+⚠️ **`call.reject(message, code, error, data)` does NOT flatten `data`.** iOS wraps it as
+`["data": data]` (`PluginCallResult.swift`, `init(message:code:error:data:)`); Android does
+`errorResult.put("data", data)` (`PluginCall.java`, the 4-arg `reject`); only then does
+`native-bridge.js` copy that payload's TOP-LEVEL keys onto the rejected `Error`. So `code` is an own
+property and `storeError` is one level down. **The first cut of #499 read `err.storeError` and
+shipped a producer whose payload the reader could not see** — the fix landed, the journal looked
+correct, and the entire diagnostic was `undefined` on every call. Worse, the unit test asserted the
+same flattened shape, so the fake and the implementation were wrong *together*: the assertions were
+green, and mutation-testing the fix still broke them "correctly". Caught in review, not by the
+tests. The fixture builder in `iapFailurePaths.test.ts` now states the wire shape in one place, with
+the Capacitor sources cited.
+
+⚠️ **On iOS the underlying error is unwrapped from the `StoreKitError` enum's ASSOCIATED VALUE, not
+from `NSError.userInfo`.** Swift's synthesized NSError bridge of a Swift enum keeps neither the
+`URLError` inside `.networkError` nor the error inside `.systemError`, and `NSUnderlyingErrorKey` is
+empty — so the `ASDErrorDomain`/`AMSErrorDomain` code that names the actual account or sandbox fault
+lives *only* there. Reading `userInfo` alone looks like it works and reports nothing.
+
+**Coverage: every reject that carries a store RESULT is structured; the rest have nothing to
+classify.** iOS carries both fields from `purchase()` and `products()`. On Android the rule is
+mechanical — **if a `BillingResult` is in scope at the reject, it goes through `rejectWithBilling`**
+(`grep -n 'rejectWithBilling(' ` on the plugin lists the definition plus every call site, which is
+the check to re-run rather than trusting a number here; a hand-maintained count is exactly what
+goes stale, and the first draft of this paragraph said "six" because it counted the definition).
+What stays bare prose is app-side refusal with no store result behind it — `productId is required`,
+`unknown product`, `no subscription offer available`, `a purchase is already in progress`,
+`purchaseToken is required`.
+
+⚠️ **"Is a `BillingResult` in scope" is the test, not "does the message sound like validation" —
+and the difference is not cosmetic.** `unknown product` sat in that bare list while its `if` was
+`responseCode != OK || list.isEmpty()`, with the `BillingResult` right there in the lambda. So a
+`SERVICE_UNAVAILABLE(2)` or `NETWORK_ERROR(12)` — the store simply not answering — was reported as
+"unknown product: coins_100", telling the player and the log that a product visible on the shelf
+does not exist. On the *purchase* path, where unlike `consume`/`acknowledge` the payload is actually
+read. The two disjuncts are now separate branches: a non-OK response rejects as "could not look up
+…" with the code attached, and only the OK-but-empty case keeps the "unknown product" prose — its
+response code is `OK(0)`, so attaching it as a classification would name a success. Caught by the
+close-out review *after* this paragraph had already blessed the site as validation, which is the
+lesson: a doc that ratifies a miss stops the next sweep from finding it.
+
+⚠️ **Treat both fields as optional on the JS side.** An older native binary predating #499, the web
+stub, and any throw from outside the bridge carry neither; `describeStoreError` omits them rather
+than journalling `undefined`, and there is a test for that degraded shape specifically — it is the
+case that actually ships first, since JS updates OTA and native does not.
+
+⚠️ **A classified reject that nothing reads is a producer with no consumer** — the defect this repo
+repeats most, and #499 walked back into it: the plugins were taught to classify `consume`/
+`acknowledge`/`finish` failures while every one of those journal sites still printed `String(e)`, so
+a `billing.6` arrived and was discarded one line short of the log. Nothing failed, because those
+paths are deliberately non-fatal. **Every store rejection now goes through `journalStoreFailure`**
+(`iap.finish-failed`, `iap.acknowledge-failed`, `iap.entitlements-failed`, `iap.reconcile-failed`,
+`iap.dispose-failed`), with a test asserting the finish path carries `code`. Route new ones through
+it rather than calling `journal` with `String(e)`.
 
 ⚠️ **The decision rests on "a subscription unlocks nothing outside the app"** — no server-granted
 content, no single player spanning both stores. Those two are exactly what on-device verification
@@ -285,12 +473,166 @@ someone re-attaches it and unknowingly tests against a stale product list.
 
 [tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
+### ⚠️ OPEN (#580): every purchase stalls 20-40 s on the iPhone 8
+
+**OPEN, root cause not established.** Observed on the iPhone 8 (iOS 16.7.16) on 2026-09-02 across
+two separate test rounds. Recorded here so the measurement is not lost, not as a diagnosis.
+
+Every purchase attempt spanned 1400-2300 journal ticks between `iap.purchase.started` and its
+outcome, regardless of which outcome it settled on.
+
+⚠️ **The seconds column is DERIVED, not measured, and the assumption behind it is unverified.** It
+divides ticks by 60. On a live device the journal tick is `time.frame`, incremented once per
+**rendered** frame (`timeSystem()` in `engine/packages/modoki/src/runtime/core/timeSystem.ts`) on a real-clock
+delta — not a fixed dt. (`stepSimulation()`'s `1/60` default governs the HEADLESS deterministic
+stepper, and the original report cited it here in error; it does not apply to a device run.) So if
+Court rendered at ~30fps on an iPhone 8 the real spans are 40-80 s, not 20-40 s — and if rAF is
+throttled while the StoreKit sheet is up, ticks stop entirely and the figure understates by an
+unknown amount. **Nobody measured the frame rate during these attempts.** The tick counts are the
+hard data; treat the seconds as a lower bound.
+
+| attempt | ticks started→settled | derived seconds (assumes 60fps — NOT measured) | outcome |
+|---|---|---|---|
+| coins300 | 216→2207 | ~33.2s | cancelled |
+| coins1000 | 5199→6598 | ~23.3s | granted (via reconcile recovery) |
+| coins300 retry | 11239→12710 | ~24.5s | granted (via reconcile recovery) |
+| coins2500 | 14439→16101 | ~27.7s | cancelled |
+| coins2500 retry | 28178→30467 | ~38.2s | cancelled |
+| coins300 (2nd session) | 1052→2811 | ~29.3s | granted |
+
+**The shape of the failure:** both `granted` outcomes arrived through `reconcile()`'s
+`purchasesUpdated`-driven recovery path (`iap.recovered`), NOT through the direct `purchase()`
+settle. The direct call's own promise resolved LATER and was correctly de-duplicated
+(`iap.duplicate` / `iap.settle-in-flight`, no double-grant). That is consistent with `purchase()`
+itself stalling or resolving unreliably on this device/OS, with `reconcile()` independently
+recovering the transaction.
+
+**Ruled out**, recorded so nobody re-runs them: the settle-serialization race —
+`settling` is keyed by transaction id
+(the `settling` set in `engine/packages/modoki/src/runtime/iap/purchaseService.ts`, de-dup in `settle()`) and only one
+`court.coins.changed` fired per transaction; the StoreKit 2 `Transaction.updates` listener
+busy-looping — it is a `for await` over an AsyncSequence (`updatesTask` in `IapPlugin.swift`'s `load()`) and suspends
+between events by construction; and `markDirty()` (`games/court/runtime/systems.ts`), a
+trivial boolean set.
+
+⚠️ **Two mechanisms look like they would cover this and do not.**
+- #583's stranded-purchase timeout is **Android-only**
+  (`engine/packages/capacitor-modoki-iap/android/src/main/java/com/modokiengine/capacitor/iap/ModokiIapPlugin.java`,
+  `armStrandTimeout` / `PARKED_PURCHASE_TIMEOUT_MS`), and the iOS Swift path has no equivalent.
+  ⚠️ **But do not read that as "port it to iOS and the stall is bounded".** `PARKED_PURCHASE_TIMEOUT_MS`
+  is `5 * 60_000L` — five minutes (`ModokiIapPlugin.java`), 7-15x the observed span. It would
+  never fire during this symptom, for exactly the reason the watchdog below is dismissed. Porting it
+  would be a no-op against this bug.
+- Court's `STORE_WATCHDOG_MS = 90_000` (`games/court/runtime/systems.ts`) is not a purchase
+  timeout — it only releases the full-screen overlay. It is also longer than the span, so it does
+  not fire during the symptom. ⚠️ That margin is thinner than it looks: it is comfortable only at
+  the assumed 60fps (20-40 s). At 30fps the derived span is 40-80 s and 90 s stops being a
+  comfortable margin — so **measure the frame rate before crossing the watchdog off**.
+
+**Not checked**, so the next session knows where to start: no CPU profiler was attached; whether
+disabling parts of the debug bridge or the analytics SDKs (Firebase, Crashlytics, AppsFlyer) changes
+it; whether it reproduces on newer hardware (the iPhone 8 is the oldest supported device in the
+fleet).
+
+⚠️ The co-occurring iOS "excessive wakeups" reports that were originally filed as part of this issue
+are **not** the cause and are not a defect. The evidence lives in `docs/devices.md` § "iOS
+`wakeups_resource` reports are expected cost, not a defect", **which is private and not part of the
+published snapshot** (hence a path rather than a link) — in short, the signal spans four bundle ids,
+two of which have no purchase flow at all.
+
 ### Android — every device iteration costs a Play upload
 
-- **A sideloaded build CAN bill** — measured, against an earlier claim here that it could not. The
-  A23 that ran every purchase and the force-quit recovery reports `installer=null` and carries no
-  `DEBUGGABLE` flag: a sideloaded, release-signed APK Play never installed. (The account/device had
-  been licensed by an earlier Play install, which is the part that matters.)
+- **A sideloaded build CAN bill, and neither the signing nor the `versionCode` is what allows it.**
+  Four arms on the A23, 2026-09-03, every one returning `queryProductDetails(inapp): code=0 found=6
+  remaining=0` — release-signed at versionCode 1; release-signed at 6050; **debug-signed** at 1; and
+  debug-signed at the auto-derived 6067 on a FRESH install after a full uninstall. So the earlier
+  wording here ("a sideloaded, **release-signed** APK") was narrower than the truth, and the claim in
+  `a19f2be8d`'s commit message that a debug-signed APK "genuinely cannot match the Play Console
+  listing" is wrong — that symptom is explained by the missing `@PluginMethod` on `products()`, which
+  failed every Android call however the APK was signed.
+- ⚠️ **A parked `purchase()` has a 5-minute native timeout (#583) — and it HAD to be native.** When
+  `purchasesUpdated` fires OK with a list that does not contain the awaited product, the call is
+  deliberately left parked (the delivery may be an unrelated Ask-to-Buy approval or a renewal).
+  Nothing bounded that, so a delivery that never matched left the slot occupied for the life of the
+  process: the product refused every later `purchase()` with "already in progress", and in Court
+  `storeInFlight` never cleared either — which made the `court.purchase` reload blocker read blocked
+  forever and **silently disabled the whole #574 resume-reload for the process**. `armStoreWatchdog`
+  does not help; by design it releases the SCREEN, not the purchase.
+  A JS-side timeout in `purchaseService.ts` would NOT have worked, and the fix is worth understanding
+  for that reason: the stuck resource is `awaitingPurchase`, a plugin FIELD. Settling the JS promise
+  clears `storeInFlight` but leaves the native slot parked, so the next `purchase()` still hits the
+  hard reject — one confusing "cancelled" followed by a permanent refusal that merely LOOKS fixed.
+  ⚠️ **It is armed from the NO-MATCH BRANCH ONLY — never at park time**, and that distinction is the
+  whole safety argument. A park-time draft shipped first and close-out review killed it: arming at
+  park bounds EVERY purchase, including one whose Play sheet is legitimately still open, and firing
+  resolves `{transaction:null}`, which settles the JS promise, which clears `storeInFlight` — whose
+  own doc records that the last omission in that area was a DOUBLE CHARGE. That was not theoretical:
+  the park-time build was measured on the A23 firing at 10:55:25 with the sheet still on screen.
+  Bounding only the case #583 describes — an OK delivery that arrived without the awaited product,
+  re-armed on each further non-matching one — leaves a live sheet alone. Cancelled in `unpark()`, the
+  single choke point every settle path routes through (including #586's reload release), with the
+  cancel INSIDE the `awaitingPurchase == call` identity check so a stale settle cannot cancel a newer
+  call's timer.
+  Three further things review forced, all pinned by `iapParkedCallRelease.test.ts` and each verified
+  by mutation (break it, watch exactly one test go red, restore):
+  **(a)** the check-and-park is `synchronized (lock)` and the two fields are `volatile` — the park runs
+  on a Play Billing THREAD POOL (`queryProductDetailsAsync` submits to
+  `Executors.newFixedThreadPool(availableProcessors())` and calls back directly, no Handler post), so
+  a non-atomic guard lets two `purchase()` calls both see the slot free and the loser parks a
+  `setKeepAlive(true)` call nothing can settle — the very defect #583 bounds, on the one path a
+  stale-fire guard cannot rescue; **(b)** `handleOnDestroy()` drops anything posted, since an armed
+  timer strongly holds the `PluginCall` → `Bridge` → `WebView` → `Activity`; **(c)** the fire path
+  unparks BEFORE resolving, matching every other settle site.
+  ✅ **The whole chain is device-verified, arm site included — and #583 was reproduced, which it
+  never had been.** The issue shipped as static analysis because nobody could make Play deliver an
+  OK list without the awaited product. The recipe, measured on the A23 on 2026-09-03, is a
+  **licence tester's SLOW test instrument** (the sheet's payment-method row offers "approves in a
+  few minutes" alongside "always approves" — the latter settles instantly and is useless here):
+
+  1. Buy product A on the slow card -> `delivered: products=[A] state=2` (PENDING, `order=null`).
+     That delivery MATCHES A, so it settles A's own call normally.
+  2. Park a DIFFERENT product B while A is still pending.
+  3. A's approval lands as `delivered: products=[A] state=1` while B is awaited — the no-match
+     branch, reached for the first time on hardware.
+
+  ```
+  14:20:15.816  delivered: products=[court.coins.1000] state=2      <- PENDING, slow card
+  14:20:54.781  launchBillingFlow: court.coins.2500                 <- B parked
+  14:21:15.040  delivered: products=[court.coins.1000] state=1      <- A approves
+  14:21:15.042  delivery does not contain the awaited product (court.coins.2500)   <- ARM
+  14:26:15.045  purchase timeout: ... within 300000ms of the last non-matching one <- FIRE (+300003ms)
+  14:27:22.142  onPurchasesUpdated: code=1 parkedCall=FALSE         <- slot already free
+  ```
+
+  The last line is the load-bearing one: dismissing the sheet afterwards reported the slot as
+  already empty, from a different code path than the one that released it, so the FIELD was cleared
+  and not merely logged. The JS promise resolved `{transaction:null}`.
+
+  ⚠️ **And the game is RUNNING the whole time the sheet is up** — measured behind an open sheet in
+  the same session: `document.visibilityState` `"visible"`, `document.hidden` false, and **46
+  requestAnimationFrame ticks in 1010 ms**. `ProxyBillingActivity` is translucent, so the host
+  Activity pauses and never stops; the WebView keeps rendering and the main looper keeps delivering,
+  which is why a `Handler` timer fires normally there. Do not assume the app is suspended behind a
+  purchase sheet — it is live, and killable, with no `appStateChange` having fired.
+
+  ⚠️ **Being live is what makes that survivable, and it cut the other way from how #619 first read
+  it.** A running app keeps servicing the 150 ms PlayerPrefs debounce, so pending writes drain
+  themselves behind the sheet; nothing accumulates for its duration. The write with no timer behind
+  it was a *rejected* one, which #619 fixed by making the retry self-scheduling. The missing
+  lifecycle edge was fixed too — `@capacitor/app`'s `'pause'` event does fire from
+  `handleOnPause()`, which is now measured on the A23 rather than read out of Capacitor's source. Full write-up: [native-and-sdks.md](./native-and-sdks.md) § "The defects this
+  boundary produced, and how each was addressed".
+
+- ⚠️ **The precondition that DOES gate it is a Play LICENCE-TESTER account on a published app.**
+  Court is on internal testing (#370), and the human confirmed the sheet shows the real price against
+  a licensed test account — a free test purchase. That is the documented Google condition, and it is
+  why the four arms are indistinguishable: a licence tester is served the catalogue for ANY locally
+  installed build of a published package. **A machine whose Google account is not a licence tester
+  cannot test IAP locally, however it builds or signs** — budget a Play upload there, not here.
+- ⚠️ **Catalogue and sheet-launch are not a completed purchase.** The runs above were cancelled on
+  purpose, so nothing measured here covers a purchase completing, being acknowledged, or being
+  attributed — where Play's checks are strictest. Do not generalise "IAP works on a local build"
+  past `queryProductDetails` + `launchBillingFlow`.
 - What blocks the loop is narrower: `adb install` of a **debug** APK over a **release-signed** one
   fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Build release-signed, or uninstall first — and
   uninstalling destroys the on-device ledger, which is usually the state under test. A `versionCode`
@@ -309,6 +651,17 @@ someone re-attaches it and unknowingly tests against a stale product list.
   fails.
 - **One `BillingClient`, ever.** Building one per call produced four concurrent clients at boot; the
   plugin holds a single client with queued callers and reconnects rather than replacing.
+- **The `purchase()` call is parked, not answered directly** — Play reports the outcome through
+  `purchasesUpdatedListener`, not through `launchBillingFlow`'s return, so `purchase()` stashes the
+  call in `awaitingPurchase`/`awaitingProductId` and marks it `setKeepAlive(true)`. Every one of the
+  four places that can settle it (cancel, a non-OK/null delivery, a matched delivery, a launch
+  failure) routes through one `unpark()` helper, which clears both fields and the keep-alive flag
+  together, before resolve/reject. **Invariant: a settle path never touches `awaitingPurchase`,
+  `awaitingProductId`, or `setKeepAlive` directly — always through `unpark()`.** ⚠️ On Android today
+  that keep-alive flag is inert rather than a leak (`Bridge.java` only saves a kept-alive call at
+  the moment the plugin method *returns*, and this call is parked several async hops later) — #514
+  was filed on the opposite reading; see the docblock on `unpark()` for the full trace through
+  Capacitor's bridge.
 - Release builds swallow JS console logs unless `loggingBehavior: "production"` is set.
 
 **`games/iap-test`'s upload history**, so a later reader can date a device behaviour to a build:
@@ -371,12 +724,32 @@ Kept because each is a class, not an incident.
 | Two concurrent `purchase()` calls orphaned a `PluginCall` — its promise hung forever | same slot, no occupancy check |
 | Ledger held 300 coins; screen showed 0 | `entity.set(UIElement, …)` does not dirty the UI projection — **data-correct is not pixels-correct** |
 | `withInterruption` skipped the wrapper at `'none'`, so the device toggle could never arm | an optimisation for the state every build starts in |
+| A game swap landing during an await could write entitlements into the NEXT game's live `Set` (#434) — `stillActive(c)` was checked before the await but not immediately before the write that followed it | a check that guards the wrong moment |
+| `dispose()` existed and was called, but raced the constructor's own `addListener` round-trip, so the native listener still outlived the swap (#487) | a teardown that cannot see the setup it is undoing |
+| Every purchase failure on iOS reported `"Request Canceled"` — the catch-all rejected with `localizedDescription` alone, discarding the domain, code and underlying error (#499) | **a diagnostic that erases the difference it exists to report** |
+| A *thrown* `StoreKitError.userCancelled` fell into that same generic arm, so a player who backed out was reported as a failure — and reached `purchase_failed` analytics, which the design says a cancel must never do (#499) | one outcome with two code paths, only one of them handled |
 
-Two shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
+Three shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
 subsystem, sweep the *chain*, not the change. And **a check that cannot fail** (rows 1, 10): if a
 guard has never been observed rejecting anything, assume it does not work. The first row is the one
 to remember — it was found only by tracing the durability claim through four files into the
 storage backend, and every test and every device run had been green with it in place.
+
+The third, added by #499: **an error path that reports without classifying.** A failure that always
+says the same thing is indistinguishable from a failure that always happens for the same reason, and
+the cost is paid later, by whoever has to reproduce it on a phone. The owner hit a reproducible
+purchase failure whose journal line — `error: "Error: purchase failed: Request Canceled"` — was
+compatible with a user cancel, an `ASDErrorDomain`/`AMSErrorDomain` account or sandbox fault, and a
+network drop, all at once. The native plugins now carry `domain`/`code`/`underlying` through
+Capacitor's reject payload, `iap.purchase.failed` journals them, and the classification rides into
+`PurchaseResult.error`. **The test to apply when writing any error branch: could two causes that
+need different fixes produce the same line here?**
+
+⚠️ The fix for it had the same defect one layer up, which is worth more than the fix: the JS reader
+looked for the payload at the wrong depth, so a carefully-built diagnostic was assembled natively,
+serialized, and dropped on arrival — and the test asserted the reader's own wrong shape, so nothing
+went red. See § "A rejection carries a diagnosis" above. **A fake that models behaviour the real
+dependency does not have makes the guard defend the bug.**
 
 ---
 

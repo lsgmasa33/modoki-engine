@@ -1,0 +1,13 @@
+{
+  "contextmenu.item.Move to Trash": "Interpolated context-menu label built from live project data (a folder/asset name), not a finite source-side literal — contextMenuItemIds's docblock explains why interpolated labels are deliberately not derived.",
+  "contextmenu.item.Remove GroupAlpha": "Interpolated context-menu label (`Remove ${title}`), built from live project data — same as contextmenu.item.Move to Trash above.",
+  "particle.bursts.row.0.count": "Authored array index (a `*.row.${i}.*` id) — no finite source-side vocabulary to derive from; see the 'Families with NO deriver' note above particleFieldIds.",
+  "particle.bursts.row.0.remove": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "particle.bursts.row.0.time": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "particle.bursts.row.2.count": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "particle.bursts.row.2.time": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "spriteAnim.frames.0.down": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "spriteAnim.frames.0.remove": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "spriteEditor.slice.91ba05c8-33d3-4389-936f-892ac9262743": "Authored sprite-slice GUID — project data, not a source-side value.",
+  "uiActions.binding.0.kind": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above."
+}

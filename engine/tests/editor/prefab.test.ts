@@ -1,12 +1,13 @@
 /** Tests for the prefab system. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, PrefabInstance, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getEntityTraits, readTraitData, getAllEntities } from '@modoki/engine/runtime';
 import { getTraitByName } from '@modoki/engine/runtime';
-import { serializePrefab, instantiatePrefab, PREFAB_FORMAT_VERSION, type PrefabFile } from '@modoki/engine/editor';
+import { registerAsset } from '@modoki/engine/runtime';
+import { serializePrefab, instantiatePrefab, getPrefabSource, PREFAB_FORMAT_VERSION, type PrefabFile } from '@modoki/engine/editor';
 import {
   buildPrefabEditScene,
   SCAFFOLD_PREFIX,
@@ -182,6 +183,77 @@ describe('instantiatePrefab', () => {
     const eaMeta = getTraitByName('EntityAttributes')!;
     const childEa = readTraitData(childId, eaMeta);
     expect(childEa!['parentId']).toBe(rootId);
+  });
+
+  // Close-out (2026-09-05, #762 follow-up fallout): every RAW-fetched instantiate path
+  // (Assets.tsx/Hierarchy.tsx/Inspector.tsx) hands its prefab straight to instantiatePrefabAsync
+  // → instantiatePrefab WITHOUT going through getPrefabSource, which is where the migration used
+  // to live exclusively — so a raw-fetched prefab authoring UIAnchor.zIndex spawned with the key
+  // silently dropped (koota's generated setter ignores an unknown field) instead of landing on
+  // UIElement.zIndex. instantiatePrefab's spawn loop now runs the migration itself.
+  it('migrates UIAnchor.zIndex onto UIElement.zIndex at spawn time', () => {
+    const prefab: PrefabFile = {
+      version: 1,
+      name: 'ZIndexTest',
+      rootLocalId: 1,
+      entities: [
+        {
+          localId: 1, name: 'Root',
+          traits: {
+            UIAnchor: { zIndex: 20 } as unknown as Record<string, unknown>,
+            UIElement: { zIndex: 0 } as unknown as Record<string, unknown>,
+            EntityAttributes: { name: 'Root', parentId: 0, layer: 'ui' },
+          },
+        },
+      ],
+    };
+
+    const rootId = instantiatePrefab(prefab);
+    expect(rootId).toBeGreaterThan(0);
+
+    const uiElementMeta = getTraitByName('UIElement')!;
+    const uiAnchorMeta = getTraitByName('UIAnchor')!;
+    expect(readTraitData(rootId, uiElementMeta)!['zIndex']).toBe(20);
+    // UIAnchor.zIndex no longer exists on the trait at all — the koota schema has no such field —
+    // so there is nothing to assert it was "cleared" beyond the element having picked it up.
+    expect(uiAnchorMeta.fields['zIndex']).toBeUndefined();
+  });
+});
+
+// Close-out (#762 follow-up): getPrefabSource used to migrate only `entry.traits` — a shallow
+// call — so a nested-instance row's OWN `overrides`/`added`/`nestedOverrides` (the outer localId
+// space a nested prefab's scene-authored overrides live in) never got the fix, unlike the four
+// locations loadSceneFile.ts's migrateV12toV13 covers for scenes. It now deep-walks each entry.
+describe('getPrefabSource — deep UIAnchor.zIndex migration on fetch', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('migrates zIndex inside a nested-instance row\'s own overrides, not just top-level traits', async () => {
+    const fixture: PrefabFile = {
+      id: 'bbbbbbbb-0000-4000-8000-000000000099',
+      version: 1,
+      name: 'NestedFixture',
+      rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0, layer: 'ui' } } },
+        {
+          localId: 2, name: 'ChildInstance', prefab: 'some-child-guid',
+          traits: { EntityAttributes: { name: 'ChildInstance', parentId: 1, layer: 'ui' } },
+          overrides: { 9: { UIAnchor: { zIndex: 33 }, UIElement: { zIndex: 0 } } },
+        },
+      ],
+    };
+    registerAsset(fixture.id!, '/games/x/assets/prefabs/NestedFixture.prefab.json', 'prefab');
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => JSON.parse(JSON.stringify(fixture)),
+    })));
+
+    const loaded = await getPrefabSource(fixture.id!);
+    expect(loaded).not.toBeNull();
+    const nestedRow = loaded!.entities.find((e) => e.localId === 2)!;
+    const bag = nestedRow.overrides![9];
+    expect((bag.UIElement as Record<string, unknown>).zIndex).toBe(33);
+    expect((bag.UIAnchor as Record<string, unknown>).zIndex).toBeUndefined();
   });
 });
 

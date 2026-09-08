@@ -129,6 +129,24 @@ describe('atlasReimportHandler', () => {
     expect(h2).toBe(h1);
   });
 
+  // #784 (docs/format-versioning.md § 2b-bis: REFUSE disposition) — the atlas reimport handler
+  // parsed a versioned document with no try/catch AND ignored `raw.version` entirely. This is
+  // its REFUSE-disposition regression test: a too-new document must not be packed at all, and
+  // the throw lands in the caller's own error handling (unit-tested at the source directly here,
+  // since the three production callers — the build gate, the dev route, and modoki_import_file —
+  // each already have their own try/catch around this handler; see reimport-atlas.ts's header).
+  it('refuses a too-new .atlas.json — throws before any pack work runs, sidecar untouched', async () => {
+    fs.writeFileSync(atlasAbs, JSON.stringify({
+      id: ATLAS, version: 99, members: [SP_A, SP_B],
+      pageSize: 128, padding: 4, extrude: 2,
+    }, null, 2));
+    const before = readMetaSidecar(atlasAbs).atlasCache;
+
+    await expect(atlasReimportHandler(ATLAS_URL, atlasAbs, ctxFor(listAssets()))).rejects.toThrow(/99/);
+
+    expect(readMetaSidecar(atlasAbs).atlasCache).toEqual(before); // no pack work landed
+  });
+
   it('changes the content hash when a member slice rect changes', async () => {
     writeAtlas([SP_A, SP_B], { pageSize: 128, padding: 4, extrude: 2 });
     await atlasReimportHandler(ATLAS_URL, atlasAbs, ctxFor(listAssets()));

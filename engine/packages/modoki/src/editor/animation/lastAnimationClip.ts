@@ -7,15 +7,23 @@
  *  The Animator binding is stored as the entity's stable `EntityAttributes.guid`
  *  (NOT its koota id, which is reassigned every scene load), and restore only
  *  fires when the SAME scene is loaded — guids are scene-scoped. Mirrors the
- *  guid-keyed approach in `selectionRestore.ts`. */
+ *  guid-keyed approach in `selectionRestore.ts`.
+ *
+ *  The key is ALSO project-scoped (#473). The same-scene check reads like it already covers a
+ *  project switch, and it does not: scene paths are flat (`/assets/scenes/main.scene.json` is
+ *  several projects' boot scene), so two projects collide on the string and the guard passes —
+ *  and it is skipped outright when the persisted `scenePath` is null. Scoping the key removes
+ *  the cross-project case entirely instead of relying on names not colliding. */
 
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentScenePath } from '../scene/serialize';
+import { getGuidForPath } from '../../runtime/loaders/assetManifest';
+import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
 
-const KEY = 'editor:lastAnimationClip';
+const KEY_BASE = 'editor:lastAnimationClip';
 
 interface PersistedClip {
   path: string;
@@ -69,6 +77,7 @@ let unsubscribe: (() => void) | null = null;
 export function registerLastAnimationClipPersistence(): void {
   if (registered) return;
   registered = true;
+  clearUnscopedLegacyKey(KEY_BASE);
   let prevPath = useEditorStore.getState().editingAnimationAsset?.path ?? null;
   let prevRoot = useEditorStore.getState().animatorRootEntityId;
   unsubscribe = useEditorStore.subscribe((state) => {
@@ -81,27 +90,37 @@ export function registerLastAnimationClipPersistence(): void {
     if (path === prevPath && rootId === prevRoot) return;
     prevPath = path;
     prevRoot = rootId;
-    if (!asset) { try { localStorage.removeItem(KEY); } catch { /* ignore */ } return; }
+    // Resolve the key per write, not once at register — see projectScopedKey.
+    const key = projectScopedKey(KEY_BASE);
+    if (!asset) { try { localStorage.removeItem(key); } catch { /* ignore */ } return; }
     const payload: PersistedClip = {
       path: asset.path,
       name: asset.name,
       animatorGuid: rootId != null ? guidForEntity(rootId) : null,
       scenePath: getCurrentScenePath(),
     };
-    try { localStorage.setItem(KEY, JSON.stringify(payload)); } catch { /* quota/private mode */ }
+    try { localStorage.setItem(key, JSON.stringify(payload)); } catch { /* quota/private mode */ }
   });
 }
 
 /** Re-open the last clip into the editor store. No-op (returns false) when there
- *  is nothing saved, the JSON is bad, or it was bound under a different scene.
- *  Call after the scene has loaded so the Animator guid can be resolved. */
+ *  is nothing saved, the JSON is bad, it was bound under a different scene, or the remembered
+ *  clip is not an asset of the project now open. Call after the scene has loaded so the Animator
+ *  guid can be resolved (the manifest is up by then too, which the existence check needs). */
 export function restoreLastAnimationClip(): boolean {
+  const key = projectScopedKey(KEY_BASE);
   let raw: string | null;
-  try { raw = localStorage.getItem(KEY); } catch { return false; }
+  try { raw = localStorage.getItem(key); } catch { return false; }
   if (!raw) return false;
   let p: PersistedClip;
   try { p = JSON.parse(raw); } catch { return false; }
   if (!p?.path) return false;
+  // A clip deleted/renamed/moved since it was remembered no longer serves — re-opening it would
+  // take the dev server's SPA fallback and report the human's file as broken (#460/#473). Refuse,
+  // but do NOT delete the entry: a failed manifest fetch resolves to null and leaves every path
+  // unresolvable for one launch, and dropping on that makes a transient failure permanent. See
+  // the fuller note on restoreLastSkinRig.
+  if (!getGuidForPath(p.path)) return false;
   // Guids are scene-scoped — don't rebind into an unrelated scene.
   const scene = getCurrentScenePath();
   if (p.scenePath && scene && p.scenePath !== scene) return false;

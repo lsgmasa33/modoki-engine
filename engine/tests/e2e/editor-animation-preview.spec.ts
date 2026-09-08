@@ -22,8 +22,11 @@ test('enabling Animation preview does not turn on the skeletal-mixer flag', asyn
   // Baseline: nothing is previewing, so the flag is off.
   expect(await page.evaluate(() => (window as any).__modokiEditorTest.isSkeletalPreviewing())).toBe(false);
 
-  // Turn on the Animation preview exactly as the transport ▶ does (sim stays Stopped).
-  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true));
+  // Turn on the Animation preview exactly as the transport ▶ does (sim stays Stopped) — including
+  // the owner tag the transport passes (#810 follow-up). `isPreviewPlaying` is shared with the
+  // Timeline panel, so an untagged call drives NEITHER panel; naming the panel is what the real
+  // gesture does.
+  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true, 'animation'));
   expect(await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().isPreviewPlaying)).toBe(true);
 
   // Let many SceneView frames run — any one of them could have flipped the flag.

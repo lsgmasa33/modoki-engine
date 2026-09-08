@@ -35,7 +35,7 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
-⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment at `healNativeConfig.ts:596`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
 
 ⚠️ **Those plugins' `package.json` therefore declares `"capacitor": { "android": … }` with NO `ios` entry, and that is DELIBERATE.** The App target already compiles the `.swift` directly; adding an `ios` entry makes `cap sync ios` *also* add the SPM package, so the plugin class lands in two modules — **one `@objc` runtime class name with two implementations**. (What that then does at runtime has not been observed: the ObjC runtime resolves one name to one implementation, so expect a duplicate-class warning and a nondeterministic winner rather than, say, two `NWListener`s both binding :9095. The defect is the duplication; the symptom is unverified.)
 
@@ -155,6 +155,26 @@ const { shown } = await ApplovinMax.showInterstitial();
 await ApplovinMax.showMediationDebugger();
 ```
 
+⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an
+empty id throws on the native **main thread** — outside any JS `try/catch` — and terminates the app.
+So a game's ad wrapper must gate on **the unit id it is about to pass**, per entry point; gating on
+the SDK key alone is not enough, because a configured key with unfilled unit ids is exactly the
+half-configured state that reaches the SDK.
+
+⚠️ **Check the plugin signature — not every ad call takes an id, and the rule only bites on the
+ones that do.** **Read the plugin's `definitions.ts` for the call you are adding** rather than trusting a list
+here — this one has already been wrong once, and a hand-maintained enumeration in a doc whose
+thesis is "check the signature" is precisely what goes stale. As of writing, `loadInterstitial`,
+`loadRewardedAd`, `showBanner` and `showMRec` take an `adUnitId`, and those guards are crash
+guards; `showInterstitial`/`showRewardedAd` take only `{ placement }` and
+`hideBanner`/`showMediationDebugger` take nothing at all, so no blank id can reach the SDK through
+them — guarding those on the unit id is still right, but it is a *behavioural* "we never loaded
+one, so there is nothing to show", not a crash guard. Stating it as one (this doc did, briefly)
+teaches the next wrapper author to look for the wrong thing. `games/court/packages/app-services/src/ads.ts` is the
+reference shape (a `unit(kind)` accessor + a guard on every call that takes an id);
+`games/3d-test`'s had the warning in its banner and the check on the key only, which is how #510
+was filed. `hideBanner`/`showMediationDebugger` take no id and need no such guard.
+
 ### `capacitor-adjust` — Adjust (SDK v5)
 
 Attribution, event tracking, ad-revenue, IDFA/ADID, ATT, purchase verification.
@@ -204,24 +224,441 @@ await LitertLm.sendMessage({ conversationId, message }); // tokens stream via 't
 
 **Model download is split by platform** (`games/llm-test/runtime/services/ModelDownloader.ts`): on **Android** `LitertLm.downloadModel` fetches via `HttpURLConnection` into app internal storage and returns the local file path (skipped if `isModelDownloaded` reports it present); on **web** the plugin's `downloadModel`/`isModelDownloaded` are no-ops — the game instead `fetch`es the model with a streaming reader for progress, stores it in the `caches.open('llm-models')` Cache API, and hands MediaPipe a `URL.createObjectURL(blob)`. Web's `loadModel` lazy-imports `@mediapipe/tasks-genai` (and its wasm fileset from jsdelivr) so the bundle isn't paid for off-web.
 
+## Removing a plugin listener — `remove()` is NOT idempotent
+
+⚠️ **Calling `.remove()` twice on one `PluginListenerHandle` silently evicts somebody ELSE's
+listener.** `@capacitor/core`'s `WebPlugin.removeListener` is, verbatim:
+
+```js
+const index = listeners.indexOf(listenerFunc);
+this.listeners[eventName].splice(index, 1);
+```
+
+There is no `index === -1` guard, so a stale remove does `splice(-1, 1)` — which deletes the
+**last** entry in that event's array. Nothing throws and nothing logs. The victim is whichever
+listener registered most recently, i.e. usually the newest one, i.e. the one somebody is
+actively waiting on.
+
+**This bites the moment a handle has two paths to removal**, which is exactly what a teardown
+that can reach an in-flight operation creates: `dispose()` removes the handle, and then the
+operation's own `finally` removes it again. Concretely (#525): a dispose lands mid-load, a fresh
+service starts a new load and registers its `loadProgress` listener, the first load's promise
+then settles and its `finally` evicts the NEW listener — and that load's progress sits at 0 for
+a multi-GB download with nothing erroring anywhere.
+
+**The shape that is safe** — the Set membership is the arbiter, so the two paths are mutually
+exclusive, and `games/llm-test/runtime/services/CapacitorLLMService.ts` is the worked example:
+
+```ts
+private activeListeners = new Set<PluginListenerHandle>();
+// ... register:  this.activeListeners.add(handle);
+// ... teardown:  for (const h of this.activeListeners) h.remove(); this.activeListeners.clear();
+// ... finally:   if (this.activeListeners.delete(handle)) handle.remove();
+```
+
+Two rules follow, and the second is the one that gets skipped:
+
+1. **Never remove a handle a teardown can also reach without a membership check.** A bare
+   `handle.remove()` in a `finally` is correct only while nothing else can remove that handle.
+2. **Every listener a class registers goes in the same registry.** The asymmetric version —
+   one kind of listener tracked, another kept as a bare local — is its own defect with the
+   polarity reversed: `dispose()` cannot reach the untracked one, so a teardown mid-operation
+   leaves it registered until that operation settles. Fixing that by adding it to the registry
+   while leaving its `finally` unconditional trades the leak for the double-remove above.
+
+A repo-wide sweep (2026-09-01) found no remaining reachable double-remove. The near misses are
+single-path only by accident and are worth knowing: `games/court/packages/app-services/src/auth.ts`'s
+`onAuthChanged` unsubscriber and `games/court/runtime/cloudSyncWiring.ts`'s registered closures both
+do a bare `void handle.remove()` with no guard and no null-out — safe today because each has exactly
+one caller that drains exactly once, and unsafe the moment a second caller appears.
+
+## What a webview reload does and does not reset (#547)
+
+`location.reload()` is this engine's restart primitive — the owner's 2026-09-02 ruling is that the
+app has **no teardown path**, so a full reload is the sanctioned route to clean state, and the route
+for AB tests, LiveOps and resuming after a long background (`useResumeReload.ts`, #574).
+⚠️ Only the last of those exists today — there is no LiveOps or A/B system in the engine
+(`docs/todo.md`); the other two are stated intent for a reload, not shipped consumers of one. The JS side
+of that is covered in [managers-and-systems.md](managers-and-systems.md) § "App-scoped managers are
+never unregistered in production" — **every end-of-lifetime here is a REALM DEATH, not a teardown.**
+
+This section is the other half: what happens NATIVELY, where the process outlives the realm.
+
+**The one-line rule: a realm death is not a process death.** A reload rebuilds every manager, system,
+store, cache and module `let`. It re-runs nothing native. Anything initialised once per process
+launch — `FirebaseApp.configure` in `AppDelegate`, Android's `FirebaseInitProvider`, a plugin's
+`load()` — survives untouched, and a JS latch (`let initialized = false`) cannot see the difference.
+**Where a once-per-process guard is genuinely needed, it must live natively.**
+
+### What Capacitor does on every navigation
+
+Both platforms call `bridge.reset()` at navigation START — `WebViewDelegationHandler.swift`'s
+`didStartProvisionalNavigation`, `BridgeWebViewClient.java`'s `onPageStarted`. It does exactly
+two things:
+
+1. clears its saved-call map (`savedCalls` on Android, `storedCalls` on iOS)
+2. calls `removeAllListeners()` on every plugin instance, emptying each one's JS listener list
+
+⚠️ **This contract is source-only — it is NOT in Capacitor's documentation**, so it can regress in a
+future version with no changelog entry. Anything depending on it should cite these lines.
+
+⚠️ **Navigation is not the only trigger.** iOS also calls `reset()` from
+`webViewWebContentProcessDidTerminate` (`WebViewDelegationHandler.swift`) — the WKWebView
+content process being recycled while the app process lives on. That is the concrete mechanism behind
+the `sessionStorage` caveat below and in `resumeReload.ts`: the JS realm and its storage can vanish
+without any navigation, and without the native side noticing at all.
+
+What `reset()` does **not** touch, all verified against the vendored sources (2026-09-03):
+
+- **Plugin fields.** A plugin's own state survives. This is a live bug source: `ModokiIapPlugin`'s
+  parked `purchase()` call is a field, not a saved call, so a reload used to strand it and reject
+  every later purchase for that product (#586).
+- **`retainedEventArguments`.** A separate map from `eventListeners`, so an event fired with
+  `retainUntilConsumed: true` while no listener is attached is **queued**, and drains when the next
+  realm subscribes (`Plugin.java`'s `notifyListeners` + `addEventListener` →
+  `sendRetainedArgumentsForEvent`; `CAPPlugin.m`'s `notifyListeners:data:retainUntilConsumed:`
+  is the same shape). This is the fix for a delivery landing in the reload
+  window — retention beats trying to subscribe earlier, because it closes the window instead of
+  narrowing it.
+- **`webViewListeners`.** `Bridge.addWebViewListener` registrations survive every reload, which is
+  what makes `WebViewListener.onPageStarted` the right seam for native-side reload cleanup on
+  Android. ⚠️ There is **no `handleOnPageStarted` on `Plugin`** — the lifecycle hooks stop at
+  `handleOnStart/Restart/Resume/Pause/Stop/Destroy/ActivityResult/NewIntent/ConfigurationChanged`.
+  iOS's nearest equivalent is `shouldOverrideLoad:` (`CAPPlugin.h`, dispatched per plugin from
+  `WebViewDelegationHandler.swift`), but it is **not** interchangeable: it is a *policy* hook,
+  so an observer must return `nil` to avoid altering navigation, and it fires inside
+  `decidePolicyFor` — i.e. **before** `reset()` (in `didStartProvisionalNavigation`), the
+  opposite ordering to Android's `onPageStarted`, which runs after it. So a cleanup that needs
+  "the old realm is definitively gone" has no exact iOS twin.
+
+### Retained events are drained exactly once, ever
+
+`CAPPlugin.m`'s `sendRetainedArgumentsForEvent:` reads the retained array and then `removeObjectForKey:` — permanently. So an event emitted with
+`retainUntilConsumed: true` and consumed by the FIRST realm is gone for every later one. Firebase's
+`authStateChange` is emitted that way, which means **after a reload `onAuthChanged` never fires**
+until a genuine sign-in or sign-out. Court survives only because `cloudSyncWiring.ts`'s `seedUid`
+polls `currentUser()` on a backoff — a mitigation written for iOS keychain restore, with nothing
+naming reload as a case it covers. **Weaken that poll and cloud save goes permanently inert after
+every reload.**
+
+### Conversely: plugin listeners do NOT leak across reloads
+
+Worth recording because the widely-repeated opposite is stale. `reset()` gained
+`removeAllPluginListeners()` in [capacitor#7962](https://github.com/ionic-team/capacitor/commit/06aeea9);
+before that they genuinely did stack up. Anything written before that commit is wrong about this.
+
+### Per-process native init, per shipped project
+
+- `games/court` — `AppDelegate.swift`'s `FirebaseApp.configure(options:)` call; Android via
+  `FirebaseInitProvider` at process start. **Unreachable from JS**: none of the four
+  `@capacitor-firebase/*` plugins exposes a JS-side init and Court calls none, so a reload can
+  neither re-run nor double-configure it, and it needs no guard. All four plugin implementations
+  also carry their own `if (FirebaseApp.app() == nil)` guard, the vendor's answer to the fatal
+  double-configure trap.
+- `games/3d-test` — same `AppDelegate` shape.
+- Plugin `load()` overrides run once per plugin INSTANCE. ⚠️ That is not the same as once per
+  process on Android: `BridgeActivity.onCreate` builds a fresh `Bridge` with fresh `PluginHandle`s,
+  so an Activity recreation runs `load()` again. Current `load()` overrides:
+  `IapPlugin.swift`'s StoreKit `Transaction.updates` observer, and (since #586)
+  `ModokiIapPlugin.java`'s `WebViewListener` registration.
+
+### Firestore snapshot listeners — a trap that is currently unreachable
+
+Capacitor's Android `reset()` (`Bridge.java`) calls the **no-arg** `removeAllListeners()`
+(`Plugin.java`'s no-arg overload, which only does `eventListeners.clear()`), so Firestore's own
+`removeAllListeners(PluginCall)` override is **never reached**. iOS is fine — `CapacitorBridge.swift`
+dispatches via `#selector(CAPPlugin.removeAllListeners(_:))`, which does hit the Swift override.
+
+**Inert today, and deliberately not "fixed":** there are zero `addDocumentSnapshotListener` /
+`addCollectionSnapshotListener` / `addCollectionGroupSnapshotListener` / `onSnapshot` call sites in
+`games/` or `engine/` — every Firestore
+call in `cloudSave.ts` is one-shot, and its "Do NOT add a Firestore SNAPSHOT LISTENER here"
+comment (#588) says so. It becomes a real per-reload leak
+— billed reads, battery, invisible — on the day Court adopts its first snapshot listener. That day,
+start here (#588).
+
+### The defects this boundary produced, and how each was addressed
+
+All five were found by reading the reload path end to end while building #574's trigger. They share
+one root: **a guard, a latch or a counter that assumes "restart" means a new process.** The first
+four are fixed on `work-ai2`; check `git log`/the issues for whether that has reached `main` yet.
+
+| # | Defect | Fix |
+|---|---|---|
+| #584 | A reload counted as an OTA boot-confirmation, so `requiredConfirms = 2` was satisfied by one real launch plus a refresh — the two-boot watchdog defeated by exactly the thing it excludes | `OtaCore.confirm` credits at most one confirm per counted boot attempt, in the pure core on both ports so the shared vectors hold them to one spec |
+| #586 | `ModokiIapPlugin`'s parked `purchase()` call is a plugin FIELD that `Bridge.reset()` never clears, so the next realm's purchase was rejected forever; and a `purchasesUpdated` delivery in the reload window was dropped | A `WebViewListener.onPageStarted` releases the stale slot — registered at PARK time, **not** from `load()`; see the ⚠️ below. `purchasesUpdated` is now emitted `retainUntilConsumed: true` on both platforms, so a delivery with no listener is queued and drains into the next realm |
+| #587 | `AdsService.cleanup()` hung off a React unmount that never commits, so banners/MRECs survived every reload still refreshing and monetising with no listener — undercounting `ad_revenue`; and one interstitial was orphaned per `loadInterstitial` | `registerRealmShutdownTask` / `runRealmShutdownTasks` — the app registers, the runtime invokes (the reload sites are in `runtime/**` and cannot reach `appServices()`); plus destroy-before-reassign for the interstitial |
+| #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
+| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Open, iceboxed.** The JS guard that would prevent it is a realm-scoped `let`, which is exactly the class above |
+
+⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
+therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
+shipped config has `sdkKey: ''`, so `initAds()` returns before it can
+`registerReloadBlocker('court.fullscreenAd', …)` or attach the `adHidden`/`adLoadFailed` listeners,
+and `cleanupAds()`'s three `destroy*` calls sit behind the same gate. Every test that exercises this
+forces the gate open with `vi.mock('./config', …)`. So the banner/MREC surviving a reload and
+under-counting `ad_revenue` — the defect #587 describes — cannot happen right now, and the first
+real exercise of the mechanism will be the day a key is added, with no device evidence behind it.
+The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
+Worth knowing before anyone reads #587 as "ads teardown is proven".
+
+⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`engine/app/useBackgroundFlush.ts`) is an ANDROID
+measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`
+firing on a mere backgrounding — not a real teardown — is documented real-world behaviour on iOS;
+nobody has measured whether it actually happens in this app's WKWebView. **The Android half that the
+gate DOES rest on is `4099c5691`'s measurement, and it lives only in that commit message, so here it
+is: on the S22, `pagehide` does NOT fire on backgrounding (that is `visibilitychange`), and DOES fire
+with `persisted: false` on a real reload.** That is the reading which makes the gate correct on
+Android and says nothing about iOS. Rather than guess at a
+narrower, iOS-specific gate (risking the worse failure of suppressing a genuine teardown), #611
+leaves the gate as-is and bounds the risk with a recovery seam instead: `realmShutdown.ts`'s
+`onRealmSurvived` plus `realmDeathBackstop.ts`'s foreground check re-init ads (and anything else
+that registers a recovery) if the trigger turns out to have been a false alarm. ⚠️ **Plain
+"re-init ads" was not enough, and #631 is why**: `cleanupAds()` nulls the rewarded-video handler and
+destroys the banner, neither of which `initAds()` puts back — so the recovery now calls a dedicated
+`AdsService.restoreAfterRealmSurvived()` when a project provides one, falling back to `init()` when
+it does not. So the risk here is
+now bounded by that seam, not by a claim that the gate itself is correct on iOS.
+
+⚠️ **#584's own commit message (`8406660ef`) states its residual BACKWARDS** — it says a sub-game's
+boot attempt is "not counted on a reload". The opposite is true and is what makes the residual real:
+`beginBundleLoad` re-runs on a reload and DOES increment (`OtaCore.java`'s `boot`,
+`OtaCore.swift`'s state-based `boot`), which is precisely why the confirm guard cannot
+protect a sub-game. This file and
+[ota-updates.md](ota-updates.md) are correct; git history is the archive and that one sentence in it
+is wrong.
+
+⚠️ **A `WebViewListener` registered from `Plugin.load()` is silently DISCARDED — #586's first fix
+was inert because of it.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java`),
+which is what runs `Plugin.load()`. `Bridge.Builder.create()` then calls
+`bridge.setWebViewListeners(...)` eighteen lines later, and that setter **replaces** the
+whole list rather than appending — so anything `load()` registered is gone before the
+first navigation, and `BridgeWebViewClient.onPageStarted`, which iterates
+`bridge.getWebViewListeners()`, walks a list that never contained it.
+
+Device-measured on a Galaxy S22 (2026-09-03), both halves of the fork, same build tooling and the
+same reload path (`[resume-reload] reloading after 80s away`, one process throughout):
+
+| Registered from | `onPageStarted` reached it? |
+|---|---|
+| `load()` | **No** — never fired across a real reload |
+| a `@PluginMethod` call (post-construction) | **Yes** — fired 116 ms after the reload line |
+
+`load()` itself was never the problem and DOES run — logged 1 ms after
+`Registering plugin instance: ModokiIap`. The original investigation looked for a missing `load()`
+because the only log in that code path sat inside `onPageStarted` **behind the parked-call guard**,
+so it could not print unless a purchase was already in flight — a probe that could not detect its
+own positive case. Register after construction instead; `ensureWebViewListener()` does it at park
+time, which is both provably late enough and exactly when the listener acquires a job.
+
+✅ **The park-and-release itself is now device-verified — #586's last open gap.** Every earlier
+check proved a LINK (`load()` runs, the listener registers, `onPageStarted` fires after a reload);
+none had ever parked a real purchase. Measured end-to-end on the Galaxy A23 (SC-56C), 2026-09-03,
+against the real Play store, one process throughout:
+
+```
+09:41:12.312  launchBillingFlow: product=court.coins.300 type=inapp        <- slot parked
+09:42:33.675  onPageStarted: webview reloaded with a purchase parked
+              (court.coins.300) - releasing it                            <- the fix fires
+09:44:08.970  onPurchasesUpdated: code=1 count=null parkedCall=false       <- field already cleared
+09:45:08.035  launchBillingFlow: product=court.coins.300 type=inapp        <- 2nd purchase LAUNCHES
+```
+
+`parkedCall=false` on the cancel is the load-bearing line: it is emitted by a different code path
+from the release itself, so it confirms the FIELD was cleared rather than merely that a log ran. The
+second `launchBillingFlow` is the user-visible half — it got past the `if (awaitingPurchase != null)
+reject(...)` guard that used to strand every later purchase. Zero occurrences of
+`a purchase is already in progress` across the run. The reload was forced through the debug bridge,
+so this measures the MECHANISM; which production events reach it is a separate question, below.
+
+⚠️ **No background edge fires while a Play billing sheet is up — so the resume-reload trigger (#574)
+never even starts, and `court.purchase` is not what stops it.** This is the opposite of what it looks
+like, and an earlier version of this section had it wrong. Capacitor's `BridgeActivity.onStop()` is
+the only caller of `fireStatusChange(false)`; `onPause` is not. Play Billing's `ProxyBillingActivity`
+is **translucent**, so the host activity pauses and never stops. Measured consequences on the A23:
+the game-debug bridge stayed up throughout the sheet (a real HOME press logs `GameDebug: Server
+stopped`; the sheet does not), and `document.visibilityState` stayed `"visible"`. `useResumeReload`
+drives `onBackground()` from exactly those two signals, so `backgroundedAt` stays `null` and
+`resumeReload.ts`'s `if (at == null) return;` bails **before any blocker predicate is consulted**.
+
+⚠️ **MEASURED, 2026-09-03, A23 (SC-56C, Android 13), `com.apiary.court`.** The claim below was
+derived from Capacitor's source when #619 landed; it is now observed. A translucent Settings panel
+(`android.settings.panel.action.VOLUME`) was launched over the running game — the same shape as
+`ProxyBillingActivity`, and `dumpsys` confirmed the host task stayed `visible=true` while the panel
+was `topResumedActivity`, i.e. paused and never stopped. With listeners registered in-page:
+
+| Edge | `pause` | `appStateChange` | `visibilitychange` | `visibilityState` |
+|---|---|---|---|---|
+| Translucent panel OPENS | **fires (x1)** | **does not fire** | **does not fire** | stays `visible` |
+| Translucent panel CLOSES | — | fires `isActive:true` | does not fire | `visible` |
+| HOME press (control) | fires | fires `isActive:false` | fires -> `hidden` | `hidden` |
+| Return from HOME (control) | — | fires `isActive:true` | fires -> `visible` | `visible` |
+
+Three things this settles that reading the source could not:
+
+- **`pause` is the only edge a translucent Activity produces**, and on the HOME control it arrives
+  BEFORE `appStateChange(false)` — the `onPause`-then-`onStop` ordering, visible from JS.
+- **Timers are not throttled behind it.** `setTimeout(..., 150)` fired at **158 ms** with the panel
+  up, alongside 47 rAF ticks in 1022 ms. ⚠️ **That is consistent with the 46-in-1010 ms figure taken
+  behind a real billing sheet (`990e1f11f`, `docs/iap.md`), but it does NOT corroborate it** — same
+  clone, same device, same agent lineage, so the two readings share every instrument and bound no
+  instrument error between them. What the new one adds is not a second opinion on rAF; it is the
+  `setTimeout` measurement, which tests the mechanism the argument actually rests on. PlayerPrefs'
+  150 ms debounce genuinely drains itself there — previously an INFERENCE from the rAF count.
+- ⚠️ **Closing a translucent Activity fires an UNPAIRED `appStateChange(isActive:true)`** — a
+  "foregrounded" with no matching `(false)` before it, because `BridgeActivity.onResume()` fires
+  the status change while `onStop` never ran. ⚠️ **This is not a translucent-Activity quirk — it is
+  the general shape.** `fireStatusChange(true)` at `onResume()` is UNCONDITIONAL, while the
+  `false` at `onStop()` is additionally gated on `activityDepth == 0`. So a runtime-permission
+  dialog, a system alert and the app's own cold-launch resume all emit one too (the cold-launch one
+  is merely dropped, since `AppPlugin.java`'s `load()` notifies with `retainUntilConsumed: false`). **Never
+  write an `appStateChange` consumer that assumes a `(true)` is preceded by a `(false)`.** Anything treating `appStateChange(true)` as "we came
+  back from being backgrounded" is wrong on this path: `useResumeReload` survives it only because
+  `resumeReload.ts` bails on `if (at == null) return;`, and **Court's cloud sync
+  (`cloudSyncWiring.ts`) issues a `'resume'` sync request on it** — so every dismissed dialog asks
+  for a sync. Pre-existing and not obviously wrong (a purchase sheet closing is a fair moment to
+  sync), but it is a network call on an edge nobody chose deliberately.
+
+The probe was shown to detect the positive case FIRST — the HOME-press control rows are that proof.
+Without them, "no `appStateChange`" would have been indistinguishable from a listener that never
+registered.
+
+⚠️ **"No background edge" is about `appStateChange`, not about the Activity lifecycle — `onPause`
+DOES run, and `@capacitor/app` publishes it.** `AppPlugin.handleOnPause()` fires a separate `'pause'`
+event, dispatched by `Bridge.onPause()` to every plugin, and that is the edge a translucent Activity
+produces. #619 subscribes to it for the PlayerPrefs flush (below). ⚠️ **`useResumeReload` is
+deliberately NOT on it** — arming a resume-reload on every translucent dialog would reload the app
+the moment a purchase sheet closes, which is a regression and not a fix — and neither is the
+game-debug bridge's port handoff, since a dialog does not change which app owns the foreground and
+the bridge staying alive through a sheet is the instrument that proved `onStop` never ran.
+
+Two things follow, and both matter more than the reload:
+- **`court.purchase` is NOT dead code** — do not "fix" or delete it on the strength of never seeing
+  it decline. It arms correctly for a genuine HOME press mid-purchase, which does reach `onStop`.
+  Its predicate reads `storeInFlight` (see `beginStorePurchase` in `games/court/runtime/systems.ts`;
+  cleared in that function's `finally` when the generation still matches, and wholesale by
+  `resetStoreUi`).
+- **PlayerPrefs get no background flush while a purchase sheet is open (#619) — and the severity
+  was overstated here first.** `App.tsx`'s background flush was `appStateChange` ->
+  `if (!isActive) flush()` with `visibilitychange`/`pagehide` as the WEB fallback only, so no edge
+  fired. ⚠️ **But this bullet used to end "pending writes stay unflushed for the whole sheet", and
+  that is wrong — the measurement in the paragraph above is what disproves it.** The write debounce
+  is 150 ms and trailing-edge (`scheduleFlush()` returns early while a timer is armed, so a burst of
+  writes does not push it out), and the app is *live* behind the sheet, so the ordinary debounce
+  drains itself — no longer an inference from the rAF count: a 150 ms `setTimeout` was measured
+  firing at 158 ms behind a translucent Activity (table above). Nothing accumulates for the
+  duration of the sheet. Flush-on-
+  background earns its keep on a real HOME press because a backgrounded WebView gets its timers
+  throttled and the pending drain may never run — which is exactly what does NOT happen here.
+  What was genuinely unbounded was a **rejected** write: `drain()`'s catch re-queued the key
+  promising "will retry on next flush" while nothing scheduled one, so it sat dirty until the next
+  `set()`/`del()`/`clear()` or an explicit `flush()`, and under a sheet neither arrives. #619 fixed
+  both ends — a `'pause'` listener for the missing edge, and a bounded self-scheduling retry in
+  `playerPrefs.ts`. **The lesson worth keeping: a live app drains its own debounce, so "no lifecycle
+  edge fires" is not by itself a durability defect — find the write that has no timer behind it.**
+
+⚠️ **What makes Play Billing serve a sideloaded build is NOT the versionCode and NOT the signing.**
+Four arms on the A23, 2026-09-03, all returning `queryProductDetails(inapp): code=0 found=6
+remaining=0` — release-signed at versionCode 1; release-signed at 6050; debug-signed at 1; and
+debug-signed at the auto-derived 6067 on a FRESH install after a full uninstall. So a low versionCode
+buys nothing (a pin was briefly committed on that false inference and reverted the same day), and
+neither does release signing.
+
+The precondition that DOES hold — confirmed the same day by the human reading the sheet — is a
+**Play licence-tester account on a published app**: Court has been on internal testing since #370,
+and the sheet showed the real price against a licensed test account (a free test purchase). That is
+the documented Google condition, and it explains why the four arms are indistinguishable: a licence
+tester is served the catalogue for ANY locally installed build of a published package. ⚠️ The
+actionable form: **a machine whose Google account is not a licence tester cannot test IAP locally**,
+however it builds or signs. Preconditions live in [iap.md](iap.md).
+
+⚠️ The older claim that a **debug-signed** APK "genuinely cannot match the Play Console listing"
+(asserted in `a19f2be8d`'s commit message) is disproven by arm three — that observation is much
+better explained by the missing `@PluginMethod` on `products()` described below, which made every
+call fail on Android regardless of how the APK was signed.
+
+⚠️ **What was verified is the CATALOGUE and the sheet launching, not a completed purchase.** Both
+runs were cancelled deliberately, so nothing here shows a purchase completing, being acknowledged,
+or being attributed — the steps where Play's checks are strictest. Do not read "IAP works on a local
+build" as broader than `queryProductDetails` + `launchBillingFlow`.
+
+⚠️ **The debug bridge survives a billing sheet but not a real background** (same measurements). Handy:
+`device_eval` can force `location.reload()` at the exact moment a call is parked, which is how the run
+above was driven. The trap: a `visibilitychange` handler is the WRONG way to detect the sheet and
+never fires — one was armed as a fallback for that run and would have been a silent no-op.
+
+⚠️ **`products()` was unreachable on Android from the plugin's first commit — a missing
+`@PluginMethod`.** The method existed and compiled; without the annotation `PluginHandle` never
+indexes it, so every call failed with `"ModokiIap.products() is not implemented on android"`. Court's
+shelf could price nothing on Android and fired `store_products_failed` on every open. iOS carried its
+`CAPPluginMethod(name: "products")` entry all along, which is why it survived so long — the platform
+where IAP got the most use was the one that worked. `npm run verify` is vitest and compiles no Java,
+so nothing local could see it; `engine/tests/architecture/pluginMethodParity.test.ts` now holds the
+TS, Android and iOS method surfaces to the same set.
+
+⚠️ **#584's fix is complete for the shell only.** A sub-game's boot attempt IS counted on a reload
+(`beginBundleLoad` re-runs and its JS genuinely re-executes), so a sub-game bundle can still reach
+`active` after one cold launch plus one resume-reload. Bounded rather than alarming — a bundle that
+fails to LOAD still never confirms — but two rapid loads in one process are weaker evidence than the
+two separate launches `requiredConfirms = 2` was written to demand. Closing it needs native process
+identity, which this fix deliberately does not use. See `docs/ota-updates.md`.
+
+⚠️ **The pattern to check when adding any once-per-process guard:** if the latch is a module `let`, a
+`sessionStorage` key, or anything else living in the JS realm, it cannot see a realm death and will
+re-run. The close-out sweep for #587 enumerated them — `grep -rnE "^let [a-zA-Z]+ = false;"` over
+`engine/packages/modoki/src/runtime`, `engine/app` and `games/court/**` gives 123 module latches, 14
+of them named like once-per-process guards. Only those guarding NATIVE state are defects; a JS-only
+latch (`engineActions`, `register.ts`, `consoleCapture`, …) is CORRECT to reset, because the new
+realm genuinely must re-register. Where each of the three named ones stands:
+
+| Latch | Guards | Status |
+|---|---|---|
+| `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
+| `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
+| `llm-test/LLMManager.ts` | litert-lm engine (native) | **Open — #585**, iceboxed |
+
+`milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
+`PlayerPrefs`, so a re-run is idempotent. That is the distinction to apply — not "is it a module
+`let`" but "does anything durable or native survive the realm that this latch is standing in for".
+
+### What still needs a device
+
+Written down because the source cannot settle them, and because "we checked" should mean a
+measurement:
+
+- Whether a reload produces any extra `session_start` in the Firebase console (expected: none).
+- A reload landing mid-`signInWithGoogle` on Android — `bridge.reset()` drops the saved
+  `PluginCall`, and its ordering against Firebase's own callback is a genuine race.
+- Whether Firestore's Swift `removeAllListeners(_ call: CAPPluginCall)` — non-optional — is safe
+  when Capacitor invokes it with nil. It runs on every navigation including three shipped reload
+  paths, so it is evidently surviving; the mechanism is unconfirmed.
+
 ## App-service registry
 
 Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine concerns** — they wrap native SDKs (Firebase, AppLovin MAX, Adjust) that the engine must never depend on. So the engine ships only a tiny hook surface and lets each project plug its own implementations in. This is the seam that keeps the SDK code out of the engine bundle (and out of games that don't want ads).
 
 ### Key files
 
-- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
+- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (tear down and drop them on game swap — see below). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`, plus the optional `restoreAfterRealmSurvived` — see below), `AttributionService` (`init`).
 - `engine/packages/modoki/src/runtime/core/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
 - `games/3d-test/packages/app-services/src/index.ts` — a game's implementation: `register()` calls `registerAppServices({ crashlytics, ads, attribution })`, wiring its own `crashlytics.ts` / `ads.ts` / `attribution.ts` into the engine surface.
 - `engine/app/App.tsx` — the shell that drives the lifecycle.
 - `engine/packages/modoki/src/runtime/core/globalErrors.ts` + `engine/app/installErrorCapture.ts` — the engine's **global JS error capture** (#275). The largest caller of `crashlytics`, and the one a shipped build most depends on — see below.
 - `engine/app/ui/components/ErrorBoundary.tsx` (via `reportReactError`) and `runtime/store/gameStore.ts` (screen breadcrumbs) — the other two engine-side callers.
 
+### Wiring a native-SDK dependency into a project
+
+⚠️ **`<project>/packages/app-services/` is a REQUIRED path, not a naming convention.** `projectNativeSdkDeps` in `engine/vite.config.ts` reads `<project>/packages/app-services/package.json` to force-prebundle the wrapped native-SDK deps, and returns `[]` when the path is missing — an app-service package placed anywhere else makes the editor's project-open flow silently skip the pre-bundle and visibly re-optimize/reload mid-session instead.
+
+⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only.
+
+⚠️ **`cap sync` is a STEP in promoting a plugin, and its generated files are part of the commit** — not a follow-up. Wordweave's Firebase JS wiring once landed without regenerating `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` + `android/app/capacitor.build.gradle`, and nothing caught it: the files self-heal on whoever next runs a native build, so the tree only churns silently, and `npm run verify` is vitest — it compiles no native project. Both platforms shipped with no Firebase Capacitor plugin actually linked while every test stayed green. `npx cap update android` alone is not enough to regenerate them — it exits `ENOENT` on `assets/capacitor.plugins.json`, which only `cap copy` writes, so it needs a real `--target native` build first.
+
 ### How it works
 
-The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
+The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`, and the optional `ads.restoreAfterRealmSurvived` (#631). ⚠️ That last one **replaces** `init()` on the realm-survived path rather than running alongside it: `App.tsx` calls it *instead of* `init()` when a project provides it, so an implementation owns re-initialising as well as restoring (Court's calls `initAds()` itself as its first step). A project that omits it keeps exactly the old behaviour. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) from a **realm-shutdown task**, not on unmount — `App.tsx` registers it via `registerRealmShutdownTask`, and all three reload sites (`engine.reload`, `useResumeReload`, Court's post-wipe restart) go through **`shutdownRealmThenReload()`** — use that seam rather than composing `runRealmShutdownTasks()` and the reload by hand; it owns the once-per-realm latch and re-arms it when the reload throws, which two of the three sites previously got wrong (#587). It used to hang off the unmount effect, which on this architecture never fires — see § "What a webview reload does and does not reset" above. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
 
-**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
+**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. ⚠️ **That sentence described an intention, not the code, until #511**: `clearAppServices()` was `registered = {}` and nothing more, while the only caller of `AdsService.cleanup()` was `App.tsx`'s `[]`-deps *unmount* effect — so a swap dropped the registry and left the outgoing game's AppLovin MAX listeners live under the next game, double-counting ad revenue. It now captures the outgoing `ads`, clears the registry **first** (so a cleanup that throws or re-enters finds it empty, never half-cleared), then calls `cleanup()` inside a `try/catch` — a game's teardown must never break the swap. A game's `cleanup()` must therefore be **idempotent**, because `cleanup()` is now reachable from two directions — `clearAppServices()` on a game swap, and the realm-shutdown task on a reload. The lesson generalises: **a teardown hook that exists and is called by nothing is indistinguishable from no hook at all** (same family as #506's `stopCloudSync`). Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
 
 ### Global JS error capture (#275)
 
@@ -233,10 +670,14 @@ failure in a system, or a rejected asset load reached nothing at all in producti
 closes that, and it is **deliberately ungated** — the same reason analytics may not ride the event
 journal, which `setJournalEnabled` switches off in a release build.
 
-- **`console.error` → `recordError` (a non-fatal ISSUE); `console.warn` → `log` (a BREADCRUMB).**
-  Two different Crashlytics concepts: an issue is grouped and alerted on, a breadcrumb is visible
-  only inside somebody else's report. A game warns on ordinary paths, and promoting those to alerting
-  issues buries the one report that is a real crash.
+- **`console.error` AND `console.warn` → `recordError` (a non-fatal ISSUE); only a genuine
+  breadcrumb takes `log`.** ⚠️ This doc said the opposite until 2026-09-03, and the code had already
+  moved: the owner **reversed the warn routing on 2026-08-20**, so a warn is now a separate BUDGET,
+  not a separate destination (`globalErrors.ts` — see the comment at its `deliver()`: *"'warn'
+  delivers as an ISSUE exactly like 'error' — it is a separate BUDGET, not a separate destination.
+  Only 'breadcrumb' takes the log path."*). The two Crashlytics concepts still differ — an issue is
+  grouped and alerted on, a breadcrumb is visible only inside somebody else's report — and the
+  reason warns get their own cap is so a warn flood cannot spend the crash budget.
 - ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
   hoisted and evaluated before any statement of the importing module, so the installer written as
   `main.tsx`'s first statement still ran after App.tsx's whole module graph — leaving a top-level
@@ -256,6 +697,101 @@ journal, which `setJournalEnabled` switches off in a release build.
 - The **re-entrancy latch is synchronous and a real service is async**, so what bounds the
   report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
   messages and pinned by a test.
+
+**A JS fault during boot has to reach `appServices().crashlytics` to be reported, and there are
+THREE distinct windows depending on how far boot got before it died** (#823, #825, #860):
+
+| Window | What ran | Fate | Status |
+|---|---|---|---|
+| 1 | The fault killed module evaluation of something imported ABOVE `./installErrorCapture` in `main.tsx` — `./sharedRegistry`, react, react-dom, `./index.css` | The inline guard in `engine/index.html` buffers it; nothing in the page will ever drain it | **closed by #825**, re-shaped by #861 — stashed to `localStorage`, replayed on the next boot |
+| 2 | Installer ran AND the game registered its services | `deliver()` → `recordError` | **closed by #636** |
+| 3 | Installer ran, services never registered, boot then died — **including the whole of `App.tsx`'s import graph and its async boot** | `deliver()` queues it in memory; the page goes away with the queue unflushed | **closed by #860/#861** — the queue is persisted eagerly and replayed |
+
+- ⚠️ **Where window 1 ENDS — this doc said something false until 2026-09-07, and it mattered.** It
+  claimed rolldown inlines `main.tsx`'s side-effect imports into the entry chunk's BODY, so that
+  the installer's position above `./App.tsx` "buys nothing once the app is bundled" and a throw
+  anywhere in App's static import graph lands in window 1. **Measured and refuted**: on a
+  `--target web` build of `games/sling` served over HTTP, a top-level throw in a module in
+  `App.tsx`'s import graph finds BOTH inline buffers already drained (`done: true`, read at the
+  throwing module's own evaluation time). The side-effect imports keep their source order through
+  the bundle. Window 1 is therefore only what is imported ABOVE `./installErrorCapture` in
+  `main.tsx`, and **everything in `App.tsx`'s graph is window 3** — which is why window 3 is the
+  wide, high-value one and #825's fix covers a narrower slice than its own ticket claimed.
+- ⚠️ **`#823`'s fallback screen does NOT cover window 3.** `consider()` bails on
+  `root.childElementCount > 0`, and `App.tsx` renders `Loading...` for the whole of that window, so
+  the fatality test is already false. A boot effect that throws is caught by App itself
+  (`App.tsx`'s boot `catch` → `console.error` → `setError`), which is why the fault arrives through
+  the console path rather than the `window` listener, and why the user sees App's own red panel.
+- ⚠️ **Not reproducible in the dev editor** — Vite serves unbundled modules there, so real source
+  order holds and the defect does not exist. A green dev-editor run is not evidence for this class;
+  verification needs a production build, served over HTTP (never `file://`).
+- **The cross-boot stash is ONE envelope with ONE budget** — `runtime/core/bootStash.ts` (#861),
+  not a stash per buffer. Three sites have the shape *a buffer whose only delivery path sits behind
+  the boot that fills it*: the guard's error buffer, the early-console shim's ring, and `deliver()`'s
+  `queued[]`. Copy-pasting #825's fix at each would have meant three keys, three staleness bounds
+  and **three independently guessed caps drawing on one undivided rate limiter** — the failure mode
+  `globalErrors.ts`'s own `MAX_PER_BURST_WINDOW` comment names. The divided budget, asserted by
+  `bootStash.test.ts` against the exported limiter constant:
+
+  | Slot | Count | For |
+  |---|---|---|
+  | `REPLAY_ENTRY_CAP` | 6 | faults + pre-formatted reports, ONE shared pool |
+  | `CONSOLE_CONTEXT_SLOT` | 1 | the whole console tail, as a single joined breadcrumb |
+  | `RESERVED_BREADCRUMBS` | 2 | a `[reload]` crumb, and the "N dropped" crumb |
+  | **total** | **9** | ≤ ⌊`MAX_PER_BURST_WINDOW`/3⌋ = 10 — a replay is a GUEST in the live boot's budget |
+
+  Adding a fourth replay source means **re-deriving that total**, not appending another cap; the
+  test goes red on the sum. The 6 was re-derived down from #825's 8 by owner ruling (2026-09-07) to
+  buy the console slot.
+- **The console tail has TWO sources, picked by window.** Once `installConsoleRing()` has run it
+  DRAINS the inline shim, so the ring is the only holder of the boot's output and `globalErrors.ts`
+  reads it from there; before that, the shim still holds them and `engine/index.html` reads them.
+  Same field, same single slot. A fix sourcing it only from the shim would have covered only the
+  rare window while appearing to close both.
+- **The window-3 write is EAGER, and rewrites on every queue.** `pagehide` does not fire when an
+  OOM jetsam kills a native webview, so a `pagehide` trigger would be unreachable in a real slice of
+  this failure. It rewrites rather than latching because the first thing to queue on a dying boot is
+  usually a benign warn, with the fault that killed it arriving later. `flushQueue()` clears the
+  stash when the sink arrives — without that half, a boot that RECOVERED would replay itself.
+- ⚠️ **A replayed report is never re-stashed.** On an app that registers no `crashlytics` at all (a
+  web build), a replayed report finds no sink, gets queued, and would be persisted again — the next
+  boot then replays it, re-prefixes it and re-stashes it, growing `[prev-boot] [prev-boot] …` every
+  launch for the whole staleness window. Found by running a real build, not by reading the code.
+- ⚠️ **The guard's stash constants are INJECTED at build time**, not hand-synced.
+  `plugins/earlyConsoleShim.ts`'s `transformIndexHtml` rewrites each `modoki:stash-const`-tagged
+  literal in `engine/index.html` from `bootStash.ts`. The literals in the file stay real working
+  defaults (the raw file has to run under `earlyErrorBuffer.test.ts`) and a test pins them equal.
+  This replaces the arrangement that let `EARLY_ERROR_CAP` drift to 32 — two OVER its headroom —
+  with nothing noticing. `EARLY_ERROR_CAP` itself is still hand-kept against `MAX_PER_BURST_WINDOW`,
+  with its own `-2` assertion.
+- **It stashes minimal JSON, not pre-formatted text**, so `describe()`'s formatting stays in one
+  place instead of gaining a hand-kept second copy in HTML. The one exception is the console tail:
+  the shim buffers LIVE argument references, which cannot survive a JSON round trip unformatted, so
+  the HTML does a guarded `String(arg)` join there.
+- ⚠️ **Clear-on-read, and what it costs.** `replayStashedEarlyErrors()` removes the `localStorage`
+  key before attempting to report anything, which makes the replay once-only so a deterministic
+  boot-killing crash cannot re-file on every launch forever. The cost: if the replaying boot ALSO
+  dies before the sink registers, that report is lost with it. Accepted — an unbounded re-file loop
+  is the worse failure.
+- ⚠️ **The replay is labelled `[uncaught-prev-boot]`, deliberately not made to look live.**
+  `drainEarlyErrors` already carries a `(t=Nms)` suffix because a report reading as "now" misleads
+  at exactly the moment it did not happen; a report arriving a whole launch late is that problem an
+  order of magnitude worse.
+- ⚠️ **The 7-day staleness bound is not hygiene.** A months-old fault replayed now is filed by
+  Crashlytics against the CURRENT app version, which makes an already-fixed bug look live.
+- ⚠️ **`STASH_MAX_ENTRIES` is 8, not `EARLY_ERROR_CAP`'s 28, and the reason is the SHARED burst
+  budget.** Every replay drains through the same `MAX_PER_BURST_WINDOW` limiter, in one synchronous
+  burst, right after that boot's own `drainEarlyErrors()`. A cross-boot replay is a guest in the
+  replaying boot's budget, so the bound is a fraction of the window rather than the arithmetic
+  leftover — at most a third of it, breadcrumbs included; `earlyErrorBuffer.test.ts` pins the exact
+  margin. ⚠️ An overflow here is **completely silent** — a limiter refusal emits nothing, and
+  clear-on-read has already discarded the payload by the time anything could notice.
+- **The widened fallback screen (#823).** `consider()` no longer gates on the error's message
+  text; what actually establishes fatality is `#root` being empty and STILL empty after the 1400ms
+  re-check. ⚠️ Because the first error through claims the latch, the screen's DETAIL is re-derived
+  at timer time from the buffered entries (preferring the last one carrying a real stack) rather
+  than frozen at scheduling time — otherwise a benign early error like `ResizeObserver loop limit
+  exceeded` names itself on screen and the actual boot-killer appears nowhere.
 
 ### Deliberate native fault triggers (#278)
 
@@ -493,8 +1029,14 @@ an npm `overrides` entry in the owning project's `package.json`. Two live cases:
 
 | Pin | Where | Pulled in by |
 |---|---|---|
-| `"uuid": "^11.1.1"` | every project that depends on `@capacitor/cli` — all of `games/*`, `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
+| `"uuid": "^11.1.1"` | every manifest that declares `@capacitor/cli` — 23 today: most of `games/*`, all of `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
 | `"nanoid": "^3.3.17"` | the repo root and `site/` | `vite`/`vitest`/`@vitejs/plugin-react`/`@vitest/coverage-v8` (root) and `vitepress` (site), each → `postcss` → `nanoid@^3.3.16` |
+
+⚠️ **"Most of `games/*`" is correct, not drift.** A project with no `@capacitor/cli` — `anim-bug`,
+`video-test`, `ota-subgame-test`, and `engine/templates/starter` today — needs no pin and must not be
+given one; the guard below requires the pin only where the CLI is declared. The two arrive together:
+`ensureCapacitorDeps` (`engine/plugins/addNativeTarget.ts`) writes the pin in the same heal that adds
+`@capacitor/cli`, so gaining a native target cannot reintroduce the gap.
 
 **Add the pin as soon as the project exists, not when the alert fires.** Both of these were caught
 by Dependabot *failing*, not by anyone noticing the gap: a `security_update_not_possible` job exits
@@ -503,6 +1045,22 @@ Seven projects (`games/{skin-test,space-console,llm-test,text_demo,timeline-demo
 `demos/{forest-camp,particle-demo}`) were missing the `uuid` pin while this section claimed every
 project had it — the drift was invisible because the doc asserted the invariant instead of the
 re-check command below proving it (#177).
+
+**It recurred, and the same sentence explains why: nothing under `engine/tests/` proved it, so the
+re-check only ran when someone thought to run it.** `games/iap-test` carried no `overrides` block at
+all and resolved `uuid@7.0.3` — found during a 2026-09-03 Dependabot sweep, not by the re-check.
+What made it invisible a second time is worth knowing: its alert had been **dismissed** as
+`not_used` with the reason *"unfixable alone: xcode pins uuid ^7.0.3"*, which is false — an
+`overrides` pin is exactly the fix, and twelve sibling manifests (eleven `games/`+`demos/` projects,
+plus the repo root) had already cleared the identical alert that way. Note the dismissal's two
+halves fail differently: its REACHABILITY claim was sound (`xcode` calls only `uuid.v4()`, and
+GHSA-w5hq-g745-h8pq needs a caller-supplied `buf`), while its FIXABILITY claim in the same sentence
+was not. Judge the halves separately. A dismissal silences the only signal that would have flagged
+the gap, so the argument in one has to be checked against what the other manifests actually did.
+(#87 was reopened on 2026-09-03 so it can close as `fixed` rather than stand as "unfixable".) The invariant is
+now enforced by **`engine/tests/architecture/pinnedTransitiveDeps.test.ts`**, which fails `npm test`
+on either half: a lockfile that resolves a vulnerable version, or a `@capacitor/cli`-dependent
+`package.json` that declares no `uuid` pin.
 
 #### `uuid`
 
@@ -531,7 +1089,10 @@ only top-level owners are the test/build toolchain, and in `site/` the sole path
 
 #### Re-checking the set
 
-Do this rather than trusting the table — that is the lesson of #177. Every lockfile at once:
+`engine/tests/architecture/pinnedTransitiveDeps.test.ts` now runs this on every `npm test`, so a
+green gate is the check — the command below is for when you want the answer *now*, mid-edit, without
+the suite. Either way, do this rather than trusting the table; that is the lesson of #177. Every
+lockfile at once:
 
 ```bash
 for f in $(git ls-files '*package-lock.json'); do
@@ -547,6 +1108,13 @@ done
 Silence is a pass. Per project, `npm ls uuid` / `npm ls nanoid` answers the same question. After
 adding a pin, refresh the lock with `npm install --package-lock-only --ignore-scripts` — it rewrites
 only the affected entry (measured: 3 lines per lockfile).
+
+⚠️ **Run a plain `npm install` in that project FIRST if you have pulled since you last installed.**
+All 22 projects carrying these lockfiles also carry `file:plugins/*.tgz` vendored plugins, and
+`--package-lock-only` on a project whose `node_modules` is stale advances both lockfiles without
+re-extracting — which poisons the vendored plugin permanently, in the way
+[build.md](./build.md) describes under the #685 conjunction table. On an already-current tree it is
+harmless.
 
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
 

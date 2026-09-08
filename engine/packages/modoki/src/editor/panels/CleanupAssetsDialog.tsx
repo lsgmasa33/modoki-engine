@@ -11,6 +11,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
+import { describeRefusedDeletes } from './assetOps';
 
 interface Orphan { path: string; type: string; bytes: number }
 interface UnusedResponse {
@@ -42,6 +43,12 @@ export default function CleanupAssetsDialog() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ⚠️ SEPARATE from `error`, deliberately. `scan()` owns `error` — it clears it on entry and
+  // writes its own failure into it — so a refusal written before a scan is wiped and one written
+  // after clobbers the scan's own message. They are two different facts about two different
+  // operations, and one slot cannot hold both (#884 close-out review). Same shape as `missing`
+  // vs `failed` one layer down: conflating two meanings in one field loses one of them.
+  const [refusalNote, setRefusalNote] = useState<string | null>(null);
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -83,6 +90,7 @@ export default function CleanupAssetsDialog() {
     if (paths.length === 0) return;
     setDeleting(true);
     setError(null);
+    setRefusalNote(null);
     try {
       // Trash each orphan AND BOTH its sidecars (missing ones are skipped server-side, so
       // binaries-with-sidecar and JSON-assets-without both work).
@@ -99,10 +107,24 @@ export default function CleanupAssetsDialog() {
       // `missing` rather than failing.
       const withSidecars = paths.flatMap((p) => [p, `${p}.meta.json`, `${p}.meta.local.json`]);
       const res = await backendPostJson('/api/delete-asset', { paths: withSidecars });
-      const j = (await res.json()) as { ok?: boolean; error?: string };
+      const j = (await res.json()) as { ok?: boolean; error?: string; trashed?: number; failed?: string[] };
       if (!res.ok || !j.ok) throw new Error(j.error || `delete failed (${res.status})`);
+      // ⚠️ A PARTIAL refusal is `ok:true`, so the throw above cannot see it — this dialog was the
+      // FOURTH consumer of this route and #884's close-out review is what found it. Without this
+      // the re-scan below silently re-lists the file the OS refused, with nothing saying why: the
+      // human ticks it, hits Delete, and watches it come back. Same helper the Assets panel uses,
+      // so both surfaces say the same thing about the same event.
+      const refusal = describeRefusedDeletes(
+        Array.isArray(j.failed) ? j.failed : [],
+        { trashed: typeof j.trashed === 'number' ? j.trashed : 0 },
+      );
+      if (refusal) console.error(`[Cleanup] The OS refused to trash: ${refusal.detail}`);
       // Re-scan to show what remains (the manifest refreshes via the file watcher).
       await scan();
+      // Set AFTER the scan, into its OWN slot — `scan()` clears `error` on entry, so setting this
+      // before it would simply be erased. In the dialog rather than a toast: the refused file is
+      // about to reappear in the list right here, and the explanation belongs next to it.
+      if (refusal) setRefusalNote(refusal.toast);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -121,6 +143,14 @@ export default function CleanupAssetsDialog() {
           Files no scene or prefab references — what the production build would drop.
           Deleting moves them to the Trash (recoverable).
         </div>
+
+        {/* ⚠️ Rendered OUTSIDE the loading/error/empty/list chain below, not inside the list arm.
+            A refused SIDECAR leaves the rescan with zero orphans, so the chain takes its
+            "No unused assets" arm and a note rendered inside the list would never appear —
+            defeating the point of showing it next to the file (#884 close-out review). */}
+        {refusalNote && (
+          <div style={{ color: '#e0a030', fontSize: 11, padding: '6px 0', whiteSpace: 'pre-wrap' }}>{refusalNote}</div>
+        )}
 
         {loading ? (
           <div style={{ color: '#888', fontSize: 12, padding: '20px 0' }}>Scanning…</div>

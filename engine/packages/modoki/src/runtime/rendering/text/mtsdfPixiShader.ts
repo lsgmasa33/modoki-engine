@@ -19,6 +19,7 @@ import {
   textureBit, textureBitGl,
   roundPixelsBit, roundPixelsBitGl,
 } from 'pixi.js';
+import type { GlProgram, GpuProgram } from 'pixi.js';
 import type { MtsdfStyle } from './mtsdfStyle';
 import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, clampShadowOffset } from './mtsdfStyle';
 
@@ -214,16 +215,48 @@ const mtsdfBit = {
   },
 };
 
+/** Single source for the shader's name — feeds both `compileHighShaderGlProgram`'s /
+ *  `compileHighShaderGpuProgram`'s `name:` argument (`getMtsdfPrograms`, below) AND the
+ *  `#define SHADER_NAME` stamped into `mtsdfBitGl`'s own vertex/fragment headers, so a rename of
+ *  one can't drift from the other.
+ *
+ *  ⚠️ For the GL program specifically, `name:` no longer reaches the compiled source at all:
+ *  `GlProgram`'s constructor (`setProgramName`) only stamps `#define SHADER_NAME <name>-N` when
+ *  the source doesn't already declare one, and `mtsdfBitGl`'s headers below always do — so
+ *  `setProgramName` early-returns before it ever reads `name`. The `name:` argument passed to
+ *  `compileHighShaderGlProgram` is DEAD for that reason; it is kept in sync here anyway because a
+ *  program whose reported name doesn't match its own `#define` would be a confusing thing to debug,
+ *  and because `compileHighShaderGpuProgram` (WGSL) still uses it directly. */
+const MTSDF_SHADER_NAME = 'mtsdf-text';
+
 /** The custom bit (GLSL). Uniforms are loose (Pixi's GL UBO handling maps them to
  *  the `mtsdfUniforms` group by name — names are unique across all bits). */
 const mtsdfBitGl = {
   name: 'mtsdf-bit',
   vertex: {
-    header: /* glsl */`in vec4 aTextColor;`,
+    // ⚠️ Pixi 8.19.0's GLSL preprocessor (`GlProgram`'s `setProgramName`) stamps an
+    // incrementing `#define SHADER_NAME <name>-N` into any source that doesn't already
+    // carry one — see the note above `makeMtsdfPixiShader` for why that matters. The
+    // fixed, stable defines here stop the LEAK (identical source now hashes to a stable
+    // `_key` instead of an ever-incrementing one — see the `getMtsdfPrograms` comment
+    // below). They do NOT make per-call program construction safe on their own: a SECOND
+    // `GlProgram` built from this same source would still hit `GlShaderSystem`'s cache on
+    // that stable key, `generateProgram` would never run for it, and its `_attributeData`
+    // would stay unpopulated — `GlGeometrySystem.initGeometryVao` → `getSignature` then
+    // hard-throws `Cannot read properties of undefined (reading 'aPosition')` inside the
+    // 2D frame callback. The module-level cache in `getMtsdfPrograms` is what actually
+    // keeps this to one program — it is LOAD-BEARING, not belt-and-suspenders, and it is
+    // reachable via HMR / module re-evaluation while a renderer has already compiled the
+    // program (a possibility, not confirmed against a live repro).
+    header: /* glsl */`
+      #define SHADER_NAME ${MTSDF_SHADER_NAME}-vertex
+      in vec4 aTextColor;
+    `,
     main: /* glsl */`vColor *= vec4(aTextColor.rgb * aTextColor.a, aTextColor.a);`,
   },
   fragment: {
     header: /* glsl */`
+      #define SHADER_NAME ${MTSDF_SHADER_NAME}-fragment
       uniform vec4 uTextColor;
       uniform vec4 uOutlineColor;
       uniform vec4 uGlowColor;
@@ -272,10 +305,17 @@ function mtsdfUniformValues(style: MtsdfStyle, atlasW: number, atlasH: number, d
     uGlowStrength: { value: style.glowStrength ?? 0, type: 'f32' },
     uShadowSoftness: { value: style.shadowSoftness ?? 0, type: 'f32' },
     uDistanceRange: { value: distanceRange, type: 'f32' },
-    // Used ONLY where fwidth is unavailable (see the shader body). Design-space, because the
-    // canvas scale is not known here — so on a downscaled canvas this over-estimates the range,
-    // which errs toward a crisper edge rather than a blurry one. Anything is an improvement on
-    // the alternative, which is a shader that does not compile and text that does not exist.
+    // Used ONLY where fwidth is unavailable (see the shader body). `fontSize` here is whatever
+    // the caller passes — this factory has no notion of "authored" vs "effective" size. Since
+    // #752, Scene2D's Text2D pass passes `t.fontSize * effScale`, the on-screen size after BOTH
+    // the entity's world Transform scale and the host Canvas2D's own uniform scale (see the
+    // effScale derivation in Scene2D.tsx's per-frame text-transform block), so this now tracks
+    // the rendered size rather than the design-space value alone. A caller that only has the
+    // authored size (or none of this machinery, e.g. a test) still gets a sane fallback: passing
+    // the raw fontSize is equivalent to effScale = 1.
+    // ⚠️ This expression MUST stay identical to the one in `updateMtsdfPixiMetrics` below
+    // (#690) — that function refreshes this same uniform on a REUSED shader without going
+    // through this factory, and a drift between the two would silently change edge sharpness.
     uScreenPxRange: { value: Math.max(1, (fontSize / Math.max(1, atlasSize)) * distanceRange), type: 'f32' },
     // Atlas-derived, not style-derived — so updateMtsdfPixiStyle leaves it alone.
     uHasTrueSdf: { value: hasTrueSdf ? 1 : 0, type: 'f32' },
@@ -334,15 +374,56 @@ export interface MtsdfPixiAtlas {
   type: string;
 }
 
+// ── Program cache (fixes #590) ──────────────────────────────────────────────
+// `makeMtsdfPixiShader` used to call `compileHighShaderGlProgram`/
+// `compileHighShaderGpuProgram` fresh on every invocation. `compileHighShaderGpuProgram`
+// ends in `GpuProgram.from(...)`, which is content-cached — harmless. But
+// `compileHighShaderGlProgram` ends in `new GlProgram(...)`, NOT `GlProgram.from(...)`,
+// so it built a brand-new program every call, and that is the actual leak:
+//
+// 1. `GlProgram`'s constructor runs `setProgramName` as a preprocessor. On Pixi 8.19.0
+//    that helper keeps a module-global name cache and, for any source that does not
+//    already contain `#define SHADER_NAME`, appends an INCREMENTING suffix and injects
+//    the define into the source text. Our source had none, so the injection fired
+//    every time (fixed by the `#define SHADER_NAME` lines on `mtsdfBitGl` above — belt
+//    and suspenders alongside the cache here).
+// 2. `GlProgram` computes `_key = createIdFromString(vertex + ':' + fragment)` AFTER
+//    that preprocessing, so the injected, ever-incrementing name made byte-identical
+//    input hash to a DIFFERENT key on every call.
+// 3. `GlShaderSystem`'s `_getProgramData` keys its `_programDataHash` cache by that
+//    `_key`, so a fresh key is always a cache miss: a brand-new `WebGLProgram` gets
+//    compiled and stored, and it stays there — the library has no `gl.deleteProgram`
+//    call site anywhere, so nothing ever frees the old one.
+//
+// The `#define` above closes the name-injection hole, but the root fix is here: build
+// the GL/GPU programs ONCE and reuse them. `bits`/`name` passed to the two `compile*`
+// calls below are fixed module-level constants (`mtsdfBit`/`mtsdfBitGl` and their
+// sibling bits) — none of `makeMtsdfPixiShader`'s arguments (`texture`, `atlas`,
+// `style`, `fontSize`) reach the shader SOURCE at all; they only feed `mtsdfUniforms`
+// (a `UniformGroup`, rebuilt per call below, as it must be — see the doc comment on
+// `MtsdfPixiAtlas.type` and `mtsdfUniformValues`). So there is exactly one distinct
+// program pair for the whole file, not a family keyed by some input — a `Map` would
+// only ever hold one entry.
+let cachedGlProgram: GlProgram | undefined;
+let cachedGpuProgram: GpuProgram | undefined;
+
+function getMtsdfPrograms(): { glProgram: GlProgram; gpuProgram: GpuProgram } {
+  cachedGlProgram ??= withDerivativesExtension(
+    compileHighShaderGlProgram({ name: MTSDF_SHADER_NAME, bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
+  );
+  cachedGpuProgram ??= compileHighShaderGpuProgram({ name: MTSDF_SHADER_NAME, bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
+  return { glProgram: cachedGlProgram, gpuProgram: cachedGpuProgram };
+}
+
 /** Create the Pixi MTSDF Shader for a font atlas. The atlas texture is bound BOTH
  *  ways because the mesh adaptor differs per backend: WebGL reads
  *  `resources.uTexture`, WebGPU rebinds group 2 from `mesh.texture`. Callers must
- *  therefore ALSO set `mesh.texture = <same atlas>`. */
+ *  therefore ALSO set `mesh.texture = <same atlas>`.
+ *
+ *  The `glProgram`/`gpuProgram` are shared across every call (see `getMtsdfPrograms`
+ *  above) — only the `Shader` instance and its uniforms are per-call. */
 export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, style: MtsdfStyle, fontSize: number): Shader {
-  const glProgram = withDerivativesExtension(
-    compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
-  );
-  const gpuProgram = compileHighShaderGpuProgram({ name: 'mtsdf-text', bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
+  const { glProgram, gpuProgram } = getMtsdfPrograms();
   const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size, fontSize, atlas.type !== 'msdf') as any);
   const shader = new Shader({
     glProgram, gpuProgram,
@@ -377,5 +458,61 @@ export function updateMtsdfPixiStyle(shader: Shader, style: MtsdfStyle): void {
   u.uShadowSoftness = style.shadowSoftness ?? 0;
 }
 
+/** Every `MtsdfPixiAtlas` field that reaches a uniform in `mtsdfUniformValues`. Declared as a
+ *  `Record<keyof MtsdfPixiAtlas, boolean>` so ADDING a field to the atlas type fails to compile
+ *  here until it is classified — the hand-written five-field list this replaces is the same
+ *  shape that silently dropped `type` for a commit (see `MtsdfPixiAtlas` above). Set a field to
+ *  false only if it genuinely reaches no uniform, with a comment saying why.
+ *
+ *  All five current fields feed `mtsdfUniformValues` directly: `width`/`height` → `uTexSize`
+ *  (also the shadow-offset scale), `distanceRange` → `uDistanceRange`/`uScreenPxRange`, `size`
+ *  → `uScreenPxRange`, `type` → `uHasTrueSdf`. */
+const ATLAS_UNIFORM_FIELDS: Record<keyof MtsdfPixiAtlas, boolean> = {
+  width: true, height: true, distanceRange: true, size: true, type: true,
+};
+
+/** Can an existing shader be kept for this page rather than rebuilt (#690)? The
+ *  Shader depends only on the page TEXTURE and the ATLAS geometry — `fontSize`
+ *  reaches it solely through the `uScreenPxRange` uniform ({@link updateMtsdfPixiMetrics})
+ *  and style reaches it solely through the uniforms {@link updateMtsdfPixiStyle} already
+ *  updates in place — so a plain text/fontSize/style change never needs a new `Shader`.
+ *
+ *  Compares atlas FIELDS, not object identity: callers (Scene2D) pass `{ ...provider.atlas }`,
+ *  a fresh object every frame, so `===` would always be false. */
+export function canReuseMtsdfPixiShader(shader: Shader, texture: Texture, atlas: MtsdfPixiAtlas): boolean {
+  if (shader.resources.uTexture !== texture.source) return false;
+  // `uSampler` is bound once at construction from `texture.source.style` (see
+  // `makeMtsdfPixiShader`'s `resources`) and, with a custom mesh shader, Pixi never rewrites
+  // it. Checked alongside `uTexture` for the same reason — belt and suspenders, not a live bug:
+  // no code in this repo currently REPLACES `source.style` (it mutates the object in place), so
+  // this identity check cannot fire today.
+  if (shader.resources.uSampler !== texture.source.style) return false;
+  const prev = (shader as any)._mtsdfAtlas as MtsdfPixiAtlas | undefined;
+  if (!prev) return false;
+  return (Object.keys(ATLAS_UNIFORM_FIELDS) as (keyof MtsdfPixiAtlas)[])
+    .filter((k) => ATLAS_UNIFORM_FIELDS[k])
+    .every((k) => prev[k] === atlas[k]);
+}
+
+/** Refresh the fontSize-derived uniform on a shader kept via {@link canReuseMtsdfPixiShader}
+ *  (#690). Does NOT touch `uTexSize`/`uDistanceRange`/`uHasTrueSdf` — `canReuseMtsdfPixiShader`
+ *  already guarantees those are unchanged (they come from the atlas fields it compares).
+ *
+ *  ⚠️ This expression MUST stay identical to the `uScreenPxRange` line in
+ *  `mtsdfUniformValues` above — if they drift, a reused shader renders at a different
+ *  edge sharpness than a freshly built one, and nothing will fail to tell you. */
+export function updateMtsdfPixiMetrics(shader: Shader, atlas: MtsdfPixiAtlas, fontSize: number): void {
+  const u = (shader.resources.mtsdfUniforms as UniformGroup).uniforms as any;
+  u.uScreenPxRange = Math.max(1, (fontSize / Math.max(1, atlas.size)) * atlas.distanceRange);
+  // Re-stash the fresh atlas object so the later updateMtsdfPixiStyle (which reads
+  // _mtsdfAtlas for the shadow-offset clamp) doesn't hold a stale reference.
+  (shader as any)._mtsdfAtlas = atlas;
+}
+
 /** Test-only accessor for the two generated shader bits (see the note above `mtsdfBit`). */
 export const mtsdfShaderBitsForTest = () => ({ wgsl: mtsdfBit, glsl: mtsdfBitGl });
+
+/** Test-only accessor for the module-level program cache (see `getMtsdfPrograms` above / the
+ *  "Program cache (fixes #590)" note) — lets a test assert the GL/GPU programs are actually
+ *  SHARED across calls, not just that the cache field exists. */
+export const mtsdfProgramsForTest = () => getMtsdfPrograms();

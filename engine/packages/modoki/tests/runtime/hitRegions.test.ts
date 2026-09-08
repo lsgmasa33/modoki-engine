@@ -8,12 +8,14 @@
  *  its provider NAMES, not just its output. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createWorld } from 'koota';
 import {
   registerHitRegionProvider, collectHitRegions, hitRegionProviders,
   isHitRegionOverlayVisible, setHitRegionOverlayVisible, subscribeHitRegionOverlay,
   hitShapeContains, hitShapeDistance, nearestRegionTo,
   __resetHitRegionsForTests, type HitRegion, type HitShape,
 } from '../../src/runtime/rendering/hitRegions';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 
 const circle = (id: string, x: number, y: number, r: number, over?: Partial<HitRegion>): HitRegion => ({
   id, kind: 'test', provider: 'p', shape: { type: 'circle', x, y, r }, ...over,
@@ -76,6 +78,22 @@ describe('registration', () => {
     collectHitRegions();
     collectHitRegions();
     expect(warn).toHaveBeenCalledTimes(1);   // once per id, not once per poll
+    warn.mockRestore();
+  });
+
+  it('re-warns for the same duplicate region id after a world swap (#738 group B)', () => {
+    // `warnedDuplicates` had NO production clear — `__resetHitRegionsForTests` only runs from
+    // this test file, so in a real session a region id that warned once stayed silently
+    // suppressed forever after, including in a later scene reusing the same id.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    registerHitRegionProvider('a', () => [circle('dup', 0, 0, 1)]);
+    registerHitRegionProvider('b', () => [circle('dup', 9, 9, 9)]);
+    collectHitRegions();
+    collectHitRegions();
+    expect(warn).toHaveBeenCalledTimes(1);
+    setCurrentWorld(createWorld()); // world swap — should reset the warn-once memory
+    collectHitRegions();
+    expect(warn).toHaveBeenCalledTimes(2);
     warn.mockRestore();
   });
 });

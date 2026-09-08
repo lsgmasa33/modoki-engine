@@ -33,7 +33,16 @@ interface Insets { top: string; right: string; bottom: string; left: string }
  *  A diagnostic that disagrees with the system it is diagnosing is worse than no diagnostic —
  *  this panel exists so an agent can stop guessing about device state, and reading 0 here while
  *  the layout uses 68 is exactly how a correct fix gets re-opened as a bug. On a real device
- *  nothing sets the vars, the `env()` fallback applies, and this reports what it always did. */
+ *  nothing sets the vars, the `env()` fallback applies, and this reports what it always did.
+ *
+ *  ⚠️ **The inset-in-PADDING shape is correct HERE and is retired everywhere else (#612).** This
+ *  is a one-shot read — append, read the computed style, remove — so padding is fine and clamps
+ *  negatives to 0 for free. `runtime/ui/safeArea.ts` used to look exactly like this and no longer
+ *  does, because a `ResizeObserver` reports the CONTENT box and this shape's is 0x0 before and
+ *  after any inset change, forever: an observer bolted onto it never fires (measured on device).
+ *  So do NOT copy this shape into anything that needs to OBSERVE the inset, and do not "unify"
+ *  the two — see `safeArea.ts`'s header for the shape that can be observed and the two
+ *  degradation guards it needs that this one does not. */
 function readInsets(host: HTMLElement | null): Insets {
   const probe = document.createElement('div');
   probe.style.cssText =

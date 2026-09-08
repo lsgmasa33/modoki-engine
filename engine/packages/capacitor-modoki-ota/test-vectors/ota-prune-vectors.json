@@ -1,0 +1,125 @@
+{
+  "_comment": "Shared spec for OtaCore.pruneVersions (Swift) / OtaCore.pruneVersions (Java) — #563. Deliberately NOT in the vectorFiles/VECTOR_FILES arrays the boot/confirm/loadFailed golden vectors use: this file has a different shape (state/bundle/onDisk/expect.prune, no `op`, no `constants` block) and is replayed by its own loader/test function on each port (see OtaCoreTests.swift's testPruneVectors, OtaCoreSelfTest.java's runPruneVectors). `onDisk` and `expect.prune` are FULL on-disk folder names (`<bundleName>-<version>`, matching OtaPaths.versionFolderName / the Java twin) — not bare versions — since bundle names may themselves contain hyphens and disambiguating which bundle a folder belongs to is exactly what these scenarios pin. Both ports must produce byte-identical `expect.prune` (sorted) on every scenario.",
+  "scenarios": [
+    {
+      "name": "nothing_to_prune_only_active_on_disk",
+      "state": { "active": { "shell": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v1"],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "old_superseded_version_is_pruned",
+      "state": { "active": { "shell": "v2" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v1", "shell-v2"],
+      "expect": { "prune": ["shell-v1"] }
+    },
+    {
+      "name": "active_and_pending_preserved_third_pruned",
+      "state": { "active": { "shell": "v1" }, "pending": { "shell": "v3" }, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v1", "shell-v2", "shell-v3"],
+      "expect": { "prune": ["shell-v2"] }
+    },
+    {
+      "name": "rejected_versions_folder_is_pruned",
+      "state": { "active": { "shell": "v2" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": { "shell": ["v1"] } },
+      "bundle": "shell",
+      "onDisk": ["shell-v1", "shell-v2"],
+      "expect": { "prune": ["shell-v1"] }
+    },
+    {
+      "name": "null_state_prunes_nothing",
+      "state": null,
+      "bundle": "shell",
+      "onDisk": ["shell-v1", "shell-v2"],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "empty_disk_list",
+      "state": { "active": { "shell": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": [],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "result_is_sorted_regardless_of_disk_order",
+      "state": { "active": { "shell": "v2" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v4", "shell-v1", "shell-v3", "shell-v2"],
+      "expect": { "prune": ["shell-v1", "shell-v3", "shell-v4"] }
+    },
+    {
+      "name": "different_bundle_names_do_not_interfere",
+      "state": { "active": { "shell": "v1", "otherGame": "w9" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "otherGame",
+      "onDisk": ["otherGame-w8", "otherGame-w9"],
+      "expect": { "prune": ["otherGame-w8"] }
+    },
+    {
+      "name": "hyphenated_prefix_bundle_folder_not_stolen_by_shorter_bundle",
+      "_comment": "ota-test's live folder must survive an `ota` prune pass — the folder starts with `ota-` too, but the longest known-bundle match is `ota-test`, not `ota`.",
+      "state": { "active": { "ota": "v1", "ota-test": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "ota",
+      "onDisk": ["ota-v1", "ota-test-v1"],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "hyphenated_prefix_bundle_own_superseded_folder_still_prunes",
+      "_comment": "Same disk as above, but pruning ota-test itself: its own superseded v0 folder must still be reclaimed, and ota's live folder must be left alone.",
+      "state": { "active": { "ota": "v1", "ota-test": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "ota-test",
+      "onDisk": ["ota-v1", "ota-test-v0", "ota-test-v1"],
+      "expect": { "prune": ["ota-test-v0"] }
+    },
+    {
+      "name": "folder_for_unknown_bundle_never_pruned",
+      "_comment": "A folder whose owning bundle appears in none of the state's maps and isn't `name` either — this device knows nothing about it, so it must never be touched, regardless of which bundle's prune pass is running.",
+      "state": { "active": { "shell": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v1", "mystery-v1"],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "shorter_bundle_prefix_of_longer_own_superseded_folder_prunes_correctly",
+      "_comment": "`ota` is a strict prefix of `ota-test`; pruning the SHORTER bundle `ota` must still reclaim its own superseded folder (ota-v1) without being confused by the longer bundle's folders on the same disk.",
+      "state": { "active": { "ota": "v2", "ota-test": "v5" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "ota",
+      "onDisk": ["ota-v1", "ota-v2", "ota-test-v5"],
+      "expect": { "prune": ["ota-v1"] }
+    },
+    {
+      "name": "own_name_is_added_to_known_bundles_even_when_absent_from_every_state_map",
+      "_comment": "Pins `knownBundles.insert(name)`. `shell` appears in NO state map (only a DIFFERENT bundle, `other`, is active), so WITHOUT the insert, `shell-v1`'s owner would be unresolvable (no known bundle's prefix matches) and the folder would be left alone (unknown-bundle protection) — prune=[]. WITH the insert, `shell` is recognized as its own folder's owner, and since shell has neither an active nor a pending version, that folder is superseded-by-nothing-current and IS pruned — proving the insert actually took effect.",
+      "state": { "active": { "other": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "shell",
+      "onDisk": ["shell-v1"],
+      "expect": { "prune": ["shell-v1"] }
+    },
+    {
+      "name": "known_bundles_is_the_union_over_every_state_map_not_just_active_and_pending",
+      "_comment": "Pins that `knownBundles` unions ALL FIVE state maps, not just active/pending. `ota` HAS an active entry (v2) — `ota-test` has neither active nor pending, and is only mentioned via `rejected` (a stale v1). Pruning `ota` (not `ota-test`) must recognize `ota-test` as a KNOWN bundle (from rejected.keys) so `ota-test-v1`'s folder is correctly attributed to its owner `ota-test`, not misattributed to `ota` (whose own prefix `ota-` also matches) — leaving it UNTOUCHED by this `ota` pass (expect.prune=[]). Without the rejected.keys union, `ota-test` would be unknown, `ota-test-v1` would falsely resolve to owner `ota`, and since that version (`test-v1`) equals neither `ota`'s active nor pending, it would be WRONGLY pruned.",
+      "state": { "active": { "ota": "v2" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": { "ota-test": ["v1"] } },
+      "bundle": "ota",
+      "onDisk": ["ota-test-v1"],
+      "expect": { "prune": [] }
+    },
+    {
+      "name": "known_bundles_union_includes_bootAttempts_keys",
+      "_comment": "Pins that `knownBundles` unions `bootAttempts.keys`, specifically (isolated from `rejected`, which the scenario above already covers). `ota-test` has no active/pending/confirmedBoots/rejected entry — it's only mentioned via `bootAttempts`. Pruning `ota` must recognize `ota-test` as a KNOWN bundle (from bootAttempts.keys) so `ota-test-v1`'s folder is correctly attributed to its owner `ota-test`, not misattributed to `ota` — leaving it untouched while `ota`'s own superseded `ota-v1` IS pruned. Without the bootAttempts.keys union, `ota-test` would be unknown and `ota-test-v1` would be wrongly swept into `ota`'s prune result.",
+      "state": { "active": { "ota": "v2" }, "pending": {}, "bootAttempts": { "ota-test": 1 }, "confirmedBoots": {}, "rejected": {} },
+      "bundle": "ota",
+      "onDisk": ["ota-v1", "ota-v2", "ota-test-v1"],
+      "expect": { "prune": ["ota-v1"] }
+    },
+    {
+      "name": "known_bundles_union_includes_confirmedBoots_keys",
+      "_comment": "Pins that `knownBundles` unions `confirmedBoots.keys`, specifically. `ota-test` has no active/pending/bootAttempts/rejected entry — it's only mentioned via `confirmedBoots`. Pruning `ota` must recognize `ota-test` as a KNOWN bundle (from confirmedBoots.keys) so `ota-test-v1`'s folder is correctly attributed to its owner `ota-test`, not misattributed to `ota` — leaving it untouched while `ota`'s own superseded `ota-v1` IS pruned. Without the confirmedBoots.keys union, `ota-test` would be unknown and `ota-test-v1` would be wrongly swept into `ota`'s prune result.",
+      "state": { "active": { "ota": "v2" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": { "ota-test": 1 }, "rejected": {} },
+      "bundle": "ota",
+      "onDisk": ["ota-v1", "ota-v2", "ota-test-v1"],
+      "expect": { "prune": ["ota-v1"] }
+    }
+  ]
+}

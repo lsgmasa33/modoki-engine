@@ -9,6 +9,14 @@ import {
 } from '../../src/runtime/loaders/spriteAnimCache';
 import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
+const flush = () => new Promise((r) => setTimeout(r, 0));
+// text() as well as json(): the loaders read the body as TEXT so they can spot Vite's index.html
+// SPA fallback and report a MISSING asset instead of a JSON syntax error.
+const okResponse = (body: unknown) => {
+  const text = JSON.stringify(body);
+  return { ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(text), json: () => Promise.resolve(body) };
+};
+
 beforeEach(() => {
   clearSpriteAnimCache();
   clearManifest();
@@ -89,6 +97,36 @@ describe('spriteAnimCache', () => {
     expect(getSpriteAnim('c.spriteanim.json')).not.toBeNull();
     invalidateSpriteAnim('c.spriteanim.json');
     expect(getSpriteAnim('c.spriteanim.json')).toBeNull();
+  });
+
+  it('invalidateSpriteAnim mid-flight refuses a fetch that resolves with the OLD def (#487 item 8)', async () => {
+    let resolveOld: (v: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { resolveOld = r; })));
+
+    expect(getSpriteAnim('race.spriteanim.json')).toBeNull();  // kicks off the in-flight load
+    invalidateSpriteAnim('race.spriteanim.json');                 // re-import lands mid-flight
+
+    resolveOld(okResponse({ clips: { walk: { frames: ['STALE'], fps: 12, mode: 'loop', cycles: 0 } } }));
+    await flush();
+
+    // Genuinely EMPTY (peek, no new fetch) — not merely shadowed by a fresher value.
+    expect(getSpriteAnim('race.spriteanim.json', { load: false })).toBeNull();
+  });
+
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateSpriteAnim`
+  // that bumped it would refuse every OTHER key's in-flight load too. Must FAIL against the
+  // module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED set while A is in flight leaves A cacheable', async () => {
+    let resolveA: (v: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { resolveA = r; })));
+
+    expect(getSpriteAnim('cross.a.spriteanim.json')).toBeNull(); // kicks off A's load
+    invalidateSpriteAnim('cross.b.spriteanim.json');               // UNRELATED path
+
+    resolveA(okResponse({ clips: { walk: { frames: ['a'], fps: 12, mode: 'loop', cycles: 0 } } }));
+    await flush();
+
+    expect(getSpriteAnim('cross.a.spriteanim.json')?.clips.walk.frames).toEqual(['a']);
   });
 
   it('returns undefined for a clip name not present in the set', () => {

@@ -11,6 +11,8 @@ import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { applyBindings, type UIActionBinding } from '../../src/runtime/ui/bindings';
 import { registerUIAction, unregisterUIAction } from '../../src/runtime/core/actionRegistry';
 import { setPlayState } from '../../src/runtime/core/playState';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS } from '../../src/runtime/traits/UISettings';
 
 // applyBindings resolves components via the trait registry (like the runtime).
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });
@@ -118,10 +120,16 @@ describe('applyBindings', () => {
       setOp('p', false, 'change'),
       setOp('p', true, 'submit'),
     ];
+    // Both 'change' and 'submit' are discrete activations (#466's global input lock) — advance
+    // past the lock's time floor between them so the second call is a separate press, not one
+    // swallowed by the first. See bindings/uiInputLock.test.ts for the lock's own coverage.
+    setManualNow(0);
     applyBindings(bindings, 'change');
     expect((p.get(UIElement) as any).isVisible).toBe(false); // only the change row ran
+    advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS + 1);
     applyBindings(bindings, 'submit');
     expect((p.get(UIElement) as any).isVisible).toBe(true);  // only the submit row ran
+    restoreRealClock();
   });
 
   it('skips a call binding with no action name but still runs sibling bindings', () => {

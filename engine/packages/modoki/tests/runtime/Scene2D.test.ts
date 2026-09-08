@@ -43,9 +43,20 @@ function mockDeps() {
       destroyCount = 0;        // catches double-teardown (F4)
       zIndex = 0;
       rotation = 0;
-      _x = 0; _y = 0; _sx = 1; _sy = 1;
-      position = { set: (x: number, y: number) => { this._x = x; this._y = y; } };
-      scale = { set: (x: number, y: number) => { this._sx = x; this._sy = y; } };
+      // `position`/`scale` hold the values DIRECTLY and `_x`/`_y`/`_sx`/`_sy` read through to them
+      // (that direction, rather than the reverse, so there is no `this` alias to lint at).
+      // ⚠️ `x`/`y` must be READABLE: `Scene2D.tsx`'s mask-transform dirty check reads
+      // `obj.position.x`/`.y` off the display object itself rather than from a snapshot field, so a
+      // write-only mock made that comparison read `undefined !== wantX` — permanently "changed",
+      // so the steady-state branch it gates (#692's mask scale/position dirty gate) was never
+      // exercised by anything. Same shape as the `MeshGeometry` mock hole below: a property the
+      // source reads and the mock omits makes a whole branch invisible, with every test green.
+      position = { x: 0, y: 0, set(x: number, y: number) { this.x = x; this.y = y; } };
+      scale = { x: 1, y: 1, set(x: number, y: number) { this.x = x; this.y = y; } };
+      get _x() { return this.position.x; }
+      get _y() { return this.position.y; }
+      get _sx() { return this.scale.x; }
+      get _sy() { return this.scale.y; }
       removeFromParent() {
         if (this.parent) {
           const i = this.parent.children.indexOf(this);
@@ -68,13 +79,69 @@ function mockDeps() {
     class Texture {
       static EMPTY = { width: 0, height: 0 };
       static WHITE = { width: 1, height: 1, source: { style: {} }, textureMatrix: { mapCoord: {} } };
+      // Counts every FRAMED-wrapper construction (opts.frame present) — the exact allocation
+      // `mintMaterialTexture`/`frameTexture` make for an atlas slice. A whole-image mint returns
+      // `r.base` directly with no `new Texture` call, so this counter is scoped to the wrapper
+      // path on purpose (#697 regression cover — see Scene2D.test.ts's material-pass tests).
+      static frameConstructCount = 0;
       width = 0; height = 0; source: any; textureMatrix = { mapCoord: {} };
       destroy = vi.fn();
       // Framed wrapper (new Texture({ source, frame })): carry the borrowed source so the
       // material pass's source-ready guard passes; width/height come from the sub-rect.
-      constructor(opts?: any) { this.source = opts?.source; if (opts?.frame) { this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; } }
+      // `textureMatrix.mapCoord` is derived from the frame rect (not a bare `{}`) so two
+      // different atlas slices of one sheet produce genuinely DIFFERENT mapCoord values —
+      // required by the #698 uTextureMatrix-tracks-the-swap test below (an object-identity-only
+      // mock would pass even if the swap wrote the wrong frame's matrix).
+      constructor(opts?: any) {
+        this.source = opts?.source;
+        if (opts?.frame) {
+          this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; Texture.frameConstructCount++;
+          this.textureMatrix = { mapCoord: { x: opts.frame.x, y: opts.frame.y, w: opts.frame.width, h: opts.frame.height } };
+        }
+      }
     }
-    class MeshGeometry { destroy = vi.fn(); constructor(public opts?: any) {} }
+    // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
+    // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
+    // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
+    class MeshGeometry {
+      buffers: unknown[] | null = [];
+      positions: Float32Array;
+      // One Buffer per geometry, so a test can assert `update()` was called for an in-place
+      // resize — mirrors real pixi, where `getBuffer('aPosition')` returns the geometry's own
+      // position Buffer and `.update()` is what re-uploads it.
+      private _posBuffer = { update: vi.fn() };
+      // Validates the NAME, like the real thing: Pixi's `getBuffer(id)` is
+      // `this.getAttribute(id).buffer`, which throws a TypeError on an unknown attribute. A mock
+      // that ignored the argument would let `getBuffer('aPositions')` (a typo) pass every test
+      // while throwing inside `renderFrame` in a browser and taking the whole 2D frame down.
+      getBuffer = (name: string) => {
+        if (name !== 'aPosition') throw new TypeError(`[mock] no attribute '${name}' on this geometry`);
+        return this._posBuffer;
+      };
+      unload = vi.fn();
+      destroy = vi.fn(() => { this.buffers = null; });
+      addAttribute = vi.fn();
+      constructor(public opts?: any) {
+        this.positions = opts?.positions ?? new Float32Array(8);
+        MeshGeometry.__control.callCount++;
+        if (MeshGeometry.__control.callCount === MeshGeometry.__control.throwOnCall) {
+          throw new Error('[mock] MeshGeometry construction failed');
+        }
+      }
+      // Test-only knob (Fix 1 regression cover): make the Nth constructed MeshGeometry
+      // throw, to simulate a mid-loop failure (context loss, a failed buffer allocation)
+      // inside Scene2D's text page-rebuild loop.
+      static __control = { callCount: 0, throwOnCall: -1 };
+    }
+    // Minimal stand-ins for the two pixi.js exports Scene2D's text pass constructs
+    // directly (`new Buffer(...)`, `BufferUsage.VERTEX | BufferUsage.COPY_DST`) — no
+    // other pass in this harness touches them.
+    class Buffer {
+      data: any; label?: string; usage?: number;
+      constructor(opts?: any) { this.data = opts?.data; this.label = opts?.label; this.usage = opts?.usage; }
+      update = vi.fn();
+    }
+    const BufferUsage = { VERTEX: 1, COPY_DST: 2 };
     class Mesh extends Display {
       kind = 'material';
       geometry: any; texture: any; shader: any; tint = 0xffffff; blendMode = 'normal';
@@ -85,6 +152,7 @@ function mockDeps() {
       kind = 'graphics';
       clear = vi.fn(() => this);
       rect = vi.fn(() => this);
+      roundRect = vi.fn(() => this);
       circle = vi.fn(() => this);
       moveTo = vi.fn(() => this);
       lineTo = vi.fn(() => this);
@@ -130,7 +198,7 @@ function mockDeps() {
     };
     // extensions.add(loadKTX2) is called by ensurePixiKtxTranscoder during startScene2D
     // (v8 doesn't auto-register the KTX2 parser); stub both so the transcoder setup is a no-op.
-    return { Application, Container, Texture, Rectangle, Graphics, Sprite, Mesh, MeshGeometry, Assets, isWebGPUSupported: () => Promise.resolve(false), setKTXTranscoderPath: () => {}, extensions: { add: () => {} }, loadKTX2: {} };
+    return { Application, Container, Texture, Rectangle, Graphics, Sprite, Mesh, MeshGeometry, Buffer, BufferUsage, Assets, isWebGPUSupported: () => Promise.resolve(false), setKTXTranscoderPath: () => {}, extensions: { add: () => {} }, loadKTX2: {} };
   });
 
   vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({
@@ -154,13 +222,59 @@ function mockDeps() {
     __clearSpy: clearSpy,
   }));
   let shaderSeq = 0;
-  vi.doMock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
-    // Capture the texture the material pass bound as uTexture, and the extra-sampler map
-    // (4th arg), so tests can assert the entity samples its own sprite bitmap AND that each
-    // texture param resolved to its bound Texture (vs the Texture.WHITE fallback).
-    makePixiShaderInstance: (_program: any, texture: any, _values: any, extraTextures: any) =>
-      ({ id: ++shaderSeq, texture, extraTextures, destroyed: false, destroy() { this.destroyed = true; } }),
-  }));
+  // `omitResourcesOnce` is a one-shot knob (consumed by the NEXT makePixiShaderInstance call,
+  // like MeshGeometry.__control's throwOnCall above) letting a test mint a shader with no
+  // reachable `resources.textureUniforms.uniforms` — the #698 fast path's fallback trigger.
+  let omitResourcesOnce = false;
+  vi.doMock('../../src/runtime/rendering/pixiShaderBuilder', async () => {
+    // ⚠️ `buildUniformValues` is re-exported REAL, and the fake Shader below seeds its
+    // `matUniforms` THROUGH it (#873). A hand-written default here would make the uniform
+    // re-seed test assert the mock's idea of a default instead of the engine's — the #838/#828
+    // shape, green whatever the source does. So the only thing this mock stands in for is the
+    // PixiJS object graph (`Shader` + `UniformGroup`); never the values inside it.
+    // `importActual` resolves the module's OWN `pixi.js` import through the mock above, which is
+    // safe because nothing in it touches pixi at module scope.
+    const actual = await vi.importActual<typeof import('../../src/runtime/rendering/pixiShaderBuilder')>(
+      '../../src/runtime/rendering/pixiShaderBuilder',
+    );
+    return {
+      buildUniformValues: actual.buildUniformValues,
+      // Capture the texture the material pass bound as uTexture, and the extra-sampler map
+      // (4th arg), so tests can assert the entity samples its own sprite bitmap AND that each
+      // texture param resolved to its bound Texture (vs the Texture.WHITE fallback).
+      //
+      // `resources.textureUniforms.uniforms.uTextureMatrix` mirrors what a real Shader (built by
+      // pixiShaderBuilder.ts's `makePixiShaderInstance`, then wrapped in Pixi's UniformGroup)
+      // exposes — this is the ONLY thing that makes the #698 in-place frame-swap fast path visible
+      // on screen (see Scene2D.tsx's frame-swap comment). Omitted for one call when
+      // `omitResourcesOnce` is set, to exercise the fast path's rebuild-fallback when the uniform
+      // group isn't reachable.
+      //
+      // `resources.matUniforms.uniforms` mirrors the real one on both counts that matter: it exists
+      // ONLY when the program declares uniform params (`program.params.length > 0` there), and it
+      // holds the RAW value — a number or Float32Array — not the `{value,type}` spec, because that
+      // is what `applyOverrides2D` writes and what the re-seed must restore.
+      makePixiShaderInstance: (program: any, texture: any, values: any, extraTextures: any) => {
+        const noResources = omitResourcesOnce;
+        omitResourcesOnce = false;
+        const specs = (program?.params?.length ?? 0) > 0 ? actual.buildUniformValues(program, values) : undefined;
+        const matUniforms = specs
+          ? { uniforms: Object.fromEntries(Object.entries(specs).map(([k, spec]) => [k, spec.value])) }
+          : undefined;
+        return {
+          id: ++shaderSeq, texture, extraTextures, destroyed: false,
+          destroy() { this.destroyed = true; },
+          ...(noResources ? {} : {
+            resources: {
+              textureUniforms: { uniforms: { uTextureMatrix: texture?.textureMatrix?.mapCoord ?? {} } },
+              ...(matUniforms ? { matUniforms } : {}),
+            },
+          }),
+        };
+      },
+      __setOmitResourcesOnce: () => { omitResourcesOnce = true; },
+    };
+  });
 
   // Stub the asset/texture-resolver surface so the harness needs no manifest.
   //  - A 'http…' / '/…' ref is a passthrough image url (ref === resolved url) — the
@@ -219,8 +333,9 @@ async function setup(opts: { start?: boolean } = {}) {
   if (opts.start) scene2d.startScene2D();
 
   const matCache: any = await import('../../src/runtime/loaders/spriteMaterialCache');
+  const shaderBuilder: any = await import('../../src/runtime/rendering/pixiShaderBuilder');
   const newWorld = () => trackWorld(createWorld());
-  return { pixi, traits, registerTrait, worldReg, pool, scene2d, world, newWorld, matReady: matCache.__ready as Set<string>, matProgram: matCache.__program as { params: any[]; textureParams: [string, any][]; manifest: any }, matClearSpy: matCache.__clearSpy };
+  return { pixi, traits, registerTrait, worldReg, pool, scene2d, world, newWorld, matReady: matCache.__ready as Set<string>, matProgram: matCache.__program as { params: any[]; textureParams: [string, any][]; manifest: any }, matClearSpy: matCache.__clearSpy, setOmitResourcesOnce: shaderBuilder.__setOmitResourcesOnce as () => void };
 }
 
 // Spawn a Canvas2D host entity (root). Returns the koota entity.
@@ -266,6 +381,86 @@ describe('Scene2D.renderFrame', () => {
     expect(obj.clear).toHaveBeenCalled();
     expect(obj.rect).toHaveBeenCalled();          // square → rect
     expect(obj.fill).toHaveBeenCalledWith(0x123456);
+  });
+
+  // #684: a primitive's Graphics geometry depends on shape/size/pivot/colour only, never on its
+  // transform — yet the outer `changed` gate (which decides whether to touch the display object
+  // at all) trips on x/y/rz/sx/sy too, and used to re-run `gfx.clear()` + redraw on every one of
+  // those frames. A `gfx.clear()` is not free: it emits a Pixi view-update that re-batches the
+  // WHOLE render group, so a single drifting primitive re-tessellated and re-batched every sibling
+  // around it. `geomSig` (on the slot) gates the clear+redraw separately from the transform apply.
+  describe('a primitive move does not re-issue its shape (#684)', () => {
+    it('T1: a pure move does not call clear() again, but the transform still applies', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+      expect(callsAfterBuild).toBeGreaterThan(0);
+
+      child.set(traits.Transform, { ...child.get(traits.Transform), x: 42 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBe(callsAfterBuild); // shape NOT re-issued
+      expect(obj._x).toBe(42);                                   // but the frame did run — the move applied
+    });
+
+    // The fast path must not over-widen: a genuine geometry input (size) still re-issues the
+    // shape. This passes both before and after the fix — it exists to pin the fast path against
+    // a future over-widening, not as evidence the change works (see T3 for that).
+    it('T2: a resize DOES re-issue the shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), width: 30 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBeGreaterThan(callsAfterBuild);
+    });
+
+    // Unlike size, colour reaches the geometry through `fill(color)`, not through any transform
+    // property — this genuinely fails if `color` is ever dropped from `geomSig`.
+    it('T3: a colour change DOES re-issue the shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', color: 0x123456, width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), color: 0x654321 });
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBeGreaterThan(callsAfterBuild);
+    });
+
+    // The biggest win of the change: `forceAll` (an editor trait write / gizmo drag on ANY
+    // entity) used to re-tessellate EVERY primitive in the scene, whether or not its own geometry
+    // moved. Nothing else pins this.
+    it('T4: forceAll alone does not re-issue an unchanged primitive\'s shape', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'square', width: 10, height: 10 });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      const callsAfterBuild = obj.clear.mock.calls.length;
+
+      // The external-dirty path the harness already uses to simulate an editor ECS write /
+      // gizmo drag on ANY entity — nothing about THIS entity's own geometry moved.
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+
+      expect(obj.clear.mock.calls.length).toBe(callsAfterBuild); // not re-issued
+    });
   });
 
   it('creates a Sprite for an image ref and binds the cached texture + tint', async () => {
@@ -447,6 +642,223 @@ describe('Scene2D.renderFrame', () => {
       expect(r.entityShaders.has(child.id())).toBe(false);      // purged when the entity leaves
     });
 
+    it('re-stamps the generation when a respawned entity REUSES the dead one\u2019s slot (#848)', async () => {
+      // The case the broker-level #848 tests do NOT reach, and the one that matters most: B does
+      // not merely "register nothing" \u2014 it inherits A's LIVE slot. Same material GUID, same
+      // texture, so the rebuild gate (`slot.matGuid`/`matBuildSig`/`builtEpoch`) passes and the
+      // renderer draws B with A's existing Shader. If the map entry is not re-stamped there, the
+      // generation check refuses the driver access to the very Shader on screen \u2014 permanently,
+      // because the per-frame purge keeps the entry (B IS rendering, so its id is in materialIds).
+      const broker = await import('../../src/runtime/rendering/sprite2DMaterialBroker');
+      const { traits, scene2d, pool, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+      const canvas = spawnCanvas(world, traits);
+      const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+      r.renderFrame();
+      expect(r.entityShaders.get(a.id())?.gen).toBe(a.generation());
+      const shaderA = r.entityShaders.get(a.id())!.shader;
+
+      // Despawn + respawn IDENTICALLY with NO renderFrame in between, so the purge never observes
+      // the gap. This is the pooled-prefab respawn (a bullet, a VFX) that koota's LIFO free list
+      // makes the common case rather than an exotic one.
+      a.destroy();
+      const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+      expect(b.id()).toBe(a.id());                 // the index really was reclaimed\u2026
+      expect(b.valueOf()).not.toBe(a.valueOf());   // \u2026and B is a different entity
+
+      r.renderFrame();
+
+      const slotShader = (r as any).slots.get(b.id())?.matShader;
+      expect(slotShader).toBe(shaderA);            // the slot WAS reused \u2014 nothing rebuilt
+
+      const entry = r.entityShaders.get(b.id());
+      expect(entry?.shader).toBe(slotShader);      // the entry points at the Shader on screen\u2026
+      expect(entry?.gen).toBe(b.generation());     // \u2026stamped for B, not for the dead A
+
+      // The consequence, asserted through the driver's own accessor rather than the map: B's
+      // MaterialInstance must be able to reach it, or B renders frozen at A's last uniforms.
+      const off = broker.register2DMaterialShaderMap(r.entityShaders);
+      try {
+        expect(broker.getEntity2DMaterialShaders(b.id(), b.generation())).toEqual([slotShader]);
+      } finally { off(); }
+    });
+
+    // #873 — the half #848 deliberately did NOT cover, and the worse half. #848 restored the
+    // driver's ACCESS to a reused Shader; the Shader's uniform STATE is still the dead entity's.
+    // `matUniforms` is allocated only inside `makePixiShaderInstance`, i.e. only on a build, and
+    // `applyOverrides2D` is its only other writer — so a slot handed to a new generation draws at
+    // whatever the dead entity was last driven to. Self-healing one frame late when the newcomer
+    // drives the same targets; PERMANENT when it drives none.
+    //
+    // The fix is a RESET in place, not a rebuild: see Scene2D.tsx's comment at the re-stamp for why
+    // rebuilding the Shader here would trade this bug for #699's unbounded `BindGroupSystem._hash`
+    // growth on exactly the pooled-respawn path. So the slot reuse asserted by the #848 test above
+    // is still expected to hold in every test below — that is what makes these two coexist rather
+    // than one inverting the other.
+    describe('a respawned entity does not inherit the dead one\u2019s uniform values (#873)', () => {
+      // One scalar param, so `program.params.length > 0` and the (real) `buildUniformValues`
+      // seeds `matUniforms` — matching the production shape where the manifest `default` IS the
+      // authored value (`Renderable2D.material` resolves straight to the `.shader.json`, and
+      // Scene2D passes `values: undefined`).
+      const PARAMS: [string, any][] = [['uThreshold', { type: 'float', default: 0.25 }]];
+      const DEFAULT_THRESHOLD = 0.25;
+
+      // Verbatim what `applyOverrides2D` does (`uniforms[target] = <number>`, no dirty bump) —
+      // the production write, invoked directly rather than through `materialInstanceSystem` so the
+      // test does not have to stand up Time/deltas/sources to say something about Scene2D.
+      const drive = (shader: any, v: number) => { shader.resources.matUniforms.uniforms.uThreshold = v; };
+      const read = (shader: any): number => shader.resources.matUniforms.uniforms.uThreshold;
+
+      it('re-seeds a REUSED slot to the program defaults when the newcomer drives nothing', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        r.renderFrame();
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);   // a fresh build starts at the manifest default
+        drive(shaderA, 0.9);                             // A's MaterialInstance runs it to fully dissolved
+
+        // Despawn + respawn IDENTICALLY with no renderFrame between, so nothing observes the gap —
+        // koota's LIFO free list hands B the exact index, and B carries NO MaterialInstance, which
+        // is the case nothing ever heals.
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        r.renderFrame();
+
+        // The slot really was reused — this is the reset, not a rebuild (#848's pin still holds).
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);
+        // …and B nevertheless draws at the DEFAULT, not at A's 0.9.
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);
+
+        // ONCE, on the handover — then B owns the uniforms. Without the `slot.matGen = gen` stamp
+        // the mismatch never clears and every subsequent frame re-seeds, permanently clobbering
+        // B's own driver: a worse bug than the one being fixed, and nothing else pins it.
+        drive(shaderA, 0.7);
+        r.renderFrame();
+        expect(read(shaderA)).toBe(0.7);
+      });
+
+      // The invariant, stated as a comparison rather than a constant: a respawn renders identically
+      // whether or not it reclaimed a dead entity's index. Asserting it this way is what stops a
+      // later change re-introducing the inheritance behind a different default.
+      it('gives a recycled index the same frame-0 uniforms as a FRESH index', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        r.renderFrame();
+        drive(r.entityShaders.get(a.id())!.shader as any, 0.9);
+
+        a.destroy();
+        const recycled = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        const fresh = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' }, 1);
+        expect(recycled.id()).toBe(a.id());        // LIFO: the first respawn reclaims the index…
+        expect(fresh.id()).not.toBe(a.id());       // …the second gets a brand-new one
+
+        r.renderFrame();
+
+        const recycledShader = r.entityShaders.get(recycled.id())!.shader as any;
+        const freshShader = r.entityShaders.get(fresh.id())!.shader as any;
+        expect(recycledShader).not.toBe(freshShader);          // genuinely two entities
+        expect(read(recycledShader)).toBe(read(freshShader));  // …drawing the same frame 0
+        expect(read(recycledShader)).toBe(DEFAULT_THRESHOLD);
+      });
+
+      // The reset is invisible without a redraw: the respawn changes nothing the MaterialSnap gate
+      // can see (same placement, same colour, and the driver's dirty flag is never set for B), so
+      // the uniform write must arm the canvas itself or the GPU keeps presenting A's last frame.
+      it('arms the canvas redraw for the frame it re-seeds on', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        const a = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+        const dirtied: Set<number>[] = [];
+        vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+        r.renderFrame();                                        // build → dirty
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        drive(shaderA, 0.9);
+        r.renderFrame();                                        // settled: a bare uniform write sets no flag
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+        // The other side of the gate, asserted directly rather than only through the dirty flag: a
+        // re-seed that fired on every frame instead of on a generation change would clobber a LIVE
+        // driver's value here, which is a worse bug than the one being fixed.
+        expect(read(shaderA)).toBe(0.9);
+
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+        expect(b.id()).toBe(a.id());
+
+        r.renderFrame();
+        expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // the re-seed dirties the canvas
+      });
+
+      // ⚠️ The case the first cut of this fix MISSED, found by the close-out review. The reset was
+      // keyed off `entityShaders`, whose lifetime is strictly SHORTER than the slot's: the
+      // per-frame purge (`!materialIds.has(eid)`) drops the stamp on any frame the material pass
+      // skips the entity, while the end-of-frame slot sweep keeps the slot because the SPRITE pass
+      // reached its `activeIds.add(id)` and then took its `if (!resolved) return` — which sits
+      // BEFORE its slot-kind check — without replacing it. Stamp gone, Shader alive → the old
+      // `prev &&` guard read `undefined` and skipped the reset, permanently, in exactly the
+      // scenario #873 is about. (Cited by symbol, not line: this comment's first draft carried
+      // `:1543`/`:1563` and the very commit that added it shifted both by eight.)
+      //
+      // Production preconditions, none exotic: a `sprite` ref that IS image-typed but has no 2D
+      // variant (`resolveSprite` returns undefined — a 3d-typed KTX2 used as a 2D sprite), plus at
+      // least one frame with the program unavailable, which `Scene2DRenderer.stop()` on a sibling
+      // renderer and any `.shader.json` save (#842/#852) both open. Keyed on the slot's own
+      // `matGen` it fires correctly, which is what this pins.
+      it('still re-seeds when the entityShaders stamp was purged but the SLOT survived', async () => {
+        const { traits, scene2d, pool, world, matReady, matProgram } = await setup();
+        matReady.add('matGuid');
+        matProgram.params = PARAMS;
+        const r = new scene2d.Scene2DRenderer({ pool: new pool.Canvas2DPool(), primary: false });
+        const canvas = spawnCanvas(world, traits);
+        // `img:` is image-typed to `isImagePath` but `resolveSprite` returns undefined for it (empty
+        // url) — the sprite pass's `!resolved` early return, reached AFTER `activeIds.add(id)`.
+        const rend = { sprite: 'img:', material: 'matGuid' };
+        const a = spawnChild(world, traits, canvas.id(), rend);
+
+        r.renderFrame();
+        const shaderA = r.entityShaders.get(a.id())!.shader as any;
+        drive(shaderA, 0.9);
+
+        a.destroy();
+        const b = spawnChild(world, traits, canvas.id(), rend);
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        // One frame with the program gone: the material pass returns before touching the slot, the
+        // sprite pass keeps the id alive and bails, so the purge runs and the sweep does not.
+        matReady.delete('matGuid');
+        r.renderFrame();
+        expect(r.entityShaders.has(b.id())).toBe(false);                  // stamp purged…
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);    // …Shader still alive
+
+        matReady.add('matGuid');
+        r.renderFrame();
+
+        expect((r as any).slots.get(b.id())?.matShader).toBe(shaderA);    // slot reused, as designed
+        expect(read(shaderA)).toBe(DEFAULT_THRESHOLD);                    // and reset anyway
+      });
+    });
+
     it('falls back to the default sprite while the material program is still loading', async () => {
       const { traits, pool, scene2d, world, matReady } = await setup();
       // matGuid NOT ready → ensureSpriteMaterial returns undefined → sprite pass renders it.
@@ -507,6 +919,13 @@ describe('Scene2D.renderFrame', () => {
       expect(mesh.destroyed).toBe(true);
       expect(shader.destroyed).toBe(true);          // shader torn down with the slot
       expect(mesh.geometry.destroy).toHaveBeenCalled();
+      // releaseGeometry must call unload() BEFORE destroy(true) — Pixi's Geometry.destroy()
+      // tears off the "unload" listener before firing it, so the ORDER is what actually frees
+      // the GL VAO; a mock that merely records both calls (without this) can't tell the fix
+      // apart from the bug it fixes.
+      expect(mesh.geometry.unload).toHaveBeenCalled();
+      expect(mesh.geometry.unload.mock.invocationCallOrder[0])
+        .toBeLessThan(mesh.geometry.destroy.mock.invocationCallOrder[0]);
       expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
     });
 
@@ -622,6 +1041,213 @@ describe('Scene2D.renderFrame', () => {
       expect(pixi.Assets.__unloaded).not.toContain('http://t/hero.png'); // same-url rebuild never hit refcount 0
     });
 
+    // #697: the material pass used to call the OLD resolver (which minted a framed `Texture`
+    // wrapper INLINE) once per material entity per FRAME, regardless of whether the Mesh needed
+    // rebuilding — the mint was dropped on the floor every steady-state frame. The split resolver
+    // (`resolveMaterialTextureRef`, allocation-free) + `mintMaterialTexture` (called only on a
+    // build or a frame swap) means a steady atlas-sliced material costs exactly ONE wrapper for
+    // its whole lifetime until something actually changes.
+    it('mints the atlas-slice Texture wrapper once on build, not once per steady-state frame (#697)', async () => {
+      const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      // 'sheet:0' resolves to an ATLAS SLICE (a frame) of one shared sheet — the case that mints
+      // a framed wrapper at all (a whole image never allocates one).
+      spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid' });
+
+      scene2d.renderFrame(); // build: exactly one wrapper minted
+      const afterBuild = pixi.Texture.frameConstructCount;
+      expect(afterBuild).toBeGreaterThan(0);
+
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // steady-state frame: ref/size/pivot/url/epoch all unchanged
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // and again
+
+      expect(pixi.Texture.frameConstructCount).toBe(afterBuild); // NOT one more per frame
+    });
+
+    // #698: `matSig` no longer carries the sprite ref, and a frame swap within one sheet takes an
+    // in-place path (swap `mesh.texture` + write `uTextureMatrix`) instead of disposing and
+    // rebuilding Mesh+Shader+Geometry. The observable is Mesh OBJECT IDENTITY: it must survive a
+    // same-sheet slice change, and it must NOT survive a genuine structural change (a size edit).
+    describe('atlas frame swap stays in place (#698)', () => {
+      it('keeps the SAME Mesh across an atlas slice change (SpriteAnimator-style ref swap)', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const texBefore = meshBefore.texture;
+        expect(meshBefore.kind).toBe('material');
+
+        // Same sheet, next slice — width/height/pivot/url/epoch all unchanged, only the sub-rect moves.
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).toBe(meshBefore);              // SAME Mesh object — no rebuild
+        expect(meshBefore.destroyed).toBe(false);       // never torn down
+        expect(kids[0].texture).not.toBe(texBefore);    // but it samples the NEW slice
+      });
+
+      // #692 changed this: a size/pivot change no longer forces a rebuild (it resizes the quad
+      // in place via `matQuadSig`, regardless of whether a ref swap happens in the same frame) —
+      // only a genuine BUILD input (`matBuildSig`: resolved url / extra-sampler set) still does.
+      // A same-sheet ref swap alongside a size change now takes the in-place frame-swap path
+      // (texture + uTextureMatrix written in place) AND the in-place quad resize, on the SAME
+      // Mesh+Shader — see 'material quad resize is in-place, not a rebuild (#692)' → T5/T6 above.
+      //
+      // The OLD expectation here ("a size change alongside a ref swap forces a NEW Mesh") was only
+      // ever true because size sat in the (now-split) build signature — it was an accident of the
+      // old sig's shape, not a real requirement. With `matBuildSig`/`matQuadSig` split, a combined
+      // frame legitimately takes BOTH in-place paths at once: the frame swap writes the new slice's
+      // `uTextureMatrix`, then the resize writes the 8 position floats — and both still apply.
+      it('resizes in place (still the frame-swap Mesh) when a size change accompanies a same-sheet ref swap', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderIdBefore = meshBefore.shader.id;
+
+        // Same sheet (matBuildSig unchanged) + a size change (matQuadSig changed) + a ref swap
+        // (matSpriteRef changed) all in one frame.
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1', width: 40 });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).toBe(meshBefore);              // SAME Mesh — no rebuild
+        expect(kids[0].shader.id).toBe(shaderIdBefore); // SAME Shader
+        expect(meshBefore.destroyed).toBe(false);       // never torn down
+      });
+
+      // The gap an adversarial review found: the mock shader used to have no `resources`, so
+      // every existing test above took the swap in-place WITHOUT ever executing the
+      // `tu.uTextureMatrix = ...` write — the one statement that makes the swap visible on a
+      // real GPU (see Scene2D.tsx's frame-swap comment: the mesh adaptors only refresh
+      // uTexture/uSampler/uTextureMatrix inside `if (!shader)`, which a material slot never
+      // hits). This pins that the fast path actually writes the NEW frame's matrix onto the
+      // SAME shader object, not just that the Mesh survives.
+      it('writes the NEW slice matrix onto the uTextureMatrix uniform, in place on the SAME shader', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderBefore = meshBefore.shader;
+        const uMatrixBefore = shaderBefore.resources.textureUniforms.uniforms.uTextureMatrix;
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).toBe(meshBefore);                       // still the in-place fast path
+        expect(meshAfter.shader).toBe(shaderBefore);              // SAME shader object — no rebuild
+        const uMatrixAfter = shaderBefore.resources.textureUniforms.uniforms.uTextureMatrix;
+        expect(uMatrixAfter).not.toEqual(uMatrixBefore);          // tracked the new slice's matrix
+        expect(uMatrixAfter).toEqual(meshAfter.texture.textureMatrix.mapCoord); // matches the new texture's own matrix
+      });
+
+      // Fallback: when the shader's uniform group is NOT reachable (a shader minted by a build
+      // path that doesn't expose `resources.textureUniforms.uniforms` — e.g. an older/foreign
+      // Shader instance), the fast path must refuse and fall through to a full rebuild, rather
+      // than silently swapping `mesh.texture` while leaving the old sub-rect's matrix bound
+      // (which would render the WRONG slice forever with nothing failing).
+      it('falls back to a full rebuild (a NEW Mesh) when the shader has no reachable uTextureMatrix uniform', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady, setOmitResourcesOnce } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        setOmitResourcesOnce(); // the NEXT makePixiShaderInstance call mints a shader with no `resources`
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshBefore.shader.resources).toBeUndefined(); // confirms the fallback trigger is actually armed
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'sheet:1' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const kids = pool.getSlot(canvas.id())!.container.children as any[];
+        expect(kids).toHaveLength(1);
+        expect(kids[0]).not.toBe(meshBefore);   // rebuilt, not swapped in place
+        expect(meshBefore.destroyed).toBe(true);
+      });
+    });
+
+    // #692 site 2: `matSig` used to include width/height/pivot, so an animated size rebuilt the
+    // whole Mesh+Shader+Geometry every frame — and every Shader rebuild leaks a permanent entry
+    // into WebGPU's BindGroupSystem._hash (#699) and pixi's GCManagedHash (#707), making an
+    // animated size an unbounded grow. `matBuildSig`/`matQuadSig` split the two: a size/pivot
+    // change now resizes the existing quad's 8 position floats in place instead.
+    describe('material quad resize is in-place, not a rebuild (#692)', () => {
+      it('T5: a size change resizes the quad in place — same Mesh, same Shader, geometry updated', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        const { computePivotOffset } = await import('../../src/runtime/rendering/render2DUtils');
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/hero.png', { width: 64, height: 64, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+        const shaderIdBefore = meshBefore.shader.id;
+        const geomBefore = meshBefore.geometry;
+
+        const rendAfter = child.get(traits.Renderable2D);
+        child.set(traits.Renderable2D, { ...rendAfter, width: 30 });
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).toBe(meshBefore);                  // SAME Mesh object — no rebuild
+        expect(meshAfter.shader.id).toBe(shaderIdBefore);    // SAME Shader — this is the #699/#707 pin
+        expect(meshAfter.geometry).toBe(geomBefore);         // SAME geometry object, resized in place
+        expect((geomBefore.getBuffer('aPosition') as any).update).toHaveBeenCalled();
+        // x1 reflects the NEW width, via the same pivot-offset derivation production uses.
+        const { ox } = computePivotOffset(30, rendAfter.height, 0.5, 0.5);
+        expect(geomBefore.positions[2]).toBe(ox + 30 * 2);
+      });
+
+      // Proves the split did not make the rebuild gate too narrow: a genuine build input
+      // (the resolved sprite url) must still force a real rebuild.
+      it('T6: a url change still rebuilds (matBuildSig still forces it)', async () => {
+        const { pixi, traits, pool, scene2d, world, matReady } = await setup();
+        matReady.add('matGuid');
+        pixi.Assets.__seed('http://t/hero.png', { width: 64, height: 64, source: { style: {} } });
+        pixi.Assets.__seed('http://t/villain.png', { width: 64, height: 64, source: { style: {} } });
+        const canvas = spawnCanvas(world, traits);
+        const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid', width: 10, height: 10 });
+
+        scene2d.renderFrame();
+        const meshBefore = pool.getSlot(canvas.id())!.container.children[0] as any;
+
+        child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/villain.png' });
+        scene2d.markScene2DDirty();
+        scene2d.renderFrame();
+
+        const meshAfter = pool.getSlot(canvas.id())!.container.children[0] as any;
+        expect(meshAfter).not.toBe(meshBefore); // a NEW Mesh — matBuildSig still gates a rebuild
+        expect(meshBefore.destroyed).toBe(true);
+      });
+    });
+
     // Perf gate (MaterialSnap): the material pass used to force a canvas redraw EVERY running
     // frame. Now it dirties the canvas only on a (re)build, a transform/appearance change, a
     // driver uniform change (sprite2DMaterialBroker flag), or an external dirty — so a static
@@ -652,10 +1278,74 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();                                   // settled again
       expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
 
-      broker.markEntity2DMaterialDirty(child.id());            // driver wrote a new uniform this frame
+      broker.markEntity2DMaterialDirty(child.id(), child.generation()); // driver wrote a new uniform this frame
       scene2d.renderFrame();
       expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // uniform change forces a redraw
       broker.clearEntity2DMaterialDirty();
+    });
+
+    // #211 review finding: the MaterialSnap `changed` gate compared `snap.opacity !== rend.opacity`
+    // while the write below it stores the COMPOSED value (`snap.opacity = alpha`, where
+    // `alpha = rend.opacity * groupAlpha`) — the sprite and skinned passes both compare `alpha`;
+    // the material pass was the lone outlier. Under a steady `GroupAlpha` of 0.5 (rend.opacity
+    // staying its default 1), `snap.opacity` holds 0.5 forever but was compared against `1`, so
+    // the mismatch never clears and the gate never settles — a full GPU pass every frame with
+    // nothing moving, the exact cost the gate above exists to avoid.
+    it('a material entity under a steady GroupAlpha settles (does not redraw forever) (#211)', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const group = world.spawn(
+        traits.GroupAlpha({ alpha: 0.5 }),
+        traits.EntityAttributes({ name: 'group', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+      );
+      world.spawn(
+        traits.Transform({}),
+        traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10, material: 'matGuid' }),
+        traits.EntityAttributes({ name: 'child', parentId: group.id(), sortOrder: 0, layer: '2d' }),
+      );
+
+      const dirtied: Set<number>[] = [];
+      vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+      scene2d.renderFrame();                                   // first frame: Mesh built
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+      scene2d.renderFrame();                                   // nothing changed
+      scene2d.renderFrame();
+      // Before the fix this stayed true forever — the raw-vs-composed mismatch never resolves.
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+    });
+
+    // The other half of #211: holding `rend.opacity` constant and fading only the ANCESTOR
+    // GroupAlpha must still mark the canvas dirty. Before the fix this read as UNCHANGED
+    // (`snap.opacity` 1.0 compared against `rend.opacity` 1.0, both untouched by the fade), so
+    // the new alpha was written to `mesh.alpha` below but the canvas was never re-presented — a
+    // fade that does not paint.
+    it('a group FADE on a material entity marks the canvas dirty (#211)', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const group = world.spawn(
+        traits.GroupAlpha({ alpha: 1 }),
+        traits.EntityAttributes({ name: 'group', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+      );
+      world.spawn(
+        traits.Transform({}),
+        traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10, material: 'matGuid' }),
+        traits.EntityAttributes({ name: 'child', parentId: group.id(), sortOrder: 0, layer: '2d' }),
+      );
+
+      const dirtied: Set<number>[] = [];
+      vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+      scene2d.renderFrame();                                   // build
+      scene2d.renderFrame();                                   // settle
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+
+      group.set(traits.GroupAlpha, { alpha: 0.5 });            // fade — rend.opacity untouched
+      scene2d.renderFrame();
+      expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);     // before the fix: silently unchanged
     });
 
     // Review finding (HIGH): with the redraw gate, a co-resident static material no longer
@@ -1192,6 +1882,98 @@ describe('Scene2D.renderFrame', () => {
     expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
   });
 
+  // Reachability for `Orphan2DTracker.prune` (canvas2DRouting.ts): unit-tested directly there,
+  // but nothing called it from `renderFrame` until this wiring — that gap is exactly what let a
+  // tested mechanism never fire in production. This drives it through the REAL frame path
+  // (spawn → renderFrame → destroy → renderFrame → respawn → renderFrame), not a direct
+  // `orphan2D.prune(...)` call, so it also proves the frame loop calls it with the right set.
+  it('forgets a dead orphaned entity through the real renderFrame path, unblocking its recycled id (prune wiring)', async () => {
+    const { traits, scene2d, world, registerTrait } = await setup();
+    // The harness registers EntityAttributes with `fields: {}` (setup() above), so
+    // readTraitData normally returns `{}` for it and `orphan2DKey` always falls back to
+    // `id:<entityId>` regardless of an authored guid — re-register with real field hints so
+    // THIS test can give two entities distinct guid-keyed warn identities, matching what a real
+    // scene (guid always registered) does. `Orphan2DTracker.warned` is keyed by guid, and this
+    // test targets `frames` pruning specifically — a guid-less entity's `id:` fallback key has
+    // its OWN, different collision on id recycling (`warned` never forgets it), which is a real
+    // but separate gap from what `prune` fixes.
+    const { inferFields } = await import('../../src/runtime/core/ecs/traitRegistry');
+    registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: inferFields(traits.EntityAttributes) });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Only the orphan-ancestor warning — the harness spawns entities without registerEntity(),
+    // which independently logs its own unrelated O(n)-fallback warning on every readTraitData
+    // call, so a raw call count would conflate the two.
+    const orphanWarnCount = () => warnSpy.mock.calls.filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]')).length;
+
+    const spawnOrphan = (guid: string) => world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+      traits.EntityAttributes({ name: guid, parentId: 0, sortOrder: 0, layer: '2d', guid }),
+    );
+
+    // Orphaned (parented to root, no Canvas2D ancestor) — warns on its very first frame, since
+    // ORPHAN_2D_WARN_FRAMES is 1.
+    const dead = spawnOrphan('dead-guid');
+    const deadId = dead.id();
+    scene2d.renderFrame();
+    expect(orphanWarnCount()).toBe(1);
+
+    // Dies WITHOUT recovering (no clear() — it never routes to a canvas). Without prune wired
+    // into renderFrame, its stale warn-frame count would sit in `frames` forever. One more frame
+    // runs the sweep over THIS frame's live-entity set, which no longer contains `deadId`.
+    dead.destroy();
+    scene2d.renderFrame();
+
+    // koota's entity-id pool is LIFO: destroying one entity and then spawning exactly one more
+    // hands back the freed id (verified against the real koota package before writing this
+    // test). This is what puts a NEW entity on the SAME numeric id the dead one held.
+    warnSpy.mockClear();
+    const revived = spawnOrphan('revived-guid');
+    expect(revived.id()).toBe(deadId); // the recycling this test exists to exploit
+
+    scene2d.renderFrame();
+    // Without the fix: `frames.get(deadId)` still held the dead entity's count (1), so this
+    // frame's `note()` lands on 2 — never == ORPHAN_2D_WARN_FRAMES(1) again — and the new entity
+    // could NEVER warn. With `prune` reached from the real frame loop, the stale count was
+    // dropped before this frame, so the new entity starts at 0 and warns right on schedule.
+    expect(orphanWarnCount()).toBe(1);
+  });
+
+  // Adversarial review of #590 (docs/ios-gpu-memory.md): `liveEntityIds` was
+  // built ONLY from `world.query(attrMeta.trait)` (EntityAttributes), but `noteOrphan2D` is
+  // reachable from the Renderable2D/SkinnedSprite2D/Text2D passes for entities that have NO
+  // EntityAttributes at all — the same entities `orphan2DKey` falls back to an `id:` key for.
+  // Those entities can never resolve to a canvas either (findCanvasAncestor needs a
+  // `parentOfEntity` entry, which only the EntityAttributes query populates), so they orphan
+  // FOREVER — and every frame's `prune()` used to delete their frame count out from under them
+  // before the routing passes ran, since it fires right after the EntityAttributes query. At
+  // ORPHAN_2D_WARN_FRAMES===1 that reset is invisible in the warn COUNT (both a reset-to-1 and a
+  // real accumulation land on "warn once"), so this asserts the tracker's internal counter
+  // directly — the only way to see whether it survives the prune or gets wiped every frame.
+  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntityIds completeness)", async () => {
+    const { traits, scene2d, world } = await setup();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const orphan = world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+      // Deliberately NO traits.EntityAttributes(...) — this is the gap.
+    );
+    const id = orphan.id();
+
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+
+    // Without the fix, `prune()` deletes this id's count every frame (it's absent from
+    // `liveEntityIds`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
+    // frames. With `liveEntityIds` also covering every `Transform`-bearing entity, the count
+    // accumulates normally.
+    const frames = (scene2d.defaultRenderer as any).orphan2D.frames as Map<number, number>;
+    expect(frames.get(id), 'a still-live orphan must not be pruned out from under itself').toBe(3);
+  });
+
   it('tears down all slots and releases the pool on world swap', async () => {
     const { traits, pool, scene2d, world, worldReg, newWorld } = await setup({ start: true });
     const canvas = spawnCanvas(world, traits);
@@ -1239,7 +2021,17 @@ describe('Scene2D.renderFrame', () => {
       expect(obj.clear).toHaveBeenCalledTimes(2);     // color change → redraw
     });
 
-    it('redraws when the transform moves (an animating sprite)', async () => {
+    // #684 changed this: a primitive's Graphics geometry does not depend on its transform, so a
+    // pure move no longer re-issues the shape (see 'a primitive move does not re-issue its shape
+    // (#684)' → T1 above) — the entity still redraws (position.set still runs every changed
+    // frame), it just does so without a wasted clear()+redraw of an unmoved shape.
+    //
+    // The OLD expectation here ("a move redraws the shape") was wrong on its own terms, not just
+    // superseded: it pinned "clear() is called again on a pure move" as CORRECT behaviour, when
+    // that call was exactly #684's defect (a manufactured view change that re-batches the whole
+    // render group for a shape that never moved). This test was defending the bug it should have
+    // caught.
+    it('moves without re-clearing the shape (an animating sprite) — #684', async () => {
       const { traits, pool, scene2d, world } = await setup();
       const canvas = spawnCanvas(world, traits);
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
@@ -1250,7 +2042,8 @@ describe('Scene2D.renderFrame', () => {
 
       child.set(traits.Transform, { ...child.get(traits.Transform), x: 50 });
       scene2d.renderFrame();
-      expect(obj.clear).toHaveBeenCalledTimes(2);
+      expect(obj.clear).toHaveBeenCalledTimes(1); // geometry unchanged → not re-issued
+      expect(obj._x).toBe(50);                    // but the move still applied
     });
 
     it('skips the whole frame while the sim is stopped and nothing is externally dirty', async () => {
@@ -1274,6 +2067,102 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       expect(obj.clear).toHaveBeenCalledTimes(2);     // now redrawn
     });
+
+    it('retries a slot that owes a redraw (redrawOwed) even while the sim is stopped and nothing is dirty (#455)', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const { setPlayState } = await import('../../src/runtime/core/playState');
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+
+      scene2d.renderFrame(); // frame 1: allocates the slot; its Application init is async
+      const slot = pool.getSlot(canvas.id())!;
+      await slot.ready;
+      // `renderAll` skips a slot whose canvas is still 1x1 (unsized) — give it a real size so the
+      // GPU render pass is actually reached.
+      slot.canvas.width = 320;
+      slot.canvas.height = 480;
+      const render = (slot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+
+      // A genuinely dirty, now-initialized frame — the first real GPU render.
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' }, 1);
+      scene2d.renderFrame(); // frame 2: renders for real
+      expect(render).toHaveBeenCalledTimes(1);
+
+      // Force the next render to throw, then dirty the canvas again (still running) so renderAll
+      // actually reaches — and fails on — this slot, arming `redrawOwed`.
+      render.mockImplementationOnce(() => { throw new Error('boom'); });
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' }, 2);
+      scene2d.renderFrame(); // frame 3: render throws, redrawOwed = true
+      expect(render).toHaveBeenCalledTimes(2);
+
+      setPlayState('stopped');
+      render.mockClear();
+      // Nothing new is dirty and the sim is stopped — without reading `hasRedrawOwed` above the
+      // idle skip, renderFrame would return before `pool.renderAll` is ever reached and this
+      // assertion would fail.
+      scene2d.renderFrame(); // frame 4
+      expect(render).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+// #701: an editor panel (ShaderPreview) that previews a texture-param default used to
+// `Assets.load` it with no matching release — every param edit stranded another texture for the
+// life of the editor process. `retainPanelTexture`/`releasePanelTexture` hold urls on a SEPARATE
+// map from the scene's own refcount (`spriteTextureRefs`), because that one is scene-scoped by
+// design (F3) and gets wiped wholesale on a world swap / last-renderer stop — a panel hold has to
+// survive both. `unloadSpriteTextureNow` — the single choke point both the deferred per-slot
+// release and the wholesale sweep funnel through — returns early while a panel hold exists.
+describe('panel texture holds veto the shared unload (#701)', () => {
+  it('a panel hold survives a world-swap wholesale sweep that would otherwise unload it', async () => {
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-a.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    // A scene sprite retains it too, so it's genuinely in play for the wholesale sweep
+    // (`unloadAllSpriteTextures` only iterates the scene-tracked refcount map).
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-a.png' });
+    scene2d.renderFrame();
+
+    scene2d.retainPanelTexture('http://t/panel-a.png'); // the panel holds it too
+
+    worldReg.setCurrentWorld(newWorld()); // disposes the scene slot + runs the wholesale sweep (liveRenderers<=1)
+    await new Promise((r) => setTimeout(r, 0)); // let any deferred release elapse
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/panel-a.png'); // panel hold vetoed it
+    scene2d.stopScene2D();
+  });
+
+  it('releasing the last panel hold while a scene hold remains does NOT unload', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-b.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-b.png' });
+    scene2d.renderFrame(); // scene now holds it
+
+    scene2d.retainPanelTexture('http://t/panel-b.png');
+    scene2d.releasePanelTexture('http://t/panel-b.png'); // last (only) panel hold dropped
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/panel-b.png'); // the scene still samples it
+    scene2d.stopScene2D();
+  });
+
+  it('releasing the last of both panel and scene holds DOES unload', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/panel-c.png', { width: 10, height: 10, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/panel-c.png' });
+    scene2d.renderFrame();
+
+    scene2d.retainPanelTexture('http://t/panel-c.png');
+
+    child.destroy();
+    scene2d.renderFrame(); // scene drops its hold (deferred)
+    scene2d.releasePanelTexture('http://t/panel-c.png'); // panel drops its last hold too
+
+    await new Promise((r) => setTimeout(r, 0)); // let the scene's deferred release settle too
+    expect(pixi.Assets.__unloaded).toContain('http://t/panel-c.png');
+    scene2d.stopScene2D();
   });
 });
 
@@ -1306,6 +2195,70 @@ describe('Scene2D collider overlay (editor)', () => {
     scene2d.setShowColliders2D(false);
     scene2d.renderFrame();
     expect(g.clear).toHaveBeenCalled();
+  });
+
+  // #684 (site 2, close-out sweep): `drawColliderOverlays` used to unconditionally
+  // `g.clear()` every overlay Graphics at the top of EVERY frame, even an empty one nothing
+  // had drawn into since the last clear. `GraphicsContext.clear()` has no empty early-out — it
+  // unconditionally emits the same 'update' → whole-render-group re-batch #684's main fix
+  // was about. So once a session had ever shown colliders, every canvas holding a (now empty)
+  // overlay paid a full re-batch on every subsequent frame forever, with the overlay OFF.
+  // `_colliderOverlaysDrawn` gates the clear loop on "something was actually drawn since the
+  // last clear", so an idle/disabled overlay is cleared exactly once, not every frame.
+  it('clears the overlay once after the toggle goes off, not every frame after (#684 site 2)', async () => {
+    const { traits, pool, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    world.spawn(
+      traits.Transform({ x: 100, y: 100 }),
+      traits.Collider2D({ shape: 'box', halfW: 50, halfH: 50 }),
+      traits.EntityAttributes({ name: 'wall', parentId: canvas.id(), layer: '2d' }),
+    );
+
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame(); // drawn
+    const slot = pool.getSlot(canvas.id())!;
+    const g = (slot.container.children as any[]).find((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
+
+    scene2d.setShowColliders2D(false);
+    scene2d.renderFrame(); // cleared once — the existing test above already pins this call
+    expect(g.clear).toHaveBeenCalled();
+
+    g.clear.mockClear();
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+    expect(g.clear).not.toHaveBeenCalled(); // nothing was drawn since the last clear → not re-cleared
+  });
+
+  // Guard against the flag latching the feature off entirely. The realistic trigger is a rapid
+  // UI toggle: OFF then back ON again before the next renderFrame() — so the clear-loop's
+  // `_colliderOverlaysDrawn` is still true (something WAS drawn last frame) at the moment
+  // `_showColliders` is ALREADY true again too. A plausible-but-wrong implementation returns
+  // early right after the clear-and-reset block (treating "something needed clearing" as "this
+  // frame is done"), which would swallow the re-enable until a SECOND frame. It must draw in
+  // the very same frame that clears.
+  it('drawing resumes in the SAME frame that clears, after an off-then-back-on toggle (#684 site 2)', async () => {
+    const { traits, pool, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    world.spawn(
+      traits.Transform({ x: 100, y: 100 }),
+      traits.Collider2D({ shape: 'box', halfW: 50, halfH: 50 }),
+      traits.EntityAttributes({ name: 'wall', parentId: canvas.id(), layer: '2d' }),
+    );
+
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame(); // drawn — _colliderOverlaysDrawn is now true
+    const slot = pool.getSlot(canvas.id())!;
+    const g = (slot.container.children as any[]).find((c: any) => c.kind === 'graphics' && c.stroke.mock.calls.length > 0);
+    g.stroke.mockClear(); g.moveTo.mockClear(); g.lineTo.mockClear(); g.clear.mockClear();
+
+    // Off then back on, BEFORE the next render — no intervening frame sees the off state.
+    scene2d.setShowColliders2D(false);
+    scene2d.setShowColliders2D(true);
+    scene2d.renderFrame();
+
+    expect(g.clear).toHaveBeenCalled();      // the pending clear from the off-toggle still ran
+    expect(g.stroke).toHaveBeenCalled();     // AND the re-enable drew in the SAME frame
+    expect(g.moveTo.mock.calls.length + g.lineTo.mock.calls.length).toBeGreaterThan(0);
   });
 });
 
@@ -1415,5 +2368,558 @@ describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
     child.set(traits.Transform, { ...child.get(traits.Transform), x: 99 });
     scene2d.renderFrame();           // no provider, stopped, clean ⇒ skip (unchanged behavior)
     expect(obj._x).toBe(0);
+  });
+});
+
+// A mask's display object destroy is DEFERRED by one frame (#455): destroying it in the SAME
+// pass that disposes the mask slot makes the `renderAll` at the end of that pass throw (Pixi's
+// AlphaMaskPipe holds a bind group whose resource just went null). Pinning the ordering
+// invariant directly, rather than the render-throw symptom, since jsdom's null 2D context
+// already forces the stencil path (no `ownedTexture`) and the ordering matters either way.
+describe('Mask2D teardown deferral (#455)', () => {
+  it('a disposed mask object is not destroyed until the frame AFTER the one that disposes it', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    // A real child so the mask group isn't empty.
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot).toBeDefined();
+    const maskObj = slot.maskObj;
+    expect(maskObj.destroyed).toBe(false);
+
+    // Disable the mask → disposeMaskSlot runs this frame.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), isEnabled: false });
+    scene2d.renderFrame();  // frame 2: disposes the slot — must NOT destroy maskObj yet
+    expect(renderer.maskSlots.has(mask.id())).toBe(false); // slot itself is gone
+    expect(maskObj.destroyed).toBe(false);                 // but its display object survives this frame
+
+    scene2d.renderFrame();  // frame 3: the deferred queue flushes at the TOP of this frame
+    expect(maskObj.destroyed).toBe(true);
+  });
+
+  it('a SHAPE change (not just disable) also defers the outgoing mask object destroy', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot).toBeDefined();
+    const oldMaskObj = slot.maskObj;
+    expect(oldMaskObj.destroyed).toBe(false);
+
+    // Change the SHAPE (width) so `sig !== slot.sig` and `rebuildMaskObject` runs, rather than
+    // disabling/removing the mask entirely.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), width: 60 });
+    scene2d.renderFrame();  // frame 2: rebuildMaskObject runs — must NOT destroy oldMaskObj yet
+    expect(oldMaskObj.destroyed).toBe(false);
+    const newSlot = renderer.maskSlots.get(mask.id());
+    expect(newSlot.maskObj).not.toBe(oldMaskObj); // a fresh mask object was built
+
+    scene2d.renderFrame();  // frame 3: the deferred queue flushes at the TOP of this frame
+    expect(oldMaskObj.destroyed).toBe(true);
+  });
+
+  it('stop() drains the deferred-destroy queue without another renderFrame (no leak)', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.startScene2D();
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    const oldMaskObj = slot.maskObj;
+
+    // Disable the mask → disposeMaskSlot queues the deferred destroy this frame.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), isEnabled: false });
+    scene2d.renderFrame();  // frame 2: queues the destroy, does NOT flush it
+    expect(oldMaskObj.destroyed).toBe(false);
+
+    // Tear the renderer down WITHOUT another renderFrame — stop() must drain the queue itself.
+    scene2d.stopScene2D();
+    expect(oldMaskObj.destroyed).toBe(true);
+  });
+});
+
+// #692 (site 3, close-out sweep): WHERE a mask's size lands decides whether a resize needs a
+// rebuild. The stencil path bakes it into `roundRect` (an absolute cornerRadius, a genuine shape
+// change) and the feathered path rasterises a ramp bitmap of that size (also genuine) — both stay
+// in `sizeSig`. But a RESOLVED `texture`-mode mask only ever routes the size into
+// `slot.baseScaleX/Y` via `setMaskBaseScale` (a matrix), so rebuilding the Sprite (plus a
+// refcount drop/re-take and a re-resolve) to change two floats was pure waste. `sizeSig` is now
+// empty for that one path and `setMaskBaseScale` applies in place every frame instead.
+describe('Mask2D texture-mode resize is in-place, not a rebuild (#692)', () => {
+  it('a resized texture-mode mask keeps its Sprite and updates its scale', async () => {
+    const { pixi, traits, scene2d, world } = await setup();
+    pixi.Assets.__seed('http://t/mask.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, mode: 'texture', sprite: 'http://t/mask.png', feather: 0, width: 10, height: 10 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame(); // frame 1: mask slot built, resolved texture → 'alpha' kind
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot.kind).toBe('alpha');
+    const maskObjBefore = slot.maskObj;
+    const baseScaleXBefore = slot.baseScaleX;
+
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), width: 30 });
+    scene2d.renderFrame(); // frame 2: sizeSig is empty for this path → no rebuild, scale updates
+
+    expect(slot.maskObj).toBe(maskObjBefore);          // SAME Sprite — no rebuild
+    expect(maskObjBefore.destroyed).toBe(false);       // never torn down
+    expect(slot.baseScaleX).not.toBe(baseScaleXBefore); // but the size DID apply, as scale
+    expect(slot.baseScaleX).toBeCloseTo((30 * 2) / 64, 10);
+  });
+
+  // The existing #455 "a SHAPE change (not just disable) also defers the outgoing mask object
+  // destroy" test (above) already exercises a resized RECT/stencil mask rebuilding — that is why
+  // `width` stays in `sizeSig` for the stencil path: `roundRect`'s absolute cornerRadius makes a
+  // resize a genuine shape change, not a uniform scale. Not duplicated here.
+
+  // Pre-existing gap this change exposed rather than introduced: comparing only position/rotation
+  // meant a mask that only SCALES (no rebuild, no reposition) never marked its canvas dirty. That
+  // was invisible while every scale-affecting input (a texture-mode size change included) forced a
+  // rebuild that marked the canvas itself — removing that rebuild for the resolved-texture path
+  // would have made an animated-scale mask silently stop repainting.
+  it('a mask that only scales (Transform.sx) marks its canvas dirty', async () => {
+    const { traits, scene2d, pool, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    const dirtied: Set<number>[] = [];
+    const renderAllSpy = vi.spyOn(pool.Canvas2DPool.prototype, 'renderAll').mockImplementation(function (ids?: Set<number>) { dirtied.push(new Set(ids)); });
+
+    scene2d.renderFrame(); // frame 1: built — dirtied
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+    scene2d.renderFrame(); // frame 2: settled — nothing changed
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(false);
+
+    // Scale ONLY — no position/rotation change, no shape/sig change.
+    mask.set(traits.Transform, { ...mask.get(traits.Transform), sx: 2 });
+    scene2d.renderFrame(); // frame 3: must still mark the canvas dirty
+    expect(dirtied.at(-1)!.has(canvas.id())).toBe(true);
+
+    renderAllSpy.mockRestore();
+  });
+});
+
+// #700 (second half): the orphan-warn tracker (`Orphan2DTracker`) is WORLD-lifecycle state —
+// `prune()` bounds it WITHIN a world, but across a world swap or a full stop koota recycles ids
+// as the norm, so a surviving key would wrongly silence (or wrongly re-warn) the next world's
+// occupant of a reused id. Both `stop()` and the `onWorldSwap` handler now call `orphan2D.reset()`.
+describe('Orphan-warn tracker reset at world lifecycle (#700)', () => {
+  // No EntityAttributes → no Canvas2D ancestor is reachable at all (same shape as the existing
+  // "keeps a live no-EntityAttributes orphan's frame count" test above) — the entity orphans on
+  // the very first scan and warns immediately (ORPHAN_2D_WARN_FRAMES === 1).
+  function spawnOrphan(world: any, traits: any) {
+    return world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+    );
+  }
+
+  it('reset()s the tracker on world swap', async () => {
+    const { traits, scene2d, world, worldReg, newWorld } = await setup({ start: true });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    spawnOrphan(world, traits);
+    scene2d.renderFrame(); // warns once, populating both `frames` and `warned`
+
+    const tracker = (scene2d.defaultRenderer as any).orphan2D;
+    expect(tracker.warned.size).toBeGreaterThan(0);
+    expect(tracker.frames.size).toBeGreaterThan(0);
+
+    worldReg.setCurrentWorld(newWorld()); // fires the onWorldSwap teardown
+
+    expect(tracker.frames.size).toBe(0);
+    expect(tracker.warned.size).toBe(0);
+    scene2d.stopScene2D();
+  });
+
+  it('reset()s the tracker on stop()', async () => {
+    const { traits, scene2d, world } = await setup({ start: true });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    spawnOrphan(world, traits);
+    scene2d.renderFrame();
+
+    const tracker = (scene2d.defaultRenderer as any).orphan2D;
+    expect(tracker.warned.size).toBeGreaterThan(0);
+    expect(tracker.frames.size).toBeGreaterThan(0);
+
+    scene2d.stopScene2D();
+
+    expect(tracker.frames.size).toBe(0);
+    expect(tracker.warned.size).toBe(0);
+  });
+});
+
+// #718: `stop()` used to leave every pool slot `boundBySim` — only the `onWorldSwap` handler
+// dropped the sim claim. The runtime pool never noticed (`Game.tsx`'s `destroyPool()` opens with
+// its own `releaseAll()`), but the editor pool (`editorCanvas2DPool`) has no other release caller
+// at all, so a `stop()`'d editor renderer left every allocated slot's Application + GPU context
+// alive with no way back — `reclaimIfUnclaimed` bails while `boundBySim` is still true.
+describe('Scene2DRenderer.stop() releases every pool slot (#718)', () => {
+  it('drops the sim claim so a stopped renderer leaves no slot stuck boundBySim', async () => {
+    const { traits, scene2d, pool, world } = await setup();
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start();
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+    editorRenderer.renderFrame(); // allocates the slot — boundBySim = true
+
+    const slotWhileRunning = editorPool.getSlot(canvas.id());
+    expect(slotWhileRunning).not.toBeNull();
+    expect(slotWhileRunning!.boundBySim).toBe(true);
+
+    editorRenderer.stop();
+
+    // Nothing else claims this slot (no Canvas2DMount), so releasing the sim claim must fully
+    // reclaim it — `reclaimIfUnclaimed` deletes the entityMap mapping once both claims drop.
+    expect(editorPool.getSlot(canvas.id())).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Text2D shader-reclaim pass (#690/#696 adversarial review). `canReuseMtsdfPixiShader`
+// itself is unit-tested in `mtsdfPixiShaderReuse.test.ts` in isolation — what's missing
+// there is proof the MECHANISM in Scene2D actually fires: deleting the reclaim loop, or
+// mis-keying `reusable` by array index instead of page number, leaves every test in that
+// file green while the optimization (and the #690 leak fix it protects) silently reverts.
+//
+// Font provider / texture loading are mocked (this is a rendering-glue test, not a font
+// pipeline test); `layoutText`/`buildTextGeometryByPage` and the reclaim loop itself in
+// Scene2D.tsx are REAL. `mtsdfPixiShader` is mocked with a lightweight fake Shader (same
+// pattern as the `pixiShaderBuilder` mock above, for the 2D material pass) — its own
+// contract (`canReuseMtsdfPixiShader` field comparison) is covered by
+// `mtsdfPixiShaderReuse.test.ts`, so re-asserting it here would duplicate that file.
+// ─────────────────────────────────────────────────────────────────────────
+describe('Text2D shader reclaim (#690/#696)', () => {
+  function mockTextDeps() {
+    mockDeps();
+
+    const fontTextures = new Map<string, any>();
+    vi.doMock('../../src/runtime/rendering/text/fontTexturePixi', () => ({
+      getFontTexturePixi: (provider: any, page = 0) => {
+        const key = `${provider.id}:${page}`;
+        if (!fontTextures.has(key)) fontTextures.set(key, { destroyed: false, source: { style: {} } });
+        return fontTextures.get(key);
+      },
+    }));
+
+    let currentProvider: any;
+    vi.doMock('../../src/runtime/loaders/fontAtlasLoader', () => ({
+      ensureFontLoaded: () => {},
+      getLoadedFont: (_guid: string) => currentProvider,
+      __setProvider: (p: any) => { currentProvider = p; },
+    }));
+
+    // A lightweight fake Shader mirroring the real `mtsdfPixiShader.ts` contract closely
+    // enough to prove the RECLAIM LOOP's bookkeeping (identity kept/dropped, destroy called)
+    // — not to re-derive the atlas-field comparison itself (that's the real module's job,
+    // covered separately).
+    let shaderSeq = 0;
+    vi.doMock('../../src/runtime/rendering/text/mtsdfPixiShader', () => ({
+      makeMtsdfPixiShader: (texture: any, atlas: any, style: any, fontSize: any) => ({
+        id: ++shaderSeq,
+        // `mtsdfUniforms.uniforms.uScreenPxRange` mirrors the real shader's fontSize-derived
+        // uniform (mtsdfPixiShader.ts:502) — a #749 fast-path test asserts THIS gets updated
+        // on a fontSize-only edit. A mock without it would let that assertion pass vacuously
+        // (see #698's scar: `makePixiShaderInstance` mocked with no `resources` once made a
+        // uniform-write assertion pass whether or not the write actually happened).
+        resources: { uTexture: texture.source, uSampler: texture.source?.style, mtsdfUniforms: { uniforms: { uScreenPxRange: fontSize } } },
+        _mtsdfAtlas: { ...atlas },
+        _style: { ...style },
+        _fontSize: fontSize,
+        destroyed: false,
+        destroy: vi.fn(function (this: any) { this.destroyed = true; }),
+      }),
+      canReuseMtsdfPixiShader: (shader: any, texture: any, atlas: any) => {
+        if (shader.resources.uTexture !== texture.source) return false;
+        const p = shader._mtsdfAtlas;
+        return !!p && p.width === atlas.width && p.height === atlas.height
+          && p.distanceRange === atlas.distanceRange && p.size === atlas.size && p.type === atlas.type;
+      },
+      updateMtsdfPixiMetrics: (shader: any, atlas: any, fontSize: any) => {
+        shader._mtsdfAtlas = { ...atlas }; shader._fontSize = fontSize;
+        shader.resources.mtsdfUniforms.uniforms.uScreenPxRange = fontSize;
+      },
+      updateMtsdfPixiStyle: (shader: any, style: any) => { shader._style = { ...style }; },
+    }));
+
+    return { fontTextures };
+  }
+
+  async function setupText() {
+    const { fontTextures } = mockTextDeps();
+    const pixi: any = await import('pixi.js');
+    const traits = await import('../../src/runtime/traits');
+    const { registerTrait } = await import('../../src/runtime/core/ecs/traitRegistry');
+    const worldReg = await import('../../src/runtime/core/ecs/worldRegistry');
+    const pool = await import('../../src/runtime/rendering/canvas2DPool');
+    const scene2d = await import('../../src/runtime/rendering/Scene2D');
+    const fontLoader: any = await import('../../src/runtime/loaders/fontAtlasLoader');
+    const { createWorld } = await import('koota');
+
+    registerTrait({ name: 'Canvas2D', trait: traits.Canvas2D, category: 'component', fields: {} });
+    registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: {} });
+
+    trackWorld(worldReg.getCurrentWorld());
+    const world = trackWorld(createWorld());
+    worldReg.setCurrentWorld(world);
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    return { pixi, traits, world, pool, scene2d, fontLoader, fontTextures, renderer };
+  }
+
+  // A 2-page font: 'A' lives on page 0, 'B' on page 1 — lets a test span pages, or drop
+  // back to one, by choosing which letters the text contains.
+  function makeFontProvider(id = 'font1') {
+    const metrics = { emSize: 1, lineHeight: 1.2, ascender: -0.8, descender: 0.2 };
+    const atlas = { type: 'mtsdf', distanceRange: 4, width: 256, height: 256, size: 32, yOrigin: 'top' as const };
+    const glyphs = new Map<number, any>([
+      [65, { unicode: 65, advance: 0.6, plane: { left: 0, top: -0.7, right: 0.6, bottom: 0.05 }, atlas: { left: 0, top: 0, right: 32, bottom: 32 }, page: 0 }], // 'A'
+      [66, { unicode: 66, advance: 0.6, plane: { left: 0, top: -0.7, right: 0.6, bottom: 0.05 }, atlas: { left: 32, top: 0, right: 64, bottom: 32 }, page: 1 }], // 'B'
+    ]);
+    return {
+      id, atlasVersion: 0, pageCount: 2, metrics, atlas,
+      getGlyph: (cp: number) => glyphs.get(cp),
+      kerning: () => 0,
+      ensureGlyphs: () => {},
+      addDisposable: () => {},
+      dispose: () => {},
+    };
+  }
+
+  function spawnText(world: any, traits: any, canvasId: number, text2d: any = {}, sortOrder = 0) {
+    return world.spawn(
+      traits.Transform({}),
+      traits.Text2D({ text: 'A', font: 'font1', fontSize: 32, ...text2d }),
+      traits.EntityAttributes({ name: 'text', parentId: canvasId, sortOrder, layer: '2d' }),
+    );
+  }
+
+  it('reuses the SAME shader across a layout rebuild, on a NEW Mesh', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'A' });
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    const shader1 = slot1.textShaders[0];
+    const mesh1 = slot1.pageMeshes[0];
+    expect(shader1).toBeDefined();
+
+    // A text/layout change (still page 0 only) — the geometry rebuilds, but the shader
+    // should be RECLAIMED, not rebuilt (#690).
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA' });
+    scene2d.renderFrame();
+    const slot2 = renderer.slots.get(text.id());
+    const shader2 = slot2.textShaders[0];
+    const mesh2 = slot2.pageMeshes[0];
+
+    expect(shader2).toBe(shader1);      // same Shader instance — reclaimed, not rebuilt
+    expect(mesh2).not.toBe(mesh1);      // but a fresh Mesh (geometry always rebuilds)
+    expect(shader1.destroyed).toBe(false);
+  });
+
+  it('destroys a LEFTOVER shader for a page the text no longer touches', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    // 'AB' spans page 0 ('A') and page 1 ('B').
+    const text = spawnText(world, traits, canvas.id(), { text: 'AB' });
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    expect(slot1.pageNums).toEqual([0, 1]);
+    const shaderPage0 = slot1.textShaders[slot1.pageNums.indexOf(0)];
+    const shaderPage1 = slot1.textShaders[slot1.pageNums.indexOf(1)];
+
+    // Drop to page-0-only text — page 1 is no longer touched.
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'A' });
+    scene2d.renderFrame();
+
+    expect(shaderPage1.destroyed).toBe(true);   // leftover — destroyed
+    expect(shaderPage0.destroyed).toBe(false);  // reclaimed onto the new page-0 mesh
+    const slot2 = renderer.slots.get(text.id());
+    expect(slot2.textShaders).toEqual([shaderPage0]);
+  });
+
+  it('a reused shader still picks up a STYLE change made in the same frame as a layout change', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'A', color: 0xffffff });
+
+    scene2d.renderFrame();
+    const shader1 = renderer.slots.get(text.id()).textShaders[0];
+    expect(shader1._style.color).toBe(0xffffff);
+
+    // Layout AND style change in the same update, same frame.
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA', color: 0xff0000 });
+    scene2d.renderFrame();
+
+    const shader2 = renderer.slots.get(text.id()).textShaders[0];
+    expect(shader2).toBe(shader1);            // reused
+    expect(shader2._style.color).toBe(0xff0000); // but carries the NEW colour
+  });
+
+  it('a throw mid page-rebuild loop still destroys every reclaimed shader (Fix 1 regression)', async () => {
+    const { traits, world, scene2d, fontLoader, renderer, pixi } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id(), { text: 'AB' }); // pages 0 and 1
+
+    scene2d.renderFrame();
+    const slot1 = renderer.slots.get(text.id());
+    const shaderPage0 = slot1.textShaders[slot1.pageNums.indexOf(0)];
+    const shaderPage1 = slot1.textShaders[slot1.pageNums.indexOf(1)];
+
+    // Force a relayout that still spans both pages, and make the mock's MeshGeometry
+    // constructor throw on the SECOND page built this frame — pages build in ascending
+    // order (0, then 1), so page 0 succeeds and reclaims shaderPage0 before the throw;
+    // page 1's construction never completes, so shaderPage1 is never reused — it must
+    // still be destroyed out of the leftover `reusable` map.
+    // ⚠️ A `text` CHANGE, not `fontSize` (#749) — a fontSize-only edit now takes the
+    // layout-only FAST PATH (writes positions in place, never calls buildTextGeometryByPage
+    // / MeshGeometry at all), which would make this whole scenario never fire. Reordering
+    // the letters changes `buildKey` (`t.text` is part of it) so the fast path's
+    // `meshBuildKey` check misses and the full rebuild this test exists to exercise runs.
+    pixi.MeshGeometry.__control.throwOnCall = pixi.MeshGeometry.__control.callCount + 2;
+    text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'BA' }); // bumps layoutHash AND buildKey
+
+    expect(() => scene2d.renderFrame()).not.toThrow(); // Scene2D's own try/catch swallows it
+
+    expect(shaderPage0.destroyed).toBe(false); // reclaimed before the throw
+    expect(shaderPage1.destroyed).toBe(true);  // leftover — must still be destroyed
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // #749: a LAYOUT-ONLY edit (fontSize/align/maxWidth/lineSpacing/letterSpacing, with
+  // font/text/atlasVersion/textDirty unchanged) writes new quad positions into the
+  // EXISTING page geometry instead of rebuilding it — `layoutText` provably reorders
+  // nothing and drops nothing for such an edit (whitespace is the only thing word-wrap
+  // adds/removes, and it never emits a quad). See `canWriteTextPositionsInPlace` for the
+  // guard that verifies this per-frame instead of just assuming it.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('layout-only fast path reuses geometry in place (#749)', () => {
+    it('a fontSize-only change keeps the SAME geometry object, writes NEW positions, and updates uScreenPxRange', async () => {
+      const { traits, world, scene2d, fontLoader, renderer, pool } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const slot1 = renderer.slots.get(text.id());
+      const mesh1 = slot1.pageMeshes[0];
+      const geo1 = mesh1.geometry;
+      const shader1 = slot1.textShaders[0];
+      const positionsBefore = geo1.positions.slice(); // copy — geo1.positions is mutated in place below
+
+      // #752: uScreenPxRange is now ALSO scaled by the host canvas's own uniform scale, not
+      // fontSize alone — so give the canvas a real size matching its 1080x1920 reference
+      // (`spawnCanvas`'s default `scaleMode: 'fitH'`). Left at the pool's default 1x1 slot
+      // canvas, `canvasScale` would be ~1/1920, making the expected value below about the
+      // CANVAS SIZE this test never sets out to cover, not the fontSize edit it does.
+      const poolSlot = pool.getSlot(canvas.id())!;
+      poolSlot.canvas.width = 1080; poolSlot.canvas.height = 1920;
+
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 64 }); // layout-only: buildKey unchanged
+      scene2d.renderFrame();
+
+      const slot2 = renderer.slots.get(text.id());
+      const mesh2 = slot2.pageMeshes[0];
+
+      expect(mesh2).toBe(mesh1);                        // same Mesh
+      expect(mesh2.geometry).toBe(geo1);                // same geometry OBJECT — the whole claim
+      expect(slot2.textShaders[0]).toBe(shader1);        // same Shader (already true since #690)
+      // The fast path actually WROTE — not a silent no-op, which would pass the identity
+      // check above just as well.
+      expect(Array.from(mesh2.geometry.positions)).not.toEqual(Array.from(positionsBefore));
+      expect(mesh2.geometry.getBuffer('aPosition').update).toHaveBeenCalled();
+      // Not optional (see the fast-path comment in Scene2D.tsx): uScreenPxRange is
+      // fontSize-derived, so a resized string with a stale value would antialias wrong.
+      expect(shader1.resources.mtsdfUniforms.uniforms.uScreenPxRange).toBe(64);
+    });
+
+    it('a TEXT change (buildKey change) still produces a NEW geometry object — the fast path does not fire unconditionally', async () => {
+      const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const geo1 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), text: 'AA' }); // buildKey changes
+      scene2d.renderFrame();
+
+      const geo2 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+      expect(geo2).not.toBe(geo1);
+    });
+
+    // Adversarial review of the #749 fast path's readiness check (9d3052167) — the
+    // `!!ptex && !ptex.destroyed` half is covered by the tests above, but nothing exercised
+    // the `canReuseMtsdfPixiShader` half added alongside it. Simulate the page texture
+    // moving to a NEW identity (same cache key, e.g. a font atlas repack) while `buildKey`
+    // stays put — the fast path's own texture lookup would see a live, non-destroyed
+    // texture and, on the old `!!ptex && !ptex.destroyed` check alone, wrongly keep writing
+    // positions into geometry built against the OLD texture. `canReuseMtsdfPixiShader`
+    // compares `shader.resources.uTexture` against the texture's CURRENT `source`, so a
+    // swapped texture correctly fails it and forces the full rebuild path instead.
+    it('a page texture that moves to a NEW identity (buildKey unchanged) forces a full rebuild, not the fast path', async () => {
+      const { traits, world, scene2d, fontLoader, renderer, fontTextures } = await setupText();
+      fontLoader.__setProvider(makeFontProvider());
+      const canvas = spawnCanvas(world, traits);
+      const text = spawnText(world, traits, canvas.id(), { text: 'A', fontSize: 32 });
+
+      scene2d.renderFrame();
+      const geo1 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+
+      // Same cache key ('font1:0') but a brand-new texture object — same posture as an atlas
+      // repack that keeps `atlasVersion` (and so `buildKey`) unchanged but reallocates pages.
+      fontTextures.set('font1:0', { destroyed: false, source: { style: {} } });
+      text.set(traits.Text2D, { ...text.get(traits.Text2D), fontSize: 64 }); // layout-only: buildKey unchanged
+      scene2d.renderFrame();
+
+      const geo2 = renderer.slots.get(text.id()).pageMeshes[0].geometry;
+      expect(geo2).not.toBe(geo1); // full rebuild, NOT the fast path's in-place write
+    });
   });
 });

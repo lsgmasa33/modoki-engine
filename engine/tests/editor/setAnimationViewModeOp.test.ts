@@ -1,4 +1,4 @@
-/** The `set-animation-view-mode` agent op — the renderer side of `modoki_animation_view_mode` (#369).
+/** The `set-animation-view-mode` agent op — the renderer side of `modoki_set_animation_view_mode` (#369).
  *
  *  WHY THE OP VALIDATES, when its neighbour `set-scene-view-mode` does not. That op silently drops
  *  an unrecognised mode and returns a state read, so a bad call is indistinguishable from a good

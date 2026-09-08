@@ -10,7 +10,7 @@
  *  guarded, failures are RECORDED rather than thrown, and one broken game never prevents its
  *  siblings (or the editor) from registering. */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   addGameBootFault, getGameBootFaults, describeGameBootFaults,
 } from '../../app/editor/gameBootFaults';
@@ -86,19 +86,44 @@ describe('game boot faults', () => {
 });
 
 describe('console capture formats Errors', () => {
+  // F3 (#626/#633 adversarial review): this used to test the editor's own `formatError`, which by
+  // the time of this review had ZERO production callers — `getEditorLogs()` projects the shared
+  // ring's `stringifyArg` instead, which used to drop `cause` entirely. `formatError` is deleted;
+  // the fix moved to the ring itself (`runtime/core/consoleRing.ts`), so these are repointed at
+  // the REAL path: `console.error(err)` through the shared ring.
+  //
+  // Snapshotted BEFORE any test's `installConsoleRing()` wraps it, and restored directly
+  // (bypassing the ring's own `__resetConsoleRingForTest`, which lives on whatever module
+  // instance `vi.resetModules()` handed each test — restoring the raw global sidesteps that
+  // "which instance" question entirely).
+  const pristineConsoleError = console.error;
+  afterEach(() => {
+    console.error = pristineConsoleError;
+  });
+
   it('keeps the message instead of JSON.stringify-ing it to "{}"', async () => {
     // `JSON.stringify(new Error('x')) === '{}'` — an Error has no enumerable own properties.
     // That is how "[Editor] scene load failed: {}" reached the log bridge with the actual
     // cause erased, sending four debugging sessions after the wrong thing.
     vi.resetModules();
-    const { formatError } = await import('../../packages/modoki/src/editor/consoleCapture');
+    const { installConsoleRing, getConsoleRingEntries } = await import('../../packages/modoki/src/runtime/core/consoleRing');
+    installConsoleRing();
     expect(JSON.stringify(new Error('the real cause'))).toBe('{}'); // the trap, pinned
-    expect(formatError(new Error('the real cause'))).toBe('Error: the real cause');
+    console.error(new Error('the real cause'));
+
+    const [entry] = getConsoleRingEntries();
+    expect(entry.args[0]).toContain('Error: the real cause');
   });
 
   it('includes the cause chain', async () => {
-    const { formatError } = await import('../../packages/modoki/src/editor/consoleCapture');
+    vi.resetModules();
+    const { installConsoleRing, getConsoleRingEntries } = await import('../../packages/modoki/src/runtime/core/consoleRing');
+    installConsoleRing();
     const err = new Error('outer', { cause: new RangeError('inner') });
-    expect(formatError(err)).toBe('Error: outer\n  caused by: RangeError: inner');
+    console.error(err);
+
+    const [entry] = getConsoleRingEntries();
+    expect(entry.args[0]).toContain('Error: outer');
+    expect(entry.args[0]).toContain('caused by: RangeError: inner');
   });
 });

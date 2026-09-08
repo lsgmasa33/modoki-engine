@@ -92,13 +92,41 @@ export function summarizeTraits(
     }
     return { schemaAvailable, traits: { [q.name]: hit } };
   }
+  const traitCount = Object.keys(traits).length;
+
+  // ⚠️ The empty-registry refusal covers `all:true` TOO, which is why this guard sits ABOVE the
+  // `q.all` early return rather than below it. Review caught the first cut fixing `name=` and the
+  // bare call while leaving `all=true` answering a cheerful `{schemaAvailable:false, traits:{}}` —
+  // the same "this project has zero traits" lie, on the exact call an agent makes when it wants
+  // every schema before a setTrait. `/api/trait-schema` answers `traits: schema?.traits ?? {}`
+  // with no push, so a cold start reaches it every time.
+  //
+  // EMPTY is the whole condition — deliberately not `schemaAvailable !== true` as well: the engine
+  // registers its own core traits (Transform, EntityAttributes, …) on every boot, so zero traits
+  // means the push has not happened, whatever the flag claims. And deliberately NOT the `q.name`
+  // branch's `schemaAvailable === false || empty` either — that disjunct is scoped to a lookup MISS
+  // up there. Here there is no miss, so a POPULATED registry with `schemaAvailable:false` must
+  // still be reported with the flag propagated (the caller tells ref checks from type checks by
+  // it); `mcpSummarize.test.ts`'s "propagates schemaAvailable" case pins exactly that.
+  if (traitCount === 0) {
+    return { error: {
+      code: 'NO_RENDERER',
+      what: q.all ? 'list every registered ECS trait with its schema' : 'list the registered ECS traits',
+      why: 'the trait registry is EMPTY — no editor renderer has pushed it yet (cold start, or the window is reloading). This says NOTHING about whether traits exist.',
+      options: ['wait for the editor window to finish loading, then retry', 'check the editor is running: modoki_identity'],
+    } };
+  }
+
   if (q.all) return { schemaAvailable, traits };
 
+  // Reached only with a non-empty registry (#648): this used to report `traitCount: 0`
+  // unconditionally for an empty one, which reads as an ANSWER — "this project has zero traits" —
+  // the same lie the `q.name` branch above already refused to tell.
   const byCategory: Record<string, string[]> = {};
   for (const [name, s] of Object.entries(traits)) (byCategory[s.category ?? 'other'] ??= []).push(name);
   return {
     schemaAvailable,
-    traitCount: Object.keys(traits).length,
+    traitCount,
     byCategory,
     hint: 'Names only. Pass name=<Trait> for its field schema (do this before a setTrait), or all=true for every schema.',
   };

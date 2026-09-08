@@ -7,7 +7,7 @@ import { warnUnknownParamTypes, type ShaderManifest } from '../core/shaderSchema
 
 export {
   type ShaderParamType, type ShaderParam, type ShaderParamSchema, type ShaderManifest,
-  shaderSpace, coerceParamValue, mergeParamDefaults,
+  shaderSpace, coerceParamValue, mergeParamDefaults, shaderBodyPath,
 } from '../core/shaderSchema';
 
 /** Fetch + parse a `.shader.json` manifest. Returns null on network/parse failure.

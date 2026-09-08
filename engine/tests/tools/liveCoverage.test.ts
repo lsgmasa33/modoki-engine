@@ -20,10 +20,12 @@
  *  open — see F2 in the ledger.
  */
 
+import { join } from 'node:path';
 import { describe, it, expect, afterEach } from 'vitest';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { COVERED_BY_SMOKE, LIVE_UNCOVERED } from '../../tools/modoki-mcp/src/liveCoverage';
 import { loadSurface, type Surface } from './mcpSurface';
+import { readScannedSource } from '@modoki/engine/testing';
 
 let surface: Surface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -63,6 +65,57 @@ describe('T3 live coverage is declared, total, and honest', () => {
 
   it('the two buckets do not overlap — a tool is covered or it is not', () => {
     expect(COVERED_BY_SMOKE.filter((n) => n in LIVE_UNCOVERED)).toEqual([]);
+  });
+
+  /** `COVERED_BY_SMOKE`'s own doc comment: "Each entry is a claim that a real case exists there —
+   *  not an exemption." A name can sit in the bucket with NO case at all, and nothing above catches
+   *  it — this is exactly the `modoki_prefab` failure mode (T1+T2 green, dead route) wearing a
+   *  different hat: a ledger entry claiming coverage that isn't there.
+   *
+   *  This check is TEXT-based (does the tool name appear anywhere in test-smoke.mjs), which is a
+   *  weak proxy for "a real, EXECUTING case exists" — a bare mention in a comment, or in an argument
+   *  list of a step whose batch never runs, would satisfy it too. That gap is exactly what
+   *  `modoki_set_selection` exploited: its only occurrence was inside a batch pre-flight-REFUSED
+   *  case, so the step never executed.
+   *
+   *  KNOWN_UNCOVERED is a holding pen, not a home: each entry silences this guard for one specific
+   *  tool, so each earns its place with a written reason and the issue tracking the fix. It is
+   *  EMPTY, and the type is kept so the next gap has somewhere honest to sit rather than being
+   *  quietly absorbed. Found 2026-08-31 in #483's close-out review; #496 emptied it in three
+   *  passes, each the same defect wearing a different hat:
+   *    • `modoki_dispatch_action` — no call site at all. Now a real case, gated on a PLAY window,
+   *      because a stopped sim refuses a real action and a bogus name identically.
+   *    • `modoki_set_selection` — its one occurrence was a step in a batch asserted to be REFUSED
+   *      at pre-flight, so it never executed. Now selects by guid and reads back.
+   *    • `modoki_save_all` — its two occurrences were a step in UC7's mid-batch-failure case and
+   *      the assertion that it lands in `notRun`, i.e. the case PROVES it does not run. Now a real
+   *      case that saves to an explicit probe path and reads the written file back from disk
+   *      through `modoki_validate_scene`. The probe path keeps the PRIMARY save off any committed
+   *      file; it cannot redirect the `extraSaved` loop (other dirty scenes in a base chain go to
+   *      their own real paths), so the case fails loudly and names them instead.
+   *
+   *  ⚠️ The lesson, for whoever is tempted to add the next entry: all three passed this grep. A
+   *  name appearing in test-smoke.mjs is necessary and NOT sufficient, and the only check that
+   *  distinguishes them is a human reading the call site. This guard stops the debt growing; it
+   *  cannot audit what is already claimed.
+   */
+  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
+
+  it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
+    const smokeSrc = readScannedSource(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs')).code;
+    const missing = COVERED_BY_SMOKE.filter((n) => !(n in KNOWN_UNCOVERED) && !smokeSrc.includes(n));
+    expect(missing,
+      'COVERED_BY_SMOKE claims a real case exists in test-smoke.mjs for these tools, but the name '
+      + "does not appear there at all — add a real case, or add a KNOWN_UNCOVERED entry with a reason "
+      + 'and a tracked issue.').toEqual([]);
+  });
+
+  it('KNOWN_UNCOVERED does not silently grow stale — every entry still names a real gap', () => {
+    // Each entry here is a claim of its own ("this tool has no real coverage"). If the name stops
+    // appearing in COVERED_BY_SMOKE, or a real case is added, the exemption should be deleted, not
+    // left behind as dead weight.
+    const staleExemptions = Object.keys(KNOWN_UNCOVERED).filter((n) => !COVERED_BY_SMOKE.includes(n));
+    expect(staleExemptions, 'a KNOWN_UNCOVERED entry for a tool no longer in COVERED_BY_SMOKE is dead weight').toEqual([]);
   });
 
   it('the live tier reaches a MAJORITY of the surface (the gap list cannot quietly become the plan)', () => {

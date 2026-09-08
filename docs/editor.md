@@ -101,6 +101,94 @@ persistent editor-only toggle: follow that convention (a small `load*`/`save*` p
 component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
 folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
 
+#### Remembering an ASSET PATH is not the same as remembering a toggle (#473)
+
+A toggle is a value. A remembered **path** is a reference into a project, and the editor's
+`localStorage` is not project-scoped by nature: **one clone serves every project it opens from the
+same origin** (the Vite port derives from the clone DIRECTORY, not the project —
+`engine/scripts/editorPorts.mjs`), and asset URLs carry **no project segment** — a rig in
+`games/skin-test` is served at `/assets/rigs/zombie.rig2d.json`, because a flat project's
+`runtime/assets` maps to `/assets` (`findAssetRoots`, `plugins/vite-asset-scanner.ts`).
+
+So a path remembered under project A is a *valid-looking* URL in project B, where it addresses B's
+asset root, matches nothing, and takes the dev server's SPA fallback — `200 index.html`. That is
+the mechanism behind **#460**: the human opened a rig in `skin-test`, opened a different project
+next, and was told their `.rig2d.json` was **corrupt JSON** about a file that was present and
+untouched. `editor-layout` is global too, so the Skin panel travels along and the load fires with
+nothing rig-related having been clicked. (#460 fixed only the message — the honest text now names
+the path; #473 is why the fetch happened at all.)
+
+**Two guards, covering different failures. A remembered path that can SOURCE a node or a write
+target needs the first; only a path that names an ASSET can have the second:**
+
+| Guard | Covers | How |
+|---|---|---|
+| **Project-scoped key** | another project's path | `projectScopedKey(base)` → `<base>:<project>`, with `setEditorProjectScope(config.name)` injected in `createEditor` |
+| **Manifest existence check** | THIS project's asset, since deleted/renamed/moved | `getGuidForPath(path)` at restore — **refuse, never delete** (below) |
+
+⚠️ **The second guard does not apply to FOLDER paths** — `getGuidForPath` addresses assets, and a
+folder is not one. `pendingFolders` gets an equivalent from the Assets panel's own reconcile
+(`Assets.tsx`, on every scan); `currentFolder` has none, so within one project a folder deleted
+since it was remembered is still the default write target and the next Import re-creates it via
+`/api/write-file`. Known and accepted: the blast radius is one import landing in a folder that
+reappears, versus gating panel state on an async scan. Say so rather than assuming the table
+covers it.
+
+The manifest check is not redundant: a scoped key cannot see a rig that was renamed under a live
+editor — routine across a branch switch. It is the same refusal the `open-skin-editor` agent op
+already makes; the restore path bypassed it by calling the store setter directly.
+
+⚠️ **That check refuses; it must never DELETE the remembered entry** — the first cut of #473 did,
+and it was wrong. `ensureManifestLoaded` swallows a failed fetch and returns `null`: it warns, boot
+continues, and it clears its own memo so the next attempt retries. So a dev server restarting
+mid-boot leaves EVERY path unresolvable for one launch, indistinguishable at this call site from a
+genuinely deleted asset — and dropping there converts a transient, self-healing failure into
+permanent loss of the human's memory, inside a loader written specifically to be recoverable.
+Keeping a stale entry costs nothing once a miss is silent: nothing opens, nothing warns, it
+re-checks for free next launch, and it starts working again if the asset comes back.
+
+Current users: `panels/lastSkinRig.ts`, `animation/lastAnimationClip.ts`, and
+`panels/assetFolderState.ts` (`expanded`, `pendingFolders`, `currentFolder` — its `typeFilter`
+and `viewMode` stay global, being preferences rather than paths).
+
+**Deliberately NOT scoped, and the distinction is the useful part — a SOURCE set versus a LOOKUP
+set.** `pendingFolders` *sources* tree nodes, so a foreign entry becomes a clickable folder: that
+is the whole defect. An expand/collapse set is only ever *consulted*, so a foreign entry matches
+nothing and renders nothing. So `editor:scripts:expanded:v2` (`ScriptTree.tsx`) and the
+`editor:hierarchy:*` sets (`Hierarchy.tsx`) stay global — cosmetic at worst. `engineExpanded`
+stays global for a different reason: it holds `/modoki/assets` paths, and the engine's built-ins
+are identical in every project by construction. Assets' own `expanded` was scoped anyway, for
+consistency with the two path keys beside it in the same module rather than out of necessity.
+
+Scenes solve the same problem separately and predate the helper (`lastSceneKey` in
+`scene/serialize.ts`, plus a self-heal to `config.scenePath` — its comment names this exact leak),
+which is precisely why the rig key should never have shipped global: **the fix already existed two
+lines from the call site.**
+
+⚠️ **The remembered folder is the one that WRITES.** `defaultTargetFolder` returns it whenever it
+matches `ASSET_ROOT_RE` (`panels/assetRoots.ts`), and that regex tests a path's SHAPE, not its
+existence — `/assets/rigs` is shaped identically in every project. Unscoped, browsing there in one
+project made the next project's Import / paste / New Folder default there too, and
+`/api/write-file` creates the directory on demand: it silently CREATED a folder the human never
+opened. Worth stating because these are the instances of this leak that do not merely fail loudly.
+
+`pendingFolders` is sharper still, and scoping `currentFolder` alone would not have closed it. It
+holds folders created but not yet backed by any asset, and the Assets reconcile prunes only
+entries the scan COVERS — so a folder carried in from another project is never pruned, renders as
+a phantom node in this project's tree, and the moment the human clicks it and imports, the folder
+becomes real. The node the user clicks is the vector, not the remembered target.
+
+⚠️ **The scope value is `config.name`, a display name, not an identity.** Nothing enforces
+uniqueness and an empty one collapses to `default`, so two projects sharing a name share a key.
+The manifest check bounds the damage to "opens THIS project's file at that path" rather than the
+#460 error, and `lastSceneKey` already carries the identical exposure — so this is a known limit,
+not an open defect. Related accepted cost: entries are never pruned, so renaming a project orphans
+its old ones (~100 bytes each).
+
+⚠️ The clip memory looks like it was already safe because restore skips a mismatched `scenePath` —
+it was not. Scene paths are flat too, so several projects share `/assets/scenes/main.scene.json`
+and the guard passes; it is also skipped outright when the persisted `scenePath` is null.
+
 ### `createEditor()` — host configuration
 
 `editor/createEditor.tsx` is the factory the host (a game) calls to configure the
@@ -196,9 +284,11 @@ different fixes, and the second sends you to check a cable that was never the pr
 
 **Two refusals guard the pick**, both pure and unit-tested (`buildRefusal`, `pickRefusal`):
 
-- **A second concurrent build is refused.** `/api/build` takes no lock, `runBuild` fires an SSE
-  request per call, and a native OS menu is not covered by the DOM progress modal — so the modal
-  only *looks* like it is holding the door. Before every device row was a build this took a
+- **A second concurrent build is refused — here, in front of the server's own slot.** `/api/build`
+  does take a slot (#173's in-process one, plus #650's cross-process claim), but it refuses *after*
+  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call,
+  and a native OS menu is not covered by the DOM progress modal — so the modal only *looks* like it
+  is holding the door. This refusal keeps the second build from ever being sent. Before every device row was a build this took a
   deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
   gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
   into the single shared `buildStatus`. A build that already FAILED does not count as running: its
@@ -238,6 +328,17 @@ projects:
   internal game `webBucket: "gs://modoki-www-site/demo"`. Note prune measures "already
   recorded" against the **pre-edit** file: pass the patched one and every key is trivially
   present, nothing prunes, and the bug returns for full-object saves.
+  ⚠️ **A third rule since #821: a top-level SECTION the build does not know is carried
+  through from the pre-edit file.** `mergeProjectConfig` returns a fixed literal naming
+  only the sections in `DEFAULT_PROJECT_CONFIG`, so before this an unknown section never
+  reached prune and an older editor **deleted a section a newer branch had added** — in a
+  committed file, with six clones on different branches. Unknown keys *inside* a declared
+  section were never affected (every section is spread, so they land in `resolved` and the
+  already-in-the-file rule keeps them). The carry is **top-level only**, and deliberately
+  does not recurse; `pruneProjectConfig`'s own docblock carries the reasoning, including a
+  measurement showing the hazard its first draft cited does not currently exist.
+  ⚠️ Consequence worth knowing: prune used to double as a scrubber of unrecognised
+  top-level junk in the committed file, and no longer does — a stray key now survives Apply.
 - **Reading COERCES a bad string-union value; writing ROUND-TRIPS it.** `mergeProjectConfig`
   falls an out-of-union value back to the default and warns, for EVERY string-union field in
   the config — not just `rendering.web.sizeMode` / the three/pixi `backend`s (#39) — so the
@@ -418,6 +519,25 @@ question the person in front of it was actually asking.
 
 ## Panels
 
+### A panel's load/write DECISION goes in a plain `.ts` beside it, not in the `.tsx`
+
+Editor `.tsx` is not mounted in jsdom — that asserts the mock rather than the panel — so any logic
+left inside a component is testable only by a source SCAN, which sees tokens and not behaviour.
+Extract the decision and the `.tsx` keeps just the I/O and the render.
+
+The worked examples are the batch views, and they are a matched pair on purpose:
+`assetViews/materialBatchLoad.ts` (`.mat.json`, #886) and `assetViews/metaBatchLoad.ts`
+(`.meta.json`, #903). Each exports the load outcome AND the write plan from one module, because the
+two halves are a single decision: the loader's promise — *a member that could not be read is absent
+from the map* — means nothing unless the writer honours absence, and in both issues the defect was
+precisely that it did not.
+
+⚠️ **What this buys, stated as a limit rather than a benefit.** The extracted module is tested for
+behaviour; the panel is tested for DELEGATION. So a guard over the `.tsx` proves a decision is
+wired, never that it renders somewhere reachable — and that gap is real: `SkinEditor` and
+`TimelineEditor` both shipped a refusal banner *below* their own early return, where it could never
+appear, and no scan could have caught it. That half needs the live editor.
+
 ### A new dropdown in editor chrome must be DOM, not a native `<select>` (#149)
 
 A native `<select>` renders its popup in a separate OS layer that `sendInputEvent` cannot reach —
@@ -527,6 +647,14 @@ The exceptions are real and worth recognizing so this is not applied blindly: a 
 called fresh on each open (`discoverScenes` in `SceneListEditor.tsx` — deliberately
 unmemoized, documented as such) and a one-shot read at boot (`createEditor()`) need
 nothing. The rule bites *memoized* or *render-time* reads inside a long-lived panel.
+
+**`assetsVersion` tracks the asset PATH SET, not file contents.** `createEditor.tsx` only
+bumps it when `assetSetSignature()` changes, and that signature is
+`assets.map(a => a.path).sort().join('|')` — paths only, deliberately (see the function's own
+header). So a same-path CONTENT change on disk (a re-import, a `git checkout`) bumps nothing,
+and **a panel holding a parsed copy of a file's body cannot rely on `assetsVersion` to learn
+that the file changed underneath it** — see the asset Inspector's fourth rule below for what
+that gap costs a panel that also WRITES the whole file.
 
 ### A list built from `getAllAssets()` must be SORTED, not left in map order
 
@@ -713,6 +841,23 @@ Panels live in `editor/panels/`:
   unmount. It reloads on a re-import off the invalidation epoch — see "The asset Inspector"
   below, rule 3.
 
+**The two standalone `WebGLRenderer`s must call `forceContextLoss()`** (#776).
+`ModelPreview` and `previewScene` are the only editor surfaces that build a renderer directly
+rather than through `makeWebGPURenderer` — and `WebGLRenderer.dispose()` frees programs and render
+targets but does **not** release the underlying GL context; the browser reclaims it whenever it
+feels like it. Both panels mount per asset click, and `ModelPreview`'s effect re-runs on `[hasLods]`
+as well, so without the explicit call the live-context count climbs to the browser's ~16 cap and
+"too many active WebGL contexts" blacks out the previews **and** the main SceneView. `previewScene`
+had the call from the start; `ModelPreview` shipped without it for months, because the seam was
+documented in two places (`gpuContextTracking.ts`'s header and `previewScene`'s own comment) and
+guarded in none. It is guarded now, on comment-stripped source, by
+`tests/architecture/glContextRelease.test.ts`. Both panels place the call just before `dispose()`,
+but that ordering is convention, not a requirement — `dispose()` never touches the extensions
+closure or `_gl`, so either order releases the context. The guard therefore checks that the call
+exists, not where it sits. ⚠️ This does **not** apply to `WebGPURenderer`, which
+has no such API — `makeWebGPURenderer` wraps its `dispose` instead, so every downstream disposer is
+correct for free.
+
 Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 `ProjectSettingsDialog`, and the import/build progress modals. Each panel is wrapped in a
 `PanelErrorBoundary` so one panel crashing doesn't take down the editor.
@@ -810,6 +955,108 @@ derives basic hints from a koota schema's default values; it has no internal cal
 
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
+
+### ⚠️ The UI-mode measurement seam — THREE stacked coordinate spaces, and FOUR wrong fixes
+
+`UIResizeOverlay`'s drag math has produced a shipped defect four times, each fix plausible, each
+surviving a green `npm run verify` and a review, each caught only by putting a browser in front
+of it. Read this before touching a measurement there.
+
+**There are three spaces, not two:**
+
+| Space | Read with | Blind to |
+|---|---|---|
+| Screen px | `getBoundingClientRect()` | nothing — it sees every transform |
+| Layout px | `clientWidth`/`offsetWidth`, `getComputedStyle` padding/border | **every** transform |
+| Frame-logical px | what `toLogicalDelta` produces | only the FRAME's transform is divided out |
+
+Two separate transforms stack between the frame and an element. `SceneView` lays the preview
+frame out at the logical device size and applies `transform: scale(uiScale)`; **and**
+`applyRotationStyle` (`runtime/ui/anchorCss.ts`) emits a second `transform: scale(s)` on any node
+whose `UIElement.scale !== 1`. A measurement is only correct if it names which of the three
+spaces it is in and converts consistently. The first three failures were all one mistake — mixing
+two spaces in a single expression; the fourth (below) was different — assuming a
+`getBoundingClientRect()` ratio between two boxes equals a scale factor, which is true only when
+nothing in the chain is rotated:
+
+1. **Original** — `%` denominator was the parent's **border** box (`getBoundingClientRect`),
+   where CSS resolves against the content or padding box. Wrong whenever the parent had padding.
+2. **#651 B2's first fix** — subtracted layout-px padding/border from a screen-px rect, then
+   multiplied by `1/uiScale`, dividing the padding term by `uiScale`. Correct only at
+   `uiScale === 1`; error `S·|1−1/u|` — where `S` is the total padding+border subtracted from the
+   screen-px rect (both edges combined, in layout px), the term the bug multiplied by `1/uiScale`
+   alongside the screen rect when only the screen term should have been — so **break-even at
+   exactly 0.5 and strictly worse below** it — and tablet/desktop presets letterboxed into a
+   SceneView panel sit below 0.5 routinely. On a small parent the denominator clamped to 0 and the
+   handle went silently dead.
+3. **Its replacement** — used pure layout px (`clientWidth`) and so corrected the frame's
+   transform but was blind to `UIElement.scale`. A `%` child of a scaled node overshot by that
+   scale factor; `computedSize` additionally double-counted the element's *own* transform
+   (measured: 83px round-tripped to 747px at `scale: 3`).
+4. **That fix's own regression** — its `ancestorScaleRatio(screenSize, layoutSize, frameScaleAxis)`
+   recovered the second transform as a ratio of a `getBoundingClientRect()` box to a layout size —
+   correct only when nothing in the chain is rotated. `getBoundingClientRect()` on a rotated
+   element returns its axis-aligned BOUNDING box, which is bigger than the element itself, so the
+   ratio stopped being a scale factor the moment rotation entered the picture: measured (parent
+   200×150, `scale: 1`, frame scaled 0.5) at `rotation: 15` the ratio came out `1.160/1.311` for
+   what should be exactly `1/1`, and `0.750/1.333` at `rotation: 90` on the same non-square parent.
+   A scene with no `UIElement.scale` at all — the case the original fix existed to leave alone —
+   regressed the instant an author rotated anything.
+
+**The resolution:** `decomposeScale`/`accumulateAncestorScale` (`uiResizeMath.ts`) read the
+ancestor chain's CSS transform MATRIX directly instead of comparing two boxes. A `matrix(a,b,c,d,e,f)`
+is the coefficient matrix whose columns are where the X/Y basis vectors land; rotation only changes
+a column's DIRECTION, never its length, so `hypot` of a column recovers exactly that axis's scale
+regardless of any rotation composed into the same transform. `UIResizeOverlay` walks from an
+element's parent up through `.parentElement` to (excluding) the preview frame, decomposing and
+compounding each ancestor's own transform. The result is exactly **1** when no ancestor between the
+element and the frame carries a transform of its own — true whether that ancestor is unrotated,
+PURELY rotated, or both rotated and scaled — which is the property that keeps every untransformed
+case byte-identical, and (unlike item 4 above) is now asserted against a REAL browser-computed
+transform, not inferred from a box ratio. A degenerate `scale: 0` — a legitimate authored value (a
+pop-in clip's first keyframe) — falls back to 1 rather than propagate a zero into `%`'s denominator,
+where it would otherwise turn a drag into a silent no-op. Layout boxes are then scaled into
+frame-logical space by the result, and `deltaToUnit`/`computeResize`/`computeMoveOffsets` divide it
+back out for every unit **except `%`** (the `%` path cancels, because its denominator carries the
+same factor; `px` and `vw`/`vh`/`vmin`/`vmax` do not) — including an auto-sized `px` element's own
+measured-size BASE, which needs that same division alongside `dx`/`dy` and was, until this fix, the
+one place it was still missing.
+
+⚠️ **Scope of "exact under rotation": the recovered SCALE FACTOR, not the whole resize.** This fix
+makes `decomposeScale`/`accumulateAncestorScale`'s own return value exact under rotation — the
+%-denominator and the `px`/auto-size divisions above are all correct now. It does NOT make dragging
+a handle under a rotated ancestor geometrically correct: `toLogicalDelta` converts a screen-pixel
+drag straight into a frame-logical delta and never projects it onto the element's own (rotated)
+local axis, and the 8 resize handles are placed at fractions of the on-screen AABB rather than the
+element's true corners. So a 45°-rotated ancestor still writes the FULL dragged px count into
+`width`/`height` for a horizontal drag (matching `dx` directly) where the visually-intended change
+is `dx · cos45° ≈ 0.707 · dx` — a 40px drag writes 40 layout px where the visual intent is ~28.3.
+That is a real, separate, still-open gap this fix does not touch — decomposing the matrix fixed the
+DENOMINATOR, not the DRAG AXIS.
+
+**Why the gate never caught any of it, which is the part worth generalising:**
+`uiResizeMath.test.ts` feeds hand-written numbers to pure functions — never the broken part, so
+deleting the whole `getComputedStyle` block leaves it green. `UIResizeOverlay.test.tsx` never
+enters `handlePointerDown` (its fixture has `parentId: 0`, so no parent element mounts), and jsdom
+reports every rect as `0x0` and `''` for unset padding → `NaN` → `|| 0`, so the mismatch is
+invisible there **by construction**. A pure-function test cannot see a units error at a DOM seam.
+Failure 4 got past a pure-function test a DIFFERENT way: `ancestorScaleRatio` had its own unit
+tests, and they passed — but every `(screenSize, layoutSize, frameScaleAxis)` triple they fed it
+was hand-picked as if `screenSize = layoutSize / frameScaleAxis * trueScale`, an identity that only
+holds without rotation, so the tests could not have failed even reading the wrong formula; only a
+browser, computing `screenSize` itself from an actually-rotated element, could disagree with it.
+Cover it with an e2e that drags at a non-1 `uiScale`, under a scaled ancestor, **and under a
+ROTATED one** — all three exist now, and each caught a different one of the four failures.
+Assert the unit is still `%`, or the test silently stops testing this path the moment a fixture
+drifts to `px`.
+
+⚠️ **The rotated case asserts the stored `%`, not the on-screen pixel round-trip the other two
+use, and that difference is deliberate.** A rotated ancestor puts the child's own
+`getBoundingClientRect()` into the paint chain as an AABB, and the drag axis is never projected
+onto the element's local axis — so a pixel assertion there would pass or fail for reasons that
+have nothing to do with the denominator under test. Asserting the written value isolates the one
+thing the fixture exists to pin. A test that passes for the wrong reason is the failure mode this
+whole section is about.
 
 ### The idle render gate — what re-arms it, and the edge that keeps being missed
 
@@ -976,7 +1223,7 @@ per-orientation data, and what is measured vs published:
 ### Driving the preview screen from an agent (#367)
 
 The selected device and orientation live in the **editor store** (`gameViewDevice` /
-`gameViewOrientation`), not in GameView-local state, so `modoki_game_view_device` can set them —
+`gameViewOrientation`), not in GameView-local state, so `modoki_set_game_view_device` can set them —
 the same lift `sceneViewMode` got, for the same reason: the device picker is a popup that trusted
 input cannot operate. Before it, every layout check an agent ran measured whatever device the human
 last left selected, and the per-device bug class (safe-area insets, panel-fit budgets) is precisely
@@ -984,7 +1231,7 @@ the one that needs the device changed repeatedly to be checked at all. `modoki_g
 lists the catalog; `modoki_get_editor_state` reports the current selection as `gameView`, so a
 measurement can be attributed to a screen size.
 
-Four things about that surface are load-bearing:
+Six things about that surface are load-bearing:
 
 - **`gameViewDevice` + `gameViewOrientation` are the source of truth; `gameViewSize`,
   `gameViewSafeArea` and `gameRect` stay DERIVED** — GameView resolves them and publishes them
@@ -1055,6 +1302,191 @@ runtime) safe: those writes only ever happen while playing, and Stop throws them
 they reach disk. Transitions emit `!play`/`!pause`/`!stop` to the editor journal (see
 [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept").
 
+**The scrub/preview run-modes carry an OWNER, and taking it now NOTIFIES the panel that lost it
+(#810).** `RunMode` is a single global that both the Timeline and Animation panels drive, so each
+tags its transitions with an `owner` and `exitPreviewMode(owner)` refuses to tear down a mode a
+different panel holds. That guard covers only the panel that never entered: once panel B enters
+legitimately — an ordinary ruler drag — it owns the mode, and B's exit then returned the global to
+`stopped` while A's preview rAF was still running and still mutating authored traits, because that
+loop is keyed on `[playing, rootId]` and never consults `getRunMode()`. `registerModeOwnerDisplaced`
+closes it: taking the mode tells the previous owner, which stops its own loop.
+
+⚠️ Three traps live in that mechanism. **The notification must fire after the new mode is set** —
+before it, TimelineEditor's `if (getRunMode() === 'preview')` cleanup clobbers the transition being
+entered. But that ordering is **necessary, not sufficient**: it makes the guard decline only when the
+new mode is `'scrub'`; a `'preview'` displacer passes it and steals the ownership back. What makes it
+safe is that **no displacement callback re-enters a mode transition** — they only stop their own rAF.
+Second, **a displaced panel must stop its own rAF, never call `setPreviewPlaying(false)`** —
+`isPreviewPlaying` is one flag BOTH panels read, so that stops the global preview rather than the
+panel. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
+press**, so each would take the mode from the other — and the Timeline always lands second (its entry
+is behind an await), so it always won and always stopped the Animation panel's loop. Pressing ▶ in
+the Animation panel played nothing at all. A panel now drives the preview only when it owns it.
+
+⚠️ **There are TWO shared resources here, and checking ownership on one is not enough.** Besides the
+`isPreviewPlaying` flag there is the preview **session** — `AnimationEditor` opens it through the
+same `beginTimelinePreviewSession()` the Timeline uses. `TimelineEditor`'s unmount used to end that
+session whoever owned it, and **ending it reloads the scene**
+(`endTimelinePreviewSession` → `SceneManager.loadScene` → a world swap), which tore down the
+Animation panel's live preview as a side effect of closing an idle tab — and the Timeline's own
+`onWorldSwap` handler then saw that swap and cleared the flag too. Three passes fixed the flag
+before anyone noticed the session, because every one of them reasoned about the flag. The store's
+`closeTimelineEditor`/`closeAnimationEditor` are the same shape again: ownership decisions wearing a
+store action's clothes.
+
+**Test it by the OWNER, not by the playhead.** With a timeline doc loaded the Timeline's own loop
+advances `playheadTime` too, so "the playhead moved" passes under both the correct and the broken
+behaviour — the vacuum this change's first test fell into. `previewModeOwner()` on the editor test
+bridge exists for that: `playMode`'s `_modeOwner` is module state an E2E cannot reach through the
+store. The seam is covered by `tests/e2e/editor-preview-panel-ownership.spec.ts`, which is
+mutation-checked against the one-word change that reintroduces the bug and that all 3379 editor unit
+tests missed. Full mechanism, and why this site needed a displacement
+callback where its sibling `timelinePreview._saveHandler` needed a re-seating stack:
+[rendering.md](./rendering.md) § "One fix, two twin globals".
+
+**Stop pressed during Play's startup window is queued, not dropped (#470).** `enterPlay` awaits
+several times (ending a Timeline preview session, `serializeScene()` for the primary and each base)
+before the final `setPlayState('playing')`, and `getPlayState()` still reads `'stopped'` for that
+whole window — so a Stop landing there used to hit `stopPlay`'s own `'stopped'` early-return and do
+nothing, silently. `enterPlay` now sets an in-flight latch synchronously before its first await; a
+Stop that arrives while it's set is queued instead of dropped, and `enterPlay`'s tail runs the real
+`stopPlay()` revert once it reaches `'playing'`. A second `enterPlay()` arriving in that same window
+is refused outright (returns without doing anything) rather than starting a concurrent snapshot —
+two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
+`'playing'` with no snapshot left to revert.
+
+## Panel registrations in module-level slots — why the unguarded ones are safe (#811)
+
+Several editor panels publish per-instance state into a module-level single slot and clear it on
+effect cleanup. The class — *take path overwrites unconditionally, release path nulls without
+re-seating a survivor* — and its two failure shapes are in
+[rendering.md](./rendering.md) § "One fix, two twin globals" (#802, #810). This section records the
+**editor-specific** half: which slots still lack the identity guard, and the invariants that make
+that safe today rather than lucky.
+
+`SceneView` registers three slots inside its one big viewport `useEffect`, and that effect's cleanup
+releases all three with a bare clear:
+
+| Slot | Declared in | Released by |
+|---|---|---|
+| `_pickBillboardInUI` | `editor/panels/SceneView.tsx`, module scope | direct assignment to `null` |
+| `editorCamera` | `editor/scene/sceneViewBus.ts` | `setEditorViewportCamera(null)` |
+| `ecsObjectsRegistry` | `editor/scene/sceneViewBus.ts` | `setEcsObjectsRegistry(null)` |
+
+Their siblings in the same file — `setFocusEntityHandler` and `setViewportController` — DO return an
+identity-guarded unregister (`if (slot === handler) slot = null`). That asymmetry is real and was
+filed as #811.
+
+**#811 was closed as not-reachable**, because the harm needs an ordering nothing can produce: the
+OLD instance's cleanup running *after* a NEW instance has already registered. Four paths were
+checked, and all four are shut:
+
+- **Two SceneViews at once — impossible.** `dockPanel()` (`editor/panelDock.ts`) scans for an
+  existing tab whose `getComponent()` matches the requested id and takes its focus branch —
+  returning `'focused'` — instead of adding a second. `EditorApp`'s `PANELS` table maps `scene` to
+  `SceneView` exactly once, and the Window menu / `showPanel` / the openByDefault auto-dock all go
+  through `dockPanel`. Pinned by `tests/editor/panelDock.test.ts`,
+  `it('focuses (never duplicates) when the tab already exists')`.
+
+  ⚠️ **`dockPanel` is NOT the only add path, and a reader hardening it would be covering four
+  fifths of nothing.** Five asset-editor panels — particle-editor, spriteanim-editor, skin-editor,
+  animation-editor and timeline-editor — are docked by a direct `Actions.addNode` in `EditorApp`,
+  each behind its **own hand-copied** "find an existing tab, else add" check rather than
+  `dockPanel`'s. Six implementations of one rule. None of them can add a `scene` tab, so the
+  conclusion above holds — but it holds because of `PANELS` and those six separate checks, not
+  because one function owns the invariant.
+- **A dock move does not remount.** FlexLayout renders each tab through a portal keyed
+  `child.getId() + (child.isEnableWindowReMount() ? child.getWindowId() : '')`. Dragging a tab to
+  another tabset changes its position in the model, not its id — so the key is stable and React
+  keeps the component mounted. Hidden tabs stay mounted (CSS-hidden); they are not torn down.
+- **StrictMode is on unconditionally** — `engine/app/main.tsx` wraps `<App/>` in `<StrictMode>` with
+  no DEV gate — but its double-invoke is create → destroy → create on ONE instance. It never places
+  a cleanup after a newer registration.
+- **The async `setup()` cannot be overtaken.** The effect body is fire-and-forget (`void
+  setup().catch(...)`) and the unmount cleanup sets `outerDisposed = true`, so a superseded run must
+  bail. Each of `setup()`'s four awaits — the WebGPU renderer build, the retry backoff,
+  `acquireRenderer`, and `setActiveRenderer` — is followed by an `outerDisposed` re-check; the one
+  after `setActiveRenderer` is deliberate and carries its own comment (#254). After that last guard
+  there is **no further await before the three registrations**, so a run past it assigns all three
+  synchronously in one task.
+
+⚠️ **What would flip this class live, all at once.** The safety is a property of the editor's panel
+model, not of these call sites, so it is not local and it is not obvious:
+- **Enabling popout / floating windows.** `enableWindowReMount` appears nowhere in the editor today;
+  the moment it does, the portal key above gains `getWindowId()` and moving a panel between OS
+  windows becomes a genuine remount. A guard test forbidding the flag was considered and rejected —
+  it would block a legitimate feature instead of making it safe. This note is the precondition
+  instead: **whoever enables popout owns guarding these slots first.**
+- **A second `scene` tab**, or any panel id that also renders `SceneView`.
+- **A throw partway through `setup()` — this WAS live, and is now fixed (#858).** The four
+  arguments above are all about ordering *between* instances. They said nothing about a *single*
+  instance failing mid-bring-up: `cleanup` was assigned last, so a throw after the first
+  registration left `teardownViewport()`'s `fn?.()` releasing nothing and every slot registered so
+  far dangling. An identity guard would not have helped — a release-side guard is inert when
+  release never runs.
+
+  SceneView now seeds `cleanup = scope.dispose` as `setup()`'s FIRST statement
+  (`runtime/core/teardownScope.ts`) and pushes each release at the site that acquires it. **Scoped
+  by one test — does the thing keep ACTING after the bring-up is gone?** On the scope: every
+  module-level registration (the five slots, `onWorldSwap`, the render surface, the
+  bounds/pick/handle providers, the invalidation listener, the dirty subscriptions, the frame
+  callback), the renderer LEASE, the two loss listeners, and the six `window` input listeners plus
+  the `document.body` marquee element. Still terminal-only, and deliberately: the scene graph and
+  GPU objects, plus the listeners on the renderer's own canvas, which dies with it — a partial
+  bring-up leaks those as memory and nothing else. Full rationale in
+  [rendering.md](./rendering.md). **It was one of five sites with that shape** —
+  `Scene3D`, `ParticleEditor`, `previewScene`/`Preview3DShell` and `ModelPreview` were the others,
+  and the renderer LEASE leaked alongside the five slots. The class, the per-site table and what is
+  and is not tested: [rendering.md](./rendering.md) § "The release path must exist before the first
+  acquisition". Ordering is pinned by `tests/architecture/teardownScopeSeeding.test.ts`.
+
+  ⚠️ This does NOT reopen #811, and **does not supply the identity guard** this section says the
+  three unguarded slots still lack. The release pushed for the camera is `() =>
+  setEditorViewportCamera(null)` — the same blind null-write the old closure did. A scope keys
+  which RUN owns a release, not which registrant currently holds the slot, so in the popout
+  scenario instance A's drain still nulls the camera instance B just set. The precondition stands
+  unchanged: **whoever enables popout owns guarding these slots first.**
+
+  ⚠️ One genuinely NEW path into the trap, small but real: those three blind slot-nulls now also run
+  on a PARTIAL drain, where before they ran only when `setup()` completed.
+- **Making the context-loss `rebuild` non-awaiting, or relaxing its coalescing.** `outerDisposed` is
+  per-EFFECT, not per-`setup()`-RUN: a rebuild does not set it, so a superseded run has nothing to
+  bail on. That is harmless today only because `rendererRecovery.ts` serialises rebuilds (`inFlight`)
+  and its `rebuild` *awaits* `setup()` — so the safety the bullet above credits to SceneView's own
+  guards is in fact owned by a different file. Whoever changes either owes a per-run epoch here
+  first.
+
+⚠️ **The obvious fix is wrong for `editorCamera`, and this is the trap worth carrying forward.**
+It is registered TWICE — once when the orbit camera is built, and again from the viewport
+controller's `toggleProjection`, with a *different* camera object each time (`activeEditorCam` swaps
+perspective↔orthographic). So copying the sibling's value-identity guard would make the cleanup
+refuse to clear after any toggle, leaving the slot dangling to a disposed camera for the rest of the
+session — reintroducing exactly the defect the guard was added to prevent. A guard here has to key
+on the **registrant** (the effect run / renderer lease), not on the value. `_pickBillboardInUI` and
+`ecsObjectsRegistry` are each set once per run, so value-identity *would* work for them — which is
+how a fix ends up carrying two shapes of one guard. Use owner-identity for all three, or none.
+
+**Three more slots share the shape** and are unreachable for the same reasons, so they are recorded
+here rather than as their own tickets — they would want one guard shape between them, not three:
+`editor/animation/recording.ts`'s `hook` (`setRecordHook`, cleared by `AnimationEditor`'s effect
+cleanup — that panel is a singleton too, but via its **own** duplicate check in `EditorApp`'s
+auto-dock effect, not via `dockPanel`; see the ⚠️ above);
+`runtime/input/inputSources.ts`'s `inputGate` (`setInputGate`, cleared in an `EditorApp` effect keyed
+on `hmrEpoch`, whose re-runs React orders cleanup-then-effect); and `runtime/core/uiDirty.ts`'s
+`_singleEditorCb` (`setEditorDirtyCallback`), which has no live caller at all — worth guarding
+*before* it acquires one, since its take path drops a differing previous registrant silently.
+
+For contrast, the guarded shapes already in the tree: `offscreenCapture.ts`'s
+`unregisterSceneRenderer` (`if (current === fn)`, documented as protecting against React's
+mount-before-unmount ordering), `editorJournal.ts`'s `closeActorLease` (compares the lease id), and
+`materialBroker.ts`'s `registerRenderSurface` (a `Set` keyed on the object handle, safe by
+construction).
+
+⚠️ Cite these by SYMBOL, not by line (#686 / `docCitations.test.ts`). This section's first draft used
+line numbers and the gate rejected all 37 of them — correctly, and pointedly: **#811's own body cited
+a cleanup range that had already rotted by four lines** between filing and being picked up, which is
+the whole argument for the rule.
+
 ## Selection restore across world swaps
 
 koota entity ids are scoped to their owning world, so a `SceneManager` world swap (scene
@@ -1066,14 +1498,220 @@ for entities lacking a guid, matches by name + ancestor path. Anything unresolve
 cleared. This is the same GUID-keyed mechanism that lets a Stop-revert preserve the user's
 selection.
 
+### Hierarchy collapse restore — the swap must SCHEDULE its own restore (#839)
+
+Expand/collapse is per-user view state, so it lives in `localStorage` keyed by scene path and by
+`EntityAttributes.guid` (a runtime id does not survive the swap). The load/save pair and both
+decisions live in `editor/panels/hierarchyCollapse.ts`; `Hierarchy.tsx` keeps only the wiring.
+
+- **The panel restores from a SETTLED refresh, never from inside the `onWorldSwap` handler** —
+  `getCurrentScenePath()` is still the pre-swap value at that instant, because `loadScene` writes
+  it in its own tail after `sceneManager.loadScene` resolves (`scene/serialize.ts`). A restore run
+  synchronously on the swap would key the new world's tree to the OLD scene's saved set. For the
+  same reason the restore waits while **`aSceneSwapIsHappening()`** (`editor/scene/playMode.ts`)
+  is true. ⚠️ Ask that, never "do the two scene paths agree" — every writer of the editor path
+  other than `loadScene`'s tail leaves it diverged from `sceneManager` **indefinitely** (Save As,
+  Assets → Create Scene, the boot restore), and so does a load that throws after the swap, so a
+  path comparison is not "not settled yet" but "never settled" — it would shut the restore and the
+  save gate for the rest of the session, which is #839 itself by another route. (Create Scene was
+  in that list until #853; it now sets the editor path *before* its swap and clears
+  `loadedScenes`, so it no longer diverges. Save As and the boot restore still do, which is why
+  the rule stands.)
+- **⚠️ But the swap handler must SCHEDULE that settled refresh itself.** It used to leave the job
+  to `onStructureDirtyCoalesced`, which fires on `registerEntity` — and `loadSceneFile` registers
+  the incoming scene's entities into the **staging** world *before* the swap, while `SceneManager`
+  marks nothing structure-dirty after `setCurrentWorld`. So for any scene loaded after boot, no
+  settled refresh ever followed the swap: collapse was neither restored nor saved for the rest of
+  that scene, and the first entity the user created finally ran the restore and overwrote whatever
+  they had collapsed. Structure-dirty is the late-spawn **backstop**, not the primary path.
+
+⚠️ **The set is owned by a WORLD, not by a scene path.** The save gate and the restore trigger both
+compare `getCurrentWorld()` against the world the set was restored for. Keying them on the *path*
+looks equivalent and is not: `saveScene()` changes the path with **no swap and no structural
+change** (`serialize.ts` — both the Save-As and known-path branches), so a path-keyed claim reads
+"needs restore" after a plain **Save As** and the next structural change collapses the whole tree
+and persists that over the user's arrangement. A world identity says the true thing — the ids are
+still valid, only the file name moved — so the arrangement carries across and is saved under the
+new path.
+
+⚠️ **A world identity cannot see "same world, all-new content" — and one path used to produce
+exactly that** (#853). `newScene()` deleted and respawned in place, so the owner still matched the
+live world, `needsCollapseRestore` returned false, and no restore ran — while the save gate stayed
+open, seeding the new scene's entry from the old scene's leftovers. That hole is closed **at the
+source** rather than here: `newScene()` now replaces content through
+`SceneManager.replaceWorldContent()`, so the swap is real and this machinery sees it like any other.
+See [scene-loading.md](./scene-loading.md) § "Replacing every entity IS a world swap".
+
+⚠️ **Keying the in-memory set by guid instead of runtime id would NOT have made this section
+redundant**, and #853's body argues that it would — so the correction belongs here, where the next
+reader will be. A guid-keyed stale entry is inert on *read*, which is real: nothing renders wrongly
+collapsed. But the set would still hold the outgoing scene's guids, `shouldPersistCollapse` would
+still be true, and the first toggle in the new scene would write those guids under the **new**
+scene's path. That is not harmless: it consumes the "never seen" sentinel `computeRestoredCollapse`
+depends on (a MISSING entry means collapse-all-by-default), so the new scene permanently loses that
+default. Guid keying still needs a restore trigger that fires on this path — which is the defect —
+so it is hardening, not a replacement for the ownership machinery.
+
+`hierarchyCollapse.test.ts` pins the decisions; `e2e/editor-hierarchy-collapse.spec.ts` pins the
+wiring, including the Save-As case and the Create Scene case (reverting either turns it red). The
+mechanism class is written up in [async-lifetime.md](./async-lifetime.md).
+
+
 ## Asset editors
 
 Several assets get a dedicated editor. They share one architecture: **the live def is the
 single source of truth in `editorStore`**, so edits push to the **global** undo stack
 (shared with Hierarchy/Inspector/SceneView) and apply even when the panel is unfocused;
-consecutive same-field edits **coalesce** into one undo entry within a ~500 ms window; and
-persistence is a **debounced `/api/write-file`** (~400 ms) that also re-seeds the relevant
-runtime cache so any live entity referencing the asset updates next frame.
+consecutive same-field edits **coalesce** into one undo entry within a ~500 ms window; and an
+edit is **PARKED in the dirty-asset registry**, with **Cmd+S** (Save All) as the only write.
+
+⚠️ That last clause used to read "persistence is a debounced `/api/write-file` (~400 ms)", which
+**#259 removed** — the panels no longer autosave. The flush goes through `/api/asset-write`, which
+also re-seeds the relevant runtime cache so any live entity referencing the asset updates next
+frame. See `useParkedAssetDoc`'s docblock for why dropping the debounce was a fix rather than a
+simplification (its cleanup discarded the last ≤400 ms of edits on unmount).
+
+#### A failed read yields NO document — never `{}`, never `defaultX()` (#886/#896)
+
+**The invariant: an asset editor that cannot READ its document must hold nothing and disable
+editing.** Not an empty object, not a typed empty shell, not the factory default. The panel's
+editing surface is gated on that document (`{clip && …}`, or a `commit` that early-returns on a
+null def), so refusing is enforced by construction rather than by a flag threaded through every
+field — the shape `ParticleEditor` and `AtlasAssetView` already use.
+
+**Why it is an invariant and not a judgement call.** These panels persist through `dirtyAssets` →
+`/api/asset-write`, and a panel-origin flush sends `replace: true` — a FULL REPLACE that
+deliberately skips that route's dropped-field guard. A fabricated document is therefore not "a
+slightly wrong starting point"; it is the file's next contents. Five panels had it, with two
+different consequences:
+
+| Fabrication | Panels | What the flush destroyed |
+|---|---|---|
+| `defaultX(newGuid(), name)` | `AnimationEditor`, `TimelineEditor` | the document **and its GUID** — the fabrication carries an id, so `/api/asset-write`'s preservation branch (`!out.id && prevDoc?.id`) never fires and the file is replaced by one wearing a DIFFERENT id. The scanner's heal pass cannot flag it (the document looks complete), so every reference to the old guid dangles silently |
+| `{}` / `{ clips: {} }` / an empty rig | `MaterialBatchView`, `SpriteAnimEditor`, `SkinEditor` | every field except `id`, which survives |
+
+⚠️ **A MISSING file is not a failed read, and collapsing the two is the other way to get this
+wrong.** For a genuinely absent file — a brand-new asset, or a stale ref — defaults ARE the correct
+content, and refusing there makes the asset unauthorable. That distinction is why
+`classifyAssetDocFetchFailure` (`editor/panels/assetDocLoad.ts`) returns a verdict rather than a
+boolean, and it is why the fetch **must** go through `parseAssetJson`: Vite answers an unknown path
+with `200 index.html`, so "absent" and "corrupt" arrive at the same `.catch` and a raw `r.json()`
+cannot tell them apart. `MaterialBatchView` was exactly that caller and could not have classified
+its own failure if it had wanted to.
+
+⚠️ **"Did not come back" is not "is not there", and asking the wrong one of those reopens the whole
+defect.** `parseAssetJson` throws `MissingAssetError` for EVERY non-ok status, so `isMissingAsset` is
+true for a **500 on a file that exists** — and the first cut of this fix asked exactly that, which
+left `AnimationEditor`/`TimelineEditor` fabricating `defaultX(newGuid())` over an unreadable file for
+that entire error class. Two predicates, two questions:
+
+| Predicate | True for | Ask it when |
+|---|---|---|
+| `isMissingAsset(e)` | the SPA fallback, and **any** non-ok status | you will show nothing (eight readers do this, and it is right for them) |
+| `assetIsAbsent(e)` | a 404/410, or the SPA fallback | you will **substitute content** — write defaults, mint a GUID, treat the path as free |
+
+The producer is not hypothetical: `plugins/backend/writeResult.ts` answers 500 when
+`createReadStream` errors on a file `existsSync` has just confirmed — EMFILE under a scene-load
+fan-out, EACCES, EBUSY on Windows — and `electron/backendServer.ts` adds a catch-all 500 on the same
+call. Both substitution callers (`assetDocLoad.ts` and `scene/modelImportPersist.ts`, whose
+`'absent'` verdict MINTS a GUID) ask `assetIsAbsent`; `modelImportPersist` had the same defect
+pre-existing and was fixed in the same pass. An unknown status fails CLOSED — not absent — so a
+mock that means 404 has to say so.
+
+**Not a park-time guard, deliberately.** The `.meta.json` SIDECAR registry solves its half of this
+class with a tag on the document, refused at the write seams (`scene/metaReadFallback.ts`, #880).
+That shape is right there — 18 spread sites, no single load helper — and wrong here: the fabricated
+document reaches the editor store and the live preview *before* any park, so a park-time refusal
+would let a human keep editing a fabricated clip and only complain N edits later at Cmd+S. Each of
+these panels has exactly one load effect, so the failure has a single place to be named.
+
+Guarded by `tests/architecture/assetEditorRefusesUnreadableDoc.test.ts` (the corpus is DERIVED from
+`useParkedAssetDoc(`, so a sixth editor is covered the day it is written). ⚠️ **That guard proves
+the classifier is CALLED, not that both branches are handled** — the verdict's own two-sided
+behaviour is `packages/modoki/tests/editor/assetDocLoad.test.ts`, and the batch view's
+exclusion/write halves are `tests/editor/materialBatchLoad.test.ts`.
+
+**Retrying a refused load is `reloadEditingAsset`, never `open<X>Editor` and never a local nonce.**
+Both alternatives were shipped and both were wrong, in opposite directions — a local nonce re-runs
+the load effect but cannot get past its `if (existing)` early return, so Retry adopts whatever
+document happened to land in the store, with no further check; `open<X>Editor` does null the
+document, but also clobbers `isPreviewPlaying`/
+`previewOwner`/`playheadTime`, which are SHARED between the Animation and Timeline panels and which
+`closeAnimationEditor`/`closeTimelineEditor` guard with `panelMayStopPreview` for that reason
+(#810). **A re-read is not a re-open**, and the two open actions that reset preview state are
+exactly the two whose close actions guard it. `reloadEditingAsset`'s docblock lists what each of the
+five open actions actually resets — they differ, and the first version of that docblock generalised
+from one of them and was false of three.
+
+⚠️ **Nulling the document removes that early return; it does NOT guarantee a disk read** — and five
+docblocks plus this section said it did until #896's fourth review. The next branch is
+`pendingAssetDoc`, which adopts a PARKED document before any `fetch`, deliberately: a park is
+unsaved work newer than the file, and re-reading over it is the destruction #831/#843 and
+QA-CTX-0008 are about. Every agent op parks (`persistOrMarkDirty` is unconditional under manual
+persistence) and so does a redo — the two cases the old wording named as what a re-read PREVENTS —
+so "Retry re-reads the file" holds only when nothing is parked for that path. A refused panel's
+instruction to the human must say so, or repairing the file and clicking Retry silently yields the
+parked document instead, and Cmd+S then writes it over the repair.
+
+⚠️ **A store-level test cannot see whether a PANEL is wired to it.** `reloadEditingAsset` had a
+complete five-row table and a passing test while `ParticleEditor` was still on a local nonce — a
+table can be complete and a panel still broken. The panel half is a source scan
+(`tests/architecture/assetEditorRefusesUnreadableDoc.test.ts`), over the same corpus derived from
+`useParkedAssetDoc(`, because the panels are `.tsx` and this repo does not mount those.
+
+⚠️ **`SkinEditor`'s fallback is EMPTY by owner ruling (#423 item 2) and stays that way** — a
+phantom `root` bone would claim content the file does not have. That ruling is about what is
+DISPLAYED and is compatible with refusing (a refused load shows nothing either); what changed in
+#896 is only that the empty rig is no longer SAVABLE, which is the thing the ruling was actually
+guarding against.
+
+#### The client write seam — one JSON body producer, one wrapper (#835)
+
+The editor serialises scene/prefab/asset-document JSON **client-side** and POSTs the finished
+string to `/api/write-file` — unlike `/api/asset-write`, which parks an OBJECT and lets the
+server produce the bytes (`assetJsonBytes`, `editorBackendRouter.ts`). Before #835, every
+`/api/write-file` JSON call site spelled out its own `JSON.stringify(x, null, 2)`, and none of
+them appended the trailing newline the committed corpus (and `assetJsonBytes`) carries — 537
+committed `.scene.json`/`.prefab.json` files lost it this way.
+
+**`jsonFileBody`** (`editor/backend/editorBackend.ts`) is the client mirror of the server's
+`assetJsonBytes` — the one place a JSON document's final bytes are composed. **`writeAssetFile`**
+(same file) is the one write wrapper: it POSTs `content` to `/api/write-file` completely
+unchanged, so a JSON caller must run `jsonFileBody(data)` first and a binary caller passes its
+base64 string with `encoding:'base64'` — the function itself does not know or care which. Every
+JSON call site now reads `writeAssetFile(path, jsonFileBody(data))`; the five near-identical
+wrapper functions #835 replaced (`serialize.ts`'s `writeFileToServer`, this module's own prior
+duplicate, a third copy in `modelImport.ts`, `writeAssetFileOrAbort`, and an inline `post` lambda
+in `ModelAssetView.tsx`) are gone.
+
+**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to a UltraHDR JPEG, an
+extracted PNG texture, or a converted GLB corrupts the asset. Three sites deliberately keep their
+own raw `backendFetch('/api/write-file', …)` call rather than routing through `writeAssetFile`:
+`assetViews/EnvironmentAssetView.tsx`, `scene/modelImport.ts` (its texture-extraction write only —
+the material/mesh JSON writers in the same file DO route through the wrapper), and
+`scene/convertToGLB.ts`. `tests/architecture/clientJsonWriteSeam.test.ts` enforces the split: no
+file outside the wrapper reaches the route directly unless it is on that file's EXEMPT ledger,
+scanned against the ROUTE STRING rather than the `JSON.stringify` pattern (which is exactly what
+let four real call sites hide from the original bug report's grep).
+
+`AtlasAssetView` is not on this seam at all — since #831 it parks an object through
+`/api/asset-write` and the server produces the bytes, same as the debounced asset-editor
+persistence below. It is the template for "hand the server an object" where that shape fits; the
+five editors below stay on `/api/write-file` because each already had its own write plumbing this
+commit chose not to restructure further.
+
+⚠️ **A GAME's editor panels write asset documents too, and they reach the engine ONLY through the
+public barrel** — a game is copied out of the repo, so it may not import
+`editor/backend/editorBackend.ts` by a relative path (portability, #29). While the barrel exported
+raw `backendFetch` and nothing else, the one definition of a document's bytes was unreachable from
+the only place still spelling its own, and `games/sling/editor/{Level,Wave}Editor.tsx` duly
+reproduced the pre-#835 shape — hand-rolled `JSON.stringify`, no trailing newline, all four of
+their committed `.level`/`.wave` files churning on every save.
+
+So **`jsonFileBody` and `writeAssetFile` are exported from `@modoki/engine/editor`**, and both
+sling call sites go through them. The general rule: a helper that games must not bypass belongs on
+the public barrel, or the export list itself becomes the reason the defect recurs outside the
+engine.
 
 #### The binding is a PATH, so every file move must update it (#186)
 
@@ -1094,19 +1732,54 @@ the binding is repointed via `remapEditingAssetPath` rather than reopened: reope
 re-fetches from disk and would discard the in-memory doc, which after a rename is the newer
 of the two.
 
-**Six call sites, and they are the whole contract** — asset delete (`executeDeletion`),
-folder delete (`handleDeleteFolder`, which deliberately does *not* route through
-`executeDeletion`), asset rename, cut/paste move, folder rename, and drag-drop into a folder
-(`handleFilesDrop`). The four move sites remap in their **undo/redo closures** too, since
-those move the file back — and each closure gates the remap on the move actually succeeding:
-`/api/move-file` 409s when the destination exists, and repointing a binding at a path the
-file is *not* at is the forking bug itself.
+⚠️ **"Binding" undersells what `applyAssetPathMoves` repairs.** It started as the five
+`editing<X>Asset` fields and has grown every time something else turned out to be path-keyed:
+the **parked writes** and their **`ifMatch` CAS baselines** (#259), the **flushed-record maps**,
+**`currentFolder`** (#854) and the **Inspector selection** (#867). Anything else keyed by asset
+path belongs here too, not at a call site — including `expanded` and `pendingFolders`, which were
+remapped by hand at three of the thirteen sites until #867's own review pointed out that they were
+never out of reach: `assetFolderState.ts` holds them at MODULE scope with exported setters (its
+header says they **must not** go back into `useState`, #309), and this module already imported
+`remapCurrentFolder` from that very file. `remapFolderSets` now runs in the seam with everything
+else. What stayed at the call site is `commitFolderRename`'s `.add(newPath)` — keeping a renamed
+folder open is a property of that gesture, not of the repair.
 
-Two sweep lessons are baked into that list. The first version wired only `executeDeletion`
-and missed four; a follow-up sweep for `moveFileTo` call sites still missed `handleFilesDrop`,
-which uses the sibling helper **`moveFile`** (folder target) instead. Grep for the *behaviour*
-— "what changes an asset's path?" — not for one helper's name. A copy/paste is deliberately
-absent: it creates a new file and leaves the original in place, so nothing bound has moved.
+**⚠️ The call sites are NOT the contract any more (#867) — the MOVE carries the repair.**
+This section used to read *"six call sites, and they are the whole contract"*, and both halves
+of that were wrong by the time it was written: there are **13 direct call sites** (5 in
+`Assets.tsx`, 8 in `assetUndo.ts`) plus `unbindDeletedAssetEditors` wrapping it for 4 more, and
+enumerating them was never going to hold. Three sites failing the same way is a **missing seam**,
+not a longer to-do list:
+
+- **`modoki_move_asset` could not call the repair AT ALL.** The MCP server is a different
+  *process* from the renderer. So `POST /api/move-file` — the one place a move actually happens —
+  now calls the renderer back through `ctx.requestBrowser('apply-asset-path-moves', …)`, the same
+  server→renderer RPC ~20 other routes use, already abstracted over Vite HMR and Electron IPC. It
+  swallows a missing renderer on purpose: a CLI move has no in-memory state to repair.
+- **A dragged FOLDER built an exact-path move**, so `applyMove` returned `undefined` for every
+  descendant. `planFilesDropMoves` (`utils/assetPaths.ts`) is now the pure planner and sets
+  `prefix` from whether the thing is a folder — asked of the tree per path, because a
+  multi-selection drag carries ONE payload for many. `DropMove` carries `prefix` through undo and
+  redo; reversing a prefix move is still a prefix move.
+- **The route is the only party that can tell a folder from a file** on the agent path — the
+  client passes two strings and they look identical. `statSync().isDirectory()`.
+
+The panel still repairs synchronously when *it* is the mover, and that is not redundancy:
+**ordering is load-bearing** — the registry must be repaired before the selection moves, because
+`AtlasAssetView`'s load effect keys on the selected path for its CAS baseline. Applying a move
+twice is a no-op (`applyMove` matches on `from`, and after the first pass nothing is at `from`),
+so the route's call is a safe backstop for every caller that is not the panel.
+
+Each undo/redo closure still gates its remap on the move actually succeeding: `/api/move-file`
+409s when the destination exists, and repointing a binding at a path the file is *not* at is the
+forking bug itself. A copy/paste is deliberately absent — it creates a new file and leaves the
+original in place, so nothing bound has moved.
+
+The sweep lesson that produced the old list — *"grep for the behaviour, not for one helper's
+name"* — is what the seam retires. It was good advice for a repair wired to call sites, and it
+still failed twice: the first version wired only `executeDeletion` and missed four, and a
+follow-up sweep for `moveFileTo` missed `handleFilesDrop` because it uses the sibling helper
+`moveFile`. **A repair you have to remember to call is one you will eventually not call.**
 
 Folder matching is **segment-boundary**, not `startsWith`: renaming `/assets/anim` must not
 capture `/assets/animations/…`. Adding a sixth binding editor means adding a row to
@@ -1146,7 +1819,7 @@ asset-binding bug above was found. The check is permissive on purpose — any re
 outside `editorStore.ts` counts, including from a test — and it excludes its own file from
 the corpus, since naming an orphan in an allowlist would otherwise launder it.
 
-### The asset Inspector — three rules that have each failed repeatedly
+### The asset Inspector — six rules that have each failed repeatedly
 
 The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
 per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
@@ -1278,6 +1951,186 @@ frames are read off the manifest; a video streams from its URL). A test in
 is "not a GPU cache the renderer keys by path"; `audioBufferCache` is keyed by path, so that
 premise was simply false and the test was defending the bug.
 
+**6. A panel that writes the WHOLE document must prove it still has the whole document.**
+`AtlasAssetView` builds the entire `.atlas.json` from a copy it read when the panel opened.
+Nothing tells it the file changed underneath — `assetsVersion` is keyed on paths, not content
+(see § "A panel that reads `getAllAssets()` must subscribe to `assetsVersion`" above), and
+`atlas` is not a `SceneChangedKind`, so the watcher's `dropParkedWriteFor` never fires for it
+either. A `.atlas.json` altered on disk while the panel is open (a `git checkout` under a live
+editor, which CLAUDE.md names as a real hazard) was silently reverted by the next padding nudge,
+with nothing erroring (#439).
+
+The guarantee is a **compare-and-swap**, and it now travels with the parked write. The panel
+hashes what it loaded into `baselineHash`, parks it alongside the document as
+`DirtyAsset.ifMatch`, and `flushDirtyAssets` sends it as `POST /api/asset-write`'s optional
+`ifMatch` precondition (a sha256 hex of the expected current content). The server compares
+against the file's actual current hash and only then writes — synchronously, with no `await`
+between the compare and the write (`ifMatchRefusal`, shared with `/api/write-file`), so there is
+no gap for a second write to land in. A mismatch, or the file not existing, 409s with no write.
+`ifMatch` is optional and absent means an unconditional write, unchanged for every other caller.
+
+⚠️ **#831 made this window LONGER, not shorter, which is why the CAS survived the change.** The
+panel used to write on every control interaction, so the read-to-write gap was one keystroke; it
+now parks and Cmd+S is the write, so the gap is however long the human takes to save. What did
+NOT survive is `createAtlasWriteQueue`: it existed (#469 review finding 1) to stop this panel's
+own overlapping writes self-inflicting a 409 on each other, and parking is synchronous and
+last-write-wins in a `Map`, so there are no concurrent writes left to serialize. That claim is
+asserted rather than argued — `tests/editor/atlasParksNotWrites.test.ts` drives N rapid edits and
+pins ONE pending write, the LAST document, the ORIGINAL baseline, and zero network calls.
+
+**A conflict is now a fork the human resolves, not a discard.** The old flow dropped the losing
+edit and reloaded from disk, which was proportionate when the edit was one control change; after
+#831 a conflict lands on a set of unsaved edits, so discarding them silently would be the larger
+data loss. `flushDirtyAssets` leaves the entry parked and records why (`getAssetFlushError`), and
+the banner offers both exits explicitly — **Discard & reload** (`discardDirtyAssets`) or
+**Overwrite on save** (`clearAssetIfMatch`, which drops the precondition). The CAS exists to
+prevent a SILENT overwrite; a deliberate one is the human's call.
+
+History, so the shape is not re-derived: #439's original fix did the compare client-side — read,
+compare, then write as two separate calls — which closed the `git checkout` race but left a
+narrower one open between two rapid edits; #469 moved the compare-and-write into one atomic
+server-side operation on `/api/write-file`; #831 moved the whole write onto the registry, so the
+precondition moved to `/api/asset-write` with it and the client-side queue went away.
+
+⚠️ **A record keyed by a PATH must follow the path when the file moves (#854).** The registry is
+four path-keyed maps — `dirty`, `lastFlushed`, `lastFlushedHash`, `flushErrors` — and a rename
+originally repaired one of them, incompletely. `applyMovesToParkedAssets` re-parked a moved entry
+with `markAssetDirty(to, doc.type, doc.data, doc.origin)` and no fifth argument, so `data` and
+`origin` survived the move and **`ifMatch` did not**. That turned the compare-and-swap off for the
+rest of the session, silently and with no banner: the panel re-seeds `baselineHash` from
+`peekDirtyAsset(path)?.ifMatch` on its parked-doc branch, which was now `undefined`. Park an atlas
+edit, rename the `.atlas.json`, and the `git checkout` hazard this whole section exists to close was
+back — on the one view whose ONLY protection is the CAS, which is exactly the argument used to
+justify not giving `atlas` a `LiveReloadKind`.
+
+Two things made it survive review. `markAssetDirty` documents that an omitted `ifMatch` **preserves**
+whatever the destination key already carried, which is correct for all six same-path re-park callers
+(`adoptParkedDoc`, the agent ops, `useParkedAssetDoc`) — `applyMovesToParkedAssets` is the only
+CROSS-path re-park in the tree, and it is the one place where "preserve what is at this key" and
+"carry what came from the other key" are different answers. And the suite already pinned
+`origin` surviving a move, which reads as coverage of the tuple; it was one field short.
+
+The fix threads `doc.ifMatch` through, which is sound because a rename does not change bytes
+(`/api/move-file` is a `renameSync`), so the hash captured at `from` still describes the file at
+`to` — including a case-only rename on a case-insensitive FS, where the inode is the same entry.
+
+Two ordering invariants hold this together, both load-bearing and neither obvious:
+
+- **`remapFlushedAssetRecords` runs BEFORE the discard loop.** `discardDirtyAssets` calls
+  `forgetFlushedHash`, which is right for an edit being DISCARDED and wrong for a file merely
+  MOVING; remapping first makes that call a no-op and the record survives at `to`. This is also the
+  only repair that reaches a path with NO parked write — `applyMovesToParkedAssets`' own loop
+  iterates `getDirtyAssetPaths()`, so it structurally cannot see one, and those entries were
+  stranded forever under a filename that no longer existed.
+- **`applyAssetPathMoves` runs BEFORE `selectAsset`** in the Assets panel's rename. `selectAsset` is
+  what re-points the Inspector, and `AtlasAssetView`'s load effect is keyed on that path — it reads
+  the parked entry to recover its baseline. Repairing the registry first means the panel cannot
+  observe a half-repaired state. This was never a live bug: both calls are synchronous, so React's
+  automatic batching guarantees no render interleaves. The order is structural so the invariant does
+  not rest on that.
+
+`flushErrors` is deliberately NOT remapped: an errored path is always a dirty path, and a dirty path
+that moves is discarded (which clears its error), so it has no orphan case.
+
+⚠️ **The repair is wired to CALL SITES, not to the move — so it covers the Assets-panel rename and
+not every way a file moves.** This is the honest scope, and an earlier draft of this section (and of
+`liveReloadKinds.test.ts`'s atlas exemption) asserted the opposite as settled fact. `applyAssetPathMoves`
+is client-side, and every caller has to remember to call it with the right arguments:
+
+- **`modoki_move_asset`** POSTs `/api/move-file` and nothing else. It runs **out of process**, so it
+  cannot call the repair at all — the fix has to push a move notification to the renderer, or move
+  the repair server-side. A parked atlas edit survives as a park keyed to a dead path; Cmd+S then
+  409s against a file that no longer exists, and the only forward exit recreates it at the old path.
+- **A dragged FOLDER** sets `isFolder: true` in the drag payload and `handleFilesDrop` never reads
+  it, so it builds an exact-path move with no `prefix`. Nothing under the folder is repaired —
+  `applyMove` returns `undefined` for every child.
+- **Inspector SELECTION** is re-pointed by `handleRename` alone; the cut/paste, drag-drop and
+  undo/redo move paths leave it aimed at the old path, and nothing self-heals when a selected path
+  vanishes from a refreshed listing.
+
+One mechanism — *the client repairs a move per call site instead of the move carrying its own
+repair* — so it wants one fix across all three, not three patches. Tracked as #867.
+
+⚠️ **The remap's own trap, found by reviewing the fix.** `remapFlushedAssetRecords` first
+snapshotted each map's KEYS and then read each VALUE live inside the walk — so a chained move
+`[A→B, B→C]` set `B` to A's record, read that back on the second hop, carried it to `C` and deleted
+`B`. One record destroyed, the other misattributed. Its comment claimed plan-then-apply prevented
+exactly that, which snapshotting keys alone does not buy.
+
+⚠️ **Snapshotting ENTRIES is not the fix either, and that was the first prescription.** With key
+AND value captured up front, the second hop's DELETE of `B` still lands after the first hop's WRITE
+to `B`, so `B` ends up empty rather than holding A's record — the same bug wearing a different
+symptom. It takes the full two-phase shape `applyMovesToParkedAssets` already uses one layer up:
+plan every `(from, to, value)` triple, delete every source key, THEN set every destination. No
+caller passes a chained move today, so this pins the shape rather than a live bug — which is
+precisely why it survived a green gate and four mutation checks aimed at other lines.
+
+⚠️ **Why this panel and not its siblings — and the answer is narrower than it first looks.** An
+earlier version of this section said the other views were covered because "their types are all
+`SceneChangedKind`s, so an external change drops their parked write through
+`dropParkedWriteFor`". **That is false for two of them.** `material` and `shader` are absent from
+`LiveReloadKind`/`SceneChangedKind` (`vite-asset-scanner.ts`, `agentBridge.ts`) and
+`classifySceneChange` has no case for either, so `MaterialAssetView`, `ShaderAssetView` and
+`MaterialBatchView` park whole documents with **no** baseline and **no** watcher drop — #439's
+defect on three more views. That is **#842**, whose fix is to derive the watcher classification
+from `ASSET_SCHEMA_TYPES` rather than to give each view its own baseline. So the honest scoping is:
+the atlas carries a compare-and-swap because it needs one INDEPENDENTLY of #842, not because it is
+the only view at risk. See [mcp-persistence.md](./mcp-persistence.md) § "5. The dirty-asset
+registry — the ONE path from an asset edit to disk".
+
+**But parking is not itself the protection — that was always a second mechanism, and #842 showed
+it can be silently absent.** A parked write is only dropped as stale by `dropParkedWriteFor`
+(`engine/app/debug/agentBridge.ts`), which fires ONLY off a `modoki:scene-changed` broadcast,
+which fires ONLY when the changed file's type has a `LiveReloadKind`
+(`classifySceneChange`, `engine/plugins/vite-asset-scanner.ts`). `material` and `shader` had no
+`LiveReloadKind` at all until #842, so `MaterialAssetView`/`MaterialBatchView`/`ShaderAssetView`
+parked their edits with **no staleness protection whatsoever** in that window — an external
+change to the same `.mat.json`/`.shader.json` (an agent's `write_asset`, a `git checkout`)
+would never be noticed, and the stale parked edit would win at the next Cmd+S.
+
+So there are now **two independent mechanisms guarding the same hazard**, and a reader should not
+conflate them: `AtlasAssetView` alone parks WITH the compare-and-swap `ifMatch` precondition
+(#439/#469, above; #831 added the park) — its protection is checked server-side at write time.
+Every OTHER Inspector asset surface — the five panels and the four views — parks WITHOUT one and
+relies on watcher-driven park-drop instead, which is checked at edit time but depends entirely on
+the kind being watched. **The rule to take away: absent a compare-and-swap, parking a write
+protects it only if the file's kind carries a `LiveReloadKind` — adding a type to the parkable set
+with neither silently removes the guarantee**, exactly as it did here for two full types across an
+entire release window.
+
+⚠️ Still uncovered by either mechanism: `.meta.json` sidecars are invisible to `detectType`
+(`vite-asset-scanner.ts`, the `relPath.endsWith('.meta.json')` branch) — see #845. **So a sidecar
+gets a THIRD mechanism rather than either of these two: an explicit gate that asks the renderer
+before the write** (#872/#882). The watcher-driven park-drop that protects `modoki_write_asset`
+cannot fire for a sidecar, and `/api/write-meta` sends no `ifMatch` of its own, so neither of the
+two mechanisms above was ever going to reach it. Read side, CAS half and write side are all closed
+now (#872/#871/#874/#882); the gate, why it must not fail open, and the three routes it covers are
+in [mcp-persistence.md](./mcp-persistence.md) § 5.
+
+⚠️ **And being watched is not the same as being invalidated WELL.** Adding a kind to
+`LiveReloadKind` makes the broadcast fire; what the matching `ASSET_CACHE_INVALIDATORS` entry then
+does with the path it is handed is a separate question, and `invalidateShader` answered it by
+throwing the path away and clearing every compiled 2D material program (#852). Rule and the two
+traps that come with it (an unresolved key is UNKNOWN, not absent; fire the waiters you evict):
+[mcp-persistence.md](./mcp-persistence.md) § "Wiring a kind into the table is only HALF the job".
+
+Why it stayed invisible: `AtlasAssetView`'s own header notes the page preview "refreshes after a
+Re-pack via the watcher's manifest broadcast" — and it does. **Derived** data (the `.meta.json`
+pages/frames block, surfaced through the manifest) refreshed correctly, while the **authored**
+source document did not. A panel that visibly updates is the worst place to hide a stale read.
+(#439's sibling #430, on the failed-READ half of the same panel, has no separate write-up here —
+it shipped with code + tests + one QA case only.)
+
+⚠️ **A BOM defeated three of `/api/asset-write`'s guards at once** (found 2026-09-07 while moving
+the atlas write onto that route). `prevText` was read as `readFileSync(abs, 'utf-8')`, BOM
+included, and `JSON.parse` rejects that — so the format-version classifier called the file corrupt
+and **refused every write to it forever** (`400 could not be classified (unparsable)`), `prevDoc`
+fell to `null` so the dropped-field guard passed anything, and id preservation was skipped, which
+lets the scanner's heal mint a fresh GUID and dangle every reference to the old one. Type-agnostic
+and pre-existing: a Windows-authored `.mat.json` hits it identically, which is CLAUDE.md's
+recurring Windows class surfacing on a Mac-only gate. Fixed by reading through `stripUtf8Bom`, the
+same helper the `ifMatch` hash already used to agree with the browser's `Response.text()`.
+
 ### Animation Editor
 
 `editor/panels/AnimationEditor.tsx` — a Unity-style keyframe timeline for `.anim.json`
@@ -1361,7 +2214,7 @@ view is showing decides what `modoki_handles` can see at all, and the default is
 `modoki_handles editor=curves` comes back empty until the view is switched, which reads as *"this
 clip has no tangents"* rather than *"you are looking at the wrong view"*. The choice therefore
 lives in the **editor store** (`animationViewMode`), not in `AnimationEditor` local state, so it is
-agent-drivable — `modoki_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
+agent-drivable — `modoki_set_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
 it back (#369). Same move, and the same reason, as `sceneViewMode` gating the Collider2D handles.
 Setting it does not open, reload, or reset a clip; `modoki_open_animation_editor` does (it clears
 the loaded document and resets the playhead to 0), which is why the view is a separate call rather
@@ -1449,6 +2302,56 @@ is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.
 > `engine/tests/editor/metaMergeNotClobber.test.ts` encodes exactly that rule. Found by the
 > close-out sweep of the 9-slice work, not by a report — the post succeeds, the UI updates, and
 > the damage sits in a file nobody re-reads until much later.
+
+> **`version` is the sidecar's FORMAT version, and `writeMetaSidecar` owns it — writers must not
+> supply one** (#734). The pattern every versioned document in the repo follows, and the decision
+> table it belongs to, is [format-versioning.md](./format-versioning.md). It says how the `.meta.json` document is laid out, not anything about the
+> asset it describes. Every write THROUGH `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION`
+> (`plugins/meta-sidecar.ts`), so a caller that passes `version` is ignored; a caller that omits it
+> is correct.
+>
+> ⚠️ **`writeAssetGuid` is not the only writer outside `writeMetaSidecar`** — the complete list of
+> four is `writeAssetGuid` (writes via `vite-asset-scanner.ts`'s own `writeJsonAtomic`), the two
+> `.meta.json` generator scripts (`gen-white-hdr.mjs`, `gen-skinned-test-models.mjs`), and
+> `tools-scratch/spine-import.mjs`. None of them inherit `writeMetaSidecar`'s stamp or its refusal
+> automatically. **Calling
+> `assertSidecarWritable` alone is NOT sufficient** — a writer that refuses but never stamps
+> `SIDECAR_FORMAT_VERSION` still leaves an unstamped document behind, which is the same downgrade
+> risk (#734) wearing a different face. The actual rule for a writer outside `writeMetaSidecar`:
+> it must BOTH stamp `SIDECAR_FORMAT_VERSION` and, if it can overwrite an existing sidecar, call
+> `assertSidecarWritable` (or an equivalent refusal) first. Every known sidecar writer overwrites
+> an EXISTING file — `gen-white-hdr.mjs` and `gen-skinned-test-models.mjs` both rewrite a tracked
+> `.meta.json` on every run (reading the old one first to preserve `id`) — so all of them owe both
+> halves.
+>
+> It was written by 14 sites and **read by nothing** until #734, and ten of those sites stamped a
+> literal `2` over whatever was already on disk — so a sidecar written by a build with a newer
+> format was silently downgraded in place. That is not hypothetical: the postprocessor incident
+> above downgraded `version` 2 → 1 alongside the GUID loss. The stakes are the sidecar's contents —
+> the stable GUID every scene and mesh ref resolves through, the Texture-Inspector import settings,
+> and the Sprite Editor's hand-drawn slices with their own per-slice GUIDs. **None of it is
+> regenerable**, so "just reimport it" was never a recovery story: a reimport regenerates the files
+> listed under `generated`, not the authored state beside them.
+>
+> ⚠️ **A too-new sidecar makes the write REFUSE, loudly.** `writeMetaSidecar` throws when the
+> on-disk `version` is strictly greater than this build's, writing neither the committed sidecar nor
+> `.meta.local.json`; `/api/write-meta` surfaces that as a 500 carrying the message.
+> `assertSidecarWritable` is the same check exported for callers that want to fail before doing
+> work — `/api/reimport` calls it per asset, INSIDE that asset's own try/catch, so a refusal on one
+> asset is recorded into `summary.errors` and the loop CONTINUES to the next asset; the route still
+> rebuilds the manifest and sends `invalidate-assets` afterward. **Deliberately not [PlayerPrefs' shape](./player-prefs.md)**:
+> that one warns and silently does nothing, which is right for a save read at boot with nobody
+> watching, and wrong for an action a human just triggered in the editor and is waiting on. The cost
+> is accepted — on a branch older than the format bump you cannot reimport that asset until you
+> merge.
+>
+> ⚠️ **The `version: 2` literals still in the seven panel writers are INERT BUT LOAD-BEARING — do
+> not tidy them away.** They no longer affect what is written (the server stamps it), so they read
+> as dead weight. But `tests/editor/metaMergeNotClobber.test.ts` finds a meta-write literal by
+> searching for `version:\s*\d`, so they are that detector's anchor: strip them and every one of its
+> per-file assertions matches an empty set and passes **vacuously**. A liveness test in that file
+> turns the cleanup red rather than silently green; if you genuinely need them gone, re-anchor the
+> detector on the `writeMetaOrWarn(` / `'/api/write-meta'` call instead of deleting the test.
 
 ### SpriteAnim Editor
 
@@ -1879,8 +2782,9 @@ OS trash; the partial case was not reported at all. `makeDeleteUndo` now restore
 
 ⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,
 `deleteAssetFile`, `moveFileTo`, `createFolderApi` and `duplicateAssetFile`
-**never throw** — they catch and resolve `false`. (`SceneAssetView`'s `mutateScene` was the one
-exception: it resolved `{ok:false}` for an HTTP error but let a network-level rejection escape,
+**never throw** — they catch and resolve `false`. (`mutateScene` — then in `SceneAssetView`, since
+#831 in `scene/pendingBaseScene.ts` — was the one exception: it resolved `{ok:false}` for an HTTP
+error but let a network-level rejection escape,
 straight out of an undo closure and into the both-stacks-lost path below. It now catches too.) So ignoring the return value is silent *by
 construction*, and `undoManager` pops the entry and reports success either way: Cmd+Z reads as
 working while nothing happened. The forward path of the same function usually checks the return;
@@ -1960,6 +2864,94 @@ extended it rather than inventing a second home.
 filesystem boolean — and stack ordering means the entity is present in the normal case (deleting
 it pushed its own undo entry, which unwinds first). The abnormal case is a world-rebuild
 guid-index gap, a different bug to chase; fifteen speculative warnings would be noise.
+
+
+#### The same class one layer up: a boolean that could not be false (#884)
+
+⚠️ **#308 fixed the closures that ignored the boolean. It could not fix a boolean that was
+computed from the wrong thing** — and #875 introduced exactly that, without touching a single one
+of those closures.
+
+`/api/delete-asset` reports its outcome **per path**: `missing` (never on disk) and, since #875,
+`failed` (the OS refused it — a locked file, a denied ACL, a >260-char path). The wrappers
+collapsed that to a whole-batch verdict computed from the **HTTP status**: `deleteAssetFile`
+returned `res.ok`, and `deleteAssetFiles` hardcoded `ok: true` on any 200. A refusal answers
+**200**. So every guard #308 had carefully installed was checking a value that could not be false,
+and three consumers went wrong at once:
+
+- the **Assets panel** dropped the row, unbound the editor and offered undo for a file still on
+  disk — while the route, one process away, was carefully filtering its OWN half of the repair
+  under the comment *"Unbinding an editor from a file that is still on disk would be the wrong
+  direction"*;
+- the **folder delete** pruned the tree for a folder that is still there;
+- **`modoki_delete_asset`** told an agent the file was gone. That one had no backstop at all:
+  `isFailureBody` short-circuits on `ok === true` **by design** (*"the route says it succeeded —
+  believe its explicit verdict"*), so the shared MCP false-success guard was defeated by the route
+  being wrong rather than by the guard being weak.
+
+**The fix is a verdict per OUTCOME, not per request.** A route that answers one `ok` for two
+different outcomes gives every caller a value it cannot act on:
+
+| outcome | reply | what a caller should do |
+|---|---|---|
+| everything went | `ok:true`, no `failed` | the ordinary path |
+| some went | `ok:true` + `failed` | reconcile the ones that went; keep the rest |
+| nothing went | `ok:false` + `failed` | report it; change nothing |
+
+#875's argument for never answering a failure here — *a 500 reads as "nothing was deleted" about
+N-1 files that ARE gone* — is exactly right about the **partial** row and says nothing about the
+third. When nothing went, "nothing was deleted" is simply true. It stays a **200** so `missing`,
+`failed` and `manifestRebuilt` survive; `isFailureBody` handles an `{ok:false}` 200 explicitly, and
+that is the shape it exists for.
+
+**Two rules this leaves behind.**
+
+1. **A per-path outcome list is reported in the CALLER'S OWN strings.** `failed` used to map
+   through `absToAssetUrl(abs) ?? abs`, so a path that would not canonicalise arrived as an
+   ABSOLUTE path in a field the renderer can only match against asset urls — the same fallback
+   `/api/move-file` explicitly refuses, one size smaller. `missing`, the sibling list in the same
+   reply, always echoed the input; two outcome lists in one reply that are keyed differently cannot
+   be treated uniformly by anyone. The **renderer repair** keeps `absToAssetUrl` — a different
+   consumer with a different correct key.
+2. **Everything after a partial delete keys off what WENT.** `planDeleteOutcome` (`assetOps.ts`)
+   is that split, in `.ts` so it is testable without mounting the panel. Note the asymmetry it
+   encodes: a refused **sidecar** does NOT keep the asset's row, because the asset itself is gone
+   and a row pointing at nothing is the mirror defect.
+
+**What the close-out review then found — the same class, three more times.** Worth recording
+because every one of them was in code the fix had already touched or should have:
+
+- **`makeDeleteUndo`'s REDO half had the identical defect**, one layer over. `if (!res.ok)` cannot
+  see a partial refusal, so a redo re-listed the refused file and read as a no-op — #291's
+  complaint, reintroduced by #875's new shape. Fixing a false success on the forward path does not
+  fix its twin on the undo path; they are separate call sites of the same wrapper.
+- **`failed` is NOT stable across a retry, and `missing` is.** They were merged into one
+  `notTrashed` set captured at construction — which is wrong precisely because the toast asks the
+  human to close the handle and try again. After a successful retry the second undo skipped that
+  file's write *and* dropped it from the shortfall report: a clean-looking Cmd+Z with the file
+  still in the OS trash. **A filter over a per-path outcome has to be recomputed by whatever
+  re-runs the operation.**
+- **The route had FIVE consumers, and two searches in a row undercounted them.** `CleanupAssetsDialog`
+  posts to `/api/delete-asset` directly, so no search for `deleteAssetFiles` finds it; `modelImport`'s
+  orphan-prune does too, behind a bare `.catch(() => {})` that read neither the status nor the body
+  — while logging `Pruned N orphan files` unconditionally and having already rewritten `generated`,
+  so a refused prune stranded a file nothing would ever retry. The rule this leaves: **when a
+  route's contract changes shape, enumerate its callers from the ROUTE (`grep` the url), not from
+  the wrapper** — and note that the first application of that rule still missed one, because the
+  fix commit said "fourth" when the answer was fifth.
+
+⚠️ **The toast's own reachability is the platform trap, not just its testability.** `describeRefusedDeletes` is driven by `failed`, so on macOS and Linux — where a refusal is a whole-batch
+throw — it produces nothing, and the human got a toast for a failed FOLDER delete and silence for a
+failed FILE delete. A `!ok` fallback covers it. Naming the paths is better; saying nothing is the
+defect.
+
+⚠️ **`failed` is populated on win32 only, and the platforms genuinely disagree.** darwin's
+`osascript` and Linux's `trash-put` are single invocations: a mid-list refusal throws as a whole,
+`parseTrashFailures` finds no marker, `moveToTrash` rethrows and the route 500s. So **an empty
+`failed` is not evidence that every path went — `ok` is**, and the partial row of the table above
+is unreachable outside Windows. That also means the toast cannot be driven from a Mac: the
+behaviour is pinned at the seam (`deleteAssetRouter.test.ts`, `assetUndo.test.ts`,
+`assetDeleteRenamePolicy.test.ts`) and end-to-end confirmation belongs to the `win` clone.
 
 ---
 
@@ -2046,7 +3038,7 @@ a future change picks, these do not change:
 distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
 loss, worth interrupting for whatever caused it.
 
-⚠️ **This was LATENT when fixed** — #308 closed the last live route (`SceneAssetView`'s
+⚠️ **This was LATENT when fixed** — #308 closed the last live route (the base-scene field's
 `mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
 on the stack" is the obvious-looking design the next change will reach for, and it did not work

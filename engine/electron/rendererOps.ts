@@ -17,6 +17,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pruneOldTempFiles } from '../plugins/backend/tempFiles';
+// Type-only, from the DOM-free `frameLoopStatus` LEAF rather than `frameDriver.ts` (same reason
+// `editorBackendRouter.ts` does — see that leaf's header): this file is compiled under
+// `tsconfig.node.json` (no DOM lib), and it's the SAME program `editorBackendRouter.ts`/
+// `agentBridge.ts` are reached through, so a member rename here must redden this branch on
+// `frameLoop.status` too, not just those two (#682 close-out round 3, BLOCKER 2).
+import type { FrameLoopStatus } from '../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
 const MAX_SIDE = 1568;
 const JPEG_QUALITY = 70;
@@ -73,7 +79,7 @@ export function fitToMaxSide(width: number, height: number, maxSide: number): { 
  *  successful capture). Shapes mirror `frameLoop` / `rendererGate` in
  *  `modoki_get_editor_state` — the same two liveness signals a human would go read by hand. */
 export interface RenderSurfaceFacts {
-  frameLoop?: { status?: string; refCount?: number; callbacks?: number; fps?: number; detail?: string } | null;
+  frameLoop?: { status?: FrameLoopStatus; refCount?: number; callbacks?: number; fps?: number; detail?: string } | null;
   rendererGate?: { status?: string; detail?: string } | null;
   /** GPU device loss / uncaptured errors (`activeRenderer.ts`'s `GpuFaultState`, mirrored here
    *  the same way `frameLoop`/`rendererGate` are). Checked BEFORE `frameLoop` below — a lost

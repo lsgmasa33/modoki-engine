@@ -43,7 +43,7 @@
  * Each of those still gets the loud synthetic banner, so the weaker mechanism is never quiet.
  */
 
-import { decodeAimReply, resolveAimViaDevice, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
+import { decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
 // TYPE-ONLY, and it must stay that way: `wdaLauncher` is loaded through a dynamic import below so
 // an iOS-free session never pays for it. A type import is erased, so this costs nothing at runtime.
 import type { LeaseHardware } from './wdaLauncher';
@@ -186,12 +186,22 @@ export async function getDeviceWdaSession(
     lease?: LeaseHardware;
   } = {},
 ): Promise<WdaSession | null> {
-  if (cached) return cached;
   const host = opts.host;
-  if (!host) return null;   // no WiFi lease target ⇒ nothing to reach (adb/USB leases are Android)
+  // No WiFi lease target ⇒ nothing to reach (adb/USB leases are Android). Dropping the cache here
+  // is the second half of #519: `host` goes undefined exactly when the lease moved to an Android
+  // device, so a session kept across that move would be handed to the next iOS call for a phone
+  // this machine no longer holds.
+  if (!host) { resetDeviceWdaSession(); return null; }
   const fetchImpl = opts.fetchImpl ?? (fetch as unknown as WdaFetch);
   const port = opts.port ?? resolveWdaPort();
   const baseUrl = `http://${host}:${port}`;
+  // A cache hit must still be a session for the DEVICE THE CALLER ASKED FOR (#519) — the lease can
+  // move (e.g. iPad → iPhone Air) between calls, and a stale `cached` would silently drive the WRONG
+  // PHONE. `deviceCdp.ts` needed the identical fix one device down (#142 `cachedPackage`, #149
+  // `cachedSerial`); this module simply never got it. No network teardown here — we've already lost
+  // the lease on the old device by the time we notice, so reaching for it would only hang.
+  if (cached && cached.baseUrl === baseUrl) return cached;
+  if (cached) resetDeviceWdaSession();
   // Lazy launch (Phase 2b, Decision 1) — only on the INPUT path. `device_status` passes
   // autoLaunch:false because a status READ must not start a multi-second agent as a side effect;
   // it reports what is true now, and the first tap is what pays the spin-up.
@@ -285,7 +295,7 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
       if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
       if (r.kind === 'refusal') return { handled: true, reply: r.error };
       await wdaTap(session, r.aim.x, r.aim.y);
-      return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_WDA_MECHANISM}]` };
+      return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_WDA_MECHANISM}]` };
     }
     // drag
     const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');

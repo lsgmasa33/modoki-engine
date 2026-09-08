@@ -43,10 +43,17 @@ export interface Rig2DFile {
   skinWeights?: number[];
 }
 
-/** A fresh, valid `.rig2d.json` document: one root bone, one empty v1 part. The shape the Skin
- *  editor's "+ New Rig2D" writes and the shape `create-asset {type:'rig2d'}` scaffolds — ONE
- *  definition, so the two cannot drift into disagreeing about what an empty rig is. `id` is
- *  assigned by the caller (the editor mints one; the create-asset route injects one). */
+/** A fresh, valid `.rig2d.json` document: one root bone, one empty v1 part. This is THE ONE
+ *  definition behind the Skin Editor's "+ New Rig2D" (`SkinEditor.newRig`), the Assets panel's
+ *  "Create 2D Rig" (`builtinCreatableAssets.ts`, via `defaultAssetData('rig2d')`), and the MCP
+ *  `create-asset {type:'rig2d'}` route — none of the three inline their own copy, so they cannot
+ *  drift into disagreeing about what an empty rig is. `id` is assigned by the caller (the editor
+ *  mints one; the create-asset route injects one).
+ *
+ *  ⚠️ Both editor entry points used to inline their own byte-identical literal under this exact
+ *  claim (#417) — the docstring asserted one definition while three existed, and no behavioural
+ *  test could tell shared from duplicated. `tests/editor/rig2dCreateParity.test.ts` pins both
+ *  editor call sites to this function; `tests/runtime/assetSchemas.test.ts` covers the MCP one. */
 export function defaultRig2DFile(): Rig2DFile {
   return {
     sprite: '',

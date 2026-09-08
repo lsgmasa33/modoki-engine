@@ -19,15 +19,19 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/runtime/loaders/assetManifest.ts');
 const src = readFileSync(SRC, 'utf-8');
+const strippedSrc = stripComments(src);
+assertScanIsSane(src, strippedSrc, SRC);
 
-/** Optional field names declared on an interface, comments stripped. */
+/** Optional field names declared on an interface, comments stripped (shared scanner,
+ *  @modoki/engine/testing, #419). */
 function declaredFields(iface: string): string[] {
-  const m = src.match(new RegExp(`export interface ${iface}\\s*\\{([\\s\\S]*?)\\n\\}`));
+  const m = strippedSrc.match(new RegExp(`export interface ${iface}\\s*\\{([\\s\\S]*?)\\n\\}`));
   expect(m, `${iface} not found in assetManifest.ts`).toBeTruthy();
-  const body = m![1].replace(/\/\*[\s\S]*?\*\//g, '');
+  const body = m![1];
   return [...new Set([...body.matchAll(/^\s*(\w+)\??:/gm)].map((x) => x[1]))];
 }
 

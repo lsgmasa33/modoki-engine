@@ -35,6 +35,8 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { hasOssOverlay } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
@@ -61,6 +63,17 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
   },
+  'engine/packages/capacitor-appsflyer/package.json': {
+    pin: '^5.9.3',
+    why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
+  },
+  'engine/packages/modoki/package.json': {
+    pin: '~6.0.3',
+    why: 'ON the root compiler, and a devDependency only — the `./testing` subpath\'s scanner asks '
+      + 'TypeScript to locate string literals (#419). Declared rather than left to hoisting '
+      + 'because an exports subpath is a public surface; nothing under `src/` imports it, so no '
+      + 'compiler reaches a shipped bundle',
+  },
   'engine/tools/modoki-mcp/package.json': {
     pin: '~6.0.3',
     why: 'ON the root compiler (#87); carries its own only because it is deliberately not a root workspace',
@@ -72,21 +85,17 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
 };
 
 /** Engine-owned manifests only: the root, plus everything under `engine/` that is not an
- *  installed dependency. `games/`/`demos/` are excluded on purpose (see KNOWN GAP above). */
+ *  installed dependency. `games/`/`demos/` are excluded on purpose (see KNOWN GAP above). Via
+ *  the shared corpus producer (#799/#771/#805 Phase 4); floored well under the 10 measured
+ *  under `engine/` today. */
 function engineOwnedManifests(): string[] {
-  const found: string[] = ['package.json'];
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue;
-      const abs = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(abs);
-      else if (entry.name === 'package.json') {
-        found.push(path.relative(repoRoot, abs).split(path.sep).join('/'));
-      }
-    }
-  };
-  walk(path.join(repoRoot, 'engine'));
-  return found;
+  const underEngine = repoFiles({
+    under: path.join(repoRoot, 'engine'),
+    match: /(^|\/)package\.json$/,
+    exclude: ['node_modules', 'dist'],
+    floor: 5,
+  }).map(({ rel }) => rel);
+  return ['package.json', ...underEngine];
 }
 
 function typescriptPin(rel: string): string | undefined {
@@ -173,7 +182,7 @@ describe('workflow node-version tracks the provisioned Node', () => {
       if (!fs.existsSync(abs)) continue;
       for (const name of fs.readdirSync(abs)) {
         if (!/\.ya?ml$/.test(name)) continue;
-        const src = fs.readFileSync(path.join(abs, name), 'utf8');
+        const src = readScannedSource(path.join(abs, name)).code;
         for (const m of src.matchAll(/^\s*node-version:\s*['"]?([0-9.]+)['"]?/gm)) {
           out.push({ file: `${dir}/${name}`, version: m[1] });
         }
@@ -185,7 +194,7 @@ describe('workflow node-version tracks the provisioned Node', () => {
   it('every workflow (private AND the oss/ overlay) pins the PINNED_NODE major', () => {
     // Read the pin from source rather than hard-coding 24 — a hard-coded copy is the same drift
     // this guard exists to catch, one level up.
-    const src = fs.readFileSync(path.join(repoRoot, 'engine/toolchain/nodeProvision.ts'), 'utf8');
+    const src = readScannedSource(path.join(repoRoot, 'engine/toolchain/nodeProvision.ts')).code;
     const pinned = src.match(/version:\s*'v(\d+)\./);
     expect(pinned, 'could not read PINNED_NODE.version from nodeProvision.ts').not.toBeNull();
     const major = pinned![1];
@@ -209,7 +218,10 @@ describe('workflow node-version tracks the provisioned Node', () => {
       if (!fs.existsSync(abs)) continue;
       for (const name of fs.readdirSync(abs)) {
         if (!/\.ya?ml$/.test(name)) continue;
-        if (fs.readFileSync(path.join(abs, name), 'utf8').includes('node-version:')) {
+        // ⚠️ Stripped: this is the NON-VACUITY check for the pin comparison above, and a bare
+        // `.includes` is satisfied by `# node-version: 20` in a comment — a workflow that had
+        // stopped pinning Node would still look covered (#812).
+        if (readScannedSource(path.join(abs, name)).code.includes('node-version:')) {
           filesWithNodeVersion.push(`${dir}/${name}`);
         }
       }

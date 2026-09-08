@@ -10,7 +10,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   getRunMode, setRunMode, isAdvancing, getPlayState,
 } from '../../src/runtime/core/playState';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../../src/editor/scene/playMode';
+import {
+  enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner, registerModeOwnerDisplaced,
+} from '../../src/editor/scene/playMode';
 
 afterEach(() => { setRunMode('playing', { advancing: true }); }); // restore the runtime default
 
@@ -89,5 +91,61 @@ describe('editor preview/scrub run-mode transitions', () => {
     setRunMode('playing', { advancing: true });
     exitPreviewMode('timeline');
     expect(getRunMode()).toBe('playing');
+  });
+
+  describe('displacement notification (#810)', () => {
+    it('tells the DISPLACED owner it lost the mode, exactly once, when a different owner enters', () => {
+      setRunMode('stopped');
+      let calls = 0;
+      const unregister = registerModeOwnerDisplaced('timeline', () => { calls += 1; });
+      enterPreviewMode(true, 'timeline');
+      expect(calls).toBe(0); // taking your OWN first mode is not a displacement
+      enterScrubMode('animation'); // displaces the Timeline
+      expect(calls).toBe(1);
+      unregister();
+    });
+
+    it('does NOT notify when the SAME owner re-enters (no displacement occurred)', () => {
+      setRunMode('stopped');
+      let calls = 0;
+      registerModeOwnerDisplaced('timeline', () => { calls += 1; });
+      enterScrubMode('timeline');
+      enterPreviewMode(true, 'timeline'); // same owner, scrub → preview
+      expect(calls).toBe(0);
+    });
+
+    it('a displacement callback that THROWS does not prevent the transition from completing', () => {
+      setRunMode('stopped');
+      enterPreviewMode(true, 'timeline');
+      registerModeOwnerDisplaced('timeline', () => { throw new Error('boom'); });
+      expect(() => enterScrubMode('animation')).not.toThrow();
+      expect(getRunMode()).toBe('scrub');
+      expect(getModeOwner()).toBe('animation');
+    });
+
+    it('ORDERING: a callback re-entering the review-L1 guard sees the NEW mode and declines (scrub displacer)', () => {
+      // ⚠️ Only for a SCRUB displacer. With a PREVIEW displacer `getRunMode()` reads 'preview',
+      // the guard PASSES and the transition is clobbered — the ordering is necessary, not
+      // sufficient. See `notifyDisplaced`'s doc in playMode.ts: what makes production safe is
+      // that no registered callback re-enters a mode transition at all.
+      setRunMode('stopped');
+      enterPreviewMode(true, 'timeline');
+      registerModeOwnerDisplaced('timeline', () => {
+        if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline'); // the guard from TimelineEditor's cleanup
+      });
+      enterScrubMode('animation');
+      expect(getRunMode()).toBe('scrub'); // NOT clobbered back to preview
+      expect(getModeOwner()).toBe('animation');
+    });
+
+    it('unregister stops future notifications', () => {
+      setRunMode('stopped');
+      let calls = 0;
+      const unregister = registerModeOwnerDisplaced('timeline', () => { calls += 1; });
+      unregister();
+      enterPreviewMode(true, 'timeline');
+      enterScrubMode('animation');
+      expect(calls).toBe(0);
+    });
   });
 });

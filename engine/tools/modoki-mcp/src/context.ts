@@ -35,6 +35,14 @@ export type ToolContext = {
   httpFailure: (what: string, status: number, body: unknown) => ToolResult;
   /** Raw call — parsed JSON (or text) + HTTP status. Prefer getJson/postJson. */
   call: (path: string, init?: RequestInit, timeoutMs?: number) => Promise<{ status: number; body: unknown }>;
+  /** True when `body` is the SPA's `index.html` rather than JSON — a missing `/api` route on the
+   *  dev server falls through and answers 200 with the app shell (V3). `getJson`/`postJson` apply
+   *  this for free; exposed (#648) for the rare raw-`call()` site that cannot use them (a §5 label
+   *  more specific than `getJson` hardcodes, or a shape guard that must not throw into `getJson`'s
+   *  own `transform`-then-catch) but still needs the same guard. */
+  htmlFallthrough: (body: unknown) => boolean;
+  /** The `NOT_AVAILABLE_HERE` envelope for a `htmlFallthrough` hit — see above. */
+  noSuchRoute: (path: string) => ToolResult;
   /** GET = "tell me this" → `ok` in the body may be the ANSWER (`diagnose`, `validate_scene`),
    *  so this deliberately does NOT run `isFailureBody` BY DEFAULT. See the C7 convention in
    *  `docs/debug-tools-mcp.md`; do not "fix" that by flipping the default.
@@ -195,6 +203,19 @@ export function createToolContext(config: { backend: string; token?: string }): 
       ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
       : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
     const code = codeFromBody(body, statusCode);
+    // Options the ROUTE named beat anything derived here, for the same reason `code` does: the
+    // route knows what its own refusal costs and what the caller's real exits are, and this
+    // function can only guess from a status. Without this a §5 refusal authored server-side —
+    // the park gate's "save first / discardUnsaved:true / read the parked value" (#872) — arrived
+    // with its `why` intact and its options silently dropped, which is the half that converts a
+    // dead end into the agent's next move.
+    const routeOptions = ((): string[] | undefined => {
+      if (!body || typeof body !== 'object') return undefined;
+      const o = (body as { options?: unknown }).options;
+      if (!Array.isArray(o)) return undefined;
+      const list = o.filter((x): x is string => typeof x === 'string' && !!x);
+      return list.length ? list : undefined;
+    })();
     return fail({
       code,
       what,
@@ -202,11 +223,13 @@ export function createToolContext(config: { backend: string; token?: string }): 
         ? `the backend refused with HTTP ${status}: ${detail}`
         : `the backend answered HTTP ${status} with no explanation.`,
       got: body,
-      ...(routeMissing
-        ? { options: ['the route is absent — this editor build may predate the tool; relaunch the editor from this checkout'] }
-        : status === 403
-          ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
-          : {}),
+      ...(routeOptions
+        ? { options: routeOptions }
+        : routeMissing
+          ? { options: ['the route is absent — this editor build may predate the tool; relaunch the editor from this checkout'] }
+          : status === 403
+            ? { options: ['the backend belongs to a DIFFERENT editor/project (C6) — call modoki_identity, then point MODOKI_BACKEND at your own editor'] }
+            : {}),
     });
   }
 
@@ -471,12 +494,32 @@ export function createToolContext(config: { backend: string; token?: string }): 
         }), so whether there is UNSAVED work is UNKNOWN — not known to be clean.`
       );
     }
-    const st = body as { unsavedChanges?: unknown; scenePath?: unknown };
+    const st = body as {
+      unsavedChanges?: unknown; scenePath?: unknown;
+      unsavedCauses?: { sceneDirty?: unknown; dirtyAssetPaths?: unknown; dirtyScenes?: unknown };
+    };
     if (st.unsavedChanges === false) return null; // answered, and clean
     if (st.unsavedChanges !== true) {
       return (
         `the editor answered /api/editor-state without an \`unsavedChanges\` boolean (got ` +
         `${JSON.stringify(st.unsavedChanges)}), so whether there is UNSAVED work is UNKNOWN.`
+      );
+    }
+    // #844: name the ACTUAL cause(s) — a fixed string blaming create_entity/duplicate_entity/
+    // prefab sent an agent hunting entities it never created when the real cause was a dirty
+    // asset (a Material slider drag parks one the same way, since #831). `unsavedCauses` is
+    // additive on `/api/editor-state` (agentEditorOps.ts's `readEditorState`), so an older/
+    // mismatched renderer simply omits it — fall back to the old generic wording rather than
+    // naming a cause list that isn't there.
+    const c = st.unsavedCauses;
+    const causes: string[] = [];
+    if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
+    if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
+    if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+    if (causes.length) {
+      return (
+        `the editor has UNSAVED work — ${causes.join(' AND ')} — and a build reads the scene FILE, ` +
+        `so the artifact would be missing it. Run modoki_save_all first.`
       );
     }
     return (
@@ -582,6 +625,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     backend: BACKEND,
     ok, fail, httpFailure, call, getJson, postJson, evalRenderer, editorAction,
     unsavedChangesWarning, consumeBuildStream, ensureIdentity, unreachable,
+    htmlFallthrough, noSuchRoute,
     getIdentityWarning: () => identityWarning,
   };
 }

@@ -53,6 +53,69 @@ git fetch origin && git merge origin/work-ai      # or origin/work-ai2, origin/w
 git fetch origin && git merge origin/main
 ```
 
+### Who resolves a conflict — the worker, before it pushes
+
+**A conflict belongs to whoever has the context.** Measured 2026-09-01 over the last 40 hub merges:
+**24 needed manual resolution**, and every one was resolved on `main` by the clone that wrote
+neither side. The top conflict sources were `.agent-memory/MEMORY.md` (10 — now generated, so this
+class is gone), `games/court/runtime/systems.ts` (6) and `engine/app/debug/agentBridge.ts` (3).
+
+The cause is drift: workers were running far behind main (`work-ai` 52 commits, `work-ai2` 25,
+`win` 475), so every worker's `npm run verify` was green against a stale engine, and the first time
+the two sides met was on `main` in front of the person least able to judge them.
+
+So the last step before a push is:
+
+```bash
+# From a worker clone, immediately before pushing:
+git fetch origin && git merge origin/main
+npm run verify          # ← NOT optional: see below
+git push origin <branch>
+```
+
+⚠️ **For a worker, merging main IS re-testing.** `CLAUDE.md`'s "merging is not re-testing" is about
+the HUB receiving work a worker already verified. It inverts here: pulling main in runs *your* tests
+against everyone else's engine changes for the first time, and that combination has never been
+tested by anyone. Merge at **push time** only — `/close-out` is already the push trigger, and five
+clones re-verifying on every main update is a real cost multiplier.
+
+⚠️ **Being fully current with main is NOT a precondition for pushing.** With six clones, main can
+move between your merge and your push. The hub merge is still there as the fallback, which makes a
+stale merge base harmless rather than a race nobody can win — do not loop trying to win it.
+
+Two things this also buys, beyond cheaper conflicts:
+- **A worker receives a privacy scrub instead of re-leaking around it.** A branch forked before a
+  scrub still carries the real value, and git presents it as the newer side; merging main in takes
+  the scrubbed version.
+- **It manufactures the fast-forwards** that let the hub skip `verify` (next section).
+
+### The hub skips `verify` on a fast-forward — but never `verify:publish`
+
+```bash
+# From the hub, before merging:
+git fetch origin
+git merge-base --is-ancestor HEAD origin/work-ai && echo "fast-forward — verify can be skipped"
+```
+
+A fast-forward means main's HEAD was already an ancestor of the branch tip, so the merged tree is
+**byte-identical** to the tree the worker verified at close-out — nothing of main's is new to the
+branch, so there is no untested combination and `verify` would re-test the same bytes.
+
+⚠️ **`npm run verify:publish` still runs EVERY time, fast-forward or not.** A worker never runs it,
+so the hub is the *only* place a private value (Apple Team ID, real device UDID, internal `gs://`
+bucket) is caught before it reaches a PUBLIC repo — twice a leak has ridden a worker branch this
+far. A fast-forward carries a leak exactly as happily as a merge commit. It scans the WORKING TREE,
+so it answers about what you are about to push, not about HEAD.
+
+Three bounds on the saving, so it is not oversold:
+- **Only the FIRST merge of a batch can be a fast-forward.** Once it lands, main has moved and the
+  next branch is behind again.
+- **It fires only because of the rule above.** With workers never merging main in, **0 of the last
+  9 hub merges were fast-forwards** — the skip would have applied zero times.
+- **A fast-forward proves the trees match, not that the tip was verified.** It cannot tell that a
+  commit was pushed *after* a green close-out. That is the worker's discipline, not something the
+  hub can check.
+
 ## The two concrete rules (everything else follows from these)
 
 Each clone is a fully independent repo that happens to share one machine. Nothing in git
@@ -120,6 +183,15 @@ source of truth every launch path reads — this table is checked against it by
 | `~/Projects/modoki-ai2` (work-ai2) | 5181 | 5175 | 9224 | `engine/scripts/launch-editor.sh games/3d-test` |
 | `~/Projects/modoki-ai3` (work-ai3) | 5182 | 5176 | 9225 | `engine/scripts/launch-editor.sh games/3d-test` |
 | `~/Projects/modoki-qa` (work-qa) | 5183 | 5177 | 9226 | `engine/scripts/launch-editor.sh games/3d-test` |
+
+⚠️ **A KNOWN clone reached by a second spelling used to land here too, which is a bug and not the
+deliberate part** (#881). `backendPortForClone` took `path.basename(path.resolve(root))` and looked
+it up case-SENSITIVELY, so `E:/Projects/MODOKI`, a `subst`ed drive, or a clone reached through a
+symlink or junction found no key, returned `null`, and fell into the auto-port path below —
+producing #349's symptom from a different cause, and producing it **silently**, since a clone
+legitimately absent from the table looks identical from here. It now canonicalises with
+`canonicalPath` and falls back to a `pathCaseKey` lookup; both halves are needed, because `.native`
+cannot normalise a directory that does not exist yet. See docs/windows.md § Paths.
 
 ⚠️ **A clone directory not in that table gets AUTO ports, not a pinned one** — deliberately. Any
 hardcoded fallback is correct on exactly one clone and silently wrong on the rest, which was the
@@ -207,6 +279,37 @@ every other clone at yours.**
   including when NOTHING holds it. Read-only calls stay allowed. The hook reaches only a Claude
   session's Bash tool in this repo, and **fails OPEN if its path breaks**, so it is a backstop for
   the discipline, not a replacement for it.
+  ⚠️ **"Is this claim mine?" is ONE comparison, `sameClone` — and it was four copies until #865.**
+  `foreignClaimFor`, `ownAdbClaim`, `claim-guard.mjs`'s `heldByThisClone` and `device.mjs`'s
+  WiFi-claim filter each hand-rolled it, in three different normalisations, and none of them
+  checked that the STORED path was rooted in a way `path.resolve` could finish without consulting
+  `process.cwd()`. On win32 `path.isAbsolute('/Projects/modoki')` is `true` and `resolve` re-roots
+  it onto the cwd's drive, so a stored `"."`, `""` or another platform's `/Projects/...` silently
+  became THIS clone. `foreignClaimFor` returns `null` for *"not foreign, it's mine"*, so that
+  failed **OPEN**: the clone proceeded against a phone a sibling held, and `claim-guard.mjs` — the
+  backstop — failed the same way at the same moment. **Polarity is now REFUSE** (owner,
+  2026-09-07): an unrecognisable stored path matches nothing. The accepted cost is that a corrupt
+  `~/.modoki/device-claims.json` can block this clone's own builds until it is deleted by hand.
+  ⚠️ **The second half of #865 is NOT Windows-only, and it fails the other way.** `device.mjs`
+  records `clone: repoRoot` with `findRepoRoot` **realpathing** it, while `vite-asset-scanner.ts`
+  calls `foreignClaimFor`/`ownAdbClaim` with no `clone` at all — so the own side was a bare
+  `process.cwd()`. Through a symlinked, junctioned or `subst`ed checkout the two spell one directory two ways
+  and the editor's build path refuses this clone its OWN phone. `canonicalClonePath` now carries
+  the realpath for every caller — via **`fs.realpathSync.native`**, which is load-bearing and not
+  a detail: see `docs/windows.md` § Paths, the JS walk resolves neither `subst` nor drive-letter
+  case. `claim-guard.mjs` had documented that reasoning and done the
+  realpath; the two it pointed at had not, which is the drift that got #865 filed.
+  ⚠️ **#865 left a residue, closed by #869: `sameClone` kept comparing with `===`.** The
+  canonicaliser was right and the COMPARATOR was not — `.native` throws for a path that does not
+  exist, so the fallback was bare `path.resolve`, which folds no case at all. **A stale claim
+  entry naming a deleted directory is precisely that case**, and it is the case this predicate is
+  most often asked about. It now compares through `samePath`
+  (`engine/scripts/pathIdentity.mjs`), the ONE "same directory?" implementation — which the repo
+  had hand-rolled **eight** times in four inconsistent recipes.
+  ⚠️ That residue had **no test**: a mutation check reverting the comparison stayed green,
+  because every existing case used a path that EXISTS, where `.native` already repairs the drive
+  letter. Pinned now. The lesson generalises — when a fix has a "…except when the path is
+  missing" clause, the test set almost certainly only covers paths that exist.
   Detail: [debug-tools-mcp.md](./debug-tools-mcp.md) § "Several phones attached".
 - **Several phones of the SAME platform? Say which one.** Every adb call on the device surface is
   now `-s <serial>`-targeted, resolved ONCE when the lease opens and reused by the CDP tunnel and

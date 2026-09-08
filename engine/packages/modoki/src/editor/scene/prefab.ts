@@ -2,7 +2,7 @@
 
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { backendFetch } from '../backend/editorBackend';
+import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -10,6 +10,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { isTraitDefault } from './traitDefault';
@@ -77,8 +78,16 @@ export interface PrefabEntity {
  *  never mentioned `version` at all, so a grep for the token could not find it.
  *
  *  Scenes are the precedent: `engine/scripts/migrate-legacy-scenes.mjs` pins one number and
- *  triggers on `(doc.version ?? 0) < 12`, never on what the document contains. */
-export const PREFAB_FORMAT_VERSION = 2;
+ *  triggers on `(doc.version ?? 0) < 12`, never on what the document contains.
+ *
+ *  v3: `UIAnchor.zIndex` removed (mirrors scene v13). Prefabs still have no migration LADDER
+ *  (nothing on the loading path inspects this field at all — see above), so the fix for the
+ *  data-loss window isn't version-gated either: `getPrefabSource` and `fetchPrefab`
+ *  (meshTemplateCache.ts) both run `migrateUIAnchorZIndexStructured` on every entity,
+ *  unconditionally, on every load — cheap and idempotent, so it costs nothing to apply to an
+ *  already-migrated (or v3-native) file. The version bump here only makes freshly-written
+ *  files honest about which serializer touched them, same as every bump before it. */
+export const PREFAB_FORMAT_VERSION = 3;
 
 export interface PrefabFile {
   /** Stable UUID — written once at save, never changes across renames/moves. */
@@ -86,10 +95,16 @@ export interface PrefabFile {
   /** The format version the file was WRITTEN by — {@link PREFAB_FORMAT_VERSION}, always, for
    *  anything this serializer produces. Not a capability floor and not content-derived.
    *
-   *  v1 and v2 share the same shape (the nested-instance fields are optional), so a v1 file
-   *  still loads unchanged and nothing on the loading path inspects this at all (#365). `1`
-   *  survives in the type for documents written before #379 that nobody has re-saved. */
-  version: 1 | 2;
+   *  v1, v2 and v3 all share the same shape (the nested-instance fields are optional, and v3
+   *  only drops a trait FIELD, not a structural shape), so an older file still loads unchanged
+   *  and nothing on the loading path inspects this at all (#365). Documents written before
+   *  #379/this change and never re-saved still carry a `1` or `2` on disk; they load fine, and
+   *  this field reports what wrote them, not what this build would write.
+   *
+   *  Widened from `1 | 2 | 3` to `number` (#784) — this is a read-back document (bytes may
+   *  come from a newer build than this one understands), and the literal union made
+   *  `existing.version` at a v4+ document lie about its own type (#734 precedent). */
+  version: number;
   name: string;
   rootLocalId: number;
   entities: PrefabEntity[];
@@ -436,13 +451,23 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     id: fresh.id ?? existing.id,
     // The merge output is written by THIS serializer, so it carries this serializer's version
     // rather than the older of the two inputs' (#379) — but never DOWNGRADES. `existing` is
-    // whatever is on disk, which the `1 | 2` type does not actually constrain: the day a v3
-    // ladder ships, re-importing a rigged model over a v3 file would otherwise stamp it `2`
-    // and invite the ladder to re-migrate a document it already migrated.
-    // ⚠️ Preserving the higher number is a floor, not a full answer — such a merge still
-    // writes v2-era semantics into a file labelled v3. Whoever adds a v3 owes this call site a
-    // real decision (most likely: refuse the merge loudly rather than guess).
-    version: Math.max(PREFAB_FORMAT_VERSION, existing.version) as 1 | 2,
+    // whatever is on disk, which the `1 | 2 | 3` type does not actually constrain: re-importing
+    // a rigged model over a file from an OLDER serializer would otherwise stamp it with that
+    // older number and invite a later migration to re-migrate a document already at the newer
+    // shape.
+    // v3 arrived in #762/#762-follow-up (UIAnchor.zIndex removed, folded into UIElement.zIndex)
+    // and it is safe to preserve-the-higher-number here: v3 only DROPS a trait field, it does
+    // not change the entity shape (see the v1/v2/v3 note on PREFAB_FORMAT_VERSION above), and
+    // every load path (getPrefabSource/fetchPrefab/instantiatePrefab) runs
+    // migrateUIAnchorZIndexStructured unconditionally on every entity regardless of the stamped
+    // version. So a v2-labelled-as-v3 merge here is never actually read as v2 semantics — the
+    // migration re-applies (idempotently) the next time anything loads it. A hypothetical v4
+    // that changes SHAPE (not just drops a field) would not get this same free pass and would
+    // need its own decision here.
+    // `preservedVersion()` (runtime/core/formatVersion.ts) is the shared form of this exact
+    // rule, but routing prefab through it needs a verdict computed first — that's #784 phase
+    // C3, not this change.
+    version: Math.max(PREFAB_FORMAT_VERSION, existing.version),
     name: fresh.name,
     rootLocalId: fresh.rootLocalId,
     entities: [...mergedSkeleton, ...mergedUser],
@@ -520,6 +545,18 @@ export function instantiatePrefab(
 
   // First pass: spawn each row.
   for (const pe of prefab.entities) {
+    // Migrate legacy UIAnchor.zIndex → UIElement.zIndex (SCENE_FORMAT_VERSION 12→13) — this
+    // row's raw traits bag may come from a RAW fetch that never ran through getPrefabSource
+    // (Assets.tsx/Hierarchy.tsx/Inspector.tsx's instantiate paths), so this is the one place
+    // all of them converge. Runs BEFORE the `pe.prefab` branch below (which `continue`s) —
+    // `overrides`/`added`/`nestedOverrides` exist ONLY on a nested-instance row (one that
+    // carries `pe.prefab`), so a call placed after that branch — as this one used to be —
+    // never actually reaches them; that row IS the case this migration exists to cover, since
+    // a legacy override bag setting `UIAnchor.zIndex` on a nested member has nowhere else to
+    // be caught. Structured (see uiAnchorZIndexMigration.ts) rather than a shape-agnostic deep
+    // walk — it knows the override-bag carrier policy differs from the trait-bag one.
+    migrateUIAnchorZIndexStructured(pe);
+
     if (pe.prefab) {
       // Nested-instance root: recursively expand the child prefab.
       const child = getCachedPrefabSync(pe.prefab);
@@ -666,6 +703,14 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
     const res = await fetch(url);
     if (!res.ok) return null;
     const prefab: PrefabFile = await res.json();
+    // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
+    // nothing on the loading path inspects (#365/#379). Applying the zIndex migration
+    // unconditionally here (cheap, idempotent) is the smallest thing that closes the same
+    // data-loss window a versioned migration closes for scenes — see uiAnchorZIndexMigration.ts.
+    // Structured walk — reaches overrides[localId][UIAnchor], added[] subtrees and
+    // nestedOverrides paths too (including this prefab FILE's own nested rows), not just
+    // entry.traits.
+    for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
     prefabCache.set(source, prefab);
     if (prefab.id) registerAsset(prefab.id, url, 'prefab');
     return prefab;
@@ -1576,12 +1621,9 @@ export async function writePrefabFile(source: string, prefab: PrefabFile): Promi
   // through resolveRef would trip its internal-path rejection.
   const path = isGuid(source) ? (resolveRef(source) || source) : source;
   registerAsset(prefab.id, path, 'prefab');
-  const content = JSON.stringify(prefab, null, 2);
+  const content = jsonFileBody(prefab);
   try {
-    const res = await backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content }),
-    });
+    const res = await postWriteFile(path, content);
     if (res.ok) {
       // Evict the runtime refcounted prefab cache so the NEXT scene load re-reads
       // the new file from disk. Without this, opening another scene that uses this

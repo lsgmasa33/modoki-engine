@@ -13,9 +13,11 @@
  *  exception (dev-only tooling, not gameplay input), not a silent pass. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
+import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = join(HERE, '../../../../..');
@@ -46,24 +48,26 @@ const ALLOW = new Set<string>([
   'engine/packages/modoki/src/runtime/debug/DebugMenu.tsx',
 ]);
 
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
+
+/** Read + strip a set of absolute file paths once, keeping raw alongside stripped so the
+ *  sanity check and the guards can both use it without re-reading/re-scanning. */
+function scanAll(files: string[]): { abs: string; rel: string; raw: string; code: string }[] {
+  return files.map((f) => {
+    const raw = readFileSync(f, 'utf8');
+    return { abs: f, rel: relative(REPO_ROOT, f).replace(/\\/g, '/'), raw, code: stripComments(raw) };
+  });
 }
 
 /** All .ts/.tsx (non-test) files under `dir`, skipping any path segment `skip`. */
 function tsFiles(dir: string, skip?: string): string[] {
-  const out: string[] = [];
-  if (!existsSync(dir)) return out;
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) {
-      if (skip && name === skip) continue;
-      out.push(...tsFiles(full, skip));
-    } else if (/\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name)) {
-      out.push(full);
-    }
-  }
-  return out;
+  if (!existsSync(dir)) return [];
+  return repoFiles({
+    under: dir,
+    match: (rel) => /\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel),
+    ...(skip ? { exclude: [skip] } : {}),
+    floor: 0,
+  }).map(({ abs }) => abs);
 }
 
 /** Engine runtime (minus the sanctioned `input/` sources). */
@@ -83,10 +87,19 @@ function gameFiles(): string[] {
 }
 
 describe('input source guard (Part A6)', () => {
+  const engine = scanAll(engineFiles());
+  const games = scanAll(gameFiles());
+
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    for (const f of [...engine, ...games]) assertScanIsSane(f.raw, f.code, f.rel);
+  });
+
   it('no raw DOM/gamepad input reads outside runtime/input/ sources', () => {
-    const offenders = [...engineFiles(), ...gameFiles()]
-      .filter((f) => FORBIDDEN.test(stripComments(readFileSync(f, 'utf8'))))
-      .map((f) => relative(REPO_ROOT, f).replace(/\\/g, '/'))
+    const offenders = [...engine, ...games]
+      .filter((f) => FORBIDDEN.test(f.code))
+      .map((f) => f.rel)
       .filter((rel) => !ALLOW.has(rel));
     expect(
       offenders,
@@ -95,13 +108,43 @@ describe('input source guard (Part A6)', () => {
   });
 
   it('no raw pointer/mouse/touch listeners in game runtimes (use the Input pointer source)', () => {
-    const offenders = gameFiles()
-      .filter((f) => FORBIDDEN_POINTER.test(stripComments(readFileSync(f, 'utf8'))))
-      .map((f) => relative(REPO_ROOT, f).replace(/\\/g, '/'))
+    const offenders = games
+      .filter((f) => FORBIDDEN_POINTER.test(f.code))
+      .map((f) => f.rel)
       .filter((rel) => !ALLOW.has(rel));
     expect(
       offenders,
       `read tap/drag from the Input resource (pointerPressed/pointerDown/pointerDrag/…) instead of adding raw pointer listeners:\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+
+  // ── (#866) Non-vacuity pins ────────────────────────────────────────────────────────────────
+  // Both guards above collect offenders and expect an EMPTY list, which is the shape that goes
+  // GREEN when the scan breaks rather than red. This file is one of #866's sites: it discards
+  // git's own `rel` (it maps the rows down to `abs` — see `engineFiles()` above) and rebuilds
+  // it with `relative(REPO_ROOT, …)`
+  // against a root derived from `import.meta.url`. Those two derivations coincide on macOS, so a
+  // Mac gate cannot see it — but drive-letter case, a `subst`ed or symlinked checkout, or an 8.3
+  // short path make them disagree, and then every `rel` is wrong, `ALLOW` matches nothing, and
+  // both guards pass having checked nothing at all. Only these two pins can tell that apart.
+  it('the scan is not vacuous — it reaches the engine runtime', () => {
+    expect(
+      engine.length,
+      'the engine runtime scan reached almost nothing — the enumeration is broken, not the repo clean',
+    ).toBeGreaterThan(100);
+  });
+
+  it('every ALLOW key names a file the scan actually reached — the allowlist is load-bearing', () => {
+    const scanned = new Set([...engine, ...games].map((f) => f.rel));
+    // A checkout with no `games/` (the public OSS snapshot) legitimately reaches no games file, so
+    // only the keys whose root was actually scanned are required to match.
+    const required = [...ALLOW].filter((k) => (k.startsWith('games/') ? games.length > 0 : true));
+    const unmatched = required.filter((k) => !scanned.has(k));
+    expect(
+      unmatched,
+      'These ALLOW entries match no scanned file. Either the path is stale, or the `rel` derivation '
+      + 'broke (#866) — in which case both guards above are now passing vacuously:\n'
+      + `${unmatched.join('\n')}`,
     ).toEqual([]);
   });
 

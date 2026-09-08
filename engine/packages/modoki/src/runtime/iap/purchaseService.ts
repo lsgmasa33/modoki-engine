@@ -38,7 +38,7 @@ import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { NoopStoreBackend, type StoreBackend } from './storeBackend';
 import { IapLedger, type IapLedgerStore } from './ledger';
 import { LocalVerifier, type PurchaseVerifier } from './verifier';
-import type { IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
+import type { IapGrant, IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
 
 /** Journal without requiring a world. `reconcile()` runs at boot, potentially before any scene has
  *  loaded, and a missing world must not turn recovery into a crash. */
@@ -58,12 +58,68 @@ function journal(type: string, payload?: unknown, level: 'info' | 'warn' | 'erro
   emit(type, payload, w, level);
 }
 
+/**
+ * Pull the STRUCTURED half out of a rejected native call — the half `String(e)` throws away.
+ *
+ * A store failure's `localizedDescription` is not a diagnosis. `"Request Canceled"` is the same
+ * sentence for a real user cancel, an `ASDErrorDomain`/`AMSErrorDomain` account or sandbox fault,
+ * and a network failure — which is exactly why the owner-reported failure in #499 could not be
+ * named without a device session. The native plugins carry the domain, code and underlying chain
+ * through Capacitor's reject payload; this is the reader for it.
+ *
+ * ⚠️ **The two fields live at DIFFERENT depths, and getting that wrong fails silently.**
+ * `call.reject(message, code, error, data)` does NOT flatten `data`: iOS wraps it as
+ * `["data": data]` (`PluginCallResult.swift`, `init(message:code:error:data:)`) and Android does
+ * `errorResult.put("data", data)` (`PluginCall.java`, the 4-arg `reject`). Only then does
+ * `native-bridge.js` copy the payload's TOP-LEVEL keys onto the rejected `Error`. So the wire shape
+ * is `{ message, errorMessage, code, data: { storeError } }` — `code` is an own property, and
+ * `storeError` is one level down. Reading it at the top level yields `undefined` on every call,
+ * with no error anywhere: the fix ships, the journal looks fine, and the diagnostic is silently
+ * absent. That is exactly the bug this function had when it was written, caught in review.
+ *
+ * Everything is optional by construction: an older native binary predating #499, the web stub, the
+ * mock backend, and any throw from outside the bridge carry neither field and must journal cleanly.
+ */
+/**
+ * Journal a store rejection at `warn`, WITH its classification.
+ *
+ * ⚠️ Exists because a structured reject payload that nothing reads is a producer with no consumer —
+ * this repo's most-repeated defect, and one #499 walked straight back into: the native plugins were
+ * taught to classify `consume`/`acknowledge`/`finish` failures, and every one of these call sites
+ * went on journalling `String(e)`, so a `billing.6` arrived and was thrown away one line short of
+ * the log. Adding a field is not the same as wiring it — route every store rejection through here,
+ * and there is a test asserting these sites carry `code`.
+ */
+function journalStoreFailure(
+  type: string,
+  payload: Record<string, unknown>,
+  e: unknown,
+  level: 'warn' | 'error' = 'warn',
+): void {
+  const d = describeStoreError(e);
+  journal(type, { ...payload, error: d.message, code: d.code, detail: d.detail }, level);
+}
+
+export function describeStoreError(e: unknown): { message: string; code?: string; detail?: unknown } {
+  const message = String(e);
+  if (typeof e !== 'object' || e === null) return { message };
+  const r = e as { code?: unknown; data?: { storeError?: unknown } };
+  const detail = typeof r.data === 'object' && r.data !== null ? r.data.storeError : undefined;
+  return {
+    message,
+    ...(typeof r.code === 'string' && r.code !== '' ? { code: r.code } : {}),
+    ...(detail !== undefined ? { detail } : {}),
+  };
+}
+
 interface IapConfig {
   backend: StoreBackend;
   ledger: IapLedger;
   verifier: PurchaseVerifier;
   /** productId → catalog entry. Authored data, supplied by the game (see `types.ts`). */
   catalog: Map<string, IapProduct>;
+  /** The game's own durable write, run BEFORE the finish. See `ConfigureIapOptions.onGrant`. */
+  onGrant: ((grant: IapGrant) => Promise<boolean> | boolean) | null;
 }
 
 let cfg: IapConfig | null = null;
@@ -88,6 +144,18 @@ let entitled = new Set<string>();
  *
  * Idempotency in the LEDGER is not enough because the destructive step is in the STORE. This set
  * is the missing mutual exclusion: one settle per transaction id at a time.
+ *
+ * ⚠️ **`settling.delete()` in `settle()`'s `finally` is deliberately UNGUARDED — do not add a
+ * `stillActive`-style generation check there.** `resetIap()` clears `cfg` and `entitled` but
+ * deliberately does NOT clear `settling` (see its comment), precisely so that if a settle for the
+ * same transaction id starts again in the next session, `settle()`'s in-flight check at the top
+ * still sees it as busy and the stale `finally` releasing it later is CORRECT — not a leak. Adding
+ * a generation guard here would make the stale `finally` a no-op and leave the marker stuck,
+ * permanently blocking that transaction id from ever settling again. Court's `storeInFlight` is the
+ * mirror image and needs the OPPOSITE fix: `resetStoreUi` DOES clear its set on teardown, so a
+ * next-session entry can be added right after, and only a generation check stops the stale
+ * `finally` from deleting the NEW entry. Same shape, opposite requirement — because one of the two
+ * teardown functions clears its set and the other doesn't; check that before applying either fix.
  */
 const settling = new Set<string>();
 
@@ -100,6 +168,35 @@ export interface ConfigureIapOptions {
   products: readonly IapProduct[];
   /** Defaults to `LocalVerifier` (the platform already verified — see `verifier.ts`). */
   verifier?: PurchaseVerifier;
+  /**
+   * The game's own durable write, run **after** the ledger grant is durable and **before** the
+   * finish. Return true once the game's state is safely stored; false (or throw) to withhold the
+   * finish.
+   *
+   * ── Why this exists ────────────────────────────────────────────────────────
+   * Invariant 1 says "grant durably, THEN finish", and without this hook it only holds for the
+   * ENGINE's ledger. A game whose truth lives elsewhere — a coin wallet, an entitlement flag —
+   * would necessarily write it *after* `finish()` had already told the store to stop re-delivering,
+   * so a crash in that window loses the purchase with no recovery. That is invariant 1's own
+   * failure mode, reintroduced one layer out by wiring rather than by logic.
+   *
+   * `games/iap-test` never needed it because the fixture holds no game-side state at all: it reads
+   * `iapBalanceOf()` straight off the ledger, so for it the ledger genuinely IS the truth. Court is
+   * the first caller for which it is not (#371).
+   *
+   * ⚠️ **It MUST be idempotent, keyed by `IapGrant.transactionId`.** It runs once per settle pass
+   * until a finish lands — on the fresh purchase AND on every re-delivery — because it also runs on
+   * the already-granted path. That is deliberate: were it skipped there, a crash between the ledger
+   * write and the game's write would be unrecoverable, since the re-delivery would find the ledger
+   * already processed and go straight to the finish, applying nothing, forever.
+   *
+   * ⚠️ **Returning false is the SAFE outcome, not an error path.** The transaction stays unfinished,
+   * the store re-delivers next launch, and nothing is lost — the same trade `confirmDurable` already
+   * makes. A hook that cannot confirm its write must say so rather than let the finish proceed.
+   *
+   * Omitted by default, so every existing caller is unchanged.
+   */
+  onGrant?: (grant: IapGrant) => Promise<boolean> | boolean;
 }
 
 /** Wire the subsystem up. Called once per game load by L3 composition. */
@@ -109,6 +206,7 @@ export function configureIap(opts: ConfigureIapOptions): void {
     ledger: new IapLedger(opts.store),
     verifier: opts.verifier ?? new LocalVerifier(),
     catalog: new Map(opts.products.map((p) => [p.id, p])),
+    onGrant: opts.onGrant ?? null,
   };
   entitled = new Set();
 }
@@ -123,7 +221,7 @@ export function resetIap(): void {
   } catch (e) {
     // Teardown must not throw: it runs from `unregisterGameSystems()`, and a failure here would
     // abort the swap and leave the NEXT game half-registered.
-    journal('iap.dispose-failed', { error: String(e) }, 'warn');
+    journalStoreFailure('iap.dispose-failed', {}, e);
   }
   cfg = null;
   entitled = new Set();
@@ -205,8 +303,13 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * Is the config this settle STARTED with still the active one?
  *
  * ⚠️ A settle spans awaits that can last minutes — the platform sheet, Face ID, a parent approving
- * Ask-to-Buy. `resetIap()` can run in that window (a game swap: the editor's Open Project, or an
- * OTA sub-game module), and `settleInner` holds the OLD config in a closure. Its ledger store
+ * Ask-to-Buy. `resetIap()` can run in that window — a live in-process game swap: an OTA sub-game
+ * switch, or hash navigation between two baked games. Both re-enter `GameShell`'s `[gameId]` boot
+ * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) at `App.tsx:301` and re-inits
+ * PlayerPrefs at `:290`. ⚠️ NOT the editor's File → Open Project, which this comment used to cite:
+ * Electron's `setProject` ends in `webContents.reloadIgnoringCache()` and the web-served editor has
+ * no in-process project switch at all, so neither editor surface reaches this window (#421).
+ * `settleInner` holds the OLD config in a closure. Its ledger store
  * closes over a PlayerPrefs KEY, not a namespace snapshot, and `PlayerPrefs.init()` re-namespaces a
  * module-level global for the incoming game — so a late write would land in the NEXT game's
  * namespace and clobber its ledger with this game's grant.
@@ -214,6 +317,12 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * Aborting is safe precisely because of invariant 1: nothing has been granted or finished at either
  * check, so the transaction stays unfinished and the next launch recovers it normally. Losing a
  * settle to a game swap costs one relaunch; writing into another game's save data does not undo.
+ *
+ * ⚠️ This applies to `entitled` too, not just the ledger (#434) — `refreshEntitlements()` and the
+ * post-`finish()` `entitled.add()` both write module state after an await, and `entitled` is
+ * REASSIGNED rather than mutated across a swap, so a late write there lands in the INCOMING game's
+ * live Set. The rule is general: check `stillActive(c)` immediately before every write to module
+ * state that follows an await capable of outliving the session — not only before the await.
  */
 function stillActive(c: IapConfig): boolean {
   return cfg === c;
@@ -257,7 +366,7 @@ async function settleInner(
       c.ledger.markFinished(tx.transactionId);
       void c.ledger.flush();
     } catch (e) {
-      journal('iap.finish-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+      journalStoreFailure('iap.finish-failed', { transactionId: tx.transactionId }, e);
     }
     return { outcome: 'failed', productId: tx.productId, transactionId: tx.transactionId, error: 'revoked' };
   }
@@ -276,7 +385,7 @@ async function settleInner(
     await c.backend.acknowledge(tx);
   } catch (e) {
     // Non-fatal: the grant is what matters, and the next launch re-delivers and retries this.
-    journal('iap.acknowledge-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+    journalStoreFailure('iap.acknowledge-failed', { transactionId: tx.transactionId }, e);
   }
 
   const product = c.catalog.get(tx.productId);
@@ -312,6 +421,14 @@ async function settleInner(
     c.ledger.recordGrant(tx.transactionId, tx.productId, units);
     await c.ledger.flush();
 
+    // ⚠️ `confirmDurable` reads back through `PlayerPrefs`, which is namespaced to whatever game is
+    // live NOW — not to the one this settle started in. A swap inside the `flush()` above would
+    // make that read-back miss a write the backend actually took, and the path would then journal
+    // `iap.durability-unconfirmed` at ERROR level, blaming storage quota or native I/O for a fault
+    // that is really a torn-down session (#487 item 3). The money outcome is the same either way —
+    // both decline to finish — but only one of them is true. Ask the question before reading.
+    if (!stillActive(c)) return tornDown(tx, source);
+
     // INVARIANT 1's guard. If the write did not survive the round trip, stop here — the transaction
     // stays unfinished and the store hands it back next launch. Finishing now is the one action
     // that could not be undone.
@@ -329,9 +446,60 @@ async function settleInner(
     journal('iap.duplicate', { productId: tx.productId, transactionId: tx.transactionId, source });
   }
 
+  // ── The game's own durable write, BEFORE the consume (#371) ────────────────────────────────
+  //
+  // Invariant 1 for the GAME's state rather than the ledger's. Owner, 2026-08-29: *"the flow should
+  // be purchase start, callback, increment the balance / change flag, save them, then consume the
+  // purchase. the consume must be called last."*
+  //
+  // ⚠️ **Deliberately OUTSIDE the `if (!alreadyGranted)` block above.** On the already-granted path
+  // the ledger has recorded this transaction but the game may not have — that is exactly the crash
+  // this re-delivery exists to repair. Skipping the hook there would let the finish land with the
+  // game's state never written, unrecoverably, since the store never re-delivers a finished
+  // transaction. The cost is that the hook sees repeats, which is why its contract demands
+  // idempotency by transaction id.
+
+  // Last point before the hook writes persistent storage — see `stillActive`. Without this, the
+  // `alreadyGranted` path has NO check between the catalog lookup and the hook, so a config swap
+  // (resetIap()+PlayerPrefs.init() — an OTA sub-game switch or hash navigation between baked games,
+  // NOT the editor's Open Project; see `stillActive`'s own doc) landing mid-`await` lets the hook
+  // write into ANOTHER game's PlayerPrefs namespace — not merely a wasted call.
+  if (!stillActive(c)) return tornDown(tx, source);
+
+  if (c.onGrant) {
+    let applied: boolean;
+    try {
+      applied = await c.onGrant({
+        transactionId: tx.transactionId,
+        productId: tx.productId,
+        // `product` is the outer binding — non-null by construction, since the unknown-product
+        // branch returned long before here. Reused rather than re-fetched so the hook and the
+        // ledger cannot disagree about which catalog entry this transaction is.
+        product,
+        units: product.kind === 'consumable' ? (product.grant ?? 1) : 0,
+      });
+    } catch (e) {
+      // A throwing hook is treated exactly as a refusal, never as a reason to finish anyway. The
+      // game failing to store its half is the one case where finishing destroys the purchase.
+      journal('iap.grant-hook-threw', { productId: tx.productId, transactionId: tx.transactionId, error: String(e) }, 'error');
+      applied = false;
+    }
+    if (!applied) {
+      journal('iap.grant-hook-refused', { productId: tx.productId, transactionId: tx.transactionId, source }, 'error');
+      return {
+        outcome: 'failed', productId: tx.productId, transactionId: tx.transactionId,
+        error: 'the game did not confirm its grant; the transaction stays unfinished and recovers next launch',
+      };
+    }
+  }
+
   // The destructive step, and the other side of `stillActive`: finishing against a torn-down
   // session would tell the store to stop re-delivering a purchase whose grant may have gone into
   // the wrong namespace. Leave it open instead.
+  //
+  // ⚠️ Checked AFTER the hook, not only before it: `onGrant` awaits the game's own flush, which is
+  // another window a game swap can land in. The hook's write went to the OLD game's namespace and
+  // finishing here would tell the store to forget a purchase the incoming game will never see.
   if (!stillActive(c)) return tornDown(tx, source);
 
   try {
@@ -343,10 +511,19 @@ async function settleInner(
     journal('iap.finished', { productId: tx.productId, transactionId: tx.transactionId });
   } catch (e) {
     // Granted but not finished — the safe side of the window. Next launch re-delivers and retries.
-    journal('iap.finish-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+    journalStoreFailure('iap.finish-failed', { transactionId: tx.transactionId }, e);
   }
 
-  if (product.kind !== 'consumable') entitled.add(tx.productId);
+  // Re-checked here, not just before `finish()` above: `.add()` below DOES mutate whatever Set
+  // `entitled` currently names — but `configureIap`/`resetIap` REASSIGN (never mutate) that binding
+  // on a swap, so `stillActive(c)` is what tells the two cases apart. Still active means no swap
+  // landed during the `finish()` await, so `entitled` still names THIS session's own Set and the
+  // mutation is safe; not active means a swap already reassigned `entitled` to the INCOMING game's
+  // live Set, and `stillActive(c)` skips the write rather than mutating an orphan. Dropping the
+  // write in that case is safe: `entitled` is rebuilt wholesale from the store on the next
+  // `refreshEntitlements()`, so nothing durable is lost, only a cache entry this session no longer
+  // owns.
+  if (product.kind !== 'consumable' && stillActive(c)) entitled.add(tx.productId);
 
   return {
     outcome: alreadyGranted ? 'already-owned' : 'granted',
@@ -369,8 +546,12 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
   try {
     tx = await c.backend.purchase(productId);
   } catch (e) {
-    journal('iap.purchase.failed', { productId, error: String(e) }, 'error');
-    return { outcome: 'failed', productId, error: String(e) };
+    const d = describeStoreError(e);
+    journal('iap.purchase.failed', { productId, error: d.message, code: d.code, detail: d.detail }, 'error');
+    // The code rides along in the string because `PurchaseResult.error` is the only channel that
+    // reaches a caller, and it is documented as log-only — so a game's own failure reporting can
+    // name the store's classification without the engine growing a field nobody reads.
+    return { outcome: 'failed', productId, error: d.code ? `${d.message} [${d.code}]` : d.message };
   }
 
   if (!tx) {
@@ -389,14 +570,31 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
 export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
   const c = activeCfg();
   if (!c) return entitled;
+  // Snapshot BEFORE the await — see the catch branch below. `entitled` is REASSIGNED, not mutated,
+  // by `configureIap`/`resetIap`, so this binding stays this session's own Set even after the
+  // module has moved on to the next game's.
+  const startedWith = entitled;
   try {
     const active = await c.backend.entitlements();
-    entitled = new Set(active.map((t) => t.productId));
+    // `entitled` is REASSIGNED (not mutated) by `configureIap`/`resetIap`, so a game swap landing
+    // during this await leaves this closure holding the OLD session while the module has already
+    // moved on to the next game's live Set. Publishing here would replace that Set wholesale with
+    // this game's entitlements. `stillActive` already exists for exactly this window (see its doc);
+    // return the locally-computed set — the truthful answer for THIS caller — without touching the
+    // module state that now belongs to another game.
+    const freshlyRead = new Set(active.map((t) => t.productId));
+    if (!stillActive(c)) return freshlyRead;
+    entitled = freshlyRead;
     journal('iap.entitlements', { productIds: [...entitled] });
   } catch (e) {
     // Keep the previous set rather than revoking on a transient read failure — briefly stale beats
-    // wrongly locking a paying player out of what they bought.
-    journal('iap.entitlements-failed', { error: String(e) }, 'warn');
+    // wrongly locking a paying player out of what they bought. But if a game swap landed in the
+    // `await` above, "the previous set" must mean THIS session's own `startedWith`, not the module
+    // global — by the time the catch runs, `entitled` may already be the INCOMING game's live Set,
+    // and handing that back to the outgoing caller by reference (#434's failure shape, on the
+    // failure half this time) would let it read another game's entitlements as its own.
+    journalStoreFailure('iap.entitlements-failed', {}, e);
+    if (!stillActive(c)) return startedWith;
   }
   return entitled;
 }
@@ -419,7 +617,7 @@ export async function reconcile(): Promise<PurchaseResult[]> {
   try {
     pending = await c.backend.unfinished();
   } catch (e) {
-    journal('iap.reconcile-failed', { error: String(e) }, 'error');
+    journalStoreFailure('iap.reconcile-failed', {}, e, 'error');
     return [];
   }
 
@@ -440,7 +638,34 @@ export async function reconcile(): Promise<PurchaseResult[]> {
  */
 export async function restorePurchases(): Promise<PurchaseResult[]> {
   journal('iap.restore.started');
+  // ⚠️ `cfg` directly, NOT `activeCfg()`. That accessor journals `iap.not-configured` as a side
+  // effect, and `reconcile()` calls it a line later — so going through it here emits the same
+  // warning twice on the documented boot-race path. Worse, it would make the guard below a
+  // skip-gate computed from the very thing it guards: with no config it is `null`, the
+  // `c && …` short-circuits, and the swap check silently switches itself off.
+  const c = cfg;
   const results = await reconcile();
+  // ⚠️ `entitled` is REASSIGNED by `configureIap`/`resetIap`, and `reconcile()` spans a purchase
+  // settle — the platform sheet, Face ID, Ask-to-Buy — so it can outlive the session. Reading it
+  // blind would journal the INCOMING game's entitlements as this restore's result (#487 item 4).
+  //
+  // ⚠️ A capture-before is NOT the fix here, unlike in `refreshEntitlements`: `reconcile()` calls
+  // `refreshEntitlements()`, which REPLACES `entitled` on its happy path, so a pre-await snapshot
+  // would report the set from BEFORE the restore — the one number this trace exists to not report.
+  // And by the time a swap has happened, this session's own refreshed Set has already been dropped
+  // on the floor; there is no truthful set left to name. So say THAT, which is the more useful
+  // diagnostic anyway: a restore that reports nothing because it was torn down is a different
+  // event from one that reports nothing because the player owns nothing.
+  if (!c) {
+    // Never configured — `reconcile()` already warned and did nothing. Not the same event as a
+    // teardown, and it must not be reported as one.
+    journal('iap.restore.finished', { recovered: 0, notConfigured: true }, 'warn');
+    return results;
+  }
+  if (!stillActive(c)) {
+    journal('iap.restore.finished', { recovered: results.length, tornDown: true }, 'warn');
+    return results;
+  }
   journal('iap.restore.finished', { recovered: results.length, entitlements: [...entitled] });
   return results;
 }

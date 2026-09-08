@@ -437,16 +437,33 @@ describe('buildEntityTree', () => {
     expect(buildEntityTree([])).toEqual([]);
   });
 
-  it('sorts by sortOrder then by id', async () => {
+  it('sorts by sortOrder, then guid, then name (NOT ecs id)', async () => {
     const { buildEntityTree } = await getUtils();
+    // Same sortOrder, no guid: the tiebreak falls through to NAME. id order (1,2,3) and
+    // name order ('A','B','C') would agree if named the old way, so name each entity the
+    // OPPOSITE of its id — only a real name-based sort produces the expected order.
     const entities = [
-      { id: 3, name: 'C', traits: [], parentId: 0, sortOrder: 0 },
-      { id: 1, name: 'A', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 1, name: 'C', traits: [], parentId: 0, sortOrder: 0 },
       { id: 2, name: 'B', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 3, name: 'A', traits: [], parentId: 0, sortOrder: 0 },
     ];
 
     const tree = buildEntityTree(entities as any);
-    expect(tree.map(e => e.id)).toEqual([1, 2, 3]);
+    expect(tree.map(e => e.id)).toEqual([3, 2, 1]);
+  });
+
+  it('sorts by guid before name when both are present and disagree', async () => {
+    const { buildEntityTree } = await getUtils();
+    // Same sortOrder, distinct guids that sort in the OPPOSITE order of both id and name —
+    // guid must win over the name fallback.
+    const entities = [
+      { id: 1, name: 'A', guid: 'guid-c', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 2, name: 'B', guid: 'guid-b', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 3, name: 'C', guid: 'guid-a', traits: [], parentId: 0, sortOrder: 0 },
+    ];
+
+    const tree = buildEntityTree(entities as any);
+    expect(tree.map(e => e.id)).toEqual([3, 2, 1]);
   });
 });
 
@@ -676,6 +693,16 @@ describe('getTrait / setTrait (typed, direct component access)', () => {
   it('setTrait no-ops on a missing entity / absent trait', async () => {
     const { setTrait } = await getUtils();
     expect(() => setTrait(99999, Transform, { x: 1 })).not.toThrow();
+  });
+
+  it('setTrait ignores an explicitly-undefined key, keeping the prior value (koota tests `in`, not definedness)', async () => {
+    const { setTrait, getTrait } = await getUtils();
+    const entity = testWorld.spawn(Transform({ x: 5, y: 2, z: 9 }), EntityAttributes({ name: 'A' }));
+    entityIndex.set(entity.id(), entity);
+    setTrait(entity.id(), Transform, { x: 42, y: undefined } as Partial<{ x: number; y: number }>);
+    const t = getTrait(entity.id(), Transform)!;
+    expect(t.x).toBe(42);   // real key still written
+    expect(t.y).toBe(2);    // undefined key must NOT overwrite the prior value
   });
 });
 

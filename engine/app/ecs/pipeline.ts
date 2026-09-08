@@ -4,7 +4,7 @@
 import {
   registerSystem, runPipeline as modokiRunPipeline,
   timeSystem, uiTreeProjection, entriesSystem, installEntryPrefabProvider, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
-  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
+  physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, pollUIBusyContinuity, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
   videoSystem, setVideoUrlResolver, resolveVideoUrl,
   setVideoSourceResolver, setVideoDownloader, resolveVideoSource,
   VideoCache, CacheApiBackend, hasCacheStorage, setActiveVideoCache,
@@ -42,6 +42,9 @@ registerSystem('rotate3D', rotate3DSystem, SYSTEM_PRIORITY.GAME);
 // after inputSystem (INPUT tier) has this frame's edges. App-pipeline only — the
 // activation itself is drained by UIRenderer outside the tick (applyBindings F10).
 registerSystem('uiFocus', uiFocusSystem, SYSTEM_PRIORITY.GAME);
+// Polls #530's UI-busy predicates every frame so the input lock's stuck-busy valve observes
+// continuity directly instead of inferring it between discrete activations (#551).
+registerSystem('uiBusyPoll', pollUIBusyContinuity, SYSTEM_PRIORITY.GAME);
 // Haptics settings → service. Copies two booleans; never plays anything (a haptic on a per-frame
 // path buzzes forever — moments fire from state transitions). INPUT tier so the gates are current
 // before this frame's gestures can raise a moment.

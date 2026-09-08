@@ -14,7 +14,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { deriveSettingsForType, type TextureImportSettings } from '../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
-import { writeMetaOrWarn } from './assetViews/widgets';
+import { flushPendingMetaFor, writeMetaWholesale } from '../scene/pendingMeta';
 
 /** Sets a texture's type to `2d` and re-imports it so it gets a whole-image
  *  sprite. Resolves `true` on success; the caller (SpritePicker) is responsible
@@ -30,9 +30,20 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // `textureCache` with it. This is a `return false`, not a best-effort continue.
   //
   // Requiring `res.ok` costs nothing, because the route is explicit about every failure
-  // (F10): bad path 400, outside-root 403, missing asset 404 — so an ok response carrying
-  // `{}` unambiguously means "this asset exists and simply has no sidecar yet", which is a
-  // safe thing to spread.
+  // (F10): bad path 400, outside-root 403, missing asset 404.
+  //
+  // ⚠️ But an ok response carrying `{}` does NOT unambiguously mean "no sidecar yet" — this
+  // comment claimed that and was wrong. `readMetaSidecar` also returns `{}` for a sidecar that
+  // exists and does not PARSE (merge-conflict markers, #778), so this function can still reach
+  // the write below with no `id` in hand. What makes that survivable is downstream, not here:
+  // `writeMetaSidecar` salvages the `id` textually out of the damaged bytes before quarantining
+  // them, so the identity is restored even though the payload posted from here lacks it. Do not
+  // re-derive a "safe to spread" argument from the status code alone.
+  // #845: a still-parked Inspector settings edit for this path has not reached disk yet. Flush it
+  // first, or this read-modify-write would build its merge on the PRE-edit doc, silently discard
+  // the parked edit from what gets written below, and leave the (now stale) parked entry to
+  // overwrite this function's own write at the next Cmd+S.
+  await flushPendingMetaFor(path);
   const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`).catch(() => null);
   if (!metaRes || !metaRes.ok) {
     console.error(`[SpritePicker] could not read the meta for ${path} (${metaRes ? metaRes.status : 'network error'}) — not converting, because overwriting the sidecar from a failed read would discard its GUID.`);
@@ -59,8 +70,10 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // the button a no-op that claims to have converted something.
   const prior = (meta as { texture?: Partial<TextureImportSettings> }).texture ?? {};
   const { format: _format, mipmaps: _mipmaps, wrapS: _wrapS, wrapT: _wrapT, ...carried } = prior;
-  const updatedMeta = { ...meta, version: 2, type: '2d', texture: deriveSettingsForType('2d', carried) };
-  const wrote = await writeMetaOrWarn(path, updatedMeta);
+  const updatedMeta = { ...meta, type: '2d', texture: deriveSettingsForType('2d', carried) };
+  // #874: writeMetaWholesale IS the write plus the forget-on-success — see its docblock for why
+  // that pairing lives in one function rather than at each of the three call sites.
+  const wrote = await writeMetaWholesale(path, updatedMeta);
   if (!wrote) return false;
 
   const res = await backendFetch('/api/reimport', {

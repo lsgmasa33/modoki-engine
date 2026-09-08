@@ -39,6 +39,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
+import { buildZip } from './ota/zip.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pluginDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-game-debug');
@@ -96,18 +97,74 @@ function run(name, cmd, args, opts = {}) {
 // summary can name every leg that exists, including the ones this machine could not run.
 const otaDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-ota');
 
-/** `swift test` legs: a package path that must carry its own Package.swift. */
+// The ios/ota-core leg's OtaZipTests.swift cross-checks OtaZip against a REAL zip built by the
+// Node writer (engine/scripts/ota/zip.mjs) — that fixture used to be a hand-typed /tmp file
+// nothing ever created, so the test silently XCTSkip'd forever (#565). Build it here and hand it
+// to the leg via env rather than checking in a binary .zip.
+let otaZipFixturePath = null;
+let otaZipFixtureError = null;
+try {
+  const entries = [
+    { path: 'index.html', data: Buffer.from('<html>hi</html>', 'utf8') },
+    { path: 'assets/app.js', data: Buffer.from('console.log(1)'.repeat(50), 'utf8') },
+    { path: 'assets/tiny.txt', data: Buffer.from('x', 'utf8') },
+    { path: 'empty.txt', data: Buffer.alloc(0) },
+  ];
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-zip-fixture-'));
+  otaZipFixturePath = path.join(fixtureDir, 'ota-test.zip');
+  fs.writeFileSync(otaZipFixturePath, buildZip(entries));
+} catch (e) {
+  // NOT environmental — this machine is fully capable of producing the fixture, so a failure
+  // here is a FAIL for the leg that needs it, not a SKIP.
+  otaZipFixtureError = e.message;
+}
+
+/** `swift test` legs: a package path that must carry its own Package.swift. Each leg may declare
+ *  `env(fixturePath)` to pass leg-specific environment — a row, not a special case in the loop. */
 const SWIFT_LEGS = [
   { name: 'ios/lease-parity', packagePath: path.join(pluginDir, 'ios', 'Tests') },
-  { name: 'ios/ota-core', packagePath: path.join(otaDir, 'core') },
+  {
+    name: 'ios/ota-core',
+    packagePath: path.join(otaDir, 'core'),
+    env: () => ({ MODOKI_OTA_ZIP_FIXTURE: otaZipFixturePath }),
+    // #565-class mutation guard: OtaZipTests.swift XCTSkips (exit 0) when
+    // MODOKI_OTA_ZIP_FIXTURE is absent — the correct behavior for a human running `swift
+    // test` standalone, but a silent false PASS if this leg's `env:` row above is ever
+    // deleted from this table. `requiresFixture: true` makes the runner loop below verify a
+    // fixture is actually WIRED for this leg (not just that the platform/tools are
+    // available) and FAIL loudly if it isn't, rather than letting the Swift-side XCTSkip
+    // stand in for a real result.
+    requiresFixture: true,
+  },
 ];
 
 for (const leg of SWIFT_LEGS) {
   const rel = path.relative(repoRoot, leg.packagePath);
+  // Environmental checks FIRST: on a machine that cannot run this leg at all, a fixture failure is
+  // irrelevant and must stay a SKIP — reporting FAIL there would fire a false alarm under
+  // --require-all on a non-macOS runner.
   if (process.platform !== 'darwin') skip(leg.name, `XCTest needs macOS (this is ${process.platform})`);
   else if (!has('swift')) skip(leg.name, 'no `swift` on PATH — install the Xcode command line tools');
   else if (!fs.existsSync(path.join(leg.packagePath, 'Package.swift'))) skip(leg.name, `no test package at ${rel}`);
-  else run(leg.name, 'swift', ['test', '--package-path', leg.packagePath]);
+  else if (leg.requiresFixture && !leg.env) {
+    // The platform/tools ARE available — this is exactly the case where deleting the leg's
+    // `env:` row would otherwise silently produce a false PASS (the Swift test would run
+    // with MODOKI_OTA_ZIP_FIXTURE unset, hit XCTSkip, and exit 0). A leg that needs the
+    // fixture but declares no way to supply it is a misconfigured leg, not an environmental
+    // skip — fail it loudly instead.
+    results.push({ name: leg.name, status: 'FAIL', reason: 'required fixture not available — leg misconfigured (its env: row is missing) or fixture build broken' });
+  }
+  else if (leg.env && otaZipFixtureError) {
+    // NOT environmental — this runner is responsible for producing the fixture on a machine that
+    // could otherwise run the leg, so failing to do so is a FAIL, not a SKIP.
+    results.push({ name: leg.name, status: 'FAIL', reason: `could not build the OtaZip test fixture: ${otaZipFixtureError}` });
+  }
+  else if (leg.requiresFixture && leg.env && !leg.env().MODOKI_OTA_ZIP_FIXTURE) {
+    // Belt-and-suspenders: env() exists but doesn't actually resolve to a fixture path (e.g.
+    // narrowed rather than removed outright) — same "leg misconfigured" verdict as above.
+    results.push({ name: leg.name, status: 'FAIL', reason: 'required fixture not available — leg misconfigured (env() did not produce MODOKI_OTA_ZIP_FIXTURE) or fixture build broken' });
+  }
+  else run(leg.name, 'swift', ['test', '--package-path', leg.packagePath], leg.env ? { env: { ...process.env, ...leg.env() } } : {});
 }
 
 /** JAVA_HOME from the SAME resolver the editor and the CLI build use — never a fresh probe, and

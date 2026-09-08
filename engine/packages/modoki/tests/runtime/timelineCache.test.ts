@@ -146,6 +146,77 @@ describe('timelineCache — a GUID-loaded timeline is invalidated BY PATH', () =
   });
 });
 
+describe('timelineCache — invalidateTimeline mid-flight bumps generation (#487 item 8)', () => {
+  it('refuses a fetch that resolves with the OLD def AFTER invalidateTimeline ran mid-flight', async () => {
+    let resolveOld: (v: unknown) => void = () => {};
+    fetchMock.mockReturnValueOnce(new Promise((r) => { resolveOld = r; }));
+
+    expect(getTimeline('race.tl')).toBeNull();   // kicks off the in-flight load
+    invalidateTimeline('race.tl');                // re-import lands mid-flight — must bump generation
+
+    resolveOld(okResponse({ ...DEF, id: 'stale' })); // the pre-import fetch resolves late
+    await flush();
+
+    // Genuinely EMPTY (peek, no new fetch) — not merely shadowed by a fresher value.
+    expect(getTimeline('race.tl', { load: false })).toBeNull();
+  });
+
+  it('keep-direction: with no invalidation in between, the same load still caches normally', async () => {
+    fetchMock.mockResolvedValueOnce(okResponse(DEF));
+    expect(getTimeline('keep.tl')).toBeNull();
+    await flush();
+    expect(getTimeline('keep.tl')?.duration).toBe(2);
+  });
+});
+
+describe('timelineCache — a per-key invalidation must not refuse a DIFFERENT key\'s in-flight load', () => {
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateTimeline`
+  // that bumped it would refuse every OTHER key's in-flight load too — the exact bug that made a
+  // scene's own timeline (A) load successfully, then get discarded because an unrelated
+  // `.timeline.json` (B) was invalidated by the file watcher mid-await. This must FAIL against
+  // the module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED path while A is in flight leaves A cacheable', async () => {
+    let resolveA: (v: unknown) => void = () => {};
+    fetchMock.mockReturnValueOnce(new Promise((r) => { resolveA = r; }));
+
+    expect(getTimeline('cross.A.tl')).toBeNull(); // kicks off A's in-flight load
+    invalidateTimeline('cross.B.tl');              // an UNRELATED path invalidated mid-flight
+
+    resolveA(okResponse({ ...DEF, id: 'a-def' }));
+    await flush();
+
+    expect(getTimeline('cross.A.tl')?.id).toBe('a-def'); // A must be cached, not refused
+    expect(fetchMock).toHaveBeenCalledTimes(1);            // no spurious re-fetch of A
+  });
+
+  it('loadTimelineNow(A) resolves with A\'s def even when invalidateTimeline(B) lands mid-fetch', async () => {
+    let resolveA: (v: unknown) => void = () => {};
+    fetchMock.mockReturnValueOnce(new Promise((r) => { resolveA = r; }));
+
+    const p = loadTimelineNow('cross.now.A.tl');
+    invalidateTimeline('cross.now.B.tl'); // unrelated path, mid-await
+
+    resolveA(okResponse({ ...DEF, id: 'a-now-def' }));
+    const def = await p;
+    expect(def?.id).toBe('a-now-def');
+  });
+
+  it('loadTimelineNow retries when its OWN key is invalidated mid-fetch, resolving the fresh def', async () => {
+    let resolveStale: (v: unknown) => void = () => {};
+    fetchMock.mockReturnValueOnce(new Promise((r) => { resolveStale = r; })); // attempt 1 (stale)
+    fetchMock.mockResolvedValueOnce(okResponse({ ...DEF, id: 'fresh-def' }));  // attempt 2 (retry)
+
+    const p = loadTimelineNow('retry.tl');
+    invalidateTimeline('retry.tl'); // its OWN key invalidated during the first fetch
+
+    resolveStale(okResponse({ ...DEF, id: 'stale-def' }));
+    const def = await p;
+
+    expect(def?.id).toBe('fresh-def'); // retried instead of giving up after one refused attempt
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
 // Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
 // shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
 // undefined for a guid absent from the manifest with no warning at all.

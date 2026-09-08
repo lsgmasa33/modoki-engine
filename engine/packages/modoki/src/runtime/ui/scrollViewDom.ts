@@ -18,8 +18,22 @@ export interface ScrollViewNodeData {
 /** CSS for the scroll BOX itself. `UIElement.overflow` is a separate authored field and is
  *  applied by UINode; this only adds what the scroll view owns, so an element that is a scroll
  *  view but was never given `overflow:'scroll'` still does not scroll — which is deliberate:
- *  two fields, one visible consequence, and the one the author already knows wins. */
-export function scrollViewStyle(s: ScrollViewNodeData): Record<string, string> {
+ *  two fields, one visible consequence, and the one the author already knows wins.
+ *
+ *  ⚠️ **`overflow` is a PARAMETER because that invariant was false without it (#743).** The
+ *  cross-axis pin below writes `overflow-x`/`overflow-y`, and per CSS **when one of the two is
+ *  not `visible`, the other computes to `auto`** — so on an element left at `overflow: 'visible'`
+ *  the pin silently promoted the OTHER axis and the box scrolled after all. Worse than merely
+ *  contradicting the doc: `UINode` gates both the scrollbar skin and the `pointerEvents: 'auto'`
+ *  force on `overflow === 'scroll'`, so the box that resulted scrolled with unstyled native
+ *  scrollbars and, under the `pointer-events: none` root, could not receive the wheel. Reached by
+ *  authoring a `UIScrollView` and forgetting `overflow`, which the docs told you was a no-op.
+ *
+ *  The pin's whole justification (the measured scrollbar theft below) only exists for a box that
+ *  scrolls, so gating it costs nothing. `scrollSnapType`/`overscrollBehavior`/`scrollbarWidth`
+ *  stay unconditional: none of them changes how `overflow` computes, so on a non-scrolling box
+ *  they are inert rather than harmful. */
+export function scrollViewStyle(s: ScrollViewNodeData, overflow: string): Record<string, string> {
   const css: Record<string, string> = {};
   css.overscrollBehavior = s.overscroll === 'auto' ? 'auto' : s.overscroll;
   // `scrollbar-width: none` is the standards property (Chromium 121+, Safari 18.2+); older
@@ -42,6 +56,12 @@ export function scrollViewStyle(s: ScrollViewNodeData): Record<string, string> {
   // This does NOT contradict "the author's `overflow` wins" above: that rule is about whether the
   // box scrolls AT ALL, which is still the author's call. `axis` is this trait's own field, and
   // saying which axis is the only thing it can mean.
+  //
+  // ⚠️ Gated on the author having opted the box into scrolling (#743) — see the banner. The gate
+  // is `=== 'scroll'` rather than `!== 'visible'` to match the two other gates over the same
+  // decision in `UINode` (the scrollbar skin, and the `pointerEvents: 'auto'` force); `'hidden'`
+  // needs no pin because it already clips both axes.
+  if (overflow !== 'scroll') return css;
   if (s.axis === 'x') css.overflowY = 'hidden';
   else if (s.axis === 'y') css.overflowX = 'hidden';
   return css;
@@ -141,6 +161,158 @@ export function clearScrollRequest(guid: string, appliedBehavior?: string): void
   // Cost is one tree rebuild per CONSUMED request, and a request is user- or game-initiated,
   // never per-frame. The scroll READ-BACK above must stay dirty-free; this is not that.
   markUIDirty();
+}
+
+/** Structural shape of the DOM properties `readScrollMeasurement` reads — not `HTMLElement`, so a
+ *  plain object can stand in for the element in a test with no DOM. */
+export interface ScrollMeasurementSource {
+  clientWidth: number; clientHeight: number;
+  scrollLeft: number; scrollTop: number;
+  scrollWidth: number; scrollHeight: number;
+}
+
+/** ⚠️ **Refuse to RECORD a measurement from an element that generates no box (#413).** The trait
+ *  holds ONE measurement, keyed by guid, but the editor mounts `UIRenderer` TWICE — once in
+ *  GameView, once in SceneView's UI-mode preview — so one entity has two DOM elements and two
+ *  ResizeObservers writing the same slot. `UIRenderer` already knows this: `consumePendingActivation`
+ *  is idempotent "so two mounted UIRenderers activate once" — the scroll measurement never got that
+ *  treatment.
+ *
+ *  The element sitting inside a hidden editor dock tab measures 0×0 and overwrote the visible one's
+ *  real 434. With `entryWidth` authored in `%`, a zero viewport makes every entry zero-wide, the
+ *  window empty and the pool zero-slot — so the view renders blank while the prefab is cached and
+ *  the source registered, i.e. with every existing diagnostic silent.
+ *
+ *  A zero-extent view can display no entries either way, so declining the write costs nothing; the
+ *  cost of ACCEPTING it is losing the only good measurement. Returns `null` (rather than a partial
+ *  measurement) when the element generates no box, so the caller has one thing to check.
+ *
+ *  Two facts replace the old "known limitation" paragraph, which was both wrong and incomplete:
+ *
+ *  - The "both trees visible at different DEVICE sizes" case that paragraph warned about **cannot
+ *    occur**: `SceneView.tsx:2323` sizes its preview frame from `gameViewSize`, which only
+ *    GameView's effects write (`engine/app/editor/agentEditorOps.ts:142`). Both mounts render the
+ *    same logical device size by construction — a measured 434 vs 435 is scrollbar/rounding, not a
+ *    device gap.
+ *  - The residual hazard is a **MIXED** measurement, not two viewports, and it is pre-existing
+ *    rather than introduced here: the returned object also carries `scrollX`/`scrollY` from
+ *    whichever element fired it. With both trees visible, the SceneView mount sits at
+ *    `scrollLeft: 0` while the player has scrolled GameView to page N; any resize on the SceneView
+ *    side (a device-preset change, a splitter drag) fires its RO, now passes this guard, and writes
+ *    `scrollX: 0` beside a real viewport — so `driveEntriesFromScroll` re-plans the window at page 0
+ *    while the GameView DOM is still at page N. Far enough out, that lands outside the pooled band
+ *    and the view IS blank. Scoping the measurement to one owning tree is the real fix; this guard
+ *    does not attempt it.
+ *
+ *  Caveat: jsdom reports `clientWidth: 0` for everything, so a future jsdom test of the entries DOM
+ *  path records no viewport at all — assert against `readScrollMeasurement` directly rather than
+ *  through a mounted node.
+ *
+ *  **#665 — `viewportWidth` used to be raw `clientWidth`, and CSSOM rounds `clientWidth` to the
+ *  nearest integer.** A `UIEntries` pager entry authored `entryWidth: 100%` resolves to 100% of
+ *  that ROUNDED number, so a viewport whose true width is (say) 434.1px reports `clientWidth: 434`
+ *  while the box actually painted is 0.1px wider — leaving a sliver of the NEXT card visible at
+ *  rest. The optional `precise` parameter is how the caller supplies the true fractional width
+ *  (via `readPreciseBoxSize`) so this can correct for that.
+ *
+ *  `viewportWidth`/`viewportHeight` are `Math.ceil(precise.width/height)` when `precise` is given,
+ *  raw `clientWidth`/`clientHeight` otherwise. Ceiling — not the fractional value itself — is the
+ *  fix, for three reasons that all follow from keeping every quantity an INTEGER:
+ *  - `entryWidth: 100%` resolves to the same integer as `viewportWidth`, so `entryW ===
+ *    viewportWidth` exactly, which is the invariant `round(scrollX / viewportWidth)` page indexing
+ *    depends on (`games/wordweave/tests/sceneChrome.test.ts` guards it; wordweave's
+ *    `dictionaryPagerIndex` and Court's level select both derive pages that way).
+ *  - Page k then sits at `k * ceil`, an integer offset — one Chrome can actually rest on.
+ *  - `ceil >= trueWidth`, so card k covers the whole visible box and no neighbour can ever peek
+ *    through. The accepted cost: up to ~1px of the CURRENT card is clipped at its right/bottom
+ *    edge instead of leaving a sliver of the NEXT one visible — that is the trade the owner chose.
+ *    When the true width is already an integer, `ceil` is a no-op: no clipping, no sliver.
+ *
+ *  ⚠️ **A FRACTIONAL `viewportWidth` was tried first and reverted** — it made the symptom WORSE.
+ *  Chrome parks this scroller's resting offset on integer CSS pixels regardless of what
+ *  `scrollTo({left})` was asked for: `scrollTo({left: 598.1875})` came to rest at exactly `598`,
+ *  and page 3's `scrollTo({left: 897.28125})` landed at `897`. A fractional stride therefore misses
+ *  every offset the view can actually rest on, so instead of one constant 0.109px sliver of the
+ *  NEXT card, each page showed a 0.19–0.28px sliver of the PREVIOUS one. Do not reintroduce a
+ *  fractional `viewportWidth` — that measurement is why this function ceils instead.
+ *
+ *  This function does NOT call `readPreciseBoxSize` itself — the caller decides when to pay for a
+ *  `getComputedStyle` read, because `readScrollMeasurement` runs on every `scroll` event (cheap by
+ *  design — see `writeScrollState`'s no-dirty write above) while the precise box only needs
+ *  refreshing on RESIZE.
+ */
+export function readScrollMeasurement(
+  el: ScrollMeasurementSource,
+  precise?: { width: number; height: number } | null,
+): {
+  scrollX: number; scrollY: number;
+  viewportWidth: number; viewportHeight: number;
+  contentWidth: number; contentHeight: number;
+} | null {
+  if (!(el.clientWidth > 0) && !(el.clientHeight > 0)) return null;
+  return {
+    scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
+    viewportWidth: precise ? Math.ceil(precise.width) : el.clientWidth,
+    viewportHeight: precise ? Math.ceil(precise.height) : el.clientHeight,
+    contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
+  };
+}
+
+/** The fractional equivalent of `clientWidth`/`clientHeight` (#665), read via `getComputedStyle`
+ *  instead of the integer-rounded `clientWidth`/`clientHeight`.
+ *
+ *  ⚠️ **`UINode.tsx` sets `boxSizing: 'border-box'` on every UI node, and for a border-box element
+ *  Chrome's resolved `cs.width` is the BORDER-box width — it already includes padding and borders,
+ *  and it does NOT subtract the scrollbar gutter.** The old formula (`cs.width + paddingLeft +
+ *  paddingRight`) assumed `cs.width` was the content box, which is backwards for this renderer and
+ *  double-counts padding. Measured in real Chromium (authored `width: 434.109px`, target
+ *  `clientWidth: 434`):
+ *
+ *  | case                                   | `cs.width` | `clientWidth` | old formula |
+ *  |-----------------------------------------|-----------:|--------------:|------------:|
+ *  | border-box, no padding                  |    434.094 |            434 |   434.094 ✓ |
+ *  | border-box + `padding: 0 12px`          |    434.094 |            434 |   458.094 ✗ |
+ *  | border-box + padding + borders          |    434.094 |            426 |   458.094 ✗ |
+ *  | content-box + padding                   |    434.094 |            458 |   458.094 ✓ |
+ *
+ *  So under `border-box`, padding must NOT be added back, and both the border widths and the
+ *  scrollbar gutter (`offsetWidth - clientWidth`, minus the borders already counted) must be
+ *  subtracted instead. The `content-box` branch is kept only because `boxSizing` is itself an
+ *  authorable `UIElement` field — nothing in this renderer sets it, but nothing stops a game from
+ *  authoring it. **Invariant: `|result - clientWidth| < 1` in every case** — this function exists
+ *  only to recover the fractional residue `clientWidth` rounds away, never to disagree with it.
+ *
+ *  ⚠️ **Call `getComputedStyle` on its OWNER, never as a detached reference.** `const f =
+ *  view.getComputedStyle; f(el)` throws `Illegal invocation` in real Chrome — `getComputedStyle` is
+ *  not callable off its `Window` receiver — but jsdom does NOT reproduce that restriction, so a
+ *  detached call stays green in unit tests and only breaks in a real browser. Always invoke it as
+ *  `view.getComputedStyle(el)`.
+ *
+ *  Returns `null` when the result is unusable so the caller can fall back to `clientWidth`/
+ *  `clientHeight`: no `getComputedStyle` available at all, any parsed length is `NaN` (jsdom
+ *  returns `''` for an unset computed length, which parses to `NaN`), or both dimensions are
+ *  `<= 0`.
+ */
+export function readPreciseBoxSize(el: Element): { width: number; height: number } | null {
+  const view = el.ownerDocument?.defaultView
+    ?? (typeof getComputedStyle !== 'undefined' ? globalThis : undefined);
+  if (!view || typeof view.getComputedStyle !== 'function') return null;
+  const cs = view.getComputedStyle(el);
+  const num = (v: string) => parseFloat(v);
+  const htmlEl = el as HTMLElement;
+  const bl = num(cs.borderLeftWidth), br = num(cs.borderRightWidth);
+  const bt = num(cs.borderTopWidth), bb = num(cs.borderBottomWidth);
+  const gutterX = htmlEl.clientWidth ? htmlEl.offsetWidth - htmlEl.clientWidth - bl - br : 0;
+  const gutterY = htmlEl.clientHeight ? htmlEl.offsetHeight - htmlEl.clientHeight - bt - bb : 0;
+  const width = (cs.boxSizing === 'border-box'
+    ? num(cs.width) - bl - br
+    : num(cs.width) + num(cs.paddingLeft) + num(cs.paddingRight)) - gutterX;
+  const height = (cs.boxSizing === 'border-box'
+    ? num(cs.height) - bt - bb
+    : num(cs.height) + num(cs.paddingTop) + num(cs.paddingBottom)) - gutterY;
+  if (Number.isNaN(width) || Number.isNaN(height)) return null;
+  if (!(width > 0) && !(height > 0)) return null;
+  return { width, height };
 }
 
 /** What a pending request means for `Element.scrollTo`, or null when nothing is pending.

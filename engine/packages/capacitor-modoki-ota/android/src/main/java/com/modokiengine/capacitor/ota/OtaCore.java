@@ -28,6 +28,47 @@ public final class OtaCore {
 
   public enum TargetKind { EMBEDDED, VERSION }
 
+  /** See OtaCore.swift's OtaLoadFailure doc — same three claims, must behave identically.
+   *  FATAL quarantines immediately (#550), TRANSIENT costs one attempt, NOT_EVIDENCE gives
+   *  the attempt back and must never quarantine. */
+  public enum LoadFailure { FATAL, TRANSIENT, NOT_EVIDENCE }
+
+  /** See OtaCore.swift's OtaStageVerifyResult doc — same contract, must behave identically
+   *  (#556). `null` return from {@link #verifyStagedFiles} means OK; a non-null instance
+   *  names the FIRST problem found, deterministically, by lexicographic path order. */
+  public static final class VerifyProblem {
+    public enum Kind { MISSING, UNEXPECTED, HASH_MISMATCH }
+
+    public final Kind kind;
+    public final String path;
+    public final String expectedHash; // null unless kind == HASH_MISMATCH
+    public final String actualHash; // null unless kind == HASH_MISMATCH
+
+    private VerifyProblem(Kind kind, String path, String expectedHash, String actualHash) {
+      this.kind = kind;
+      this.path = path;
+      this.expectedHash = expectedHash;
+      this.actualHash = actualHash;
+    }
+
+    static VerifyProblem missing(String path) { return new VerifyProblem(Kind.MISSING, path, null, null); }
+
+    static VerifyProblem unexpected(String path) { return new VerifyProblem(Kind.UNEXPECTED, path, null, null); }
+
+    static VerifyProblem hashMismatch(String path, String expectedHash, String actualHash) {
+      return new VerifyProblem(Kind.HASH_MISMATCH, path, expectedHash, actualHash);
+    }
+
+    @Override
+    public String toString() {
+      switch (kind) {
+        case MISSING: return "missing(" + path + ")";
+        case UNEXPECTED: return "unexpected(" + path + ")";
+        default: return "hashMismatch(" + path + ", expected=" + expectedHash + ", actual=" + actualHash + ")";
+      }
+    }
+  }
+
   public static final class Target {
     public final TargetKind kind;
     public final String name;
@@ -69,6 +110,9 @@ public final class OtaCore {
      *  resetForNewBinary. null = fresh install OR a pre-this-feature state.json — both
      *  must NOT trigger a reset. */
     public final String lastSeenBinaryVersion;
+    /** See OtaCore.swift's `highestSeenSeq` field doc (#571, anti-rollback) — a single
+     *  device-wide counter, NOT per-bundle like every other field here. */
+    public final int highestSeenSeq;
 
     public State() {
       this(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null);
@@ -83,12 +127,17 @@ public final class OtaCore {
     }
 
     public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected, String lastSeenBinaryVersion) {
+      this(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, 0);
+    }
+
+    public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected, String lastSeenBinaryVersion, int highestSeenSeq) {
       this.active = active;
       this.pending = pending;
       this.bootAttempts = bootAttempts;
       this.confirmedBoots = confirmedBoots;
       this.rejected = rejected;
       this.lastSeenBinaryVersion = lastSeenBinaryVersion;
+      this.highestSeenSeq = highestSeenSeq;
     }
 
     public State copy() {
@@ -96,7 +145,7 @@ public final class OtaCore {
       for (Map.Entry<String, java.util.List<String>> e : rejected.entrySet()) {
         rejectedCopy.put(e.getKey(), new java.util.ArrayList<>(e.getValue()));
       }
-      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots), rejectedCopy, lastSeenBinaryVersion);
+      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots), rejectedCopy, lastSeenBinaryVersion, highestSeenSeq);
     }
 
     @Override
@@ -104,15 +153,15 @@ public final class OtaCore {
       if (!(o instanceof State)) return false;
       State s = (State) o;
       return active.equals(s.active) && pending.equals(s.pending) && bootAttempts.equals(s.bootAttempts) && confirmedBoots.equals(s.confirmedBoots) && rejected.equals(s.rejected)
-        && java.util.Objects.equals(lastSeenBinaryVersion, s.lastSeenBinaryVersion);
+        && java.util.Objects.equals(lastSeenBinaryVersion, s.lastSeenBinaryVersion) && highestSeenSeq == s.highestSeenSeq;
     }
 
     @Override
-    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion); }
+    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, highestSeenSeq); }
 
     @Override
     public String toString() {
-      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + ", rejected=" + rejected + ", lastSeenBinaryVersion=" + lastSeenBinaryVersion + "}";
+      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + ", rejected=" + rejected + ", lastSeenBinaryVersion=" + lastSeenBinaryVersion + ", highestSeenSeq=" + highestSeenSeq + "}";
     }
   }
 
@@ -126,12 +175,23 @@ public final class OtaCore {
   public static State resetForNewBinary(State state, String currentBinaryVersion) {
     if (state == null) return null;
     if (state.lastSeenBinaryVersion != null && !state.lastSeenBinaryVersion.equals(currentBinaryVersion)) {
-      return new State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), state.rejected, currentBinaryVersion);
+      // `highestSeenSeq` survives a reset for the same reason `rejected` does — see
+      // OtaCore.swift's resetForNewBinary doc.
+      return new State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), state.rejected, currentBinaryVersion, state.highestSeenSeq);
     }
     if (state.lastSeenBinaryVersion == null) {
-      return new State(state.active, state.pending, state.bootAttempts, state.confirmedBoots, state.rejected, currentBinaryVersion);
+      return new State(state.active, state.pending, state.bootAttempts, state.confirmedBoots, state.rejected, currentBinaryVersion, state.highestSeenSeq);
     }
     return state;
+  }
+
+  // ---- Anti-rollback (#571) ----
+
+  /** See OtaCore.swift's `recordSeq` doc — same contract, must behave identically:
+   *  monotonically bumps `highestSeenSeq` to `max(existing, seq)`, never regresses. */
+  public static State recordSeq(State state, int seq) {
+    State s = (state == null) ? new State() : state.copy();
+    return new State(s.active, s.pending, s.bootAttempts, s.confirmedBoots, s.rejected, s.lastSeenBinaryVersion, Math.max(s.highestSeenSeq, seq));
   }
 
   // ---- Boot ----
@@ -178,13 +238,7 @@ public final class OtaCore {
   private static BootResult revert(State state, String name, boolean quarantine, FolderExists folderExists) {
     State s = state.copy();
     String badVersion = s.pending.get(name);
-    if (quarantine && badVersion != null) {
-      java.util.List<String> list = s.rejected.get(name);
-      if (list == null) list = new java.util.ArrayList<>();
-      if (!list.contains(badVersion)) list.add(badVersion);
-      while (list.size() > MAX_REJECTED_PER_BUNDLE) list.remove(0);
-      s.rejected.put(name, list);
-    }
+    if (quarantine && badVersion != null) addRejected(s, name, badVersion);
     s.pending.remove(name);
     s.bootAttempts.remove(name);
     s.confirmedBoots.remove(name);
@@ -196,13 +250,65 @@ public final class OtaCore {
     return new BootResult(Target.embedded(), s);
   }
 
+  /** See OtaCore.swift's addRejected doc — only ever called for a PENDING version. */
+  private static void addRejected(State s, String name, String version) {
+    java.util.List<String> list = s.rejected.get(name);
+    if (list == null) list = new java.util.ArrayList<>();
+    if (!list.contains(version)) list.add(version);
+    while (list.size() > MAX_REJECTED_PER_BUNDLE) list.remove(0);
+    s.rejected.put(name, list);
+  }
+
+  // ---- Load failure (sub-game bundles — #553/#550) ----
+
+  /** See OtaCore.swift's loadFailed doc — same contract, must behave identically.
+   *  Returns the version to fall back to THIS launch; the caller must NOT confirm it. */
+  public static BootResult loadFailed(State state, String name, String version, LoadFailure disposition, FolderExists folderExists) {
+    if (state == null) return new BootResult(Target.embedded(), null);
+    State s = state.copy();
+
+    if (version != null && version.equals(s.pending.get(name))) {
+      if (disposition == LoadFailure.FATAL) {
+        return revert(s, name, true, folderExists);
+      } else if (disposition == LoadFailure.NOT_EVIDENCE) {
+        int attempts = s.bootAttempts.getOrDefault(name, 0) - 1;
+        if (attempts > 0) s.bootAttempts.put(name, attempts); else s.bootAttempts.remove(name);
+      }
+      // TRANSIENT: the attempt boot() counted stands; exhaustion still reverts + quarantines.
+    } else if (version != null && version.equals(s.active.get(name)) && disposition != LoadFailure.NOT_EVIDENCE) {
+      // Promoted-then-broken. Drop it, but never quarantine — see addRejected. TRANSIENT must
+      // escalate here too: bootAttempts is a PENDING-only counter, so the "costs an attempt,
+      // quarantines after maxAttempts" argument does not hold for an active version, and
+      // without this it would be refused every launch forever. See OtaCore.swift.
+      s.active.remove(name);
+      return new BootResult(Target.embedded(), s);
+    }
+
+    String activeVersion = s.active.get(name);
+    if (activeVersion != null && !activeVersion.equals(version) && folderExists.check(name, activeVersion)) {
+      return new BootResult(Target.version(name, activeVersion), s);
+    }
+    return new BootResult(Target.embedded(), s);
+  }
+
   // ---- Confirm ----
 
   public static State confirm(State state, String name) {
+    return confirm(state, name, null);
+  }
+
+  /** See OtaCore.swift's confirm(state:name:version:) doc — `version`, when non-null, must
+   *  equal `pending[name]` or the confirm is a no-op. This is the #553 fix. */
+  public static State confirm(State state, String name, String version) {
     if (state == null) return null;
     State s = state.copy();
     String pendingVersion = s.pending.get(name);
     if (pendingVersion == null) return s;
+    if (version != null && !version.equals(pendingVersion)) return s;
+    // A confirm is credited at most once per counted boot attempt (#584) — see
+    // OtaCore.swift's confirm(state:name:version:) doc for the why, and for the three cases
+    // that rule out a per-process latch in the plugin instead.
+    if (s.confirmedBoots.getOrDefault(name, 0) >= s.bootAttempts.getOrDefault(name, 0)) return s;
     int confirms = s.confirmedBoots.getOrDefault(name, 0) + 1;
     if (confirms >= REQUIRED_CONFIRMS) {
       s.active.put(name, pendingVersion);
@@ -213,5 +319,103 @@ public final class OtaCore {
       s.confirmedBoots.put(name, confirms);
     }
     return s;
+  }
+
+  // ---- Stage verification (#556) ----
+
+  /** See OtaCore.swift's verifyStagedFiles doc — same contract, must behave identically:
+   *  case-insensitive hex hash comparison, deterministic first-problem-by-sorted-path.
+   *  Returns null for OK. */
+  public static VerifyProblem verifyStagedFiles(Map<String, String> expected, Map<String, String> actual) {
+    Map<String, String> expectedLower = new HashMap<>();
+    for (Map.Entry<String, String> e : expected.entrySet()) expectedLower.put(e.getKey(), e.getValue().toLowerCase());
+    Map<String, String> actualLower = new HashMap<>();
+    for (Map.Entry<String, String> e : actual.entrySet()) actualLower.put(e.getKey(), e.getValue().toLowerCase());
+
+    java.util.TreeSet<String> allPaths = new java.util.TreeSet<>();
+    allPaths.addAll(expectedLower.keySet());
+    allPaths.addAll(actualLower.keySet());
+    for (String path : allPaths) {
+      String expectedHash = expectedLower.get(path);
+      if (expectedHash == null) return VerifyProblem.unexpected(path);
+      String actualHash = actualLower.get(path);
+      if (actualHash == null) return VerifyProblem.missing(path);
+      if (!expectedHash.equals(actualHash)) return VerifyProblem.hashMismatch(path, expectedHash, actualHash);
+    }
+    return null;
+  }
+
+  // ---- Prune (#563) ----
+
+  /** See OtaCore.swift's pruneVersions doc — same contract, must behave identically.
+   *  Returns the FULL on-disk folder names (from {@code onDisk}, which lists every version
+   *  folder present for EVERY bundle, not just {@code name}) that are safe to delete for
+   *  {@code name}. Folders are flat and named {@code "<bundleName>-<version>"}, and bundle
+   *  names may themselves contain hyphens, so ownership cannot be recovered by splitting on
+   *  the first {@code name + "-"} — this resolves it once, here, via longest-known-bundle-
+   *  prefix matching, so the two I/O halves never re-derive (and drift on) the same
+   *  decision. {@code state == null} means every folder's status is UNKNOWN, not prunable,
+   *  so this returns empty — pruning on unparseable state would be destructive. Returns a
+   *  SORTED list so both ports agree on order and the shared vectors
+   *  (ota-prune-vectors.json) can assert exactly. */
+  public static java.util.List<String> pruneVersions(State state, String name, java.util.List<String> onDisk) {
+    java.util.List<String> result = new java.util.ArrayList<>();
+    if (state == null) return result;
+
+    java.util.Set<String> knownBundles = new java.util.HashSet<>();
+    knownBundles.addAll(state.active.keySet());
+    knownBundles.addAll(state.pending.keySet());
+    knownBundles.addAll(state.bootAttempts.keySet());
+    knownBundles.addAll(state.confirmedBoots.keySet());
+    knownBundles.addAll(state.rejected.keySet());
+    knownBundles.add(name);
+
+    String active = state.active.get(name);
+    String pending = state.pending.get(name);
+
+    for (String folder : onDisk) {
+      String owner = null;
+      for (String bundle : knownBundles) {
+        if (folder.startsWith(bundle + "-") && (owner == null || bundle.length() > owner.length())) {
+          owner = bundle;
+        }
+      }
+      if (owner == null || !owner.equals(name)) continue;
+      String version = folder.substring(owner.length() + 1);
+      if (!version.equals(active) && !version.equals(pending)) result.add(folder);
+    }
+    java.util.Collections.sort(result);
+    return result;
+  }
+
+  // ---- Bundles to prune (#563, pinned separately from pruneVersions itself) ----
+
+  /** Every bundle name a boot hook must run {@link #pruneVersions} for after a boot — the
+   *  SORTED union of the keys of {@code state.active}/{@code pending}/{@code bootAttempts}/
+   *  {@code confirmedBoots}/{@code rejected}, plus {@code shellName} itself (always
+   *  included, even when it appears in none of those maps — a fresh device that has never
+   *  staged anything but the embedded shell still needs its own prune pass so a stale
+   *  on-disk folder for it is reclaimable). {@code state == null} (fresh install / corrupt
+   *  state.json) means nothing is known yet — returns just {@code [shellName]}.
+   *
+   *  Pulled out of the boot-hook glue (OtaPlugin.java's runBootHook / OtaPlugin.swift's
+   *  OtaBootHook.run) into this pure function so it is replayed by the shared vectors
+   *  (ota-bundles-to-prune-vectors.json) instead of living untested in native glue. */
+  public static java.util.List<String> bundlesToPrune(State state, String shellName) {
+    java.util.List<String> result = new java.util.ArrayList<>();
+    if (state == null) {
+      result.add(shellName);
+      return result;
+    }
+    java.util.Set<String> names = new java.util.HashSet<>();
+    names.addAll(state.active.keySet());
+    names.addAll(state.pending.keySet());
+    names.addAll(state.bootAttempts.keySet());
+    names.addAll(state.confirmedBoots.keySet());
+    names.addAll(state.rejected.keySet());
+    names.add(shellName);
+    result.addAll(names);
+    java.util.Collections.sort(result);
+    return result;
   }
 }

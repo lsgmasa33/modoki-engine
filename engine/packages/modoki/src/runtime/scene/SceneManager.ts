@@ -14,15 +14,80 @@
  *         held by the old scene get disposed
  *  7. Resolve the promise
  *
- *  Concurrency: cancel-and-replace. Only one preload in flight; calling
- *  loadScene() while another is loading aborts the in-flight load.
+ *  Concurrency: cancel-and-replace, but ONLY up to the swap. Before step 6, one
+ *  preload is in flight and calling loadScene() aborts it (ten `signal.aborted`
+ *  checks, one after every await). At the swap `nextLoad` is cleared, so from
+ *  there on there is nothing left to abort THROUGH: a loadScene() issued during
+ *  the post-swap tail finds nothing to cancel and runs concurrently with it.
+ *  The tail is guarded instead by `!postSwapSuperseded && this.primaryId === id`,
+ *  which gates the re-activation half (fireSceneCallbacks / init*ManagersFor)
+ *  because those rewrite module-global manager state and read getCurrentWorld()
+ *  (#435). BOTH halves are needed: primaryId is reassigned at every swap, so
+ *  inequality is the "superseded by a newer LOAD" signal — but it does NOT catch
+ *  a mid-flight `unloadAll()`, which leaves primaryId naming this load until its
+ *  own tail, several awaits later (#542).
+ *  Dispose/release/destroy in the tail stay unguarded on purpose: they act on the
+ *  world and path from BEFORE this load, which no newer load touches.
+ *  See docs/scene-loading.md § SceneManager API step 9 for this mechanism.
  *
  *  Failure: if any step fails, release the next-scene's acquired resources and
  *  reject the promise. The current scene is untouched.
+ *
+ *  Teardown vs. a racing load — UNLOAD WINS (#535). `unloadAll()` is
+ *  authoritative: a `loadScene()` that races it must never win, and must never
+ *  silently resolve having actually lost. Two mechanisms, because a teardown can
+ *  race a load from either side:
+ *   - `teardownInFlight` (a counter, not a boolean, so overlapping `unloadAll()`
+ *     calls can't clear each other's flag) is incremented at `unloadAll()`'s HEAD,
+ *     before any await, and decremented in a `finally` after its tail — so a
+ *     throw mid-teardown can't leave it stuck (a stuck counter would reject every
+ *     future `loadScene()` forever, worse than the bug being fixed). `loadScene()`
+ *     checks it FIRST, before doing any work: if non-zero, a teardown already owns
+ *     the world and the load rejects immediately. This is the case the generation
+ *     counter alone is blind to — a load that starts fresh AFTER `unloadAll()`'s
+ *     head has already bumped its generation would otherwise capture the
+ *     post-bump value and sail through every checkpoint unaffected.
+ *   - `teardownToken` (a `runtime/core/liveness.ts` `TeardownToken`) is invalidated at the same
+ *     HEAD. `loadScene()` captures it (`enteredGeneration`) and every `signal.aborted` checkpoint
+ *     above (`isSuperseded`) also re-checks the CAPTURED check. ⚠️ Pre-swap this comparison is
+ *     currently redundant: a load
+ *     already mid-flight when `unloadAll()` starts also has `this.nextLoad`
+ *     aborted directly by the same HEAD, so `controller.signal.aborted` is
+ *     already true by the time the checkpoint runs — the generation arm cannot
+ *     currently fire pre-swap (mutation-confirmed; see `isSuperseded`'s own
+ *     comment). It is kept as defence-in-depth for if the `nextLoad` invariant
+ *     ever changes. What the generation IS genuinely load-bearing for, right
+ *     now, is the POST-swap window below, where `nextLoad` has already been
+ *     cleared and there is nothing left for an abort to reach.
+ *  A `loadScene()` issued fresh after an `unloadAll()` has fully settled sees
+ *  `teardownInFlight === 0` and a stable generation for its whole life, so it
+ *  proceeds and resolves normally — that property is what a naive
+ *  generation-only or counter-only fix breaks. `unloadAll()`'s own tail — clearing
+ *  `loadedScenes`, `primaryId`, `currentBaseScene`, and installing a fresh world —
+ *  stays UNCONDITIONAL: teardown can never be undone by a load that raced in
+ *  behind it.
+ *
+ *  The post-swap tail (dispose the old scene/game managers, then — only if still
+ *  primary — re-init the new ones) is unguarded by `nextLoad`/`signal.aborted`:
+ *  the swap clears `nextLoad`, so from there on there is nothing left for a
+ *  racing `unloadAll()` to abort THROUGH. That window is covered by a SEPARATE
+ *  pair of checkpoints (`isPostSwapSuperseded`, checked after each of the four
+ *  post-swap awaits) that read `teardownInFlight`/the teardown token's generation directly
+ *  instead of going through `isSuperseded` — the counter catches an `unloadAll()`
+ *  in flight right now, the generation catches one that started AND FULLY
+ *  SETTLED inside one of those awaits (so the counter is already back at zero by
+ *  the time the load resumes). Unlike the pre-swap checkpoints, a post-swap hit
+ *  does NOT skip the tail's own work — dispose/release/destroy already act on
+ *  the OLD world and commit unconditionally, same as ever, and the `primaryId
+ *  === id` guard (unchanged) still separately decides whether to skip
+ *  re-activation. A post-swap hit only decides what the CALLER is told: the load
+ *  rejects with an AbortError instead of resolving, because the swap it thought
+ *  it won has just been wiped by `unloadAll()`'s unconditional tail.
  */
 
 import { createWorld, type World, type Entity } from 'koota';
 import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
+import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
@@ -54,16 +119,48 @@ import {
   loadSceneFile,
   collectResourceRefsFromEntities,
   instantiatePrefabIntoWorld,
+  SceneFormatRefusedError,
   type SceneData,
   type SceneResourceRef,
   type SceneEntityEntry,
 } from '../loaders/loadSceneFile';
+import { classifyFormatVersion } from '../core/formatVersion';
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
+  pendingManagerInits,
 } from '../managers/managerRegistry';
 
 export type SceneState = 'loading' | 'ready' | 'active' | 'unloading';
+
+/** Upper bound, in ms, on how long a superseded world's destroy (#468, see below) may be
+ *  deferred behind an in-flight manager init. `managerRegistry.ts`'s `activate()` clears
+ *  `entry.initPromise` in a `.finally`, so a `Promise` that never SETTLES (a genuine hang, not
+ *  a rejection — those are swallowed) leaves `initPromise` non-null forever; `pendingManagerInits`
+ *  then collects it on EVERY later swap, so every later `oldWorld.destroy()` would chain behind
+ *  it and never run — koota caps total worlds at 16, so that leaks a world slot on every
+ *  subsequent scene swap and the engine breaks after ~16 of them.
+ *
+ *  This is a structural safety bound, not a feel knob — it does not belong on a config resource
+ *  (CLAUDE.md's single-source-of-truth table reserves code constants for exactly this: a
+ *  genuine invariant, not a tunable). Past this bound we deliberately accept the ORIGINAL #468
+ *  hazard (a hung manager's `init()` can write into an already-destroyed world) rather than
+ *  leak a world slot on every subsequent swap — the leak compounds forever, the hazard does
+ *  not (it only bites the one hung manager, which is already broken). Mirrors the same trade
+ *  `UISettings.inputLockMaxMs` makes for the UI input lock (#466): a safety valve must never be
+ *  allowed to block forever, even though that means occasionally accepting the thing it exists
+ *  to prevent.
+ *
+ *  The bound exists to stop an UNBOUNDED wait (a never-settling init leaking a world slot on
+ *  every later swap), not to be tight — by the time this fires, `disposeActiveSceneManagers`
+ *  has already awaited every scene-scoped init, so what's left pending here is essentially only
+ *  a SUPERSEDED load's game-scoped init (save-game sync, an SDK init) still running. On a bad
+ *  connection that can plausibly exceed 10s, and firing early destroys the world out from under
+ *  it — reintroducing the #468 crash the deferral exists to prevent, now with a warning instead
+ *  of silence. A longer bound is strictly safer: lengthening it only holds one dead world
+ *  longer, shortening it risks the hazard above. 30s is comfortably past any plausible real
+ *  init while still bounding the leak. */
+export const WORLD_DESTROY_DEFER_MAX_MS = 30_000;
 
 export interface Scene {
   readonly id: SceneId;
@@ -147,8 +244,14 @@ export interface SceneManager {
   getNext(): Scene | null;
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
-   *  aborted (the current scene remains untouched on failure). */
+   *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
+   *  wins) — leaving the current scene untouched on failure. */
   loadScene(path: string, opts?: LoadOptions): Promise<void>;
+  /** Replace every entity in the live world with freshly-spawned content, through the
+   *  normal mint → populate → promote → release → destroy contract, so `onWorldSwap`
+   *  fires (#853). `populate` spawns into the world it is handed. Not a scene load:
+   *  `loadedScenes` ends empty and `getCurrent()` returns null. */
+  replaceWorldContent(populate: (world: World) => void): Promise<void>;
   /** For tests + shutdown. Releases everything and resets the manager. */
   unloadAll(): Promise<void>;
   /** For tests: reset the sceneId counter so test runs are deterministic. */
@@ -168,6 +271,23 @@ class SceneManagerImpl implements SceneManager {
   private currentBaseScene: string | undefined;
   private nextLoad: { id: SceneId; path: string; controller: AbortController } | null = null;
   private nextSceneId: SceneId = 1;
+  // Unload-wins concurrency (#535, see the class docblock). `teardownInFlight` is
+  // incremented at the HEAD of `unloadAll()` (before any await) and decremented in
+  // a `finally` after its tail; a counter rather than a boolean so overlapping
+  // `unloadAll()` calls can't clear each other's flag. `loadScene()` checks it
+  // FIRST, before any work, rejecting immediately if a teardown already owns the
+  // world. `teardownToken` — a `runtime/core/liveness.ts` `TeardownToken` (composed, not
+  // substituted: this class keeps its own AbortController, in-flight counter and post-swap
+  // latch, and sources just the generation from the helper) — is invalidated at the same head;
+  // `loadScene()` captures it at entry and re-checks it at every `signal.aborted` checkpoint
+  // (pre-swap)
+  // and at every post-swap checkpoint (`isPostSwapSuperseded`), catching a
+  // teardown that starts WHILE it is already mid-flight — including one that
+  // starts AND fully settles inside a post-swap await, which leaves
+  // `teardownInFlight` back at zero by the time the load resumes and only the
+  // generation comparison can still catch.
+  private teardownInFlight = 0;
+  private teardownToken = createTeardownToken();
   // Both registries below are APP-LIFETIME singletons owned by their registrant's
   // lifecycle, NOT scene-scoped — `unloadAll` deliberately does not blanket-clear them
   // (the beforeSwap hooks are register/unregister-paired in the Scene2D/Scene3D React
@@ -257,10 +377,59 @@ class SceneManagerImpl implements SceneManager {
     return { id: this.nextLoad.id, path: this.nextLoad.path, state: 'loading' };
   }
 
+  /** True once `unloadAll()` has invalidated the `teardownToken` past the capture this
+   *  load took at its own entry — i.e. a teardown started AFTER this load
+   *  did. Composes with the existing `signal.aborted` checkpoints (#535 — unload
+   *  wins) rather than forming a parallel checkpoint set. Does NOT cover a
+   *  teardown that was already in flight before this load started — that's
+   *  `teardownInFlight`, checked once at `loadScene()`'s entry instead.
+   *
+   *  ⚠️ The generation arm is currently UNREACHABLE pre-swap: a pre-swap load
+   *  always owns `this.nextLoad` (relinquished only at the swap; a newer load
+   *  aborts this controller before overwriting it), and `unloadAll()`'s own
+   *  head aborts `this.nextLoad.controller` — so wherever the generation could
+   *  differ here, `controller.signal.aborted` is already true, and mutation
+   *  confirms it: gutting this to `return controller.signal.aborted;` leaves
+   *  every lifecycle test green. Kept anyway as defence-in-depth in case the
+   *  `nextLoad` invariant above ever changes — see `isPostSwapSuperseded` for
+   *  where the generation arm actually is load-bearing (post-swap). */
+  private isSuperseded(controller: AbortController, enteredGeneration: LivenessCheck): boolean {
+    return controller.signal.aborted || !enteredGeneration();
+  }
+
+  /** Post-swap counterpart to `isSuperseded` (#535 defect 1). Past the atomic
+   *  swap, `this.nextLoad` has already been cleared, so `controller.signal` can
+   *  no longer be aborted THROUGH by a racing `unloadAll()` — checking it here
+   *  would always read false and never fire. Read `teardownInFlight` directly and
+   *  re-check the captured `teardownToken` liveness instead: the counter catches a teardown that
+   *  is running RIGHT NOW, the generation catches one that started and fully
+   *  settled while this load was parked in one of the post-swap awaits (so the
+   *  counter is already back at zero again). Does not gate the tail's own
+   *  work — see the class docblock — only whether the caller's promise should
+   *  reject instead of resolving. */
+  private isPostSwapSuperseded(enteredGeneration: LivenessCheck): boolean {
+    return this.teardownInFlight > 0 || !enteredGeneration();
+  }
+
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
-   *  aborted (the current scene remains untouched on failure). */
+   *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
+   *  wins) — leaving the current scene untouched on failure. */
   async loadScene(path: string, opts: LoadOptions = {}): Promise<void> {
+    // 0. Teardown owns the world (#535): `unloadAll()` bumps `teardownInFlight`
+    // at its own head, before any await. A load that starts while a teardown is
+    // already running must not race it, so it rejects immediately — before
+    // fetching, allocating a sceneId, or touching `nextLoad` — rather than doing
+    // work that a moment later gets wiped by the teardown's unconditional tail.
+    if (this.teardownInFlight > 0) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    // Captured before any await, re-checked at
+    // every checkpoint below via `isSuperseded`. A load already mid-flight when a
+    // teardown STARTS sees the invalidation and supersedes itself; a load that starts
+    // fresh after a teardown has already fully settled captures the post-invalidation
+    // check here and is unaffected by it for the rest of its life.
+    const enteredGeneration = this.teardownToken.capture();
     // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
     // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
     const loadSpan = beginBootSpan('scene-load', path);
@@ -287,19 +456,46 @@ class SceneManagerImpl implements SceneManager {
     // the failure/abort cleanup below must release all of them, not just the
     // primary's.
     const allocatedSceneIds: SceneId[] = [id];
+    // Set true right after the atomic swap commits (below). Once true, the
+    // failure/abort cleanup in `catch` must NOT re-release `allocatedSceneIds` —
+    // ownership has passed to `loadedScenes`, and either this load's own tail or
+    // a racing `unloadAll()` releases it exactly once from there (#535 defect 1).
+    let swapped = false;
+    // Post-swap supersede (#535 defect 1): the four post-swap awaits below run
+    // unconditionally regardless of this flag — see `isPostSwapSuperseded` and
+    // the class docblock. Each checkpoint only flips this; the check right
+    // before "12. Done" is what turns it into a rejection instead of a silent
+    // resolve.
+    let postSwapSuperseded = false;
 
     try {
       // 3. Fetch + parse the PRIMARY's scene JSON (or use caller-supplied preloaded data)
       let data: SceneData;
       if (opts.preloaded) {
         // F3: treat `preloaded` as caller-owned + read-only. The per-scene resource
-        // pipeline below (step 6) mutates `resources`/`version` in place, so
-        // shallow-clone first — otherwise the dev-server / agent-bridge caller that
-        // holds onto the same parsed object after this call gets a silently
-        // rewritten `resources` (the full transitive prefab walk, not what it
-        // passed) and a bumped `version`. A shallow clone is enough: only
-        // top-level fields are overwritten (whole-array / scalar replacement, not
-        // deep edits), and the migration chain likewise reassigns whole fields.
+        // pipeline below (step 6) rewrites `resources` in place, and the migration
+        // ladder in step 9 bumps `version`, so shallow-clone first — otherwise the
+        // dev-server / agent-bridge caller that holds onto the same parsed object
+        // after this call gets a silently rewritten `resources` (the full transitive
+        // prefab walk, not what it passed) and a bumped `version`.
+        // ⚠️ The shallow clone protects the TOP LEVEL ONLY, and this comment used to
+        // claim more than that ("the migration chain likewise reassigns whole
+        // fields"). That is false: `migrateSceneData` does `delete styleObj[f]` and
+        // `delete entry.traits.Transform`, and `migrateV4toV5` does
+        // `Object.assign(el, src)` — deep edits on the very entry objects a shallow
+        // clone SHARES with the caller. #807 widened the exposure by making those
+        // rungs reachable through here at all (they were skipped while
+        // `collectSceneResourceRefs` stamped the version to 6 first).
+        // Latent, not live: all FIVE production `preloaded` callers were checked —
+        // `agentBridge` passes a freshly-parsed object, `applyPrefabUndo` passes a
+        // `clone(scene)`, and `timelinePreview`/`playMode`/`prefabEdit` all build
+        // theirs at `SCENE_FORMAT_VERSION` (the first two via `serializeScene`, and
+        // `prefabEdit` via `buildPrefabEditScene`, which stamps it itself), so
+        // no ladder rung runs on a caller-owned document today. A caller that ever
+        // passes a genuinely pre-v6 object it intends to keep needs a deep clone,
+        // not this one. Enumerate with
+        // `grep -rn "preloaded:" --include='*.ts' engine/` before trusting this list —
+        // it said "four" once and `playMode.ts` was the one it missed.
         data = { ...opts.preloaded };
       } else {
         // assetUrl() is a no-op in dev/native (BASE_URL '/'), prefixes for sub-path web
@@ -331,7 +527,7 @@ class SceneManagerImpl implements SceneManager {
       // string (empty would falsely collide across every such scene).
       const primaryGuid = sceneGuid && isGuid(sceneGuid) ? sceneGuid : `path:${path}`;
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // 4. Resolve the base-scene chain (base-scene persistence). `rawSceneCache`
       // avoids double-fetching a base scene's file between chain resolution here
@@ -374,7 +570,7 @@ class SceneManagerImpl implements SceneManager {
         'scene-resolve-chain', () => resolveSceneChain(path, fetchSceneMeta), path);
       for (const w of chainWarnings) console.warn(w);
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // The primary is always the chain's LAST entry (resolveSceneChain's
       // contract). It always resolves — the primary's own link is seeded
@@ -437,14 +633,46 @@ class SceneManagerImpl implements SceneManager {
       const preparedSceneData = new Map<string, SceneData>();
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
+        // Classify HERE, before `collectSceneResourceRefs`, for ONE reason: it must
+        // refuse a too-new/unreadable scene before that method acquires its
+        // resources — walking and fetching the whole transitive prefab chain — and
+        // before entities are spawned for a scene that is going to be refused
+        // anyway (#784 phase C adversarial review, finding 1).
+        // ⚠️ NOT because it must precede `loadSceneFile`'s ladder or its two
+        // unconditional mutators (`assignSyntheticEntityIds` /
+        // `stripLegacyCameraFrameShowGizmo`). That reason was written here and is
+        // FALSE: all three live inside `loadSceneFile`, whose own
+        // `classifyFormatVersion` runs ahead of them for every caller, so deleting
+        // this early classify would still refuse the scene before any of them
+        // touched it. Stated so the next reader does not check the cited hazard,
+        // find it does not exist, and delete this call as cargo cult.
+        // `loadSceneFile`'s own classification stays in place as the backstop for
+        // every other caller (tests, tools, future direct callers) — both route
+        // through the same `classifyFormatVersion` and the same
+        // `SceneFormatRefusedError`, so the two sites cannot disagree on the verdict.
+        const verdict = classifyFormatVersion(sceneData, SCENE_FORMAT_VERSION);
+        if (verdict.kind === 'too-new') {
+          throw new SceneFormatRefusedError(
+            `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
+            `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
+            'too-new',
+          );
+        }
+        if (verdict.kind === 'unreadable') {
+          throw new SceneFormatRefusedError(
+            `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
+            `The file may be corrupt or hand-edited incorrectly.`,
+            'unreadable',
+          );
+        }
         const sid = sceneIdByPath.get(ref.path)!;
         const refs = await bootSpanAsync(
-          'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller), ref.path);
+          'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller, enteredGeneration), ref.path);
         perSceneRefs.set(ref.path, refs);
         preparedSceneData.set(ref.path, sceneData);
       }
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       const totalResources = [...perSceneRefs.values()].reduce((sum, r) => sum + r.length, 0);
       let loadedCount = 0;
@@ -465,7 +693,7 @@ class SceneManagerImpl implements SceneManager {
       }
       } finally { endBootSpan(acquireSpan); }
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // 7. Carry: snapshot entities tagged Persistent (any scene, unchanged
       // mechanism) OR whose sourceScene is a KEPT base scene — the generalization
@@ -495,7 +723,7 @@ class SceneManagerImpl implements SceneManager {
       const persistentResources = collectResourceRefsFromEntities(persistentOnlySnapshots);
       await Promise.all(persistentResources.map((ref) => acquireResource(id, ref)));
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // 8. Filter each toLoad scene's data to drop entries that collide with a
       // carried entity's guid (unchanged mechanism — the persistent-shadows-the-
@@ -644,7 +872,7 @@ class SceneManagerImpl implements SceneManager {
         });
         } finally { endBootSpan(spawnSpan); }
 
-        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
         // Stamp sourceScene on every entity THIS scene just spawned (a post-pass
         // diff against beforeIds, rather than hooking every spawn path, so prefab-
@@ -709,7 +937,7 @@ class SceneManagerImpl implements SceneManager {
         );
       }
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // Guard: warn on cross-scene parenting (an entity parented to an entity
       // from a DIFFERENT sourceScene). Breaks save provenance (Phase 6 filtering
@@ -789,7 +1017,7 @@ class SceneManagerImpl implements SceneManager {
       const swapWorld = nextWorld;
       await bootSpanAsync('scene-before-swap-hooks', () => this.fireBeforeSwapHooks(swapWorld));
 
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
       // 10. Atomic swap.
       const oldPath = (this.primaryId !== null ? this.loadedScenes.get(this.primaryId)?.path : undefined) ?? '';
@@ -832,6 +1060,9 @@ class SceneManagerImpl implements SceneManager {
 
       setCurrentWorld(promotedWorld); // fires onWorldSwap → renderers clear caches
       nextWorld = null; // ownership transferred to current; do not destroy in catch
+      // From here on, `allocatedSceneIds` is owned by `loadedScenes` (already
+      // updated above) — the `catch` below must not release it a second time.
+      swapped = true;
 
       // Percept (J3): journal the scene activation into the now-active world — a
       // fresh load vs. a swap from a previous scene. Engine-authored → `@`-sigil.
@@ -858,7 +1089,11 @@ class SceneManagerImpl implements SceneManager {
       // manager whose async init is still in flight is disposed only after that
       // init settles.
       if (gameChanged) await disposeActiveGameManagers({ world: oldWorld, scenePath: oldPath });
+      // #535 defect 1: an `unloadAll()` can start (or start-and-fully-settle)
+      // while this await was pending — see `isPostSwapSuperseded`.
+      if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: oldPath });
+      if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
 
       // Release resources for every DROPPED scene (old-only). Anything KEPT
       // survives via its own (unchanged) refcount — releaseAllForScene only
@@ -866,28 +1101,107 @@ class SceneManagerImpl implements SceneManager {
       // scene is untouched.
       for (const sid of toDropSceneIds) releaseAllForScene(sid);
 
-      // Free the old world's slot in koota's worldId pool. koota caps total
-      // worlds at 16; without this, every scene swap permanently consumes a
-      // slot and the engine breaks after ~16 swaps.
-      if (oldWorld !== promotedWorld) {
-        try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
+      // Free the old world's koota slot, deferred behind in-flight manager inits.
+      // Shared with replaceWorldContent() — see destroyWorldWhenSafe.
+      this.destroyWorldWhenSafe(oldWorld, promotedWorld);
+
+      // 11. Fire per-scene callbacks for dynamic entity spawning, then activate
+      // this scene's managers — but ONLY if this load is still the live primary.
+      // `this.nextLoad` was cleared at the swap above, so it can no longer signal
+      // "abort me" to a load that starts during this tail; a second loadScene()
+      // issued while the awaits below are pending finds nothing to cancel and
+      // swaps its own world in concurrently. If we didn't check here, this call
+      // would then rewrite activeScenePath back to ITS path and spawn manager
+      // entities via getCurrentWorld() into the OTHER call's now-active world
+      // (#435) — both `fireSceneCallbacks` and `init*ManagersFor` read
+      // getCurrentWorld() internally, so they're only safe to run while `id` is
+      // still `this.primaryId`. A superseded load skips straight to resolving.
+      //
+      // This guard closes the SCENE-scoped tier: a superseded tail can no longer
+      // rewrite `activeScenePath` or spawn scene managers into the newer load's
+      // world. For the GAME-scoped tier when the game did NOT change:
+      // `gameChanged` is computed from `activeGameId`, which the superseded load
+      // already set before it got here, so the NEWER load also sees
+      // `gameChanged === false` and skips both `disposeActiveGameManagers` and
+      // `initGameManagersFor` for it — nothing re-activates or awaits the
+      // superseded load's game manager here. What no longer happens (#468): that
+      // manager's `init()` can no longer spawn into a DESTROYED world, because
+      // the destroy above is deferred behind every in-flight manager init. What
+      // remains, deliberately, not a bug: the manager stays `active` holding a
+      // world that is no longer current — identical to the ordinary in-game-swap
+      // outcome, since game managers survive in-game swaps by design.
+      //
+      // #542: `primaryId === id` alone is not enough — it only catches a NEWER
+      // `loadScene()` overtaking this one (which also reassigns `primaryId`
+      // before nulling `nextLoad`). It does NOT catch a mid-flight `unloadAll()`,
+      // which leaves `primaryId` pointing at THIS load right up until its own
+      // tail, several awaits later. A load parked here while such a teardown is
+      // running would still call `initGameManagersFor`/`initSceneManagersFor`,
+      // which write `activeGameId`/`activeScenePath` SYNCHRONOUSLY at their own
+      // head — landing after `unloadAll`'s own reset writes (`initGameManagersFor
+      // (null, '')` / `initSceneManagersFor('')`) leaves that state pointing at a
+      // scene/game that is already torn down, even though this load's own
+      // `postSwapSuperseded` check further down correctly rejects it. Gate on
+      // `!postSwapSuperseded` too, at both checkpoints below, so a load already
+      // known to be superseded never performs those writes in the first place —
+      // it falls straight through to the final `if (postSwapSuperseded) throw`.
+      // Regression test: sceneManagerUnloadAll.test.ts's "#542" describe block.
+      //
+      // Re-latch here rather than trusting the checkpoint ~90 lines up. That value is fresh
+      // only because nothing between the two awaits (the drop-release loop, `pendingManagerInits`
+      // and the deferred-destroy wiring are all synchronous) — an invariant nothing enforces, so
+      // a future `await` inserted in that stretch would silently staleness this guard. LATCH,
+      // do not merely test: gating on a live `isPostSwapSuperseded()` without latching would let
+      // a load skip re-activation and still RESOLVE successfully, breaking the correspondence
+      // with step 12's unconditional `if (postSwapSuperseded) throw`.
+      if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
+      if (!postSwapSuperseded && this.primaryId === id) {
+        this.fireSceneCallbacks(path);
+
+        // Activate the new game's game-scoped managers (only when the game changed;
+        // an in-game swap keeps them running), then the new scene's scene-scoped
+        // managers. Awaited so async init (e.g. entity spawning) completes before
+        // loadScene resolves.
+        if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+        if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
+        // Re-check `postSwapSuperseded` here too (#542) — a teardown can start and
+        // flip it to true during the `initGameManagersFor` await just above,
+        // between the outer guard's check and this one.
+        if (!postSwapSuperseded && this.primaryId === id) {
+          await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
+          if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
+        }
       }
 
-      // 11. Fire per-scene callbacks for dynamic entity spawning
-      this.fireSceneCallbacks(path);
-
-      // Activate the new game's game-scoped managers (only when the game changed;
-      // an in-game swap keeps them running), then the new scene's scene-scoped
-      // managers. Awaited so async init (e.g. entity spawning) completes before
-      // loadScene resolves.
-      if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
-      await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
-
-      // 12. Done
+      // 12. Done — unless a teardown won the race somewhere in the post-swap tail
+      // above (#535 defect 1): the swap this load thought it committed has since
+      // been wiped by `unloadAll()`'s unconditional tail, so the caller must see
+      // a rejection, not a silent resolve over an empty world.
+      if (postSwapSuperseded) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
     } catch (err) {
       // Failure or abort — clean up every sceneId allocated THIS attempt (the
-      // primary plus any base newly entering the chain).
-      for (const sid of allocatedSceneIds) releaseAllForScene(sid);
+      // primary plus any base newly entering the chain). Skip once the swap has
+      // committed (`swapped`): this is NOT about avoiding a double-decrement —
+      // every owner map here is a `Set<SceneId>` and every release is
+      // preconditioned on `.has(sceneId)` (meshTemplateCache.ts's
+      // `releaseAllForScene`, audioBufferCache.ts, fontAtlasLoader.ts,
+      // riggedModelCache.ts), so a second `releaseAllForScene(sid)` for the same
+      // id is a strict no-op by construction, not a hazard. The real reason is
+      // ownership: once the swap has committed, `allocatedSceneIds` names the
+      // scene that is now LIVE and on screen (this catch fires because
+      // something AFTER the swap — e.g. a scene manager's `init()` — rejected,
+      // not because the swap itself failed). Releasing here would be the first
+      // and only decrement of resources still in use, dropping mesh templates/
+      // materials/textures/audio/fonts out from under the current scene while
+      // `loadedScenes` still lists it — exactly the #535 defect-1 failure mode.
+      // (If resource ownership is ever made count-based instead of `Set`-based —
+      // see the INVARIANT comment in meshTemplateCache.ts — this guard
+      // additionally becomes load-bearing in the double-decrement sense too.)
+      if (!swapped) {
+        for (const sid of allocatedSceneIds) releaseAllForScene(sid);
+      }
       if (nextWorld) {
         try { nextWorld.destroy(); } catch { /* ignore */ }
       }
@@ -906,7 +1220,8 @@ class SceneManagerImpl implements SceneManager {
    *  manifest may be missing entries like HDRs added after first
    *  serialization), pull in timeline-referenced audio/prefab refs, then
    *  iteratively walk prefabs (fetched + cached under `sceneId`) for THEIR OWN
-   *  nested resources. Mutates `sceneData.resources`/`.version` in place.
+   *  nested resources. Mutates `sceneData.resources` in place (and, since #807,
+   *  nothing else — it no longer touches `.version`).
    *
    *  Does NOT acquire anything — that's a separate pass in the caller so every
    *  toLoad scene's total is known before the first onProgress call. Without
@@ -917,6 +1232,7 @@ class SceneManagerImpl implements SceneManager {
     sceneId: SceneId,
     sceneData: SceneData,
     controller: AbortController,
+    enteredGeneration: LivenessCheck,
   ): Promise<SceneResourceRef[]> {
     const seen = new Set<string>();
     const allRefs: SceneResourceRef[] = [];
@@ -941,7 +1257,7 @@ class SceneManagerImpl implements SceneManager {
     // would go untracked at teardown.
     for (const tRef of allRefs.filter(r => r.type === 'timeline')) {
       const def = await loadTimelineNow(tRef.path);
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
       if (!def) continue;
       // The GUID goes in AS-IS — `acquireAudio` resolves it itself, exactly like prefabs and
       // video below, and exactly like every audio resource a scene file authors (checked: every
@@ -978,7 +1294,7 @@ class SceneManagerImpl implements SceneManager {
       prefabProcessed.add(prefabPath);
       // Acquire fetches the prefab JSON into the cache under this sceneId.
       await acquirePrefab(sceneId, prefabPath);
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
       const cached = getCachedPrefab(prefabPath) as { entities?: SceneEntityEntry[] } | null;
       if (!cached?.entities) continue;
       // Walk the prefab's entities — same collector as scene entities.
@@ -989,10 +1305,231 @@ class SceneManagerImpl implements SceneManager {
     }
 
     // Persist the merged manifest back onto the scene data so downstream code
-    // (the respawn call above, telemetry) sees the full picture.
+    // (the respawn call above, telemetry) sees the full picture. This is the
+    // real fact worth recording — "this scene now has a resources manifest" —
+    // and it belongs in `resources`, not `version`: a format version is a DATA
+    // FORMAT fact, not a place to note that a manifest was collected. Deleted the
+    // `sceneData.version = Math.max(sceneData.version ?? 6, 6)` raise that used to
+    // sit here (#807) — it ran before `loadSceneFile`'s migration ladder on this
+    // same object, so a v3/v4/v5 scene got stamped straight to 6 and the
+    // `migrateSceneData`/`migrateV4toV5`/`migrateV5toV6` rungs became no-ops.
+    // Safe to delete outright: `migrateV5toV6` only synthesizes `resources` when
+    // `!data.resources`, and `allRefs` is already assigned above, so removing the
+    // raise costs that rung nothing; the numeric-coercion half it also
+    // incidentally provided is handled upstream by `classifyFormatVersion`
+    // (`loadScene`'s caller loop, above) refusing `too-new`/`unreadable` before
+    // this method ever runs.
     sceneData.resources = allRefs;
-    sceneData.version = Math.max(sceneData.version ?? 6, 6);
     return allRefs;
+  }
+
+  /** Replace every entity in the live world with freshly-spawned content, THROUGH the
+   *  normal world-lifecycle contract — mint a staging world, populate it, promote it,
+   *  release and destroy the old one. `populate` spawns into the world it is handed.
+   *
+   *  This exists because `newScene()` used to delete-and-respawn in place, which is the
+   *  only way in the repo to replace all world content WITHOUT emitting a swap (#853).
+   *  `setCurrentWorld` is the engine's one signal for "every entity you were holding is
+   *  gone", and ~46 subscribers key their id-keyed teardown on it — the Hierarchy's
+   *  collapse restore, SceneView's gizmo/outline/collider maps, the 2D renderer
+   *  singleton's slot and last-render caches, the Timeline's Director-root rebind.
+   *  koota recycles entity ids LIFO and TOTALLY (destroy N, then the next N spawns take
+   *  those same ids in reverse), so none of that state merely goes stale — it aliases
+   *  exactly onto the new scene's entities.
+   *
+   *  Not a scene LOAD: no file is read, no resources are acquired, `loadedScenes` ends
+   *  empty and `getCurrent()` returns null. The caller owns the editor's scene path.
+   *
+   *  ⚠️ Do NOT reimplement this as `unloadAll()` + spawn. `unloadAll` is the shutdown
+   *  path: it drops every loaded scene's resources and resets the manager registry's
+   *  active scope, which a new-scene gesture must not do. (Until #877 it also promoted a
+   *  fresh world without freeing the old one — that half is fixed, and both now share
+   *  `destroyWorldWhenSafe`, so the koota-cap argument this warning used to rest on no
+   *  longer applies. The rest of it still does.) */
+  async replaceWorldContent(populate: (world: World) => void): Promise<void> {
+    // Unload-wins (#535), same head as `unloadAll()` and for the same reason: this drops
+    // every loaded scene, so a `loadScene()` racing it must not win. `teardownInFlight`
+    // rejects a load that STARTS during the awaits below; the token invalidation is what a
+    // load already mid-flight sees at its next checkpoint. The `finally` is load-bearing —
+    // a stuck counter would reject every later load forever.
+    this.teardownInFlight++;
+    this.teardownToken.invalidateAll();
+    try {
+      if (this.nextLoad) {
+        this.nextLoad.controller.abort();
+        releaseAllForScene(this.nextLoad.id);
+        this.nextLoad = null;
+      }
+
+      const oldPath = (this.primaryId !== null ? this.loadedScenes.get(this.primaryId)?.path : undefined) ?? '';
+      const oldWorld = getCurrentWorld();
+
+      const staging = createWorld();
+
+      try {
+        // ⚠️ POPULATE BEFORE PROMOTE, and this is load-bearing rather than stylistic.
+        // `aSceneSwapIsHappening()` is false on this path (nothing sets `nextLoad`), so the
+        // Hierarchy's settle-wait does not apply: a swap fired against an EMPTY world would
+        // let its restore latch `collapseOwnerRef` on a zero-length tree, and the content
+        // would then arrive with the owner already claimed — #839 by another route.
+        populate(staging);
+
+        // The two GLOBAL RESOURCE singletons, materialized exactly as `loadScene` does — same
+        // guard, same `Transient` on Time (see its block for the save-bake reasoning). Nothing
+        // else in the repo spawns either, so a world promoted without them is one where
+        // `inputSystem` and `timeSystem` both early-return on the missing resource and write
+        // nothing: the new scene reads as frozen and dead to input the moment you press Play.
+        //
+        // ⚠️ `Input` in particular would be a REGRESSION this method introduces, not a
+        // pre-existing gap: it is absent from the trait registry, so the old in-place
+        // `deleteEntities(getAllEntities()…)` never saw it and it survived by accident. A fresh
+        // world has no such accident. (`Time` was already being lost on this path.)
+        //
+        // GUARDED, not unconditional, because `populate` is caller-supplied and may author its
+        // own — hosting Time in a shared base scene is a supported setup. Two Time entities is
+        // not benign: `getTime()` is `queryFirst` and picks one, while `timeSystem`/`setTimeScale`
+        // iterate `query` and write BOTH, so a timeScale set through one is read from the other.
+        let hasTime = false;
+        staging.query(Time).updateEach(() => { hasTime = true; });
+        if (!hasTime) spawnEntity(staging, Time(), Transient);
+        let hasInput = false;
+        staging.query(Input).updateEach(() => { hasInput = true; });
+        if (!hasInput) spawnEntity(staging, Input());
+      } catch (e) {
+        // `populate` is caller-supplied and this method is on the public SceneManager
+        // interface. A throw here must not strand the staging world: it was never promoted, so
+        // nothing will ever destroy it, and koota's pool is 16 wide. Mirrors `loadScene`'s own
+        // `nextWorld.destroy()` failure path. Nothing above this point has touched the live
+        // world or any global, so the editor is left exactly as it was.
+        try { staging.destroy(); } catch { /* nothing else to do */ }
+        throw e;
+      }
+
+      // Only now that the new content exists: drop the outgoing world's global bookkeeping.
+      // ⚠️ These clear PROCESS-GLOBAL maps, not world-scoped ones, and nothing restores them —
+      // so they must sit AFTER the try, not before it. Cleared before a throwing `populate`
+      // they would leave the still-live scene with its prefab override marks gone, and the
+      // next save would then re-diff an explicitly-overridden field against the prefab base,
+      // find no difference, and silently drop the override — the exact defect override marks
+      // exist to prevent. The cost of this ordering: a future `populate` that itself seeds
+      // override marks would have them wiped here, so such a caller must clear them itself.
+      clearAllOverrideMarks();
+      clearAuthoredWritesWhileStopped();
+
+      // Scene-scoped managers, disposed while the OUTGOING world is still the current one.
+      // Game-scoped managers are deliberately left active: they survive in-game scene swaps by
+      // design, and an untitled new scene is not evidence the GAME changed — `loadScene()`
+      // disposes them only on a real `gameChanged`.
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: oldPath });
+
+      // Clear the registry's `activeScenePath`, the way `unloadAll` does — otherwise a
+      // `registerManager` arriving before the next real load matches the OUTGOING scene's path
+      // and activates that scene's manager. ⚠️ The self-heal `managerRegistry`'s #554 note
+      // relies on ("`initSceneManagersFor` has no `sceneChanged` gate, so this heals on the very
+      // next swap") does NOT apply here — this swap never calls it.
+      //
+      // ⚠️ POSITION IS THE CORRECTNESS ARGUMENT, not the two lines. `initSceneManagersFor('')`
+      // can spuriously re-activate a manager with no `scenes` filter (`sceneMatches` returns
+      // true for `''`), and `activate()` hands that manager's `init()` `getCurrentWorld()` —
+      // so this must run while that is still the OUTGOING world. `unloadAll` gets away with it
+      // because it promotes afterwards into a world nobody keeps; run AFTER the promote here,
+      // a filter-less manager's `init()` would spawn its entities straight into the brand-new
+      // scene the user is about to see, and the dispose below — holding `oldWorld` — could not
+      // see them to clean up. Hence the second dispose, on the same world as the activation.
+      await initSceneManagersFor('');
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
+
+      // Rebuild bookkeeping BEFORE `setCurrentWorld` — it fires `onWorldSwap` synchronously and
+      // the Hierarchy's handler reads `getLoadedScenes()` to label its scene groups. Same
+      // ordering rule, and same reason, as `loadScene()`'s swap.
+      const toDrop = [...this.loadedScenes.keys()];
+      this.loadedScenes.clear();
+      this.primaryId = null;
+      this.currentBaseScene = undefined;
+
+      // ⚠️ Same rule as `unloadAll`'s tail (#877): the world to FREE is the one current at the
+      // promote, read here — NOT `oldWorld`, which was captured before the three manager awaits
+      // above. This one is production-reachable, unlike `unloadAll`'s: two Create Scene gestures
+      // in quick succession (or two `new_scene` agent ops) both capture the same world, and
+      // whichever tail runs first frees it. The second would then free it AGAIN — koota's
+      // `releaseWorldId` is not idempotent: the freed id is popped by the world promoted next,
+      // and the second release pushes that same id back, so a later `createWorld()` hands it to
+      // a SECOND live world — and the world the first gesture promoted leaks. `oldWorld` stays the right argument
+      // for the DISPOSE calls above: those want the world their managers ran against.
+      const outgoing = getCurrentWorld();
+      setCurrentWorld(staging);
+
+      // Release immediately (owner, 2026-09-07), matching a real scene load rather than
+      // holding GPU memory for a scene that is no longer loaded and has no owner.
+      for (const sid of toDrop) releaseAllForScene(sid);
+
+      this.destroyWorldWhenSafe(outgoing, staging);
+
+      // Journal it — without this a full world replacement is SILENCE in the journal, awkward
+      // in a repo whose rule is observe, don't infer. Picks the event the same way `loadScene`
+      // does: `@scene-swapped` only when something was actually swapped OUT, so an empty `from`
+      // keeps meaning "there was no previous scene" rather than becoming a swap between two
+      // nameless scenes. `to` is empty because this promotes no scene FILE — the editor owns
+      // whatever path it is about to show.
+      if (oldPath) emit('@scene-swapped', { from: oldPath, to: '' }, staging);
+      else emit('@scene-loaded', { path: '' }, staging);
+    } finally {
+      this.teardownInFlight--;
+    }
+  }
+
+  /** Free `oldWorld`'s slot in koota's worldId pool, deferred behind any in-flight
+   *  manager init. Extracted so `loadScene()`'s swap tail and `replaceWorldContent()`
+   *  share ONE definition of the destroy discipline — a second copy would go stale on
+   *  the first change to either (#853).
+   *
+   *  No-op when the promoted world IS the old one. */
+  private destroyWorldWhenSafe(oldWorld: World, promotedWorld: World): void {
+    // Free the old world's slot in koota's worldId pool. koota caps total
+    // worlds at 16; without this, every scene swap permanently consumes a
+    // slot and the engine breaks after ~16 swaps.
+    const destroyOldWorld = () => {
+      try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
+    };
+    if (oldWorld !== promotedWorld) {
+      // #468: a SUPERSEDED load's game-scoped manager can still be inside an
+      // async init() holding `ctx.world === oldWorld` — its own load already
+      // passed `initGameManagersFor` before this later load committed its swap,
+      // and (see the comment below) nothing re-activates or awaits it from
+      // here. Defer the destroy until every in-flight manager init has
+      // settled, so that init never writes into an already-destroyed world.
+      // NOT awaited — a slow init (an LLM download is the documented case)
+      // must not block THIS load; the koota worldId slot is simply freed a
+      // little later, as soon as it is safe.
+      //
+      // Bounded, not open-ended: a manager init that never SETTLES (a hang, not a rejection —
+      // rejections are swallowed by `activate()`) would otherwise leave `pendingManagerInits()`
+      // non-null forever, chaining every LATER swap's destroy behind it and leaking a koota
+      // world slot on each one. Race against `WORLD_DESTROY_DEFER_MAX_MS` and destroy anyway
+      // when the timeout wins — see that constant's comment for the deliberate trade.
+      const inFlight = pendingManagerInits();
+      if (inFlight) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            console.warn(
+              `[SceneManager] old world destroy deferred past ${WORLD_DESTROY_DEFER_MAX_MS}ms `
+              + `waiting on an in-flight manager init — destroying anyway (see WORLD_DESTROY_DEFER_MAX_MS).`,
+            );
+            resolve();
+          }, WORLD_DESTROY_DEFER_MAX_MS);
+        });
+        void Promise.race([inFlight, timeout]).then(() => {
+          // Clear the timer either way — if `inFlight` won the race, an armed timer left
+          // behind would otherwise keep e.g. a test's fake-timer clock (or, in a headless
+          // Node run, the process itself) alive for no reason.
+          if (timer !== undefined) clearTimeout(timer);
+          destroyOldWorld();
+        });
+      } else {
+        destroyOldWorld();
+      }
+    }
   }
 
   /** For tests + shutdown. Releases everything and resets the manager.
@@ -1007,42 +1544,98 @@ class SceneManagerImpl implements SceneManager {
    *  dispose against the CURRENT (still-alive) world before swapping in the empty
    *  one, then clear both active scopes. */
   async unloadAll(): Promise<void> {
-    if (this.nextLoad) {
-      this.nextLoad.controller.abort();
-      releaseAllForScene(this.nextLoad.id);
-      this.nextLoad = null;
+    // Unload wins (#535): mark a teardown in flight AND invalidate the teardown token, both
+    // at the HEAD, before any await — alongside the existing `nextLoad` abort
+    // below. `teardownInFlight` is what `loadScene()` checks at ITS entry (a load
+    // that starts anywhere in the awaits below sees it non-zero and rejects
+    // immediately, before doing any work); the teardown token's invalidation is what a load
+    // ALREADY mid-flight sees at its next `signal.aborted` checkpoint. The
+    // `finally` below is load-bearing: if anything in the body throws, the counter
+    // must still return to zero, or every `loadScene()` after would reject
+    // forever — a worse bug than the race being fixed here.
+    this.teardownInFlight++;
+    this.teardownToken.invalidateAll();
+    try {
+      if (this.nextLoad) {
+        this.nextLoad.controller.abort();
+        releaseAllForScene(this.nextLoad.id);
+        this.nextLoad = null;
+      }
+
+      // Dispose active managers against the world they were running on, before it
+      // is replaced below. Order mirrors the swap path: game scope first, then
+      // scene scope. Pass the still-current world + path so a dispose() that tears
+      // down world-bound state hits the right world.
+      const oldWorld = getCurrentWorld();
+      const oldPath = (this.primaryId !== null ? this.loadedScenes.get(this.primaryId)?.path : undefined) ?? '';
+      await disposeActiveGameManagers({ world: oldWorld, scenePath: oldPath });
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: oldPath });
+
+      // Reset the registry's active scope state so a subsequent loadScene (or a
+      // post-teardown registerManager) doesn't see a stale activeGameId /
+      // activeScenePath. `activeGameId` is already null by here — `disposeActive-
+      // GameManagers` (#539) clears it synchronously at its own head, before the
+      // await above — so this call's `null` is a no-op restatement for that field;
+      // it still does the real work of clearing `activeScenePath` (managerRegistry
+      // exposes no dedicated reset, so drive it through its existing public
+      // surface: initGameManagersFor(null) activates nothing, it early-returns on
+      // null; initSceneManagersFor('') sets activeScenePath = ''). The latter can
+      // spuriously (re)activate a scene manager that has no `scenes` filter
+      // (matches any path), so dispose scene managers once more afterward to leave
+      // everything inactive.
+      await initGameManagersFor(null, '');
+      await initSceneManagersFor('');
+      await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
+
+      // Release every loaded scene (today, a chain of one — Phase 5 is what makes
+      // this map hold more than the primary). Unconditional — teardown is
+      // authoritative and is never undone by a load that raced in behind it
+      // (#535, unload wins): a `loadScene()` racing any of the awaits above either
+      // already rejected at its entry (`teardownInFlight`) or will reject at its
+      // next checkpoint (the teardown token's invalidation), so nothing here needs to check
+      // `this.primaryId` before clearing it.
+      for (const sceneId of this.loadedScenes.keys()) releaseAllForScene(sceneId);
+      this.loadedScenes.clear();
+      this.primaryId = null;
+      this.currentBaseScene = undefined;
+      // Hand the world registry a fresh empty world so subsequent code doesn't
+      // see stale entities, and free the slot of the one it replaces (#877) —
+      // the same destroy discipline the other two promoters share.
+      //
+      // ⚠️ RE-READ the current world HERE; do NOT reuse `oldWorld` from this
+      // method's head. That capture is five awaits old, and the two OTHER async
+      // promoters that can run inside those awaits — a second `unloadAll()`, and
+      // `replaceWorldContent()` — each promote a world of their own and destroy
+      // what they replaced. Neither refuses while a teardown is in flight
+      // (`teardownInFlight` is a counter both merely bump, not a lock), so a
+      // second teardown starting during our awaits captures the SAME world we
+      // did, and whichever tail runs first frees it. Reusing `oldWorld` would
+      // then (a) free it a second time — koota's `releaseWorldId` is NOT
+      // idempotent: the freed id is popped by the world promoted next, and the
+      // second release pushes that same id back onto `releasedWorldIds`, so a
+      // later `createWorld()` hands it to a SECOND live world. Strictly worse
+      // than the leak this fixes — and (b) leak the world that is actually
+      // current. Regression cover: sceneManagerWorldSlots.test.ts's
+      // "two teardowns racing free each world exactly once".
+      //
+      // NOT the `loadScene` race, despite the shape: a load cannot commit its
+      // swap inside our awaits at all. Its last pre-swap checkpoint and its
+      // `setCurrentWorld` sit in one await-free stretch, so a load either swapped
+      // before our head ran (and IS our `oldWorld`) or is stopped at that
+      // checkpoint by the token this method invalidated.
+      const outgoing = getCurrentWorld();
+      const fresh = createWorld();
+      setCurrentWorld(fresh);
+      // Deferred behind in-flight manager inits, not immediate: the disposes
+      // above only touch scene- and game-scoped managers, so an APP-scoped
+      // manager (never disposed here — it activates at `registerManager` and
+      // stays active) can be inside an async `init()` holding `outgoing` as its
+      // `ctx.world` right now. `pendingManagerInits()` is exactly that set, and
+      // it is empty on the ordinary path, where this destroys synchronously.
+      this.destroyWorldWhenSafe(outgoing, fresh);
+    } finally {
+      this.teardownInFlight--;
     }
-
-    // Dispose active managers against the world they were running on, before it
-    // is replaced below. Order mirrors the swap path: game scope first, then
-    // scene scope. Pass the still-current world + path so a dispose() that tears
-    // down world-bound state hits the right world.
-    const oldWorld = getCurrentWorld();
-    const oldPath = (this.primaryId !== null ? this.loadedScenes.get(this.primaryId)?.path : undefined) ?? '';
-    await disposeActiveGameManagers({ world: oldWorld, scenePath: oldPath });
-    await disposeActiveSceneManagers({ world: oldWorld, scenePath: oldPath });
-
-    // Reset the registry's active scope state so a subsequent loadScene (or a
-    // post-teardown registerManager) doesn't see a stale activeGameId /
-    // activeScenePath. managerRegistry exposes no dedicated reset, so drive it
-    // through its existing public surface: initGameManagersFor(null) sets
-    // activeGameId = null and activates nothing (it early-returns on null);
-    // initSceneManagersFor('') sets activeScenePath = ''. The latter can spuriously
-    // (re)activate a scene manager that has no `scenes` filter (matches any path),
-    // so dispose scene managers once more afterward to leave everything inactive.
-    await initGameManagersFor(null, '');
-    await initSceneManagersFor('');
-    await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
-
-    // Release every loaded scene (today, a chain of one — Phase 5 is what makes
-    // this map hold more than the primary).
-    for (const sceneId of this.loadedScenes.keys()) releaseAllForScene(sceneId);
-    this.loadedScenes.clear();
-    this.primaryId = null;
-    this.currentBaseScene = undefined;
-    // Hand the world registry a fresh empty world so subsequent code doesn't
-    // see stale entities. Tests typically reset modules instead.
-    setCurrentWorld(createWorld());
   }
 
   /** For tests: reset the sceneId counter so test runs are deterministic. */
@@ -1053,6 +1646,8 @@ class SceneManagerImpl implements SceneManager {
     this.currentBaseScene = undefined;
     this.nextLoad = null;
     this.basesWithPrefabInstance.clear();
+    this.teardownInFlight = 0;
+    this.teardownToken.invalidateAll();
   }
 }
 

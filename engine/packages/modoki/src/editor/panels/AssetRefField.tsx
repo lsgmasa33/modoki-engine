@@ -11,25 +11,46 @@ import { fontPathFromFamily, loadFont } from '../../runtime/loaders/fontLoader';
 import { isGuid, isExternalUrl, resolveGuidToPath, getGuidForPath, getAllAssets, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { BufferedTextInput, Tooltip, inputStyle, MIXED_PLACEHOLDER } from './fields';
 import { acceptMatchesAsset } from '../utils/dragGhost';
-import { classifyJsonAssetSuffix } from '../../runtime/loaders/assetTypeClassifier';
+import { classifyJsonAssetSuffix, classifyBinaryExt } from '../../runtime/loaders/assetTypeClassifier';
 import { SpritePicker } from './SpritePicker';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { FontPicker } from './FontPicker';
 
-/** Infer asset type from file extension. The JSON asset kinds come from the shared
- *  classifier (assetTypeClassifier) — the same single source of truth the asset
- *  scanner + tree-shaker use — so this can't drift (it previously lacked
- *  `.animset.json`/`.shader.json` and mislabeled them 'unknown'). */
+/** Infer asset type from a file path, using the shared classifier (assetTypeClassifier) for
+ *  BOTH halves — the same single source of truth the asset scanner + tree-shaker use.
+ *
+ *  ⚠️ The binary half used to be a hand-written regex ladder while only the JSON half was
+ *  shared, and the docstring claimed the whole function couldn't drift. It had drifted: `.fbx`,
+ *  `.exr` and every video container read as 'unknown' here while the build classified them
+ *  correctly, so "Locate in Assets" and Find References mislabelled them (#417). Pinned by
+ *  tests/editor/assetTypeFromPath.test.ts, which iterates both shared tables.
+ *
+ *  Returns 'unknown' for a file the asset pipeline does not manage — including the
+ *  scanner-only import sources `.obj`/`.dae`, which are deliberately absent from
+ *  BINARY_EXT_TYPE (scenes reference the converted GLB, never the source). */
 export function assetTypeFromPath(path: string): string {
   const jsonType = classifyJsonAssetSuffix(path);
   if (jsonType) return jsonType;
-  if (path.endsWith('.scene.json')) return 'scene';
-  if (path.endsWith('.hdr')) return 'environment';
-  if (/\.(png|jpe?g|webp)$/i.test(path)) return 'texture';
-  if (/\.(glb|gltf)$/i.test(path)) return 'model';
-  if (/\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(path)) return 'audio';
-  if (/\.(ttf|otf|woff2?)$/i.test(path)) return 'font';
+  const binaryType = classifyBinaryExt(path);
+  if (binaryType) return binaryType;
   return 'unknown';
+}
+
+/** The `SelectedAsset.type` to use when navigating TO a path — e.g. "Locate in Assets",
+ *  "Open in editor", Find References. Prefers the live asset MANIFEST's own type
+ *  (`getAssetEntry`) over `assetTypeFromPath`'s classifier, falling back to the classifier
+ *  only when the manifest has no entry for the path.
+ *
+ *  The two deliberately disagree for a scanner-only import source like `.obj`/`.dae`:
+ *  `assetTypeFromPath` reports 'unknown' (correct for the tree-shaker/asset-pipeline
+ *  question it answers — see its own docstring), but the manifest types it 'model' (the
+ *  Assets panel offers "Import Model" for it, per `vite-asset-scanner.ts`'s EXT_TYPE). A
+ *  call site that stuffs `assetTypeFromPath`'s answer into `SelectedAsset.type` sends the
+ *  Inspector a type it has no importer section for (#423) — dead for exactly the files
+ *  clicking the SAME path in the Assets tree renders correctly. The manifest is the same
+ *  source the Assets tree itself reads from, so this makes both routes to one file agree. */
+export function selectedAssetTypeFor(path: string): string {
+  return getAssetEntry(path)?.type ?? assetTypeFromPath(path);
 }
 
 /** Friendly name for an asset path — basename without its (possibly double)
@@ -60,7 +81,7 @@ export function isAcceptableTypedRef(v: string, accept?: string[]): boolean {
   return false;
 }
 
-export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, editorPanel }: {
+export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, editorPanel, dataUiId, dataUiLabel }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
@@ -78,6 +99,17 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   /** This is a CSS-font-FAMILY field (`UIElement.fontFamily`, DOM/UI text), so a
    *  dropped font resolves to its family NAME. Default false: SDF font fields
    *  (`Text2D`/`Text3D.font`) store the asset GUID like every other asset ref. */
+  /** Caller-owned handle id — the same logical value renders as one of THREE mutually
+   *  exclusive states (mixed / a read-only GUID-name display / an editable text field),
+   *  so this is applied to all three rather than just the BufferedTextInput branches;
+   *  they never render together, so there is no duplicate-id collision.
+   *
+   *  REQUIRED (#724 close-out) — `findBufferedInputs` (chromeTagging.test.ts) can only see a
+   *  literal Buffered-input JSX tag, so it is blind to every caller of THIS helper. An optional
+   *  prop here let 8+ call sites go untagged with the suite green; making it required moves the
+   *  guard from a regex scan to the type checker, which cannot be out-parsed. */
+  dataUiId: string;
+  dataUiLabel?: string;
 }) {
   const divRef = useRef<HTMLDivElement>(null);
   const onChangeRef = useRef(onChange);
@@ -170,7 +202,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   const locateAsset = () => {
     if (!targetPath) return;
     const name = targetPath.substring(targetPath.lastIndexOf('/') + 1);
-    selectAsset({ path: targetPath, type: assetTypeFromPath(targetPath), name });
+    selectAsset({ path: targetPath, type: selectedAssetTypeFor(targetPath), name });
   };
   // Open in the game's asset editor panel: select the asset (retargets a
   // selection-driven panel like the Level Editor) THEN dock/focus that panel.
@@ -178,7 +210,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   const openInPanel = () => {
     if (!targetPath || !editorPanel) return;
     const name = targetPath.substring(targetPath.lastIndexOf('/') + 1);
-    selectAsset({ path: targetPath, type: assetTypeFromPath(targetPath), name });
+    selectAsset({ path: targetPath, type: selectedAssetTypeFor(targetPath), name });
     openPanel(editorPanel);
   };
 
@@ -218,7 +250,8 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
       {mixed ? (
         <BufferedTextInput value="" onChange={onChange} mixed placeholder={MIXED_PLACEHOLDER}
           validate={(v) => isAcceptableTypedRef(v, accept)}
-          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
+          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }}
+          dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
       ) : refName !== null ? (
         <Tooltip text={refTooltip} style={{ flex: 1, display: 'flex' }}>
           <input type="text" readOnly value={refName}
@@ -228,12 +261,14 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
               // but Backspace/Delete clears the reference when it's focused.
               if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); onChange(''); }
             }}
-            style={{ ...inputStyle, flex: 1, width: '100%', color: inputColor, fontWeight: inputWeight, background: '#1a1a2e', cursor: 'help' }} />
+            style={{ ...inputStyle, flex: 1, width: '100%', color: inputColor, fontWeight: inputWeight, background: '#1a1a2e', cursor: 'help' }}
+            data-ui-id={dataUiId} data-ui-label={dataUiLabel} />
         </Tooltip>
       ) : (
         <BufferedTextInput value={value} onChange={onChange} placeholder={placeholder}
           validate={(v) => isAcceptableTypedRef(v, accept)}
-          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
+          style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }}
+          dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
       )}
       {acceptsSprite && (
         <button

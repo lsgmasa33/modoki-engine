@@ -240,6 +240,12 @@ the prerequisite for PixiJS `ParticleContainer` batching and a 2D draw-call win.
 The authored source (`AtlasSource` — `id`, `members`, `pageSize`, `padding`,
 `extrude`, optional `maxPages`/`texture`) is committed; all derived bookkeeping
 lives in the `.meta.json` sidecar's `atlasCache` block, never in the source.
+Its DEFAULTS have one home — `defaultAtlasSource()` in `runtime/loaders/spriteAtlas.ts`
+— read by the Create-Atlas button, the Atlas inspector (initial doc *and* per-field
+read fallbacks) and the build-time reimport handler. They were inlined in all four
+places until #423; a source-level guard (`tests/editor/atlasCreateParity.test.ts`)
+now fails if a consumer goes back to its own literal, because two constants that
+agree today are indistinguishable to a runtime assertion.
 
 - **Packer (pure)** — `runtime/loaders/spriteAtlas.ts` `packAtlas()` is a
   MaxRects **Best-Short-Side-Fit** bin-packer with zero THREE/DOM/sharp/Vite
@@ -396,6 +402,18 @@ pixels a device downloads and uploads.
   loading; a live tier change is picked up by the NEXT load, not an in-place swap.
 
 ## Environment maps (HDR / UltraHDR)
+
+> This section is where the HDR/UltraHDR pipeline lives. A standalone `docs/environment-maps.md`
+> was cited before it existed and never got written — the pipeline is here instead, so there is
+> nothing missing to go and find.
+>
+> Provenance, stated exactly because the tidy version of it is wrong: the asset-import work (the
+> `.meta.json` sidecar, the reimport registry, the Inspector asset views) came from
+> `docs/plans/asset-inspector-plan.md`, whose Phases 1-4b landed. Its **Phase 5 — "Docs + polish"
+> — never did**: the tracker was deleted in `c9ebdb38d` with all three of its items still
+> unchecked, the first being "fold this into the asset docs". This section was written by that
+> same commit, not by the phase that was supposed to write it. The model side is in
+> [model-pipeline.md](./model-pipeline.md).
 
 `.hdr` classifies as asset type `environment`, gets a GUID-only `.meta.json`, and goes through the
 same generic reimport/manifest/cache plumbing as every other asset type (reimport-registry, meta

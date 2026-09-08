@@ -61,9 +61,13 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // The whole risk of a forward capture inside a backend route: `ios syslog` never exits on its
     // own, so without the timer this hangs the editor's request until the socket dies.
     const goIos = stubGoIos(line('still going'))
-    const started = Date.now()
     const cap = await captureIosSyslog({ udid: 'x', seconds: 1, goIos })
-    expect(Date.now() - started).toBeLessThan(5_000)
+    // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). This ran a REAL 1 s timer plus a process
+    // spawn against a 5 s assertion — 5x headroom on an I/O-shaped wait, the thinnest margin of the
+    // four sites #751's sweep found. It could not catch anything the harness does not already catch
+    // (`testTimeout` is 20 s, 60 s on Windows, so a stream that never ends fails as a timeout), and
+    // the two assertions below are what actually prove the capture was BOUNDED: it came back, with
+    // the window it used and the lines it read.
     expect(cap.capturedFor).toBe(1)
     expect(cap.lines).toEqual(['still going'])
   })

@@ -26,7 +26,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
-import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256 } from '../meta-sidecar';
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -170,6 +170,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { decodeSceneOpsReply } from './sceneOpsReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
 // message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
@@ -177,17 +178,45 @@ import {
   getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData,
   ASSET_SCHEMA_TYPES, type AssetSchemaType,
 } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
+import { PARTICLE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/particles/types';
+import { MATERIAL_FORMAT_VERSION } from '../../packages/modoki/src/runtime/traits/Renderable3D';
+import { ATLAS_FORMAT_VERSION } from '../../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
+// Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
+// itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
+// `tsconfig.node.json`'s `lib: ["ES2023"]` (no DOM) — importing anything from `frameDriver.ts`
+// (even `import type`) pulls its whole `document`/`requestAnimationFrame`-using file into that
+// program and fails `tsc -b engine` (confirmed: `document`/`DOMHighResTimeStamp`/etc. unresolvable
+// there). See `frameLoopStatus.ts`'s header for the full story. Its whole purpose here is
+// `refuseUndeliverableDeviceInput`'s `InputDeliverabilityReply.frameLoop.status` field below, which
+// used to be a locally re-declared `string` — see that interface's comment for why a bare `string`
+// silently disarms the guard on a rename that `bridge.ts`'s type-checked twin would catch.
+import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
+
+// Format-version constant per `AssetSchemaType`, for /api/asset-write's too-new/unreadable
+// refusal (docs/format-versioning.md § 2b). Only types that actually carry a stamped `version`
+// field belong here — `.anim.json`, `.spriteanim.json`, `.timeline.json` and `.rig2d.json`
+// don't (§ 3), so they are deliberately absent rather than mapped to an invented constant.
+const ASSET_WRITE_FORMAT_VERSION: Partial<Record<AssetSchemaType, number>> = {
+  material: MATERIAL_FORMAT_VERSION,
+  particle: PARTICLE_FORMAT_VERSION,
+  // #831: `.atlas.json` came onto this route when AtlasAssetView stopped autosaving. It carries a
+  // stamped `version`, and the PANEL already refuses a too-new one client-side
+  // (`classifyAtlasLoad`) — so without this row the refusal lived only in the UI and an agent's
+  // `modoki_write_asset` could overwrite a document this build cannot read.
+  atlas: ATLAS_FORMAT_VERSION,
+};
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
-import { adbBinary, isUsable, listAndroidDevices, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
+import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
-import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
+import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM, isCdpRoutableMethod } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
 import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
 import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
-import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform } from './goIosDevice';
+import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform, leaseForIosOps } from './goIosDevice';
 import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
 import { listCrashReports, fetchCrashReport, filterCrashReports, summarizeCrashReport, RAW_CHARS_MAX } from './deviceCrashReports';
 import { resolveModules } from '../detect-modules';
@@ -195,6 +224,8 @@ import { resolveModules } from '../detect-modules';
 // vite-asset-scanner import) into this host-agnostic router.
 import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
 import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
+// The ONE 'same directory / inside it?' comparison (#869, #881) — see engine/scripts/pathIdentity.mjs.
+import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -330,7 +361,8 @@ function hasKeyPath(o: unknown, keyPath: string): boolean {
 //   • `unsavedChanges: true` is now the normal state after any agent edit;
 //   • `modoki_build` refuses while unsaved, and the file-direct path 409s while unsaved — both
 //     now routine rather than rare, so their messages must keep naming `modoki_save_all`;
-//   • a game-code edit force-reloads the editor and DISCARDS unsaved scene edits (CLAUDE.md),
+//   • a game-code edit force-reloads the editor and DISCARDS unsaved work of every kind — scene
+//     edits, parked asset docs, and parked import settings alike (CLAUDE.md; #850),
 //     so accumulated unsaved work is more exposed than it was under `auto`.
 export type PersistenceMode = 'manual';
 export const PERSISTENCE_MODE: PersistenceMode = 'manual';
@@ -350,9 +382,83 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
   return file;
 }
 
+/** Strip a leading UTF-8 BOM (EF BB BF), if present. `/api/write-file`'s `ifMatch` precondition
+ *  hashes the raw file buffer — this makes that agree with the browser's `Response.text()`,
+ *  which strips a leading BOM as part of decoding (#490 review finding 2). */
+function stripUtf8Bom(buf: Buffer): Buffer {
+  return (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) ? buf.subarray(3) : buf;
+}
+
+/** The `ifMatch` precondition, shared by `/api/write-file` and `/api/asset-write` (#469, #831).
+ *
+ *  Returns null when the caller may proceed, or the 409 body when it may not. `expected` is a
+ *  sha256 of the file's bytes as the CLIENT last read them; a caller that omits it gets an
+ *  unconditional write, exactly as before.
+ *
+ *  ⚠️ **ATOMICITY IS THE ENTIRE POINT, and it is a property of the CALL SITE, not of this
+ *  function.** The read + hash + compare here are synchronous, and Node is single-threaded, so
+ *  nothing can interleave between this returning `null` and the caller's write — PROVIDED the
+ *  caller does not `await` in between. An `await` inserted between this call and the write
+ *  reopens exactly the race the precondition exists to close, and neither the type checker nor a
+ *  unit test can see it. This closes SAME-PROCESS races (every editor panel); a genuinely
+ *  external writer (another process, `git checkout`) can still land between the hash and the
+ *  write at the OS level — a much narrower window than before, and not what #469 is about.
+ *
+ *  A leading UTF-8 BOM is stripped before hashing so this agrees with the CLIENT side (#490
+ *  review finding 2): the browser's `Response.text()` strips a leading BOM as part of decoding,
+ *  so a BOM'd file — a Windows-authored `.atlas.json`, say — would otherwise hash differently
+ *  here than the panel's own baseline FOREVER, 409ing on every write with no way to succeed. */
+function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: false; conflict: true; reason: string } | null {
+  if (expected === undefined) return null;
+  let currentBytes: Buffer | null;
+  try { currentBytes = fs.readFileSync(absPath); } catch { currentBytes = null; }
+  const currentHash = currentBytes === null ? null : crypto.createHash('sha256').update(stripUtf8Bom(currentBytes)).digest('hex');
+  if (currentHash === null || currentHash !== expected) return { ok: false, conflict: true, reason: 'if-match' };
+  return null;
+}
+
+/** The EXACT bytes a JSON document write puts on disk — the single definition of that, used by
+ *  every JSON write this backend (or its client counterpart) makes: scenes, prefabs, layouts,
+ *  the AI-settings file, and every `ASSET_SCHEMA_TYPES` document alike (#831, converged with the
+ *  client seam in #835 — see the history note below).
+ *
+ *  ⚠️ **The trailing `\n` is load-bearing twice over.** Every committed asset JSON is authored
+ *  with one and `JSON.stringify` emits none, so each editor write silently stripped it and turned
+ *  a one-field edit into a diff carrying `\ No newline at end of file`. Measured 2026-09-06:
+ *  242 of 322 committed asset docs had already lost it this way. Existing files converge as they
+ *  are next written; #835 commit 2 additionally sweeps the scene/prefab corpus once, as its own
+ *  dedicated commit — see that commit's message for why it stayed separate from this one.
+ *
+ *  ⚠️ **And the self-write guard fingerprints these bytes.** `markEditorWrite(abs, sha1(bytes))`
+ *  lets the watcher skip the editor's own save; a fingerprint that does not match what actually
+ *  lands FAILS OPEN — the change event comes back ~150ms later, is read as an EXTERNAL edit, and
+ *  `dropParkedWriteFor` discards whatever the human had parked. Silent data loss in the authoring
+ *  path. That is why the serialisation lives HERE and every caller and fingerprint reads it,
+ *  rather than each site spelling out `JSON.stringify(x, null, 2)` and being kept in step by hand.
+ *  `assetJsonBytesAgree.test.ts` asserts the writer and the fingerprints cannot drift.
+ *
+ *  ⚠️ **This used to be two functions.** A scene is written from two places — this route
+ *  (`/api/scene-mutate`) and the editor's own save, which serialises client-side
+ *  (`editor/scene/serialize.ts`) and POSTs the finished string to `/api/write-file` — and until
+ *  #835 the client side emitted no trailing newline, on purpose, so a separate `sceneJsonBytes`
+ *  (no newline) covered the scene/prefab/layout/AI-settings writers to agree with it: if only ONE
+ *  side gained a newline they would fight forever, an agent's write adding it and the next Cmd+S
+ *  stripping it. #835 moved the client seam onto this same byte shape (`jsonFileBody` in
+ *  `editor/backend/editorBackend.ts` — the client mirror of this function), so the split has
+ *  nothing left to agree with: `sceneJsonBytes` is gone and every writer below uses this one
+ *  function. */
+export function assetJsonBytes(data: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(data, null, 2)}\n`);
+}
+
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
- *  local to avoid an import cycle.) */
-function writeJsonAtomic(absPath: string, data: unknown): void {
+ *  local to avoid an import cycle.)
+ *
+ *  ⚠️ Takes BYTES, not a document — every caller composes them with {@link assetJsonBytes}
+ *  first, the one definition (#831/#835), rather than spelling out its own
+ *  `JSON.stringify(x, null, 2)`. It used to take the document and serialise it itself, which is
+ *  how a caller could silently pick the wrong bytes for what it was writing. */
+function writeJsonAtomic(absPath: string, bytes: Buffer): void {
   // mkdir -p first, exactly as /api/write-file does. Without it /api/create-asset
   // threw a raw ENOENT 500 whenever the target folder did not exist yet — while
   // the sibling endpoint happily created it, so which of the two you called
@@ -360,7 +466,7 @@ function writeJsonAtomic(absPath: string, data: unknown): void {
   const dir = path.dirname(absPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmp = absPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.writeFileSync(tmp, bytes);
   fs.renameSync(tmp, absPath);
 }
 
@@ -520,10 +626,322 @@ function makeAssetResolver(ctx: BackendContext): AssetRefResolver | undefined {
   return makeAssetRefResolver(assets.map((a) => a?.guid));
 }
 
+/** #682 close-out (HIGH 1): refuse a trusted-input dispatch BEFORE spending a CDP/WDA/synthetic
+ *  round trip on it, when the device's own frame loop cannot actually deliver it — the false
+ *  "ok … [input:trusted-cdp]" over a dead rAF chain that #682 exists to close.
+ *
+ *  THIS is the one seam every CDP-routable method (tap/drag/press-key/hover/scroll) passes
+ *  through regardless of transport, and that is why the guard lives here rather than in
+ *  `bridge.ts`'s `handleResolveAim`: the CDP/WDA routes resolve their aim (`resolve-aim`, an
+ *  in-page round trip) for tap/drag/hover/scroll, but `press-key` has no coordinates to resolve
+ *  and never makes that round trip at all — `tryDeviceCdpInput`'s `press-key` case dispatches
+ *  straight over the CDP session. A guard placed only in `handleResolveAim` would therefore
+ *  still miss press-key; this dispatch, which every one of the five reaches before any transport
+ *  is chosen, does not. `bridge.ts`'s own per-handler `frameLoopRefusal` already covers the
+ *  pure-synthetic path (no CDP/WDA session available at all) — this is belt and braces for that
+ *  case, and the only guard for the trusted ones.
+ *
+ *  Reuses the existing `input-deliverability` op (agentBridge.ts) rather than inventing a new
+ *  round trip: it already exists to ask the page "can input be delivered right now" for the
+ *  editor's own Chromium-occlusion check, its registry answers over every transport the device
+ *  bridge reaches (bridge.ts's `delegateToAgentOps` default case), and it now also reports
+ *  `getFrameLoopHealth()`.
+ *
+ *  Message text intentionally mirrors bridge.ts's `frameLoopRefusal` — duplicated, not shared.
+ *  ⚠️ NOT because there is nothing importable across the two processes (this file is the Node
+ *  backend; that one runs in-page) — that claim stopped being true once `tools/shared/` became a
+ *  real cross-process seam: this very file already reaches into it (`mcpResult.ts`'s `ErrorCode`
+ *  above), and `agentBridge.ts` — an in-page, device-shipped bundle, the same side of the process
+ *  boundary as `bridge.ts` — value-imports `tools/shared/simStepTiming.ts` (#822). A shared helper
+ *  there could serve both call sites; this one just hasn't been extracted. Keep the wording in
+ *  sync BY HAND until it is — a future edit to either message must update the other.
+ *
+ *  Fails OPEN on anything it cannot read as a `frameLoop` fact — a proxy throw, an app build
+ *  predating this field (or the op itself), an unparseable reply — the same "never refuse input
+ *  over a stale/absent probe" rule `releaseHeldBeforeTrustedGesture` (deviceCdp.ts) already
+ *  follows for its own best-effort device round trip.
+ *
+ *  ⚠️ Only `status` is typed against the shared leaf (`FrameLoopStatus`) below — `unrecoverable`,
+ *  `detail` and `msSinceLastFrame` stay hand-typed optionals with no shared source, so a wire-key
+ *  rename on the sender's side (agentBridge.ts's `input-deliverability` op) for any of those three
+ *  fields would NOT redden here: `obj.frameLoop?.unrecoverable` would just read `undefined` and
+ *  the "fails OPEN on anything it cannot read" behaviour above would swallow the drift silently.
+ *  Not a defect today (#682 close-out round 3, BLOCKER 2 follow-up) — noted so a future rename
+ *  doesn't trust this interface to catch it. */
+interface InputDeliverabilityReply {
+  frameLoop?: { status?: FrameLoopStatus; unrecoverable?: boolean; detail?: string; msSinceLastFrame?: number };
+}
+
+async function refuseUndeliverableDeviceInput(method: string, deadlineMs?: number): Promise<string | null> {
+  if (!isCdpRoutableMethod(method)) return null;
+  let raw: unknown;
+  // `deadlineMs` is the SAME op-sized transport deadline `/api/device/request`'s own `proxy`
+  // helper already computes (#153) from the request's `params.timeoutMs` (line ~1014 above) —
+  // passed through rather than left to the connection's flat 5000ms default. ⚠️ Narrower than it
+  // sounds: none of the CDP-routable input tools (tap/drag/press-key/hover/scroll) actually SEND
+  // `timeoutMs`, so `deadlineMs` is `undefined` for every real caller today and this probe still
+  // rides the flat 5000ms default — the extra-round-trip cost this comment describes only bites a
+  // caller that supplies `timeoutMs` (LOW 5, #682 close-out round 3).
+  try { raw = await deviceConnection.proxy('input-deliverability', {}, deadlineMs); } catch { return null; }
+  if (isDeviceFailureReply(raw)) return null; // old bridge, or the op genuinely errored — fall through
+  let obj: InputDeliverabilityReply;
+  try { obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as InputDeliverabilityReply; } catch { return null; }
+  const fl = obj?.frameLoop;
+  if (!fl || (fl.status !== 'stalled' && !fl.unrecoverable)) return null;
+  return `Error: refusing ${method} — ${fl.detail ?? `the frame loop has not ticked for ${fl.msSinceLastFrame}ms`} `
+    + 'Dispatching this input now would report success while the game never receives it.';
+}
+
 /**
  * Dispatch a backend request. Returns a BackendResult, or `null` if the path is
  * not a router-owned `/api/*` route (the host then handles it or calls next()).
  */
+/** Every absolute path a move will make APPEAR, paired with the sha1 of the bytes landing there
+ *  (or `null` for a TTL-only mark). Computed BEFORE the move, while the bytes are still readable.
+ *
+ *  A file move lands one path and is hashed, which is the case a parked asset edit rides on and
+ *  worth the read. A FOLDER move lands every descendant; those are marked TTL-only rather than
+ *  hashed, because reading a whole subtree to guard a 1500ms window is the wrong trade — and
+ *  before #867 they were not marked at all, which is strictly worse than either. */
+function plannedMoveLandings(absFrom: string, absTo: string, isDir: boolean): Array<[string, string | null]> {
+  if (!isDir) {
+    try {
+      const bytes = fs.readFileSync(absFrom);
+      return [[absTo, crypto.createHash('sha1').update(bytes).digest('hex')]];
+    } catch {
+      // Unreadable for some other reason — still mark the destination, TTL-only.
+      return [[absTo, null]];
+    }
+  }
+  const out: Array<[string, string | null]> = [];
+  const walk = (dir: string, rel: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), childRel);
+      else {
+        out.push([path.join(absTo, childRel), null]);
+        // ⚠️ And the child's OLD path. chokidar emits a per-CHILD `unlink` for a directory
+        // rename, not one event for the directory — so marking only the directory's own path
+        // leaves every child's unlink looking like a foreign change, `classifySceneChange`
+        // recognizes it, and `dropParkedWriteFor(oldChildPath)` discards a human's unsaved edit.
+        // The repair normally wins that race by ~150ms, which is not a reason to leave it open.
+        out.push([path.join(absFrom, childRel), null]);
+      }
+    }
+  };
+  walk(absFrom, '');
+  return out;
+}
+
+/** Ask the renderer to run the move repair (#867 member 1).
+ *
+ *  Returns the repair's own notes, or `null` when there was no renderer to ask — which is a normal
+ *  state, not an error: a CLI invocation, a backend with no editor attached, or a game runtime
+ *  where the editor ops were never registered. The FILE move has already happened and stands
+ *  either way; all that is lost is in-memory state that does not exist in those cases. So this
+ *  swallows, deliberately, rather than turning a successful move into a 5xx. */
+type RepairOutcome =
+  | { kind: 'applied'; notes: string[] }
+  /** No renderer to repair — a CLI call, no editor attached, or a runtime without the op.
+   *  There is no in-memory state in those cases, so nothing was lost. */
+  | { kind: 'absent' }
+  /** A renderer may well be attached and the repair did NOT run. This is the one that matters:
+   *  the file moved and the editor's path-keyed state did not follow it. */
+  | { kind: 'unrepaired'; reason: string };
+
+async function applyMovesInRenderer(
+  ctx: BackendContext,
+  moves: Array<{ from: string; to: string | null; prefix?: boolean }>,
+): Promise<RepairOutcome> {
+  try {
+    // ⚠️ A SHORT timeout, not `requestBrowser`'s 3000ms default. This repair is pure in-memory
+    // bookkeeping in an attached renderer — it answers in milliseconds or there is no renderer to
+    // answer. The default would put 3s on every move and delete whenever the dev server is up with
+    // no page open, and three callers loop: `pasteClipboard`'s cut branch and `handleFilesDrop`
+    // move sequentially, and a model re-import fires N `/api/delete-asset` calls. A 10-file cut
+    // with no page open would have been ~30 seconds of nothing.
+    const r = await ctx.requestBrowser('apply-asset-path-moves', { moves }, RENDERER_REPAIR_TIMEOUT_MS) as { notes?: string[] };
+    return { kind: 'applied', notes: Array.isArray(r?.notes) ? r.notes : [] };
+  } catch (e) {
+    // ⚠️ Deliberately swallowed, but NOT indiscriminately: the file operation has already
+    // happened and stands, so this must never turn a successful move into a 5xx. What it must
+    // also not do is report a renderer-side FAULT as "no renderer attached" — a genuine throw
+    // inside `applyAssetPathMoves` would otherwise read as a clean success with corrupt in-memory
+    // state. An undelivered request (no renderer, or the timeout) is normal and silent; anything
+    // else is the repair itself failing, and gets logged with what the renderer said.
+    const msg = e instanceof Error ? e.message : String(e);
+    // A definitively-absent renderer is a normal state, silent: there is nothing in memory to
+    // repair, so nothing was lost. `unknown agent op` is the same case one layer in — a runtime
+    // build with the editor ops never registered.
+    if (/unknown agent op/i.test(msg)) return { kind: 'absent' };
+    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    // ⚠️ A TIMEOUT is NOT "no renderer", and folding it in there is how this fails silently.
+    // Electron rejects synchronously when the window is gone, so a timeout there means the
+    // renderer IS attached and did not answer in the window — mid-scene-load, a GLB parse, a TSL
+    // compile. On Vite a timeout is ambiguous (the dev server can be up with no page open), and
+    // nothing here can tell the two apart — so it is reported as ambiguous rather than guessed.
+    // The panel path has a local backstop; the AGENT path, which this feature exists for, has none.
+    console.warn(`[move-repair] the renderer did not apply the path repair: ${msg}\n` +
+      '  The file operation SUCCEEDED. If an editor is attached, its bindings, parked writes and ' +
+      'Inspector selection may now point at a path that no longer exists (#186); if none is, ' +
+      'nothing was lost. The reply carries `repairFailed` either way.');
+    return { kind: 'unrepaired', reason: msg };
+  }
+}
+
+/** Milliseconds to wait for the renderer's path repair.
+ *
+ *  Well under `requestBrowser`'s 3000ms default, because three callers loop (`pasteClipboard`'s
+ *  cut branch, `handleFilesDrop`, and a model re-import's N deletes) and a Vite dev server with
+ *  no page open only discovers that by timing out — a 10-file cut would have been 30 seconds.
+ *  Not as short as the 400ms first written here, though: on Electron a timeout can ONLY mean an
+ *  attached-but-busy renderer, and a repair that silently did not run is far worse than a slow
+ *  move. This is the value that trades those two off; it is not a measurement. */
+const RENDERER_REPAIR_TIMEOUT_MS = 1500;
+
+/** An asset-root URL as the RENDERER keys it — the one normalisation `resolveAssetPath` applies
+ *  before it resolves (`vite-asset-scanner.ts`, which imports this rather than repeating it).
+ *
+ *  ⚠️ **A gate keyed on the RAW request string is not keyed on the same thing the registry is**
+ *  (#872 review). `{path: "assets/textures/rock.png"}` and `"/assets/my%20tex.png"` both resolve to
+ *  real files, so the write proceeds — while `peekPendingMeta` is asked about a string the park was
+ *  never filed under, misses, and reports `clear`. The park is then destroyed by the very call that
+ *  checked for it. Normalise once, gate and resolve on the same value. */
+export function normalizeAssetUrl(assetPath: string): string {
+  return decodeURIComponent(assetPath.startsWith('/') ? assetPath : `/${assetPath}`);
+}
+
+/** What the park probe learned. Four outcomes, because "no park" and "could not look" are
+ *  different answers and collapsing them is the fail-open this gate exists to close. */
+export type ParkGateOutcome =
+  /** A renderer answered and nothing is parked for these paths — proceed. */
+  | { kind: 'clear' }
+  /** No renderer EXISTS (no editor window, no page on the dev server, a runtime without the ops).
+   *  `pendingMeta` is renderer-only module state, so with no renderer there is no park to be in
+   *  the way — proceed, and say `editorConnected:false` so the caller knows which it was. */
+  | { kind: 'absent' }
+  /** A park is in the way. `discarded` is non-empty only when the caller passed the override. */
+  | { kind: 'parked'; paths: string[]; discarded: string[] }
+  /** A renderer may well be attached and it did not answer. NOT the same as `absent`. */
+  | { kind: 'unknown'; reason: string };
+
+/** Ask the renderer whether a parked Inspector import-settings edit is in the way of a Node-side
+ *  `.meta.json` operation, and optionally drop it (#872/#882).
+ *
+ *  The ONE gate for all three sidecar routes. `/api/write-meta` DESTROYS a park (it replaces the
+ *  file wholesale and the park then flushes back over it, so both directions lose work);
+ *  `/api/reimport` and `/api/duplicate-asset` merely read the pre-edit bytes, so the human's edit
+ *  goes UN-INCLUDED. Two consequences, two override names — `discardUnsaved` and `force`,
+ *  `docs/mcp-tool-conventions.md` §8 — but ONE probe, so the fourth route to touch a sidecar
+ *  inherits the answer instead of inventing one.
+ *
+ *  ⚠️ **It must not fail OPEN, and that is the whole difficulty.** `requestBrowser` rejects on a
+ *  timeout, and "the renderer did not answer" is not "there is no park" (§5: *could not look is
+ *  never reported as nothing is there*). The classifier is `isRelayTransportFailure` +
+ *  `isRelayTimeout` — the SAME pair `applyMovesInRenderer` uses, deliberately not a second copy:
+ *  that list has been found incomplete by review three times, and #867 extracted it precisely
+ *  because a hand-written second regex was born missing every Electron string.
+ *
+ *  On Electron a timeout can only mean an attached-but-busy renderer (the window being gone
+ *  rejects synchronously). On Vite it is genuinely ambiguous — the dev server can be up with no
+ *  page open — and nothing here can tell those apart, so it is reported as `unknown` rather than
+ *  guessed. A caller turns `unknown` into a refusal; guessing "clear" would be the #872 defect
+ *  rebuilt inside its own fix.
+ *
+ *  The timeout is `RENDERER_REPAIR_TIMEOUT_MS`, shared with the move repair for the same reason it
+ *  was chosen there: this is in-memory bookkeeping that answers in milliseconds or not at all, and
+ *  the default 3000ms would be paid by every headless sidecar write. */
+async function metaParkGate(
+  ctx: BackendContext,
+  paths: string[],
+  opts: { discard?: boolean } = {},
+): Promise<ParkGateOutcome> {
+  const wanted = paths.filter((p) => typeof p === 'string' && p);
+  if (!wanted.length) return { kind: 'clear' };
+  try {
+    const r = await ctx.requestBrowser(
+      'resolve-meta-park',
+      { paths: wanted, ...(opts.discard ? { discard: true } : {}) },
+      RENDERER_REPAIR_TIMEOUT_MS,
+    ) as { parked?: unknown; discarded?: unknown };
+    const parked = Array.isArray(r?.parked) ? r.parked.filter((p): p is string => typeof p === 'string') : [];
+    if (!parked.length) return { kind: 'clear' };
+    const discarded = Array.isArray(r?.discarded) ? r.discarded.filter((p): p is string => typeof p === 'string') : [];
+    return { kind: 'parked', paths: parked, discarded };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // ⚠️ **`unknown agent op` is NOT "absent" here, and reading it that way was a fail-open this
+    // gate produced against itself** (#872 review). `applyMovesInRenderer` may treat it as absent
+    // because it is best-effort repair; this is a GUARD, and the transport underneath is a
+    // BROADCAST: `ws.send` goes to every HMR client and `createBrowserRequestRegistry` is
+    // first-reply-wins. `initAgentBridge()` runs on any editor-flagged page but
+    // `registerEditorAgentOps()` runs only from `editor/setup.ts`, so a second tab on the dev
+    // server's runtime route answers `unknown agent op` INSTANTLY and wins the race against the
+    // editor tab that actually holds the park. Measured shape: editor at `#/editor` with a parked
+    // Max Size edit, a plain `/` tab alongside, agent writes — the runtime tab replies first, this
+    // returned `absent`, the write proceeded, and the reply told the caller "there is no renderer"
+    // while an editor sat there with the human's unsaved edit in it.
+    //
+    // One client's "I do not have that op" says nothing about whether ANOTHER client does, so it
+    // is exactly "could not look" (§5). The cost is that a genuinely editor-op-less renderer now
+    // refuses instead of proceeding — over-conservative, and the named override is the exit.
+    if (/unknown agent op/i.test(msg)) return { kind: 'unknown', reason: msg };
+    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    return { kind: 'unknown', reason: msg };
+  }
+}
+
+/** The §5 envelope for a gate outcome that must stop the operation, or `null` to proceed.
+ *
+ *  `code` and `options` travel in the BODY: `codeFromBody` in the MCP client lifts a code out of
+ *  the payload ahead of the one derived from the HTTP status, and `httpFailure` lifts `options`
+ *  the same way — so the refusal an agent reads names its own exits rather than arriving as a
+ *  generic REFUSED_BY_OP. A refusal that lists the real options is the highest-value thing this
+ *  surface produces (§5); a refusal with no way out is a wedge. */
+function parkGateRefusal(
+  outcome: ParkGateOutcome,
+  what: { verb: string; override: 'discardUnsaved' | 'force'; consequence: string },
+): { body: Record<string, unknown>; status: number } | null {
+  if (outcome.kind === 'parked' && !outcome.discarded.length) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        code: 'REQUIRES_SAVE',
+        error: `${what.verb} refused: a human's unsaved Inspector import-settings edit is parked for `
+          + `${outcome.paths.join(', ')} and has not reached disk. ${what.consequence}`,
+        parked: outcome.paths,
+        options: [
+          'modoki_save_all — flush the human\'s edit to disk first, then repeat this call (it then works from their newest settings)',
+          `${what.override}:true — proceed anyway; see that param's description for exactly what it costs`,
+          'modoki_get_asset_meta reads the PARKED value, so you can see what is pending before deciding',
+        ],
+      },
+    };
+  }
+  if (outcome.kind === 'unknown') {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        code: 'NO_RENDERER',
+        error: `${what.verb} refused: an editor renderer may be attached and it did not answer the `
+          + `parked-import-settings probe (${outcome.reason}), so this could NOT rule out a human's `
+          + 'unsaved edit. "Could not look" is not "nothing is there", and proceeding would be the '
+          + 'silent clobber this check exists to prevent.',
+        options: [
+          'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
+          'modoki_get_editor_state lists parked edits under pendingImportSettings; if it answers, the renderer is alive',
+          `${what.override}:true — proceed without the check, accepting that cost`,
+        ],
+      },
+    };
+  }
+  return null;
+}
+
 export async function handleBackendRequest(ctx: BackendContext, req: BackendRequest): Promise<BackendResult | null> {
   const { method, urlPath, query, body } = req;
 
@@ -750,7 +1168,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           byKind,
           hint: res.handles.length
             ? 'Counts only. Pass editor=<name>, kind=<name>, or ids=[…] for handle geometry (x/y/rect).'
-            : 'No handles: open the relevant editor + enter its sub-mode first (e.g. scene_view_mode ui + collider_edit on).',
+            : 'No handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).',
         });
       }
       // A FILTERED call that matched NOTHING used to return `{count:0, editors:[], handles:[]}`
@@ -776,7 +1194,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           byKind,
           hint: live.length
             ? `no handle matches ${asked}. Live now: editor ∈ {${live.join(', ')}}, kind ∈ {${Object.keys(byKind).join(', ')}} — check the spelling, or drop the filter for counts.`
-            : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. scene_view_mode ui + collider_edit on).`,
+            : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).`,
         });
       }
       return json(res);
@@ -939,7 +1357,21 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         if (!goIos) {
           return { error: "go-ios is not installed. Install it from the editor's Build Support dialog (iOS Build Support → go-ios), or set MODOKI_GO_IOS." };
         }
-        return resolveGoIosDevice({ goIos, env: process.env, lease: await deviceConnection.deviceHardware() });
+        // Pass a lease only when it is actually HELD *and confirmed iOS* — `leaseForIosOps` is the
+        // gate (goIosDevice.ts). `deviceHardware()` is platform-agnostic: an ANDROID lease's
+        // `deviceModel` (e.g. `'SM-S901B'`) fed straight into `pickGoIosDevice` can never match an
+        // attached iPhone's `ProductType`, so a device that IS attached — just on the other
+        // platform — read as a genuine mismatch and refused (#670 finding 3: this used to be "the
+        // same gate `resolveHostSideAndroidSerial` uses", but that phrasing is what let the bug in —
+        // at the time that gate only checked the lease was HELD, not that it was the right PLATFORM
+        // for the op. #732 has since given the Android half its own `leaseForAndroidOps`, so the
+        // two are now genuine mirrors and the comparison is safe to make again).
+        // `pickGoIosDevice` also tells "no lease" from "lease with no reported hardware" apart, so
+        // `undefined` (not a hardware object with null fields) is what a non-iOS/unresolved lease
+        // must produce.
+        const connected = deviceConnection.status().state === 'connected';
+        const lease = connected ? leaseForIosOps(await deviceConnection.devicePlatform(), await deviceConnection.deviceHardware()) : undefined;
+        return resolveGoIosDevice({ goIos, env: process.env, lease });
       };
       // WHICH Android, for the host-side adb ops. The LEASE's serial wins (it is the phone the
       // caller is already driving); otherwise the same rule a build follows — the project pin, else
@@ -947,23 +1379,40 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // with three handsets plugged in, which reads whichever one adb happens to list first.
       const resolveHostSideAndroidSerial = async (): Promise<{ serial?: string } | { error: string }> => {
         const st = deviceConnection.status();
+        // Only a lease CONFIRMED Android may speak here (#732) — `deviceHardware()` is
+        // platform-agnostic, so before this gate an iPhone lease's `ProductType` was compared
+        // against adb model strings, matched nothing, and made the op refuse about an Android that
+        // was attached and answering. The exact mirror of `leaseForIosOps` on the iOS half (#670
+        // finding 3), whose own comment named THIS function as the pattern it had copied wrongly.
+        //
+        // ⚠️ The serial is read UNGATED and that is deliberate: `target.serial` exists only on the
+        // `useAdb` path, so it is Android by construction, while `devicePlatform()` swallows its
+        // errors and returns null for a perfectly good adb lease. Gating the serial on it would
+        // drop a lease we are certain about because a probe we are not certain about said nothing.
+        //
+        // ⚠️ The serial short-circuits BEFORE the inputs are gathered, and that is a cost decision,
+        // not a second copy of the precedence: `pickHostSideAndroidSerial` returns the same serial
+        // for the same input, and a test pins that. Gathering eagerly made a USB lease — the common
+        // Android case — pay `adb devices -l` plus one `adb shell` per new serial on every
+        // host-side call, to reach a serial already in hand. It also re-pays the transport deadline
+        // twice on a HALF-OPEN lease (state still `connected`, transport dead), which is precisely
+        // the app-just-died case these ops exist for, because a FAILED identity probe is
+        // deliberately not latched.
         if (st.target?.serial) return { serial: st.target.serial };
-        const attached = withFriendlyNames(listAndroidDevices().filter(isUsable));
-        // ⚠️ A WIFI lease carries NO serial — `target.serial` is set only on the `useAdb` path — so
-        // "there is a lease" does not mean "we know which handset". Falling straight through to the
-        // build resolver then reads logs off whichever OTHER phone happens to be on USB, labelled
-        // as if it were the leased one: the same silent wrong-device answer the platform gate above
-        // exists to refuse. So when a lease is live but serial-less, disambiguate the way the iOS
-        // side does — by the hardware MODEL the lease reports — and refuse rather than guess.
-        if (st.state === 'connected') {
-          const model = (await deviceConnection.deviceHardware()).deviceModel;
-          const hits = model ? attached.filter((d) => d.model === model || d.name === model) : [];
-          if (hits.length === 1) return { serial: hits[0].serial };
-          if (attached.length === 1 && !model) return { serial: attached[0].serial };
-          return { error: `the lease is over WiFi, so it names no adb serial${model ? ` (device model ${model})` : ''} — attached: ${attached.map((d) => `${d.serial}${d.name ? ` (${d.name})` : ''}`).join(', ') || 'none'}. Reconnect over adb, or pin device.androidDeviceId in Project Settings.` };
-        }
-        const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
-        return 'error' in picked ? picked : { serial: picked.serial };
+        const connected = st.state === 'connected';
+        const picked = pickHostSideAndroidSerial({
+          leasePlatform: connected ? await deviceConnection.devicePlatform() : null,
+          leaseModel: connected ? (await deviceConnection.deviceHardware()).deviceModel : null,
+          attached: withFriendlyNames(listAndroidDevices().filter(isUsable)),
+        });
+        if (!('unleased' in picked)) return picked;
+        // No Android lease to consult — the ordinary ladder. ⚠️ `listAndroidDevices()` is passed
+        // UNFILTERED here, unlike the `attached` list above: `resolveAndroidSerial` does its own
+        // usability check and its refusal names an `unauthorized`/`offline` handset as such, which
+        // is the actionable answer when the phone you meant is the one that has not trusted this
+        // Mac yet. Pre-existing, and preserved deliberately.
+        const built = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
+        return 'error' in built ? built : { serial: built.serial };
       };
       // WHICH PLATFORM these host-side ops read. The lease answers it when there is one — but these
       // ops exist precisely for when there ISN'T (the app died, so the lease died with it), and the
@@ -1012,7 +1461,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           const cap = await captureIosSyslog({
             udid: picked.device.udid, seconds: p.seconds, limit: p.limit, filter: p.filter,
           });
-          return json({ result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid });
+          return json({
+            result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid,
+            ...(picked.unverified ? { unverified: picked.unverified } : {}),
+          });
         } catch (e) {
           return json({ error: e instanceof Error ? e.message : String(e) }, 409);
         }
@@ -1030,7 +1482,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           // The package, which on Android IS the process name (unlike iOS, where every Modoki game
           // is the Capacitor `App` target). The leased app first; else the OPEN PROJECT's appId,
           // which the backend already knows and which is what you almost always mean.
-          const pkg = p.all ? undefined : (p.app || await deviceConnection.deviceAppId() || loadProjectConfig(ctx.projectRoot).app.appId);
+          //
+          // ⚠️ `deviceAppId()` is gated on the lease's PLATFORM, and #732 is why. It reads the same
+          // `app-identity` probe as `deviceHardware()` and is exactly as platform-agnostic, so an
+          // iOS lease hands back an iOS BUNDLE ID — which then filters logcat and matches nothing.
+          // Before #732 this line was unreachable with an iPhone leased, because
+          // `resolveHostSideAndroidSerial` refused first; that refusal WAS the bug, and removing it
+          // opened this door one line down. `pickHostSidePlatform` puts an explicit `platform`
+          // AHEAD of the lease, so `device_crash_reports {platform:'android'}` with an iPhone leased
+          // reaches here, picks the right Android, and then reports `matched: 0` / `filteredTo:
+          // <iOS bundle>` for a phone that has crashes. A loud refusal traded for a silent wrong
+          // answer is strictly worse — the #149/#670 class. The project's own appId below is
+          // already the platform-correct fallback.
+          const leasedPkg = (await deviceConnection.devicePlatform()) === 'android' ? await deviceConnection.deviceAppId() : null;
+          const pkg = p.all ? undefined : (p.app || leasedPkg || loadProjectConfig(ctx.projectRoot).app.appId);
           try {
             // No two-step here, and that asymmetry is real rather than an oversight: iOS lists
             // FILES you then fetch, while logcat hands back the content itself, already bounded.
@@ -1058,9 +1523,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             const text = await fetchCrashReport({ udid, name: p.name });
             if (p.raw) {
               const clipped = text.length > RAW_CHARS_MAX;
-              return json({ result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped });
+              return json({
+                result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped,
+                ...(picked.unverified ? { unverified: picked.unverified } : {}),
+              });
             }
-            return json({ result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid });
+            return json({
+              result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid,
+              ...(picked.unverified ? { unverified: picked.unverified } : {}),
+            });
           }
           const all = await listCrashReports({ udid });
           const refs = filterCrashReports(all, appProcess);
@@ -1072,6 +1543,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             result: refs.slice(0, limit), device: picked.device.name ?? picked.device.udid,
             totalOnDevice: all.length, matched: refs.length, shown: Math.min(limit, refs.length),
             filteredTo: appProcess ?? null,
+            ...(picked.unverified ? { unverified: picked.unverified } : {}),
           });
         } catch (e) {
           return json({ error: e instanceof Error ? e.message : String(e) }, 409);
@@ -1142,6 +1614,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // second call.
         return json({ result: native, wdaFallbackUnavailable: shot.reason });
       }
+      // #682 close-out (HIGH 1): ask BEFORE any CDP/WDA session discovery, so a dead frame loop
+      // costs one cheap round trip instead of a wasted adb/WDA probe as well. See
+      // `refuseUndeliverableDeviceInput`'s docblock for why this dispatch — not `handleResolveAim`
+      // — is the chokepoint that provably covers all five CDP-routable methods, `press-key`
+      // included.
+      const undeliverable = await refuseUndeliverableDeviceInput(b.method, deadline);
+      if (undeliverable) return json({ result: undeliverable });
       // GATED ON THE DEVICE BEING ANDROID, and on the CDP target being THIS lease's app (#142).
       // The mirror of the iOS gate below, and it was missing: CDP discovery runs entirely through
       // adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route
@@ -1618,7 +2097,20 @@ async function describeUnresolvedAgainstLiveWorld(
       // below only ever exists for the scene actually loaded live — this route can target ANY
       // scene FILE on disk, loaded or not), and unsavedChanges (only load-bearing on the
       // FILE-DIRECT fallback below; see its own comment for why).
-      type EditorStateProbe = { playState?: string; unsavedChanges?: boolean; scenePath?: string };
+      // `unsavedCauses` (#844) — additive on `get_editor_state`/`editor-state`, so an OLDER or
+      // otherwise-mismatched renderer simply omits it; the refusal below falls back to the old
+      // generic wording rather than crashing on a missing field.
+      type EditorStateProbe = {
+        playState?: string; unsavedChanges?: boolean; scenePath?: string;
+        // ⚠️ Every cause `unsavedChangeCauses()` returns must be declared here, or the refusal
+        // below cannot name it and falls through to a generic string that blames the wrong
+        // thing (#844). The two below were on the wire and undeclared, which is exactly how
+        // they went unnamed — the DATA arriving is not the same as the type admitting it.
+        unsavedCauses?: {
+          sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[];
+          pendingBaseScenes?: string[]; pendingImportSettings?: string[];
+        };
+      };
       let st: EditorStateProbe | null = null;
       let probeFailed = false;
       // 8s, not 2s (independent review, 2026-07-30). `requestBrowser` REJECTS on timeout, and this
@@ -1669,11 +2161,38 @@ async function describeUnresolvedAgainstLiveWorld(
       const canGoLive = !!st && !!liveRef && liveRef === wantRef && !hasSetBaseScene;
       if (canGoLive) {
         try {
-          const live = (await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000)) as {
-            ok: boolean; changed: number; errors: string[]; warnings: string[]; unresolved: EntityRef[];
-            created?: Array<{ op: number; id: number; guid: string; name: string }>;
-            code?: ErrorCode;
-          };
+          // #647: DECODE the reply, never cast it. The renderer that produces this versions
+          // independently of this host, and three of the fields below are read with `.length`
+          // or a spread — so a shape skew used to throw into the catch beneath, whose remedy
+          // ("relaunch the editor") is the WRONG one for a call whose ops already applied.
+          const decoded = decodeSceneOpsReply(await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000));
+          if (decoded.kind === 'unreadable') {
+            // ⚠️ 200 + PARTIAL, deliberately NOT a 500. The relay RETURNED, so the ops are very
+            // likely already applied to the live world; a 500 maps to NOT_AVAILABLE_HERE
+            // ("relaunch the editor"), which invites the caller to retry and DOUBLE-APPLY a
+            // write. `isFailureBody` turns `ok:false` into a failure and `codeFromBody` lifts
+            // `code` out of the body, so this reaches the agent as a PARTIAL envelope with no
+            // new plumbing on either side.
+            // ⚠️ No `changed` and no `errors` here, deliberately. `isFailureBody` carries the whole
+            // body into the envelope's `got`, so a `changed: 0` would sit directly beside the
+            // sentence saying the ops may ALREADY have applied — asserting the one number this
+            // branch provably cannot know. Omitting it is the honest shape; review caught the
+            // first cut claiming it.
+            return json({
+              ok: false,
+              code: 'PARTIAL' satisfies ErrorCode,
+              warnings: preflightWarnings,
+              saved: false,
+              mode: PERSISTENCE_MODE,
+              error: 'apply-scene-ops answered a shape this build cannot read '
+                + `(${decoded.got}). The relay RETURNED, so these ops may have ALREADY APPLIED to `
+                + 'the live world — do NOT retry this call, it would apply them twice. Re-read the '
+                + 'live world with modoki_get_scene_state and reconcile before acting. A shape skew '
+                + 'here means the editor renderer and its backend are from different builds; '
+                + 'relaunching the editor from this checkout is what fixes the cause.',
+            });
+          }
+          const live = decoded.reply;
           // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
           // every live call now, and the hint says how to persist — the field is kept (rather
           // than dropped) because callers already branch on it and `false` is meaningful.
@@ -1698,22 +2217,54 @@ async function describeUnresolvedAgainstLiveWorld(
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
           // "fall back to file-direct" territory (that would silently re-run the edit against a
           // stale file while the live world is in an unknown state); surface it.
+          //
+          // ⚠️ This now means ONLY "the relay did not return" — a rejected `requestBrowser`,
+          // a timeout, a transport error. An UNREADABLE-but-returned reply is handled above as
+          // PARTIAL and never reaches here (#647), because the two need opposite remedies: this
+          // one is safe to treat as "the editor is not answering", and that one is not safe to
+          // retry at all.
           return json({ error: `apply-scene-ops failed: ${e instanceof Error ? e.message : String(e)}` }, 500);
         }
       }
       // ── File-direct fallback (headless curl, no renderer, wrong scene loaded, or setBaseScene) ──
-      // Refuse when the editor has UNSAVED live work — entities created via create_entity /
-      // duplicate_entity / prefab that are not in the scene file yet. This route edits the FILE, and
-      // the resulting disk hot-reload rebuilds the live world FROM that file, silently DESTROYING
-      // those unsaved entities while the tool reported ok:true, changed:N. Save first, then the reload
-      // is lossless. Mirrors the load_scene / new_scene guardUnsaved sibling. (F3) Moot when we just
+      // Refuse when the editor has UNSAVED work of ANY kind — since #831 a Material slider drag
+      // parks a dirty asset the same as create_entity/duplicate_entity/prefab park a live-world
+      // edit, and this route edits the FILE either way: the resulting disk hot-reload rebuilds the
+      // live world FROM that file, silently DESTROYING whichever kind of unsaved work is pending
+      // while the tool reported ok:true, changed:N. Save first, then the reload is lossless.
+      // Mirrors the load_scene / new_scene `guardUnsaved` sibling (agentEditorOps.ts) — same
+      // cause-naming shape, built from the same `unsavedChangeCauses()`. (F3) Moot when we just
       // went live above (that branch returned already) — this only guards the true file-direct case.
       if (st?.unsavedChanges === true) {
-        return json({
-          ok: false,
-          error: `the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`,
-          unsavedChanges: true,
-        }, 409);
+        // #844: name the ACTUAL cause(s) instead of a fixed string that always blamed
+        // create_entity/duplicate_entity/prefab — a dirty asset (e.g. a Material slider drag) sent
+        // an agent hunting entities it never created. Two differences from `guardUnsaved`: the
+        // consequence here is the FILE hot-reload destroying live work, not a world swap; and this
+        // route has no `discardUnsaved`/`force` escape hatch, so the only remedy is `modoki_save_all`.
+        const c = st.unsavedCauses;
+        const causes: string[] = [];
+        if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
+        if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
+        if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+        // ⚠️ The two causes below were MISSING, and their absence reintroduced exactly the defect
+        // #844 fixed. With `pendingImportSettings` (or `pendingBaseScenes`) as the ONLY unsaved
+        // work, `causes` came out empty and the generic fallback fired — blaming
+        // create_entity/duplicate_entity/prefab and sending an agent to hunt live entities it
+        // never created. The fallback exists for an OLDER renderer that sends no `unsavedCauses`
+        // at all; a renderer that sends a cause this list does not know about is a different case
+        // and must not be answered with a confident wrong sentence.
+        //
+        // The renderer-side twin (`agentEditorOps.ts`'s guardUnsaved) was updated when each cause
+        // was added; this server-side copy was missed both times. Two copies of one cause list,
+        // which is why they drifted — worth collapsing if a third appears.
+        if (Array.isArray(c?.pendingBaseScenes) && c.pendingBaseScenes.length) causes.push(`${c.pendingBaseScenes.length} pending baseScene ref(s) awaiting a save: ${c.pendingBaseScenes.join(', ')}`);
+        if (Array.isArray(c?.pendingImportSettings) && c.pendingImportSettings.length) causes.push(`${c.pendingImportSettings.length} pending IMPORT-SETTINGS edit(s) (.meta.json) awaiting a save: ${c.pendingImportSettings.join(', ')}`);
+        const error = causes.length
+          ? `the editor has UNSAVED work — ${causes.join(' AND ')}. This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`
+          // No `unsavedCauses` on the probe (an older/mismatched renderer) — fall back to the
+          // old generic wording rather than naming a cause list that doesn't exist.
+          : 'the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.';
+        return json({ ok: false, error, unsavedChanges: true }, 409);
       }
       const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
@@ -1752,7 +2303,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // `scene`. Only the response's liveHint needs the await; it doesn't touch the file.
       if (changed > 0) {
         stripBackfilledEntityIds(scene, backfilledIds);
-        writeJsonAtomic(absPath, scene);
+        writeJsonAtomic(absPath, assetJsonBytes(scene)); // scene: matches serialize.ts (#835)
       }
       // ── C7: "no entity matching {guid}" was a LIE. ──
       // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
@@ -1797,24 +2348,67 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: assetPath, paths } = (body ?? {}) as { path?: string; paths?: string[] };
       const inputs = Array.isArray(paths) ? paths : (assetPath != null ? [assetPath] : []);
       if (inputs.length === 0) return json({ error: 'No path(s) provided' }, 400);
-      const resolved: string[] = [];
+      // The REQUEST string rides along with the abs path. `failed` below is reported back in the
+      // caller's own strings, not canonicalised ones — see the comment on the reply. Keeping the
+      // pair here is what makes that possible without a second lookup.
+      const resolved: Array<{ input: string; abs: string }> = [];
       const missing: string[] = [];
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
         if (!absPath) return json({ error: 'Path outside allowed directories' }, 403);
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
-        resolved.push(absPath);
+        resolved.push({ input: p, abs: absPath });
       }
       // Single-path back-compat: a lone non-existent target is still a 404.
       if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
-      if (resolved.length > 0) moveToTrash(resolved);
+      // Which of them are FOLDERS — asked before the trash, while they still exist. Same reason
+      // as /api/move-file: only the route can tell, and a folder needs `prefix` or the repair
+      // reaches the folder and none of its contents.
+      // Canonical urls, for the same reason /api/move-file uses them: the renderer compares
+      // exactly and these strings came straight off the wire.
+      // The abs path rides along so the list can be filtered by what ACTUALLY went to the trash
+      // (below) — the stat itself must still happen HERE, before the delete, while the paths
+      // exist. Dropped again immediately after.
+      const candidates = resolved.map(({ abs }) => {
+        let isDir = false;
+        try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
+        return { abs, move: { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) } };
+      }).filter((c): c is { abs: string; move: { from: string; to: null; prefix?: boolean } } => c.move.from !== null);
+      // ⚠️ A per-path OS refusal is a PARTIAL success, and it must not abort the reconciliation
+      // for the paths that DID go (#875 close-out review). On win32 the recycler processes each
+      // path independently, so a locked file / denied ACL / >260-char path fails alone while the
+      // rest of the batch is already in the Recycle Bin. An earlier draft let that throw: the
+      // route 500'd, `rebuildManifest` and `applyMovesInRenderer` never ran, and the caller read
+      // "nothing was deleted" about N-1 files that were gone — with no undo, and a bound editor
+      // still parked on them (the #186 resurrection the unbind below exists to prevent).
+      // That is the same 500 the `manifestRebuilt` comment below forbids, for the same reason.
+      const trashFailed = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)).failed : [];
+      // ⚠️ `samePath`, not `includes`/`===` (#881's shared helper, adopted here when main landed
+      // it). Both sides are absolute paths that made a ROUND TRIP through the win32 script — we
+      // write them to its stdin and read them back off its stderr — so this is exactly the
+      // family/path-identity shape: two operands that must spell one path identically, where a
+      // raw string compare silently answers "different" and the partition below then puts the
+      // path on the WRONG side. Getting it wrong here is not a cosmetic miss: an unmatched
+      // refusal counts as trashed, and the renderer unbinds an editor from a file still on disk.
+      const wasRefused = (abs: string) => trashFailed.some((f) => samePath(f, abs));
+      const wentToTrash = trashFailed.length === 0
+        ? resolved
+        : resolved.filter((r) => !wasRefused(r.abs));
+      // Repair the renderer for the paths that GENUINELY went. Unbinding an editor from a file
+      // that is still on disk would be the wrong direction: the binding is still live and valid.
+      const deleted = trashFailed.length === 0
+        ? candidates.map((c) => c.move)
+        : candidates.filter((c) => !wasRefused(c.abs)).map((c) => c.move);
       // Rebuild the asset manifest INLINE, like the other asset routes that mint or
       // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
       // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
-      // and neither rebuilds, but both are panel-only and the panel calls refresh().
-      // An earlier draft of this comment named duplicate-asset as a sibling that
-      // rebuilds; it does not. Verified by attributing every ctx.rebuildManifest()
-      // call site to its route.) Both backends DO
+      // and neither rebuilds. An earlier draft of this comment named duplicate-asset as a
+      // sibling that rebuilds; it does not. Verified by attributing every
+      // ctx.rebuildManifest() call site to its route. ⚠️ It also called both "panel-only,
+      // and the panel calls refresh()" — move-file stopped being panel-only when
+      // modoki_move_asset was added, which is #867: an agent move reached this route from
+      // another PROCESS and nothing repaired the renderer. move-file now calls the renderer
+      // back itself; duplicate-asset is still panel-only.) Both backends DO
       // watch `unlink` and rebuild on their own, but on a 150ms debounce — so a
       // reply sent now is AHEAD of the state a caller would verify with, and a
       // /api/scan-assets issued straight after (or a modoki_list_assets in the same
@@ -1826,10 +2420,76 @@ async function describeUnresolvedAgainstLiveWorld(
       // wait for the debounce — rather than a 500 that would read as
       // "nothing was deleted" and invite a retry against files already gone.
       let manifestRebuilt = false;
-      if (resolved.length > 0) {
+      if (wentToTrash.length > 0) {
         try { ctx.rebuildManifest(); manifestRebuilt = true; } catch { manifestRebuilt = false; }
       }
-      return json({ ok: true, trashed: resolved.length, missing, manifestRebuilt });
+      // ⚠️ A DELETE bypassed the repair exactly as a move did (#867's mechanism, found by its
+      // close-out sweep). `unbindDeletedAssetEditors` exists for precisely this — "delete
+      // unbinds, move repoints" — and the Assets panel calls it from `executeDeletion`; an agent
+      // reaching this route from the MCP PROCESS could not. The consequence is the resurrection
+      // bug that repair was written for: the panel keeps its binding to a trashed file, the next
+      // edit re-parks a write at the dead path, and Cmd+S recreates the asset the agent deleted.
+      // Not left to the watcher: its `dropParkedWriteFor` covers only paths `classifySceneChange`
+      // recognizes, arrives on a 150ms debounce, and closes no binding at all.
+      const outcome: RepairOutcome = deleted.length > 0
+        ? await applyMovesInRenderer(ctx, deleted)
+        : { kind: 'absent' };
+      // Named, not merely counted — the caller has to know WHICH ones are still there.
+      //
+      // ⚠️ Reported in the CALLER'S OWN request strings, not `absToAssetUrl`'s canonical form.
+      // Two reasons, and the second is the one that was wrong before. (1) `missing` — the other
+      // per-path outcome list in this same reply — has always echoed the input, and a caller
+      // cannot treat the two uniformly if they are keyed differently. (2) The earlier
+      // `absToAssetUrl(abs) ?? abs` fallback shipped an ABSOLUTE path into a field the renderer
+      // can only match against asset urls, which is the defect `/api/move-file` refuses a
+      // `?? from` fallback for, one size smaller. Echoing the input removes the round-trip
+      // instead of trying to survive it: the caller compares `failed` against the list it sent.
+      // The RENDERER repair keeps `absToAssetUrl` (see `candidates`) — different consumer,
+      // different correct key, deliberately not unified.
+      //
+      // ⚠️ FAIL LOUD, not silent, if an abs path does not match back. `failedInputs` and
+      // `wentToTrash` partition `resolved` by the SAME predicate, so an unmatched entry would
+      // drop out of both — reporting `{ok:true, trashed:N}` with no `failed` at all, which is the
+      // exact silent false success this whole change exists to remove, reintroduced by the fix
+      // for it. The old code mapped `trashFailed` directly, so a mismatch degraded the KEY and
+      // never lost the REPORT; keeping the unmatched abs path preserves THAT HALF ONLY.
+      //
+      // ⚠️ The report and the reconciliation now agree, because BOTH go through `wasRefused` —
+      // that was the real hole, and `samePath` above is what closed it. What survives is the
+      // residue: a path that `samePath` genuinely cannot match (not a spelling difference but a
+      // string from somewhere else entirely) is still counted in `trashed` and still carries its
+      // move, so the console and the toast tell the truth while the panel state does not. Not
+      // reachable today — the win32 script echoes stdin verbatim and a Windows path cannot carry
+      // trailing whitespace — so this stays a loud-failure guard rather than a further fix.
+      const matched = resolved.filter((r) => wasRefused(r.abs));
+      const unmatched = trashFailed.filter((abs) => !resolved.some((r) => samePath(r.abs, abs)));
+      const failedInputs = trashFailed.length === 0 ? [] : [...matched.map((r) => r.input), ...unmatched];
+      // ⚠️ NOTHING went, and `ok:true` here is simply false. The route used to answer one verdict
+      // for two different outcomes: a PARTIAL refusal genuinely succeeded for the paths that went,
+      // a TOTAL refusal succeeded at nothing. Collapsing them defeated every caller's check —
+      // `deleteAssetFile` returned `true`, the Assets panel filtered the row out, and
+      // `isFailureBody` (the MCP guard) short-circuits on `ok === true` by design, so
+      // `modoki_delete_asset` told an agent the file was gone (#884).
+      //
+      // #875's reason for NOT answering a failure here still holds — but only for the partial
+      // case it was written about: a 500 read as "nothing was deleted" about N-1 files that were
+      // already in the Recycle Bin. When nothing went, "nothing was deleted" is the truth.
+      //
+      // 200 rather than a 5xx: `missing`, `manifestRebuilt` and `failed` are all still meaningful
+      // and a 5xx body is read as an error string, not a result. `isFailureBody` handles an
+      // `{ok:false}` 200 explicitly — that is the shape it exists for.
+      if (failedInputs.length > 0 && wentToTrash.length === 0) {
+        return json({
+          ok: false, trashed: 0, missing, manifestRebuilt, failed: failedInputs,
+          error: `the OS refused to trash ${failedInputs.length === 1 ? 'the file' : `all ${failedInputs.length} files`}: ${failedInputs.join(', ')}`,
+        });
+      }
+      return json({
+        ok: true, trashed: wentToTrash.length, missing, manifestRebuilt,
+        ...(failedInputs.length ? { failed: failedInputs } : {}),
+        ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
+        ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -1851,10 +2511,15 @@ async function describeUnresolvedAgainstLiveWorld(
       // and starve other projects). Filter by resolved-abs-under-projectRoot rather
       // than a hardcoded prefix, so flat (`/assets`) and multi-game
       // (`/games/<id>/assets`) roots both pass and only the engine root is dropped.
-      const rootWithSep = ctx.projectRoot.endsWith(path.sep) ? ctx.projectRoot : ctx.projectRoot + path.sep;
+      // #881: was `abs === ctx.projectRoot || abs.startsWith(rootWithSep)`, which folds nothing —
+      // the third live instance the #869 guard's review found and the one it deferred here. A
+      // string `startsWith` also matches a SIBLING whose name merely begins with the root's
+      // (`…/modoki-ai3-old` under `…/modoki-ai3`), so it could offer an engine-owned or
+      // another-project asset for deletion. `isUnderOrSame` canonicalises and folds both sides and
+      // compares by `path.relative`, which cannot cross a directory boundary that way.
       const inProject = (o: { path: string }): boolean => {
         const abs = ctx.resolveAssetPath(o.path);
-        return !!abs && (abs === ctx.projectRoot || abs.startsWith(rootWithSep));
+        return !!abs && isUnderOrSame(ctx.projectRoot, abs);
       };
       // Largest first — the reclaimable-space wins are what the user scans for.
       const orphans = result.orphanDetails.filter(inProject).sort((a, b) => b.bytes - a.bytes);
@@ -1989,8 +2654,21 @@ async function describeUnresolvedAgainstLiveWorld(
     const resolved = ctx.resolveAssetPath(assetPath);
     if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
     if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
-    // The asset exists — an empty `{}` here now unambiguously means "no sidecar", not "bad path".
-    return { kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)) };
+    // The asset exists, so `{}` is no longer "bad path". ⚠️ It is still NOT unambiguous: this
+    // returns `readMetaSidecar`, which yields `{}` for a sidecar that exists and does not PARSE
+    // as well as for one that is absent (#778 — see that function's own warning). A caller must
+    // not read `{}` as "there was nothing here"; the write path is what protects the authored
+    // fields and the GUID, by quarantining and salvaging respectively.
+    // The CAS baseline travels in a HEADER, not the body (#845 phase 2). The body is the MERGED
+    // view (`.meta.local.json` folded back in) and every existing caller does `res.json()` on it,
+    // so wrapping it in `{meta, sha256}` would break all of them; a header is additive and ignored
+    // by anyone who does not look. `null` sidecar → header omitted, which a client must read as
+    // "no baseline", NOT as "unchanged" — see `readMetaPreferringPark`.
+    const sha = metaSidecarSha256(resolved);
+    return {
+      kind: 'raw', contentType: 'application/json', body: JSON.stringify(readMetaSidecar(resolved)),
+      ...(sha ? { headers: { 'X-Meta-Sha256': sha } } : {}),
+    };
   }
 
   // ── GET /api/font-axes?path= (M) ── the variation axes a font actually exposes,
@@ -2188,11 +2866,115 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/write-meta {path, meta} (M) ──
   if (urlPath === '/api/write-meta' && method === 'POST') {
     try {
-      const { path: assetPath, meta } = (body ?? {}) as { path: string; meta: unknown };
+      const { path: assetPath, meta, ifMatch, discardUnsaved, rendererWrite } = (body ?? {}) as {
+        path: string; meta: unknown; ifMatch?: string; discardUnsaved?: boolean; rendererWrite?: boolean;
+      };
       const resolved = ctx.resolveAssetPath(assetPath);
       if (!resolved) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // ── The park gate (#872) ──────────────────────────────────────────────────────────────
+      // This route REPLACES the sidecar wholesale, and since #845 a human's Inspector
+      // import-settings change is PARKED in the renderer rather than written. Both directions used
+      // to lose work: this write landed on disk, the park survived it, and the next Cmd+S flushed
+      // that older document straight back over it. Nothing reconciled the two, because a
+      // `.meta.json` is invisible to `detectType` so the watcher's `dropParkedWriteFor` — which is
+      // what protects an agent's `modoki_write_asset` — can never fire for a sidecar.
+      //
+      // ⚠️ It runs BEFORE `ifMatchRefusal`, not between it and the write: the CAS check and
+      // `writeMetaSidecar` are synchronous ON PURPOSE (see the comment below) and an `await`
+      // dropped into that window would reopen the race the comment forbids.
+      //
+      // ⚠️ **`rendererWrite` exempts the EDITOR'S OWN writers, and without it this gate refused a
+      // human's save** (#872 review). §8's REQUIRES_SAVE rule is an AGENT-surface rule; this route
+      // is not agent-only. `writeMetaConditional` (`assetViews/widgets.tsx`) is the one definition
+      // of the renderer's POST, and every caller of it — the Sprite Editor, the 9-slice editor, the
+      // Inspector's postprocessor row — loads through `readMetaPreferringPark` and calls
+      // `metaWrittenToDisk` afterwards, i.e. the document being written ALREADY CONTAINS the
+      // parked edit and the write is what legitimately retires it. Measured before the flag:
+      // Inspector → change Max Size → open the Sprite Editor from that same panel → Save → 409,
+      // reported by `writeMetaConditional` as "the file changed on disk", which is a wrong
+      // diagnosis of a file that did not change, and the slices could not be saved at all.
+      //
+      // The flag is an assertion about the CALLING PROCESS, not about the document: a write issued
+      // from the renderer is never blind to the registry — it either read through the park, flushed
+      // it first, or IS the flush. The gate exists for the process that cannot see the registry.
+      const gate = rendererWrite === true
+        ? { kind: 'clear' } as ParkGateOutcome
+        : await metaParkGate(ctx, [normalizeAssetUrl(assetPath)]);
+      const refused = discardUnsaved === true ? null : parkGateRefusal(gate, {
+        verb: 'write-meta',
+        override: 'discardUnsaved',
+        consequence: 'Writing now DESTROYS it: this replaces the file, and their next save flushes '
+          + 'the older parked document back over what you wrote.',
+      });
+      if (refused) return json(refused.body, refused.status);
+      // ⚠️ The precondition is checked against the SIDECAR, not the asset. `resolved` is the asset
+      // itself (`foo.png`); the bytes a concurrent writer races over are `foo.png.meta.json`.
+      // Passing `resolved` here would hash the PNG and 409 every conditional write forever.
+      //
+      // ⚠️ And nothing may `await` between this check and the write below — the read+hash+compare
+      // in `ifMatchRefusal` is synchronous and Node is single-threaded, so the guard holds only
+      // while the call site keeps that window closed. `writeMetaSidecar` is synchronous; keep it
+      // that way, and see `ifMatchRefusal`'s own docblock.
+      const refusal = ifMatchRefusal(sidecarPath(resolved), ifMatch);
+      if (refusal) return json(refusal, 409);
       writeMetaSidecar(resolved, meta as Parameters<typeof writeMetaSidecar>[1]);
-      return json({ ok: true });
+      const writtenSha = metaSidecarSha256(resolved);
+      // ⚠️ **The discard happens AFTER the write, and the order is the whole point** (#872 review).
+      // It used to ride along with the probe — so a `writeMetaSidecar` that then threw (a read-only
+      // sidecar, ENOSPC) left the human's parked edit destroyed and NOTHING written in its place,
+      // reported as a bare 500 that never mentioned the discard. A failed write must cost nothing.
+      // The residual window is the opposite way round and strictly smaller: a park created between
+      // the write and this call is dropped, and only when the caller explicitly asked to discard.
+      const discardedParked = gate.kind === 'parked' && discardUnsaved === true
+        ? await metaParkGate(ctx, [normalizeAssetUrl(assetPath)], { discard: true })
+          .then((d) => (d.kind === 'parked' ? d.discarded : []))
+          .catch(() => [] as string[])
+        : [];
+      // The hash of what we ACTUALLY wrote — the caller cannot derive it, because
+      // `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits the cache blocks out
+      // into `.meta.local.json`. A panel that keeps editing after a save needs this to advance its
+      // baseline, or its next save 409s against a file only WE changed. Mirrors `/api/asset-write`.
+      //
+      // No `markEditorWrite` here, deliberately: that guard suppresses the watcher's hot-reload
+      // BROADCAST for a self-write, and `detectType` returns null for `.meta.json`
+      // (`vite-asset-scanner.ts`), so no broadcast fires for a sidecar in the first place. Adding
+      // it would be machinery guarding nothing.
+      return json({
+        ok: true,
+        sha256: writtenSha,
+        // What the gate saw, so a caller can tell the three accept paths apart. A silent success
+        // cannot distinguish "nothing was parked" from "a park was destroyed on your instruction"
+        // from "nobody was there to ask".
+        ...(discardedParked.length
+          ? {
+            discardedParked,
+            note: 'A parked Inspector import-settings edit for this path was DISCARDED before the '
+              + 'write, as you asked. The human\'s unsaved change is gone and this file is now the '
+              + 'only version. Nothing stale survives to flush back over it.',
+          }
+          : {}),
+        ...(gate.kind === 'absent'
+          ? {
+            editorConnected: false,
+            note: 'No editor renderer answered, so no parked import-settings edit could be in the '
+              + 'way — a park is renderer-only state and there is no renderer. Written unconditionally.',
+          }
+          : {}),
+        // ⚠️ `discardUnsaved` promises that nothing stale survives to flush back over this write,
+        // and on THIS path that promise cannot be kept: the probe never reached the renderer, so no
+        // park was found and none was dropped. Saying so is the whole difference between a
+        // disclosed risk and the false success §0 ranks worst — the override means "I accept the
+        // risk", not "there was no risk".
+        ...(gate.kind === 'unknown'
+          ? {
+            note: 'Written, but the parked-import-settings probe was FORCED past without an answer '
+              + `from the renderer (${gate.reason}). NOTHING was discarded, because nothing could be `
+              + 'checked — if a human did have an unsaved edit for this path, it survives and their '
+              + 'next save will flush it over what you just wrote. Verify with '
+              + 'modoki_get_editor_state pendingImportSettings once the renderer answers again.',
+          }
+          : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2238,6 +3020,30 @@ async function describeUnresolvedAgainstLiveWorld(
       if (targets.length === 0) {
         return json({ ok: false, converted: 0, skipped: 0, errors: [], error: `no manifest asset matches ${JSON.stringify(target)}${recursive ? ' (recursive)' : ''} — check the path/casing (it must be an asset-root path like /games/<id>/assets/…), or list assets first.` }, 404);
       }
+      // ── The park gate (#882) ──────────────────────────────────────────────────────────────
+      // Every re-import handler reads the sidecar off DISK to know what to convert with, and
+      // writes it back with the fresh cache block. With a parked Inspector edit that is wrong
+      // twice: the bake uses the PRE-EDIT value while the panel already shows the new one, and the
+      // human's next save then flushes their older document over the cache block this bake just
+      // wrote. `flushPendingMetaFor` exists for exactly this and every one of its callers is
+      // renderer-side — the UI's own Re-import button flushes first, and this route could not.
+      //
+      // ⚠️ It REFUSES rather than flushing. The button flushes because the human clicked it in the
+      // panel where they made the edit, and that click is consent to persist it; an agent has no
+      // such mandate, and §8's settled precedent (`modoki_build` refuses rather than auto-saving)
+      // is the agent-surface answer. The hatch is `force`, not `discardUnsaved`: proceeding leaves
+      // the human's edit alone and merely does not USE it.
+      // Manifest paths are already canonical, so no `normalizeAssetUrl` here — unlike the two
+      // routes below, whose path comes straight off the request body.
+      const reGate = await metaParkGate(ctx, targets.map((a) => a.path));
+      const reRefused = (body as { force?: boolean } | undefined)?.force === true ? null : parkGateRefusal(reGate, {
+        verb: 're-import',
+        override: 'force',
+        consequence: 'The bake reads the sidecar from DISK, so it would convert with the PRE-EDIT '
+          + 'settings — and their next save would then flush that older document over the cache '
+          + 'block this bake writes.',
+      });
+      if (reRefused) return json(reRefused.body, reRefused.status);
       const summary = { converted: 0, skipped: 0, errors: [] as string[] };
       // Paths whose bake succeeded — pushed to the renderer below so the LIVE viewport
       // evicts its stale GPU cache without a reload. The UI "Re-import" button does this
@@ -2258,6 +3064,16 @@ async function describeUnresolvedAgainstLiveWorld(
         if (!handler) { summary.skipped++; noHandler.push(`${a.path} (${a.type})`); continue; }
         if (!abs) { summary.skipped++; unresolved.push(a.path); continue; }
         try {
+          // Fail fast on a too-new sidecar BEFORE running any conversion work for this
+          // asset — checked per-asset rather than pre-walking the whole `targets` list,
+          // and deliberately placed INSIDE this asset's own try/catch, same as any other
+          // per-asset failure: a refusal here lands in `summary.errors` and the loop
+          // CONTINUES to the next asset, it does not abort the whole route. A recursive
+          // reimport with one too-new sidecar still bakes and reports every OTHER asset,
+          // and the route still rebuilds the manifest and sends `invalidate-assets`
+          // afterward. `handler`'s own `writeMetaSidecar` re-checks anyway, so nothing is
+          // lost by checking inside the try.
+          assertSidecarWritable(abs);
           await handler(a.path, abs, reCtx); summary.converted++;
           // EVERY baked type is announced, and the renderer op decides which ones hold a
           // cache worth evicting (#304 close-out). This used to filter to model|texture
@@ -2304,6 +3120,25 @@ async function describeUnresolvedAgainstLiveWorld(
         ...summary, ok,
         ...(noHandler.length ? { noHandler } : {}),
         ...(unresolved.length ? { unresolved } : {}),
+        // The forced path is the one that needs saying out loud: the bake DID run and it did NOT
+        // use the human's newest settings. Reporting only on the refusal would make `force:true`
+        // a silent downgrade, which is the false success §0 ranks worst (#882).
+        ...(reGate.kind === 'parked'
+          ? {
+            bakedFromDisk: reGate.paths,
+            note: `${reGate.paths.length} asset(s) had a parked Inspector import-settings edit that `
+              + 'is NOT on disk, and this bake read the file — so those were converted with the '
+              + 'PRE-EDIT settings. The human\'s edit is untouched and their next save will flush it '
+              + 'over this bake\'s cache block. modoki_save_all, then re-import, uses their settings.',
+          }
+          : {}),
+        ...(reGate.kind === 'unknown'
+          ? {
+            note: 'The parked-import-settings probe was FORCED past without an answer from the '
+              + `renderer (${reGate.reason}), so whether a human's unsaved edit was in the way is `
+              + 'unknown — not "there was none".',
+          }
+          : {}),
       }, ok ? 200 : 500);
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -2324,13 +3159,31 @@ async function describeUnresolvedAgainstLiveWorld(
   // an existing file's `id` when the new data omits one.
   if (urlPath === '/api/asset-write' && method === 'POST') {
     try {
-      const { path: assetPath, type, data } = (body ?? {}) as {
-        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean;
+      const { path: assetPath, type, data, ifMatch } = (body ?? {}) as {
+        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean; ifMatch?: string;
       };
       if (!assetPath || !type) return json({ error: 'asset-write requires { path, type, data }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return json({ error: 'path outside allowed directories' }, 403);
+      // Optional compare-and-swap precondition (#831), the same one `/api/write-file` carries and
+      // through the same helper. `AtlasAssetView` is the caller that needs it: it serializes the
+      // WHOLE document, nothing notifies it of a same-path content change, and since #831 its
+      // write is PARKED — so the window between the read it serializes onto and the write is now
+      // as long as the human takes to press Cmd+S, rather than one keystroke. Absent `ifMatch` ⇒
+      // unconditional write, so every other caller (agent ops, the four parking panels) is
+      // unaffected.
+      //
+      // ⚠️ Everything from here to `writeJsonAtomic` below is SYNCHRONOUS, which is what makes the
+      // check-then-write atomic — see `ifMatchRefusal`. Do not introduce an `await` into this span.
+      const casRefusal = ifMatchRefusal(abs, ifMatch);
+      if (casRefusal) {
+        return json({
+          ...casRefusal,
+          error: `REFUSED: ${assetPath} changed on disk since it was read. Nothing was written.`,
+          hint: 'Re-read the file and re-apply the edit onto the current content.',
+        }, 409);
+      }
       const { errors, warnings } = validateAssetData(type, data);
       if (errors.length) return json({ ok: false, errors, warnings }, 400);
       // ── asset-write is a FULL REPLACE, so a thin `data` is a DESTRUCTIVE write. ──
@@ -2352,9 +3205,52 @@ async function describeUnresolvedAgainstLiveWorld(
           hint: 'Read the current def first (modoki_read_asset_def), change what you need, and write the WHOLE object back. For a one-field edit prefer the granular tools (modoki_particle_set / anim_set_clip / timeline_set).',
         }, 400);
       }
+      // ── Refuse to overwrite a document this build cannot read (docs/format-versioning.md
+      // § 2b: "a writer that ... can overwrite an existing document must refuse a too-new
+      // one"). Only the asset types that carry a real format constant are checked; a type
+      // with no stamped `version` field (`.anim.json`, `.spriteanim.json`, `.timeline.json`,
+      // `.rig2d.json`, `.shader.json`, `.animset.json` — § 3) keeps today's behaviour rather
+      // than being mapped to an invented constant. ⚠️ This comment used to say `AssetSchemaType`
+      // "does not include `mesh`/`atlas` (those are written elsewhere, never through this
+      // route)". `atlas` came onto this route in #831 and is now in the map above; `mesh` is
+      // still not an `AssetSchemaType` at all.
+      // ⚠️ BOM-stripped, and it is load-bearing three times over. A `.json` with a leading UTF-8
+      // BOM — a Windows-authored file, or one round-tripped through an editor that adds one — is
+      // NOT parsable by `JSON.parse`, so reading it raw made this route: (1) classify it
+      // `unreadable` and REFUSE every write to it forever, (2) leave `prevDoc` null so the
+      // dropped-field guard silently passed anything, and (3) skip id preservation, so a document
+      // whose `id` the caller omitted got a brand-new GUID minted by the watcher's heal and every
+      // reference to it dangled (the C7 class). Measured 2026-09-07 while adding the `ifMatch`
+      // test above: a BOM'd atlas 400'd with "could not be classified (unparsable)". The bytes
+      // written back never carry a BOM (`assetJsonBytes`), so this also heals the file in place.
+      const prevText = fs.existsSync(abs) ? stripUtf8Bom(fs.readFileSync(abs)).toString('utf-8') : null;
+      if (prevText !== null) {
+        const formatVersion = ASSET_WRITE_FORMAT_VERSION[type];
+        if (formatVersion !== undefined) {
+          const verdict = classifyJsonFormatVersion(prevText, formatVersion);
+          if (verdict.kind === 'too-new') {
+            return json({
+              ok: false,
+              error: `REFUSED: ${assetPath} is format version ${verdict.version}, newer than this build understands (${formatVersion}). Overwriting it would destroy a document this build cannot read. Nothing was written.`,
+              hint: 'Open this project with a newer engine build to edit this asset.',
+            }, 409);
+          }
+          if (verdict.kind === 'unreadable') {
+            return json({
+              ok: false,
+              error: `REFUSED: ${assetPath} could not be classified (${verdict.reason}) — it may be corrupt or hand-edited incorrectly (e.g. unresolved merge markers). Overwriting it would silently destroy whatever content is still recoverable. Nothing was written.`,
+              hint: 'Inspect and repair the file directly before writing to it again.',
+            }, 400);
+          }
+        }
+      }
+      // Parsed once, above the format-version check, and reused below for both the
+      // dropped-field guard and id preservation — a second independent parse of the same
+      // bytes (each with its own try/catch) is how a corrupt file used to slip past BOTH
+      // guards silently (#778's own precedent, see the id-preservation comment below).
       let prevDoc: Record<string, unknown> | null = null;
-      if (fs.existsSync(abs)) {
-        try { prevDoc = JSON.parse(fs.readFileSync(abs, 'utf-8')) as Record<string, unknown>; } catch { prevDoc = null; }
+      if (prevText !== null) {
+        try { prevDoc = JSON.parse(prevText) as Record<string, unknown>; } catch { prevDoc = null; }
       }
       if (isObj && prevDoc && !(body as { replace?: boolean })?.replace) {
         const incoming = new Set(Object.keys(data as object));
@@ -2379,8 +3275,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // later: every scene/Animator reference to the old guid dangled and the clip silently
       // stopped loading. `write_asset` promises to preserve the id, and reported ok:true
       // while doing the opposite. (C7)
-      if (out && typeof out === 'object' && !out.id && fs.existsSync(abs)) {
-        try { const prev = JSON.parse(fs.readFileSync(abs, 'utf-8')); if (prev?.id) out.id = prev.id; } catch { /* ignore */ }
+      if (out && typeof out === 'object' && !out.id && prevDoc?.id) {
+        out.id = prevDoc.id;
       }
       // `selfWrite` — the editor is flushing a doc it ALREADY applied to the live cache
       // (dirtyAssets.flushDirtyAssets), so fingerprint the bytes the way /api/write-file does and
@@ -2391,11 +3287,17 @@ async function describeUnresolvedAgainstLiveWorld(
       // which is the whole reason the invalidation exists.
       const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
       if (selfWrite) {
-        const bytes = Buffer.from(JSON.stringify(out, null, 2));
+        const bytes = assetJsonBytes(out);
         ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
       }
-      writeJsonAtomic(abs, out);
-      return json({ ok: true, saved: true, warnings, path: assetPath });
+      const outBytes = assetJsonBytes(out);
+      writeJsonAtomic(abs, outBytes);
+      // The sha256 of what now sits on disk, so a compare-and-swap caller can advance its own
+      // baseline without re-fetching. It CANNOT compute this itself: the bytes are the server's
+      // (`normalizeAssetData` + the id-preservation branch + `assetJsonBytes`' trailing newline),
+      // and a client that reconstructs them is a second copy of that serialisation waiting to
+      // drift — after which every subsequent write 409s against a baseline that was never right.
+      return json({ ok: true, saved: true, warnings, path: assetPath, sha256: crypto.createHash('sha256').update(outBytes).digest('hex') });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2421,12 +3323,13 @@ async function describeUnresolvedAgainstLiveWorld(
       // parked for that path: the live-cache entry AND the `dirtyAssetPaths` entry both vanish, so
       // a later `save_all` writes nothing and reports no error. Silent data loss in the authoring
       // path — an edit made in the second after create_asset, gone. Measured ~500ms end-to-end.
-      // Fingerprint the bytes `writeJsonAtomic` will actually write (JSON.stringify(x, null, 2),
-      // no trailing newline); a mismatch here fails OPEN and silently restores the bug.
+      // Fingerprint the bytes `writeJsonAtomic` will actually write — via `assetJsonBytes`, the
+      // one definition of them, so this cannot drift from the writer; a mismatch here fails OPEN
+      // and silently restores the bug.
       // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
       // so there is no stale cached def the invalidation needs to clear.
-      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(Buffer.from(JSON.stringify(data, null, 2))).digest('hex'));
-      writeJsonAtomic(abs, data);
+      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(assetJsonBytes(data)).digest('hex'));
+      writeJsonAtomic(abs, assetJsonBytes(data));
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
     } catch (e) {
@@ -2434,11 +3337,11 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
-  // ── POST /api/write-file {path, content, encoding?} (M) ── write any file
+  // ── POST /api/write-file {path, content, encoding?, ifMatch?} (M) ── write any file
   // under an asset root. Suppresses the watcher hot-reload for the editor's own save.
   if (urlPath === '/api/write-file' && method === 'POST') {
     try {
-      const { path: filePath, content, encoding } = (body ?? {}) as { path: string; content: unknown; encoding?: string };
+      const { path: filePath, content, encoding, ifMatch } = (body ?? {}) as { path: string; content: unknown; encoding?: string; ifMatch?: string };
       // Resolve the write target. Normally an asset URL (/assets/…, /games/…)
       // via resolveAssetPath. But a flat project's scenes load through Vite's
       // /@fs/<abs> form, so the editor may hold a /@fs path (e.g. saving the
@@ -2456,6 +3359,13 @@ async function describeUnresolvedAgainstLiveWorld(
         absPath = ctx.resolveAssetPath(filePath);
       }
       if (!absPath) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
+      // compare-and-swap caller gets the compare and the write as ONE atomic operation instead
+      // of doing its own read-then-write with a gap a second write can land in between. Absent
+      // `ifMatch` ⇒ unconditional write, exactly as before. See `ifMatchRefusal` for why NOTHING
+      // may `await` between here and the write below.
+      const refusal = ifMatchRefusal(absPath, ifMatch);
+      if (refusal) return json(refusal, 409);
       // Materialize the exact bytes once so the self-write guard can fingerprint
       // them (the F9 late-rename fallback) and we write the identical buffer.
       const bytes = encoding === 'base64'
@@ -2487,14 +3397,49 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/duplicate-asset {from, to} (M) ── copy + regenerate GUID.
   if (urlPath === '/api/duplicate-asset' && method === 'POST') {
     try {
-      const { from, to } = (body ?? {}) as { from: string; to: string };
+      const { from, to, force } = (body ?? {}) as { from: string; to: string; force?: boolean };
       const absFrom = ctx.resolveAssetPath(from);
       const absTo = ctx.resolveAssetPath(to);
       if (!absFrom || !absTo) return json({ error: 'Path outside allowed directories' }, 403);
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
+      // ── The park gate (#882) ─────────────────────────────────────────────────────────────
+      // `duplicateAssetFile` reads the SOURCE's `.meta.json` off disk to seed the copy's, so a
+      // parked Inspector edit on the source means the duplicate is BORN with the pre-edit import
+      // settings while the panel shows the new ones. Nothing is destroyed here — the copy is
+      // simply built from stale bytes — so the hatch is `force`, the same one `/api/reimport`
+      // takes. The DESTINATION needs no probe: it cannot exist yet (checked above), so no park
+      // can be keyed to it.
+      const dupGate = await metaParkGate(ctx, [normalizeAssetUrl(from)]);
+      const dupRefused = force === true ? null : parkGateRefusal(dupGate, {
+        verb: 'duplicate-asset',
+        override: 'force',
+        consequence: 'The copy is seeded from the source sidecar ON DISK, so it would be born with '
+          + 'the PRE-EDIT import settings while the editor shows the newer ones.',
+      });
+      if (dupRefused) return json(dupRefused.body, dupRefused.status);
       const newGuid = duplicateAssetFile(absFrom, absTo);
-      return json({ ok: true, guid: newGuid });
+      return json({
+        ok: true,
+        guid: newGuid,
+        ...(dupGate.kind === 'parked'
+          ? {
+            copiedFromDisk: dupGate.paths,
+            note: 'The source had a parked Inspector import-settings edit that is NOT on disk, so '
+              + 'this copy carries the PRE-EDIT settings. The source itself is untouched.',
+          }
+          : {}),
+        // The forced-past-an-unanswered-probe case, disclosed here as it already is on
+        // `/api/write-meta` and `/api/reimport`. Leaving it out made this the one route where
+        // `force:true` returned a bare success (#882 review) — the §0 argument applied unevenly.
+        ...(dupGate.kind === 'unknown'
+          ? {
+            note: 'Copied, but the parked-import-settings probe was FORCED past without an answer '
+              + `from the renderer (${dupGate.reason}), so whether the source had an unsaved edit `
+              + 'is unknown — not "there was none". If it did, this copy carries the pre-edit settings.',
+          }
+          : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2520,6 +3465,20 @@ async function describeUnresolvedAgainstLiveWorld(
         catch { /* stat failed → treat as a real collision */ }
         if (!sameEntry) return json({ error: 'Destination exists' }, 409);
       }
+      // Moving a folder INTO ITSELF orphans it — `renameSync` throws EINVAL, which would surface
+      // as a 500 ("something broke") rather than the 4xx this is. The drag path cannot reach it
+      // (`planFilesDropMoves` skips it); the agent path can.
+      // (`absTo === absFrom` is NOT included: a case-only rename resolves to the same entry and is
+      // explicitly allowed above. `startsWith(absFrom + sep)` already excludes equality.)
+      if (absTo.startsWith(absFrom + path.sep)) {
+        return json({ error: 'Destination is inside the source' }, 400);
+      }
+      // Is this a FOLDER move? The route is the only place that can answer — the client passes
+      // two strings, and a folder and a file look identical in them. It decides both the
+      // fingerprinting below and the `prefix` on the repair (#867).
+      let isDir = false;
+      try { isDir = fs.statSync(absFrom).isDirectory(); } catch { /* raced away → treat as a file */ }
+
       // The destination is about to APPEAR, and the watcher cannot tell a rename from an
       // external overwrite — so fingerprint it as the editor's own write, exactly as
       // /api/asset-write and /api/write-file already do. Without this the rename's own change
@@ -2527,12 +3486,63 @@ async function describeUnresolvedAgainstLiveWorld(
       // `applyMovesToParkedAssets` just deliberately moved ONTO this path: the human's unsaved
       // edit is gone, the panel still shows it, and the badge reads `Saved ✓`
       // (bug 1MCF9DFktot8hXsgBuWp). Read the bytes BEFORE the move — after it, absFrom is gone.
-      try {
-        const moved = fs.readFileSync(absFrom);
-        ctx.markEditorWrite(absTo, crypto.createHash('sha1').update(moved).digest('hex'));
-      } catch { /* unreadable (a directory move) — fall through; the guard is best-effort */ }
+      //
+      // ⚠️ This used to be a bare `readFileSync(absFrom)` in a try/catch whose comment said a
+      // directory move would "fall through; the guard is best-effort". `readFileSync` on a
+      // directory THROWS, so a folder move was fingerprinted NOT AT ALL — every child arrived at
+      // the watcher as a foreign write and had its parked edit discarded, which is precisely the
+      // bug the guard exists to prevent, on the path where the most edits are at risk. Mark every
+      // file that will land.
+      for (const [absDest, hash] of plannedMoveLandings(absFrom, absTo, isDir)) {
+        ctx.markEditorWrite(absDest, hash);
+      }
+      // And mark the SOURCE, whose `unlink` is otherwise a foreign change: `handleSceneChanged`
+      // routes it to `dropParkedWriteFor(from)`, which discards the human's unsaved edit with a
+      // console.warn. Marking it makes the watcher skip the event entirely, which also removes the
+      // race between that 150ms-debounced event and the repair below.
+      //
+      // ⚠️ Suppressing that event also drops the two things `handleSceneChanged` does BESIDE the
+      // discard: `ASSET_CACHE_INVALIDATORS[kind](from)` and `fireDirtyListeners()`. Deliberate,
+      // and it leaves a residue worth naming rather than pretending away — the cache entry at the
+      // OLD path outlives the file. It self-heals: nothing resolves the old path afterwards (refs
+      // are GUIDs and the manifest is rebuilt), and if a NEW file is later created there its own
+      // `add` invalidates the entry before anything reads it. The destination has had exactly this
+      // property since the fingerprint was first added, so this is not new behaviour, only newly
+      // symmetrical.
+      ctx.markEditorWrite(absFrom, null);
+
       moveAssetFile(absFrom, absTo);
-      return json({ ok: true });
+
+      // Tell the RENDERER to repair its path-keyed state — parked writes, CAS baselines, editor
+      // bindings, the current folder and the Inspector selection all key on a path this move just
+      // invalidated. The panel repairs itself synchronously when IT is the mover; this covers
+      // every other caller, and `modoki_move_asset` (a separate PROCESS) has no other route to it.
+      // ⚠️ CANONICAL urls, never the raw request body. `resolveAssetPath` is deliberately
+      // tolerant — it prepends a missing leading slash, `decodeURIComponent`s, and resolves `.`
+      // and `..` — while the renderer's `applyMove` compares paths EXACTLY. So an agent calling
+      // `modoki_move_asset {from: "assets/fx/spark.particle.json"}` (no leading slash, or a
+      // percent-encoded space) moved the file and then asked the renderer to repair a path that
+      // matches no binding, no parked write and no selection: a silent no-op reported as
+      // `{ok:true, repaired:[]}`, indistinguishable from "nothing was bound", arriving from the
+      // exact out-of-process caller this repair exists for. `assetEditorBindings.ts`'s header
+      // already warned that both sides must originate from the same string "if that ever stops
+      // being true this needs a shared canonicalizer" — `absToAssetUrl` is it.
+      const canonFrom = ctx.absToAssetUrl(absFrom);
+      const canonTo = ctx.absToAssetUrl(absTo);
+      // ⚠️ No `?? from` fallback. Falling back to the raw string ships exactly the defect the
+      // canonicalization fixes — a path the renderer cannot match — just one size smaller, and
+      // reports it as a successful repair. `absToAssetUrl` returns null for a path
+      // `resolveAssetPath` accepted in one case: the asset ROOT itself via a trailing slash
+      // (`/assets/`), which `modoki_move_asset`'s bare `z.string()` does accept. Renaming a
+      // project's whole asset root is not a thing to do half-repaired.
+      const outcome: RepairOutcome = canonFrom && canonTo
+        ? await applyMovesInRenderer(ctx, [{ from: canonFrom, to: canonTo, ...(isDir ? { prefix: true } : {}) }])
+        : { kind: 'unrepaired', reason: `not an asset-root path: ${canonFrom ? to : from}` };
+      return json({
+        ok: true,
+        ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
+        ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2657,11 +3667,16 @@ async function describeUnresolvedAgainstLiveWorld(
   // invalidate the virtual config module so the next reload reflects new values.
   //
   // THE BODY IS A PATCH, deep-merged onto the file ON DISK — a section you omit is
-  // left exactly as the file had it. ("Section" means one DECLARED in ProjectConfig:
-  // the write still funnels through mergeProjectConfig, whose explicit key list drops
-  // any UNDECLARED top-level key. Pre-existing — the old route did the same — and
-  // inert, since every reader resolves through that same list. Unknown keys nested
-  // INSIDE a declared section do survive, via prune's already-on-disk rule.)
+  // left exactly as the file had it, and since #821 that now holds for an UNDECLARED
+  // top-level section too. (It did not before: the write funnels through
+  // mergeProjectConfig, whose explicit key list drops any key it does not name, so a
+  // section a NEWER branch added was erased from the committed file on the next Apply
+  // by an older editor. This paragraph used to describe that as "pre-existing and
+  // inert, since every reader resolves through that same list" — the inertness claim
+  // was about READERS and did not survive the file being rewritten underneath them.
+  // pruneProjectConfig now carries such a section through, TOP LEVEL ONLY; its own
+  // docblock has the reasoning and the measurement.) Unknown keys nested INSIDE a
+  // declared section survived all along, via prune's already-on-disk rule.
   // ⚠️ **EXCEPT `rendering.three.tiers`** (REPLACE_WHOLESALE, project-config.ts): it is merged as
   // a LEAF, not a section, so a patch naming it REPLACES the whole map — an omitted tier is
   // DELETED, not left alone, and an omitted FIELD inside a named tier is refused below rather than
@@ -2681,11 +3696,24 @@ async function describeUnresolvedAgainstLiveWorld(
   // once handed an internal game the demo deploy bucket.
   if (urlPath === '/api/project-settings' && method === 'POST') {
     try {
-      // `configErrors` is the GET's read-only diagnostic, not a section. The dialog
-      // posts back the WHOLE object it loaded, so it would otherwise come straight
-      // back here and trip the unknown-section 400 below — a confusing refusal for
-      // something the caller never authored. Drop it before anything else looks.
-      const { configErrors: _configErrors, ...bodyIn } = (body ?? {}) as Record<string, unknown>;
+      // `configErrors` and `configWarnings` are the GET's read-only diagnostics, not
+      // sections. The dialog posts back the WHOLE object it loaded, so either would
+      // otherwise come straight back here and trip the unknown-section 400 below — a
+      // confusing refusal for something the caller never authored. Drop both before
+      // anything else looks.
+      //
+      // ⚠️ **`configWarnings` was missing from this list, and that made Apply fail on
+      // exactly the projects the warning exists for** (found by #821's review; the
+      // reasoning above already covered it and only `configErrors` was stripped).
+      // `configErrors` makes the dialog INERT, so its post can only happen if the form
+      // is disabled — but a warning deliberately leaves every control editable
+      // (`ProjectSettingsDialog.tsx` gates inertness on errors alone), so the banner
+      // renders, the user edits an unrelated field, presses Apply, and gets
+      // `unknown config section(s) "configWarnings" — nothing was written`. No setting
+      // could be saved until the file was hand-edited. Latent when found: no committed
+      // project.config.json currently resolves to a warning.
+      const { configErrors: _configErrors, configWarnings: _configWarnings, ...bodyIn } =
+        (body ?? {}) as Record<string, unknown>;
       const { user: userPartIn, ...configPart } = bodyIn;
       let userPart = userPartIn;
       // Private build.* fields (see PRIVATE_BUILD_FIELDS) must never land in
@@ -2882,7 +3910,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const dir = layoutsDir();
       fs.mkdirSync(dir, { recursive: true });
       const data = typeof b.content === 'string' ? JSON.parse(b.content) : b.content;
-      writeJsonAtomic(path.join(dir, `${name}.layout.json`), data);
+      writeJsonAtomic(path.join(dir, `${name}.layout.json`), assetJsonBytes(data)); // layout: #835
       return json({ ok: true, name });
     } catch (e) { return json({ error: String(e) }, 500); }
   }
@@ -2920,7 +3948,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const next = { ...readAiSettings(), ...patch };
       const dir = path.join(ctx.projectRoot, '.modoki');
       fs.mkdirSync(dir, { recursive: true });
-      writeJsonAtomic(aiSettingsFile(), next);
+      writeJsonAtomic(aiSettingsFile(), assetJsonBytes(next)); // settings: #835
       return json(next);
     } catch (e) { return json({ error: String(e) }, 500); }
   }
@@ -3062,6 +4090,43 @@ async function describeUnresolvedAgainstLiveWorld(
       // answering (400), not a dead gateway.
       const msg = String(e instanceof Error ? e.message : e);
       return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── GET /api/asset-meta?path= (M→R) ── the sidecar, PREFERRING a parked Inspector edit (#872).
+  //
+  // Deliberately a SECOND route rather than a flag on `/api/read-meta`. That one is the editor's
+  // OWN disk read — `readMetaPreferringPark` calls it from the renderer, so making it probe the
+  // renderer back would be circular for every real caller it has. This one is the agent's read,
+  // and it asks the side that actually knows.
+  if (urlPath === '/api/asset-meta' && method === 'GET') {
+    const assetPath = query.get('path');
+    if (!assetPath) return json({ error: 'asset-meta requires ?path=<asset-root URL>' }, 400);
+    // ⚠️ The F10 checks run HERE, BEFORE the renderer, and they are not optional. `/api/read-meta`
+    // fails a bad/escaped/absent path explicitly (400/403/404) precisely so it cannot collapse into
+    // a silent `{}` — but `readMetaPreferringPark`, which the op calls, flattens every non-ok
+    // response to `{meta:{}, ok:false}` and cannot tell 404 from 500. Asking the renderer first
+    // would therefore turn "that asset does not exist" into a 200 carrying an empty document, which
+    // is exactly the ambiguity F10 removed. Node can answer it, so Node answers it.
+    const preResolved = ctx.resolveAssetPath(assetPath);
+    if (!preResolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!fs.existsSync(preResolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
+    try { return json(await ctx.requestBrowser('read-asset-meta', { path: assetPath })); }
+    catch (e) {
+      // Same split as `/api/asset-def` and the editor-action relay: the op answering (400) is not
+      // a dead gateway. But unlike asset-def, a transport failure here is RECOVERABLE — the disk
+      // read is a real, if weaker, answer — so fall back rather than fail, and SAY which it is.
+      // Silently returning disk would be the #872 defect again, one layer down: an agent reading
+      // a pre-edit value with no way to know a newer one might exist.
+      const status = relayFailureStatus(e);
+      if (status === 400) return json({ error: String(e instanceof Error ? e.message : e) }, 400);
+      return json({
+        ok: true, path: assetPath, meta: readMetaSidecar(preResolved), source: 'disk', unsaved: false,
+        read: 'ok', editorConnected: false,
+        note: 'No editor renderer answered, so this is the FILE and a parked Inspector '
+          + 'import-settings edit could NOT be checked for. If an editor is open, a newer unsaved '
+          + 'value may exist — retry, or check modoki_get_editor_state pendingImportSettings.',
+      });
     }
   }
 
@@ -3253,7 +4318,11 @@ async function describeUnresolvedAgainstLiveWorld(
     const name = query.get('name') || 'default';
     if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
     try {
-      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
+      // `--repo-root` explicitly, the SAME expression `/api/ota/keys` above reads back with —
+      // before this, the two agreed only because this call happened to invoke the script by a
+      // cwd-relative path (`cwd` set, no `--repo-root`), which desyncs the moment either side's
+      // path resolution changes (#582's "Related" finding).
+      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name, '--repo-root', ctx.editorRoot || ctx.projectRoot], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
       const publicKey = out.match(/^\s*(\S+)\s*$/m)?.[1] ?? null;
       return json({ ok: true, name, publicKey, log: out });
     } catch (e) {
@@ -3477,8 +4546,28 @@ function relayFailureStatus(e: unknown): number {
   // `preview`, `overview` and `review`, so "…the PREVIEW was destroyed…" would be misclassified as
   // transport — this fix reintroducing its own bug one word smaller. Caught in review, before it
   // could bite.
-  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
-  return transport ? 504 : 400;
+  return isRelayTransportFailure(msg) ? 504 : 400;
+}
+
+/** Did the relay itself fail, rather than the op answering? The single maintained list of both
+ *  hosts' transport wordings — every string `failPendingRenderer` (electron/main.ts) and the Vite
+ *  HMR relay actually send.
+ *
+ *  ⚠️ **Extracted (#867) because a SECOND hand-copy was written and was born incomplete.** The
+ *  move/delete repair added its own regex to decide "no renderer" vs "the repair failed", and it
+ *  missed `no editor renderer window`, `editor window closed`, `project changed — renderer
+ *  reloading` and `Object has been destroyed` — every Electron string, i.e. the whole default
+ *  editor surface. This list has now been found incomplete three times by review; a copy of it is
+ *  the wrong shape of thing to own. Read the history above before touching the pattern. */
+export function isRelayTransportFailure(msg: string): boolean {
+  return /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
+}
+
+/** Was the relay failure specifically a TIMEOUT — the renderer never answered in the window?
+ *  Distinct from the rest of `isRelayTransportFailure`, which all mean the surface was
+ *  definitively absent. See `applyMovesInRenderer`. */
+export function isRelayTimeout(msg: string): boolean {
+  return /timed out waiting for the (renderer|browser)/i.test(msg);
 }
 
 /** Editor actions the /api/editor-action relay accepts (op names dispatched in

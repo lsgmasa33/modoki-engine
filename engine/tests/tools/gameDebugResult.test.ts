@@ -10,8 +10,8 @@
  *  problem, contrary to the audit that prompted this work.) */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   encodeEvalResult, encodeStructuredResult, capText, extFor, describeScreenshot, MAX_TEXT_CHARS,
   isFailureBody, deviceFail, caughtFailure, deviceReplyFailure, ERROR_CODES,
@@ -197,7 +197,7 @@ describe('§5 error envelope — the device server', () => {
     // A source guard, kept as a cheap belt to the braces. The behavioural coverage it used to
     // stand in for now exists: `deviceToolSurface.test.ts` calls these handlers for real against a
     // stub backend (the Phase-8 gap this comment used to describe is closed).
-    const src = readFileSync(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
     expect(src).toContain('async function currentScreenInfo');
     // The raw variable must never be spread into an outgoing request — only the checked accessor.
     expect(src).not.toMatch(/screenInfo:\s*adbScreenInfo/);
@@ -206,7 +206,7 @@ describe('§5 error envelope — the device server', () => {
   it('no device tool hand-rolls an anonymous `Error: <message>` result any more', () => {
     // A source guard: it stops a NEW tool from reintroducing the shape anywhere in the file, which
     // a per-tool behavioural test cannot do. `deviceToolSurface.test.ts` covers the behaviour.
-    const src = readFileSync(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts'), 'utf8');
+    const src = readScannedSource(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
     expect(src.length).toBeGreaterThan(1000);          // the guard must have a real target
     expect(src).not.toContain('text: `Error: ${(e as Error).message}`');
     // …and every failure goes through one of the three sanctioned constructors.

@@ -17,6 +17,70 @@ export function isDeviceError(v: unknown): v is string {
   return typeof v === 'string' && (v.startsWith('Error:') || v.startsWith('Unknown method:'));
 }
 
+// ── device_console_logs reply shape (#644) ─────────────────────────────────
+export type ConsoleLogEntry = { level: string; args: string[]; timestamp: number };
+export type ConsoleLogsReply =
+  | { ok: true; logs: ConsoleLogEntry[]; dropped: number }
+  | { ok: false; got: string };
+
+/** Shape-tolerant parse of `handleConsoleLogs`'s (`engine/app/debug/bridge.ts`) reply.
+ *
+ *  Root cause of #644: the tool used to assert exactly one wire shape (`const {logs, dropped} =
+ *  parseReply(raw)`) and blow up with `result.map is not a function` on anything else. That
+ *  "anything else" is not hypothetical — `handleConsoleLogs` returned a BARE ARRAY before
+ *  `6f5e81b48`, and this MCP server is a LONG-LIVED process (started once per session) that does
+ *  NOT pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against a
+ *  device on the NEW bridge (or vice versa). Tolerating both shapes here turns a version-skew
+ *  CRASH into a normal read.
+ *
+ *  `got`, for the unrecognised case, is built from the value's SHAPE only, never its content — a
+ *  captured console line can be long and can carry secrets, so it must never appear in a tool
+ *  reply's error text. */
+export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
+  const v = parseReply<unknown>(raw);
+  if (v == null) return { ok: true, logs: [], dropped: 0 }; // an empty ring is an ANSWER, not a failure
+  if (Array.isArray(v)) return { ok: true, logs: v as ConsoleLogEntry[], dropped: 0 }; // pre-6f5e81b48 bridge
+  if (typeof v === 'object' && 'logs' in v && Array.isArray((v as { logs: unknown }).logs)) {
+    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown };
+    return { ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0 };
+  }
+  return { ok: false, got: describeShape(v) };
+}
+
+// ── device_native_logs reply shape (#648) ──────────────────────────────────
+export type NativeLogsReply =
+  | { ok: true; logs: string[]; error?: string }
+  | { ok: false; got: string };
+
+/** Decode `nativeLogs`. The app side answers a BARE ARRAY on the happy path and
+ *  `{logs, error}` only when the native plugin had something extra to say — because the value
+ *  originates in Swift/Kotlin in the INSTALLED BINARY while this MCP and the JS bundle version
+ *  independently, so both shapes are live on the wire at once (the #644 lesson, one layer down).
+ *
+ *  The `error` half is the point: `bridge.ts` used to destructure `{ logs }` and drop the
+ *  declared `error` field, so `{logs: [], error: 'OSLogStore denied'}` reached the reader as
+ *  "No logs." — *could not look* rendered as *nothing is there*. Those are opposite findings.
+ *  #670 is the sibling case where the same tool answers about the WRONG DEVICE. */
+export function parseNativeLogsReply(raw: unknown): NativeLogsReply {
+  const v = parseReply<unknown>(raw);
+  if (v == null) return { ok: true, logs: [] }; // a quiet log is an ANSWER, not a failure
+  if (Array.isArray(v) && v.every((s) => typeof s === 'string')) return { ok: true, logs: v as string[] };
+  if (typeof v === 'object' && 'logs' in v) {
+    const o = v as { logs: unknown; error?: unknown };
+    if (Array.isArray(o.logs) && o.logs.every((s) => typeof s === 'string')) {
+      return { ok: true, logs: o.logs as string[], ...(typeof o.error === 'string' && o.error ? { error: o.error } : {}) };
+    }
+  }
+  return { ok: false, got: describeShape(v) };
+}
+
+// `describeShape` moved to `engine/tools/shared/mcpResult.ts` (#648) once the editor MCP and the
+// backend router needed the same refusal vocabulary. Re-exported so this module's existing
+// importers are unchanged. `mcpResult.ts` has ZERO imports of its own, so pulling it in here does
+// not cost this file the "no MCP-SDK dependency" property its header promises.
+export { describeShape } from '../../shared/mcpResult.js';
+import { describeShape } from '../../shared/mcpResult.js';
+
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather
 // than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match them by

@@ -242,6 +242,42 @@ describe('managerRegistry', () => {
     expect(getRegisteredManagers().filter((s) => s.startsWith('dup'))).toHaveLength(1);
   });
 
+  /** A deferred teardown must not tear down the activation that SUPERSEDED it (#573).
+   *
+   *  When the outgoing entry has an `initPromise` in flight, its teardown is deferred until that
+   *  promise settles. Manager defs are module-level singletons passed by IDENTITY, so on a
+   *  re-register `oldEntry.def === newEntry.def` — meaning the deferred `dispose(old)` lands after
+   *  `init(new)` has already run, on the same instance, destroying what the successor just built.
+   *
+   *  Production cadence: `registerManager` is called with a module-level def during boot and again
+   *  on a game swap, and any manager with an async `init()` (entity spawning, a service handshake)
+   *  leaves exactly this window open. `disposeActiveSceneManagers` already guarded its own await
+   *  with `entry.activationId`; this path was the one missing it.
+   */
+  it('a deferred teardown superseded by a re-register does not dispose its successor', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const dispose = vi.fn();
+    // ONE def object, registered twice — the identity case the deferral docblock describes.
+    const def: ManagerDef = { name: 'deferred', scope: 'app', init: () => gate, dispose };
+
+    registerManager(def); // activation 1 — init parked on `gate`
+    registerManager(def); // activation 2 — activation 1's teardown is deferred until `gate` settles
+    expect(dispose).not.toHaveBeenCalled(); // nothing has settled yet
+
+    release();
+    // A macrotask turn, NOT a couple of `await Promise.resolve()` — `activate()` wraps the init in
+    // `Promise.resolve(r).then(…).finally(…)` and this teardown adds another `.then`, so the chain
+    // is several microtask hops deep. Two ticks landed BEFORE the continuation ran, which made an
+    // earlier version of this test pass with the fix removed: it was asserting on a teardown that
+    // had not happened yet, not on one that was correctly skipped.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Without the def-identity check, activation 1's continuation disposes the live instance here.
+    expect(dispose).not.toHaveBeenCalled();
+    expect(getRegisteredManagers().filter((n) => n.startsWith('deferred'))).toHaveLength(1);
+  });
+
   it('registerManagers registers a list', () => {
     const defs: ManagerDef[] = [
       { name: 'a', scope: 'app' },
@@ -251,5 +287,211 @@ describe('managerRegistry', () => {
     const names = getRegisteredManagers();
     expect(names.some((s) => s.startsWith('a'))).toBe(true);
     expect(names.some((s) => s.startsWith('b'))).toBe(true);
+  });
+
+  // ── activation-token race (#487 item 5) ─────────────────────────────────────
+  // disposeActiveSceneManagers/disposeActiveGameManagers each await pending
+  // inits, THEN re-walk `managers.values()` deactivating every active entry of
+  // that scope. A manager activated DURING that await belongs to the INCOMING
+  // scene/game, not the outgoing one, and must not be swept up in it.
+
+  it('does not dispose a manager activated during the sweep\'s await (scene scope)', async () => {
+    const disposeSlow = vi.fn();
+    const disposeLate = vi.fn();
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({
+      name: 'slow',
+      init: async () => { await initGate; },
+      dispose: disposeSlow,
+    });
+
+    // Start disposing the outgoing scene's managers; 'slow' is mid-init.
+    const disposed = disposeActiveSceneManagers();
+
+    // While that dispose is awaiting, the INCOMING scene activates a second
+    // manager sharing the registry's Map — it must survive the sweep above.
+    await initSceneManagersFor('/scenes/B.json');
+    registerManager({ name: 'late', dispose: disposeLate });
+
+    resolveInit();
+    await disposed;
+
+    expect(disposeSlow).toHaveBeenCalledOnce();   // the outgoing manager IS disposed
+    expect(disposeLate).not.toHaveBeenCalled();   // the incoming one is NOT
+    expect(getRegisteredManagers().find((s) => s.startsWith('late'))).toContain('active');
+  });
+
+  it('still waits for the async init to settle before disposing (keep direction)', async () => {
+    const order: string[] = [];
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({
+      name: 'slow',
+      init: async () => { await initGate; order.push('init-done'); },
+      dispose: () => { order.push('dispose'); },
+    });
+
+    const disposed = disposeActiveSceneManagers();
+    resolveInit();
+    await disposed;
+
+    expect(order).toEqual(['init-done', 'dispose']); // dispose never precedes init
+  });
+
+  it('does not dispose a manager activated during the sweep\'s await (game scope)', async () => {
+    const disposeSlow = vi.fn();
+    const disposeLate = vi.fn();
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    registerManager({
+      name: 'slow-g',
+      scope: 'game',
+      init: async () => { await initGate; },
+      dispose: disposeSlow,
+    });
+
+    const disposed = disposeActiveGameManagers();
+
+    await initGameManagersFor('chess', '/games/chess/scenes/chess.json');
+    registerManager({ name: 'late-g', scope: 'game', dispose: disposeLate });
+
+    resolveInit();
+    await disposed;
+
+    expect(disposeSlow).toHaveBeenCalledOnce();
+    expect(disposeLate).not.toHaveBeenCalled();
+    expect(getRegisteredManagers().find((s) => s.startsWith('late-g'))).toContain('active');
+  });
+
+  // ── activeGameId cleared at teardown head (#539) ────────────────────────────
+  // `disposeActiveGameManagers` used to write `activeGameId` only on the
+  // FOLLOWING `initGameManagersFor` (i.e. never, during its own await), so
+  // `getActiveGameId()` kept answering the OUTGOING game for the whole
+  // teardown window. Two readers cared: `registerManager` (auto-activates a
+  // newly-registered game-scoped manager against `activeGameId`) and a
+  // re-entrant `loadScene`'s `gameChanged` computation.
+
+  it('a manager registered mid-teardown is NOT auto-activated against the outgoing game', async () => {
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    // An in-flight async init on an already-active manager holds the dispose
+    // sweep's await open, giving us a window to register during teardown.
+    registerManager({
+      name: 'slow',
+      scope: 'game',
+      games: ['space-console'],
+      init: async () => { await initGate; },
+    });
+
+    const disposed = disposeActiveGameManagers();
+
+    // Registered WHILE the dispose above is still awaiting — matches the game
+    // being torn down.
+    const lateInit = vi.fn();
+    registerManager({ name: 'late', scope: 'game', games: ['space-console'], init: lateInit });
+    expect(lateInit).not.toHaveBeenCalled(); // must not activate against the dying game
+
+    resolveInit();
+    await disposed;
+
+    // The assertion that actually matters: registering mid-teardown DEFERS
+    // activation rather than losing it. `lateInit` not having fired proves
+    // nothing on its own — the sweep's `owned` snapshot excludes it either
+    // way, fix or no fix. What the doc comment above promises is that the
+    // NEXT `initGameManagersFor` for the same game picks it up.
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    expect(lateInit).toHaveBeenCalledOnce();
+  });
+
+  it('getActiveGameId() is null once teardown has begun, and a re-entrant initGameManagersFor re-activates', async () => {
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    const initA = vi.fn();
+    registerManager({ name: 'a-mgr', scope: 'game', games: ['A'], init: initA });
+    await initGameManagersFor('A', '/games/A/scenes/S.json');
+    expect(initA).toHaveBeenCalledOnce();
+    expect(getActiveGameId()).toBe('A');
+
+    // Hold the sweep open via a second in-flight init.
+    registerManager({ name: 'slow', scope: 'game', games: ['A'], init: async () => { await initGate; } });
+    const disposed = disposeActiveGameManagers();
+
+    expect(getActiveGameId()).toBeNull(); // cleared synchronously at the head, before the await
+
+    resolveInit();
+    await disposed;
+    expect(getActiveGameId()).toBeNull();
+
+    // A re-entrant A→B→A load would compute gameChanged = 'A' !== getActiveGameId().
+    // With activeGameId cleared, that is true, so SceneManager calls
+    // initGameManagersFor('A', ...) again — it must actually re-activate.
+    // NOTE: this tail drives the registry directly (`initGameManagersFor`, not
+    // `SceneManager.loadScene`) — it does not exercise the `gameChanged`
+    // computation itself. That seam is covered by the real `SceneManager`
+    // integration test in sceneManagerGameTeardown.test.ts ('#539: a re-entrant
+    // loadScene back to the outgoing game re-activates its game-scoped manager').
+    await initGameManagersFor('A', '/games/A/scenes/S.json');
+    expect(initA).toHaveBeenCalledTimes(2);
+    expect(getActiveGameId()).toBe('A');
+  });
+
+  // ── activation-token re-use (SAME entry, not a new one) ─────────────────────
+  // The two tests above prove the OWNED-ARRAY snapshot excludes a brand-new
+  // entry activated during the await. They can't tell "the entry reference
+  // alone" from "the activation id" apart, because a new Entry never differs
+  // in id from what it was snapshotted with (it was never snapshotted at all).
+  // This one re-activates the SAME Entry object with a NEW activationId while
+  // the outer sweep is still suspended on an unrelated manager, so only the id
+  // comparison (not `entry.active` alone) can tell the two activations apart.
+
+  it('does not dispose a re-activated entry whose sweep already fired once (activationId)', async () => {
+    const disposeE = vi.fn();
+    let resolveFInit!: () => void;
+    const fGate = new Promise<void>((r) => { resolveFInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({ name: 'e', dispose: disposeE }); // sync init -> settles immediately
+    registerManager({ name: 'f', init: () => fGate }); // keeps the outer sweep suspended
+
+    // Outer sweep: snapshots [e, idA] and [f, idF], then awaits both. 'f' never
+    // settles until resolveFInit() below, so this stays suspended for the rest
+    // of the test.
+    const outerSweep = disposeActiveSceneManagers();
+
+    // Drop 'f' from the registry entirely (its own dispose() runs synchronously
+    // — deactivate() never waits on a pending init). The outer sweep's `pending`
+    // still holds the ORIGINAL fGate promise object, so it stays suspended.
+    unregisterManager('f');
+
+    // A full, non-suspending cycle on the SAME 'e' Entry: by now 'e' has nothing
+    // pending (its sync init already settled), and 'f' is gone from the map, so
+    // this dispose call finds nothing to await and runs to completion
+    // synchronously — disposing 'e' for real (idA still matches) and clearing
+    // `active`.
+    disposeActiveSceneManagers();
+    expect(disposeE).toHaveBeenCalledOnce();
+
+    // Re-activate the SAME Entry object for the incoming scene: a NEW
+    // activationId, same identity.
+    await initSceneManagersFor('/scenes/B.json');
+    expect(getRegisteredManagers().find((s) => s.startsWith('e'))).toContain('active');
+
+    // Let the outer sweep resume: it still holds 'e' at the OLD activationId.
+    resolveFInit();
+    await outerSweep;
+
+    // The outer sweep must not have torn down the incoming scene's 'e'.
+    expect(disposeE).toHaveBeenCalledOnce();
+    expect(getRegisteredManagers().find((s) => s.startsWith('e'))).toContain('active');
   });
 });

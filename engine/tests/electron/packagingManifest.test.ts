@@ -5,6 +5,12 @@ import path from 'node:path';
 import yaml from 'js-yaml';
 import picomatch from 'picomatch';
 import { hasOssOverlay } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
+
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'CLAUDE.md is Markdown prose, not source — its content is what this guard matches on',
+} as const;
 
 /**
  * PACKAGING GUARD — electron-builder.yml packaging contract.
@@ -113,7 +119,7 @@ describe('electron-builder packaging manifest', () => {
     }
     // …and the excludes we DO want must actually match what they claim to.
     for (const [file, glob] of [
-      ['engine/tests/assets/agentConfigSync.test.ts', 'engine/tests/**'],
+      ['engine/tests/assets/publishExclusions.test.ts', 'engine/tests/**'],
       ['engine/packages/modoki/tests/runtime/clock.test.ts', 'engine/packages/*/tests/**'],
     ] as const) {
       expect(picomatch.isMatch(file, glob), `${glob} should match ${file}`).toBe(true);
@@ -210,7 +216,7 @@ describe('starter template ships (New Project / Connect Claude Code)', () => {
   });
 
   it('CLAUDE.md primes the full agent surface (MCP verify loop + Enact + CDP + GUID rule)', () => {
-    const md = readFileSync(path.join(starter, 'CLAUDE.md'), 'utf8');
+    const md = readScannedSource(path.join(starter, 'CLAUDE.md'), DOC_AS_PROSE).raw;
     for (const needle of ['modoki_get_scene_state', 'modoki_mutate_scene', 'Enact', 'CDP', 'GUID']) {
       expect(md, `starter CLAUDE.md should mention ${needle}`).toContain(needle);
     }

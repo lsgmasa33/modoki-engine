@@ -8,6 +8,8 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as THREE from 'three';
+import { createWorld } from 'koota';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { applyPropOverride, resetMaterialInstanceClones } from '../../src/runtime/rendering/materialInstanceClones';
 
 // A mesh is just an object with a `.material` for this helper.
@@ -20,7 +22,7 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('binds an independent clone and drives opacity without touching the base', () => {
     const base = new THREE.MeshStandardMaterial({ opacity: 1, transparent: false });
     const m = mesh(base);
-    applyPropOverride(1, [m], base, 'opacity', 0.3);
+    applyPropOverride(1, 0, [m], base, 'opacity', 0.3);
 
     expect(m.material).not.toBe(base);
     expect(m.material).toBeInstanceOf(THREE.MeshStandardMaterial);
@@ -34,7 +36,7 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('drives color as a packed hex via Color.setHex', () => {
     const base = new THREE.MeshStandardMaterial({ color: 0x000000 });
     const m = mesh(base);
-    applyPropOverride(2, [m], base, 'color', 0x3366ff);
+    applyPropOverride(2, 0, [m], base, 'color', 0x3366ff);
     expect((m.material as THREE.MeshStandardMaterial).color.getHex()).toBe(0x3366ff);
     expect(base.color.getHex()).toBe(0x000000); // base untouched
   });
@@ -42,9 +44,9 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('drives roughness / metalness / emissiveIntensity as scalars', () => {
     const base = new THREE.MeshStandardMaterial({ roughness: 0, metalness: 0, emissiveIntensity: 1 });
     const m = mesh(base);
-    applyPropOverride(3, [m], base, 'roughness', 0.7);
-    applyPropOverride(3, [m], base, 'metalness', 0.4);
-    applyPropOverride(3, [m], base, 'emissiveIntensity', 2);
+    applyPropOverride(3, 0, [m], base, 'roughness', 0.7);
+    applyPropOverride(3, 0, [m], base, 'metalness', 0.4);
+    applyPropOverride(3, 0, [m], base, 'emissiveIntensity', 2);
     const clone = m.material as THREE.MeshStandardMaterial;
     expect(clone.roughness).toBeCloseTo(0.7, 9);
     expect(clone.metalness).toBeCloseTo(0.4, 9);
@@ -55,7 +57,7 @@ describe('applyPropOverride (real THREE materials)', () => {
     const base = new THREE.MeshStandardMaterial();
     const m = mesh(base);
     const clone0 = (base.clone()); // reference for comparing internals
-    applyPropOverride(4, [m], base, 'side', 99);      // unknown/dangerous target → no-op
+    applyPropOverride(4, 0, [m], base, 'side', 99);      // unknown/dangerous target → no-op
     const clone = m.material as THREE.MeshStandardMaterial;
     expect(clone.side).toBe(clone0.side);             // internal NOT overwritten with 99
   });
@@ -63,8 +65,8 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('gives two entities sharing a base INDEPENDENT clones', () => {
     const base = new THREE.MeshStandardMaterial({ opacity: 1 });
     const a = mesh(base), b = mesh(base);
-    applyPropOverride(10, [a], base, 'opacity', 0.2);
-    applyPropOverride(11, [b], base, 'opacity', 0.8);
+    applyPropOverride(10, 0, [a], base, 'opacity', 0.2);
+    applyPropOverride(11, 0, [b], base, 'opacity', 0.8);
     expect(a.material).not.toBe(b.material);
     expect((a.material as THREE.MeshStandardMaterial).opacity).toBeCloseTo(0.2, 9);
     expect((b.material as THREE.MeshStandardMaterial).opacity).toBeCloseTo(0.8, 9);
@@ -73,12 +75,12 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('binds ONE clone across an entity\'s two meshes (both surfaces) — no dispose thrash', () => {
     const base = new THREE.MeshStandardMaterial({ opacity: 1 }); // shared cache material
     const a = mesh(base), b = mesh(base);
-    applyPropOverride(12, [a, b], base, 'opacity', 0.25);
+    applyPropOverride(12, 0, [a, b], base, 'opacity', 0.25);
     expect(a.material).toBe(b.material);      // same single clone
     expect(a.material).not.toBe(base);
     // A second frame with the SAME base must not re-clone or dispose.
     const clone = a.material;
-    applyPropOverride(12, [a, b], base, 'opacity', 0.25);
+    applyPropOverride(12, 0, [a, b], base, 'opacity', 0.25);
     expect(a.material).toBe(clone);
     expect((clone as THREE.MeshStandardMaterial).opacity).toBeCloseTo(0.25, 9);
   });
@@ -87,10 +89,10 @@ describe('applyPropOverride (real THREE materials)', () => {
     const baseA = new THREE.MeshStandardMaterial({ opacity: 1 });
     const baseB = new THREE.MeshStandardMaterial({ opacity: 1 });
     const m = mesh(baseA);
-    applyPropOverride(13, [m], baseA, 'opacity', 0.5);
+    applyPropOverride(13, 0, [m], baseA, 'opacity', 0.5);
     const cloneA = m.material as THREE.MeshStandardMaterial;
     expect(cloneA.opacity).toBeCloseTo(0.5, 9);
-    applyPropOverride(13, [m], baseB, 'opacity', 0.5); // base changed
+    applyPropOverride(13, 0, [m], baseB, 'opacity', 0.5); // base changed
     const cloneB = m.material as THREE.MeshStandardMaterial;
     expect(cloneB).not.toBe(cloneA);          // fresh clone from the new base
     expect(cloneB.opacity).toBeCloseTo(0.5, 9);
@@ -99,9 +101,9 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('applies multiple prop overrides onto the SAME single clone', () => {
     const base = new THREE.MeshStandardMaterial();
     const m = mesh(base);
-    applyPropOverride(20, [m], base, 'opacity', 0.5);
+    applyPropOverride(20, 0, [m], base, 'opacity', 0.5);
     const clone = m.material;
-    applyPropOverride(20, [m], base, 'roughness', 0.9); // second prop, same frame/entity
+    applyPropOverride(20, 0, [m], base, 'roughness', 0.9); // second prop, same frame/entity
     expect(m.material).toBe(clone); // not re-cloned
     expect((clone as THREE.MeshStandardMaterial).opacity).toBeCloseTo(0.5, 9);
     expect((clone as THREE.MeshStandardMaterial).roughness).toBeCloseTo(0.9, 9);
@@ -110,13 +112,13 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('recompiles (needsUpdate) only when the transparent flag flips, not every frame', () => {
     const base = new THREE.MeshStandardMaterial({ opacity: 1, transparent: false });
     const m = mesh(base);
-    applyPropOverride(50, [m], base, 'opacity', 0.5); // opaque → transparent: one recompile
+    applyPropOverride(50, 0, [m], base, 'opacity', 0.5); // opaque → transparent: one recompile
     const clone = m.material as THREE.MeshStandardMaterial;
     const v1 = clone.version;
-    applyPropOverride(50, [m], base, 'opacity', 0.4); // still transparent: NO recompile
+    applyPropOverride(50, 0, [m], base, 'opacity', 0.4); // still transparent: NO recompile
     expect(clone.version).toBe(v1);
     expect(clone.transparent).toBe(true);
-    applyPropOverride(50, [m], base, 'opacity', 1);   // transparent → opaque: recompile
+    applyPropOverride(50, 0, [m], base, 'opacity', 1);   // transparent → opaque: recompile
     expect(clone.version).toBeGreaterThan(v1);
     expect(clone.transparent).toBe(false);
   });
@@ -124,7 +126,7 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('drives a multi-material (array) base via per-slot clones on every slot', () => {
     const baseArr = [new THREE.MeshStandardMaterial({ opacity: 1 }), new THREE.MeshStandardMaterial({ opacity: 1 })];
     const m = mesh(baseArr);
-    applyPropOverride(30, [m], baseArr, 'opacity', 0.4);
+    applyPropOverride(30, 0, [m], baseArr, 'opacity', 0.4);
     const clones = m.material as THREE.MeshStandardMaterial[];
     expect(Array.isArray(clones)).toBe(true);
     expect(clones).not.toBe(baseArr);              // a fresh array of clones
@@ -138,8 +140,8 @@ describe('applyPropOverride (real THREE materials)', () => {
     const base = new THREE.MeshStandardMaterial();
     base.map = new THREE.Texture();
     const m = mesh(base);
-    applyPropOverride(31, [m], base, 'mapOffsetX', 0.25);
-    applyPropOverride(31, [m], base, 'mapRepeatY', 3);
+    applyPropOverride(31, 0, [m], base, 'mapOffsetX', 0.25);
+    applyPropOverride(31, 0, [m], base, 'mapRepeatY', 3);
     const clone = m.material as THREE.MeshStandardMaterial;
     expect(clone.map!.offset.x).toBeCloseTo(0.25, 9);
     expect(clone.map!.repeat.y).toBeCloseTo(3, 9);
@@ -149,24 +151,24 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('no-ops (no throw) for a map target on a material without a base map', () => {
     const base = new THREE.MeshStandardMaterial(); // no .map
     const m = mesh(base);
-    expect(() => applyPropOverride(32, [m], base, 'mapOffsetX', 0.5)).not.toThrow();
+    expect(() => applyPropOverride(32, 0, [m], base, 'mapOffsetX', 0.5)).not.toThrow();
   });
 
   it('clones the base map ONCE per material and frees it when the clone is superseded', () => {
     const base = new THREE.MeshStandardMaterial();
     base.map = new THREE.Texture();
     const m = mesh(base);
-    applyPropOverride(60, [m], base, 'mapOffsetX', 0.1);
+    applyPropOverride(60, 0, [m], base, 'mapOffsetX', 0.1);
     const ownedTex = (m.material as THREE.MeshStandardMaterial).map!;
     expect(ownedTex).not.toBe(base.map);               // per-material texture clone
     const disposeSpy = vi.spyOn(ownedTex, 'dispose');
-    applyPropOverride(60, [m], base, 'mapRepeatY', 2);  // second map prop, SAME base
+    applyPropOverride(60, 0, [m], base, 'mapRepeatY', 2);  // second map prop, SAME base
     expect((m.material as THREE.MeshStandardMaterial).map).toBe(ownedTex); // NOT re-cloned
     expect(disposeSpy).not.toHaveBeenCalled();
     // Base change → the superseded clone AND its owned texture are disposed.
     const base2 = new THREE.MeshStandardMaterial();
     base2.map = new THREE.Texture();
-    applyPropOverride(60, [m], base2, 'mapOffsetX', 0.3);
+    applyPropOverride(60, 0, [m], base2, 'mapOffsetX', 0.3);
     expect(disposeSpy).toHaveBeenCalledTimes(1);
     expect(base.map!.dispose).toBeTypeOf('function'); // base texture never disposed (its own instance)
   });
@@ -175,7 +177,7 @@ describe('applyPropOverride (real THREE materials)', () => {
     const base = new THREE.MeshStandardMaterial();
     base.map = new THREE.Texture();
     const m = mesh(base);
-    applyPropOverride(61, [m], base, 'mapOffsetX', 0.2);
+    applyPropOverride(61, 0, [m], base, 'mapOffsetX', 0.2);
     const ownedTex = (m.material as THREE.MeshStandardMaterial).map!;
     const disposeSpy = vi.spyOn(ownedTex, 'dispose');
     resetMaterialInstanceClones();
@@ -185,11 +187,11 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('disposes EVERY slot clone when a multi-material base changes', () => {
     const baseArr = [new THREE.MeshStandardMaterial(), new THREE.MeshStandardMaterial()];
     const m = mesh(baseArr);
-    applyPropOverride(70, [m], baseArr, 'opacity', 0.4);
+    applyPropOverride(70, 0, [m], baseArr, 'opacity', 0.4);
     const [c0, c1] = m.material as THREE.MeshStandardMaterial[];
     const s0 = vi.spyOn(c0, 'dispose'), s1 = vi.spyOn(c1, 'dispose');
     const baseArr2 = [new THREE.MeshStandardMaterial(), new THREE.MeshStandardMaterial()];
-    applyPropOverride(70, [m], baseArr2, 'opacity', 0.6); // base ref changed → old slots freed
+    applyPropOverride(70, 0, [m], baseArr2, 'opacity', 0.6); // base ref changed → old slots freed
     expect(s0).toHaveBeenCalledTimes(1);
     expect(s1).toHaveBeenCalledTimes(1);
   });
@@ -197,8 +199,8 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('gives two entities sharing a multi-material base INDEPENDENT per-slot clones', () => {
     const baseArr = [new THREE.MeshStandardMaterial({ opacity: 1 }), new THREE.MeshStandardMaterial({ opacity: 1 })];
     const a = mesh(baseArr), b = mesh(baseArr);
-    applyPropOverride(71, [a], baseArr, 'opacity', 0.2);
-    applyPropOverride(72, [b], baseArr, 'opacity', 0.8);
+    applyPropOverride(71, 0, [a], baseArr, 'opacity', 0.2);
+    applyPropOverride(72, 0, [b], baseArr, 'opacity', 0.8);
     const ca = a.material as THREE.MeshStandardMaterial[];
     const cb = b.material as THREE.MeshStandardMaterial[];
     expect(ca[0]).not.toBe(cb[0]);
@@ -212,7 +214,7 @@ describe('applyPropOverride (real THREE materials)', () => {
   it('does NOT dispose a driven clone merely by ceasing to drive it — only reset() frees it (per-scene invariant)', () => {
     const base = new THREE.MeshStandardMaterial({ opacity: 1 });
     const m = mesh(base);
-    applyPropOverride(80, [m], base, 'opacity', 0.5);
+    applyPropOverride(80, 0, [m], base, 'opacity', 0.5);
     const clone = m.material as THREE.MeshStandardMaterial;
     const disposeSpy = vi.spyOn(clone, 'dispose');
 
@@ -235,27 +237,109 @@ describe('applyPropOverride (real THREE materials)', () => {
     const baseA = new THREE.MeshStandardMaterial({ opacity: 1 });
     const baseB = new THREE.MeshStandardMaterial({ opacity: 1 });
     const m = mesh(baseA);
-    expect(applyPropOverride(90, [m], baseA, 'opacity', 0.5)).toBe(true);   // first bind
-    expect(applyPropOverride(90, [m], baseA, 'opacity', 0.5)).toBe(false);  // settled — no rebind
-    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(true);   // base swapped
-    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(false);
+    expect(applyPropOverride(90, 0, [m], baseA, 'opacity', 0.5)).toBe(true);   // first bind
+    expect(applyPropOverride(90, 0, [m], baseA, 'opacity', 0.5)).toBe(false);  // settled — no rebind
+    expect(applyPropOverride(90, 0, [m], baseB, 'opacity', 0.5)).toBe(true);   // base swapped
+    expect(applyPropOverride(90, 0, [m], baseB, 'opacity', 0.5)).toBe(false);
     // A mesh the renderer rebound to the shared base (surface remount / re-sync): same entity,
     // same base, same value — the clone must be re-applied AND reported, or the viewport keeps
     // drawing the un-overridden material.
     m.material = baseB;
-    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(true);
+    expect(applyPropOverride(90, 0, [m], baseB, 'opacity', 0.5)).toBe(true);
   });
 
   it('rebuilds the clone after a reset (registry cleared)', () => {
     const base = new THREE.MeshStandardMaterial();
     const m = mesh(base);
-    applyPropOverride(40, [m], base, 'opacity', 0.5);
+    applyPropOverride(40, 0, [m], base, 'opacity', 0.5);
     const first = m.material;
     resetMaterialInstanceClones();
     m.material = base; // simulate the render loop rebinding the base after teardown
-    applyPropOverride(40, [m], base, 'opacity', 0.5);
+    applyPropOverride(40, 0, [m], base, 'opacity', 0.5);
     expect(m.material).not.toBe(first); // a fresh clone, not the disposed one
     expect(m.material).not.toBe(base);
+  });
+});
+
+describe('warnUnknown (#738 group B — no clear at all in production)', () => {
+  it('re-warns for the same unsupported target after a reset (world swap)', () => {
+    // `_unknownWarned` is keyed by prop TARGET NAME, not entity id, so it has no id-recycling
+    // hazard — but it had NO clear anywhere, so a target that warned once stayed silently
+    // suppressed for the rest of the process, including in an unrelated later scene.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const base = new THREE.MeshStandardMaterial();
+    const m = mesh(base);
+    applyPropOverride(100, 0, [m], base, 'side', 1); // unsupported target
+    applyPropOverride(100, 0, [m], base, 'side', 2); // same target, same frame-loop — no re-warn
+    expect(warn).toHaveBeenCalledTimes(1);
+    resetMaterialInstanceClones(); // world-swap teardown path
+    const base2 = new THREE.MeshStandardMaterial();
+    const m2 = mesh(base2);
+    applyPropOverride(101, 0, [m2], base2, 'side', 1); // different entity, SAME target name
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+});
+
+describe('the PRODUCTION world-swap wiring (#738) — not the test-only reset hook', () => {
+  // The two tests above (and every other test in this file) exercise `resetMaterialInstanceClones`
+  // — the test/teardown export — never the `onWorldSwap(disposeAll)` registration at module load
+  // that is what actually runs on a real scene swap. Deleting that registration left this whole
+  // suite green, which is the gap this test closes: it drives a REAL `setCurrentWorld` swap, the
+  // same mechanism `hitRegions.test.ts` / `interactionHandles.test.ts` use for their own
+  // world-swap-clear tests.
+  it('a real world swap disposes a registered clone AND clears `_unknownWarned`', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const base = new THREE.MeshStandardMaterial({ opacity: 1 });
+    const m = mesh(base);
+    applyPropOverride(200, 0, [m], base, 'opacity', 0.5);
+    const clone = m.material as THREE.MeshStandardMaterial;
+    const disposeSpy = vi.spyOn(clone, 'dispose');
+    applyPropOverride(200, 0, [m], base, 'side', 99); // unsupported target → warns once
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    setCurrentWorld(createWorld()); // the REAL swap path — must fire the production onWorldSwap listener
+
+    expect(disposeSpy).toHaveBeenCalledTimes(1); // the clone was freed, not merely orphaned
+
+    const base2 = new THREE.MeshStandardMaterial();
+    applyPropOverride(201, 0, [mesh(base2)], base2, 'side', 1); // same target name, POST-swap
+    expect(warn).toHaveBeenCalledTimes(2); // re-warns — `_unknownWarned` was cleared by the swap
+    warn.mockRestore();
+  });
+});
+
+describe('entity id recycling within ONE world (#738)', () => {
+  it('a same-index respawn gets its OWN clone, not the despawned entity\'s leftover override', () => {
+    // `clones` used to be keyed by the bare (masked) entity id. koota's free list is LIFO, so a
+    // despawn immediately followed by a same-shape respawn reclaims the exact index — and before
+    // the fix, `applyPropOverride`'s `entry.base === base` reuse check would hand the newcomer the
+    // DEAD entity's clone (with the dead entity's already-driven overrides still on it) whenever
+    // both entities resolve to the SAME material GUID.
+    const world = createWorld();
+    const base = new THREE.MeshStandardMaterial({ opacity: 1, roughness: 0 });
+
+    const a = world.spawn();
+    const aMesh = mesh(base);
+    applyPropOverride(a.id(), a.generation(), [aMesh], base, 'roughness', 0.9); // A drives roughness only
+    a.destroy();
+
+    const b = world.spawn();
+    // Precondition: the id was really recycled onto a DIFFERENT entity — asserted so this fails
+    // loudly rather than passing vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    const bMesh = mesh(base);
+    // B never drives roughness — only color.
+    applyPropOverride(b.id(), b.generation(), [bMesh], base, 'color', 0x00ff00);
+    const clone = bMesh.material as THREE.MeshStandardMaterial;
+
+    expect(clone).not.toBe(aMesh.material);   // an independent clone, not A's
+    expect(clone.roughness).toBe(0);          // fresh from `base` — NOT A's leftover 0.9
+    expect(clone.color.getHex()).toBe(0x00ff00);
+
+    world.destroy();
   });
 });
 
@@ -278,7 +362,7 @@ describe('cloning a TSL/file-shader base — the userData round-trip (#325)', ()
     (parked as unknown as { toJSON: () => unknown }).toJSON = () => { serialised++; return {}; };
 
     const m = mesh(base);
-    applyPropOverride(1, [m], base, 'roughness', 0.25);
+    applyPropOverride(1, 0, [m], base, 'roughness', 0.25);
 
     const clone = m.material as THREE.MeshStandardMaterial;
     expect(clone).not.toBe(base);
@@ -297,7 +381,7 @@ describe('cloning a TSL/file-shader base — the userData round-trip (#325)', ()
     const parked = new THREE.Texture();
     base.userData.textures = [parked];
 
-    applyPropOverride(1, [mesh(base)], base, 'roughness', 0.25);
+    applyPropOverride(1, 0, [mesh(base)], base, 'roughness', 0.25);
 
     expect(base.userData.textures).toEqual([parked]);
   });
@@ -309,7 +393,7 @@ describe('cloning a TSL/file-shader base — the userData round-trip (#325)', ()
     base.map = new THREE.Texture();
 
     const m = mesh(base);
-    applyPropOverride(1, [m], base, 'roughness', 0.25);
+    applyPropOverride(1, 0, [m], base, 'roughness', 0.25);
 
     const clone = m.material as THREE.MeshStandardMaterial;
     expect(clone.map).toBe(base.map);

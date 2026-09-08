@@ -22,6 +22,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
 import { parseAssetJson } from './assetFetch';
+import { createTeardownToken } from '../core/liveness';
 
 /** The subset of a SpriteAnimator instance the resolvers below read. */
 export interface SpriteAnimSource {
@@ -38,7 +39,15 @@ export interface SpriteAnimDef {
 const cache = new Map<string, SpriteAnimDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
-let generation = 0;
+/** Teardown liveness, captured per PATH before each load and re-checked after.
+ *
+ *  `invalidateAll()` is `clearSpriteAnimCache`'s (the whole cache is gone). A per-key
+ *  `invalidateSpriteAnim` must NOT refuse an in-flight load of a DIFFERENT key — this cache is
+ *  driven by the editor's file watcher, so an author saving one sprite-anim set would otherwise
+ *  make a concurrent load of an unrelated set silently drop it — so it calls `invalidateKey`
+ *  alone. Cleared wholesale by `clearSpriteAnimCache`, so the per-key map cannot outgrow the
+ *  cache it shadows. */
+const liveness = createTeardownToken<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -53,9 +62,10 @@ function spriteAnimCacheKey(refOrPath: string): string | undefined {
  *  timing defaults) so downstream code never sees a malformed SpriteClip. */
 function normalizeClip(raw: unknown): SpriteClip {
   const d = defaultSpriteClip();
-  if (!raw || typeof raw !== 'object') return d;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return d;
   const c = raw as Partial<SpriteClip>;
   return {
+    ...c,
     frames: Array.isArray(c.frames) ? c.frames.filter((f): f is string => typeof f === 'string') : d.frames,
     fps: typeof c.fps === 'number' ? c.fps : d.fps,
     mode: c.mode === 'once' || c.mode === 'loop' || c.mode === 'pingpong' ? c.mode : d.mode,
@@ -70,7 +80,7 @@ function normalizeClip(raw: unknown): SpriteClip {
 export function normalizeSpriteAnim(json: Partial<SpriteAnimDef> | undefined): SpriteAnimDef {
   const clips: Record<string, SpriteClip> = {};
   const src = json?.clips;
-  if (src && typeof src === 'object') {
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
     for (const [name, clip] of Object.entries(src)) clips[name] = normalizeClip(clip);
   }
   return { ...json, id: json?.id, clips };
@@ -92,20 +102,20 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   // caller had already decided to answer with a refusal.
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
-    const gen = generation;
+    const stillLive = liveness.capture(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (!stillLive()) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<SpriteAnimDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'spriteanim');
         cache.set(path, normalizeSpriteAnim(json as Partial<SpriteAnimDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (stillLive()) failed.add(path);
         console.warn(`[spriteAnimCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -151,6 +161,12 @@ export function setSpriteAnim(refOrPath: string, def: Partial<SpriteAnimDef>): v
 export function invalidateSpriteAnim(refOrPath: string): void {
   const path = spriteAnimCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `invalidateAll()`, which is `clearSpriteAnimCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one set must not also refuse an in-flight load of a
+  // DIFFERENT set.
+  liveness.invalidateKey(path);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -158,7 +174,7 @@ export function invalidateSpriteAnim(refOrPath: string): void {
 
 /** Drop ALL cached sets (scene swap / full resource disposal). */
 export function clearSpriteAnimCache(): void {
-  generation++;
+  liveness.invalidateAll();
   cache.clear();
   loading.clear();
   failed.clear();

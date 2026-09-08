@@ -1,4 +1,4 @@
-/** Asset schema introspection + validated authoring (particle/anim/timeline) + gesture capture.
+/** Asset schema introspection + validated authoring (all ASSET_SCHEMA_TYPES types) + gesture capture.
  *
  *  Registered by `registerAllTools` (`../registerAll.ts`). Side-effect-free on import:
  *  nothing here runs until the register function is called, which is what lets a test
@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
+import { DISCARD_UNSAVED_BASE, unsavedForceParam } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
@@ -21,9 +22,28 @@ import type { ToolContext } from '../context.js';
  *  ENFORCES (a zod enum rejects before any request is made), so drift here is not a bad error
  *  message — it is a tool that refuses a type the backend serves. `engine/tests/tools/
  *  assetTypeParity.test.ts` compares the two lists and fails the build when they disagree. */
-const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d'] as const;
+const ASSET_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset', 'atlas'] as const;
+
+/** The same list as PROSE, for the tool descriptions below. Derived, never transcribed: both
+ *  descriptions spelled the set out by hand and both were already stale — each stopped at
+ *  `rig2d`, so `shader` and `animset` were served by the backend, accepted by the zod enum above,
+ *  and invisible to the only text an agent reads before choosing a type. A prose copy of a list
+ *  is a copy, and the parity test cannot see it. */
+const ASSET_TYPES_PROSE = ASSET_TYPES.join(' / ');
 
 export { ASSET_TYPES as ASSET_TYPES_FOR_TESTS };
+
+/** The `type` values `modoki_read_asset_def` accepts — the 7 of the 9 `ASSET_TYPES` above that
+ *  the backend's `read-asset-def` op actually serves; `material` is deliberately absent (that op
+ *  refuses it — a material's live cache holds only the compiled THREE.Material, not the authored
+ *  JSON). `atlas` is also absent: the op has no `atlas` branch, and atlas holds no engine-side
+ *  cache to read back (`assetInvalidation.ts` — "atlas frames are read straight off the
+ *  manifest"; `persist.ts`'s `invalidateAtlasFile` is a documented no-op). Exported so
+ *  `assetTypeParity.test.ts` pins this enum against the op directly instead of letting it drift
+ *  again like #842/#843. */
+const READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'] as const;
+
+export { READ_ASSET_DEF_TYPES as READ_ASSET_DEF_TYPES_FOR_TESTS };
 
 export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   /** The two facts every asset-def WRITE owes its caller, in ONE wording (§2).
@@ -52,7 +72,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_asset_schema',
     'Get the field schema (types, defaults, ranges, enums) + a valid example for an asset type ' +
-      '(material / particle / animation / spriteanim / timeline / rig2d), so you can author the JSON ' +
+      `(${ASSET_TYPES_PROSE}), so you can author the JSON ` +
       'correctly. Read this BEFORE ' +
       'modoki_write_asset. Texture/effect refs must be GUIDs (use modoki_list_assets).',
     { type: z.enum(ASSET_TYPES)
@@ -61,7 +81,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_create_asset',
-    'Scaffold a new asset (material/particle/animation/spriteanim/timeline/rig2d) with sensible defaults + a fresh GUID at ' +
+    `Scaffold a new asset (${ASSET_TYPES_PROSE}) with sensible defaults + a fresh GUID at ` +
       'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit.',
@@ -112,6 +132,13 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'between them.\n\n' +
       'A path that is not on disk is REPORTED in `missing`, not an error — so a list carrying ' +
       'maybe-absent sidecars is safe, and `trashed` counts only files that really existed. ' +
+      'A path the OS REFUSES to trash (locked, denied ACL, >260 chars) is named in `failed` and ' +
+      'is STILL ON DISK: `ok:true` + `failed` means the REST went, `ok:false` means none did. ' +
+      '⚠️ `failed` is populated on Windows only — elsewhere a refusal arrives as ok:false with ' +
+      '`failed` empty, so an empty `failed` is not evidence every path went. `ok` is.\n\n' +
+      '⚠️ `repairFailed` is NOT `failed`: the files are trashed, but an attached editor still ' +
+      'holds bindings and parked writes for the dead path, so the next human Cmd+S can recreate ' +
+      'what you deleted. The panel repairs itself; you, from another process, have no backstop. ' +
       'Verify with modoki_list_assets — NOT modoki_resolve_refs, which resolves ENTITY refs and ' +
       'never answers about an asset GUID at all. The asset manifest is rebuilt ' +
       'BEFORE the reply (`manifestRebuilt:true`), so a check issued straight after — including in ' +
@@ -246,8 +273,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── read_asset_def — the READ half of the asset-editor tools ──
   tool(
     'modoki_read_asset_def',
-    'Read an asset DEFINITION back: a .particle.json, .anim.json, .timeline.json, .spriteanim.json ' +
-      'or .rig2d.json, from the LIVE cache (not the file). The companion to modoki_particle_set / ' +
+    'Read an asset DEFINITION back: a .particle.json, .anim.json, .timeline.json, .spriteanim.json, ' +
+      '.rig2d.json, .shader.json or .animset.json, from the LIVE cache (not the file). NOT ' +
+      '.mat.json — a material\'s live cache holds only the compiled THREE.Material, the authored ' +
+      'JSON is discarded once built, so read that file directly instead. The companion to ' +
+      'modoki_particle_set / ' +
       'modoki_anim_set_clip / modoki_timeline_set, which all take a FULL definition — this is how ' +
       'you GET one to modify, and how you VERIFY an edit by DATA instead of judging it from a ' +
       'rendered frame. ' +
@@ -257,8 +287,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'flushes). Errors if nothing in the open scene has loaded the asset yet.',
     {
       path: z.string().describe('Asset-root URL, e.g. /assets/particles/spark.particle.json'),
-      type: z.enum(['particle', 'animation', 'timeline', 'spriteanim', 'rig2d']).optional()
-        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d suffix.'),
+      // #842b widened the OP to 7 types; this enum stayed at the original 5, so `type:'shader'`
+      // was rejected by zod before it could reach the op — the same "a contract keyed to the old
+      // asset-type set" defect, one layer up. `material` is deliberately absent: the op refuses it.
+      type: z.enum(READ_ASSET_DEF_TYPES).optional()
+        .describe('Only needed when the filename does not carry the usual .particle/.anim/.timeline/.spriteanim/.rig2d/.shader/.animset suffix.'),
     },
     async ({ path, type }) => {
       const q = new URLSearchParams({ path });
@@ -389,12 +422,31 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'files on disk still reflect the OLD settings while the sidecar claims the new ones. '
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
     + 'multiple-of-4 dimensions, and a non-mult-4 texture with mipmaps renders SOLID BLACK on '
-    + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.',
+    + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.\n\n'
+    + 'THIS WRITES DISK. Since #845 a human\'s Inspector import-settings change is PARKED in the '
+    + 'editor rather than written, and this replaces the file wholesale — so if one is pending for '
+    + 'this path, writing DESTROYS it: your bytes land, the park survives, and their next Cmd+S '
+    + 'flushes that older document straight back over what you wrote. Both directions lose work, '
+    + 'and unlike an asset DOC nothing reconciles it — a .meta.json is invisible to the file '
+    + 'watcher, so the park-drop that protects modoki_write_asset never fires here.\n\n'
+    + '⚠️ SO THIS REFUSES while a park exists (REQUIRES_SAVE, naming the path). Your exits: '
+    + 'modoki_save_all keeps the human\'s edit (then re-read with modoki_get_asset_meta and re-apply '
+    + 'yours on top), or discardUnsaved:true destroys it and writes. modoki_get_asset_meta already '
+    + 'reads the PARKED value, so you can see what is pending before choosing.',
     {
       path: z.string().describe('Asset-root URL of the asset the sidecar belongs to (the ASSET, not the .meta.json).'),
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
+      discardUnsaved: z.boolean().optional().describe(
+        `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
+        + 'asset: it is dropped before the write, so nothing stale survives to flush back over you.',
+      ),
     },
-    async ({ path, meta }) => postJson('/api/write-meta', { path, meta }, undefined, `write the .meta.json sidecar for ${path}`),
+    async ({ path, meta, discardUnsaved }) => postJson(
+      '/api/write-meta',
+      { path, meta, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
+      undefined,
+      `write the .meta.json sidecar for ${path}`,
+    ),
   );
 
   // ── asset-tree file ops: duplicate / move / create-folder ──
@@ -404,12 +456,21 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'is why this is not a file copy: a byte-for-byte duplicate would carry the original\'s guid '
     + 'and two assets claiming one guid breaks every ref that resolves through the manifest. Use it '
     + 'to fork a material/prefab/particle as a starting point. REFUSES rather than clobbering: a '
-    + 'destination that already exists is a 409. Verify with modoki_list_assets.',
+    + 'destination that already exists is a 409. Verify with modoki_list_assets.\n\n'
+    + '⚠️ The copy\'s .meta.json import settings are seeded from the SOURCE\'S FILE, so this refuses '
+    + '(REQUIRES_SAVE) while the source has a parked Inspector import-settings edit — the copy '
+    + 'would otherwise be born with the pre-edit settings. modoki_save_all first, or force:true.',
     {
       from: z.string().describe('Asset-root URL of the asset to copy.'),
       to: z.string().describe('Asset-root URL to copy it to, including the filename and extension. Must not already exist.'),
+      force: unsavedForceParam,
     },
-    async ({ from, to }) => postJson('/api/duplicate-asset', { from, to }, undefined, `duplicate ${from} to ${to}`),
+    async ({ from, to, force }) => postJson(
+      '/api/duplicate-asset',
+      { from, to, ...(force ? { force: true } : {}) },
+      undefined,
+      `duplicate ${from} to ${to}`,
+    ),
   );
 
   tool(
@@ -419,7 +480,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '`mv` is not, because the manifest is rebuilt from the new location. REFUSES rather than '
     + 'clobbering: a destination that already exists is a 409, and a missing source is a 404. A '
     + 'case-only rename (Sprites -> sprites) IS allowed, since on macOS/Windows the two paths are '
-    + 'the same entry rather than a collision. Verify with modoki_list_assets.',
+    + 'the same entry rather than a collision. Verify with modoki_list_assets.\n\n'
+    + '⚠️ `repairFailed` = the file moved but an attached editor was NOT repaired, so its bindings '
+    + 'and parked writes still point at the old path and the next human Cmd+S can undo the move. '
+    + 'The panel repairs itself; you, from another process, have no backstop. Say so.',
     {
       from: z.string().describe('Asset-root URL of the asset to move.'),
       to: z.string().describe('Asset-root URL to move it to, including the filename. Must not already exist (a case-only rename excepted).'),

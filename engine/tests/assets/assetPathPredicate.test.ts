@@ -17,6 +17,7 @@
  *  `loaders/`. So the copy is forced, and this test is what keeps it honest. */
 import { describe, it, expect } from 'vitest';
 import { isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { isVideoRef } from '../../packages/modoki/src/runtime/core/textureRefs';
 import {
   JSON_ASSET_SUFFIX_TYPE, BINARY_EXT_TYPE,
 } from '../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
@@ -88,5 +89,38 @@ describe('isInternalAssetPath covers every managed asset kind', () => {
     ]) {
       expect(isInternalAssetPath(p), p).toBe(true);
     }
+  });
+});
+
+/** `isVideoRef` (core/textureRefs.ts) duplicates BINARY_EXT_TYPE's video entries for the same
+ *  forced reason as `isInternalAssetPath` above (L0 `core/` may import nothing) — kept honest
+ *  by this guard instead of by an import. Total in BOTH directions: every video extension the
+ *  classifier knows must be claimed, and nothing else may be. */
+describe('isVideoRef stays total over BINARY_EXT_TYPE\'s video entries', () => {
+  const videoExts = Object.entries(BINARY_EXT_TYPE)
+    .filter(([, type]) => type === 'video')
+    .map(([ext]) => ext);
+
+  it('claims a literal path for every classifier-known video extension', () => {
+    const missing = videoExts.filter((ext) => !isVideoRef(`/games/x/assets/clip${ext}`));
+    expect(
+      missing,
+      'These video containers are classified by BINARY_EXT_TYPE (assetTypeClassifier.ts) but '
+        + 'isVideoRef does not recognise them — the 2D renderer silently stops adopting them as '
+        + 'video and falls through to the still-image path instead. Add them to the regex in '
+        + 'isVideoRef, core/textureRefs.ts.',
+    ).toEqual([]);
+  });
+
+  it('claims no non-video extension from the classifier (regex not widened too far)', () => {
+    const wronglyClaimed = Object.entries(BINARY_EXT_TYPE)
+      .filter(([, type]) => type !== 'video')
+      .map(([ext]) => ext)
+      .filter((ext) => isVideoRef(`/games/x/assets/clip${ext}`));
+    expect(
+      wronglyClaimed,
+      'isVideoRef claims a path extension that BINARY_EXT_TYPE classifies as something other '
+        + 'than video — narrow the regex in isVideoRef, core/textureRefs.ts.',
+    ).toEqual([]);
   });
 });

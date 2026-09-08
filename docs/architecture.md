@@ -11,7 +11,10 @@ architecture. For deeper dives, see the sibling docs:
 The engine is composed of a small set of layers:
 
 - **ECS** — [koota](https://github.com/pmndrs/koota) provides the entity/trait/world model.
-- **3D** — Three.js (`>=0.180`, app pins `^0.184`) renders the `'3d'` layer.
+- **3D** — Three.js renders the `'3d'` layer. ⚠️ Version ranges live in `package.json` (app) and
+  `engine/packages/modoki/package.json` (peer) — read them rather than trusting a copy here; a
+  duplicated version in prose goes stale on the next bump, which is exactly what happened to the
+  `^0.184` that used to be written on this line.
 - **2D** — PixiJS v8 (`^8.17`) + `@pixi/react` (`^8`) render the `'2d'` layer.
 - **UI/DOM** — React 19 renders the `'ui'` layer as plain DOM with CSS flexbox.
 - **State bridge** — Zustand (`^5`) carries state between ECS systems and React views.
@@ -520,15 +523,44 @@ StrictMode is inert. So a game hook whose side effect must not repeat still want
 latch for the dev path (`games/court`'s AppsFlyer wrapper is the worked example); what the
 fix removes is the double-drive that reached PLAYERS.
 
-**The game-SWITCH path has two failure modes that outlive the switch**, both fixed alongside
-the above and both worth knowing before you touch the early-return guard. Switching A→B and
-back to A while B is still loading cancels B's run before it reaches either
-`setTransitioning(false)`, and lands on the `activeGameIdRef.current === gameId` guard — which
-must therefore clear `transitioning` itself, or the opaque loading overlay covers a game that
-is running perfectly well underneath, for the rest of the session. And `error` gates the whole
-render tree, so it is cleared at the start of every new load: it had no path back to `null`
-at all, which meant one unknown gameId left the error screen up even after a later game
-loaded successfully behind it.
+**The game-SWITCH path has failure modes that outlive the switch**, all worth knowing before
+you touch the early-return guard. Switching A→B and back to A while B is still loading cancels
+B's run before it reaches either `setTransitioning(false)`, so the guard must clear
+`transitioning` itself or the opaque loading overlay covers a game that is running perfectly
+well underneath, for the rest of the session. And `error` gates the whole render tree, so it is
+cleared at the start of every new load: it had no path back to `null` at all, which meant one
+unknown gameId left the error screen up even after a later game loaded successfully behind it.
+
+⚠️ **A cancelled swap must not leave a game half-torn-down, and telling "loaded" apart from
+"owns registered state" is what makes that work (#516).** The same A→B→A path unregisters A's
+systems at the top of the effect, before its first await. `activeGameIdRef` was written only on
+the success path, so it still said "A" while A was in pieces, the swap-back took the
+early-return guard, and **A stayed on screen with its systems, projections and managers gone
+for the rest of the session** — with the loading overlay dismissed over the top, so nothing
+looked wrong. Three refs now carry three different facts, and collapsing any two of them
+reintroduces one of these bugs:
+
+| Ref | Answers | Written |
+|---|---|---|
+| `activeGameIdRef` | which game is loaded AND intact — the early-return guard | on success; **nulled when a teardown starts** |
+| `registeredGameIdRef` | which game owns registered engine state | **before the first registration** (`registerPostprocessors`), so a boot cancelled part-way is still known to own what it registered |
+| `teardownRef` | a teardown that started but whose destructive half is unfinished, plus its promise | before the teardown's first await; cleared when `clearAppServices()` has run |
+
+**The same rule holds one layer down, in the manager registry (#539).** `managerRegistry`'s own
+`activeGameId` had this exact defect — written only by `initGameManagersFor`, i.e. only on success,
+while `disposeActiveGameManagers` began the teardown several awaits earlier — and is now cleared at
+that teardown's head for the same reason this ref is. Mechanism and the one case it does not close:
+[managers-and-systems.md](managers-and-systems.md) § "Scope: three tiers".
+
+`teardownRef` holds the unregister **promise** rather than a boolean so a swap-back JOINS the
+teardown instead of repeating it — and is **cleared if that promise rejects**, because a
+memoized rejection would be re-joined by every later swap and no game would ever boot again
+(the hooks are dynamic `import()`s, so a chunk 404 after a deploy reaches this) — `unregisterSystems` is a hook, and calling it twice is
+exactly what the once-per-load contract above forbids. The teardown block therefore runs even
+when the incoming game IS the previous one: A is owed the rest of its teardown before it can be
+booted again. Booting it again — rather than resuming it in place — is the deliberate choice:
+the path is a mis-tap, and a full re-boot is the only option that cannot leave a second kind of
+half-done swap behind. Pinned by `engine/tests/app/gameShellSwapCancel.test.tsx`.
 
 The rule that follows, for anyone editing that effect: **its dependency array is `[gameId]`
 and nothing else.** State the effect writes is mirrored into refs (`configReadyRef`,
@@ -540,6 +572,56 @@ tightened the guard rather than freezing the effect.
 
 For how scenes are loaded into a world and how prefabs instantiate, see
 [Scene Loading](./scene-loading.md) and [Prefabs](./prefabs.md).
+
+### A memoized promise must be cleared when it rejects (#541)
+
+**The general rule, swept repo-wide in #541: a memoized promise must be cleared when it
+rejects.** `x ??= somethingAsync()` with no clearing `catch` means "load once" on success and
+"fail forever" on failure, and every instance in this repo memoizes a dynamic `import()` or a
+network fetch — exactly what fails transiently on a chunk 404 after a deploy, an OTA bundle
+swap, or a flaky network. Impact scales with how the caller retries: the physics systems call
+`initRapier2D()`/`initRapier3D()` on every tick that sees a body, so one transient failure
+re-fires the same dead rejection every frame and physics never starts; `dynamicFontProvider`
+fails silently, and on a CJK game a glyph miss is the normal path, not the exception.
+
+Clear it behind an **identity guard**, the model at `runtime/loaders/assetManifest.ts`'s
+`ensureManifestLoaded`:
+
+```ts
+const promise = load(); memo = promise;
+promise.catch(() => { if (memo === promise) memo = null; });
+```
+
+The `=== promise` check is the part that is easy to miss — clearing unconditionally lets a
+stale rejection evict a NEWER in-flight load. `teardownRef` above nulls unconditionally and is
+safe only because its `await` resumption and catch body are one microtask; do not copy that
+shape blindly. Two deliberate non-instances: `msdfGenerate.ts`'s `getGenerator` caches its
+rejection on purpose (so N fonts do not each pay its 10 s timeout), and `textureResolver.ts`'s
+`probePromise` cannot reject at all — its IIFE swallows every error and always marks the gate
+ready.
+
+**Measured limit — a cleared memo does NOT make a failed `import()` retry.** A failed module
+fetch is recorded in the browser's module map per specifier, and re-calling `import()` with the
+same specifier resolves against that recorded failure without issuing another request.
+Verified 2026-09-01 across Chromium, WebKit and Firefox with a local server logging every hit:
+three `import('/mod.js')` calls against a 404 produced exactly ONE server-side request; the
+third still rejected even after the server was fixed to return 200; a control import of a
+different URL resolved, and the same module with a cache-busted `?v=2` both resolved and
+reached the server. So for the failure the sites above actually face — a chunk 404 after a
+deploy or an OTA bundle swap — **clearing the memo buys nothing, and the warning is the entire
+value**; a real retry would need a cache-busted URL. What a cleared memo DOES rescue is a
+failure *after* a successful import (e.g. `mod.init()` in the rapier loaders instantiating
+WASM), because the module is already resolved and the next attempt re-runs that step for real.
+This is why those loaders retry a bounded number of times and then fail loudly rather than
+retrying forever: the caller (`physics2DSystem.ts`'s `physics2DSystem`) has no backoff and
+would otherwise re-import at frame rate. ⚠️ **Do not read that budget as a meaningful retry
+window.** It is counted in ATTEMPTS against a caller that retries every tick, so all three
+are spent within roughly three frames of the failure — it rescues a condition that clears
+in ~50 ms, not a device stall lasting a second. Combined with the measured fact that the
+`import()` half is not retryable at all, the WARNINGS are most of the value here. A
+time-based budget (retry while
+`now - firstFailureAt < N`, capped at K attempts) would actually cover a transient
+WASM-instantiate failure; a count-only budget against a frame-rate caller does not.
 
 ## Single source of truth — where a value lives is decided by what KIND of value it is
 

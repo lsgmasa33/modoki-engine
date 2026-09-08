@@ -27,6 +27,14 @@
  * "durable" half of "grant durably, then finish" gets tested at all.
  */
 
+import {
+  classifyFormatVersion,
+  isReadable,
+  preservedVersion,
+  collectUnknownFields,
+  mergeUnknownFields,
+} from '../core/formatVersion';
+
 /**
  * The persistence shape the ledger needs. Deliberately the same get/set/flush contract PlayerPrefs
  * already offers, so the L3 adapter that wires them together is three lines and can't introduce
@@ -58,12 +66,34 @@ interface ProcessedEntry {
   finished: boolean;
 }
 
+/** FORMAT version of the persisted ledger document. Named, because a bare `1` gives a reader
+ *  nothing to compare against and a reviewer nothing to find — the precondition every unfixed
+ *  row of `docs/format-versioning.md` § 3 shared (#767). */
+export const LEDGER_FORMAT_VERSION = 1;
+
+/** Lowest version this build will read. Equal to the current one today: `v: 1` is the only
+ *  version ever written, so anything below it predates the format entirely. Separate from the
+ *  constant above so a future bump does not silently become a floor bump too. */
+export const MIN_READABLE_LEDGER_VERSION = 1;
+
+/** The fields this build owns. Anything else in the stored document is preserved verbatim —
+ *  see `unknownFields`. */
+const KNOWN_LEDGER_KEYS = ['v', 'seq', 'processed', 'consumables'] as const;
+
 interface LedgerDoc {
-  v: 1;
+  /** ⚠️ `number`, not the literal `1`. A type describing a document read back from STORAGE must
+   *  not pin its version literal — the bytes may have been written by a different build, and
+   *  pinning is what let `parse` treat "newer" as "invalid" (#767, same shape as #734). */
+  v: number;
   seq: number;
   processed: Record<string, ProcessedEntry>;
   /** productId → units held. Consumables only. */
   consumables: Record<string, number>;
+  /** Top-level keys a NEWER build wrote that this one does not understand, carried through
+   *  untouched so an old build reading a new document does not silently strip it (the additive
+   *  rule — owner, 2026-09-05). Absent rather than `{}` when there is nothing unknown, so an
+   *  ordinary document's serialized shape is unchanged. Never itself written as a key. */
+  unknownFields?: Record<string, unknown>;
 }
 
 /**
@@ -78,22 +108,69 @@ interface LedgerDoc {
 const MAX_PROCESSED = 1000;
 
 function emptyDoc(): LedgerDoc {
-  return { v: 1, seq: 0, processed: {}, consumables: {} };
+  return { v: LEDGER_FORMAT_VERSION, seq: 0, processed: {}, consumables: {} };
 }
 
-/** Parse whatever came back from storage, failing soft. A corrupt ledger reads as an EMPTY ledger,
- *  never a throw — the recovery path then re-grants from the store's own unfinished list, which is
- *  the correct repair. Throwing here would brick a launch over a bad byte. */
+/**
+ * Parse whatever came back from storage, failing soft. A corrupt ledger reads as an EMPTY ledger,
+ * never a throw — the recovery path then re-grants from the store's own unfinished list, which is
+ * the correct repair. Throwing here would brick a launch over a bad byte.
+ *
+ * ⚠️ **This used to be `if (d.v !== 1) return emptyDoc()` — exact equality (#767).** That mapped
+ * *too-new*, *too-old*, *absent* and *unreadable* onto one action, and that action **emptied
+ * `processed`** — the idempotency table, i.e. the only thing standing between a re-delivered
+ * purchase and a duplicate credit. A `v: 2` document written by a newer build was not merely
+ * stripped of unknown fields; every already-granted transaction read as ungranted, and the next
+ * `record()`/`settle()` wrote `{v: 1, …}` straight over it. The gate was also `||`-fused with
+ * shape validation, so a caller could not tell a version refusal from a corrupt payload.
+ *
+ * The disposition for this document is **PRESERVE**, not REFUSE (`docs/format-versioning.md`
+ * § 2b-bis): it holds the player's own purchases, so refusing to read it loses their entitlements.
+ * Verdict by verdict:
+ *
+ *  - `ok` / `too-new` — read the known fields, bag the rest, and keep the higher version on
+ *    write-back. A newer document is readable *because* the format is additive.
+ *  - `absent` — readable, per § 2a. This build has always stamped `v`, so a version-less document
+ *    is foreign or damaged; it is still gated by the `processed` shape check below, and reading it
+ *    is the safer error, because the harm of wrongly emptying this table is minting currency.
+ *  - `too-old` / `unreadable` — empty ledger. A malformed version is damaged data, and normalizing
+ *    it is correct.
+ *
+ * ⚠️ **The `Math.max` write-back is safe HERE and that was checked, not assumed.** #763's
+ * close-out caught that rule transferring wrongly onto a document with a version-GATED field
+ * (`readProgress` keeps `activeGuid` only when the version is readable, so preserving the higher
+ * `v` made the document claim semantics the writing build did not implement). Audited: `seq`,
+ * `processed` and `consumables` are each normalized unconditionally, with no field kept or dropped
+ * on the strength of `v`. Re-do this audit if one is ever added.
+ */
 function parse(raw: unknown): LedgerDoc {
-  if (!raw || typeof raw !== 'object') return emptyDoc();
+  const verdict = classifyFormatVersion(raw, LEDGER_FORMAT_VERSION, {
+    field: 'v',
+    minReadable: MIN_READABLE_LEDGER_VERSION,
+  });
+  if (!isReadable(verdict) && verdict.kind !== 'too-new') return emptyDoc();
+
   const d = raw as Partial<LedgerDoc>;
-  if (d.v !== 1 || typeof d.processed !== 'object' || !d.processed) return emptyDoc();
+  // Shape validation stays SEPARATE from the version verdict — fusing them with `||` is what made
+  // the two failures indistinguishable to the caller.
+  if (typeof d.processed !== 'object' || !d.processed) return emptyDoc();
+
+  const unknownFields = collectUnknownFields(raw, KNOWN_LEDGER_KEYS);
   return {
-    v: 1,
+    v: preservedVersion(verdict, LEDGER_FORMAT_VERSION),
     seq: typeof d.seq === 'number' && Number.isFinite(d.seq) ? d.seq : 0,
     processed: d.processed as Record<string, ProcessedEntry>,
     consumables: (typeof d.consumables === 'object' && d.consumables ? d.consumables : {}) as Record<string, number>,
+    ...(unknownFields ? { unknownFields } : {}),
   };
+}
+
+/** The bytes to persist: this build's fields, with any preserved unknown keys spread back
+ *  UNDER them so a key this build owns always wins over a stale copy in the bag. `unknownFields`
+ *  is a parse-time construct and is never itself written. */
+function serialize(doc: LedgerDoc): Record<string, unknown> {
+  const { unknownFields, ...known } = doc;
+  return mergeUnknownFields(known, unknownFields);
 }
 
 export class IapLedger {
@@ -125,7 +202,7 @@ export class IapLedger {
       this.doc.consumables[productId] = (this.doc.consumables[productId] ?? 0) + consumableUnits;
     }
     this.evict();
-    this.store.write(this.doc);
+    this.store.write(serialize(this.doc));
     return true;
   }
 
@@ -135,7 +212,7 @@ export class IapLedger {
     const e = this.doc.processed[transactionId];
     if (!e || e.finished) return;
     e.finished = true;
-    this.store.write(this.doc);
+    this.store.write(serialize(this.doc));
   }
 
   balanceOf(productId: string): number {
@@ -149,7 +226,7 @@ export class IapLedger {
     const have = this.balanceOf(productId);
     if (have < units) return false;
     this.doc.consumables[productId] = have - units;
-    this.store.write(this.doc);
+    this.store.write(serialize(this.doc));
     return true;
   }
 

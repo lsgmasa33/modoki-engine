@@ -1,0 +1,65 @@
+{
+  "_comment": "Shared spec for OtaCore.verifyStagedFiles (Swift) / OtaCore.verifyStagedFiles (Java) — #556. Deliberately NOT in the vectorFiles/VECTOR_FILES arrays the boot/confirm/loadFailed golden vectors use: this file has a different shape (no `op`/`bundle`/`state`, no `constants` block) and is replayed by its own loader/test function on each port (see OtaCoreTests.swift's testStageVerifyVectors, OtaCoreSelfTest.java's runStageVerifyVectors). Both ports must produce byte-identical `expect` on every scenario.",
+  "scenarios": [
+    {
+      "name": "exact_match",
+      "expected": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "assets/app.js": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      "actual": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "assets/app.js": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      "expect": { "kind": "ok" }
+    },
+    {
+      "name": "missing_file",
+      "expected": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "assets/app.js": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      "actual": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "expect": { "kind": "missing", "path": "assets/app.js" }
+    },
+    {
+      "name": "unexpected_extra_file",
+      "expected": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "actual": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "assets/stray.js": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+      "expect": { "kind": "unexpected", "path": "assets/stray.js" }
+    },
+    {
+      "name": "hash_mismatch",
+      "expected": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "actual": { "index.html": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+      "expect": {
+        "kind": "hashMismatch",
+        "path": "index.html",
+        "expectedHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "actualHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    },
+    {
+      "name": "uppercase_vs_lowercase_hash_is_equivalent",
+      "expected": { "index.html": "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899" },
+      "actual": { "index.html": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899" },
+      "expect": { "kind": "ok" }
+    },
+    {
+      "name": "empty_expected_and_actual",
+      "expected": {},
+      "actual": {},
+      "expect": { "kind": "ok" }
+    },
+    {
+      "name": "empty_expected_but_nonempty_actual_reports_unexpected",
+      "_comment": "Pins that an empty `expected` (a caller-provided `files: []` — a manifest that legitimately lists zero files, e.g. a sub-game with no static assets — is PRESENT verification data, not the ABSENT-verification `files` field pre-#556 legacy callers omit entirely) still requires the staged tree to be empty too. A staged tree with any actual file must report `unexpected`, not silently pass as if verification had been skipped.",
+      "expected": {},
+      "actual": { "index.html": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "expect": { "kind": "unexpected", "path": "index.html" }
+    },
+    {
+      "name": "multiple_problems_reports_first_by_sorted_path",
+      "expected": {
+        "a_missing.js": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "c_mismatch.js": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "actual": {
+        "b_unexpected.js": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "c_mismatch.js": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "expect": { "kind": "missing", "path": "a_missing.js" }
+    }
+  ]
+}

@@ -399,6 +399,160 @@ An `Environment` entity (`three/traits/Environment.ts`) binds an HDR equirect as
 
 The texture is acquired + refcounted per scene by `SceneManager` (see [Architecture](./architecture.md)) so `getCachedEnvironment(hdrPath)` returns a ready texture before first render. Every `scene.environment` / intensity / background write is CHANGE-GATED — this runs every frame, but the texture + scalars rarely change and reassigning them flags the render state dirty on some backends. An `ultrahdr`-format source is display-referred (dimmer for IBL), so both its env + bg intensity are boosted by `ULTRAHDR_INTENSITY_BOOST` toward scene-linear parity (the user's `intensity` still scales on top). A runtime-spawned Environment (editor live-edit) that skipped the acquire path kicks off an async load and lands on a later frame. Removing/deactivating the Environment — or unticking `showAsBackground` — clears `scene.environment` **and takes back a texture `scene.background`** (the texture is owned by `envCache`, never disposed here; `syncCamera` re-applies the authored clearColor on the next frame). Nothing else can take that background back: `syncCamera` leaves a texture background alone precisely because this sync owns it. `syncEnvironment` also runs the **retired-env sweep** at the end of each call — the free point for an HDR that a re-import evicted while a surface still bound it; the mechanism and why it reads the live binding instead of a refcount live in [textures.md](./textures.md) § "The env cache retires too" (#315).
 
+### The engine owns the environment PMREM and cube derivation, not three (#739, #775, #779)
+
+`scene.environment` is bound to a **pre-generated PMREM**, and `scene.background` (when
+`showAsBackground` is on) to a **pre-generated PMREM or cube texture, chosen by
+`backgroundBlurriness`** — never the raw equirect, for either. `envPmrem.ts`
+(`runtime/rendering/`) builds both kinds, caches each output render target per
+`(renderer, source texture, kind)` — **keyed on the renderer of the surface being synced, not a
+global "active" one** — and hands three the result. That key is load-bearing: a derived output is a
+render-target texture and **cannot be shared across render contexts** (three's own PMREM cache says
+so, which is why it keys its cache the same way), and the editor runs up to three renderers at
+once — GameView, SceneView, ParticleEditor — each with its own GPUDevice. Hand one surface the
+target another surface's renderer built and its IBL/background is permanently BLACK, with nothing
+to re-initialise it. `syncEnvironment` therefore takes the renderer as a parameter; when it is
+absent the raw equirect is bound instead, because absence must mean "no derived texture", never
+"somebody else's".
+
+**Two doors, because three's own dispatch forks on `backgroundBlurriness`.**
+`NodeManager.getBackgroundNode` routes a texture through `pmremTexture()` (→ `PMREMNode`) when
+`backgroundBlurriness > 0` or the mapping is already `CubeUVReflectionMapping`, and through
+`cubeMapNode()` (→ `CubeMapNode`) when it is `0`. Each node short-circuits its OWN generator only
+when the texture it's handed already satisfies that node's door —
+`isPMREMTexture`/`CubeUVReflectionMapping` for `PMREMNode`, a non-equirectangular mapping for
+`CubeMapNode` ("envNode already refers to a cube map"). Fixing only the `environment` binding (as
+#739 originally did) leaves `background` walking through whichever of the two doors blurriness
+picks, unrepaired — #779 is that leak recurring through the PMREM door for a blurred background,
+#775 is the same shape through the cube door for a sharp one. A PMREM's level 0 is not the sharp
+original, and `NodeManager` routes ANY `CubeUVReflectionMapping` texture through the blur path
+regardless of the authored blurriness — so the sharp case (0) MUST get the cube texture, never the
+PMREM, or the background silently blurs.
+
+**Why, measured (the PMREM half, #739).** Left to itself, three builds the PMREM lazily inside the
+node graph, through a `PMREMGenerator` it creates per `PMREMNode`. It frees only the PMREM
+*output* — a dispose listener on the SOURCE texture. The generator's own `_pingPongRenderTarget`
+(768×1024 half-float, ~6 MB) and its 11 LOD-mesh geometries are freed only by
+`PMREMGenerator.dispose()`, reachable only through `PMREMNode.dispose()`, and **nothing on the
+scene-swap path calls it**. Since a scene swap gives the env a new texture *identity*, that leaked
+once per swap, unbounded — four transitions cleared the `com.apple.WebKit.GPU` jetsam band (#590).
+Measured on `games/3d-test`, alternating `tropical-island` ⟷ `empty`, per swap cycle:
+
+| | render targets | textures | texture memory | geometries |
+|---|---|---|---|---|
+| before #739 | +3 | +3 | **+6.0 MB** | +16 |
+| after #739 | +1 | +1 | **0.0 MB** | 0 |
+| after #775/#779 | **0** | **0** | 0.0 MB | 0 |
+
+Re-measured after #775/#779 on the same harness: geometries and textures both flat across three
+full cycles (29/29/29 and 16/16/16), with a fresh PMREM identity each cycle — i.e. the previous
+one was released, not accumulated.
+
+⚠️ **That `0.0 MB` in the middle row is a FIXTURE artefact, and it set the wrong scope on #775 for
+a while.** `CubeMapNode` sizes its target `new CubeRenderTarget( image.height )` — the leak scales
+with the SOURCE. In this harness the only scene with `showAsBackground: true` is `empty`, whose
+env is the 16×8 `white.hdr` placeholder, so the residual measured was an **8×8** target that
+genuinely rounds to nothing; `tropical-island` has `showAsBackground: false` and never took the
+background path at all. A real scene showing a 2K HDR background downscales to 1024×512
+(`DEFAULT_ENV_SETTINGS.maxSize` 1024), giving `CubeRenderTarget(512)` — 6 × 512² × RGBA16F ≈
+**12.6 MB, ~16.8 MB with mips**, per env-identity change. So the residual #775 recorded as
+"essentially no memory" was **larger than the 6 MB/cycle #739 was worth fixing**, on any scene that
+actually shows its environment. The lesson is the general one: a leak whose size tracks an asset
+must be measured on a representative asset, not on whichever fixture the harness happened to load.
+
+The generator's lifetime is exactly one call — build, take the target, `dispose()` immediately.
+That is safe because `dispose()` frees the scratch state but **not** the output target, which is
+the one thing we keep. The cube half (#775) has no generator to dispose — `CubeRenderTarget`
+disposes its own scratch geometry/material internally inside `fromEquirectangularTexture` — but it
+temporarily swaps the source texture's filtering flags and the renderer's MRT state, restoring both
+before returning, so it must only ever run from this sync, same as the PMREM build.
+
+Consequences worth knowing before touching this:
+
+- ⚠️ **There are TWO `PMREMGenerator`s.** `THREE.PMREMGenerator` (core) is `ShaderMaterial`-based
+  and only works with `WebGLRenderer`; the one a `WebGPURenderer` needs comes from `three/webgpu`
+  — and `makeWebGPURenderer` ALWAYS builds a `WebGPURenderer` (the WebGL2 backend runs inside it),
+  so it is always the `three/webgpu` one. Using the wrong one **does not throw**: three logs
+  `NodeBuilder: Material "ShaderMaterial" is not compatible` and returns a target that rendered
+  nothing, so a silently BLACK environment gets bound and every unit test still passes.
+- ⚠️ **The "0 / 0" row is a per-surface DELTA, not a claim that ownership is free.** Engine
+  ownership keys on `(renderer, source, kind)` where three's own `CubeMapNode._cache` keys on the
+  source alone — that is the point (three would hand one surface a target another renderer built),
+  but it means an editor showing the same sharp HDR in SceneView *and* GameView now holds **two**
+  cube targets where three held one. On the ~16.8 MB figure above that is real memory, traded
+  deliberately for correctness. Two smaller corollaries: crossing `backgroundBlurriness` 0 ⟷ >0
+  while authoring builds and then RETAINS both kinds for that source — nothing releases the unused
+  one until the source itself dies — and a source that is not yet decoded (`image` absent or zero
+  height) returns undefined WITHOUT being negative-cached, so it retries next frame instead of
+  degrading permanently, mirroring three's own `isEquirectangularMapReady`.
+- **The retired-env sweep resolves EITHER derived texture back to its source.** Neither
+  `scene.environment` nor `scene.background` holds the equirect any more, so
+  `sweepRetiredEnvironments` maps whichever is bound through `sourceForEnvDerived` and treats the
+  source as bound too, for both fields independently. Without that a retired equirect looks unbound
+  and is disposed while its derived texture is still on screen — the #315 use-after-free shape.
+- **The shader prewarm must mirror the PMREM too** (only `environment` — there is no background
+  door in the prewarm scene, since three only derives a background conversion from a
+  `scene.background` that's actually set). `prewarmShadersForWorld` is registered with
+  `registerBeforeSwap`, so it runs on EVERY swap; binding a raw equirect there would make
+  `PMREMNode` build its own generator and re-open the leak through the prewarm door, with every
+  other test still green.
+- **Three's own `CubeMapNode` cache is keyed on the source texture ALONE, not per renderer** — a
+  latent cross-renderer correctness bug in the editor's multi-renderer setup (the same hazard
+  `envPmrem.ts`'s `(renderer, source, kind)` key exists to avoid for the PMREM half). Engine
+  ownership of the cube derivation fixes that too, incidentally: our cache is per-renderer by
+  construction, so a `CubeRenderTarget` built for one surface's GPU context is never handed to
+  another.
+
+`envPmrem.ts` lives in `rendering/` and not beside the env cache in `loaders/meshTemplateCache.ts`
+because `loaders/**` is reachable from the 2D boot path, and a value-import of `three/webgpu` there
+would ship the whole Three node pipeline into a `render3d:false` build (#214). It registers
+`disposeEnvDerivedFor` into a three-free hook registry in the cache instead, so a derived texture
+still dies with its source; a 2D-only build never imports the module and the registry stays empty.
+It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
+
+### The r185 bump — measured, and what it did NOT fix
+
+three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
+fixture, same probe, same island↔empty cycle:
+
+| per cycle | 0.184.0 | 0.185.1 |
+|---|---|---|
+| renderTargets | +5 | **+3** |
+| textures | +9 | **+3** |
+| geometries | +17 | **+17 (unchanged — ours, not three's)** |
+| **texturesSize** | **+72.1 MB** | **+24.1 MB** |
+
+A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
+as predicted — it was the `modelOwners` ownership gap, not a three defect.
+
+⚠️ `"three": "^0.184.0"` is a 0.x caret (`>=0.184.0 <0.185.0`), so a plain `npm install` will NOT pick
+0.185.1 up; the range must be bumped explicitly. **0.185.0 and 0.185.1 are the only releases after
+0.184.0** — there is nothing further to bump to.
+
+**What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
+`pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to
+r184 (still caches `renderTarget.texture` and disposes the wrong object), and the `PMREMGenerator`
+ping-pong target is freed only by `PMREMNode.dispose()`, which nothing calls when the env changes —
+together the residual 24.1 MB/cycle above. It also does not touch the WebGL-fallback program leak
+(#715), which is a different layer entirely.
+
+⚠️ **`@types/three` is deliberately HELD at `^0.183.1`** — owner decision, 2026-09-05, asked directly.
+Bumping it to 0.185.4 fails `verify` with ~20 errors as the TSL node generics became far more
+specific, hitting `particles/billboardTsl.ts`, `gpuComputeBackend.ts`, `spriteBillboard.ts`,
+`postfx/PostFXStack.ts`, `SceneView.tsx` and the `water.ts` shader in both `games/sling` and
+`demos/forest-camp`. Types lagging the runtime is the pre-existing arrangement, **not an open task to
+pick up.** Known cost: a REMOVED symbol still fails loudly at typecheck (the safe direction), but a
+CHANGED SIGNATURE could silently typecheck against the older types.
+
+⚠️ **GTAO is genuinely darker under r185 and the owner ACCEPTED it** (shown the side-by-side,
+2026-09-05: *"diff is fine"*). Mean luminance 42.32 → 39.86 on `demos/postfx-demo` with GTAO forced
+on — for scale, enabling GTAO at all is a -3.35 change, so r185's extra darkening is ~73% as large as
+the entire AO effect. **Do not "fix" it back later as an unreviewed regression.** It ships to nothing
+today regardless: `AmbientOcclusionPostFX` defaults to `enabled: false` and no committed scene turns
+it on. Everything else measured byte-identical, including a scene exercising particles, transparency,
+instancing and an environment.
+
+
 ### HDR conversion (Node — dev server + build)
 
 Source `.hdr` files are downscaled offline into a content cache by `env-convert.ts` + `hdr-codec.ts` — DEPENDENCY-FREE (no ImageMagick / native tool, unlike `toktx` for KTX2):
@@ -525,9 +679,9 @@ silently drop the shader's draws. `games/space-console`'s `stripes`/`matcap`/`pl
 
 `syncMaterial(obj, id, curMat, state)` (`scene3DSync.ts`) binds a mesh renderer's material each frame. A renderer references a MATERIAL only (a `.mat.json` GUID) — never a texture directly (textures live on the material; resolution + the KTX2 variant pick are in [Materials & Textures](./textures.md)):
 
-- An empty ref falls back to a shared engine default (`MeshStandardMaterial`, grey, `roughness 0.5`, `metalness 0`).
+- An empty ref falls back to a shared engine default (`MeshStandardMaterial`, grey, `roughness 0.5`, `metalness 0`) — for a `Renderable3D` (GLB) entity. A `Renderable3DPrimitive` instead gets its own `cloneDerived` of that default (#480): the primitive colour block writes `material.color.setHex(rend.color)` straight into whatever is bound, so sharing the singleton let two primitives whose refs both cleared to `''` fight over one object AND left the pollution on `_defaultMaterial` for every entity that bound it afterwards — the last one synced each frame won, permanently, for everyone. The clone is confined to primitives on purpose: `applyInstancedBatching` keys a batch on `${geo.uuid}|${mat.uuid}`, so cloning unconditionally stopped otherwise-identical GLBs from batching at all (measured on 8 entities: `{considered:8,batched:8,groups:1,drawCallsSaved:7}` → `{considered:8,batched:0,skipped:{"below-threshold":8}}`). It's safe precisely because nothing else is true for GLBs that is true for primitives: no code writes into a GLB's material in place (Tint and MaterialInstance each bind their OWN clone/variant), and an empty-ref primitive can never be light-masked (`masked = !!rend.material && …`), so the clone can never need to become a per-entity mask-variant base either.
 - A material created inline for one entity is tracked in `RenderState.ownedMaterials` and disposed when reassigned; shared cache materials are NEVER disposed here (the scene refcount owns them).
-- When the ref is UNCHANGED but the async `.mat.json` load only just finished, `syncMaterial` re-checks `resolveMaterial` and swaps the resolved material in — retrying each frame until it lands.
+- When the ref is UNCHANGED but the async `.mat.json` load only just finished, `syncMaterial` re-checks `resolveMaterial` and swaps the resolved material in — retrying each frame until it lands. That's only half the mechanism: the ref is recorded into `ecsMaterials` (the "did the authored ref change" record) only once it actually RESOLVES, at both the primitive create path and inside `syncMaterial` itself — so while a `.mat.json` is still loading (or is `MATERIAL_FAILED` and later becomes resolvable), the CHANGED-ref branch keeps re-running and retrying, for every entity kind (#479). That's the case worth knowing because the unchanged-ref poll above is SKIPPED for tinted / MaterialInstance / light-masked entities, which each own a clone or variant derived from the base — before this fix, one of those set with an unresolved ref never bound it, ever, silently, with the Inspector showing the new ref regardless. Worst case was a light-masked primitive SPAWNED with an unresolved ref: it stayed on `primitives._placeholderMaterial` (`visible: false`), so the entity was invisible rather than merely stale. The retry itself is cheap and non-churning — two map lookups, the `toFree` set lazily allocated, nothing reassigned while unresolved — verified by a test asserting the bound material object stays identical across repeated unresolved frames with no growth in `ownedMaterials`.
 - A `THREE.LOD` fans the material out to every LOD child mesh (`materialTargetsOf`).
 
 ### Ownership is per RENDER SURFACE, and teardown obeys it
@@ -546,9 +700,20 @@ three things no surface may dispose: the **shared cached `.mat.json` material** 
 cache, still bound by the other surface, and deliberately kept ALIVE across a scene swap that both
 scenes share it through — see [Scene loading](./scene-loading.md)); **`_placeholderMaterial`**, the
 module-level sentinel a primitive holds while its authored material loads, or forever if the ref
-never resolves; and `_defaultMaterial`, the fallback for an empty ref. All three are process-wide,
-so one panel unmounting broke them for every panel. Pinned by
-`tests/runtime/disposeRenderStateOwnership.test.ts`.
+never resolves; and `_defaultMaterial` — still a process-wide singleton that must never be disposed,
+but since #480 it is the clone SOURCE for primitives (see § Material Sync) and only a bound fallback,
+not a clone source, for GLB renderables. All three are process-wide, so one panel unmounting broke
+them for every panel. Pinned by `tests/runtime/disposeRenderStateOwnership.test.ts`.
+
+The same two-surfaces trap bit a different module-global: `syncRenderables`' warn-once dedupe for an
+unknown `Renderable3DPrimitive.mesh` name (#482, below) is a plain `Set<string>` at module scope, not
+per-`RenderState` — a `console.warn` isn't owned data that needs disposing, so it didn't need the
+per-surface treatment above, but it still needed a reset. Without one, the editor's two render
+surfaces (SceneView + the Game panel's `Scene3D`) shared one dedupe, so only one surface ever reported
+the bad name, and reloading the editor to reproduce "why is my primitive invisible" warned nothing at
+all — the name was already in the set from before the reload. Fixed by clearing it in `onWorldSwap`,
+the same arm signal `disposeTintMaterials` (Tint, below) and the light-mask variant cache already
+reset on.
 
 **Tint** — the `Tint` trait renders a per-`(material,color,amount)` CLONE of the shared base material (`.color` set to the tint, `nprColorPreserve` set to the strength). Clones are cached (every ally ship shares ONE blue clone) and freed only on world swap (`disposeTintMaterials`, wired to `onWorldSwap`); a continuously-varying tint (an animated colour) would grow the cache unbounded and warns past 64 entries. The NPR composite then blends the grayscale fill toward that colour per-draw (see [Color preservation](#color-preservation)).
 
@@ -1443,10 +1608,11 @@ it cannot place — which lands exactly where such a device already landed (the 
 
 #### The three-layer resolver, and what the GPU database cannot do (#210)
 
-**Why identity is better, with the numbers.** `deviceCaps.ts:180` already reads
+**Why identity is better, with the numbers.** `deviceCaps.ts`'s `readGlFacts` already reads
 `UNMASKED_RENDERER_WEBGL` on every device in a release build. It was written off
-(`qualityTier.ts:649`) as *"ambiguous — one name ships two GPUs"*. Checked against real data, the
-ambiguity is between **siblings**, not generations, and a public database resolves even that:
+(`qualityTier.ts`'s `TIER_ALLOWLIST` comment) as *"ambiguous — one name ships two GPUs"*. Checked
+against real data, the ambiguity is between **siblings**, not generations, and a public database
+resolves even that:
 
 | our device | database entry | fps |
 |---|---|---|
@@ -1497,8 +1663,9 @@ top-down; the first layer that answers, wins.
 | **3. Probe** — the existing ramp | unknown vendor, masked string, iOS web | — | the 6 s, paid by a MINORITY |
 | **iOS native** — model id (already shipped) | all iOS native | ✅ threshold rule | ~0 ms |
 
-**Layer 1 is what makes the stale database a non-issue**, and it is not a new idea — it is the rule
-`qualityTier.ts:653` already argues for on iOS, never applied to Android:
+**Layer 1 is what makes the stale database a non-issue**, and it is not a new idea — it is the
+rule `qualityTier.ts`'s `IOS_TIER_MIN_GENERATION` comment already argues for on iOS, never
+applied to Android:
 
 > *"A THRESHOLD, NOT A LIST — AND THAT IS THE WHOLE POINT. An enumerated allowlist ossifies in the
 > WORST direction… A `>= N` rule cannot fail that way, because newer silicon is only ever faster."*
@@ -2307,6 +2474,23 @@ device, at boot, and the tier it produces does not change mid-play; demotion sta
   launches each pay one** where previously only the first did. A pre-refinement cached record has
   no `samples` and is rejected on read, so an already-launched device re-probes — deliberately.
 
+  ⚠️ **A verdict write is DROPPED outright if a sub-game swap re-namespaced `PlayerPrefs` while the
+  probe ran (#487)** — hash navigation or an OTA sub-game switch can re-run `PlayerPrefs.init()`
+  with a new namespace inside the probe's own awaits (a dynamic import, up to three ramp passes, the
+  2500ms in-launch budget), and the samples this probe collected were read from the OUTGOING game's
+  namespace. Landing them anyway would overwrite the incoming game's record — possibly with
+  `final:true` (never probe again) for a fingerprint computed against the *outgoing* viewport. The
+  mechanism is an opaque session token on the `ProbeVerdictStore` seam (`ProbeStoreSession` in
+  `core/probeVerdictStore.ts`): `rendering/` captures it before its awaits and hands it back
+  unexamined, and the comparison lives entirely in the storage-side provider — the only layer
+  allowed to see `PlayerPrefs` at all, since `rendering/` may not import `storage/`. **The design
+  consequence worth writing down:** after such a swap the INCOMING game's tier is already resolved
+  (`resolveActiveTier` early-outs for it), so nothing re-probes and nothing gets cached on that same
+  boot — the dropped verdict is not replaced by a fresh one until the next launch. The "one cheap
+  re-probe next launch" bargain this buys assumes a swap is OCCASIONAL; a device that swaps sub-games
+  on every boot never settles, and pays the blocking probe forever by a different route than the bug
+  this mechanism fixes.
+
   "No launch pays more than one" is enforced by `shareTierResolution` (`probeReentrancy.ts`), and
   it is a *different* guard from the recursion flag beside it: that one stops a call arriving from
   INSIDE the probe, this one stops two surfaces arriving from outside it in the same tick, before
@@ -2745,6 +2929,32 @@ sliding budget (`MAX_RECOVERY_ATTEMPTS` in `RECOVERY_WINDOW_MS`), then abandon l
 Scheduling (defer out of the loss event, one rebuild at a time, coalesce a loss that lands
 mid-rebuild) is `rendering/rendererRecovery.ts`.
 
+**`setActiveRenderer` returns a DISPOSER, and every viewport must call it on teardown (#720).**
+Both module handles — `activeRenderer` and `attachedRenderer` — used to be assigned and never
+cleared, so after a teardown `getActiveRenderer()` handed consumers a **disposed** renderer:
+`particleBackend`'s `gpuEligible` would route new effects onto a dead device, `tierCalibration`
+wrote `shadowMap.enabled` into a corpse, and — worst for diagnosis — `gpuMemoryReport` reported the
+dead renderer's `info`, so *GPU-memory investigation itself could be reading a disposed renderer*.
+The `webglcontextlost` listener also had no removal path.
+
+Three properties are load-bearing, and each corresponds to a real hazard:
+- **Identity-guarded.** The disposer clears a handle only if it still points at *that* renderer, so
+  a late disposer from an old renderer cannot clear a newer one's — the same superseded-renderer
+  discipline the two false-positive filters in the detection paths already enforce.
+- **It does NOT reset `lossTimes`/`recoveryAbandoned`.** Every recovery installs a new renderer, so
+  clearing loss history on a routine swap would zero the counter on the very event it exists to
+  count, and a hard rebuild loop would read as an unbroken series of first-time losses.
+- **It does NOT clear `gpuFaultState`.** If a device loss *caused* the teardown, clearing it would
+  erase the fault recovery is responding to. Only a new renderer attaching resets it.
+
+A repeat registration of the SAME renderer hands back the *existing* detach rather than a no-op —
+otherwise a caller keeping only the latest disposer (a `bringUp()` retry does exactly that) would
+clear `activeRenderer` while leaving `attachedRenderer` pinned to the corpse.
+
+⚠️ **`attachedRenderer` no longer exists — #802 deleted it** (see "One fix, two twin globals"
+below). The paragraphs above describe the state #720 left behind, which is what made #802
+reachable; `activeRenderer` and its `registrants` stack are still exactly as described.
+
 **A rebuild that REJECTS is now retried (#156), not dropped.** It used to be reported and abandoned,
 which was terminal by construction: the only thing that can ask for another attempt is a further
 `onRendererLost`, and once a rebuild has failed there is no live renderer left to lose — so that
@@ -2800,6 +3010,389 @@ hook without preserving the false-positive filters.** Unifying them is a real an
 simplification, but those two filters (superseded-renderer, and `reason === 'destroyed'`) were
 paid for by shipping a diagnostic that declared a healthy 61 fps editor dead. They are the
 acceptance criteria for any such refactor.
+
+### The 2D path needs the same recovery, and two halves of it were missing (#678, #794)
+
+The recovery policy above is three's. The 2D/PixiJS path (`runtime/rendering/canvas2DPool.ts`,
+`gpuResourceInvalidation.ts`) needed its own — and was missing it in two independent places.
+
+**Half 1 — detection was WebGL-only (#794).** `canvas2DPool.attachCanvasListeners` registered only
+`webglcontextlost`/`webglcontextrestored` — DOM events a **WebGPU canvas never fires**. So on
+WebGPU a lost `GPUDevice` was undetected entirely: no log, no rebuild, the surface frozen on its
+last presented frame forever. Measured on an iPad mini 5 (iPadOS 26.6.1, `games/court`):
+`GPUDevice.destroy()` resolved `device.lost` for a hand-attached listener while the engine logged
+nothing, `renderer.uid` never changed, and `render()` kept returning cleanly. ⚠️ Verified by
+PERTURBATION, not by a screenshot — a capture never forces a render, so "the screen still looks
+right" only meant the last good frame was still on it; setting `visible = false` on the stage's
+children and rendering changed nothing, which is what proved the surface dead. Fixed by
+`attachDeviceLostListener` — the `device.lost` twin of what was then `activeRenderer.ts`'s own
+`attachWebGpuDeviceListeners`. (#802 later deleted that function and moved the 3D viewports onto
+this same shared listener, so the two are now one implementation rather than twins — see "One fix,
+two twin globals".)
+
+⚠️ One deliberate difference from the viewport policy: it filters out `reason === 'destroyed'`
+because three destroys its own device on disposal, and the original code had no disposer, so it
+cried wolf at 61 FPS. That filter now lives in `makeViewportLossPolicy`, which suppresses the log
+as well as the report. `canvas2DPool` does NOT filter on reason. Pixi never calls `GPUDevice.destroy()` at all
+(`GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`), so a `'destroyed'` reason
+means something outside Pixi destroyed the device — a real loss for this surface, and a rebuild is
+the right answer.
+
+**Half 2 — a rebuilt renderer draws nothing for surviving Graphics (#678).** `rebuildSlotApp`
+deliberately keeps the surviving scene graph and re-parents it onto the new stage. **Nothing marked
+those views dirty**, and the mechanism is a per-pipe asymmetry in Pixi:
+- `GraphicsPipe.addRenderable` (`scene/graphics/shared/GraphicsPipe.mjs`) calls `_rebuild(graphics)`
+  **only `if (graphics.didViewUpdate)`**. Unmarked, the pipe mints a fresh EMPTY `GraphicsGpuData`
+  (`batches: []`) under the new renderer's uid, which contributes nothing to the batcher — so the
+  object draws nothing, silently.
+- `MeshPipe._getBatchableMesh` (`scene/mesh/shared/MeshPipe.mjs`) initialises its gpu data
+  **unconditionally**.
+
+**That asymmetry is exactly the measurement**: on an iPhone 8 (iOS 16.7.16, `games/wordweave`),
+after a context loss and a SUCCESSFUL rebuild, **48 `graphics`-pipe objects were present,
+`destroyed: false`, visible, correctly bounded — and drew nothing, while 18 `mesh`-pipe objects
+drew fine.** Fixed by `revalidateSubtreeAfterRendererRebuild` calling `onViewUpdate()` on every
+surviving view (a VIEW-level notification that sets `didViewUpdate`, not a render-group dirty
+flag).
+
+**⚠️ But the repro has the OPPOSITE POLARITY to the report, and the reported polarity was never
+reproduced or explained.** #678 was filed on a real WebKit GPU-process jetsam (owner, 2026-09-04):
+*"all letters are gone. I see grid background and crossword background."* The measurement above is
+its mirror image — the **letters survive** and the **backgrounds vanish**. The mapping is not
+ambiguous: `Text2D` becomes a Pixi `Mesh` (`Scene2D.tsx`, `new Mesh({ geometry, texture: ptex,
+shader })`), while a `Renderable2D` whose `sprite` is not an image/video ref becomes a `Graphics`
+(`spriteKind = (imageMode || videoMode) ? 'sprite' : 'graphics'`) — and wordweave's board cells,
+crossword cells and meter segments are all `sprite: 'square'`. So 48 graphics = the squares,
+18 meshes = the letters.
+
+The **class** reproduces (a rebuilt renderer silently drawing nothing for surviving views); the
+specific content mapping does not. The standing hypothesis is that #690 made the text shader
+module-scoped and reused, so meshes now recover where they did not on 2026-09-04 — **unverified,
+and nobody has re-measured it.** What this means for anyone reading this later: `onViewUpdate()`
+repairs the Graphics half and that half is device-verified, but **the letters-gone polarity has no
+measured explanation and no live repro**, so if letters vanish again after a real jetsam, do not
+assume this fix covers it. The induced `loseContext()` drives the real recovery path — same four
+log lines, same order — but it is not proof that it drives the same *failure*.
+
+**⚠️ The comment that was measurably false.** `rebuildSlotApp`'s doc used to justify
+survive-and-reattach with *"their textures re-upload on the next draw."* They do not. It was an
+assertion nobody had watched fail — the same shape as #590 itself.
+
+**⚠️ The scar worth carrying: isolate each part of a bundled repair.** The live repair that first
+restored the frame did three things at once — deleted Pixi's `_gpuData`, set `context.dirty =
+true`, and called `onViewUpdate()` — then rendered. Only "render alone" was isolated, and the cure
+was credited to the `_gpuData` delete because a stale-GPU-cache leak was the finding already being
+chased. **That was wrong**, and it took deploying to the phone to find out: the purge ran (206
+entries) and the frame stayed blank. Isolation on the fixed build:
+
+| after the pool's own rebuild | result |
+|---|---|
+| `_gpuData` purge alone | still blank |
+| `context.dirty = true`, then render | still blank |
+| `onViewUpdate()`, then render | frame fully restored |
+
+**The `_gpuData` purge is kept, re-scoped.** It deletes only uids of renderers that are provably
+DEAD — safe precisely because those renderers no longer exist, so no live-set reasoning is needed.
+⚠️ It is a **set**, not one uid: a dead uid outlives the attempt that killed it — a rebuild whose
+`init()` exceeds `APP_INIT_TIMEOUT_MS` never reaches a purge, and a renderer torn down via
+`teardownSlot` never had one — so whichever rebuild next succeeds sweeps them all. The purge is
+**process-wide and append-only** (`deadRendererUids`), which is what closed the reach limit this
+paragraph used to record as an accepted trade: while it was per-slot it could not reach renderers
+destroyed via `teardownSlot` (`destroyPool`, the `renderAll` shrink pass, `reclaimIfUnclaimed`), so
+a SceneView mount/unmount left one null-valued key per shared `TextureSource`. `teardownSlot` now
+records too. It is append-only rather than drained-on-walk because draining is wrong the moment a
+second pool exists — slot A's walk would clear a uid still stale on a shared object reachable only
+from slot B, and nothing would ever purge it again; re-purging an already-purged uid is a `delete`
+on an absent key, i.e. free. ⚠️ An earlier version took a "live renderer uids" set
+built from one pool's own slots and deleted every key not in it; that is **wrong**, because
+`defaultPool` and `editorCanvas2DPool` are both live at once and Pixi `TextureSource`s are
+process-global, so it would delete the editor renderer's live entry off a shared texture — a leak
+introduced by a leak fix. Renderer uids come from a monotonic counter that is never reused, so
+there is no uid-collision hazard to defend against either.
+
+⚠️ **That last fact is now load-bearing, and the test fake used to contradict it.** A process-wide
+append-only set is only safe because a live renderer can never share a uid with a dead one — Pixi
+mints uids from a module counter and `resetUids()` has zero callers here. `canvas2DContextLoss.test.ts`'s
+fake derived its uid from `created.length` and reset that in `beforeEach`, i.e. it modelled uid
+RECYCLING, which the real library does not do. That was invisible while the registry was per-slot,
+and the moment it went process-wide the fake reported one pool's LIVE renderer as dead. The fake is
+now monotonic across the file. The general form is worth keeping: **a fake must not be more
+permissive than the thing it stands in for** — it will defend a bug the real dependency cannot have.
+
+**Half 3 — the cure was on the wrong function's success path (#801).** Halves 1 and 2 left one
+door open, and it is the subtlest of the three: `rebuildSlotApp` bounded its `init()` with a
+timeout, then did the revalidation *after* the `await`. A timeout **rejects but does not cancel**.
+So when a bring-up ran long, `rebuildSlotApp` threw at the `await` and everything below it —
+`contextLost = false`, the purge, the `onViewUpdate` sweep, the full-redraw flag — became
+unreachable, while `initSlotApp` carried on underneath and eventually brought a renderer up for
+real. Once `rendererRecovery` had spent its three attempts, nothing reassigned `slot.app`, so that
+late init's own `slot.app !== app` bail-out did not fire either: it took the full success path and
+attached the surviving subtree to a healthy renderer that nothing had revalidated. **Half 2's exact
+symptom, produced by Half 2's own fix being unreachable.**
+
+The repair is not another guard. The defect was that **success was decided in two places** — the
+callee brought the renderer up, the caller cured it — and a timeout was enough to make them
+disagree. The cure now lives on `initSlotApp`'s own success path, gated by a `revalidateOwed` flag
+the rebuild sets before it starts, so whichever attempt actually produces a renderer is the attempt
+that cures it, and a late one is adopted deliberately rather than by accident. **A working surface
+beats a blank one** — that is a choice, and the code used to make the worst version of it: adopt
+the renderer, withhold the cure.
+
+The general lesson, which is why this is written here and not in the ticket: *a recovery whose cure
+lives on a different function's success path from its bring-up has two places where "it worked" is
+decided, and a timeout is enough to split them.* The timeout half of that belongs to a family of
+five — see [async-lifetime.md](./async-lifetime.md) § "The other half: what still belongs to the
+operation you gave up on", which owns the shared `withTimeout` and its guard.
+
+### Detection is a shared contract now; policy stays per-surface (#795)
+
+The two sections above cover the 3D viewports (`activeRenderer.ts`) and the 2D canvas pool
+(`canvas2DPool.ts`) — but detection used to be wired **per construction site**, and three other
+live renderer surfaces had none at all: `ShaderPreview.tsx`'s Pixi `Application`, and
+`previewScene.ts`'s + `ModelPreview.tsx`'s bare `THREE.WebGLRenderer`. A lost context left each
+permanently blank with no error anywhere — the canvas keeps its size and DOM position, the ECS
+stays correct, draws keep being issued and do nothing. `ParticleEditor.tsx` had detection only by
+*inheriting* the 3D viewports' global slot, which another renderer can take out from under it.
+
+`runtime/rendering/rendererLossHandling.ts` is now the shared DETECTION contract for all three
+renderer classes a construction site can create — `THREE.WebGLRenderer`, `WebGPURenderer` (via
+`makeWebGPURenderer`), and Pixi's `Application`. `attachRendererLossHandling` wires whichever
+halves a renderer actually has: `attachContextLossListeners` (the `webglcontextlost` DOM event) and
+`attachDeviceLostListener` (the `GPUDevice.lost` promise). It is detection only — policy is each
+caller's own `onLost`, exactly as before.
+
+**Who rebuilds vs who tears down, and why:**
+
+| Surface | On loss | Why |
+|---|---|---|
+| `canvas2DPool` slots | rebuild in place | mid-scene 2D content must not go permanently blank |
+| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget | the GameView/SceneView must not stay blank mid-play |
+| `ShaderPreview`, `previewScene` (Mesh/Material previews), `ModelPreview`, `ParticleEditor` | log loudly, then run the panel's OWN existing teardown | these panels are cheap to reopen, and rebuild-in-place would land this decision inside `canvas2DPool.ts`, where #801 is a pending, separate design change to that machinery |
+
+The four previews share ONE policy, `editor/panels/previewLossPolicy.ts`'s
+`makePreviewLossPolicy`: log a distinguishing line, then call the panel's existing teardown exactly
+once — guarded so a throw inside teardown can't escape the event handler, and so a `webglcontextlost`
+plus a later `device.lost` resolution on the same surface can't run it twice.
+
+⚠️ **The shared module deliberately does NOT feed `activeRenderer`'s recovery budget** — that
+budget is 3 losses per 60s **global to the process**, and exhausting it sets `recoveryAbandoned` for
+every surface. Routing editor previews into it would let a flapping preview panel disarm the
+GameView's own recovery. `canvas2DPool` already stayed out of it for the same reason, and still does.
+
+### One fix, two twin globals — and only one of them got it (#802, #810)
+
+`activeRenderer.ts` held **two** module globals with the same shape, and #720 fixed one of them.
+`activeRenderer` got a `registrants` **stack** whose disposer hands the handle back to the most
+recent survivor. Its twin `attachedRenderer` — the slot both detection paths guarded on with
+`if (renderer !== attachedRenderer) return` — kept the single slot, overwritten on attach and
+nulled on detach with **no re-seat**.
+
+That asymmetry is the whole of #802. Three surfaces register through one global (`SceneView`,
+`Scene3D`/GameView, `ParticleEditor`), so opening the Particle Editor took the detection slot from
+SceneView; closing it left the slot `null`, and nothing re-registers — `setActiveRenderer` runs only
+at renderer CREATION. **SceneView was then deaf to context loss for the rest of the session**, which
+is the #213 failure mode with no log and no rebuild, reintroduced through the side door by an
+ordinary UI action.
+
+**The fix was to delete the slot, not to stack it.** Detection is per-renderer by construction once
+it goes through `rendererLossHandling.ts`: the listeners live on that renderer's own canvas/device
+and the detach is per-attachment, so there is nothing to win or lose. `SceneView` and `Scene3D` now
+wire `attachRendererLossHandling` with `makeViewportLossPolicy` — the viewport sibling of
+`makePreviewLossPolicy` in the table above — and `setActiveRendererHandle` keeps only its
+texture/KTX2-caps role. `RendererLostInfo.renderer` now names the renderer that actually died rather
+than whichever one held the slot, so the second viewport is routed correctly instead of never being
+heard at all.
+
+That split also closed a hazard the coupling hid: `ParticleEditor` calls `setActiveRenderer` purely
+for KTX2 `detectSupport`, and that registration used to arm the **gameplay** recovery budget as a
+side effect — exactly what the warning above says must not happen.
+
+**Three things a refactor of this path is expected to lose.** The file says so itself, and the two
+filters were paid for by shipping a diagnostic that called a healthy 61 fps editor dead:
+- `reason === 'destroyed'` must report **and log** nothing. `logLoss` runs *before* `onLost`, so an
+  early return in `onLost` alone still prints the false alarm — `describe()` has to return `null` too.
+- The superseded-renderer filter, now the per-attachment `isStale` closure. Strictly more correct:
+  the old form treated a renderer superseded by an unrelated *panel* as stale.
+- The clean-slate `gpuFaultState = null` must run for **every** viewport attach, not just WebGPU
+  ones. It now lives in `attachUncapturedErrorListener`, whose body bails early when there is no
+  WebGPU device — so placing the reset below that bail-out silently exempts the **WebGL** path,
+  which is what three's WebGL2 fallback takes on every low-end device we ship to. A rebuild after a
+  loss would then keep reporting the healthy renderer as dead, and a stale loss outranks every other
+  explanation in `explainCaptureFailure`.
+
+**The lesson generalises past rendering, which is why #810 exists.** Stated at the level the
+symptoms share: *per-instance ownership in a module-level single slot, where the take path
+overwrites unconditionally and the release path nulls without re-seating a survivor.* **"Null it if
+it is still mine" is only ever half a contract** — it guards the release and leaves the take bare,
+which is precisely the half each of these sites had already written. The same shape was live in
+`editor/scene/playMode.ts` (`_modeOwner`) and `editor/scene/timelinePreview.ts` (`_saveHandler`),
+both driven by TimelineEditor + AnimationEditor, and in `runtime/core/gpuTimings.ts`
+(`armedRenderer`, which leaked `trackTimestamp` on every renderer it displaced).
+
+⚠️ **The right fix is not always a stack** — this is the part worth carrying forward. `_saveHandler`
+is a plain slot, so a re-seating registry is exactly right. `_modeOwner` is not: `RunMode` is
+genuinely **single-valued**, so once panel B enters, panel A's preview is over globally and there is
+no slot to hand back. What A lacked was NOTICE — its rAF is keyed on `[playing, rootId]` and its tick
+never consults `getRunMode()`, so it went on mutating authored traits while the run mode read
+`stopped`. That site needed a displacement callback, and a stack would have been a confident,
+plausible, wrong fix. Ask what the displaced owner is missing — the slot, or the news — before
+reaching for the pattern that worked next door.
+
+⚠️ **A displaced panel must stop its OWN loop, never the shared flag.** Both editor panels read one
+`isPreviewPlaying` store flag, so `setPreviewPlaying(false)` is not "stop my panel", it is "stop the
+global preview". The first cut of #810 had the displaced callback do exactly that, and with both
+panels docked one ▶ press stopped itself: AnimationEditor enters preview synchronously, the
+Timeline's async session-open takes the mode a microtask later and displaces it, and Animation's
+callback then killed the flag the Timeline had just started on. `editor/panels/previewLoopGuard.ts`
+is the mechanism that avoids it — cancel this run's rAF and block its reschedule, leave the flag to
+whoever owns the mode. Its tick checks `stopped` *before* rescheduling, because a bare
+`cancelAnimationFrame` loses the race against a tick already queued.
+
+**Which sites still lack the guard, and why that is safe — not lucky.** `SceneView`'s three
+viewport registrations (`_pickBillboardInUI`, `editorCamera`, `ecsObjectsRegistry`) still release
+with a bare clear, and #811 closed as **not-reachable** rather than being fixed: the editor's panel
+model makes the required ordering impossible, and the naive guard would itself break the camera's
+projection-toggle re-seat. The four invariants that hold it up, what would flip the class live in
+one move, and the three further slots of this shape are in
+[editor.md](./editor.md) § "Panel registrations in module-level slots".
+
+**The guard, and the trap it was written around.**
+`engine/tests/architecture/rendererLossHandling.test.ts` pairs every renderer/`Application`
+construction site with an attach call into the shared module — sibling to `glContextRelease.test.ts`
+(RELEASE-on-teardown), checking a different property (DETECT-on-construction) over the same file
+census, kept as two files so a red in one is never ambiguous with the other. Its first draft also
+accepted `setActiveRenderer(` as evidence of detection, which made it unable to police
+`ParticleEditor` — that panel calls `setActiveRenderer` too, so deleting its attach call left the
+guard green. The three surfaces that legitimately wired detection elsewhere — `SceneView.tsx` and
+`scene3DSync.ts` via `core/activeRenderer.ts`'s `attachGpuFaultListeners`, and `Scene3D.tsx` via its
+own `onRendererLost` + `createRendererRecovery` — were allowlisted BY NAME instead, so the exemption
+could not spread to a new construction site.
+
+**Two of those three exemptions are gone since #802**, which is the objective measure that it
+landed: `SceneView.tsx` and `Scene3D.tsx` now call `attachRendererLossHandling` directly and are
+policed like any other construction site. `scene3DSync.ts` keeps its entry for a reason that has
+nothing to do with #802 — `createRenderer` and `makeWebGPURenderer` are DECLARED in that file, so
+`CONSTRUCT_RE` matches their own declarations whatever the file does with a renderer. The real
+construction call site is `Scene3D.tsx`'s `bringUp()`, the only caller of `createRenderer`, which is
+where the attach lives; wiring a second attach in `scene3DSync.ts` to satisfy the guard would
+double-fire every GameView loss.
+
+⚠️ **The census must name every FACTORY, not just the `new` expressions.** The same guard's first
+draft matched `makeWebGPURenderer(` but not `createRenderer(`, and `Scene3D.tsx` — the shipped-game
+3D surface — reaches its renderer only through the latter. It was therefore matched by nothing:
+not policed, and not allowlisted either, so nothing said it was uncovered. A construction site that
+names a factory builds a renderer just as surely as one that says `new`. Found by this change's own
+close-out sweep, after the guard had already been mutation-checked against two other panels.
+
+That older route's own detection lived in a single global slot another renderer could take. Fixed
+in **#802** — see "One fix, two twin globals" above.
+
+**Measured, not inferred (2026-09-06, Electron editor on macOS).** All four preview surfaces were
+driven with a REAL loss and each produced its log line and tore down: `ModelPreview` and
+`previewScene` (via MaterialPreview) through `WEBGL_lose_context.loseContext()` on the **WebGL**
+path, and `ShaderPreview` (Pixi) and `ParticleEditor` (three) through `GPUDevice.destroy()` on the
+**WebGPU** path. The `ShaderPreview` run is the load-bearing one: it is the only Pixi surface, so it
+is the only check that exercises `attachDeviceLostListener` and the `app.renderer.gpu?.device` cast
+— the two WebGL runs touch neither. `ModelPreview`'s GPU context was accounted destroyed rather
+than stranded (`gpuMemory` went `created=6,destroyed=5` -> one fewer live context), and reselecting
+the asset brought up a fresh, non-lost context.
+
+⚠️ **What that does NOT establish: pixel-correct rendering after a reopen.** A `readPixels` probe on
+the rebuilt canvas returned zeros, which is what an un-`preserveDrawingBuffer` canvas returns after
+compositing regardless of what it drew — evidence of nothing either way. The reopen is verified as
+far as "a fresh, healthy context is up"; nobody has looked at the pixels.
+
+### The release path must exist before the first acquisition (#858)
+
+The three sections above are all about a release that runs at the WRONG time or on the WRONG
+object. This one is about a release that **cannot run at all**, and it was live at five bring-ups
+at once.
+
+Every long bring-up here was written the same way: take things as you go, then build one big
+teardown closure at the END and hand it to the unmount path.
+
+```ts
+let cleanup: (() => void) | undefined;
+const setup = async () => {
+  setEditorViewportCamera(camera);   // ← taken here
+  …2,000 lines…                      // ← a throw anywhere in here
+  cleanup = () => { …release it… };  // ← never reached
+};
+const teardownViewport = () => { const fn = cleanup; cleanup = undefined; fn?.(); };
+```
+
+**A bring-up that ends early — a throw, a rejected await, an early return — therefore leaves
+everything it already took both unreleased and unreachable.** `cleanup` is still `undefined`, so
+`fn?.()` releases nothing, and the closure that knew how to release it was never built. Note what
+this is *not*: an identity guard on the release side (#811) is inert, because release never runs.
+
+**The five sites, and what each one's stale state then said.** All verified by reading, not
+observed running — the honest status #858 carries:
+
+| Site | Release assigned | What ends bring-up early | Who answered wrongly |
+|---|---|---|---|
+| `editor/panels/SceneView.tsx` | end of `setup()` | any sync throw in the ~2,175 lines from the first registration (there is no `await` in that span) | `focusEntityInSceneView()` returns `true` having framed nothing, so `modoki_focus_entity` reports `{ok:true, framed:true}`; "Copy from Editor Camera" reads a disposed camera; `isEcsObjectVisible` answers from a torn-down graph — a **false green** for an e2e collider assertion. Plus the renderer LEASE, which the ticket did not mention |
+| `runtime/rendering/Scene3D.tsx` | end of `startRenderLoop()` | `install()` has no `try/catch`; `bringUp().catch` logs and calls `abandonScenePaint()`, never `teardown()` | a leaked `registerBeforeSwap` hook fires on **every future scene swap**, prewarming against an abandoned renderer and warning each time |
+| `editor/panels/ParticleEditor.tsx` | end of the async IIFE | its two `await` bails ARE guarded — the file's own comment describes this exact bug — but the ~85 synchronous lines after them are not | the renderer never pops off `activeRenderer`'s registrant stack, so `getActiveRenderer()` hands every consumer a dead renderer for the rest of the session |
+| `editor/panels/previewScene.ts` + `Preview3DShell.tsx` | via the factory's `return` | `pmrem.fromScene` is a real GPU op; the caller's `catch` had **nothing to dispose** — `handle` is unassigned when the constructor throws | `gpuContextTracking`'s live count climbs toward `SOFT_CONTEXT_LIMIT` with no decrement: the counter that exists to warn about context exhaustion is the thing being lied to |
+| `editor/panels/ModelPreview.tsx` | defined ~120 lines after the context | no `try/catch` at all, so the `useEffect` callback throws and React registers **no cleanup for that run** | the same counter, and `forceContextLoss()`/`dispose()` never run (cf. #776) |
+
+**The repo already contained the correct shape**, which is the argument that this is one class and
+not five accidents: `ShaderPreview.tsx` defines its `teardown` *before* the async IIFE that acquires
+anything and returns it unconditionally, and `App.tsx`'s boot effect carries the comment *"Claim
+ownership BEFORE the first registration, not after the last"*. Those two got it right by hand.
+
+**The fix is `runtime/core/teardownScope.ts`** — that discipline as an object, for the bring-ups
+whose teardown closes over dozens of locals that do not exist yet and so cannot simply be written
+first. `createTeardownScope(label)` gives a LIFO, idempotent, per-step-caught drain; the bring-up
+assigns `cleanup = scope.dispose` as its FIRST statement and pushes each release at the site that
+takes the thing. The big closure is pushed LAST, so LIFO still runs it FIRST and the existing order
+survives.
+
+⚠️ **Where the line is drawn.** On the scope goes anything whose leak OUTLIVES the bring-up and
+keeps acting: every module-level registration (the stale reader answering wrongly), the renderer
+lease, the loss listeners, the frame callback — and every **global** handler, meaning the six
+`window` input listeners and the `document.body` marquee element SceneView installs. Those last
+seven were nearly left behind on the grounds that what stays in the terminal closure is "just
+memory"; they are not memory, they are live input handlers that would run viewport gesture logic on
+every pointer move in the editor for the rest of the session after a failed bring-up. They
+early-return while no gesture is active, which is exactly why nobody noticed.
+
+What genuinely does stay terminal-only is the scene graph and the GPU objects — geometries,
+materials, the gizmo, `controls`, and the listeners bound to the renderer's own canvas, which dies
+with it. Those a partial bring-up still leaks, and that IS only memory. **The test is not "is it a
+DOM listener" but "does it keep answering after the bring-up is gone".**
+
+Two properties that are there for one site each, not for symmetry:
+- **`add()` after disposal runs the release immediately.** This closes the MIRROR-image defect with
+  the same object: `Scene3D`'s `prewarmShadersForWorld(...).then(startLoop, startLoop)` registers a
+  frame callback from a pending promise, so it could land *after* teardown with nothing left to
+  remove it — `renderFrame()` running forever against a disposed renderer.
+- **`installTornDown` in `Scene3D`'s `isStale`.** `disposed` is per-EFFECT and the recovery path
+  (`teardown(); bringUp()`) never sets it, so without a per-install flag a context-loss event
+  dispatched during the rebuild's own `renderer.dispose()` reads as live.
+
+⚠️ **The one ordering change, at four of the five sites: the loss listener now detaches AFTER the
+GPU disposal instead of before.** Safe, and the reason is worth carrying: every event path in
+`rendererLossHandling.ts` consults `isStale()` first, and `isStale` reads a flag the teardown sets
+before anything drains. Whoever removes that flag owes this note a re-read.
+
+**`noteGpuContextCreated()` now RETURNS its matching release**, one-shot, instead of five sites each
+hand-rolling `let contextLive = true; … if (contextLive) { contextLive = false;
+noteGpuContextDestroyed(); }`. It is not a required `TeardownScope` parameter, which was the first
+design: seven sites call it and they do not share one lifetime shape — `scene3DSync`'s renderer and
+`canvas2DPool`'s slots own their context through their own `dispose()`, and a pool slot cycles many
+contexts. Forcing a scope there would have meant restructuring two currently-correct, heavily
+scarred modules to buy compile-time enforcement. **The honest limit: a caller can still drop the
+returned release on the floor.**
+
+**What is tested, and what deliberately is not.** `teardownScope.test.ts` pins the mechanism
+(mutation-checked; note that idempotence has two independent mechanisms, so only removing BOTH
+turns it red — recorded in that file's header). `teardownScopeSeeding.test.ts` pins the ORDER at all
+five sites, read through `readScannedSource` so a marker in a comment cannot satisfy it (#812).
+Neither is the seam the ticket asked for — "make `setup()` throw from the inside" needs the panel
+MOUNTED, which `CLAUDE.md` forbids in jsdom, and a jsdom mount of a 2,200-line WebGPU bring-up would
+assert the fakes. **Nothing here has been observed failing or fixed on a running editor.**
 
 ### No custom GLSL
 
@@ -3583,7 +4176,7 @@ The `2d` layer draws `Renderable2D` (and `Text2D` / `SkinnedSprite2D`) entities 
 
 ### Canvas2D host + design-resolution scaler
 
-A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a PixiJS `<canvas>`; every `Renderable2D` descendant renders into its NEAREST Canvas2D ancestor (`canvas2DRouting.ts` `findCanvasAncestor` — a cycle-guarded walk up `EntityAttributes.parentId`; an entity that IS a Canvas2D resolves to itself). Content is authored at a design resolution (`referenceWidth`×`referenceHeight`, default 1080×1920) and mapped onto the live canvas pixels by `canvas2DScaler.ts` `computeCanvasScale(refW, refH, actualW, actualH, mode)`:
+A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a PixiJS `<canvas>`; every `Renderable2D` descendant renders into its NEAREST Canvas2D ancestor (`canvas2DRouting.ts` `findCanvasAncestor` — a cycle-guarded walk up `EntityAttributes.parentId`; an entity that IS a Canvas2D resolves to itself). Content is authored at a design resolution (`referenceWidth`×`referenceHeight`, default 1080×1920) and mapped onto the live canvas pixels by `canvas2DScaler.ts` `computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW?)`:
 
 > **An entity that routes to NO Canvas2D is warned about, once, and the warning FORGETS a recovery** (QA-ASSET-0014). Scene2D skips a visible `Renderable2D` with no canvas ancestor, so a 2D prefab instantiated at the world root (`modoki_prefab`'s own default parent) came back `ok:true` and then reported `screen:null` with nothing said anywhere; `Scene2D` now warns once per entity and `modoki_prefab` answers in its own response via `findUnrenderable2D`. The bookkeeping lives in `canvas2DRouting.ts` `Orphan2DTracker`, not inline in the component, and it holds two properties that both regressed silently while inline: it **drops an entity's warned key when the entity finds a canvas**, so parenting an orphan under the host and back out again warns a *second* time (a warn-once registry over a recoverable condition has to forget, or the second break is the silent one — the same gap `resolveRefWarnOnce` had, QA-ASSET-0005); and the guid lookup that forms the key is a **callback**, invoked only on the frame an entity crosses the threshold or recovers, never for the healthy entities that make up the scene — `clear()` runs per drawn 2D entity per frame, so an eager key would put a trait read on the hot path.
 
@@ -3597,6 +4190,49 @@ A **Canvas2D** entity (`traits/Canvas2D.ts`) marks a UI element that hosts a Pix
 | `cover` | Uniform scale to COVER the area (crop the overflow axis). |
 | `fill` | Non-uniform stretch to fill exactly (no crop, no letterbox). |
 | `none` | 1:1 pixels. |
+
+**`maxReferenceWidth` — an OPT-IN adaptive design width** (#774). A portrait design box is
+pillarboxed on any host wider than its design aspect, and nothing authored INSIDE the box can reach
+those bars: on an iPad Pro 13" preview, 26.1% of the canvas width was pillarbox. Set
+`maxReferenceWidth` and the box widens toward the host's aspect instead:
+
+⚠️ **Two pillarbox figures for "an iPad Pro 13\"" appear in this change's history and BOTH are
+right** — they were taken on differently-shaped canvases, which is a trap worth naming. #774
+originally measured a canvas of 633.48x907.58 css (aspect 0.698) and reported **19.4%**; the live
+close-out measurement on the same PRESET measured 680.68x894.79 (aspect 0.7607, which is what
+1032x1376 minus the 20px bottom safe-area inset actually gives) and reported **26.1%**. The editor's
+Game panel scales the preset to the panel, so "the iPad Pro 13\" preview" does not pin a canvas
+size. **Always quote the canvas you measured, not just the device.**
+
+```
+effectiveRefW = clamp(referenceHeight x hostAspect, referenceWidth, maxReferenceWidth)
+```
+
+- **`0` (the default) disables it**, as does any value <= `referenceWidth`. Every existing project is
+  therefore byte-identical, which is deliberate — see the Court note below.
+- It can only ever GROW the box from `referenceWidth`, never shrink it. On a host at or TALLER than
+  the design aspect (every phone, for a 1080x1920 box) the result is exactly `referenceWidth` and
+  nothing moves.
+- Past the cap the content letterboxes exactly as before. **That ceiling is load-bearing, not
+  cosmetic**: an iPad in LANDSCAPE would otherwise follow the aspect to ~2746 design px. Apple
+  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), and
+  Android 16 ignores `android:screenOrientation` on displays >= 600dp, so a wide host is reachable on
+  both platforms in a shipping build.
+
+⚠️ **The mode is NOT the lever — do not reach for `fitH` instead.** Every mode in
+`computeCanvasScale` centres on both axes, so with `referenceWidth` pinned, `fitH` pillarboxes
+exactly as `contain` does. Only the reference WIDTH changes the answer.
+
+⚠️ **`CanvasScale` carries the EFFECTIVE box back as `refW`/`refH`.** A consumer that needs the box's
+own size — `contentRect = refW * scaleX`, a design-space centre at `refW / 2` — must read those,
+not its own input, or it describes a box that is not the one on screen.
+
+⚠️ **Adaptation is opt-in because a game may DEPEND on the pillarbox.** `games/court` authors
+`contain` and clamps `ChromeRoot`, `NarrationBand` and `BoardPage` to `maxWidth: 56.25vh`
+(= `100 x refW/refH`) so its chrome shrinks to meet the board instead of spanning an iPad's full
+width (`games/court/tests/chromeLetterbox.test.ts`). Court answered the same geometry the OPPOSITE
+way on purpose; widening every `contain` canvas would strand those three clamps against a letterbox
+that no longer exists.
 
 Every mode CENTERS the content (via `offsetX`/`offsetY`). `fill` stretches non-uniformly, so the scaler also returns `compensateX`/`compensateY` (= `uniformScale / axisScale`) which Scene2D multiplies back onto each object's scale so PRIMITIVE SHAPES stay un-stretched even while the container fills. `screenToReference2D` inverts the mapping for 2D picking (client px → reference space), shared by the DOM SceneView layer and the Pixi pick overlay so both pick identically.
 
@@ -3621,11 +4257,41 @@ Shared placement knobs: `width`/`height` (half-extents), `pivotX`/`pivotY` (0 = 
 
 - **Asset shape.** A `.shader.json` with `space:'2d'` + a `params` block, plus sibling `<name>.wgsl` / `<name>.glsl` bodies (Pixi v8 is WebGPU-preferred, so both backends ship). The body is a fragment MAIN snippet that writes `outColor` (a premultiplied vec4; the base high-shader multiplies it by `vColor` = the mesh tint/alpha). Available in the body: `vUV` (the texture-space UV — 0..1 for a whole-image sprite, the atlas sub-rect for a slice), `uTexture`/`uSampler` (the sampled texture), and the params as a uniform block — WGSL `matUniforms.<param>`, GLSL loose `<param>`. One configured shader = one material (v1); multiple looks = multiple assets.
 - **Builder** — `pixiShaderBuilder.ts` generalizes the MTSDF text shader (`mtsdfPixiShader.ts`): it composes Pixi's own high-shader bits (`localUniformBit` transform, `textureBit` sampler, `roundPixelsBit`) + ONE generated custom bit that declares the uniform block (a WGSL `struct MatUniforms` at `@group(3)`, or GLSL loose uniforms) and splices the authored body — so the engine owns only the fragment maths. It compiles **only the active backend's** program (resolved by the shared `canvas2DPool.resolvePixiBackend`, honoring the `pixi.backend` override so the program always matches the live renderer), once per asset; each entity mints its OWN `Shader` (its own `UniformGroup`) so uniforms are per-entity. **Reserved-name guard:** a param keyed like a Pixi built-in (`uColor`/`uTexture`/`uResolution`/…) is rejected at build + validation (it would break the WebGL fallback where uniforms are loose globals).
-- **Cache** — `spriteMaterialCache.ts` resolves a material GUID → compiled program, lazily and deduped (a failed compile is marked so it isn't retried every frame). World-lifecycle: cleared **unconditionally** on world swap / teardown (a compiled program holds no GPU memory of its own — Pixi caches the underlying programs by source and each live per-entity `Shader` holds its own reference — so a clear only empties the maps, and clearing on swap is what makes an edited `.shader.json` recompile on hot-reload). The GUID is a scene resource (`type:'shader'`, no-op acquire — tree-shaker keep; the `.wgsl`/`.glsl` siblings are kept by the shader-manifest sweep).
-- **Rendering** — Scene2D draws a material entity in a SEPARATE pass (like the skinned/text passes, so it can't destabilize the sprite change-detection) as a `Mesh`: a pivot quad (`buildMaterialQuad`, sized like a primitive) + the per-entity `Shader`, with `blendMode`/tint/alpha/transform/paint applied. The sprite pass skips a material entity once its program is ready and falls back to the default sprite/tint while it loads (an `onReady` wake re-renders when the async compile lands, even while the sim is stopped). Each entity's `Shader` is registered in a Scene2D-owned `entityShaders` map (published via `sprite2DMaterialBroker` for the driver) and disposed with its slot.
-- **Redraw gate (`MaterialSnap`)** — a material's uniforms are usually the only thing that moves per frame, and the driver writes them straight into the `UniformGroup` with no render-visible signal, so the pass can't tell a changed frame from a static one on its own. Rather than force a GPU pass every running frame, the material pass dirties its canvas only when (a) the `Mesh` was just (re)built, (b) an external edit/load/swap forced it, (c) the placement/appearance moved vs a per-entity `MaterialSnap`, or (d) a driver wrote a NEW uniform value this frame: `materialInstanceSystem` compares-before-write and, on an actual change, flags the entity through `sprite2DMaterialBroker` (a per-frame set it clears at the top of its pass, at ECS priority — before the render passes read it). So an animating material still redraws each frame, but a static-uniform one (no driver, a constant curve, or a stopped clock) costs zero redraws once settled.
-- **Sampling the sprite bitmap.** The material Mesh samples the entity's OWN `Renderable2D.sprite` as `uTexture` (`resolveMaterialTexture` resolves the GUID and loads it through the shared `spriteTextureRefs` refcount, exactly like the sprite pass — retained on build, released in `disposeSlot`). While the texture loads — or when the entity has no image sprite (a purely procedural shader like `gradient-scroll`) — it falls back to `Texture.WHITE`; the resolved url is part of the slot's rebuild signature (`matSig`), so the Mesh re-mints with the real bitmap the frame it becomes resident. A texture is only bound once its `source` is live (a cached-but-mid-decode/stale texture would otherwise crash the shader on `source.style`). Example: `games/3d-test/.../shaders/dissolve.{shader.json,wgsl,glsl}` (samples `uTexture`, burns it away by a hashed-noise `uThreshold`), driven by a MaterialInstance `time` curve — demo scene `games/3d-test/.../scenes/2d-material-demo.scene.json`. An **atlas slice** (a `resolved.frame`) binds a per-slot framed WRAPPER Texture whose uv matrix (`uTextureMatrix` = the texture's `mapCoord`) maps the quad's 0..1 UVs into the sub-rect, so the shader samples the right pixels (a whole image borrows the base texture, identity matrix); the wrapper is `destroy(false)`d in `disposeSlot` (source kept for the refcount). `matSig` carries the sprite REF so a frame swap on one sheet forces a rebuild. `vUV` is therefore texture-space (0..1 whole, sub-rect for a slice).
-- **Extra samplers (`texture` params).** A shader can declare `texture`-typed params — each becomes an ADDITIONAL sampler beyond the entity's own `uTexture`. A texture param's VALUE is its manifest `default` (a sprite GUID) OR a per-instance `MaterialInstance` override with `kind:'texture'` + a `ref` on that target (a STATIC swap — MaterialInstance *sources* drive only scalar uniforms, so a texture ref isn't animated; `readTextureOverrides` collects them, the override wins over the default, and the resolved url is in `matSig` so an inspector edit rebuilds the Mesh with the new texture). Scene2D resolves each WHOLE-image through the same `spriteTextureRefs` refcount + KTX2/WebP variant seam as the sprite (`resolveMaterialTexture(ref, wholeOnly)`), retains each url on build (stored in `slot.materialTexUrls`), releases them in `disposeSlot`, and binds them in `makePixiShaderInstance`. An unresolved extra texture binds `Texture.WHITE` (WebGPU needs every declared group-3 binding present) and `matSig`'s `extraSig` forces exactly one rebuild when it lands. **WGSL binding:** the custom bit declares extra textures in `@group(3)` at binding `1+2i` (texture) / `2+2i` (`<key>Smp` sampler) — binding 0 stays reserved for `matUniforms` — so a texture param `uFoo` is sampled `textureSample(uFoo, uFooSmp, vUV)` (WGSL) or `texture(uFoo, vUV)` (GLSL). Extra textures are whole-image (no atlas sub-rect) and sampled at the sprite-space `vUV`. **Authoring footgun:** never write `@group(N)`/`@binding(N)` in a WGSL body COMMENT — Pixi's `extractStructAndGroups` regex only skips a decorator when the char before `@` is `/`, so `// @group(3) … ;` (space after `//`) is parsed as a real binding and silently fails the whole material. Example: `games/3d-test/.../shaders/reveal.{shader.json,wgsl,glsl}` (cross-fades the sprite with a Metal texture bound to `uReveal`, mix driven by a MaterialInstance) in `2d-material-demo.scene.json`. **Build:** the asset tree-shaker keeps extra-sampler textures in prod — `processShader` follows a 2D shader's `texture`-param `default` GUIDs and `probeTraitRefs` follows `MaterialInstance` `kind:'texture'` override refs (both were previously shaken out → a 404 in prod). **Runtime gap:** like every 2D texture, an extra sampler loads LAZILY (one-frame pop-in) — not scene-pre-acquired; the scene `resources` manifest lists override refs (via `collectResourceRefsFromEntities`) but not the async shader-manifest defaults. Scalar-VALUE overrides remain **uniform-only** and **scalar-only** (see the MaterialInstance section); a `kind:'texture'` override is the only non-scalar override kind, and it's 2D-only.
+- **Cache** — `spriteMaterialCache.ts` resolves a material GUID → compiled program, lazily and deduped (a failed compile is marked so it isn't retried every frame). World-lifecycle: cleared **unconditionally** on world swap / teardown (a compiled program holds no GPU memory of its own — Pixi caches the underlying programs by source and each live per-entity `Shader` holds its own reference — so a clear strands no GPU memory, and clearing on swap is what makes an edited `.shader.json` recompile on hot-reload). ⚠️ **The clear is not just a map wipe** (#523): it bumps a `generation` that an in-flight compile captures beforehand and re-checks on resolve, so a compile superseded by a clear writes nothing back. That guard has to run *before* the `.then` touches any map — a new compile for the same GUID may already own the `loading`/`waiters` entries, and deleting those orphans it. Because a superseded resolve fires no `onReady`, the clear itself wakes the pending waiters: `Scene2DRenderer.stop()` clears this **shared** cache while a sibling viewport is still drawing and re-dirties only the instance going away, so without that wake the survivor sits on a fallback sprite until an unrelated dirty. The GUID is a scene resource (`type:'shader'`, no-op acquire — tree-shaker keep; the `.wgsl`/`.glsl` siblings are kept by the shader-manifest sweep).
+- **Rendering** — Scene2D draws a material entity in a SEPARATE pass (like the skinned/text passes, so it can't destabilize the sprite change-detection) as a `Mesh`: a pivot quad (`buildMaterialQuad`, sized like a primitive) + the per-entity `Shader`, with `blendMode`/tint/alpha/transform/paint applied. The sprite pass skips a material entity once its program is ready and falls back to the default sprite/tint while it loads (an `onReady` wake re-renders when the async compile lands, even while the sim is stopped). Each entity's `Shader` is registered in a Scene2D-owned `entityShaders` map (published via `sprite2DMaterialBroker` for the driver) and disposed with its slot. Each entry carries the entity's koota **generation**, and every broker read checks it (#848): the key is the masked index, which a despawn+respawn reclaims LIFO, and the driver reads the broker at ECS priority 0 — *before* the purge below runs at render priority. ⚠️ **The stamp must be re-written on the slot-REUSE path, not only when a Mesh is built** — a respawn resolving the same material and texture passes the rebuild gate, so the renderer draws the newcomer with the dead entity's Shader, and the purge keeps that entry because the newcomer *is* rendering. A read-side check with no re-stamp therefore refuses the driver the very Shader on screen, permanently: the entity renders frozen at the dead one's last uniforms with no redraw ever armed. Storing the generation is half the shape `engine-concepts.md` § Entity prescribes; *rebuilding on a mismatch* is the other half. ⚠️ The re-stamp restores the driver's **access** to the reused Shader; it does **not** reset that Shader's uniform values, which are seeded only on a build. That second half is **#873**, closed by a SEPARATE block just above the re-stamp: the slot carries its own `matGen` (the generation its Shader's uniform state belongs to), and on a mismatch the pass re-seeds `matUniforms` from `buildUniformValues(program, undefined)` — the program defaults, which for a 2D material ARE the authored values (`Renderable2D.material` resolves straight to the `.shader.json`; the build itself passes `values: undefined`) — and marks the entity built so the canvas redraws. **The invariant: a respawn renders identically whether or not it reclaimed a dead entity's index.** ⚠️ **`matGen` is on the SLOT, not read out of `entityShaders`, and that distinction is load-bearing** — the map's lifetime is strictly SHORTER than the slot's, because the per-frame purge drops the stamp on any frame this pass skips the entity while the sweep keeps the slot (the sprite pass adds the id to `activeIds` and can then early-return without replacing it — a material still compiling plus a sprite ref with no 2D variant does it). #873's first cut keyed the reset off the map and therefore skipped exactly the case it exists for; its own close-out review caught that, and `tests/runtime/Scene2D.test.ts` pins it. The general rule: **key a reset off the thing being reset**, which is the same reason `geomSig` lives on the slot rather than on a `lastRender` snapshot. ⚠️ **Reset in place, deliberately NOT a rebuild** — see `engine-concepts.md` § Entity: rebuilding the Shader here would trade the bug for #699's `BindGroupSystem._hash` growth (two permanent entries per `new Shader`, cleared only at renderer teardown) on precisely the pooled-respawn path, which is what the #692 `matBuildSig`/`matQuadSig` split and the #698 frame swap exist to keep off. What licenses the in-place reset is that `matUniforms` is provably the WHOLE per-entity payload a surviving slot carries: the Mesh's placement/appearance is rewritten unconditionally every frame, the quad by `matQuadSig`, the sampled texture by `matBuildSig` + `builtEpoch`, `uTextureMatrix` by the frame swap, and the extra samplers by `extraSig` (which folds in this entity's own `kind:'texture'` overrides). Add per-entity state to a material slot and that enumeration is what you must extend. ⚠️ **Every in-place uniform write in the 2D layer writes into the group's `uniforms` bare, with no `update()`/`_dirtyId` bump, and that is correct ONLY because these `UniformGroup`s take Pixi's default `isStatic: false`.** There are **five**, and they share the one dependency: this reset; `applyOverrides2D` (the `MaterialInstance` driver); `updateMtsdfPixiMetrics` (#690's `uScreenPxRange`); `updateMtsdfPixiStyle` (eleven text style uniforms); and the #698 frame swap's `uTextureMatrix`. Count them from the code rather than from this list if you are about to rely on it — an earlier version of this paragraph said "three" and omitted the last two, which is exactly the shape of audit that would then set `isStatic: true` on the groups it had not looked at. Verified against pixi.js 8.20.1: `UboSystem.updateUniformGroup` (WebGPU/UBO) and `GlUniformGroupSystem.updateUniformGroup` both short-circuit their `_dirtyId` early-out when `isStatic` is false, and both sync functions read `uniforms[name]` at sync time — so replacing a value, including swapping in a fresh `Float32Array` for a vec/color, is picked up on either backend. Constructing one with `isStatic: true` (an obvious-looking optimisation) would silently strand all three writes.
+- **Redraw gate (`MaterialSnap`)** — a material's uniforms are usually the only thing that moves per frame, and the driver writes them straight into the `UniformGroup` with no render-visible signal, so the pass can't tell a changed frame from a static one on its own. Rather than force a GPU pass every running frame, the material pass dirties its canvas only when (a) the `Mesh` was just (re)built, (b) an external edit/load/swap forced it, (c) the placement/appearance moved vs a per-entity `MaterialSnap`, or (d) a driver wrote a NEW uniform value this frame: `materialInstanceSystem` compares-before-write and, on an actual change, flags the entity through `sprite2DMaterialBroker` (a per-frame map of id → generation that it clears at the top of its pass, at ECS priority — before the render passes read it; the generation is there because the mark and the read straddle the same recycled-index window as the Shader lookup, #848). So an animating material still redraws each frame, but a static-uniform one (no driver, a constant curve, or a stopped clock) costs zero redraws once settled.
+- **Sampling the sprite bitmap.** The material Mesh samples the entity's OWN `Renderable2D.sprite` as `uTexture` (`resolveMaterialTexture` resolves the GUID and loads it through the shared `spriteTextureRefs` refcount, exactly like the sprite pass — retained on build, released in `disposeSlot`). While the texture loads — or when the entity has no image sprite (a purely procedural shader like `gradient-scroll`) — it falls back to `Texture.WHITE`; the resolved url is part of the slot's REBUILD signature (`matBuildSig`), so the Mesh re-mints with the real bitmap the frame it becomes resident. The quad's size/pivot is deliberately NOT in it (#692): those live in `matQuadSig` and are applied by rewriting the geometry's 8 position floats in place, because a `Shader` rebuild adds two PERMANENT entries to WebGPU's `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707) — so an animated size in the build signature was unbounded growth, not just wasted work. A texture is only bound once its `source` is live (a cached-but-mid-decode/stale texture would otherwise crash the shader on `source.style`). Example: `games/3d-test/.../shaders/dissolve.{shader.json,wgsl,glsl}` (samples `uTexture`, burns it away by a hashed-noise `uThreshold`), driven by a MaterialInstance `time` curve — demo scene `games/3d-test/.../scenes/2d-material-demo.scene.json`. An **atlas slice** (a `resolved.frame`) binds a per-slot framed WRAPPER Texture whose uv matrix (`uTextureMatrix` = the texture's `mapCoord`) maps the quad's 0..1 UVs into the sub-rect, so the shader samples the right pixels (a whole image borrows the base texture, identity matrix); the wrapper is `destroy(false)`d in `disposeSlot` (source kept for the refcount). `matBuildSig` deliberately does NOT carry the sprite ref (#698): two slices of one sheet share a url and a texture SOURCE, so an atlas frame swap is one `uTextureMatrix` write in place — the ref lives in `slot.matSpriteRef`, and "sig equal, ref moved" IS the frame-swap case. If the shader's uniform group is not reachable the fast path REFUSES itself and falls through to a full rebuild, rather than swapping the texture and leaving the matrix stale (which would animate the ECS while rendering frame 0 forever, with every test green). `vUV` is therefore texture-space (0..1 whole, sub-rect for a slice).
+- **Extra samplers (`texture` params).** A shader can declare `texture`-typed params — each becomes an ADDITIONAL sampler beyond the entity's own `uTexture`. A texture param's VALUE is its manifest `default` (a sprite GUID) OR a per-instance `MaterialInstance` override with `kind:'texture'` + a `ref` on that target (a STATIC swap — MaterialInstance *sources* drive only scalar uniforms, so a texture ref isn't animated; `readTextureOverrides` collects them, the override wins over the default, and the resolved url is in `matBuildSig` so an inspector edit rebuilds the Mesh with the new texture). Scene2D resolves each WHOLE-image through the same `spriteTextureRefs` refcount + KTX2/WebP variant seam as the sprite (`resolveMaterialTexture(ref, wholeOnly)`), retains each url on build (stored in `slot.materialTexUrls`), releases them in `disposeSlot`, and binds them in `makePixiShaderInstance`. An unresolved extra texture binds `Texture.WHITE` (WebGPU needs every declared group-3 binding present) and `matBuildSig`'s `extraSig` forces exactly one rebuild when it lands. **WGSL binding:** the custom bit declares extra textures in `@group(3)` at binding `1+2i` (texture) / `2+2i` (`<key>Smp` sampler) — binding 0 stays reserved for `matUniforms` — so a texture param `uFoo` is sampled `textureSample(uFoo, uFooSmp, vUV)` (WGSL) or `texture(uFoo, vUV)` (GLSL). Extra textures are whole-image (no atlas sub-rect) and sampled at the sprite-space `vUV`. **Authoring footgun:** never write `@group(N)`/`@binding(N)` in a WGSL body COMMENT — Pixi's `extractStructAndGroups` regex only skips a decorator when the char before `@` is `/`, so `// @group(3) … ;` (space after `//`) is parsed as a real binding and silently fails the whole material. Example: `games/3d-test/.../shaders/reveal.{shader.json,wgsl,glsl}` (cross-fades the sprite with a Metal texture bound to `uReveal`, mix driven by a MaterialInstance) in `2d-material-demo.scene.json`. **Build:** the asset tree-shaker keeps extra-sampler textures in prod — `processShader` follows a 2D shader's `texture`-param `default` GUIDs and `probeTraitRefs` follows `MaterialInstance` `kind:'texture'` override refs (both were previously shaken out → a 404 in prod). **Runtime gap:** like every 2D texture, an extra sampler loads LAZILY (one-frame pop-in) — not scene-pre-acquired; the scene `resources` manifest lists override refs (via `collectResourceRefsFromEntities`) but not the async shader-manifest defaults. Scalar-VALUE overrides remain **uniform-only** and **scalar-only** (see the MaterialInstance section); a `kind:'texture'` override is the only non-scalar override kind, and it's 2D-only.
+
+### Editing a shader: what invalidates what
+
+A shader edit has to travel a chain — **watcher → broadcast → `invalidateShader` → the cache holding
+the compiled output** — and until #857/#864 that chain was short at BOTH ends. Worth knowing as one
+picture, because each half looked complete from the other's side.
+
+**The entry.** A shader is two files, and the watcher only ever saw the `.shader.json`. Editing the
+`.glsl`/`.wgsl` body — the file `ShaderAssetView` tells authors to edit — broadcast nothing at all.
+Body writes now remap to the sibling descriptor; the mechanics and the two-watcher hazard are in
+[editor-hmr.md](./editor-hmr.md) § "A shader is TWO files".
+
+**The exit, and the part that surprises people.** `invalidateShader` lives in `spriteMaterialCache`
+and is **2D-only** — it evicts that cache's GUID-keyed programs and calls
+`invalidatePixiShaderProgram`. Nothing about its name says so, and it is the single value behind the
+`shader` key in the invalidator table, so the wiring reads as complete from every angle: the kind is
+registered, the invalidator is reachable, and it is per-key. All three of those are about the 2D half.
+
+A `space:'3d'` shader takes a different route — a `.mat` names it, `materialPresets` calls
+`buildFileShaderMaterial`, and the result lands in `meshTemplateCache.materialCache` keyed by the
+**`.mat` path**. There was no shader→material edge, so a 3D shader had no invalidation path at all:
+not the body, and not the descriptor either. `fetchMaterial` now records `shader → Set<matPath>` (and
+the inverse, so a `.mat` re-pointed at another shader prunes its stale edge), and `invalidateShader`
+emits `emitAssetInvalidated('shader', path)` which `meshTemplateCache` subscribes to. It routes
+through `invalidateMaterial`, so #317's retire-don't-dispose still holds — a mesh may be binding that
+NodeMaterial right now.
+
+⚠️ **`space` defaults to `'3d'` when the field is absent**, so both 3D shaders in the repo carry no
+`space` key and a `grep '"space"'` finds only the 2D ones — which reads as "there are no 3D shaders"
+and is how this stayed invisible. Check the default, not the grep.
 
 ### Paint order
 
@@ -3656,7 +4322,42 @@ Found via Court's memo pen marks, which rendered nothing while being perfectly c
 
 `renderFrame` used to re-tessellate + GPU-render every Canvas2D every frame; a two-tier gate fixes that:
 1. **Idle whole-frame skip** — while the sim is stopped / paused, 2D only changes via paths that set `_externalDirty` (editor edits, async texture loads, canvas resizes, world swaps, play-state changes), so idle + clean ⇒ no ECS scan, no render.
-2. **Per-entity change detection** — a `RenderSnap` / `MeshSnap` / `TextSnap` per entity captures the exact inputs that determine its output; only Canvas2D hosts with a CHANGED entity are GPU-rendered (`dirtyCanvases` → `pool.renderAll(dirtyIds)`). `preserveDrawingBuffer: true` keeps a skipped canvas's last frame on screen across a browser recomposite (scroll, ancestor transform, tab refocus).
+2. **Per-entity change detection** — a `RenderSnap` / `MeshSnap` / `TextSnap` per entity captures the exact inputs that determine its output; only Canvas2D hosts with a CHANGED entity are GPU-rendered (`dirtyCanvases` → `pool.renderAll(dirtyIds)`). `preserveDrawingBuffer: true` keeps a skipped canvas's last frame on screen across a browser recomposite (scroll, ancestor transform, tab refocus) — but that is belt-and-braces, NOT the property the skip rests on: retention was measured to hold on WebGPU too, which has no such flag. Reading this line as a WebGL-only guarantee is exactly what produced #455's falsified first diagnosis.
+
+⚠️ **A snapshot that trips is NOT the same as work that must be redone, and conflating the two is its
+own defect class (#684, #692).** The per-entity snapshot deliberately captures everything that affects
+an entity's OUTPUT, which is far more than affects its GEOMETRY — a primitive's `x/y/rz/sx/sy` are in
+it, and none of them change a single vertex. So each pass gates its expensive half on a SECOND, narrower
+signature stored on the SLOT (not on the snapshot, so slot lifetime === object lifetime and a rebuilt
+slot always draws): `geomSig` for primitives, `matBuildSig` vs `matQuadSig` for material quads, and the
+mask's shape `sig` with the size excluded on the one path where size is a scale rather than a shape.
+
+**Why this is correctness and not a micro-optimisation:** in PixiJS a redraw is a *claim that this
+object's view changed*, and the renderer acts on the claim. `GraphicsContext.clear()` has **no empty
+early-out** — it unconditionally calls `onUpdate()` (`dirty = true` + `emit('update')`), which reaches
+`Graphics.onViewUpdate` → `RenderGroup.onChildViewUpdate` → the VIEW list, where `validateRenderable`
+returns true for anything batchable → `structureDidChange` → `_buildInstructions` **for the entire
+render group**. One drifting square re-batched every sibling around it, and a `forceAll` frame (an
+editor trait write on ANY entity) re-tessellated every primitive on screen. PixiJS is right to do that
+with a view change; the bug was ours, for manufacturing one. Transform and view changes live in two
+separate lists there (`childrenToUpdate` vs `childrenRenderablesToUpdate`), so a Graphics that only
+MOVES never enters the view list at all — unless we clear it.
+
+The same reasoning is why a size edit must not rebuild a `Shader`: every rebuild adds two permanent
+entries to WebGPU's `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash`
+(#707), so an animated width was unbounded growth. **Both text paths now rebuild geometry only** —
+the 2D one reclaims its `Shader` (#690), the 3D one reclaims its per-page TSL material (#692), each
+gated on an atlas-identity check that REFUSES the reuse rather than proceeding half-applied.
+
+**Two invariants the dirty gate depends on (#455), both measured on a wordweave level advance that rebuilds the crossword clip mask and disposes the old one in the same frame:** (1) a `Mask2D` slot's outgoing display object + owned ramp texture are DESTROYED one frame LATER than the pass that disposes the slot — destroying them mid-pass leaves PixiJS's `AlphaMaskPipe` holding a bind group whose resource just went null, and the `renderAll` at the end of that same pass throws. (2) a render that throws sets `slot.redrawOwed`, which overrides the dirty set on the NEXT `renderAll` regardless of `dirtyCanvases` — the aborted render already cleared the surface, so the frame it presented was blank, and `Scene2D` rebuilds `dirtyCanvases` from scratch every frame so the failed attempt consumed the only flag that would have redrawn it. Without (2), one swallowed throw left a canvas blank INDEFINITELY — the session ran to its end still blank, with no frame count recorded — until an unrelated edit (a tap, an MCP call, a resize) happened to dirty it. ⚠️ **The same aborted render LOOKS different per platform, which is why this arrived as two separate reports.** Chromium/Electron presented the cleared frame, so the panel went BLANK; iOS Safari's WebGPU never presented that frame at all, so the OLD board stayed on screen until a tap. Identical cause, opposite-looking symptom — so a stale 2D canvas and a blank one are worth suspecting together. Confirmed fixed on both surfaces (editor, and an iPhone Air on iOS 26.6 running a build with the fix).
+
+**Generalised — the rule those two are instances of: never free a GPU-backed resource inside the pass that then renders.** `Scene2DRenderer.renderFrame` ends by calling `pool.renderAll`, so anything destroyed earlier in that same pass is destroyed *while the renderer is still holding it*. Four places in the 2D path now obey this, and they were arrived at INDEPENDENTLY, from four different symptoms — worth reading as one rule rather than coincidences: mask teardown defers to `pendingMaskDestroy`, drained at the top of the next frame (#455); `releaseSpriteTexture` defers its `Assets.unload` by a macrotask and cancels it on re-retain (the same-frame rebuild case); `disposeSlot` uses a bare `Shader.destroy()` / `texture.destroy(false)` so shared programs and Assets-owned sources outlive the slot; and `videoTextureSync2D.ts`'s `syncVideoTextures2D` detaches a bound video texture and queues its GPU teardown into a per-surface `pendingDestroy` list, flushed by `flushPendingVideoDestroy2D` at the top of the next `syncVideoTextures2D` and — mirroring the mask flush — at the top of `Scene2D.renderFrame` itself, above the idle-frame skip (#476). The risk ranks by whether the renderer reaches the doomed object from OUTSIDE the parent/child walk: a mask (an effect, plus a cached bind group) is the dangerous end, an already-`removeFromParent()`ed sprite is the safe end.
+
+The rule now has its first 3D instance too (#477): `scene3DSync.ts`'s `syncMaterial` no longer disposes a replaced owned material inline, but only once every target that held it has actually rebound elsewhere; a material still bound with no replacement resolved yet is handed to `derivedMaterials.ts`'s retirement queue so a later FOREIGN rebind (`applyLightMask`, `materialInstanceSystem`) that never revisits `syncMaterial` still gets it freed by the per-frame sweep instead of leaked. ⚠️ **The likelier instance was the one NEXT DOOR, not the one the issue described**: the primitive REBUILD path (shape/size change) disposed the discarded mesh's owned geometry under a comment reading "so size churn doesn't leak" and dropped its owned material two lines later, where neither the sweep nor `disposeRenderState` could ever see it again. Dragging `size` in the Inspector leaked a material per value, per surface. When you fix an instance of this rule, the sibling sweep is not optional.
+
+The same rebuild path had a second, sharper instance of the ordering error (#482): an unknown `Renderable3DPrimitive.mesh` name (a hand-edited scene, or a primitive kind renamed since the scene was authored — `modoki_create_entity` refuses an unknown name outright, so this only arrives via `modoki_mutate_scene` `setTrait` or a hand-edited `.scene.json`) used to `scene.remove` the old mesh, dispose its geometry, and clear the tracking maps, and only THEN call `createPrimitiveMesh`, discover it returned `null`, and throw inside the render pass on the bare `!`. Fixed by gating the entire rebuild — the free included — on the name being one `isPrimitive` recognizes. The first attempt at that fix still had the bug: it gated only the kind-change half, so a `sizeChanged` edit could tear the entity down regardless of whether the kind was known; and because `ecsSprites` is deliberately never updated for an unknown name, `kindChanged` stays `true` forever once it happens, so the entity was armed for every LATER size edit too and eventually vanished — geometry disposed, nothing logged (the warn-once had already fired on the earlier frame). Gating the whole condition (`sizeChanged || kindChanged`) on `meshKnown` closes every route at once.
+
+**The corpus was swept exhaustively in 2026-08 — don't redo it, extend it.** Every free-shaped call (`.dispose()` / `.destroy(` / `Assets.unload` / `release*Texture`) under `runtime/**`, `engine/app/**`, `games/**`, `demos/**`: 237 sites across 44 files, each asked *what is freed, what still binds it, which pass renders it*. Beyond the two fixed above, **no confirmed violation exists**. What makes the rest safe is worth knowing, because it is mostly structural rather than careful: THREE's `dispose()` is a re-upload, not a death (which is why the 3D video twin needs no deferral queue and why #477's symptom was a stutter, not a blank frame), whereas Pixi's `destroy(true)` is fatal; owned geometry is always a fresh per-call object with no second binder; and every `.then()`-shaped rebuild is a microtask, so it cannot land inside a synchronous render pass. One residual remains filed, not lurking: #481 (a font atlas texture that a disposed provider would hand back already destroyed — latent, no reaching chain found, and a destroyed `Texture` is truthy so the existing guard misses it); #482 above is now fixed. The deferral machinery a new site should reuse rather than reinvent: `pendingMaskDestroy`, `pendingDestroy`, `releaseSpriteTexture`'s macrotask defer, `retireDerivedMaterial`, `retiredMaterials3D`/`retiredEnvironments`, and `textureResolver`'s refcounted `retired` map.
 
 ### Canvas2D Application pool + GPU-context budget
 
@@ -3728,7 +4429,7 @@ consequences the pool now handles explicitly, each with a mutation-verified test
   mutating the live slot: a rebuild's forced loss would flip `contextLost` back to true on the
   freshly healthy renderer and queue a redundant second rebuild.
 - `initSlotApp` must **capture** `slot.app` rather than re-read it after its `await`. `rebuildSlotApp`
-  reassigns `slot.app`, so a rebuild whose `init()` exceeds `REBUILD_INIT_TIMEOUT_MS` (rejected, but
+  reassigns `slot.app`, so a rebuild whose `init()` exceeds `APP_INIT_TIMEOUT_MS` (rejected, but
   *not* cancelled) would resume on the retry's Application — double-counting the context budget while
   the timed-out one is never destroyed at all: a leaked live GPU context.
 
@@ -3742,6 +4443,389 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **⚠️ The GLSL program declares `OES_standard_derivatives`, and WHERE it declares it is load-bearing.** Pixi's high-shader assembly emits **version-less (GLSL ES 1.00)** source — it only takes the ES 3.00 path when the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`). In ES 1.00 the `screenPxRange` line's `fwidth` is illegal without the extension declared, so every MTSDF program failed to compile on iOS 15 (`ERROR: 'GL_OES_standard_derivatives' : extension is disabled`) and **every glyph silently vanished**. Not a capability gap — WebGL2 and the extension are both present; desktop and Android drivers simply accept `fwidth` in ES 1.00 source anyway, so only Apple's stricter compiler rejects it, which is why it hid on every machine we test on. The directive **must precede `precision`**: measured on-device, a pragma placed in this file's `fragment.header` bit (where Pixi injects it, i.e. *after* the precision line) fails just as loudly with `extension directive must occur before any non-preprocessor tokens`. Hence `withDerivativesExtension` rewrites the ASSEMBLED source instead. `enable`, not `require`, so a device lacking it degrades to a warning; not switched to `#version 300 es`, which would hard-fail a genuinely WebGL1-only device.
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
+
+
+#### Rebuild lifetime — what `layoutHash` may gate, and what it must not (#590, #690, #692, #749)
+
+The text pass is where a ~300 MB/6 min iOS leak came from, so the gating rules here are load-bearing
+rather than an optimisation. Platform side of that incident: [ios-gpu-memory.md](ios-gpu-memory.md).
+
+**Shader lifetime must NOT be coupled to geometry rebuild.** The pass originally gated the WHOLE
+rebuild on `layoutHash` — destroying the page meshes AND `slot.textShaders`, then rebuilding both.
+But the two depend on different things:
+
+| | depends on | in `layoutHash`? |
+|---|---|---|
+| geometry | text, fontSize, align, maxWidth, spacing, atlas | yes — correctly |
+| **shader** | texture, atlas, style, fontSize | only `fontSize` + `atlasVersion` |
+
+So a plain TEXT change — a score counter ticking — rebuilt the geometry (correct) and threw away and
+rebuilt the shader **for nothing**. A `fontSize` change needs no recompile either: `fontSize` feeds
+`uScreenPxRange`, a UNIFORM. Split for #690: geometry on `layoutHash`, shader only when the page
+texture or atlas actually moves.
+
+**⚠️ Every `new Shader` on the GL path leaked a compiled `WebGLProgram`, and PixiJS can never free
+one.** The chain, verified in the vendored source rather than inferred:
+
+1. `makeMtsdfPixiShader` ends in **`new GlProgram(...)`** — not the content-cached `GlProgram.from`.
+2. `GlProgram`'s constructor runs `setProgramName` as a **preprocessor**, which keeps a module-global
+   name cache and injects an **incrementing** `#define SHADER_NAME <name>-N` into the shader source.
+   Its escape hatch (`if (src.indexOf("#define SHADER_NAME") !== -1) return src;`) never fired,
+   because our source declared none.
+3. `_key` is computed from the source **AFTER** the preprocessors mutated it ⇒ **a different key on
+   every call, for byte-identical input** ⇒ `GlShaderSystem._getProgramData` always misses ⇒ a fresh
+   program is compiled and linked.
+4. `gl.deleteProgram` has **ZERO call sites in the whole library** (checked in 8.19.0 and 8.20.1),
+   and `GlProgramData.destroy()` only nulls JS fields — so it is never freed, not even at teardown.
+
+At ~2,700 text rebuilds/min that was ~2,700 leaked programs/min, bracketing the measured 38.57 MB/min
+residual. **Fixed on our side by hoisting the two program compiles to module constants
+(`getMtsdfPrograms()`)** so one `GlProgram`/`GpuProgram` pair is reused; the genuinely per-instance
+state is the `UniformGroup`, which is cheap. A fixed `#define SHADER_NAME` in our source is the
+second, independent hardening.
+
+⚠️ **The module-level program cache is load-bearing, not belt-and-suspenders.** With the fixed
+`#define` in place, identical source now HITS the cache, so `generateProgram` never runs for a second
+program and `getSignature` hard-throws on unpopulated `_attributeData`. Reintroducing a per-call
+construction turns the old leak into a crash.
+
+⚠️ **Sweep obligation — this is a property of `new GlProgram`, not of text.** Any path that builds a
+`Shader` per INSTANCE rather than per program has it in full. `pixiShaderBuilder.ts` (2D custom
+materials) had exactly the same shape and was fixed for #716.
+
+⚠️ **#716 is GL-ONLY, and that asymmetry is the whole reason the leak exists.** `compileHighShaderGlProgram` ends in a bare `new GlProgram(...)`, bypassing the content cache; `compileHighShaderGpuProgram` already returns `GpuProgram.from({...})` — Pixi's own content cache — so the **WebGPU path was never at risk of the stranded-program leak**. Do not read a clean WebGPU measurement as evidence the GL path is fine; iOS 16 Safari, where this bug lives, has no WebGPU at all. The module-level program cache still earns its keep on the GPU path, but for a different reason: it skips the manifest fetch and the string assembly, which are backend-agnostic.
+
+**Scale must not be applied by rebuilding geometry** (#692) — rebuilding to apply a scale is wasted
+CPU *unless deforming or batching draw calls*. `layoutText` multiplies every geometric quantity by
+`fs`, so it is a **pure linear scale**, with two exceptions that make the fast path conditional:
+`letterSpacing` is added in px AFTER the multiply so it does not scale, and `maxWidth` wrapping
+genuinely depends on size. Gating on `letterSpacing === 0 && maxWidth == null` covers the
+overwhelming majority. Legitimately deformation, leave alone: `SkinnedSprite2D`, per-glyph
+`TextAnimation`, skeletal, trails.
+
+⚠️ **Moving scale to the transform REQUIRES writing `uScreenPxRange` per frame** — it is
+`(fontSize / atlasSize) * distanceRange`, the MSDF antialiasing width, or glyphs go blurry/crunchy at
+the extremes. It lives in a `UniformGroup` with a mutation path, so this is a float write, not a
+shader rebuild.
+
+⚠️ **`getTextDirtyVersion()` is process-GLOBAL and sits inside `layoutHash`** (#696), so one newly
+rasterised glyph rebuilt every text mesh in the scene. Worst for CJK / dynamic fonts, where new
+glyphs arrive during play.
+
+### 2D masking — `Mask2D` (#449)
+
+Clip a 2D subtree to a rect or a texture. `Mask2D` on an entity clips **that entity and every
+descendant**; nested masks **intersect**.
+
+| Field | Meaning |
+|---|---|
+| `mode` | `'rect'` (authored box) or `'texture'` (alpha from `sprite`) |
+| `offsetX` / `offsetY` | the rect's centre relative to the mask entity's own origin, design px |
+| `width` / `height` | **HALF-extents**, matching `Renderable2D`'s convention |
+| `pivotX` / `pivotY` | same pivot convention as `Renderable2D` |
+| `cornerRadius` | rect only; clamped to `min(width, height)` |
+| `feather` | design px of soft edge. `0` = hard |
+| `sprite` | texture mode: an asset **GUID**, never a path |
+| `isEnabled` | `false` ⇒ contributes no group at all; descendants route to the canvas unclipped |
+
+**Which Pixi pipe you land in is decided by the mask object's CLASS**, not by anything we choose:
+`AlphaMask.test` is `mask instanceof Sprite` and `StencilMask.test` is `mask instanceof Container`,
+registered `AlphaMask, ColorMask, StencilMask` in `pixi.js/lib/rendering/init.mjs` and tested in
+that order. So `feather: 0` builds a `Graphics` (stencil — cheap, hard-edged) and anything soft or
+textured builds a `Sprite` (alpha — a filter pass). That is a real cost difference worth knowing
+before feathering a mask that did not need it.
+
+**How it works against a flat tree.** `Scene2D` otherwise puts every display object straight onto
+its Canvas2D container, but a Pixi mask applies to ONE display object — so each enabled `Mask2D`
+gets a real sub-`Container` (`MaskSlot`), and `containerFor` routes all five `addChild` sites
+(sprite/graphics, material mesh, skinned mesh, text) into it. Ancestor resolution is
+`maskGroups.ts` (`computeMaskGroups`), the same sparse walk as `computeGroupAlpha` and lazy the
+same way: no `Mask2D` in the scene ⇒ empty maps and ~zero per-frame cost.
+
+- ⚠️ **The sub-container stays at IDENTITY.** Children already carry fully-composed WORLD
+  transforms, so a container that transformed anything would apply it twice.
+- ⚠️ **A masked group is a contiguous z-BAND.** It sorts among its siblings by the mask entity's
+  own paint index; entities outside cannot interleave with entities inside.
+- ⚠️ **Put the mask on a STATIC parent, never on the entity that moves the content.** Mask geometry
+  comes from the mask entity's own world transform, so a mask on a pan/zoom root pans and zooms
+  with what it is meant to clip and clips nothing. Wordweave inserts `CrosswordClip` above
+  `CrosswordRoot` for exactly this reason.
+- ⚠️ **Position the rect with `offsetX`/`offsetY`, and leave the mask entity's `Transform` at
+  identity.** A mask can only clip a subtree by BEING that subtree's ancestor, so moving the mask
+  ENTITY translates everything it clips. Measured: `CrosswordClip` placed at the panel centre moved
+  every crossword cell by exactly that centre — cell 32 read world (787.9, 1031.2) for a local
+  (247.9, 515.6), landing the grid outside its own mask. The offset fields exist to remove that
+  class; the mask rect moves, the subtree does not. This is separate from the warning above and
+  both apply.
+- ⚠️ **A change of mask MEMBERSHIP forces a full redraw**, folded into `forceAll`. Every pass
+  early-returns on an unchanged per-entity snapshot and re-parents only *after* that guard, so an
+  entity entering or leaving a mask without otherwise changing would otherwise keep its old
+  container forever.
+- ⚠️ **`disposeMaskSlot` destroys the container with `{ children: false }`.** Its children are live
+  display objects owned by entity slots that may outlive the mask; they re-home on the next frame.
+
+**The feather ramp is generated, not blurred.** `maskRamp.ts` rasterises a rounded-box SDF into an
+alpha buffer (pure, no DOM, unit-tested), so there is no dependency on Canvas2D `filter` and the
+result is deterministic. Coverage is `clamp01(-sdf / feather)`: **0 exactly on the authored edge**,
+1 at `feather` inside. ⚠️ It was briefly the straddled `clamp01(0.5 - sdf/feather)` — half the ramp
+outside the rect — which cannot be rasterised into a buffer sized to the rect: measured live at
+`feather: 90`, alpha ran 255 → 133 and hard-stopped, a 52%-opacity seam where the fade should have
+finished. Small feathers hid it entirely with every test green. A clip must not paint outside its
+own rect.
+
+⚠️ **`sprite.width = n` is a SCALE against the texture size in Pixi**, so a mask Sprite's sizing is
+kept as `MaskSlot.baseScaleX/Y` and multiplied into the per-frame world-scale write. Writing
+`.width` directly is silently undone the next frame — measured: wordweave's 984×751 clip collapsed
+to the 256px ramp and masked away all but a sliver of the grid.
+
+**What is NOT clipped, and it is not obvious:**
+
+- ⚠️ **Particles — DELIBERATELY, and this is the standing rule** (owner, 2026-08-30, #453).
+  The 2D particle path resolves its container straight from the canvas pool, so an emitter under a
+  `Mask2D` renders **unclipped**. That is not an oversight to fix later: the motivating SHAPE is a
+  travelling effect that crosses a clip boundary — a particle that flies from OUTSIDE a clipped
+  panel INTO it — and clipping it would erase the arc that carries the meaning. (Wordweave's #450
+  flying letters are the non-particle instance of this shape: `Text2D` glyphs parented to the host
+  canvas, not particles, so this rule doesn't actually apply to them — #450 is cited for the shape,
+  not as a particle example.) So the trait's "every descendant" contract reads **every
+  descendant except particles**. If you need a particle confined to a panel, mask the panel's
+  CONTENT and keep the emitter out of the story — do not reach for `Mask2D`.
+- The **collider debug overlay** (`zIndex = 1e9`) also bypasses the mask, deliberately — a debug
+  overlay you cannot see because it got clipped is a worse debug overlay.
+
+Rect mode ships with a real consumer (wordweave's crossword). **Texture mode is covered by unit
+tests only** — no game exercises it yet.
+
+⚠️ **`Mask2D` does not support `Canvas2D.scaleMode: 'fill'`.** Under `fill` the compensation makes
+the mask rect's extent shrink while the content it clips is positioned uncompensated, so the clip
+lands wrong. No project uses `fill` today (swept: 64 `contain`, 11 `fitW`, 5 `fitH`, 0 `fill`).
+
+## GPU resource ownership — derived resources, and what owns them
+
+Graduated from the retired `docs/plans/gpu-resource-ownership-plan.md` tracker (2026-09-07), which
+was written for #695. Owner's original ask: *"make the ownership of GPU resources explicit, otherwise
+it's hard to manage the lifecycle."* **The registry that design proposed was never built and is not
+planned** — #695 closed on a regression test instead, for the reason the "roads not taken" below
+gives. Read this for the mental model and the rejected approaches, both of which are load-bearing,
+not as a work item.
+
+For the env/PMREM specifics — the per-swap measurement table, the prewarm door, the sharp-vs-blurred
+background split — see § "HDR Environment & IBL" above, which owns that detail.
+
+### The shape that actually recurs
+
+Two measured incidents — #590 (PixiJS, ~300 MB over 6 min, four teardown sites wrong at once) and
+#739 (three.js, 72 MB per scene load from the environment alone) — are the same defect, and neither
+is a destroy-order bug:
+
+| | owned resource | derived resource | derived by | back-reference? |
+|---|---|---|---|---|
+| #590 | a Scene2D slot | geometry, shader, mesh, container | our own four hand-written teardown loops | none — each loop re-derived the contract |
+| #739 | the env `DataTexture` | PMREM cubeUV + ping-pong render targets | **three.js**, in `PMREMNode` | none in r184 — fixed in r185 |
+| #739 | the env `DataTexture` | background `CubeRenderTarget` | **three.js**, in `CubeMapNode` | a listener exists, but it disposes the target's TEXTURE — still broken in r185 |
+
+**The generalisation: a GPU object created FROM a resource we own, by code that is not the owner,
+with nothing linking owner to derivative.** Releasing the owner then cannot release the derivative,
+and nothing errors — the counter simply never comes down. #739 is the sharper case precisely because
+the deriving code is a third party we cannot change, which is what makes "one helper per class"
+useless there: there is no call site of ours to route through.
+
+⚠️ **Having the link is necessary and not sufficient.** three's `CubeMapNode` DOES register
+`texture.addEventListener('dispose', …)` — and still leaks, because `onTextureDispose` caches
+`renderTarget.texture` but disposes the *target*'s texture rather than the target
+(`three/src/nodes/utils/CubeMapNode.js`). A back-reference has to be tested by observation, not by
+reading that it exists.
+
+### Two axes, not one — RELEASE and INVALIDATION
+
+The family has a second axis that the original design missed, added from #678 and #794, both
+device-measured:
+
+| | release (#695) | invalidation (#678, #794) |
+|---|---|---|
+| trigger | owner dies | GPU context/device dies |
+| needs | owner → derivatives | renderer → everything it uploaded |
+| today | hand-written per site | **nothing at all** |
+
+"Nothing at all" is a measured sweep, re-verified 2026-09-07: there is no context-loss hook on
+`meshTemplateCache.ts`, `textureResolver.ts`, `fontTexturePixi.ts`, or the module-scope program
+caches in `pixiShaderBuilder` / `mtsdfPixiShader`. `activeRenderer`'s `lostListeners` has exactly
+three production subscribers — the `onRendererLost(...)` calls in `frameDriver.ts`, `Scene3D.tsx`
+and `SceneView.tsx` — and all three only request a renderer rebuild. **Nothing subscribes on behalf
+of a resource cache.** See § "GPU context loss is recoverable" above for the recovery path itself.
+
+### Roads not taken — read these before proposing a fix here
+
+- **"One release helper per resource kind" is the WRONG generalisation.** #695 originally proposed
+  cloning the `releaseGeometry` pattern across `Shader`, `Texture`/`TextureSource`, `Mesh`,
+  `Container` and the three.js equivalents. Do not. `releaseGeometry` (in `Scene2D.tsx`) is a
+  workaround for ONE upstream quirk, and its own body doc says so: PixiJS's `Geometry.destroy()`
+  calls `removeAllListeners()` before `unload()`, orphaning the VAO, while `Buffer`,
+  `TextureSource`, `GraphicsContext` and `ViewContainer` all order it correctly. Cloning it per kind
+  produces five wrappers around a `destroy()` that was already correct. It solves destroy ORDER —
+  a real problem, already solved where it occurs, and **not** the problem that cost 300 MB.
+- **Its guard test must not be cloned either.** `engine/tests/architecture/geometryRelease.test.ts`
+  is a 373-line per-identifier static scanner whose header enumerates what it cannot see (array
+  elements, `this`-stored geometry, wrapper helpers) and closes with *"Do not extend this guard to
+  chase those without a design discussion — they need either real type information or a bigger
+  rewrite, not another regex."* Five copies means five heuristics with five sets of blind spots.
+- **The guard for this class must be a RUNTIME check, not a sixth scanner.** The invariant is
+  observable — *after `releaseAllForScene(sceneId)`, nothing owned by that scene remains* — and a
+  static guard could not have caught #739 at all, where there is no call site of ours to scan.
+  ⚠️ **Verify by PERTURBATION**: a registry that is empty because nothing ever registered passes
+  identically to one that is empty because everything was released, so the test must first assert
+  it is NON-empty while the scene is live.
+- **Tier 2 (slot-granularity handles — no caller touches `destroy` directly) was never built.** If
+  it is ever revisited it must re-ask the `meshTemplateCache` question below, which the registry
+  design did not trigger.
+- ⚠️ **An owner-keyed registry would NOT have caught #747, and that bounds the whole idea.** #747
+  was a third shape: the derivative-to-owner link was present and correct, and the OWNER ITSELF was
+  a sentinel — `LAZY_OWNER = -1`, which no `sceneId` can equal — so `releaseRiggedModelsForScene`
+  never reported last-owner. Nothing was derived and nothing was unlinked; the release ran and
+  correctly concluded an owner remained. State the invariant over OWNERS, not only over
+  derivatives.
+
+### Destroy ORDER is part of the contract — the PixiJS quirk `releaseGeometry` exists for
+
+`releaseGeometry` (in `Scene2D.tsx`) looks like tidiness and is not. PixiJS's
+`Geometry.destroy()` calls `removeAllListeners()` **one line before** `unload()` fires the `"unload"`
+event:
+
+```js
+destroy(destroyBuffers = false) {
+  this.emit("destroy", this);
+  this.removeAllListeners();            //  ← tears off the "unload" listener
+  if (destroyBuffers) { this.buffers.forEach((buffer) => buffer.destroy()); }
+  this.unload();                        //  ← emits "unload" to nobody
+```
+
+`gl.deleteVertexArray` is reachable ONLY through `GCManagedHash`'s `item.once("unload", …)`, so the
+VAO handle becomes unreachable from JS **permanently**. The buffer GC works correctly; the VAO
+deletion never fires at all.
+
+**`Buffer`, `TextureSource`, `GraphicsContext` and `ViewContainer` all order `unload()` BEFORE
+`removeAllListeners()`. `Geometry` is the only one of the five that inverts it.**
+
+⚠️ **`destroy(true)` is NOT the fix** — `buffers.forEach` still runs before `unload()`, and the VAO is
+still never deleted. **The fix is `g.unload(); g.destroy(true);`** — calling `unload()` while the
+listener is still attached is what reaches the handler. That is exactly what `releaseGeometry` does,
+and it is why cloning it per resource kind is the wrong generalisation (see "Roads not taken" above):
+it encodes ONE library's ordering quirk, not a contract the other kinds share.
+
+One inference, flagged as such because it comes from the GL spec and not from Pixi's source: an
+undeleted VAO holds its attribute buffers' DATA STORE alive even after `gl.deleteBuffer` releases
+their names. That is the link from "VAO leaked" to monotonic growth.
+
+⚠️ **Worth its own measurement before you credit it.** Freeing ~11,000 GL buffers/min properly bought
+only **1.27x** against a control — it is a real release bug and was kept as such, but it was ~21% of
+the growth, not the cause. The dominant term was rebuild VOLUME.
+
+### Procedural buffer SIZING — the failure is silent truncation, not corruption
+
+A classic overrun is **impossible in JS**: TypedArrays are bounds-checked, writing past the end is
+silently ignored, and `.set()` with an oversized source throws `RangeError`. WebGL is specified
+against the driver-side twin too (a deleted buffer name becomes invalid rather than dangling;
+out-of-range index fetches return zeros under robust buffer access).
+
+**The adjacent failure IS real and is the "looks fine" kind: silent truncation** — a wrong size gives
+missing or wrong vertices with no error anywhere. One instance of that shape exists: the in-place
+text-animation upload bails on a length mismatch and silently leaves the OLD data on screen rather
+than failing loudly.
+
+The text path is **verified correct**: `buildTextGeometry` allocates `n*4*2` positions, `n*4*2` uvs,
+`n*4*4` colors and `n*6` indices for `n` quads, with the `Uint16`/`Uint32` switch at the right
+threshold (`n*4 > 65535`). One waste, not a bug: the conversion doubles index memory and allocates a
+second array per rebuild, because the builder emits `Uint16Array` and `MeshGeometry` is fed
+`Uint32Array`.
+
+**When auditing any other procedural allocation** (material quad, skin buffers, particle buffers,
+trail geometry, mask ramp), the three questions are: is the size exactly proportional to the content,
+**can it GROW across rebuilds**, and does any writer silently truncate instead of failing? A size
+that grows is the only version of this that explains memory growth.
+
+
+### `meshTemplateCache`'s count-based invariant — checked, and it does NOT fire
+
+`meshTemplateCache.ts` carries an INVARIANT comment: if resource lifetime is ever made
+finer-grained than per-scene, its `Set<sceneId>` ownership must become count-based. A derived-resource
+registry does not trigger it — the registry is keyed on the OWNING resource and released with it, so
+the owner's own lifetime is unchanged and still scene-scoped via `releaseAllForScene`. The invariant
+fires on a genuine per-entity unload, streaming/LOD eviction, or an "unload unused assets" action.
+See [scene-loading.md](./scene-loading.md).
+
+### `envPmrem.ts` is the working prototype — generalise it, don't invent one
+
+`runtime/rendering/envPmrem.ts` (landed for #775/#776/#779) is `register`/`releaseDerived` in all but
+name and already carries both axes: `envDerivedCache`, a `WeakMap` keyed by RENDERER, and
+`envDerivedBySource`, a reverse index keyed by OWNER, with `disposeEnvDerivedFor(source)` as the
+release entry point. Anyone tempted to build a generic registry should start from this rather than
+from scratch.
+
+⚠️ **A PMREM texture belongs to the renderer that produced it**, so the key is **(surface renderer,
+env path)** — not env path alone. The editor runs GameView and SceneView on separate renderers plus a
+throwaway prewarm scene; a shared cache would let one dispose the other's target out from under it.
+The reverse index deliberately holds no `Set`/strong reference to a renderer either — that would pin
+a disposed renderer and everything it retains for the process lifetime, which is #720's defect
+re-created inside the fix for #739.
+
+### ⭐ A per-renderer discriminant is only real if a two-surface test pins it (#828)
+
+**The transferable rule, and the most reusable thing this design produced.** `envPmremOwnership.test.ts`
+had 18 cases and not one of them could tell the two shapes apart: every case built exactly one
+`const renderer = {}`, so a `WeakMap<renderer, …>` and a single shared `Map<source, target>` behave
+IDENTICALLY. Collapsing the WeakMap indirection to a plain Map passed all 18 unchanged.
+
+> **A derived-resource cache's discriminant is not verified by any test that only ever exercises one
+> instance of that discriminant.** Wherever a cache is keyed by renderer / surface / scene to keep
+> two live instances from colliding, the regression test has to construct two of them and assert
+> they don't collide — one instance cannot fail either way.
+
+The sibling `lightMaskVariants.ts` solves the identical multi-surface problem with key salting
+instead of a nested cache, and its suite states the two-surface scenario in its own docblock and
+renders alternating frames from both surfaces — which is why that cache had cover and this one did
+not. **#828 tracks the six sites where this cover is still missing**, including
+`pixiShaderBuilder.ts`, which shares compiled GPU programs across both live `Scene2DRenderer`s with
+no renderer in the key and may be a live defect rather than a cover gap.
+
+### Retractions worth keeping — each was a confident claim that measurement killed
+
+- **`registerRuntimeMeshTemplate` is fragile by design but is NOT a live leak.** It writes into
+  `cache` but never into `modelOwners`/`meshAssetOwners`, so a procedurally registered template is
+  invisible to `releaseAllForScene` — and an earlier revision of this design called that "the
+  sharpest unfiled instance" and demanded a red test before any fix. **That was wrong, and checking
+  took one grep**: the only caller in tracked source, `games/sling/runtime/field/rebuildField.ts`,
+  accumulates every key it registers into a per-root set and unregisters all of them. The convention
+  is discharged correctly. What survives is that *nothing enforces it* — a plausible latent leak,
+  never measured. Tier 1 was therefore hardening with no measured defect behind it, which is part of
+  why it was not built.
+- **PixiJS `_gpuData` orphans: "nothing purges an entry when the renderer is destroyed" was
+  overstated.** Purging need not use `delete` — fifteen systems/pipes hold a `GCManagedHash` whose
+  `destroy()` → `removeAll()` → `remove()` **nulls** `item._gpuData[renderer.uid]`, and
+  `Application.destroy` calls `renderer.destroy()`. On a clean teardown most entries are already
+  null; genuinely unmanaged are `SpritePipe` and `MeshPipe`. Orphans survive mainly when teardown
+  THROWS part-way. So the gap is not "nothing is purged" — it is "no cache can be ASKED what it
+  holds for a dead renderer," which is narrower. Measured on an iPhone 8 (`games/wordweave`): 206
+  orphaned entries after a SINGLE context loss.
+- **"A later renderer can be handed a uid a stale entry already sits under" — it cannot.**
+  `renderer.uid` comes from a monotonic `uid('renderer')` counter and `resetUids()` is called nowhere
+  in this repo, so a renderer uid is never reused. That is what lets the shipped purge be scoped to
+  provably-dead uids instead of needing live-set reasoning.
+- **#715's GL program/shader leak was real, is closed in-repo, and is NOT fully fixed.** three's
+  `webgl-fallback` backend compiles programs and never issues a GL delete: measured over repeated
+  scene swaps, `Pipelines._releaseProgram` fired 12 times while `gl.deleteProgram`,
+  `gl.deleteShader` and `gl.deleteVertexArray` were called **zero** times (`gl.deleteBuffer` fired
+  106 times, the control proving the instrumentation worked). The GL context survives a scene swap,
+  so anything leaked this way accumulates for the life of the app.
+  `installGlProgramReleaseHatch` (`runtime/rendering/glProgramRelease.ts`) closes the program/shader
+  half by wrapping three's `Pipelines.prototype` — self-disabling, verifying the vendor's private
+  shape at install time and degrading to a loud no-op if it moves. **UBOs never leaked** (24/24
+  `destroyUniformBuffer` calls issue a `gl.deleteBuffer`; a `deleteBindGroupData` override would
+  DOUBLE-FREE). **VAOs do leak and cannot be fixed from here** — `three/build/three.webgpu.js`
+  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is iceboxed;
+  what remains is three upstream changes, not one: wire `_releaseProgram` to
+  `backend.destroyProgram`; make `WebGLBackend.destroyProgram` actually issue the GL deletes rather
+  than only dropping its DataMap entry; and invent a backend hook for the pipeline half, which has
+  no `backend.*` call on either backend.
 
 ## Shipped web build: canvas sizing (`rendering.web.sizeMode`)
 

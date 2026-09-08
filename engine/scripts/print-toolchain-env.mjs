@@ -30,11 +30,10 @@
  * through to the machine's SDKs, i.e. reproduces the bug this script exists to fix.
  */
 
-import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -51,29 +50,24 @@ function appDataRoot() {
 // every clone, which is why it is not under a per-clone profile dir.
 process.env.MODOKI_TOOLCHAIN_DIR ??= path.join(appDataRoot(), 'Modoki', 'toolchain');
 
-/** Bundle `engine/toolchain/index.ts` to a temp ESM file and import it. */
-async function loadToolchain() {
-  const outfile = path.join(os.tmpdir(), `modoki-toolchain-${process.pid}.mjs`);
-  await build({
-    entryPoints: [path.join(repoRoot, 'engine', 'toolchain', 'index.ts')],
-    outfile, bundle: true, format: 'esm', platform: 'node', target: 'node20',
-    // Node built-ins only — the toolchain module has no third-party deps, and marking them
-    // external keeps a stray one a loud failure rather than a silently inlined copy.
-    packages: 'external', logLevel: 'silent',
-  });
-  try {
-    return await import(pathToFileURL(outfile).href);
-  } finally {
-    try { fs.unlinkSync(outfile); } catch { /* best effort */ }
-  }
-}
-
 const shellQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
 
 const args = new Set(process.argv.slice(2));
 const asJson = args.has('--json');
 
-const { detect } = await loadToolchain();
+// `engine/toolchain/index.ts` through the SHARED esbuild seam (#827) — this file used to carry
+// its own bundle-to-temp-and-import copy, byte-for-byte the same contract as
+// `loadVendorPlugins.mjs`'s. `loadRequiredEngineModules`, not the plain null-returning wrapper:
+// this script's ENTIRE output is `detect()`'s answer, so a degrade has nothing to fall back to and
+// must be a loud failure rather than an empty `eval`-able stdout that silently leaves JAVA_HOME
+// unset. Marking node_modules external is the shared loader's default, so a stray third-party
+// import under engine/toolchain stays a loud failure rather than a silently inlined copy.
+//
+// Loaded AFTER the MODOKI_TOOLCHAIN_DIR default above: the toolchain module reads it.
+const [toolchain] = await loadRequiredEngineModules(
+  repoRoot, [path.join('toolchain', 'index.ts')], 'print-toolchain-env.mjs',
+);
+const { detect } = toolchain;
 
 const java = detect('java');
 const sdk = detect('android-sdk');

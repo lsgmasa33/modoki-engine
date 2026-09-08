@@ -12,20 +12,22 @@
  *  genuinely escapes stays absolute. This is the whole of that decision, extracted from the route
  *  because the route itself cannot be unit-tested: it blocks on a modal `osascript` panel that
  *  only a human can dismiss (see `routeCoverage.test.ts`). */
-import fs from 'node:fs';
 import path from 'node:path';
+import { canonicalPath } from '../../scripts/pathIdentity.mjs';
 
 /** Resolve symlinks in the CONTAINING directory only, keeping the leaf name as chosen.
  *  Resolving the leaf too would follow a symlink that lives inside the project out to its
  *  target and store the target's absolute path — the opposite of what the caller wants.
  *  Falls back to the input when the path does not exist (a synthetic path in a test). */
 function realDir(p: string): string {
-  const dir = path.dirname(p);
-  try {
-    return path.join(fs.realpathSync(dir), path.basename(p));
-  } catch {
-    return p;
-  }
+  // #881: the inner canonicalisation was the JS `fs.realpathSync` walk. `canonicalPath` is `.native`
+  // — which additionally expands a `subst` mapping, a junction and drive-letter case — and it does
+  // not throw, falling back to `path.resolve`. The old `catch { return p }` is therefore gone, and
+  // the non-existent-directory case now yields `resolve(dir)/basename` rather than `p` verbatim.
+  // That only differs for a RELATIVE `p`, and both callers are absolute by construction (the value
+  // comes from the native chooser via `POST /api/pick-path`); the pinned behaviour that matters —
+  // the leaf is never itself realpath'd — is unchanged.
+  return path.join(canonicalPath(path.dirname(p)), path.basename(p));
 }
 
 /** The project-relative form of `chosenAbs` when it resolves under `projectRoot`, else

@@ -25,22 +25,32 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
+/** Every test root in the repo, not the two somebody listed (#830). The claim this guard makes is
+ *  universal — "**no test** may compute it inline" — and `games/<id>/tests/` and `demos/<id>/tests/`
+ *  are test roots the sibling guards (`commentStripperIsShared`, `testFilesAreCollected`) both
+ *  enumerate. No offender lives there today, so this widening is latent-by-measurement rather than
+ *  a fix; the point is that the scope now matches the sentence. */
 const TEST_DIRS = [
   path.join(REPO_ROOT, 'engine', 'tests'),
   path.join(REPO_ROOT, 'engine', 'packages', 'modoki', 'tests'),
+  path.join(REPO_ROOT, 'games'),
+  path.join(REPO_ROOT, 'demos'),
 ];
 
 /** The helper is the one legitimate place to compute this. This guard is excluded because it
  *  must SPELL OUT the shapes it forbids — its `what:` labels below literally contain
  *  `discoverProjects(...).some(...)`, so it flags itself otherwise. (It did, first run.) A guard
  *  that reports its own documentation as a violation is one people learn to ignore. */
+// Repo-relative POSIX literals — matched against `rel` (git's own repo-relative string), never
+// against an independently `path.join`-built absolute path (#849).
 const ALLOWED = new Set([
-  path.join(REPO_ROOT, 'engine', 'tests', 'helpers', 'repoLayout.ts'),
-  path.join(REPO_ROOT, 'engine', 'tests', 'architecture', 'projectPresencePredicate.test.ts'),
+  'engine/tests/helpers/repoLayout.ts',
+  'engine/tests/architecture/projectPresencePredicate.test.ts',
   // The e2e host-project pick — the one legitimate `discoverProjects` call under e2e/. See the
   // E2E_* describe block below for why every OTHER spec is forbidden from making it.
-  path.join(REPO_ROOT, 'engine', 'tests', 'e2e', 'hostProject.ts'),
+  'engine/tests/e2e/hostProject.ts',
 ]);
 
 /** Inline computations of project presence — the shapes that have actually appeared. */
@@ -50,18 +60,19 @@ const INLINE_PATTERNS: { re: RegExp; what: string }[] = [
   { re: /existsSync\s*\(\s*path\.join\s*\([^)]*['"]games['"]\s*\)\s*\)/, what: "existsSync(path.join(..., 'games'))" },
 ];
 
-function* walkTests(dir: string): Generator<string> {
-  if (!fs.existsSync(dir)) return;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walkTests(full);
-    else if (/\.tsx?$/.test(e.name)) yield full;
-  }
+/** Every `.tsx?` test source file under `under`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). */
+function walkTests(under: string | string[], floor: number): Array<{ rel: string; abs: string }> {
+  return repoFiles({
+    under,
+    match: (rel: string) => /\.tsx?$/.test(rel) && !rel.split('/').some((s) => s.startsWith('.') || s === 'node_modules'),
+    floor,
+  });
 }
 
 describe('project-presence is asked in exactly one place (#98)', () => {
-  const files = TEST_DIRS.flatMap((d) => [...walkTests(d)]);
+  // Floored well under the 1259 measured today.
+  const files = walkTests(TEST_DIRS, 900);
 
   it('found test files to scan (sanity: the guard is not passing vacuously)', () => {
     // Without this, a moved test root turns the whole guard into a silent pass — the failure
@@ -71,8 +82,8 @@ describe('project-presence is asked in exactly one place (#98)', () => {
 
   it('no test computes project presence inline — import from helpers/repoLayout instead', () => {
     const offenders: string[] = [];
-    for (const abs of files) {
-      if (ALLOWED.has(abs)) continue;
+    for (const { rel, abs } of files) {
+      if (ALLOWED.has(rel)) continue;
       const src = fs.readFileSync(abs, 'utf8');
       for (const { re, what } of INLINE_PATTERNS) {
         // Ignore matches inside comment lines — the rule gets DESCRIBED in prose, and a guard
@@ -80,7 +91,7 @@ describe('project-presence is asked in exactly one place (#98)', () => {
         const hit = src
           .split('\n')
           .some((line) => !/^\s*(\/\/|\*|\/\*)/.test(line) && re.test(line));
-        if (hit) offenders.push(`${path.relative(REPO_ROOT, abs)} — ${what}`);
+        if (hit) offenders.push(`${rel} — ${what}`);
       }
     }
     expect(offenders, 'inline project-presence checks (use hasInternalGames() / hasAnyProject())')
@@ -108,11 +119,11 @@ describe('e2e specs never discover projects themselves (#326 follow-up)', () => 
   it('no spec under engine/tests/e2e calls discoverProjects — pickHostProject() does', () => {
     const offenders: string[] = [];
     let scanned = 0;
-    for (const file of walkTests(E2E_DIR)) {
-      if (ALLOWED.has(file)) continue;
+    for (const { rel, abs } of walkTests(E2E_DIR, 15)) {
+      if (ALLOWED.has(rel)) continue;
       scanned++;
-      if (/\bdiscoverProjects\s*\(/.test(fs.readFileSync(file, 'utf8'))) {
-        offenders.push(path.relative(REPO_ROOT, file));
+      if (/\bdiscoverProjects\s*\(/.test(fs.readFileSync(abs, 'utf8'))) {
+        offenders.push(rel);
       }
     }
     expect(offenders).toEqual([]);

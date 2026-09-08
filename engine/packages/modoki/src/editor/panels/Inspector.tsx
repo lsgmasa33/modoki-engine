@@ -1,7 +1,6 @@
 /** Inspector — auto-generates trait editors from the trait registry */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
@@ -17,6 +16,7 @@ import { useEditorStore } from '../store/editorStore';
 import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
+import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
 // Which anchors stretch which axis is decided ONCE, in anchorLayout — the same import
@@ -29,7 +29,8 @@ import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
-import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex, writeMetaOrWarn } from './assetViews/widgets';
+import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
+import { parkMetaEdit, readMetaPreferringPark } from '../scene/pendingMeta';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
 import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
@@ -52,7 +53,9 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate } from '../../runtime/ui/uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate, isElementMarginInert, selectionMarginGate, MARGIN_KEYS, pooledRowNoteSegments } from '../../runtime/ui/uiAuthoring';
+import { isPrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../scene/prefabEdit';
+import { entryKindUsesOf, type EntryKindUseHit } from './entryPrefabUse';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -90,6 +93,8 @@ export const UNIT_FIELD_MAPS: Record<string, Record<string, string>> = {
     paddingRight: 'paddingRightUnit', paddingBottom: 'paddingBottomUnit',
     marginTop: 'marginTopUnit', marginRight: 'marginRightUnit',
     marginBottom: 'marginBottomUnit', marginLeft: 'marginLeftUnit',
+    minWidth: 'minWidthUnit', maxWidth: 'maxWidthUnit',
+    minHeight: 'minHeightUnit', maxHeight: 'maxHeightUnit',
   },
   UIAnchor: { top: 'topUnit', right: 'rightUnit', bottom: 'bottomUnit', left: 'leftUnit' },
 };
@@ -121,6 +126,37 @@ export function inertSizeTooltipMultiAnchor(axis: 'width' | 'height'): string {
     + `axis, so it is sized by that anchor's ${offsets} offsets, which overwrite it. Edit those `
     + `offsets to size them, or choose a non-stretched anchor to make ${axis} live again.`;
 }
+
+/** Why a `UIElement.margin*` field is greyed out: the element is anchored, and `applyAnchorStyle`
+ *  clears all four margins (#757). #746's shape, and the same wording rule applies — point at what
+ *  IS live rather than implying the precedence is a bug to route around, because it is not: anchor
+ *  offsets are deliberately the one way to inset an anchored box.
+ *
+ *  Names the anchor mode, matching `inertSizeTooltip`, so a single-select author can see which
+ *  anchor is responsible. Pure + exported so the wording is testable without mounting the panel. */
+export function inertMarginTooltip(key: string, anchor: string): string {
+  return `${key} has no effect on a '${anchor}' anchor: an anchored element is positioned by its `
+    + `anchor offsets, which overwrite all four margins. Use the UIAnchor offsets to inset it, or `
+    + `remove the anchor to put this element back in flow layout and make ${key} live again.`;
+}
+
+/** Same explanation for a multi-selection whose anchor modes DIFFER — naming one would name the
+ *  wrong one for the rest of the selection, so this names none. Mirrors
+ *  `inertSizeTooltipMultiAnchor` and `shadowedZIndexTooltipMulti`. */
+export function inertMarginTooltipMultiAnchor(key: string): string {
+  return `${key} has no effect on ANY of the selected elements: each one is anchored, and an `
+    + `anchored element is positioned by its anchor offsets, which overwrite all four margins. Use `
+    + `the UIAnchor offsets to inset them, or remove the anchors to put them back in flow layout.`;
+}
+
+/** A MIXED selection — some anchored, some in flow. The field stays editable (#34: never narrow a
+ *  write because part of the selection would ignore it), but says how many will drop the value. */
+export function partiallyInertMarginTooltip(key: string, inert: number, total: number): string {
+  return `${key} has no effect on ${inert} of the ${total} selected elements: those are anchored, `
+    + `and an anchored element's margins are overwritten by its anchor offsets. The other `
+    + `${total - inert} are in flow layout, where ${key} applies — so this field stays editable.`;
+}
+
 
 /** The MIXED case (issue #34): the axis is inert on part of the selection and live on
  *  the rest. The field deliberately stays EDITABLE — disabling it would remove the only
@@ -469,6 +505,7 @@ function SkinnedMeshRendererMaterials({ entityIds, meta, data }: {
             value={overrides[slot] ?? ''}
             onChange={(v) => setSlot(slot, v)}
             accept={['.mat.json']}
+            dataUiId={`inspector.material.${slot}`} dataUiLabel={slot}
           />
         ))
       )}
@@ -634,6 +671,7 @@ function AnimationLibraryAnimSets({ entityIds, meta }: {
             value={ref}
             onChange={(v) => setAt(i, v)}
             accept={['.animset.json']}
+            dataUiId={`inspector.animSet.${i}`} dataUiLabel={`animset #${i + 1}`}
           />
           {ref && <BoneMapEditor animSetRef={ref} model={model} map={boneMaps[ref] ?? {}} onChange={(m) => setBoneMap(ref, m)} />}
         </div>
@@ -644,6 +682,7 @@ function AnimationLibraryAnimSets({ entityIds, meta }: {
         onChange={add}
         accept={['.animset.json']}
         placeholder="drop a .animset.json"
+        dataUiId="inspector.animSet.add" dataUiLabel="add animset"
       />
     </div>
   );
@@ -683,13 +722,16 @@ function AudioSourceClips({ entityIds, meta }: {
           <BufferedTextInput
             value={c.key} onChange={(v) => setKeyAt(i, v)} placeholder="key"
             style={{ ...inputStyle, width: 78, flex: '0 0 auto' }}
+            dataUiId={`audio.clip.${i}.key`} dataUiLabel={c.key || `clip ${i}`}
           />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <AssetRefField label="" value={c.ref} onChange={(v) => setRefAt(i, v)} accept={AUDIO_EXT} />
+            <AssetRefField label="" value={c.ref} onChange={(v) => setRefAt(i, v)} accept={AUDIO_EXT}
+              dataUiId={`audio.clip.${i}.ref`} dataUiLabel={c.key || `clip ${i}`} />
           </div>
         </div>
       ))}
-      <AssetRefField label="+ add" value="" onChange={add} accept={AUDIO_EXT} placeholder="drop an audio clip" />
+      <AssetRefField label="+ add" value="" onChange={add} accept={AUDIO_EXT} placeholder="drop an audio clip"
+        dataUiId="audio.clip.add" dataUiLabel="add clip" />
     </div>
   );
 }
@@ -726,6 +768,38 @@ function FilterIgnoredNote({ layer }: { layer: string }) {
       ℹ️ Ignored while <b>Layer</b> is set (<b>{layer}</b>) — collisions come from the
       layer + collision matrix (Project Settings → Physics Layers). Clear the Layer
       above to author these raw bits directly.
+    </div>
+  );
+}
+
+/** Section-level note for the whole UIElement trait section (not one sub-section — the fields it
+ *  covers span Size, Margin, Size Constraints and other sub-sections) when the selected entity is
+ *  a pooled UIEntries row (#651, widened to all fourteen pinned fields in #761), OR (#671) a
+ *  PREFAB some UIEntries view spawns as an entry kind — the two are mutually exclusive in
+ *  practice (a live pooled row's sibling `UIEntry` trait never exists inside prefab-edit mode, see
+ *  `entryPrefabUse.ts`'s docblock), so the caller picks exactly one mode per render.
+ *
+ *  The DECISION — what the note says for each mode, and the unanimous-or-nothing `mixed` rule
+ *  (#34) — lives in `uiAuthoring.pooledRowNoteSegments` (a plain, tested `.ts` function) so it
+ *  cannot drift from what `entriesSystem.ts`'s pin actually writes the way the old two-group text
+ *  (margin, min/max size) drifted from the six fields #761 added silently; this component only
+ *  renders that intro plus a bolded `label: forcedTo` list, per this repo's "editor .tsx carries
+ *  no tests" convention. Structured (not a flattened string) so the labels can be bolded and read
+ *  as a short list (#764 — the owner reads this note) rather than one ~300-character sentence
+ *  naming the five fields twice. `entry-prefab`'s items have no "forced to" suffix, matching
+ *  `mixed`: the fields are not being forced RIGHT NOW, only described. */
+function PooledRowNote({ mode }: { mode: 'inert' | 'mixed' | 'entry-prefab' }) {
+  const { intro, items } = pooledRowNoteSegments(mode);
+  return (
+    <div data-ui-id="inspector.section.pooledRowNote" style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
+      <div>ℹ️ {intro}</div>
+      <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
+        {items.map((item) => (
+          <li key={item.label}>
+            <b>{item.label}</b>{mode === 'inert' ? <> — forced to {item.forcedTo}</> : ''}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -814,6 +888,49 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
   // Only a UNANIMOUS anchor disables the control; a mixed selection stays editable.
   const anchorGate = selectionAnchorGate(anchorModes);
   const selfPlacementDisabled = (key: string) => isSelfPlacementDisabled(meta.name, anchorGate === 'inert', key);
+
+  // A pooled UIEntries row (carries the sibling UIEntry trait, stamped by entriesSystem.ts on
+  // every pooled instance root) has its margin/min/max-size fields pinned to 0 every tick by
+  // the scroll view that owns it — see PooledRowNote below (#651). Same live-sibling-read +
+  // unanimous-or-nothing pattern as anchorModes/anchorGate above (#34); unlike that gate this
+  // one only drives an inline note, never `readOnly` — the fields stay editable.
+  const pooledRowFlags: boolean[] = meta.name === 'UIElement' ? (() => {
+    const entryMeta = getAllTraits().find(t => t.name === 'UIEntry');
+    if (!entryMeta) return entityIds.map(() => false);
+    return entityIds.map((id) => {
+      const entity = findEntity(id);
+      return !!entity && entity.has(entryMeta.trait);
+    });
+  })() : [];
+  const pooledRowGate = selectionPooledRowGate(pooledRowFlags);
+
+  // Entry-prefab advisory (#671, editor half): the SAME fourteen fields as the pooled-row pin
+  // above, but for the case that pin's live-sibling read can never see — a prefab open in
+  // prefab-edit mode, whose root has no live `UIEntry` trait to gate on (it's `runtimeOnly`,
+  // stamped at spawn, absent from every `.prefab.json` — see `entryPrefabUse.ts`'s docblock).
+  // `entryKindUsesOf` asks the on-disk reference graph instead. `null` = not looked up / unknown
+  // and must never render as "not an entry kind" (see that module) — the effect below only ever
+  // sets `[]` or a populated array once a lookup actually completes.
+  const [entryKindHits, setEntryKindHits] = useState<EntryKindUseHit[] | null>(null);
+  const editingPrefabGuid = editingPrefab?.guid ?? null;
+  const singleSelectedId = entityIds.length === 1 ? entityIds[0] : null;
+  useEffect(() => {
+    setEntryKindHits(null);
+    if (meta.name !== 'UIElement' || !editingPrefabGuid || singleSelectedId === null) return;
+    // Ground truth is the LIVE world, not the store flag — `editingPrefab` can go stale
+    // (prefabEdit.ts's `isEditingPrefab` docs the same trap for Cmd+S).
+    if (!isPrefabEditWorld()) return;
+    // Root only (`PREFAB_EDIT_ROOT_GUID`, prefabEdit.ts): the runtime pin only ever hits the row
+    // ROOT, and `entryPrefabRootWarnings` (the validator arm this mirrors) judges only the root —
+    // firing here on a child would claim something false.
+    const entity = findEntity(singleSelectedId);
+    if (entity?.get(EntityAttributes)?.guid !== PREFAB_EDIT_ROOT_GUID) return;
+    let cancelled = false;
+    void entryKindUsesOf(editingPrefabGuid).then((hits) => {
+      if (!cancelled) setEntryKindHits(hits);
+    });
+    return () => { cancelled = true; };
+  }, [meta.name, editingPrefabGuid, singleSelectedId]);
 
   // Classify fields into an ordered item stream (single field OR a grouped
   // VecField), split by section. A grouped VecField respects its members'
@@ -936,19 +1053,45 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       const isSizeKey = meta.name === 'UIElement' && (key === 'width' || key === 'height');
       const axis = key as 'width' | 'height';
       const sizeGate = isSizeKey ? selectionSizeGate(anchorModes, axis) : 'live';
-      const stretchDisabled = sizeGate === 'inert';
-      // Distinct anchor modes among the entities the axis is inert on — one means we can
+      // ── margin (#757) ───────────────────────────────────────────────────────────────────────
+      // `applyAnchorStyle` clears all four margins on ANY anchored element, so an authored value
+      // is discarded with no signal — the same failure #746 fixed for `zIndex`, found by sweeping
+      // for the pattern. The condition has no per-mode nuance (unlike size, which only dies on the
+      // stretched axis), so `selectionAnchorGate` — "is every selected entity anchored?" — already
+      // answers it exactly — but it must be asked through `selectionMarginGate`, NOT
+      // `selectionAnchorGate`: the latter carries its own inline copy of the condition, so routing
+      // margin through it would make the shared-predicate guarantee false for the very decision
+      // that sets `readOnly`. `selectionMarginGate` runs `isElementMarginInert`, the same predicate
+      // `anchorCss` and the scene validator use, so the three cannot part company.
+      const isMarginKey = meta.name === 'UIElement' && (MARGIN_KEYS as readonly string[]).includes(key);
+      const marginGate = isMarginKey ? selectionMarginGate(anchorModes) : 'live';
+      // One gate for this field, whichever kind it is — both feed the same dim/readOnly treatment.
+      const unitGate = isSizeKey ? sizeGate : marginGate;
+      const stretchDisabled = unitGate === 'inert';
+      // Distinct anchor modes among the entities the field is inert on — one means we can
       // name it (the common single-select case), several means we must not.
       const inertAnchors = isSizeKey && sizeGate !== 'live'
         ? [...new Set(anchorModes.filter((a): a is string => !!a && isSizeInert(a, axis)))]
-        : [];
-      const labelHint = sizeGate === 'inert'
-        ? { ...hint, tooltip: inertAnchors.length === 1 ? inertSizeTooltip(axis, inertAnchors[0]) : inertSizeTooltipMultiAnchor(axis) }
-        : sizeGate === 'mixed'
-          ? { ...hint, tooltip: partiallyInertSizeTooltip(axis, anchorModes.filter((a) => !!a && isSizeInert(a, axis)).length, anchorModes.length) }
-          : hint;
+        : isMarginKey && marginGate !== 'live'
+          ? [...new Set(anchorModes.filter((a): a is string => isElementMarginInert(a)))]
+          : [];
+      const labelHint = isMarginKey
+        ? marginGate === 'inert'
+          // ⚠️ `inertAnchors[0]` can be `''` — a readable UIAnchor with an unreadable MODE, which
+          // still counts as anchored. Naming it would render "has no effect on a '' anchor", so an
+          // unnamed mode falls to the multi-anchor wording, which explains the rule without
+          // pointing at a mode the author cannot see in the dropdown.
+          ? { ...hint, tooltip: inertAnchors.length === 1 && inertAnchors[0] ? inertMarginTooltip(key, inertAnchors[0]) : inertMarginTooltipMultiAnchor(key) }
+          : marginGate === 'mixed'
+            ? { ...hint, tooltip: partiallyInertMarginTooltip(key, anchorModes.filter((a) => isElementMarginInert(a)).length, anchorModes.length) }
+            : hint
+        : sizeGate === 'inert'
+          ? { ...hint, tooltip: inertAnchors.length === 1 ? inertSizeTooltip(axis, inertAnchors[0]) : inertSizeTooltipMultiAnchor(axis) }
+          : sizeGate === 'mixed'
+            ? { ...hint, tooltip: partiallyInertSizeTooltip(axis, anchorModes.filter((a) => !!a && isSizeInert(a, axis)).length, anchorModes.length) }
+            : hint;
       return (
-        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(sizeGate === 'inert' ? { opacity: 0.35 } : sizeGate === 'mixed' ? { opacity: 0.65 } : {}) }}>
+        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}), ...(unitGate === 'inert' ? { opacity: 0.35 } : unitGate === 'mixed' ? { opacity: 0.65 } : {}) }}>
           <FieldLabel label={key} hint={labelHint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
           <BufferedNumberInput value={val as number} step={hint.step ?? 1} mixed={mx} min={hint.min} max={hint.max}
             onChange={v => write(key, v)} readOnly={stretchDisabled}
@@ -969,7 +1112,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     }
     if (hint.type === 'number') {
       const disabledByAnchor = selfPlacementDisabled(key);
-      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(disabledByAnchor ? { opacity: 0.35 } : {}) }}><NumberField label={key} value={val as number} step={hint.step}
+      const dim = disabledByAnchor ? { opacity: 0.35 } : {};
+      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...dim }}><NumberField label={key} value={val as number} step={hint.step}
         readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx}
         dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
@@ -994,7 +1138,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2, ...(ov ? overrideStyle : {}) }}>
             <FieldLabel label={key} hint={hint} style={{ flex: 1, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
             <BufferedTextInput value={typeof val === 'string' ? val : ''} onChange={(v) => write(key, v)} mixed={mx} multiline={hint.multiline} readOnly={hint.readOnly}
-              style={{ ...inputStyle, flex: 1, color: ov ? '#5dade2' : '#ddd', fontWeight: ov ? 'bold' : 'normal' }} />
+              style={{ ...inputStyle, flex: 1, color: ov ? '#5dade2' : '#ddd', fontWeight: ov ? 'bold' : 'normal' }}
+              dataUiId={`inspector.field.${meta.name}.${key}`} dataUiLabel={key} />
           </div>
         );
       }
@@ -1008,7 +1153,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
             if (e?.type === 'sprite' && e.sprite) { write('pivotX', e.sprite.pivot.x); write('pivotY', e.sprite.pivot.y); }
           }
         : (v: string) => write(key, v);
-      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel} /></div>;
+      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel}
+        dataUiId={`inspector.field.${meta.name}.${key}`} dataUiLabel={key} /></div>;
     }
     if (hint.type === 'color') {
       // A color field can fold a sibling 0..1 field into an A slider (hint.alphaField),
@@ -1060,7 +1206,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: safeAreaInert ? 'default' : 'pointer', fontSize: '11px', marginBottom: 2, ...(safeAreaInert ? { opacity: 0.4 } : {}) }}>
           <input type="checkbox" checked={mx ? false : (val as boolean)} disabled={safeAreaInert}
             ref={(el) => { if (el) el.indeterminate = mx; }}
-            onChange={(e) => write(key, e.target.checked)} />
+            onChange={(e) => write(key, e.target.checked)}
+            data-ui-id={`inspector.field.${meta.name}.${key}`} />
           <FieldLabel label={key} hint={safeAreaHint} style={{ color: '#bbb' }} />
         </label>
       );
@@ -1096,6 +1243,16 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
 
   return (
     <Section title={isResource ? `${meta.name} (resource)` : meta.name} defaultOpen onRemove={onRemove} menuItems={menuItems}>
+      {/* UIElement pooled-row note (#651): section-level, not scoped to one sub-section —
+          the fields it covers (margin, min/max size) live in TWO different collapsible
+          sub-sections (Margin, Size Constraints), so a single note here covers both. */}
+      {meta.name === 'UIElement' && pooledRowGate !== 'live' && <PooledRowNote mode={pooledRowGate === 'mixed' ? 'mixed' : 'inert'} />}
+      {/* Entry-prefab note (#671): the pooled-row gate above is always 'live' in prefab-edit
+          mode (no live UIEntry sibling to read there — see the effect above), so this is the
+          mutually-exclusive OTHER case, not an additional one. Silent on `null` (unknown) —
+          the note only ever adds information, never disables a field. */}
+      {meta.name === 'UIElement' && pooledRowGate === 'live' && !!entryKindHits?.length && <PooledRowNote mode="entry-prefab" />}
+
       {/* Top-level items (no section) — grouped VecFields + singles, in order */}
       {topItems.map(renderItem)}
 
@@ -1306,22 +1463,31 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
   useEffect(() => {
     if (asset.type !== 'model') return;
     setMetaLoaded(false);
+    // #845: ASK THE REGISTRY BEFORE THE FILE — a postprocessor edit here is PARKED, so disk still
+    // holds the PRE-edit doc until Cmd+S. Re-seeding from disk on a reselect would read as the
+    // edit having been lost (mirrors AtlasAssetView's `pendingAssetDoc` check).
     const ac = new AbortController();
-    backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`, { signal: ac.signal })
-      .then(r => r.ok ? r.json() : {})
-      .then((m: Record<string, unknown>) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
+    readMetaPreferringPark(asset.path, { signal: ac.signal })
+      .then(({ meta: m }) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
       .catch(e => { if (e.name !== 'AbortError') setMetaLoaded(true); });
     return () => ac.abort();
   }, [asset.path, asset.type]);
 
-  // Persist postprocessor to meta when changed
+  // Persist postprocessor to meta when changed — PARKED, not written immediately (#845). Cmd+S
+  // is the write.
+  //
+  // #870: this row needs no `UnsavedMetaBadge` of its own, and adding one would put TWO markers on
+  // screen for one edit. It parks `asset.path`, and `<ModelAssetView path={asset.path} …>` — which
+  // this same Inspector renders below — already shows the badge for that path. The badge is keyed
+  // on the PATH, not on which control made the edit, which is what makes that true.
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
-    const updated = { ...(metaRef.current ?? {}), version: 2, postprocessor: newPostprocessor };
+    // No `version` here — `writeMetaSidecar` stamps `SIDECAR_FORMAT_VERSION` onto every write
+    // unconditionally, so a literal here would be dead weight at best and a stale number at
+    // worst. See docs/format-versioning.md § 2b.
+    const updated = { ...(metaRef.current ?? {}), postprocessor: newPostprocessor };
     metaRef.current = updated;
-    // writeMetaOrWarn, not a raw fetch with `.catch(() => {})` — that swallow-catch is exactly
-    // the pattern it exists to replace (a dev-server outage looked like a successful edit).
-    void writeMetaOrWarn(asset.path, updated);
+    parkMetaEdit(asset.path, updated);
   }, [asset.path]);
 
   return (
@@ -1359,7 +1525,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
               onClick={async () => {
                 try {
                   const res = await fetch(asset.path);
-                  const prefab: PrefabFile = await res.json();
+                  const prefab = await parseAssetJson(res, asset.path) as PrefabFile;
                   // Preload nested children before the sync expand (nested prefabs).
                   const rootId = await instantiatePrefabAsync(prefab);
                   setPrefabSource(rootId, asset.path);
@@ -1372,8 +1538,13 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                     initialId: rootId,
                     respawn: async () => {
                       const r = await fetch(asset.path);
-                      if (!r.ok) return null;
-                      const p: PrefabFile = await r.json();
+                      let p: PrefabFile;
+                      try {
+                        p = await parseAssetJson(r, asset.path) as PrefabFile;
+                      } catch (e) {
+                        if (isMissingAsset(e)) return null;
+                        throw e;
+                      }
                       const id = await instantiatePrefabAsync(p);
                       setPrefabSource(id, asset.path);
                       return id;
@@ -1682,10 +1853,39 @@ export default function Inspector() {
 
   // Asset mode — batch inspector when >1 asset selected, else single-asset.
   if (selectedAssets.length > 1 && selectedId === null) {
-    return <AssetBatchInspector assets={selectedAssets} />;
+    // ⚠️ Keyed for the same reason as the single-asset branch below, and found by that fix's own
+    // sweep. Each batch view gates its controls on `loaded`, and `loadAll` sets that false — but it
+    // runs in an EFFECT, so for one render after the selection changes `loaded` is still true from
+    // the PREVIOUS selection while `metas`/`mats` hold the previous paths' documents. Texture and
+    // Model batch then park `{ ...(metas[p] ?? {}) }` for a path they have not read: an id-less
+    // document, N of them, one click. `parkMetaEdit`'s read-path stamp refuses those, so nothing
+    // reaches disk either way; the key is what stops the panel offering the window at all, and it
+    // is what covers `MaterialBatchView`, whose registry that stamp cannot see.
+    // ⚠️ `\n`, not a space: asset names contain spaces, and a space-joined key makes
+    // {`/a/x y.png`, `/a/z.png`} and {`/a/x.png`, `/a/y.png z.png`} the SAME string — no remount,
+    // window reopens. NUL is the one byte a path cannot contain (a newline CAN: measured, APFS
+    // accepts it), so it is the only separator that makes the join injective.
+    return <AssetBatchInspector key={selectedAssets.map((a) => a.path).join('\0')} assets={selectedAssets} />;
   }
   if (selectedAsset && selectedId === null) {
-    return <AssetInspector asset={selectedAsset} />;
+    // ⚠️ `key` — this REMOUNTS the whole asset panel when the selection moves to another asset, and
+    // it is load-bearing rather than tidiness (#891 member 2, #897). Without it React reuses the
+    // instance, so every child keeps asset A's state while `path` is already asset B: `meta` /
+    // `data` still hold A's document, `metaRef`/`metaLoaded` still describe A's read, and — because
+    // these views have no loading gate that a non-null foreign document can trip — every control
+    // renders enabled and populated with A's values under B's name. An edit in that window parked
+    // A's document under B's path, GUID included.
+    //
+    // ⚠️ A key ALONE would be a trap, and #891's own thread says so: a fresh instance starts at
+    // `useState(null)` and parks an ID-LESS document instead of a foreign one (#890) — the same
+    // destruction, harder to notice. It is shipped as one half of a pair with `parkMetaEdit`'s
+    // read-path stamp (`metaReadFallback.ts` § READ_FOR_PATH), which refuses both. This half stops
+    // the panel DISPLAYING another asset's values; that half stops any of it reaching disk.
+    //
+    // Keyed here rather than on each child so it also covers this component's OWN per-asset state
+    // (the postprocessor row's `metaRef`/`metaLoaded`, which is member 1) and the `.mat.json`-side
+    // views, whose `if (!data) return <Loading…/>` gate is honest again once `data` resets.
+    return <AssetInspector key={selectedAsset.path} asset={selectedAsset} />;
   }
 
   if (selectedIds.length === 0 || traits.length === 0) {
@@ -1781,8 +1981,10 @@ export default function Inspector() {
           <span
             style={{ flex: 1, display: 'flex' }}
             title={overrides.has('EntityAttributes.name') ? 'Overridden from prefab' : undefined}
-            // BufferedTextInput doesn't forward data-* attributes, so the wrapper carries
-            // the id. Tap it to focus, then `modoki_type_text` — the rename flow.
+            // The wrapper carries the id (predates #724, which gave BufferedTextInput its
+            // own dataUiId/dataUiLabel/dataUiKind forwarding — this one is left as-is per
+            // #724 to avoid double-tagging). Tap it to focus, then `modoki_type_text` —
+            // the rename flow.
             data-ui-id="inspector.header.name" data-ui-kind="field" data-ui-label="entity name"
           >
             <BufferedTextInput

@@ -8,7 +8,9 @@
  *  the backend; now it is a list. */
 
 import { describe, it, expect } from 'vitest';
-import { deletionPathsFor, planRename } from '../../src/editor/panels/assetOps';
+import {
+  deletionPathsFor, planRename, planDeleteOutcome, describeRefusedDeletes,
+} from '../../src/editor/panels/assetOps';
 
 describe('deletionPathsFor — the sidecar rule', () => {
   it('puts the asset itself first, so an undo restores in the original order', () => {
@@ -107,5 +109,81 @@ describe('planRename', () => {
     expect(planRename('/a/hero.png', '../evil', [])).toMatchObject({ toPath: '/a/.._evil.png' });
     expect(planRename('/a/hero.png', 'sub/evil', [])).toMatchObject({ toPath: '/a/sub_evil.png' });
     expect(planRename('/a/hero.png', 'sub\\evil', [])).toMatchObject({ toPath: '/a/sub_evil.png' });
+  });
+});
+
+/** #884 — what the panel does with a delete the OS REFUSED.
+ *
+ *  `/api/delete-asset` reports per PATH (`failed`); the panel used to act per REQUEST, so a file
+ *  still on disk lost its row, kept an unbound editor and was offered back by undo. These are the
+ *  two decisions that split, extracted out of `Assets.tsx` so they can be asserted without
+ *  mounting it. */
+describe('planDeleteOutcome — act on what went, not on what was asked', () => {
+  const REQ = ['/a/hero.png', '/a/hero.png.meta.json', '/a/tree.png', '/a/tree.png.meta.json'];
+  const ASSETS = ['/a/hero.png', '/a/tree.png'];
+
+  it('keeps a refused file OUT of `went`, so nothing downstream unbinds it', () => {
+    const { went } = planDeleteOutcome(REQ, ASSETS, ['/a/tree.png']);
+    expect(went).toEqual(['/a/hero.png', '/a/hero.png.meta.json', '/a/tree.png.meta.json']);
+    expect(went).not.toContain('/a/tree.png');
+  });
+
+  it('keeps the refused asset\'s ROW listed — the defect this exists for', () => {
+    // The old code removed every requested asset because `ok` was true.
+    const { removed } = planDeleteOutcome(REQ, ASSETS, ['/a/tree.png']);
+    expect(removed).toEqual(['/a/hero.png']);
+  });
+
+  it('still removes the row when only a SIDECAR was refused — the mirror defect', () => {
+    // The asset itself is gone; a row pointing at nothing is not better than a stray sidecar.
+    const { removed, went } = planDeleteOutcome(REQ, ASSETS, ['/a/tree.png.meta.json']);
+    expect(removed).toEqual(ASSETS);
+    // …but the refused sidecar still must not be unbound or restored.
+    expect(went).not.toContain('/a/tree.png.meta.json');
+  });
+
+  it('ACCEPT SIDE: with nothing refused, every row goes and every path counts as went', () => {
+    // A guard proven only on its reject side is half-tested — this is the case that runs every
+    // time a delete works, and it must not start reporting phantom survivors.
+    const { went, removed } = planDeleteOutcome(REQ, ASSETS, []);
+    expect(went).toEqual(REQ);
+    expect(removed).toEqual(ASSETS);
+  });
+});
+
+describe('describeRefusedDeletes — the message the human gets', () => {
+  it('returns null when nothing was refused, so a working delete is silent', () => {
+    expect(describeRefusedDeletes([], { trashed: 3 })).toBeNull();
+  });
+
+  it('names a PARTIAL delete by what did go, and by what was really THERE', () => {
+    // ⚠️ The denominator is trashed + refused (4), NOT the requested-path count. A delete asks for
+    // maybe-absent sidecars on purpose, so requesting 7 paths to remove one texture would report
+    // "Moved 3 of 7" about files that never existed.
+    const r = describeRefusedDeletes(['/a/tree.png'], { trashed: 3 })!;
+    expect(r.toast).toContain('Moved 3 of 4');
+    expect(r.toast).toContain('tree.png');
+  });
+
+  it('says "on disk", never "listed" — a refused SIDECAR has no row to stay in', () => {
+    // vite-asset-scanner classifies .meta.json / .meta.local.json as null, so they are never
+    // listed; and the asset's own row is gone anyway when its primary file went.
+    const r = describeRefusedDeletes(['/a/tree.png.meta.json'], { trashed: 2 })!;
+    expect(r.toast).toContain('still on disk');
+    expect(r.toast).not.toContain('listed');
+  });
+
+  it('does NOT say "moved 0 of N" for a total refusal — that reads as a count that could tick up', () => {
+    const r = describeRefusedDeletes(['/a/tree.png'], { trashed: 0 })!;
+    expect(r.toast).not.toContain('0 of');
+    expect(r.toast).toContain('still on disk');
+  });
+
+  it('caps the named files and says how many more, so the toast cannot run off', () => {
+    const many = ['/a/1.png', '/a/2.png', '/a/3.png', '/a/4.png', '/a/5.png'];
+    const r = describeRefusedDeletes(many, { trashed: 0 })!;
+    expect(r.toast).toContain('+2 more');
+    // The console line is the only hand-recovery record, so it keeps every FULL path.
+    expect(r.detail).toBe(many.join(', '));
   });
 });

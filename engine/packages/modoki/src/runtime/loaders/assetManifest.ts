@@ -21,6 +21,7 @@
  */
 
 import { assetUrl } from './assetUrl';
+import { ASSET_MANIFEST_VERSION } from './assetManifestVersion';
 import { markUIDirty } from '../core/uiDirty';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
@@ -159,12 +160,20 @@ export interface AssetManifestFile {
   assets: AssetManifestEntry[];
 }
 
+// Re-exported from its own zero-import file — see assetManifestVersion.ts's header for why
+// this constant can't simply live here: this module transitively imports assetFetch.ts/
+// assetUrl.ts (browser-only globals), and vite-asset-scanner.ts (a Node-context Vite plugin)
+// needs the version number without dragging that graph into its Node-lib typecheck.
+export { ASSET_MANIFEST_VERSION };
+
 /** Sidecar `.meta.json` written next to binary assets (.glb, .hdr, .png/.jpg).
  *  Carries the stable UUID plus importer state (e.g., the list of derived
  *  files produced from a GLB so they can be cleaned up on delete). */
 export interface BinaryAssetMeta {
   id: string;
-  version: 2;
+  /** Format version of the sidecar document itself — owned and stamped by
+   *  `writeMetaSidecar` (see `SIDECAR_FORMAT_VERSION` in meta-sidecar.ts). */
+  version: number;
   /** Importer/loader ID (e.g., 'island', 'default'). Optional — only models have one. */
   loader?: string;
   /** Files produced from this binary by the importer — used for cleanup. */
@@ -561,7 +570,12 @@ export function resolveRef(ref: string): string | undefined {
       pathRefSeen.add(ref);
       console.error(
         `[assetManifest] path reference no longer supported — use a GUID: ${ref}\n` +
-        `  (Re-save the owning scene/asset in the editor, or re-run scripts/migrate-to-guids.mjs.)`,
+        `  An asset reference must be the asset's stable GUID, not a literal path — use its ` +
+        `\`id\` field (or its .meta.json sidecar GUID for a binary). Re-saving the owning ` +
+        `scene/asset does NOT fix this (the serializer only flags a stray path, it doesn't ` +
+        `rewrite it) — in the editor, re-pick the asset in the Inspector's reference field ` +
+        `(drag it from the Assets panel, or use the picker) to write a GUID. See ` +
+        `docs/scene-loading.md § "Resource cache with refcounting" for the convention.`,
       );
     }
     return undefined;
@@ -696,7 +710,7 @@ export function serializeManifest(): AssetManifestFile {
       environment: entry.environment,
     });
   }
-  return { version: 2, assets };
+  return { version: ASSET_MANIFEST_VERSION, assets };
 }
 
 /** Clear the manifest. Used in tests + when reloading. */

@@ -103,6 +103,52 @@ describe('summarizeTraits — bare returns names by category', () => {
   it('propagates schemaAvailable (ref checks vs type checks depend on it)', () => {
     expect((summarizeTraits(TRAITS, false) as { schemaAvailable: boolean }).schemaAvailable).toBe(false);
   });
+
+  // #648 — this branch used to report `traitCount: 0` for an EMPTY registry unconditionally, which
+  // reads as an ANSWER ("this project has zero traits") — exactly the sibling of the bug already
+  // fixed on the name= branch below ("an EMPTY registry is NO_RENDERER, never 'unknown trait'").
+  // An empty registry from a cold-start/reloading editor means we know NOTHING, not that the
+  // project genuinely has zero traits.
+  it('a bare call on an EMPTY registry that was never pushed is NO_RENDERER, not traitCount:0', () => {
+    const d = summarizeTraits({}, false) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NO_RENDERER');
+    expect(d.error.why).toContain('EMPTY');
+  });
+
+  it('…same for schemaAvailable undefined (an older backend that never sent the field)', () => {
+    const d = summarizeTraits({}, undefined) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NO_RENDERER');
+  });
+
+  it('an EMPTY registry refuses even when schemaAvailable is TRUE — zero traits is never a real answer', () => {
+    // Deliberately the same rule as the `name=` branch (which also refuses on empty regardless of
+    // the flag). The engine registers its own core traits (Transform, EntityAttributes, …) on
+    // every boot, so an empty registry means the push has not happened, whatever the flag says —
+    // and `traitCount: 0` would be read as "this project has no traits". Keeping the two branches
+    // identical is also what stops them drifting apart (§9).
+    const d = summarizeTraits({}, true) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NO_RENDERER');
+  });
+
+  it('a NON-empty registry is reported normally — the guard must not over-refuse', () => {
+    const d = summarizeTraits(TRAITS, true) as { traitCount: number; byCategory: Record<string, string[]> };
+    expect(d.traitCount).toBeGreaterThan(0);
+  });
+
+  // #648 review follow-up: the first cut of the empty-registry guard sat BELOW the `q.all` early
+  // return, so `all=true` still answered a cheerful success carrying `{traits:{}}` — the same
+  // "this project has zero traits" lie, on the exact call an agent makes when it wants every
+  // schema before a setTrait.
+  it('all=true ALSO refuses an empty registry — it must not slip past the guard', () => {
+    const d = summarizeTraits({}, false, { all: true }) as { error: ToolErrorDetail };
+    expect(d.error.code).toBe('NO_RENDERER');
+    expect(d.error.what).toMatch(/every registered ECS trait/);
+  });
+
+  it('all=true still returns every schema when the registry is populated', () => {
+    const d = summarizeTraits(TRAITS, true, { all: true }) as { traits: Record<string, TraitSchema> };
+    expect(Object.keys(d.traits).length).toBeGreaterThan(0);
+  });
 });
 
 describe('summarizeTraits — name= returns exactly one schema', () => {

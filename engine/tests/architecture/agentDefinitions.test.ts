@@ -27,7 +27,16 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { REPO_ROOT, hasAgentDefinitions } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
+
+/** Agent definitions and the runbooks that name them are Markdown — the doc TEXT is what these
+ *  assertions are about, and Markdown carries no comment syntax a scan could be blinded by. */
+const AGENT_MD_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the agent definitions and runbook prose ARE the subject',
+} as const;
 
 const AGENT_DIR = path.join(REPO_ROOT, '.claude', 'agents');
 
@@ -45,7 +54,7 @@ function parseAgents(): Def[] {
     .readdirSync(AGENT_DIR)
     .filter((f) => f.endsWith('.md'))
     .map((file) => {
-      const raw = fs.readFileSync(path.join(AGENT_DIR, file), 'utf8');
+      const raw = readScannedSource(path.join(AGENT_DIR, file), AGENT_MD_AS_PROSE).raw;
       const m = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(raw);
       if (!m) return { file, name: '', body: '', fm: {} };
       const fm: Record<string, string> = {};
@@ -60,16 +69,18 @@ function parseAgents(): Def[] {
 /** Every place that may NAME an agent and expect it to be spawnable. */
 function referencingFiles(): string[] {
   const out = [path.join(REPO_ROOT, 'CLAUDE.md')];
-  const skillsDir = path.join(REPO_ROOT, '.claude', 'skills');
-  if (fs.existsSync(skillsDir)) {
-    const walk = (d: string): void => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name.endsWith('.md')) out.push(p);
-      }
-    };
-    walk(skillsDir);
+  // Enumerated through the ONE shared producer (#799/#771/#805), like every other corpus in the
+  // repo. `.claude/skills/**` is tracked content, so git can enumerate it — it is not the
+  // build-output or scratch-dir case that genuinely cannot use the producer.
+  //
+  // `floor: 0` because this is module-adjacent and `.claude/` is one of the directories
+  // `scripts/publish-engine-oss.sh` does NOT ship: on the public OSS snapshot there are no skills
+  // at all, and a throw there would fail collection rather than let the guard scan just CLAUDE.md.
+  // The suite gates on `hasAgentDefinitions()` (see the `describe.skipIf` below), and the snapshot
+  // ships neither `.claude/agents` nor `.claude/skills` — so an empty result here is an expected
+  // state, not a broken enumeration.
+  for (const { abs } of repoFiles({ under: '.claude/skills', match: /\.md$/, floor: 0 })) {
+    out.push(abs);
   }
   return out.filter((f) => fs.existsSync(f));
 }
@@ -117,7 +128,7 @@ describe.skipIf(!hasAgentDefinitions())('.claude/agents definitions are reachabl
     const dangling: string[] = [];
     let referenced = 0;
     for (const file of referencingFiles()) {
-      const text = fs.readFileSync(file, 'utf8');
+      const text = readScannedSource(file, AGENT_MD_AS_PROSE).raw;
       for (const m of text.matchAll(REPO_AGENT_NAME)) {
         referenced++;
         if (!defined.has(m[1])) {

@@ -82,7 +82,7 @@ A sweep of every per-frame motion source found:
 | **Skeletal anim** (`scene3DSync.ts` → `mixer.update`) | **its own `performance.now()` delta** | ❌ **offender** |
 
 Consequences that drive the Phase 1 redesign below:
-- **Skeletal bypasses `Time` entirely** (`scene3DSync.ts:636-642`) — so it ignores Pause
+- **Skeletal bypasses `Time` entirely** (`scene3DSync.ts`) — so it ignores Pause
   (skeletal characters keep animating while the game is paused) *and* can't be stepped
   deterministically. This is a live bug, not just a determinism gap.
 - **No `timeScale`** — there is no engine concept of game-time control, so pause / slow-mo /

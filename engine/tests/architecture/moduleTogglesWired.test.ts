@@ -29,6 +29,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
  *  (no camel boundary before a digit, so it does NOT become `RENDER_3D`). */
@@ -36,27 +38,18 @@ function defineName(key: string): string {
   return `__MODOKI_MODULE_${key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase()}__`;
 }
 
-/** Strip comments so a MENTION cannot masquerade as a branch.
+/** Comment stripping is the shared scanner (`@modoki/engine/testing`, #419).
  *
- *  This is the guard's own #256, caught in its close-out review: the check was a bare
+ *  Why this guard strips at all — its own #256, caught in close-out review: the check was a bare
  *  `includes`, and `app/sharedRegistry.ts` names `__MODOKI_MODULE_RENDER3D__` in a doc comment
  *  explaining the DCE. That comment counted as a consumer. Both render keys have real branches
- *  too, so nothing was wrong — but the guard would have stayed GREEN if the last real branch
- *  were deleted and the comment left behind, which is exactly the failure it exists to catch.
+ *  too, so nothing was wrong — but the guard would have stayed GREEN if the last real branch were
+ *  deleted and the comment left behind, which is exactly the failure it exists to catch.
  *
- *  `//` preceded by `:` is left alone so a `https://…` inside a string literal does not eat the
- *  rest of its line. Erring here costs a false FAIL (loud, and the fix is obvious), never a
- *  false pass.
- *
- *  What this still does NOT prove: that the surviving mention is a REACHABLE branch. An unused
- *  `const x = __MODOKI_MODULE_FOO__` and a file nobody imports both still count — catching those
- *  needs the import graph and an AST, which `render3dBoundary.test.ts` has and this does not.
- *  The gap is narrow and stated rather than papered over. */
-export function stripComments(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
-}
+ *  ⚠️ **What this still does NOT prove: that the surviving mention is a REACHABLE branch.** An
+ *  unused `const x = __MODOKI_MODULE_FOO__` and a file nobody imports both still count — catching
+ *  those needs the import graph and an AST, which `render3dBoundary.test.ts` has and this does
+ *  not. The gap is narrow and stated rather than papered over. */
 
 /** The files that DEFINE or DECLARE the defines. A mention here is not a consumer. */
 const DEFINITION_SITES = new Set([
@@ -67,26 +60,18 @@ const DEFINITION_SITES = new Set([
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'coverage', '.git', 'tests', 'e2e']);
 
-function collectSources(dir: string, out: string[]): void {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) collectSources(full, out);
-    else if ((full.endsWith('.ts') || full.endsWith('.tsx')) && !full.endsWith('.d.ts')) out.push(full);
-  }
-}
-
+/** Every `.ts`/`.tsx` (non-declaration) source under `engine/`, via the shared corpus producer
+ *  (#799/#771/#805 Phase 4). Floored well under the 1011 measured today. */
 const sources = (() => {
-  const out: string[] = [];
-  collectSources(path.join(REPO_ROOT, 'engine'), out);
-  return out
-    .map((f) => path.relative(REPO_ROOT, f).split(path.sep).join('/'))
+  return repoFiles({
+    under: path.join(REPO_ROOT, 'engine'),
+    match: (rel: string) => {
+      if (!/\.tsx?$/.test(rel) || rel.endsWith('.d.ts')) return false;
+      return !rel.split('/').some((s) => s.startsWith('.') || SKIP_DIRS.has(s));
+    },
+    floor: 700,
+  })
+    .map(({ rel }) => rel)
     .filter((rel) => !DEFINITION_SITES.has(rel));
 })();
 
@@ -97,12 +82,13 @@ describe('build.modules toggles are wired in both directions', () => {
     expect(MODULE_KEYS.length).toBeGreaterThan(0);
   });
 
-  it('stripComments removes mentions without eating code or URLs', () => {
-    expect(stripComments('/** __MODOKI_MODULE_X__ */ const a = 1;')).not.toContain('__MODOKI_MODULE_X__');
-    expect(stripComments('// gate on __MODOKI_MODULE_X__\nconst a = 1;')).not.toContain('__MODOKI_MODULE_X__');
-    expect(stripComments('if (__MODOKI_MODULE_X__) go();')).toContain('__MODOKI_MODULE_X__');
-    // A protocol's `//` must not swallow the rest of its line.
-    expect(stripComments("const u = 'https://x.dev'; if (__MODOKI_MODULE_X__) go();")).toContain('__MODOKI_MODULE_X__');
+  // The scanner's own self-test (four inline snippets) now lives in sourceScanner.test.ts (#419).
+
+  it('the comment scan is sane over every collected source file', () => {
+    for (const rel of sources) {
+      const raw = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
   });
 
   it.each(MODULE_KEYS)('%s actually has a define emitted for it', (key) => {
@@ -133,7 +119,7 @@ describe('build.modules toggles are wired in both directions', () => {
 
   it('the Engine Modules panel offers exactly the keys MODULE_KEYS resolves', () => {
     const panelPath = 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx';
-    const src = fs.readFileSync(path.join(REPO_ROOT, panelPath), 'utf8');
+    const src = readScannedSource(path.join(REPO_ROOT, panelPath)).code;
     const start = src.indexOf('const MODULES');
     expect(start, `${panelPath} no longer declares a MODULES array — this guard needs updating`).toBeGreaterThan(-1);
     const block = src.slice(start, src.indexOf('\n];', start));

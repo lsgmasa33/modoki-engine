@@ -40,46 +40,30 @@ export const makeEntitySpec = () => z.object({
   name: z.string().optional(),
   id: z.number().optional(),
   surface: z.enum(['game-3d', 'game-2d', 'scene-view', 'game-ui']).optional()
-    .describe("Which on-screen surface to aim in. REQUIRED for a 2D/3D entity — including when " +
-      'only one viewport has it. For a UI entity it is OPTIONAL but becomes REQUIRED when the ' +
-      "entity resolves to more than one DOM node: the editor mounts a UI renderer in BOTH the " +
-      "Scene panel's preview frame ('scene-view') and the Game panel ('game-ui'), so with both " +
-      'open every full-screen overlay, modal and HUD button has two live nodes and the aim is ' +
-      'refused until you say which. A shipped game (and an editor with one host mounted) has ' +
-      'exactly one node, where it stays optional. A 2D/3D entity is often on screen TWICE: with the Scene and Game panels both ' +
-      'open, each measures it through its own camera. "Author it in the SceneView" and "play it ' +
-      'in the GameView" are different intents, so stating which is how a call keeps meaning the ' +
-      'same thing when the layout changes — and how a wrong assumption becomes a refusal that ' +
-      "names the real surfaces instead of a success on the wrong viewport. 'scene-view' = the " +
-      "editor authoring viewport (3D/2D authoring AND the UI preview frame); 'game-3d'/'game-2d' " +
-      "= the running game's canvases; 'game-ui' = the running game's DOM UI layer."),
+    .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
+      'viewport shows it. For a UI entity it is optional until the entity resolves to more than ' +
+      'one DOM node — the editor mounts a UI host in BOTH the Scene panel preview and the Game ' +
+      "panel — and then required. 'scene-view' = the editor authoring viewport, including its UI " +
+      "preview frame; 'game-3d'/'game-2d' = the running game's canvases; 'game-ui' = its DOM UI " +
+      'layer. Why it must be stated rather than guessed: docs/debug-tools-mcp.md § Aiming.'),
   allowOccluded: z.boolean().optional()
-    .describe('Aim at the entity even when the surface\'s own hit-test says something else is ' +
-      'in front of it, and report what was actually hit. Default false: an occluded `entity` ' +
-      'aim on a surface with a pick provider (`occlusionScope:\'entity\'`) is a REFUSAL, not a ' +
-      'flag — "click the character" failed if the game would not select that character (the ' +
-      'character-behind-a-wall case). Pass true as the "click it anyway and see what happens" ' +
-      'escape hatch. It applies on EVERY scope: a covered aim is refused whether the cover is ' +
-      'another entity (the picker saw it) or a DOM element over the viewport — a modal, a menu, ' +
-      'a panel — because the press lands on that either way. What the scope still tells you is ' +
-      'how far the check could SEE: on `occlusionScope:\'canvas\'` only DOM covering was ' +
-      'checked, so a mesh in front of the target is not detected at all.'),
+    .describe('Aim at the entity even when the surface\'s own hit-test says something else is in ' +
+      'front of it, and report what was actually hit. Default false — a covered aim is a REFUSAL ' +
+      'on EVERY scope, whether the cover is another entity or a DOM element over the viewport (a ' +
+      'modal, a menu, a panel), because the press lands on it either way. `occlusionScope` in the ' +
+      'response says how far the check could SEE.'),
 }).describe(
-  'Aim at a SCENE ENTITY by {guid} | {name} | {id} — resolved to its live screen rect INSIDE ' +
-  'this call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on ' +
-  'every scene reload. A name matching several entities is REFUSED (not first-match). A 2D/3D ' +
-  'entity additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted ' +
-  'in more than one panel. The response reports ' +
-  '`entity` (who resolved), `surface` (WHICH on-screen copy was aimed at), `occluded`, and ' +
-  '`occlusionScope`: "element" for a UI entity (a real DOM comparison — trustworthy); "entity" ' +
-  'for a 2D/3D entity on a surface with a registered pick provider, where the surface\'s own ' +
-  'hit-test was asked what a click would actually select — a mesh in front of the target IS ' +
-  'detected, and by default REFUSES the aim (see `allowOccluded`); "canvas" for a 2D/3D entity ' +
-  'with no pick provider registered, where only DOM-level covering is detected and a mesh in ' +
-  'front of the target is NOT. The response also reports `aimedAt` ("centre" | "sampled" — ' +
-  'whether the projected rect\'s centre picked the target or a concave/hollow shape needed a ' +
-  'sampled point instead) and `occludedByEntity` (who is actually there) on the "entity" scope. ' +
-  'Overrides `selector` and x/y.');
+  'Aim at a SCENE ENTITY by {guid} | {name} | {id}, resolved to its live screen rect INSIDE this ' +
+  'call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on every ' +
+  'scene reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
+  'additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted in more ' +
+  'than one panel. Overrides `selector` and x/y. The response reports `entity`, `surface` (WHICH ' +
+  'on-screen copy was aimed at), `aimedAt` ("centre" | "sampled"), `occluded`, ' +
+  '`occludedByEntity` and `occlusionScope` — "element" (UI: a real DOM comparison, trustworthy), ' +
+  '"entity" (the surface\'s own hit-test ran, so a mesh in front IS detected and REFUSES the aim ' +
+  'by default — see `allowOccluded`), or "canvas" (no pick provider: DOM covering only, a mesh ' +
+  'in front is NOT detected, so a clear result proves less). Detail: docs/debug-tools-mcp.md ' +
+  '§ Aiming.');
 
 /** The one description of the occlusion escape hatch, shared by every aimed input tool — a rule
  *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2). */
@@ -173,9 +157,17 @@ export const precisionParam = (fields?: string) => z.number().int().nonnegative(
 
 /** `force` — "proceed even though the editor has unsaved work", in ONE wording.
  *
- *  Shared by the three tools that build an artifact FROM THE FILES while the live world holds edits
- *  the files do not have (§8's REQUIRES_SAVE rule), around one identical and load-bearing
- *  consequence: the thing you ship does not contain your work.
+ *  Shared by the five tools that work FROM THE FILES while the editor holds edits the files do not
+ *  have (§8's REQUIRES_SAVE rule), around one identical and load-bearing consequence: the thing
+ *  you produce does not contain your work.
+ *
+ *  ⚠️ **The wording was ARTIFACT-SPECIFIC and is no longer** (#872/#882). It said "the artifact is
+ *  built from the FILES", which was true of the original three (`build`/`add_native_target`/
+ *  `ota_publish`) and false of the two that joined them: `modoki_reimport_asset` bakes an asset
+ *  from a `.meta.json` it reads off disk, and `modoki_duplicate_asset` copies one. Same rule, same
+ *  consequence, no artifact — so the shared string now names the CAUSE (this reads disk) rather
+ *  than one family's output. Widening the wording was the alternative to five tools stating one
+ *  rule two ways, which is exactly the drift §2's containment guard exists to catch.
  *
  *  NO PER-TOOL VERB any more. It used to interpolate "Build"/"Scaffold"/"Publish", which reads
  *  nicely and cost the surface its guard: §2's containment check requires every variant of a
@@ -187,11 +179,11 @@ export const precisionParam = (fields?: string) => z.number().int().nonnegative(
  *  With the destructive half renamed to `discardUnsaved`, `force` now means exactly one thing
  *  everywhere it appears, and the guard polices it instead of an exemption list. */
 export const unsavedForceParam = z.boolean().optional().describe(
-  'Proceed even though the editor has unsaved live-world changes. The artifact is built from the '
-  + 'FILES, so it will NOT contain them — this proceeds anyway rather than refusing. Prefer '
-  + 'modoki_save_all first; use this only when you mean to ship the last saved state. '
-  + 'NON-DESTRUCTIVE: your unsaved work is left alone, merely not included — which is why THIS one '
-  + 'keeps the name `force`. The world-swapping tools that destroy it call theirs `discardUnsaved`.',
+  'Proceed even though the editor has unsaved work this operation cannot see. It works from what '
+  + 'is on DISK, so your unsaved changes will NOT be included — this proceeds anyway rather than '
+  + 'refusing. Prefer modoki_save_all first; use this only when you mean to work from the last '
+  + 'saved state. NON-DESTRUCTIVE: your unsaved work is left alone, merely not used — which is why '
+  + 'THIS one keeps the name `force`. The tools that DESTROY it call theirs `discardUnsaved`.',
 );
 
 /** `discardUnsaved` — shared by the three tools that SWAP THE WORLD and destroy live work.
@@ -212,12 +204,25 @@ export const unsavedForceParam = z.boolean().optional().describe(
  *  Found by the close-out sweep after `modoki_render_sequence.force` was renamed for the same
  *  rule — the sibling, and the one with the worse consequence.
  *  `docs/mcp-tool-conventions.md` §2. */
+/** ⚠️ **The base was WORLD-SWAP-SPECIFIC and is no longer** (#872). It opened "Swap the world even
+ *  though…" and ended "…AND from the undo stack" — true of the three world-swapping tools, false of
+ *  `modoki_write_asset_meta`, which swaps nothing and destroys a parked `.meta.json` edit that was
+ *  never on the undo stack in the first place.
+ *
+ *  §2's containment guard is what forces the resolution, and it forces the RIGHT one: every variant
+ *  of a 3+-tool param must contain the shortest verbatim, so a fourth tool cannot quietly restate
+ *  the rule its own way, and it cannot be given a different NAME either — same consequence, same
+ *  name. The base therefore states the CONSEQUENCE (unsaved editor work is destroyed) and each tool
+ *  appends what that work is for it. */
 export const DISCARD_UNSAVED_BASE =
-  'Swap the world even though it has unsaved live-world changes. ⚠️ DESTRUCTIVE and IRREVERSIBLE: '
-  + 'those changes are gone — from the world, from the file, AND from the undo stack. Prefer '
-  + 'modoki_save_all first. This is the param that used to be called `force`; it was renamed '
-  + 'because `force` on modoki_build / modoki_add_native_target / modoki_ota_publish destroys '
-  + 'NOTHING, and one word cannot mean both';
+  'Proceed even though this DESTROYS unsaved editor work. ⚠️ DESTRUCTIVE and IRREVERSIBLE: what '
+  + 'it destroys is gone — from the editor, from the file, and from the undo stack. It destroys '
+  + 'only what THIS operation overwrites or replaces, NOT everything the editor is holding: a '
+  + 'world swap leaves a parked .meta.json import-settings edit untouched, and a sidecar write '
+  + 'leaves the live world untouched — so this is never a way to clear an unrelated '
+  + 'REQUIRES_SAVE. Prefer modoki_save_all first. This is the param that used to be called '
+  + '`force`; it was renamed because `force` on modoki_build / modoki_add_native_target / '
+  + 'modoki_ota_publish destroys NOTHING, and one word cannot mean both';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
 /** A factory for the same `$ref`-dedup reason as `makeEntitySpec` above — `modoki_drag` uses this

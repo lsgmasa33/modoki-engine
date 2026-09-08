@@ -230,15 +230,154 @@ describe('sync', () => {
     expect(getTool('modoki_tap')).toBeDefined();
   });
 
-  it('drops every game tool when the backend stops answering', async () => {
+  // Hysteresis (#475, Phase 2): a page reload from a game-code edit takes the renderer down and
+  // back within a handful of polls, and tearing down on the first miss turns that blip into a
+  // `tools/list_changed` — which invalidates the whole prompt cache, since `tools` renders first
+  // in the cache prefix. So teardown now waits for UNREACHABLE_GRACE_POLLS consecutive misses.
+  it('does NOT drop game tools on a single unreachable poll', async () => {
     let up = true;
     const h = harness(() => (up ? { body: { version: 1, tools: [decl()] } } : { status: 504, body: { error: 'no renderer' } }));
     await h.sync.refresh();
     expect(h.sync.active()).toEqual(['court_load_level']);
     up = false;
     const r = await h.sync.refresh();
+    // Still registered — this is the whole point of the grace window — and `registered` reports
+    // the truth (still live), not a hardcoded [].
+    expect(r.reachable).toBe(false);
+    expect(r.registered).toEqual(['court_load_level']);
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    expect(toolNames()).toContain('court_load_level');
+  });
+
+  it('drops every game tool after 3 consecutive unreachable polls', async () => {
+    let up = true;
+    const h = harness(() => (up ? { body: { version: 1, tools: [decl()] } } : { status: 504, body: { error: 'no renderer' } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    up = false;
+    await h.sync.refresh(); // failure 1 — still held
+    await h.sync.refresh(); // failure 2 — still held
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    const r = await h.sync.refresh(); // failure 3 — teardown
     // A tool that stays advertised after its editor is gone answers 504 forever — worse than absent.
     expect(r.registered).toEqual([]);
+    expect(h.sync.active()).toEqual([]);
+    expect(toolNames()).not.toContain('court_load_level');
+  });
+
+  it('resets the grace counter on a success, so it takes 3 MORE misses to tear down', async () => {
+    let mode: 'up' | 'down' = 'up';
+    const h = harness(() => (mode === 'up' ? { body: { version: 1, tools: [decl()] } } : { status: 504, body: { error: 'no renderer' } }));
+    await h.sync.refresh();
+    mode = 'down';
+    await h.sync.refresh(); // failure 1
+    await h.sync.refresh(); // failure 2
+    mode = 'up';
+    await h.sync.refresh(); // a success — resets the counter
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    mode = 'down';
+    await h.sync.refresh(); // failure 1 (post-reset)
+    await h.sync.refresh(); // failure 2 (post-reset)
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    await h.sync.refresh(); // failure 3 (post-reset) — now it tears down
+    expect(h.sync.active()).toEqual([]);
+  });
+
+  // Shrink-to-zero (#475 follow-up): a 200 carrying `{tools: []}` is a SUCCESS, not an unreachable
+  // poll — measured on a live editor across a page reload, `reachable` never went false, but the
+  // tool list briefly did. `onUnreachable()` alone never sees this case, because the fetch succeeds
+  // and `decls` is just empty; it needs its own grace door.
+  it('does NOT drop game tools on a single empty-200 poll', async () => {
+    let empty = false;
+    const h = harness(() => (empty ? { body: { version: 1, tools: [] } } : { body: { version: 1, tools: [decl()] } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    empty = true;
+    const r = await h.sync.refresh();
+    // Still registered, and reachable is TRUE — the backend answered, it just had nothing to say.
+    expect(r.reachable).toBe(true);
+    expect(r.registered).toEqual(['court_load_level']);
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    expect(toolNames()).toContain('court_load_level');
+  });
+
+  it('drops every game tool after 3 consecutive empty-200 polls', async () => {
+    let empty = false;
+    const h = harness(() => (empty ? { body: { version: 1, tools: [] } } : { body: { version: 1, tools: [decl()] } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    empty = true;
+    await h.sync.refresh(); // empty 1 — still held
+    await h.sync.refresh(); // empty 2 — still held
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    const r = await h.sync.refresh(); // empty 3 — teardown
+    expect(r.registered).toEqual([]);
+    expect(h.sync.active()).toEqual([]);
+    expect(toolNames()).not.toContain('court_load_level');
+  });
+
+  it('a tool-bearing 200 inside the empty-window resets the counter', async () => {
+    let mode: 'up' | 'empty' = 'up';
+    const h = harness(() => (mode === 'up' ? { body: { version: 1, tools: [decl()] } } : { body: { version: 1, tools: [] } }));
+    await h.sync.refresh();
+    mode = 'empty';
+    await h.sync.refresh(); // empty 1
+    await h.sync.refresh(); // empty 2
+    mode = 'up';
+    await h.sync.refresh(); // a tool-bearing success — resets the counter
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    mode = 'empty';
+    await h.sync.refresh(); // empty 1 (post-reset)
+    await h.sync.refresh(); // empty 2 (post-reset)
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    await h.sync.refresh(); // empty 3 (post-reset) — now it tears down
+    expect(h.sync.active()).toEqual([]);
+  });
+
+  // The end-to-end reload shape this whole fix exists for: 7 tools → 0 tools → 7 tools across
+  // three consecutive polls (the setup() gap: renderer up, registerCourtAgentTools() not run yet).
+  // Zero unregisters must happen anywhere in the sequence — that's what proves no
+  // `tools/list_changed` would have fired mid-reload.
+  it('survives a 7 tools → 0 tools → 7 tools reload with no teardown at any point', async () => {
+    const seven = Array.from({ length: 7 }, (_, i) => decl({ name: `court_tool_${i}` }));
+    let mode: 'full' | 'empty' = 'full';
+    const h = harness(() => (mode === 'full' ? { body: { version: 1, tools: seven } } : { body: { version: 0, tools: [] } }));
+
+    await h.sync.refresh();
+    expect(h.sync.active().sort()).toEqual(seven.map((d) => d.name).sort());
+
+    mode = 'empty';
+    const r1 = await h.sync.refresh(); // the reload gap: 200, zero tools
+    expect(r1.reachable).toBe(true);
+    expect(h.sync.active().sort()).toEqual(seven.map((d) => d.name).sort());
+
+    mode = 'full';
+    const r2 = await h.sync.refresh(); // registerCourtAgentTools() has now run
+    expect(r2.registered.sort()).toEqual(seven.map((d) => d.name).sort());
+    // The INTERMEDIATE assertion is what proves this — `removeAll()` clears `registered`, so a
+    // teardown-and-rebuild cannot leave the tools visible mid-sequence. Asserting only the final
+    // state would pass vacuously, since a rebuild also ends at 7. (Handle IDENTITY is not checked.)
+    for (const d of seven) expect(toolNames()).toContain(d.name);
+  });
+
+  // Guard against over-applying the grace: a non-empty schema CHANGE is not a shrink, and must
+  // still reconcile on the very next poll.
+  it('still reconciles a non-empty schema change immediately, without waiting on the grace window', async () => {
+    let params: Record<string, unknown> = { levelId: { type: 'string', description: 'the guid' } };
+    const h = harness(() => ({ body: { version: 1, tools: [decl({ params })] } }));
+    await h.sync.refresh();
+    expect((h.registered.get('court_load_level')!.inputSchema as z.ZodTypeAny).safeParse({ index: 2 }).success).toBe(false);
+    params = { index: { type: 'number', description: 'i', int: true } };
+    const r = await h.sync.refresh();
+    expect(r.registered).toEqual(['court_load_level']);
+    expect((h.registered.get('court_load_level')!.inputSchema as z.ZodTypeAny).safeParse({ index: 2 }).success).toBe(true);
+  });
+
+  it('stop() still tears down immediately, without waiting for the grace window', async () => {
+    const h = harness(() => ({ body: { version: 1, tools: [decl()] } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+    h.sync.stop();
     expect(h.sync.active()).toEqual([]);
     expect(toolNames()).not.toContain('court_load_level');
   });
@@ -290,6 +429,73 @@ describe('sync', () => {
     const r = await h.sync.refresh();
     expect(r.registered).toEqual(['court_load_level']);
     expect(Object.keys(r.refused)).toHaveLength(1);
+  });
+
+  // #648 — a bare `null` element (distinct from the well-formed-but-nameless object case above)
+  // used to reach `fingerprint()` BEFORE the per-element `!d` guard ever ran: `t.name` on `null`
+  // threw a TypeError straight out of `refresh()`. Called directly (as here, not through `tick()`'s
+  // own poll `catch`) that surfaces as a REJECTED promise — the whole surface died over one bad
+  // element, breaking gameTools.ts's own stated contract ("a refused tool is reported, not dropped
+  // quietly") for every well-formed declaration in the same reply.
+  it('a bare null element does not take the whole poll down — valid tools still register', async () => {
+    const h = harness(() => ({ body: { version: 1, tools: [decl(), null, decl({ name: 'court_b' })] } }));
+    const r = await h.sync.refresh();
+    expect(r.registered.sort()).toEqual(['court_b', 'court_load_level']);
+    expect(Object.keys(r.refused)).toHaveLength(1);
+    expect(h.sync.active().sort()).toEqual(['court_b', 'court_load_level']);
+  });
+
+  // #648 review follow-up — these two guard the FIX's own regressions, not the original bug. Both
+  // need MORE THAN ONE refresh(), which is exactly why the single-call test above could not see
+  // them: partitioning the malformed entries out made every downstream decision read a set that no
+  // longer matched the one being reasoned about.
+  it('keeps reporting a malformed declaration on a STEADY-STATE poll (it is not fingerprinted away)', async () => {
+    // Fingerprinting `validDecls` alone meant a malformed element never changed the print, so the
+    // `print === lastPrint` early return handed back `lastRefused` — and `refused` is rebuilt per
+    // call and was never assigned. The bad declaration was therefore reported on NO poll, ever.
+    let tools: unknown[] = [decl()];
+    const h = harness(() => ({ body: { version: 1, tools } }));
+
+    const first = await h.sync.refresh();
+    expect(first.registered).toEqual(['court_load_level']);
+    expect(Object.keys(first.refused)).toHaveLength(0);
+
+    tools = [decl(), null];                       // the backend starts sending a bad element
+    const second = await h.sync.refresh();
+    expect(second.registered).toEqual(['court_load_level']);
+    expect(Object.keys(second.refused), 'a malformed decl must be REPORTED, not silently dropped').toHaveLength(1);
+
+    const third = await h.sync.refresh();         // and it must keep being reported while it persists
+    expect(Object.keys(third.refused)).toHaveLength(1);
+
+    tools = [decl()];                             // ...and stop once the backend stops sending it
+    const fourth = await h.sync.refresh();
+    expect(Object.keys(fourth.refused), 'a refusal must not outlive the declaration that caused it').toHaveLength(0);
+    expect(fourth.registered).toEqual(['court_load_level']);
+  });
+
+  it('an ALL-malformed poll gets the shrink-to-zero grace, not an instant teardown', async () => {
+    // The grace window still keyed on the raw `decls` while everything downstream keyed on
+    // `validDecls`: `{tools:[null]}` has decls.length === 1, so the guard was skipped and a SINGLE
+    // corrupt poll called removeAll() on every registered game tool. `{tools:[]}` would have been
+    // given grace; the two are the same event as far as the usable set is concerned.
+    let tools: unknown[] = [decl()];
+    const h = harness(() => ({ body: { version: 1, tools } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+
+    tools = [null];
+    await h.sync.refresh();
+    expect(h.sync.active(), 'one corrupt poll must not tear the surface down').toEqual(['court_load_level']);
+  });
+
+  it('two null elements are reported as TWO refusals, not collapsed into one', async () => {
+    // `decls.indexOf(d)` returns the FIRST match for identical primitives, so both nulls wrote the
+    // same `(malformed #0)` key and one of them vanished.
+    const h = harness(() => ({ body: { version: 1, tools: [decl(), null, null] } }));
+    const r = await h.sync.refresh();
+    expect(r.registered).toEqual(['court_load_level']);
+    expect(Object.keys(r.refused)).toHaveLength(2);
   });
 
   // The SEAM, and the one claim in gameTools.ts's own docblock that reading the code can only

@@ -21,7 +21,7 @@ vi.mock('../../src/runtime/loaders/assetUrl', () => ({
 }));
 
 import {
-  acquireFont, releaseFontsForScene, getLoadedFont, getFontOwnerCounts, disposeAllFonts,
+  acquireFont, releaseFontsForScene, getLoadedFont, getFontOwnerCounts, disposeAllFonts, invalidateFont,
 } from '../../src/runtime/loaders/fontAtlasLoader';
 
 const METRICS = {
@@ -175,5 +175,90 @@ describe('the unresolvable-font warning forgets a guid that later resolves (QA-A
       expect(await acquireFont(1, 'font-late')).toBeNull();
       expect(warn).toHaveBeenCalledTimes(2);                     // warns AGAIN, not silently
     } finally { warn.mockRestore(); missingGuids.clear(); }
+  });
+});
+
+/** #856 — `acquireFont`'s liveness capture/`invalidateFont`/`releaseFontsForScene`'s per-guid
+ *  drop used a SHARED, module-wide generation (`liveness.capture()` / `liveness.invalidateAll()`),
+ *  not one keyed by guid. So invalidating/releasing font A superseded every OTHER font's in-flight
+ *  acquire in the same module — this matters because `ensureFontLoaded` is called per frame from
+ *  `Scene2D.tsx`/`scene3DSync.ts`, so a live unrelated acquire genuinely can be in flight at the
+ *  same time. Per-key now: `invalidateFont(guid)` invalidates only that guid's own key. Mirrors
+ *  the reference fix in `spriteMaterialCache.invalidateShader` (#852). */
+describe('fontAtlasLoader liveness generation (#856 per-key)', () => {
+  /** Fetch, gated PER URL (not the single shared gate `mockFetchOnce` uses) so two concurrent
+   *  `acquireFont` calls can be resolved independently and in a chosen order. "get-or-create" on
+   *  both `resolveMatching` and the fetch handler, so it doesn't matter which runs first. */
+  function mockFetchGatedByUrl() {
+    const gates = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+    function gateFor(url: string) {
+      let g = gates.get(url);
+      if (!g) {
+        let resolve!: () => void;
+        const promise = new Promise<void>(r => { resolve = r; });
+        g = { promise, resolve };
+        gates.set(url, g);
+      }
+      return g;
+    }
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      await gateFor(url).promise;
+      return completeResponse({ ok: true, json: async () => METRICS });
+    }));
+    return {
+      resolveMatching(substr: string) {
+        const matches = [...gates.keys()].filter(u => u.includes(substr));
+        if (matches.length === 0) throw new Error(`no in-flight fetch matching "${substr}" — call acquireFont first`);
+        for (const u of matches) gateFor(u).resolve();
+      },
+    };
+  }
+
+  it('invalidating font A does not discard font B\'s unrelated in-flight acquire', async () => {
+    const gated = mockFetchGatedByUrl();
+
+    const pA = acquireFont(1, 'font-a'); // in flight
+    const pB = acquireFont(1, 'font-b'); // in flight, concurrently
+
+    invalidateFont('font-a'); // must supersede ONLY font-a's in-flight acquire
+
+    gated.resolveMatching('font-b');
+    const resultB = await pB;
+
+    // font-b was never invalidated — its own acquire lands normally.
+    expect(resultB).not.toBeNull();
+    expect(getLoadedFont('font-b')).toBe(resultB);
+
+    // Let font-a settle too so nothing is left hanging.
+    gated.resolveMatching('font-a');
+    await pA;
+  });
+
+  it('invalidating font A still discards its OWN in-flight acquire', async () => {
+    const gated = mockFetchGatedByUrl();
+
+    const pA = acquireFont(1, 'font-a'); // in flight
+
+    invalidateFont('font-a'); // same key — must supersede this in-flight acquire
+
+    gated.resolveMatching('font-a');
+    const result = await pA;
+
+    expect(result).toBeNull();
+    expect(getLoadedFont('font-a')).toBeUndefined();
+  });
+
+  it('full teardown (disposeAllFonts) still supersedes every outstanding acquire', async () => {
+    const gated = mockFetchGatedByUrl();
+
+    const pB = acquireFont(1, 'font-b'); // in flight
+
+    disposeAllFonts();
+
+    gated.resolveMatching('font-b');
+    const result = await pB;
+
+    expect(result).toBeNull();
+    expect(getLoadedFont('font-b')).toBeUndefined();
   });
 });

@@ -20,11 +20,19 @@
  *  while playing are reverted by Stop (snapshot/revert) and Cmd+S is blocked in
  *  play, so runtime state never reaches disk. */
 
-import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, findEntityByGuid, onWorldSwap } from '../core/ecs/world';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { markUIDirty } from './uiTreeStore';
 import { isSimRunning } from '../core/playState';
 import { dispatchUIAction, type UIActionPayload } from '../core/actionRegistry';
+import { rawNow } from '../core/clock';
+import {
+  getActiveUIBusySources, getBusyAccumulatedMs, isBusyWarned, markBusyWarned, resetBusyContinuity,
+} from '../core/uiBusySources';
+import {
+  UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
+} from '../traits/UISettings';
+import { createTeardownToken } from '../core/liveness';
 
 // UIActionEvent/UIActionKind/UIActionBinding are the UIAction trait's own schema — defined in
 // traits/UIAction.ts and re-exported here (not the reverse) so every existing import of these
@@ -45,6 +53,210 @@ export interface ApplyBindingsOptions {
   /** The triggering event's value (slider number, input string) — feeds '$value'
    *  and is passed as ctx.payload to 'call' handlers. */
   eventValue?: UIActionPayload;
+  /** This event stream is CONTINUOUS, not a discrete activation — a range slider's 'change'
+   *  firing repeatedly while the pointer moves, or a controlled text input's 'change' firing
+   *  once per keystroke. Neither takes nor respects the global input lock (#466): blocking a
+   *  slider drag would freeze it mid-drag, and blocking a keystroke stream would DROP
+   *  characters (the write IS what produces the field's value, so a swallowed keystroke is
+   *  lost, not merely delayed). */
+  continuous?: boolean;
+}
+
+// ── Global input lock (#466) ─────────────────────────────────────────────────────
+//
+// A single global lock, not per-button: the owner's explicit override of the issue's own
+// proposal, which asked for a per-button window so a fast tap on a DIFFERENT button still
+// fires. Here it does NOT — every discrete activation (click / submit / a toggle's change)
+// takes and respects the SAME lock, so a double tap anywhere while one action is still
+// settling is swallowed, not just a repeat on the same button.
+//
+// The primary gate is the action COMPLETING (every promise a 'call' binding's handler
+// returned has settled), not a timer — `inputLockMinMs` is only a floor under that, for the
+// common synchronous case where completion is instant. Both knobs are authored on the
+// `UISettings` resource trait, not code constants (CLAUDE.md's authored-values rule): the
+// right value is a feel call, not a fixed constant.
+//
+// A THIRD gate (#530): a game can register a busy PREDICATE (`core/uiBusySources.ts`) instead of
+// making every handler return a promise — the completion gate above is a silent opt-in (a
+// non-thenable return is simply ignored), and a game whose `call` handlers are all synchronous
+// wrappers (Court's `() => fireTap(target)`) gets nothing from it. `isInputLockActive` consults
+// both.
+
+let lockHeld = false;
+let lockAcquiredAt = 0;
+let lockPendingCount = 0;
+let lockPendingNames: string[] = [];
+// Invalidated by every acquireLock()/releaseLock() — a stale promise from an EARLIER lock (one
+// that force-released via the max-ms valve, or was reset by a world swap) must not decrement the
+// pending count of whichever lock is current when it finally settles. Without this, an old
+// promise settling after a NEW activation has acquired its own lock silently releases that new
+// lock early, while its own async handler is still in flight — the exact double-fire this
+// feature exists to prevent. See trackLockPromise and its regression test.
+const lockLiveness = createTeardownToken();
+
+// Busy-window continuity (#530's valve) is now OBSERVED, not inferred: `pollUIBusyContinuity`
+// (registered as a per-frame system, `app/ecs/pipeline.ts`) polls the busy predicates every
+// frame and owns `busyAccumulatedMs`/`busyWarned` in `core/uiBusySources.ts` — this module only
+// reads them. This retires the old activation-sampled gap heuristic (#551): that version could
+// only sample busy state at a discrete UI activation, so it had to INFER continuity between
+// samples via a tuned gap threshold: correct with adjacent-frame polling, there is nothing left
+// to infer.
+
+// Reset on world/scene swap — a lock held by the previous world's action must not carry over
+// and brick the next one. Top-level, matching UINode.tsx:109 / uiValues.ts:56 / focusManager
+// precedent (registered once at module load, not lazily). Routed through releaseLock() (not a
+// duplicate set of field writes) so the swap reset and every other release path bump lockGen
+// identically and can never drift apart.
+onWorldSwap(() => {
+  releaseLock();
+  resetBusyContinuity(); // a busy source registered by the outgoing world's manager must not
+  // carry credited stall time into the next world's first activation
+});
+
+/** Is the lock currently blocking a new discrete activation? A CHECK, not a passive read: an
+ *  expired lock (past `inputLockMaxMs`) is force-released here rather than by a `setTimeout`,
+ *  so nothing depends on a timer firing — the safety valve is just "an old lock reads as free,
+ *  and warns" the next time anyone asks.
+ *
+ *  The max-ms valve is for a HUNG HANDLER, so it must only be consulted when something is
+ *  actually pending — checked BEFORE the pending gate, it fired on an ordinary idle lock with
+ *  nothing outstanding (a plain synchronous 'set'/'call' left the lock sitting held past
+ *  `inputLockMaxMs` with `lockPendingCount === 0`, and the very next tap — however much later —
+ *  hit the valve and warned about a handler that never existed). An idle lock is freed silently
+ *  by the floor branch below instead.
+ *
+ *  Takes the authored window as a parameter rather than reading module state — see
+ *  `readLockWindow` below for why the two knobs are no longer cached at all. */
+function isInputLockActive(lockWindow: { minMs: number; maxMs: number }): boolean {
+  // The busy-source gate (#530) goes FIRST, before `lockHeld` — a busy predicate can start
+  // outside any UI activation at all (Court's sign-in begins from `beginSignIn`, not from a
+  // chrome tap that took the lock), and the 300ms floor below may already have expired while the
+  // underlying work continues. So this must block even an otherwise-idle lock.
+  //
+  // ⚠️ It carries its OWN safety valve, mirroring `lockWindow.maxMs` below — a naive
+  // `if (busyNames.length) return true` would let a predicate stuck true (a real Court case: the
+  // account side can legitimately sit in 'working' for up to its own 60s watchdog) brick ALL UI
+  // input FOREVER, reintroducing exactly the failure `inputLockMaxMs` exists to prevent.
+  // `pollUIBusyContinuity` (a per-frame system) owns tracking how long busy has been continuously
+  // true — this just reads the accumulated total.
+  const busyNames = getActiveUIBusySources();
+  if (busyNames.length > 0) {
+    if (getBusyAccumulatedMs() > lockWindow.maxMs) {
+      if (!isBusyWarned()) {
+        markBusyWarned();
+        console.warn(
+          `[UI input lock] busy-source valve force-released after ${lockWindow.maxMs}ms — stuck busy: `
+          + busyNames.join(', '),
+        );
+      }
+      // Do not reset the accumulator here: the source(s) are still reporting busy, and resetting
+      // would re-arm a fresh window on the very next check instead of recognizing this as the
+      // SAME ongoing stall. It resets only once nothing is busy (owned by `pollUIBusyContinuity`).
+    } else {
+      return true;
+    }
+  }
+
+  if (!lockHeld) return false;
+  const elapsed = rawNow() - lockAcquiredAt;
+  if (lockPendingCount > 0) {
+    if (elapsed > lockWindow.maxMs) {
+      console.warn(
+        `[UI input lock] force-released after ${lockWindow.maxMs}ms — a handler never settled: `
+        + `${lockPendingNames.length ? lockPendingNames.join(', ') : '(no call binding — a stuck set?)'}`,
+      );
+      releaseLock();
+      return false;
+    }
+    return true; // an async 'call' handler hasn't settled yet, and still within the max-ms valve
+  }
+  if (elapsed < lockWindow.minMs) return true; // floor not elapsed yet
+  releaseLock(); // both gates satisfied — free it now rather than waiting to be asked again
+  return false;
+}
+
+function releaseLock(): void {
+  lockHeld = false;
+  lockPendingCount = 0;
+  lockPendingNames = [];
+  lockLiveness.invalidateAll();
+}
+
+// Takes no window: since #543 nothing caches the authored knobs, so the acquire has nothing to
+// snapshot — `isInputLockActive` reads them fresh each time. See `readLockWindow`.
+function acquireLock(): void {
+  lockHeld = true;
+  lockAcquiredAt = rawNow();
+  lockPendingCount = 0;
+  lockPendingNames = [];
+  lockLiveness.invalidateAll();
+}
+
+/** Read and clamp the authored lock window from `UISettings` — the SINGLE place either knob is
+ *  read. Previously `acquireLock` snapshotted these into module-level `lockMinMs`/`lockMaxMs`, but
+ *  the busy-source valve in `isInputLockActive` consults the window BEFORE any activation ever
+ *  calls `acquireLock` (a busy predicate can go true with no preceding tap), so that cache ran on
+ *  the module default for the whole first busy episode of a session, and on the PREVIOUS world's
+ *  value for the first episode after a world swap (#543). Reading fresh at evaluation time instead
+ *  of caching removes the staleness entirely — the cost is one extra `queryFirst` per discrete
+ *  activation, same as the one this replaces. */
+function readLockWindow(world: ReturnType<typeof getCurrentWorld>): { minMs: number; maxMs: number } {
+  const settings = world.queryFirst(UISettings)?.get(UISettings);
+  const minMs = settings?.inputLockMinMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS;
+  const maxMs = settings?.inputLockMaxMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS;
+  // Defend against an authored inversion (min > max) — the Inspector can't express a
+  // cross-field constraint, so `inputLockMinMs: 1000, inputLockMaxMs: 100` is legal input.
+  // Left unclamped, the valve's max-ms window would sit BELOW the floor, so a lock with
+  // nothing pending could never even reach a pending check. Clamp the ceiling up to the floor
+  // instead of clamping the floor down, so the floor — the value the owner is more likely
+  // tuning for feel — always wins. (The valve no longer fires on an idle lock at all —
+  // `isInputLockActive` only consults `maxMs` when `lockPendingCount > 0` — so this clamp
+  // is just keeping `maxMs >= minMs` sane, not suppressing a per-activation warning.)
+  return { minMs, maxMs: Math.max(minMs, maxMs) };
+}
+
+/** Register a 'call' binding's returned value against the held lock IF it's a thenable, so
+ *  release waits for it too — a runtime duck-type check, not the static `UIActionHandler`
+ *  return type (`unknown`, so a plain value-returning one-liner like `() => count++` stays
+ *  legal and is simply ignored here). Same idiom as `managerRegistry.ts`'s `activate()`
+ *  — genuinely: both settle paths are handled via `.then(onFulfilled, onRejected)`, not
+ *  `.finally()`, because `.finally()` RE-THROWS into its own derived promise, which nobody
+ *  awaits — a rejecting handler would then log an *extra* unhandled-rejection on top of the
+ *  handler's own. `.then` with both arguments swallows it, same as `activate()`.
+ *  No-op for any non-thenable return (the common synchronous handler). */
+function trackLockPromise(result: unknown, actionName: string): void {
+  if (!result || typeof (result as Promise<unknown>).then !== 'function') return;
+  lockPendingCount += 1;
+  lockPendingNames.push(actionName);
+  // Captured at registration: if this promise outlives ITS lock (force-released by the max-ms
+  // valve, or cleared by a world swap) and settles after a NEW lock has been acquired, liveness
+  // will have moved on and this decrement must be a no-op — it belongs to a lock that is already
+  // gone, not to whichever lock happens to be current.
+  const stillLive = lockLiveness.capture();
+  const settle = () => {
+    if (!stillLive()) return;
+    lockPendingCount = Math.max(0, lockPendingCount - 1);
+    // Prune this action's name too — not just the count — so the max-ms valve's warning
+    // (#1's primary diagnostic now) names only what's STILL pending. splice the first matching
+    // occurrence rather than filtering all of them: two rows can legitimately share an action
+    // name, and each needs its own decrement/prune pair to balance.
+    const idx = lockPendingNames.indexOf(actionName);
+    if (idx !== -1) lockPendingNames.splice(idx, 1);
+  };
+  const onSettled = (isRejection: boolean) => (err: unknown) => {
+    // The lock must not become an error black hole: `.then(settle, settle)` alone silently
+    // swallows every rejecting 'call' handler (this used to surface as an Uncaught (in promise) —
+    // now nothing prints at all), so log it here before decrementing.
+    if (isRejection) {
+      // A superseded scene load rejects with AbortError as part of normal operation (a fast
+      // double-navigation cancels the first `engine.loadScene`) — that is expected, not a bug,
+      // and logging it would be noise on every quick nav. Every other rejection is real.
+      const isAbort = (err as { name?: string } | undefined)?.name === 'AbortError';
+      if (!isAbort) console.warn(`[UI input lock] '${actionName}' handler rejected:`, err);
+    }
+    settle();
+  };
+  Promise.resolve(result).then(onSettled(false), onSettled(true));
 }
 
 /** Resolve only the requested guids to entities via the maintained guid→entity
@@ -91,7 +303,7 @@ export function applyBindings(
 ): void {
   if (!bindings?.length || !isSimRunning()) return;
 
-  const { selfGuid, eventValue } = opts;
+  const { selfGuid, eventValue, continuous } = opts;
 
   // Pass 1: collect the distinct target guids of the rows matching this event —
   // inline, no `.filter` allocation. Most UIs target `selfGuid` → a 1-element set.
@@ -106,9 +318,29 @@ export function applyBindings(
   if (!anyRow) return;
 
   const world = getCurrentWorld();
-  // Only 'click': 'change' fires continuously while a slider is dragged, and 'submit' is a
-  // keystroke, so neither is a press to acknowledge.
-  if (event === 'click') clickCue?.();
+
+  // A discrete activation (click / submit / a toggle's change) takes and respects the global
+  // input lock; a continuous stream (a range slider's drag `change`) does neither (#466).
+  const isDiscrete = !continuous;
+  if (isDiscrete) {
+    // Swallow the WHOLE event, before the click cue, so a blocked second tap makes no sound —
+    // the doubled sound was the original bug report's own proof the action ran twice. Read the
+    // authored window ONCE here — both the busy-valve check and the acquire below share it,
+    // rather than each re-querying `UISettings` (#543).
+    // Named `lockWindow`, not `window`: a bare `window` here would shadow the DOM global
+    // inside `applyBindings`, and this is DOM-adjacent code.
+    const lockWindow = readLockWindow(world);
+    if (isInputLockActive(lockWindow)) return;
+    acquireLock();
+  }
+
+  // Shared with the input lock above (#528) rather than testing the event name: the old
+  // `event === 'click'` test silenced every UIToggle, whose activation fires 'change', not
+  // 'click'. A slider drag and a per-keystroke text 'change' pass `continuous: true` and stay
+  // silent through `isDiscrete` same as the lock. `submit` IS discrete but is exempted here on
+  // purpose (owner, 2026-09-01) — Enter in a text field follows typing, and a tap sound would
+  // read as a keyboard click, not a button press. Don't "unify" it away.
+  if (isDiscrete && event !== 'submit') clickCue?.();
   // Resolve only the needed guids (early-break scan), shared by 'set' + 'call'.
   const byGuid = resolveGuids(world, needed);
 
@@ -126,7 +358,10 @@ export function applyBindings(
       const payload = eventValue !== undefined ? eventValue : (params?.payload as UIActionPayload | undefined);
       const guid = b.target || selfGuid;
       // Reuse the guid→entity map we already built — skip dispatchUIAction's scan.
-      dispatchUIAction(b.action, { payload, params, targetGuid: guid, target: guid ? byGuid.get(guid) : undefined });
+      const result = dispatchUIAction(b.action, { payload, params, targetGuid: guid, target: guid ? byGuid.get(guid) : undefined });
+      // Hold the lock open until an async handler settles — the core of the owner's design
+      // (the action COMPLETING is the real gate, `inputLockMinMs` is only a floor under it).
+      if (isDiscrete) trackLockPromise(result, b.action);
       continue;
     }
     // kind: 'set'

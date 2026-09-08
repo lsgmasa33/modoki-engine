@@ -34,4 +34,15 @@ describe('pipeline', () => {
     // Should not throw even with a minimal mock world
     expect(() => runPipeline(mockWorld)).not.toThrow();
   });
+
+  it('registers the uiBusyPoll system at GAME priority (#551)', async () => {
+    // Regression: nothing else in this suite exercises the actual `registerSystem` call in
+    // `app/ecs/pipeline.ts` — every test in uiInputLock.test.ts calls `pollUIBusyContinuity()`
+    // directly. Deleting the registration line would leave that whole suite green while the
+    // valve never accumulates in the real running app.
+    const { getRegisteredSystems } = await import('../../packages/modoki/src/runtime/core/pipeline');
+    await import('../../app/ecs/pipeline'); // self-registers everything on import
+
+    expect(getRegisteredSystems()).toContain('uiBusyPoll (100)');
+  });
 });

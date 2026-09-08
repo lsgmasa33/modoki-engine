@@ -204,6 +204,31 @@ describe('save_all flushes the dirty-asset registry alongside the scene write', 
     expect(getDirtyAssetPaths()).toEqual(['/assets/fx/op-willfail.particle.json']); // still pending
   });
 
+  // The THIRD partial-failure channel, added with #831 and — like the second before it — added as
+  // a FIELD without a check. `/api/scene-mutate` can refuse a pending base-scene ref on its own
+  // run-mode or unsaved-work guard; the ref is then RE-PARKED and is still unsaved, while the op
+  // answered `{ok:true, scenePath}`. Same consequence as the asset channel: a build reads FILES.
+  it('the save_all AGENT OP fails when a pending base-scene ref was refused', async () => {
+    const { markBaseSceneEdit, getPendingBaseScenePaths, clearPendingBaseScenes } =
+      await import('../../packages/modoki/src/editor/scene/pendingBaseScene');
+    clearPendingBaseScenes();
+    setCurrentScenePath('/assets/scenes/dirty-basescene-fail.json');
+    markSceneSaved();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-mutate')) {
+        return { ok: false, status: 409, json: async () => ({ ok: false, error: 'the editor has unsaved live changes' }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    markBaseSceneEdit('/assets/scenes/level-2.scene.json', 'base-guid');
+
+    await expect(runAgentOp('save-all', {})).rejects.toThrow(/PARTIALLY failed[\s\S]*base-scene ref on \/assets\/scenes\/level-2\.scene\.json/);
+    expect(getPendingBaseScenePaths(), 'a refused ref must stay pending')
+      .toEqual(['/assets/scenes/level-2.scene.json']);
+    clearPendingBaseScenes();
+  });
+
   it('the save_all AGENT OP still reports success when everything lands', async () => {
     stubFetch();
     setCurrentScenePath('/assets/scenes/dirty-op-ok.json');

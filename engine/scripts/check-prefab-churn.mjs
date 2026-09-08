@@ -51,23 +51,22 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repoFiles } from './repoCorpus.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
-/** Every .prefab.json under a project, excluding build/native output. */
-function findPrefabs(projDir) {
-  const out = [];
-  const skip = new Set(['node_modules', 'dist', 'build', 'ios', 'android', 'ads', '.git']);
-  const walk = (dir) => {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (e.isDirectory()) { if (!skip.has(e.name)) walk(path.join(dir, e.name)); }
-      else if (e.name.endsWith('.prefab.json')) out.push(path.join(dir, e.name));
-    }
-  };
-  walk(projDir);
-  return out.sort();
+/** Every .prefab.json under a project, git-enumerated (#771/#799) rather than a hand-rolled
+ *  `readdirSync` walk — `ios`/`android` are excluded explicitly because they are TRACKED native
+ *  mirrors; `node_modules`/`dist`/`build`/`ads`/`.git` need no entry at all, since every one of
+ *  them is gitignored (or, for `.git`, never emitted by `git ls-files` in the first place) and is
+ *  therefore excluded for free. */
+function findPrefabs(proj) {
+  return repoFiles({
+    under: proj,
+    match: /\.prefab\.json$/,
+    exclude: ['ios', 'android'],
+    floor: 0,
+  }).map(({ abs }) => abs).sort();
 }
 
 const NESTED_FIELDS = ['prefab', 'overrides', 'added', 'removed', 'removedTraits', 'nestedOverrides'];
@@ -77,7 +76,7 @@ let totalPrefabs = 0, totalChanged = 0, problems = 0, regressions = 0;
 for (const proj of process.argv.slice(2)) {
   const dir = path.join(ROOT, proj);
   if (!fs.existsSync(dir)) { console.log(`${proj}: no such project`); continue; }
-  const files = findPrefabs(dir);
+  const files = findPrefabs(proj.split(path.sep).join('/'));
   if (!files.length) { console.log(`${proj}: no prefabs`); continue; }
 
   for (const abs of files) {

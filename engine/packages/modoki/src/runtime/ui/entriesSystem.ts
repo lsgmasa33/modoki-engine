@@ -44,6 +44,7 @@ import {
   type AxisWindow,
 } from './entriesLayout';
 import { markUIDirty } from '../core/uiDirty';
+import { POOLED_ROW_PINNED_FIELDS, POOLED_ROW_GENERIC_WARN_FIELDS, buildPooledRowPin } from './uiAuthoring';
 
 /** How this system reaches prefabs — INJECTED, never imported.
  *
@@ -56,8 +57,11 @@ import { markUIDirty } from '../core/uiDirty';
  *  It also buys a testable seam: a test can install a fake provider and drive the whole system
  *  without a prefab cache or an asset manifest. */
 export interface EntryPrefabProvider {
-  /** The prefab root's authored `UIElement` size, for the `entry{Width,Height} = 0` case. */
-  rootSize(prefabGuid: string): { width: number; height: number };
+  /** The prefab root's authored `UIElement` size, for the `entry{Width,Height} = 0` case. Carries
+   *  its OWN unit — a root authored `width: 50, widthUnit: '%'` must resolve against the
+   *  viewport exactly like the view's own authored `entryWidth`, not get pinned to a raw px
+   *  number (#765). */
+  rootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' };
   /** Spawn one instance under `parentId`. Returns the root ecs id, or 0 if it cannot yet (the
    *  prefab is not cached) — the caller then tries again next frame rather than guessing. */
   spawnInstance(world: World, prefabGuid: string, opts: { parentId: number; guidSeed: string }): number;
@@ -168,7 +172,7 @@ interface ViewState {
   uncachedTicks: number;
 }
 const viewStates = new Map<string, ViewState>();
-onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); });
+onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); });
 
 /** Views already warned about an AUTHORING mistake (see `diagnoseBlankView`), so a per-frame
  *  system does not spam the console.
@@ -188,6 +192,18 @@ const warned = new Set<string>();
  *  occurrence for good. */
 const warnedUncached = new Set<string>();
 
+/** Entity+field pairs already warned about an AUTHORED value the box pin below is about to
+ *  overwrite (#651 B1 sibling — margin/min/max on a pooled `UIEntries` root). Keyed on
+ *  `${entityId}:${field}` rather than the view, because the fault is per pooled ROOT: the same
+ *  view can have some slots authored correctly and others not.
+ *
+ *  ⚠️ Cleared on a world swap, like `warnedUncached` and unlike `warned`. The reason stated here
+ *  used to be "a scene load mints fresh ecs ids, so anything keyed by id is meaningless" — but
+ *  this set is NOT keyed by id (see `warnAuthoredOverride`: the key is `viewGuid:slot:field`,
+ *  deliberately, because koota recycles ids). The real reason to clear is simpler: the next scene
+ *  has different views, so every entry is dead weight that would otherwise grow forever. */
+const warnedOverridden = new Set<string>();
+
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
  *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
  *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
@@ -195,7 +211,9 @@ const warnedUncached = new Set<string>();
 const UNCACHED_WARN_TICKS = 120;
 
 /** Reset module state — tests and teardown. */
-export function resetEntriesSystem(): void { viewStates.clear(); warned.clear(); warnedUncached.clear(); }
+export function resetEntriesSystem(): void {
+  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear();
+}
 
 /** Say WHY a pooled view is blank when the cause is the PREFAB rather than the authoring.
  *
@@ -243,10 +261,10 @@ function diagnoseBlankView(viewGuid: string, countX: number, countY: number, sou
 }
 
 /** The entry prefab's own authored root size, for the `entryWidth/Height = 0` case ("read it
- *  from the prefab"). Returns 0 when the prefab is not cached yet — the caller then has no size
- *  and renders nothing this frame rather than guessing one. */
-export function prefabRootSize(prefabGuid: string): { width: number; height: number } {
-  return provider?.rootSize(prefabGuid) ?? { width: 0, height: 0 };
+ *  from the prefab"). Returns 0 (px) when the prefab is not cached yet — the caller then has no
+ *  size and renders nothing this frame rather than guessing one. */
+export function prefabRootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } {
+  return provider?.rootSize(prefabGuid) ?? { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
 }
 
 export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): void {
@@ -367,8 +385,8 @@ function driveView(
   // Entry size. `0` means "read it from the prefab" — the single-source-of-truth rule, so a
   // fixed-size entry is not a second copy of what the prefab root already states.
   const fromPrefab = prefabRootSize(kinds[0].prefab);
-  const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width);
-  const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height);
+  const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width, fromPrefab.widthUnit);
+  const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height, fromPrefab.heightUnit);
 
   // A pending scrollToEntry request, converted here because THIS is where entry size is
   // resolved — the `%`-of-viewport case and the `0` = "read it from the prefab" case both live
@@ -930,6 +948,74 @@ function writeWindowState(view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWi
   view.set(m.enMeta.trait, next);
 }
 
+/** Does an authored value on a pooled row root deserve a warning?
+ *
+ *  Only when it differs from BOTH the pin AND the trait's own default (#761). The default means
+ *  "the author never touched this field" — the common case, and not worth a line. Checking only
+ *  `cur !== pinned` (the pre-#761 rule) is wrong for a field whose pin is NOT its default:
+ *  `flexShrink` defaults to 1 but pins to 0, so that alone would warn on every untouched row;
+ *  `isVisible` defaults to `true` but pins to the slot's `live` state, so every freshly-spawned
+ *  PARKED slot (`live === false`) would warn too. For the eight fields whose pin already equals
+ *  their default (margin, min/max — all pinned and defaulted to 0) `pinned === def`, so this
+ *  reduces to exactly the old `cur !== pinned` check — no behaviour change there. */
+function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): boolean {
+  return cur !== pinned && cur !== def;
+}
+
+/** Does an authored `width`/`height` on a pooled row root deserve a warning?
+ *
+ *  A `%`-unit value is NOT a trap — it is the shape `entriesSystem` is designed around. The
+ *  standard pager authors `width: 100, widthUnit: '%'` on the entry prefab root (matching
+ *  `entryWidth: 100%` on the `UIEntries` view itself), and this system resolves that `%` against
+ *  the live viewport into the px pin every tick — the docstring above ("Not a shadow of the
+ *  authored value — it IS the authored value resolved") says so directly. Comparing the RAW
+ *  percent number against the resolved px pin (the pre-#762-review rule) is therefore comparing
+ *  two different units and warns on the canonical shape itself: `cur=100, pinned=390` always
+ *  differs, so 5 of the 6 committed entry-prefab roots in the repo tripped it.
+ *
+ *  So: only a `px`-unit authored value can be a real trap (an author typing `width: 200px` on a
+ *  pooled row, expecting it to hold). Any other unit — `%`, `vw`, `vh`, `vmin`, `vmax` — is
+ *  resolved by the scroll view and is NEUTRAL here, mirroring `isNeutralSize` in
+ *  `sceneValidation.ts`, which exists for exactly the same "don't warn on the documented
+ *  contract" reason.
+ *
+ *  Fixed (#765): the `entryWidth: 0` ("read it from the prefab") case used to be an exception to
+ *  the rule above. `entryPrefabProvider.ts`'s `rootSize` used to return `ui.width` raw and ignore
+ *  `widthUnit`, and `resolveEntrySize` (`entriesLayout.ts`) short-circuited on `authored === 0`
+ *  and returned it verbatim as px — so a root authored `width: 100, widthUnit: '%'` under a view
+ *  with no `entryWidth` was silently pinned to 100px with nothing warning here. `rootSize` now
+ *  carries its own unit and `resolveEntrySize` resolves it against the same viewport axis as the
+ *  view's own authored value, so the rule above holds for this case too. */
+function pooledSizeNeedsWarning(curValue: unknown, curUnit: unknown, wantPx: number, def: unknown): boolean {
+  if (curUnit !== 'px') return false;
+  return curValue !== wantPx && curValue !== def;
+}
+
+/** Warn once per pooled SLOT per field when the box pin below is about to overwrite a value the
+ *  author actually authored (per `pooledFieldNeedsWarning` above — the caller has already
+ *  decided). Runs in the frame loop, so `warnedOverridden` is what keeps this to one line per
+ *  offender rather than one per tick forever.
+ *
+ *  ⚠️ Keyed on `viewGuid:slot`, NOT on `entity.id()`. koota RECYCLES entity ids, so an id key is
+ *  wrong in both directions within a single scene: tearing down one `UIEntries` view and building
+ *  another can hand a fresh pooled root a retired id whose field was already warned, silently
+ *  swallowing a real authoring mistake. A view's guid plus its slot index names the same seat for
+ *  as long as the view exists and can never collide with a different view's.
+ *
+ *  `field` is the warn-once key AND the name shown; pass `displayField`/`displayValue` to fold a
+ *  value and its companion unit into ONE line (`width=50%`) instead of two — see the width/height
+ *  call sites, the only ones that need it. */
+function warnAuthoredOverride(
+  entity: EntityLike, attr: Record<string, unknown>, viewGuid: string, slot: number, field: string,
+  cur: unknown, pinnedDisplay: unknown, displayField: string = field, displayValue: unknown = cur,
+): void {
+  const key = `${viewGuid}:${slot}:${field}`;
+  if (warnedOverridden.has(key)) return;
+  warnedOverridden.add(key);
+  const name = (attr.name as string) || `#${entity.id()}`;
+  console.warn(`[UIEntries] entity '${name}' authored UIElement.${displayField}=${String(displayValue)}, but a pooled UIEntries root owns its own box and pins ${displayField} to ${String(pinnedDisplay)} every tick — the authored value never takes effect.`);
+}
+
 /** Bind each slot to its coordinate, then fill it from the game's resolver. */
 function applySlots(
   world: World, plan: ReturnType<typeof planSlots>, pool: Map<number, EntityLike>,
@@ -985,18 +1071,65 @@ function applySlots(
     //  live viewport, `0` read back from the prefab root. Writing it is what makes the box
     //  definite, and a definite box is what a `%`-sized prefab root needs once its parent is an
     //  auto-width row (a `%` against an indefinite container silently becomes content-sized).
-    //  `flexShrink: 0` is the other half: without it the row's own trailing padding squeezes
+    //  `flexShrink: 0` is the second half: without it the row's own trailing padding squeezes
     //  every entry to nothing, which is exactly how the pager rendered 0px-wide pages.
+    //
+    //  `margin*: 0` is the third half (#651, see docs/ui-system.md's "Scroll views" section for
+    //  the full derivation): margin sits outside the border box, so an authored margin on the
+    //  prefab root would desync the real on-screen stride from `entrySize + gap` — the same
+    //  move as pinning width/height/flexShrink above, for the same reason.
+    //
+    //  `minWidth/maxWidth/minHeight/maxHeight: 0` (each field's own "none", per UIElement.ts) are
+    //  the fourth half (#651 B1 sibling): a min/max constraint overrides the definite width/height
+    //  above from INSIDE the border box, the same desync as margin from outside it.
+    //
+    //  `isVisible` (pinned to the slot's live state, not a constant) is the fifth half. Its
+    //  warning — and `flexShrink`'s above — stayed SILENT until #761: unlike every field above,
+    //  neither field's pin equals its trait DEFAULT, so the naive "warn when authored ≠ 0" rule
+    //  would either warn on every untouched row (`flexShrink` defaults to 1, not 0) or on every
+    //  freshly-spawned PARKED slot (`isVisible` defaults to `true`, and a parked slot's pin is
+    //  `false`). See `pooledFieldNeedsWarning`, which checks against the default too.
+    //
+    //  Every pinned field lives in ONE place — `uiAuthoring.POOLED_ROW_PINNED_GROUPS`, via
+    //  `buildPooledRowPin` — so the equality guard, the `entity.set` below and the Inspector note
+    //  can't drift apart again the way the six #761 fields did (pinned in total silence, no
+    //  warning, no Inspector mention) — and, per the #764 review, can't drift the OTHER direction
+    //  either: a field added to the pin literal without a matching constant entry now fails the
+    //  `uiAuthoring.test.ts` bidirectional guard instead of pinning in silence a second time.
     const ui = entity.get(m.uiMeta.trait) as Record<string, unknown> | undefined;
     if (ui) {
       const wantW = Math.max(0, grid.entryW);
       const wantH = Math.max(0, grid.entryH);
-      if (ui.isVisible !== live || ui.width !== wantW || ui.height !== wantH
-        || ui.widthUnit !== 'px' || ui.heightUnit !== 'px' || ui.flexShrink !== 0) {
-        entity.set(m.uiMeta.trait, {
-          ...ui, isVisible: live, flexShrink: 0,
-          width: wantW, widthUnit: 'px', height: wantH, heightUnit: 'px',
-        });
+      // The trait's OWN defaults, read off its koota schema rather than re-typed here — the one
+      // way `pooledFieldNeedsWarning` can tell "authored" from "never touched" without a second,
+      // hand-maintained copy of UIElement.ts's defaults that could drift from it.
+      const defaults = (m.uiMeta.trait as { schema?: Record<string, unknown> }).schema ?? {};
+      const pinned = buildPooledRowPin({ live, wantW, wantH });
+
+      // The nine fields the generic equality guard covers — everything `POOLED_ROW_PINNED_FIELDS`
+      // names EXCEPT `isVisible` and `width`/`height` (+ their units), which each need their own
+      // comparison below (live-state and folded-unit respectively).
+      for (const field of POOLED_ROW_GENERIC_WARN_FIELDS) {
+        if (pooledFieldNeedsWarning(ui[field], pinned[field], defaults[field])) {
+          warnAuthoredOverride(entity, attr, viewGuid, slot, field, ui[field], pinned[field]);
+        }
+      }
+      if (pooledFieldNeedsWarning(ui.isVisible, live, defaults.isVisible)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'isVisible', ui.isVisible, live);
+      }
+      // width/height fold their companion unit into ONE warning — an author authors an axis, not
+      // two independent fields, and a `width`+`widthUnit` pair that BOTH differ from the pin would
+      // otherwise print twice for the same mistake. A `%` (or `vw`/`vh`/`vmin`/`vmax`) authored
+      // unit is the documented contract, not a trap — see `pooledSizeNeedsWarning`.
+      if (pooledSizeNeedsWarning(ui.width, ui.widthUnit, wantW, defaults.width)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'width', ui.width, `${wantW}px`, 'width', `${ui.width}${ui.widthUnit}`);
+      }
+      if (pooledSizeNeedsWarning(ui.height, ui.heightUnit, wantH, defaults.height)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'height', ui.height, `${wantH}px`, 'height', `${ui.height}${ui.heightUnit}`);
+      }
+
+      if (POOLED_ROW_PINNED_FIELDS.some((field) => ui[field] !== pinned[field])) {
+        entity.set(m.uiMeta.trait, { ...ui, ...pinned });
       }
     }
     if (!live || !content) continue;

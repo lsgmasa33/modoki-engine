@@ -7,11 +7,12 @@ import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
-import { markUIDirty } from './uiTreeStore';
+import { markUIDirty, useUITreeStore } from './uiTreeStore';
 import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
+import { installPressOriginTracking } from './pressOrigin';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
 
 interface UIRendererProps {
@@ -28,8 +29,16 @@ interface UIRendererProps {
 
 export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, uiVisualsHidden }: UIRendererProps) {
   const tree = useUIEntities();
+  // Scene-wide default DOM font (#803) — resolved once in the projection (uiTreeStore), not
+  // here, so it's the same value every UI root inherits by CSS cascade, applied below to the
+  // one container all roots share. '' when unset, so the container carries no fontFamily at
+  // all and App.css's body rule (or any ambient default) still wins.
+  const rootFontFamily = useUITreeStore(s => s.rootFontFamily);
   const [vpVars, setVpVars] = useState<Record<string, string>>({});
   const roRef = useRef<ResizeObserver | null>(null);
+  /** The queued `update()` frame, so the callback ref's cleanup can CANCEL it rather than let it
+   *  run against a container it has already torn down — see the note at the observer below. */
+  const frameRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(null);
 
   // Rebuild the UI tree on Play/Stop so a TextAnimation on a UIElement toggles its
   // CSS animation with play state (UINode applies it only while isSimRunning).
@@ -69,14 +78,22 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // viewport mounted this component, not a per-render toggle, so closing over it
   // inside this ref (recreated only when it changes) is safe.
   const unblockRef = useRef<(() => void) | null>(null);
+  // #664 — tracks which element a press/release pair started/ended on (see pressOrigin.ts), so
+  // UINode's click handler can refuse a click the browser resolved to an ancestor a swipe merely
+  // passed through. Same runtime-only gating as unblockRef, and disposed alongside it.
+  const pressOriginRef = useRef<(() => void) | null>(null);
 
   const measureRef = useCallback((el: HTMLDivElement | null) => {
     roRef.current?.disconnect();
     roRef.current = null;
+    if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
     unblockRef.current?.();
     unblockRef.current = null;
+    pressOriginRef.current?.();
+    pressOriginRef.current = null;
     if (!el) return;
     if (!onSelectEntity) unblockRef.current = registerPointerBlocker(el);
+    if (!onSelectEntity) pressOriginRef.current = installPressOriginTracking(el.ownerDocument);
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
@@ -90,12 +107,19 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           '--ui-vmax': `${Math.max(vw, vh)}px`,
         });
       }
-      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — measured from THIS
-      // container's cascade, so it reads the editor preview's simulated inset and the
-      // device's real `env()` through one path. Measured here rather than on its own
-      // observer because every event that can change an inset (orientation, an editor
-      // device-preset change, a panel resize) already resizes this container. Outside
-      // the w/h > 0 guard on purpose: a container can be measurable for insets before it
+      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — REGISTERED from here, so the
+      // measurement happens inside THIS container's cascade and reads the editor preview's
+      // simulated inset and the device's real `env()` through one path.
+      //
+      // ⚠️ This call is the registration, NOT the whole freshness story, and the comment that
+      // used to sit here said it was — "every event that can change an inset already resizes this
+      // container". That is false, and it is the single belief that cost four issues (#273 → #579
+      // → #592 → #600): under `setDecorFitsSystemWindows(false)` an Android window keeps its size
+      // when the system bars hide, so the insets move and this observer never fires. Measured on a
+      // Galaxy A23: bottom 0→48 with zero `resize` events. `safeArea.ts` now owns its own observer
+      // on probes SIZED by the inset, which is what actually catches that case (#612).
+      //
+      // Outside the w/h > 0 guard on purpose: a container can be measurable for insets before it
       // has a non-zero box, and a stale inset is worse than an early-but-correct one.
       measureSafeAreaInsets(el);
     };
@@ -106,10 +130,21 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     // notifications". rAF moves the read past layout settle. (Same guard as
     // UIResizeOverlay.)
     let pending = false;
+    // ⚠️ The queued frame is CANCELLED by this ref's cleanup (`frameRef`, above), not merely left
+    // to run against a disconnected observer. It re-enters `update()`, which registers this
+    // container with `safeArea.ts`; an unmount in the same frame as the mount (a scene swap's
+    // empty-tree beat, an editor panel closing mid-resize) would otherwise register a node that is
+    // already detached, and in the editor's two-viewport case that late registration steals the
+    // LIVE viewport's probes. `safeArea.ts` refuses a detached node defensively too — this stops
+    // one being sent at all.
     const ro = new ResizeObserver(() => {
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; update(); });
+      frameRef.current = requestAnimationFrame(() => {
+        pending = false;
+        frameRef.current = null;
+        update();
+      });
     });
     ro.observe(el);
     roRef.current = ro;
@@ -132,11 +167,25 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
       {...{ [UI_ROOT_ATTR]: onSelectEntity ? 'editor' : 'runtime' }}
       style={{
         position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden',
+        // Every UI root mounted below is a SIBLING inside this one div (there is no single
+        // "top" element UI roots nest under), so this is the ONE place a scene-wide font
+        // reaches all of them — by ordinary CSS inheritance. A per-element
+        // UIElement.fontFamily still wins over this for that element by cascade (#803).
+        // Omitted entirely (not `fontFamily: ''`) when unset, so an empty string can't
+        // override an ambient default (e.g. App.css's body rule) with nothing.
+        ...(rootFontFamily ? { fontFamily: rootFontFamily } : {}),
         ...vpVars as any,
       }}
     >
+      {/* The scene-wide default IS what a root inherits — there is no ancestor above it but this
+          container. Deliberately NOT `node.fontFamily || rootFontFamily` like the recursion sites
+          (#803): there the expression runs on the PARENT and is handed to the child, so it means
+          "the font my child inherits"; here it would run on the node receiving it and hand a root
+          its OWN font as its inherited one. Identical today — the only consumer reads the prop in
+          an `else` after `if (node.fontFamily)` — and wrong the moment a second consumer reads it
+          above that branch. */}
       {tree.map(node => (
-        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
       ))}
     </div>
   );

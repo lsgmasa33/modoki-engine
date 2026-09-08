@@ -19,7 +19,6 @@ export const videoReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     settings,
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
-  meta.version = 2;
   meta.video = settings;
   meta.videoCache = {
     hash: result.hash,

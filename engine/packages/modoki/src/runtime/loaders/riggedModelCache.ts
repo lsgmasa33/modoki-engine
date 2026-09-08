@@ -14,9 +14,17 @@
  *
  *  Ownership mirrors `meshTemplateCache`'s scene-scoped refcount (`Set<sceneId>`):
  *  acquired by `SceneManager.loadScene` from the scene's `resources` manifest,
- *  released wholesale by `releaseAllForScene` (wired in meshTemplateCache). A
- *  LAZY owner (`LAZY_OWNER`) keeps editor-authored models (drag a GLB → add a
- *  SkinnedModel, no manifest entry yet) resident until full teardown. */
+ *  released wholesale by `releaseAllForScene` (wired in meshTemplateCache).
+ *
+ *  Two acquire entry points, deliberately split (#747) so the two roles can't be
+ *  confused: `ensureRiggedModelLoadedFor(sceneId, ref)` is the SCENE-SCOPED lazy
+ *  acquire the render sync uses when it meets a ref with no manifest-driven load
+ *  yet — ownership goes to the real scene, so the scene's own release reaches it.
+ *  `ensureRiggedModelLoaded(ref)` is the EDITOR SESSION PIN (drag a GLB → add a
+ *  SkinnedModel, no manifest entry at all) — it stamps the sentinel `LAZY_OWNER`,
+ *  which no scene release can ever remove, so it stays resident until full
+ *  teardown (`disposeAllRiggedModels`). It has exactly one legitimate caller:
+ *  `editor/scene/modelImport.ts`. */
 
 import * as THREE from 'three';
 import type { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -29,6 +37,7 @@ import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
 import { notifyModelTemplatesLoaded } from './modelLoadNotify';
+import { createTeardownToken } from '../core/liveness';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -40,8 +49,11 @@ export interface RiggedModel {
 
 export type SceneId = number;
 
-/** Sentinel owner for editor lazy-loads (no manifest entry). Negative so it can
- *  never collide with a real scene id. */
+/** Sentinel owner for the EDITOR SESSION PIN (no manifest entry) — deliberately
+ *  outlives every scene release; only `disposeAllRiggedModels` (full teardown)
+ *  reclaims it. Negative so it can never collide with a real scene id. Stamped by
+ *  `ensureRiggedModelLoaded` ONLY — runtime code acquires via
+ *  `ensureRiggedModelLoadedFor` instead, which owns with the real scene (#747). */
 const LAZY_OWNER: SceneId = -1;
 
 // INVARIANT (B2): keyed by PATH, not content hash — same contract as
@@ -51,9 +63,10 @@ const cache = new Map<string, RiggedModel>();
 const loadPromises = new Map<string, Promise<void>>();
 const owners = new Map<string, Set<SceneId>>();
 
-// Bumped on full dispose so a load that resolves AFTER teardown disposes its
-// result instead of leaving an owner-less entry in the cache forever.
-let generation = 0;
+// Teardown liveness, captured per PATH before each load and re-checked after: a load that
+// resolves AFTER teardown (or a per-key invalidateRiggedModel) disposes its result instead of
+// leaving an owner-less — or stale — entry in the cache (#863).
+const liveness = createTeardownToken();
 
 // Constructed lazily on first load (not at module scope) so importing this
 // module is side-effect-free — matches meshTemplateCache, and keeps callers that
@@ -163,7 +176,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
   if (cache.has(path)) { disposePendingGltf(path); return Promise.resolve(); }
   if (loadPromises.has(path)) return loadPromises.get(path)!;
 
-  const gen = generation;
+  const stillLive = liveness.capture(path);
   // Try the derived variant first; on failure, fall back to the raw source so a
   // missing/mis-based variant (e.g. project served in a different URL context
   // than it was imported in) never leaves the model invisible.
@@ -174,7 +187,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     // the editor import handoff). `loadedFrom` is just the log label.
     const finishLoad = (gltf: { scene: THREE.Group; animations?: THREE.AnimationClip[] }, loadedFrom: string) => {
       // Disposed (teardown) or released mid-load → drop the result.
-      if (gen !== generation || !owners.has(path)) {
+      if (!stillLive() || !owners.has(path)) {
         const tmp: RiggedModel = { prototype: gltf.scene, animations: gltf.animations ?? [] };
         disposePrototype(tmp);
         resolve();
@@ -305,15 +318,34 @@ export function releaseRiggedModelsForScene(sceneId: SceneId): void {
   }
 }
 
-/** Editor convenience: ensure a model is loading even without a manifest entry
- *  (drag a GLB → add a SkinnedModel). Held by LAZY_OWNER so it stays resident for
- *  the session; cleared by `disposeAllRiggedModels`. Idempotent + deduped. */
+/** EDITOR SESSION PIN — the one legitimate caller is `editor/scene/modelImport.ts`
+ *  (drag a GLB → add a SkinnedModel, no manifest entry yet). Held by LAZY_OWNER,
+ *  which no scene's `releaseRiggedModelsForScene` can ever remove (#747) — it is
+ *  deliberately reclaimed only by `disposeAllRiggedModels` (full teardown), so the
+ *  editor-authored model stays resident for the whole session. Idempotent + deduped.
+ *  ⚠️ Runtime render-sync code must NOT call this — a normal scene-scoped acquire
+ *  would get pinned forever. Use `ensureRiggedModelLoadedFor` instead. */
 export function ensureRiggedModelLoaded(modelRef: string): void {
   const path = refToPath(modelRef);
   if (!path) return;
   // Already cached → nothing to load; drop any import handoff so it can't strand.
   if (cache.has(path)) { disposePendingGltf(path); return; }
   addOwner(path, LAZY_OWNER);
+  void fetchRiggedModel(path, postprocessorFor(modelRef));
+}
+
+/** Fire-and-forget SCENE-SCOPED acquire — the render sync calls this when it first
+ *  sees a rigged-model ref it cannot resolve. Mirrors `ensureFontLoaded`: an
+ *  already-cached model still takes the scene's ownership stamp, so the scene's own
+ *  release (`releaseRiggedModelsForScene`) reaches it.
+ *  ⚠️ NOT `ensureRiggedModelLoaded` — that stamps LAZY_OWNER, which no scene release
+ *  can ever remove (#747). Runtime code must use THIS one. */
+export function ensureRiggedModelLoadedFor(sceneId: SceneId, modelRef: string): void {
+  const path = refToPath(modelRef);
+  if (!path) return;
+  addOwner(path, sceneId);
+  // Already cached → nothing to load; drop any import handoff so it can't strand.
+  if (cache.has(path)) { disposePendingGltf(path); return; }
   void fetchRiggedModel(path, postprocessorFor(modelRef));
 }
 
@@ -339,6 +371,9 @@ export function invalidateRiggedModel(modelRef: string): void {
     if (model) disposePrototype(model);
     cache.delete(key);
     loadPromises.delete(key);
+    // #863: an in-flight load of THIS key is carrying pre-invalidation bytes — refuse it, or it
+    // re-caches the stale prototype on top of whatever re-import follows.
+    liveness.invalidateKey(key);
   }
 }
 
@@ -403,7 +438,7 @@ export function getBoneNames(modelRef: string): string[] {
 
 /** Dispose ALL cached rigged models (full teardown / world reset). */
 export function disposeAllRiggedModels(): void {
-  generation++;
+  liveness.invalidateAll();
   for (const model of cache.values()) disposePrototype(model);
   cache.clear();
   loadPromises.clear();

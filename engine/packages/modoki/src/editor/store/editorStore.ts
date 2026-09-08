@@ -14,6 +14,7 @@ import type { AnimationClipDef } from '../../runtime/animation/types';
 import { setTimeline } from '../../runtime/loaders/timelineCache';
 import type { TimelineDef } from '../../runtime/timeline/types';
 import { FREE_PRESET, type DevicePreset, type Orientation } from '../scene/devicePresets';
+import { panelMayStopPreview } from '../scene/previewOwnership';
 
 // Toast auto-dismiss state, module-scoped (F5): a newer toast clears the prior
 // timer so N rapid toasts don't leave N zombie timers, and the id is a monotonic
@@ -67,6 +68,17 @@ export interface SelectedAsset {
  *  'weights' paints per-vertex influence (heatmap + brush + test-pose). */
 export type SkinMode = 'parts' | 'rig' | 'weights';
 
+/** The five `editing<X>Asset` slots — the asset editors that hold a document and park it.
+ *
+ *  ⚠️ **ONE definition.** This union was hand-written in four places (`remapEditingAssetPath`,
+ *  `reloadEditingAsset`, `AssetEditorBinding['assetField']`, and a test's own copy), which is the
+ *  repo's shadowing-constant class applied to a type: `assetEditorBindings.ts` says "Adding a sixth
+ *  means adding it HERE", and by the time it said so it was no longer the only HERE. Adding a sixth
+ *  editor now updates this line, and every list that must grow with it fails to compile. */
+export type EditingAssetField =
+  | 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
+  | 'editingAnimationAsset' | 'editingTimelineAsset';
+
 interface EditorState {
   /** Primary (anchor) selection — last-clicked entity. Drives the SceneView
    *  gizmo and all single-entity consumers. Always either null or a member of
@@ -113,7 +125,7 @@ interface EditorState {
   /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
    *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
    *  AnimationEditor-local state into the store so it is agent-drivable
-   *  (`set-animation-view-mode` / `modoki_animation_view_mode`, #369) — the same move
+   *  (`set-animation-view-mode` / `modoki_set_animation_view_mode`, #369) — the same move
    *  `sceneViewMode` above records.
    *
    *  It is not cosmetic: exactly ONE of the two views is mounted, and each publishes its own
@@ -166,7 +178,7 @@ interface EditorState {
   particlePreview: boolean;
   /** The Game panel's selected device preset, and the orientation it is viewed in. Lifted from
    *  GameView-local state into the store so they are agent-drivable (`set-game-view-device` /
-   *  `modoki_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
+   *  `modoki_set_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
    *  same reason: the device picker is a popup an agent's trusted input cannot operate, so any
    *  layout check a session runs used to measure whatever device the human last left selected.
    *
@@ -240,7 +252,7 @@ interface EditorState {
   findReferencesTarget: { target: string; label: string } | null;
   /** "Build Support" dialog open state (toolchain detection + install/guide). */
   buildSupportOpen: boolean;
-  /** "Publish OTA Update…" dialog open state (docs/plans/mobile-ota-updates-plan.md Phase 5a). */
+  /** "Publish OTA Update…" dialog open state (docs/ota-updates.md). */
   otaPublishOpen: boolean;
   /** "OTA Keys…" dialog open state (generate/inspect the OTA signing keypair). */
   otaKeysOpen: boolean;
@@ -346,6 +358,15 @@ interface EditorState {
   isRecording: boolean;
   /** Preview playback running (advances the playhead each frame). */
   isPreviewPlaying: boolean;
+  /** WHICH panel the ▶ was pressed in, or null when nobody claimed it (#810 follow-up).
+   *  `isPreviewPlaying` is ONE flag both the Timeline and Animation panels read, so without
+   *  this both panels' preview effects run on a single press and each takes the single-valued
+   *  `RunMode` from the other — after #810 gave displacement real teeth, the loser's loop is
+   *  stopped, and the Timeline always lands second (its entry is behind an await), so pressing
+   *  ▶ in the Animation panel played nothing at all. A panel drives the preview only when it
+   *  owns it. NULL means unclaimed — a programmatic `setPreviewPlaying(true)` (the e2e path)
+   *  keeps the pre-existing any-panel-may-drive behaviour rather than silently doing nothing. */
+  previewOwner: 'timeline' | 'animation' | null;
 
   selectEntity: (id: number | null) => void;
   /** Replace the whole selection set. `primary` becomes the anchor (defaults to
@@ -467,12 +488,51 @@ interface EditorState {
    *  disk and would discard the in-memory doc, which after a rename is the newer of the
    *  two. The doc is the truth here — only its location changed. A no-op if that editor is
    *  unbound, so a stale move can never conjure a binding out of nothing. */
-  remapEditingAssetPath: (
-    field: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
-      | 'editingAnimationAsset' | 'editingTimelineAsset',
-    path: string,
-    name?: string,
-  ) => void;
+  remapEditingAssetPath: (field: EditingAssetField, path: string, name?: string) => void;
+  /** Force an open asset editor to RE-READ its file: null the loaded document and bump that
+   *  editor's nonce, so its load effect runs again and cannot take its `if (existing)` early
+   *  return. Nothing else changes.
+   *
+   *  ⚠️ **Deliberately NOT `open<X>Editor(sameAsset)`, and that distinction is the whole reason this
+   *  exists** (#896 review 2). Each open action resets more than the document, and what it resets
+   *  DIFFERS — read off the source rather than generalised from one of them, because the first
+   *  version of this docblock generalised from `openAnimationEditor` and was false of three:
+   *
+   *   - `openAnimationEditor` — `playheadTime`, `isRecording`, `isPreviewPlaying`, `previewOwner`,
+   *     `animatorRootEntityId`
+   *   - `openTimelineEditor`  — `playheadTime`, `isPreviewPlaying`, `previewOwner` (not
+   *     `isRecording`), `directorRootEntityId`
+   *   - `openSkinEditor`      — `activeSkinPart`, `skinPreviewHidden`
+   *   - `openParticleEditor`, `openSpriteAnimEditor` — nothing beyond the doc and the nonce
+   *
+   *  ⚠️ Those two root-entity fields are the strongest argument for this action existing at all:
+   *  they are PARAMETERS of the open actions, so routing a re-read through one would mean inventing
+   *  a root id for a panel that is only re-reading the asset it already has open.
+   *
+   *  `isPreviewPlaying`/`previewOwner` are SHARED between the Animation and Timeline panels, which is
+   *  why `closeAnimationEditor`/`closeTimelineEditor` guard them with `panelMayStopPreview` (#810)
+   *  while the open actions clobber them unconditionally — correct when the human opens a DIFFERENT
+   *  asset, wrong for a re-read. Routing the refused-load Retry through an open action meant clicking
+   *  Retry in a refused Timeline stopped the Animation panel's running preview and snapped the shared
+   *  playhead to 0. A re-read is not a re-open.
+   *
+   *  ⚠️ It follows that this action does NOT restore `activeSkinPart`/`skinPreviewHidden` either. Fine
+   *  for Retry (a refused panel has both at their open-time defaults); if this is ever called on a
+   *  LOADED rig, a re-read with fewer parts leaves `activeSkinPart` pointing past the end.
+   *
+   *  ⚠️ **"Touches nothing else" is about STORE STATE, not about consequences.** The nonce is not
+   *  private: `EditorApp.tsx` subscribes to all five and docks/selects that editor's tab when one
+   *  moves. So a Retry re-focuses the panel where the old local nonce did not — benign, since you
+   *  must be looking at the panel to click Retry, but it is a real difference and the first version
+   *  of this line implied there was none. */
+  reloadEditingAsset: (field: EditingAssetField) => void;
+  /** Repoint the ASSET SELECTION at paths a move has changed, WITHOUT an undo entry (#867).
+   *  Selection is path-keyed like the editor bindings, and a repair is not a user action — it is
+   *  what keeps an existing action's result coherent, so it must not land in the history the user
+   *  is about to step back through. `selectAsset` cannot be used for this: it pushes an undoable
+   *  `Select …`. Pass the already-resolved next values; the path arithmetic lives with the moves
+   *  in `applyMovesToSelection`. */
+  remapSelectedAssets: (next: { selectedAsset: SelectedAsset | null; selectedAssets: SelectedAsset[] }) => void;
   /** Seed the open clip from a freshly-loaded asset (updates the live cache, no undo). */
   loadAnimationClip: (clip: AnimationClipDef) => void;
   /** Apply a clip to an asset by path: refreshes the runtime cache + the editor form when
@@ -480,7 +540,7 @@ interface EditorState {
   applyAnimationClip: (path: string, clip: AnimationClipDef) => void;
   setPlayhead: (t: number) => void;
   setRecording: (on: boolean) => void;
-  setPreviewPlaying: (on: boolean) => void;
+  setPreviewPlaying: (on: boolean, owner?: 'timeline' | 'animation') => void;
   setAnimatorRoot: (id: number | null) => void;
 
   /** Open the Timeline Editor on a `.timeline.json` asset, bound to `rootEntityId` (the
@@ -618,7 +678,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   prefabReturnScenePath: null,
   playheadTime: 0,
   isRecording: false,
-  isPreviewPlaying: false,
+  isPreviewPlaying: false, previewOwner: null,
 
   selectEntity: (id) => {
     const prev = get();
@@ -910,14 +970,34 @@ export const useEditorStore = create<EditorState>((set, get) => {
     animationEditNonce: s.animationEditNonce + 1,
     playheadTime: 0,
     isRecording: false,
-    isPreviewPlaying: false,
+    isPreviewPlaying: false, previewOwner: null,
   })),
-  closeAnimationEditor: () => set({ editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false, isPreviewPlaying: false }),
+  // Same ownership guard as `closeTimelineEditor` below — see its comment. `isRecording` is NOT
+  // gated: it is this panel's own flag, not shared with the Timeline.
+  closeAnimationEditor: () => set((s) => ({
+    editingAnimationAsset: null, editingAnimationClip: null, animatorRootEntityId: null, isRecording: false,
+    ...(panelMayStopPreview(s.previewOwner, 'animation') ? { isPreviewPlaying: false, previewOwner: null } : {}),
+  })),
   remapEditingAssetPath: (field, path, name) => set((s) => {
     const cur = s[field];
     if (!cur) return {}; // unbound → nothing to repoint
     return { [field]: { ...cur, path, name: name ?? cur.name } } as Partial<EditorState>;
   }),
+  /** field -> the document slot it loads into, and the nonce its load effect depends on. A table
+   *  rather than five actions: the five editors differ only in which slots they name. */
+  reloadEditingAsset: (field) => set((s) => {
+    const SLOTS = {
+      editingParticleAsset: ['editingParticleDef', 'particleEditNonce'],
+      editingSpriteAnimAsset: ['editingSpriteAnimDef', 'spriteAnimEditNonce'],
+      editingSkinAsset: ['editingSkinDef', 'skinEditNonce'],
+      editingAnimationAsset: ['editingAnimationClip', 'animationEditNonce'],
+      editingTimelineAsset: ['editingTimelineDoc', 'timelineEditNonce'],
+    } as const;
+    if (!s[field]) return {}; // unbound -> nothing to re-read
+    const [docField, nonceField] = SLOTS[field];
+    return { [docField]: null, [nonceField]: (s[nonceField] as number) + 1 } as Partial<EditorState>;
+  }),
+  remapSelectedAssets: (next) => set(() => next),
   loadAnimationClip: (clip) => {
     const { editingAnimationAsset } = get();
     if (editingAnimationAsset) setAnimationClip(editingAnimationAsset.path, clip);
@@ -929,7 +1009,16 @@ export const useEditorStore = create<EditorState>((set, get) => {
   },
   setPlayhead: (t) => set({ playheadTime: Math.max(0, t) }),
   setRecording: (on) => set({ isRecording: on }),
-  setPreviewPlaying: (on) => set({ isPreviewPlaying: on }),
+  setPreviewPlaying: (on, owner) => {
+    // DEV-only: an untagged start drives NEITHER panel (see `panelDrivesPreview` — the permissive
+    // fallback was #810 re-armed). Silence would look exactly like a broken ▶, so say which call
+    // is at fault rather than leaving the next reader to find it.
+    if (on && !owner && import.meta.env?.DEV) {
+      console.warn('[editorStore] setPreviewPlaying(true) with no owner — no panel will drive this ' +
+        "preview. Pass 'timeline' or 'animation'.");
+    }
+    set({ isPreviewPlaying: on, previewOwner: on ? (owner ?? null) : null });
+  },
   setAnimatorRoot: (id) => set({ animatorRootEntityId: id }),
 
   openTimelineEditor: (asset, rootEntityId) => set((s) => ({
@@ -938,9 +1027,17 @@ export const useEditorStore = create<EditorState>((set, get) => {
     directorRootEntityId: rootEntityId,
     timelineEditNonce: s.timelineEditNonce + 1,
     playheadTime: 0,
-    isPreviewPlaying: false,
+    isPreviewPlaying: false, previewOwner: null,
   })),
-  closeTimelineEditor: () => set({ editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null, isPreviewPlaying: false }),
+  // ⚠️ Clear the shared preview flag ONLY if this panel owns it (or nobody does). `isPreviewPlaying`
+  // is read by BOTH preview panels, so an unconditional clear here stops a RUNNING Animation
+  // preview when an idle Timeline tab is merely closed — the same defect as #810, on the store
+  // action behind the panel rather than in the panel. The panels' unmount cleanups were guarded
+  // first and these two actions were missed; the #810 E2E is what caught it.
+  closeTimelineEditor: () => set((s) => ({
+    editingTimelineAsset: null, editingTimelineDoc: null, directorRootEntityId: null,
+    ...(panelMayStopPreview(s.previewOwner, 'timeline') ? { isPreviewPlaying: false, previewOwner: null } : {}),
+  })),
   loadTimelineDoc: (doc) => {
     const { editingTimelineAsset } = get();
     if (editingTimelineAsset) setTimeline(editingTimelineAsset.path, doc);

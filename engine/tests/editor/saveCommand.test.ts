@@ -216,3 +216,47 @@ describe('toastForSave — a preview that holds authored scene edits', () => {
     expect(t.text).not.toMatch(/CHANGED while previewing/);
   });
 });
+
+describe('a refused base-scene ref is reported, and named as itself (#831)', () => {
+  // The Scene inspector's `baseScene` edit parks and `saveAll` flushes it LAST, through
+  // /api/scene-mutate — a route with its own run-mode and unsaved-work refusals. When it turns the
+  // write down the entry is re-parked, so the edit is still pending and nothing else would have
+  // told the human. Same rule as a failed asset write: report the pending work that stayed pending.
+  it('names the path and turns the toast WARN, even over a scene that saved fine', () => {
+    const t = toastForSave(scene({
+      scene: { saved: true, path: '/s.scene.json', reason: 'ok' },
+      baseScenes: { saved: [], failed: [{ path: '/assets/scenes/level-2.scene.json', error: 'the editor has unsaved live changes' }] },
+    }));
+    expect(t.kind, 'a save that left work unsaved is a warning, whatever else went right').toBe('warn');
+    expect(t.text).toContain('base-scene ref(s) FAILED');
+    expect(t.text).toContain('/assets/scenes/level-2.scene.json');
+  });
+
+  it('calls it a base-scene ref, NOT an asset write', () => {
+    // Different noun on purpose: a one-field scene mutation is not an asset document, and a human
+    // sent to the asset panel to retry it looks in the wrong place. `discard_asset_edits` does not
+    // reach these either, so the wrong noun points at the wrong remedy too.
+    const t = toastForSave(scene({
+      scene: { saved: true, path: '/s.scene.json', reason: 'ok' },
+      baseScenes: { saved: [], failed: [{ path: '/l.scene.json', error: 'nope' }] },
+    }));
+    expect(t.text).not.toContain('asset write(s) FAILED');
+  });
+
+  it('reports BOTH kinds when both failed, in one sentence', () => {
+    const t = toastForSave(scene({
+      scene: { saved: true, path: '/s.scene.json', reason: 'ok' },
+      assets: { saved: [], failed: [{ path: '/a.mat.json', error: 'disk full' }] },
+      baseScenes: { saved: [], failed: [{ path: '/l.scene.json', error: 'nope' }] },
+    }));
+    expect(t.text).toContain('asset write(s) FAILED');
+    expect(t.text).toContain('base-scene ref(s) FAILED');
+  });
+
+  it('says nothing when the base-scene flush had nothing to do', () => {
+    // The silence matters as much as the report: a save with no pending refs must not mention them.
+    const t = toastForSave(scene({ scene: { saved: true, path: '/s.scene.json', reason: 'ok' } }));
+    expect(t.text).not.toContain('base-scene');
+    expect(t.kind).not.toBe('warn');
+  });
+});

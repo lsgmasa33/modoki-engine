@@ -1,5 +1,9 @@
 /**
- * App-service registry (analytics / crashlytics / ads / attribution).
+ * App-service registry (crashlytics / ads / attribution).
+ *
+ * ⚠️ ANALYTICS IS NOT ONE — the registry has no `analytics` slot, and this header claimed
+ * one for a while. A game's own package owns analytics and calls it directly; Court's
+ * `packages/app-services/src/index.ts` header states the same absence.
  *
  * These are native-SDK wrappers (Firebase, AppLovin MAX, Adjust) that do NOT
  * belong in the engine — they are app/game concerns. A PROJECT provides concrete
@@ -24,6 +28,15 @@ export interface CrashlyticsService {
 export interface AdsService {
   init(): void | Promise<void>;
   cleanup(): void;
+  /** Optional recovery for a realm-survived false alarm — re-establish state `cleanup()` tore
+   *  down that ordinary `init()` does not know how to restore (e.g. a registered handler, a
+   *  banner that was showing). Most games have nothing here, hence optional.
+   *
+   *  ⚠️ **It REPLACES `init()` on that path, it does not run alongside it.** `App.tsx` calls this
+   *  INSTEAD of `init()` when a service provides it, so an implementation owns re-initialising as
+   *  well as restoring — Court's calls `initAds()` itself as its first step. Reading "optional
+   *  recovery" as "an extra step after init" would leave the SDK uninitialised. */
+  restoreAfterRealmSurvived?(): void | Promise<void>;
 }
 
 /** Attribution lifecycle the engine shell drives (init on game load). */
@@ -31,10 +44,17 @@ export interface AttributionService {
   init(): void | Promise<void>;
 }
 
+/** A native modal dialog. The ONLY thing that can be drawn once WebKit has stopped rendering
+ *  updates — DOM paint is dead in that state, so an in-page message is impossible. */
+export interface NativeDialogService {
+  alert(opts: { title: string; message: string; buttonTitle?: string }): Promise<void>;
+}
+
 export interface AppServices {
   crashlytics?: CrashlyticsService;
   ads?: AdsService;
   attribution?: AttributionService;
+  dialog?: NativeDialogService;
 }
 
 let registered: AppServices = {};
@@ -67,7 +87,31 @@ export function appServices(): AppServices {
   return registered;
 }
 
-/** Drop all registered services (on game swap, so a previous game's services don't leak). */
+/** Drop all registered services (on game swap, so a previous game's services don't leak).
+ *
+ * Order matters: capture the outgoing registry, clear `registered` FIRST, THEN run cleanup on
+ * the capture. That way a cleanup that throws — or that re-enters the registry (e.g. by calling
+ * `registerAppServices` itself) — always finds `registered` already empty, never a half-cleared
+ * one. A game swap is the path that made this matter: `App.tsx` calls `clearAppServices()` before
+ * the next game registers, but until #511 nothing here ever called `ads.cleanup()`, so the
+ * outgoing game's AppLovin MAX listeners survived under the next game. `cleanup()` can now be
+ * reached a second time in the same realm — once here on a game swap, and again from the
+ * realm-shutdown task App.tsx's mount effect registers in place of the unmount handler it used to
+ * call `cleanup()` from (#587, `realmShutdown.ts`) — so it must still be idempotent. Safe, because
+ * every game's `cleanup()`/`cleanupAds` already is (it loops an already-emptied array and resets
+ * flags), so a second call after a swap already cleaned up is a no-op. */
 export function clearAppServices(): void {
+  const { ads } = registered;
   registered = {};
+  try {
+    ads?.cleanup();
+  } catch (e) {
+    // A game's cleanup must never break the swap — same posture as registerAppServices above.
+    // But it is WARNED, not silently eaten: a throwing cleanup leaves the outgoing game's
+    // listeners registered, which is #511's exact symptom, and swallowing without a word would
+    // reproduce the bug in a form nothing can observe. ⚠️ This cannot see an async failure —
+    // Capacitor's `remove()` returns a Promise, so a rejecting one escapes as an unhandled
+    // rejection rather than reaching here. A game's cleanup should stay synchronous and total.
+    console.warn('[appServices] a game ads.cleanup() threw during swap; its listeners may survive:', e);
+  }
 }

@@ -12,10 +12,10 @@ import { createWorld } from 'koota';
 import { Transform } from '../../src/runtime/core/traits/Transform';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
 import { AudioListener } from '../../src/runtime/traits/AudioListener';
-import { audioSystem, stopWorldAudio } from '../../src/runtime/audio/audioSystem';
+import { audioSystem, stopWorldAudio, rearmAudioAutoplay } from '../../src/runtime/audio/audioSystem';
 import { cueSound, cueClip } from '../../src/runtime/audio/audioCues';
 import {
-  getAudioLog, clearAudioLog, setAudioRecordMode, setBusVolume, resume,
+  getAudioLog, clearAudioLog, setAudioRecordMode, setBusVolume, resume, dispose, endRecordedVoices,
 } from '../../src/runtime/audio/audioService';
 import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
 import { setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
@@ -93,6 +93,45 @@ describe('audioSystem — autoplay', () => {
     world.spawn(AudioSource({ clip, autoplay: true })); // no Transform
     audioSystem(world);
     expect(getAudioLog().filter((l) => l.op === 'play')).toHaveLength(1);
+  });
+});
+
+describe('audioSystem — rearmAudioAutoplay (#611 realm-death false alarm)', () => {
+  it('re-arms a loop+autoplay source silenced by audioDispose(), restarting it from the top', () => {
+    const clip = mintClip();
+    world = createWorld();
+    const e = world.spawn(Transform(), AudioSource({ clip, autoplay: true, loop: true }));
+
+    audioSystem(world);
+    expect(e.get(AudioSource)!.playing).toBe(true);
+    expect(getAudioLog().filter((l) => l.op === 'play')).toHaveLength(1);
+
+    // Realm-death false alarm: `App.tsx`'s `app.cleanup` task calls the audio service's
+    // `dispose()` (aliased `audioDispose`) unconditionally, real shutdown or not. Headless
+    // record mode (what every test here runs in — no AudioContext exists in node) has no
+    // real `LiveHandle`s for `dispose()`'s `stopAll()` to reach, so `endRecordedVoices()`
+    // stands in for what it does to a live handle in a real browser: end it.
+    dispose();
+    endRecordedVoices();
+
+    // Without the fix this is PERMANENT: `autoplayed` still holds this id, so autoplay can
+    // never re-declare intent and the source is silent for the rest of the session — exactly
+    // the bug this test pins.
+    audioSystem(world);
+    expect(e.get(AudioSource)!.playing).toBe(false);
+    expect(getAudioLog().filter((l) => l.op === 'play')).toHaveLength(1);
+
+    rearmAudioAutoplay(world);
+    audioSystem(world);
+    expect(e.get(AudioSource)!.playing).toBe(true);
+    // A restart from the top — a NEW play, not a resume — exactly what a real reload
+    // would have produced. `rearmAudioAutoplay` does not attempt to resume mid-track.
+    expect(getAudioLog().filter((l) => l.op === 'play')).toHaveLength(2);
+  });
+
+  it('is a safe no-op for a world with no audio state yet', () => {
+    world = createWorld();
+    expect(() => rearmAudioAutoplay(world!)).not.toThrow();
   });
 });
 

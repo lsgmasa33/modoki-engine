@@ -3,7 +3,7 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -168,6 +168,24 @@ export function registerAllTraits() {
     priority: 33.4,
     fields: {
       alpha: { type: 'number', min: 0, max: 1, step: 0.01, tooltip: 'Fades this entity AND every descendant in the 2D layer (#211). Multiplies with Renderable2D.opacity rather than replacing it, and nested groups multiply together — same model as Unity CanvasGroup. Put it on a bare hierarchy node to fade a whole subtree that the node itself does not draw.' },
+    },
+  });
+
+  registerTrait({
+    name: 'Mask2D', trait: Mask2D, category: 'component', componentCategory: 'Rendering',
+    priority: 33.45,
+    fields: {
+      mode: { type: 'enum', options: ['rect', 'texture'], tooltip: "rect: an authored rectangle (width/height/pivot/cornerRadius/feather). texture: the alpha channel of Sprite, for shapes a rect can't describe." },
+      isEnabled: { type: 'boolean', tooltip: 'Off = no clip at all — lets a mask be authored once and toggled without removing the entity.' },
+      width: { type: 'number', step: 0.01, group: 'Size', tooltip: 'HALF-extent, matching Renderable2D — the masked rect is width * 2 wide. rect mode only.' },
+      height: { type: 'number', step: 0.01, group: 'Size', tooltip: 'HALF-extent — see width. rect mode only.' },
+      pivotX: { type: 'number', step: 0.05, min: 0, max: 1, group: 'Pivot' },
+      pivotY: { type: 'number', step: 0.05, min: 0, max: 1, group: 'Pivot' },
+      cornerRadius: { type: 'number', min: 0, step: 1, tooltip: 'Corner radius in design pixels. rect mode only.' },
+      feather: { type: 'number', min: 0, step: 0.5, tooltip: 'Soft-edge width in design pixels. 0 = hard-edged stencil mask (cheap); >0 = soft alpha ramp (costs a filter pass — see the trait doc comment).' },
+      sprite: { type: 'string', accept: ['sprite'], tooltip: 'Alpha mask sprite (texture mode only). GUID-only — never a literal path.' },
+      offsetX: { type: 'number', step: 1, group: 'Offset', tooltip: "Clip rect centre relative to this entity's own origin, in its local space (design px). Keep the entity's Transform at identity and use this to place the rect instead — moving the entity would displace every descendant it clips." },
+      offsetY: { type: 'number', step: 1, group: 'Offset', tooltip: 'See offsetX — same local-space offset, Y axis.' },
     },
   });
 
@@ -349,6 +367,7 @@ export function registerAllTraits() {
       flipY: { type: 'boolean', tooltip: 'Mirror vertically about the pivot' },
       blendMode: { type: 'enum', options: ['normal', 'add', 'multiply', 'screen'], tooltip: 'Compositing mode. add = additive glow (on dark backdrops); multiply = darken; screen = lighten; normal = source-over alpha.' },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      orderInLayer: { type: 'number', step: 1, tooltip: 'Draw order within the 2D layer (higher = in front).' },
     },
   });
 
@@ -753,7 +772,14 @@ export function registerAllTraits() {
         tooltip: 'Muted video is exempt from the browser autoplay rule; a clip WITH sound needs a user gesture first.',
       },
       volume: { type: 'number', min: 0, max: 1, step: 0.05 },
-      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: 'Mix bus for the video\'s audio track.' },
+      fadeOutSec: {
+        type: 'number', min: 0, step: 0.1,
+        tooltip: 'Seconds of audio fade at the end of a non-looping clip. 0 = a hard cut.',
+      },
+      bus: {
+        type: 'enum', options: ['master', 'music', 'sfx', 'ui'],
+        tooltip: 'Mix bus for the video\'s audio track. NOT live — takes effect on a clip change, entity despawn, leaving Play, or a scene swap, not on a clip already playing.',
+      },
       rate: { type: 'number', min: 0.1, max: 4, step: 0.05, tooltip: 'Playback rate before timeScale (1 = normal).' },
       timeMode: {
         type: 'enum', options: ['diegetic', 'presentation'],
@@ -836,6 +862,16 @@ export function registerAllTraits() {
     fields: {
       sfxVoiceLimit: { type: 'number', min: 0, max: 64, step: 1, tooltip: 'Max concurrent fire-and-forget one-shots on the sfx bus; past it the OLDEST is stolen. Music is never capped, entity AudioSource voices are never stolen (a looping ambience would be the oldest voice forever), and the ui bus is uncapped. 0 or less = uncapped.' },
       sfxStealFadeSec: { type: 'number', min: 0, max: 1, step: 0.005, tooltip: 'Seconds a STOLEN one-shot ramps to silence before stopping. 0 = a hard cut, which clicks — an instant stop is an amplitude discontinuity on every steal. The 10ms default is below the threshold where a fade reads AS a fade, so it still stops abruptly, just cleanly.' },
+    },
+  });
+
+  registerTrait({
+    name: 'UISettings', trait: UISettings, category: 'resource',
+    fields: {
+      inputLockMinMs: { type: 'number', min: 0, max: 5000, step: 10, tooltip: 'Minimum time, ms, a UI input stays locked after a discrete activation (click, submit, a toggle\'s change), stopping a double tap from firing an action twice. The real gate is the action\'s own promise settling — this is only the floor for a synchronous action that settles instantly. 0 disables the floor (action-completion only), the escape hatch for a rapid-fire button. Must be ≤ Input Lock Max Ms — a smaller max is clamped up to this value.' },
+      inputLockMaxMs: { type: 'number', min: 100, max: 60000, step: 100, tooltip: 'Safety valve, ms. If the lock has been held longer than this, it is force-released (with a console warning) on the next acquire attempt, so a hung async handler cannot brick the UI permanently. Must be ≥ Input Lock Min Ms — a smaller value here is clamped up to the floor.' },
+      fontFamily: { type: 'string', tooltip: 'The DEFAULT typeface for every UI root in the scene — a FONT ASSET (drag one in, or use the Aa picker), stored as a GUID like every other asset reference. UI roots are SIBLINGS, not nested under one shared element, so a font authored only on a single UIElement never reaches the others; author it HERE once and it reaches every root by CSS inheritance. A per-element UIElement.fontFamily still overrides this for that element and its descendants.\nEmpty ⇒ falls back to systemFont, then to the browser default. When both are set the ASSET wins.', accept: ['.ttf', '.otf', '.woff', '.woff2'] },
+      systemFont: { type: 'string', tooltip: 'A plain CSS family name (system-ui, Helvetica, or a stack) — for a typeface no asset can express. Used only when fontFamily above is empty or unresolvable. Same override rule: a per-element UIElement.systemFont still wins for that element.' },
     },
   });
 
@@ -965,16 +1001,18 @@ export function registerAllTraits() {
       scrollbarStyle: { type: 'enum', options: ['auto', 'tinted', 'hidden'], tooltip: 'How the scrollbar looks when overflow:scroll actually overflows.\nauto = the platform\'s own bar\ntinted = use the two colours below\nhidden = no bar (it still scrolls by drag)\n⚠️ Only applies when overflow is scroll.\n⚠️ hidden removes the only hint that content continues below.', ...S('Layout') },
       scrollbarThumbColor: { type: 'color', tooltip: 'Scrollbar thumb colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
       scrollbarTrackColor: { type: 'color', tooltip: 'Scrollbar track colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
-      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings.', ...S('Layout') },
       rotation: { type: 'number', step: 1, tooltip: 'Tilt in degrees, clockwise. 0 = square.\nRotates about the ANCHOR PIVOT (the point that sits on the anchor point), so the anchor stays put as the angle changes; an unanchored or stretched element turns about its centre.\n\u26a0\ufe0f A non-zero rotation creates a stacking context, which traps the zIndex of everything inside it \u2014 tilt the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays axis-aligned; the render is still correct.', ...S('Layout') },
       scale: { type: 'number', step: 0.05, tooltip: 'Uniform scale. 1 = natural size.\nScales the RENDER, not the layout \u2014 the box keeps its laid-out size, so siblings do not reflow and text scales with the card (unlike keying width/height).\nScales about the ANCHOR PIVOT, so the anchor stays put as it grows; an unanchored or stretched element scales about its centre.\n\u26a0\ufe0f A scale other than 1 creates a stacking context, which traps the zIndex of everything inside it \u2014 scale the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays at the unscaled rect; the render is still correct.', ...S('Layout') },
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
+      swallowClicks: { type: 'boolean', tooltip: 'Consume a click that lands here (or on a non-interactive child) instead of letting it bubble.\nDoes NOT run bindings or show a pointer cursor — this is not a button.\nFor a dialog card whose backdrop dismisses on tap.\n⚠️ Inert if pointerThrough is also on — pointerThrough wins. Pick one; they are opposites.\n⚠️ Redundant (not lost) with a real click binding — the binding already stops the tap and still runs.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
       // Container-level flexbox. Independent of this element's own anchor, so it
       // stays LIVE even when anchored — needed to stack a runtime-variable list
       // (leaderboard/inventory) you can't hand-anchor. Do NOT fold back into Layout.
       flexDirection: { type: 'enum', options: ['row', 'column'], tooltip: 'Layout direction for children.\nrow = horizontal, column = vertical', ...S('Child Layout', { sectionDivider: true }) },
+      flexWrap: { type: 'enum', options: ['nowrap', 'wrap'], tooltip: 'Whether children wrap onto additional rows/columns when they no longer fit.', ...S('Child Layout') },
       justifyContent: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'space-between', 'space-around'], tooltip: 'How children are distributed along the main axis', ...S('Child Layout') },
       alignItems: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'How children are aligned on the cross axis', ...S('Child Layout') },
       gap: { type: 'number', step: 1, tooltip: 'Space between children', ...S('Child Layout') },
@@ -1002,14 +1040,16 @@ export function registerAllTraits() {
       text: { type: 'string', tooltip: 'Text content. Supports {storeField} templates', ...S('Text'), sectionDivider: true },
       fontSize: { type: 'number', step: 1, tooltip: 'Text size, in fontSizeUnit (px by default).', ...S('Text') },
       fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vh when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 vh, NOT vmin, which is min(vw,vh) and so follows WIDTH on any viewport taller than wide (every phone in portrait), leaving the text fixed while the parent shrinks \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
+      autoFitText: { type: 'boolean', tooltip: 'Shrink-only auto-fit (#614): when on, the effective font size is reduced \u2014 NEVER grown past the authored fontSize \u2014 until the text fits its box on one line, down to fontSizeMin. Below that floor, maxLines/textOverflow take over exactly as they would with this off. Use it where a fixed string can overflow at some viewport/locale (a hardcoded smaller fontSize must be re-tuned per device width, and shortening the string collides with localisation).\nDoes nothing when elementType is \u2018input\u2019 \u2014 an input\u2019s text is player-entered, not an authored label.', ...S('Text') },
+      fontSizeMin: { type: 'number', step: 0.1, tooltip: 'The shrink floor for autoFitText, in fontSizeUnit \u2014 the SAME unit as fontSize (there is deliberately no separate unit field for this one, same reasoning as letterSpacingUnit above). 0 means \u201cno explicit floor\u201d: the effective floor is half the authored fontSize.', ...S('Text') },
       fontWeight: { type: 'enum', options: ['normal', 'bold'], tooltip: 'Text weight', ...S('Text') },
       fontStyle: { type: 'enum', options: ['normal', 'italic'], tooltip: 'Text style', ...S('Text') },
       textColor: { type: 'color', alphaField: 'textOpacity', tooltip: 'Text color', ...S('Text') },
       textOpacity: { type: 'number', step: 0.01, min: 0, max: 1, tooltip: 'Text color alpha', ...S('Text') },
       textAlign: { type: 'enum', options: ['left', 'center', 'right'], tooltip: 'Horizontal text alignment', ...S('Text') },
-      fontFamily: { type: 'string', tooltip: 'The typeface for this element\u2019s text \u2014 a FONT ASSET (drag one in, or use the Aa picker). Stored as a GUID like every other asset reference, so the build can see it and ship the font. Inherited by descendants, exactly as CSS font-family is: author it once on a UI root.\nEmpty \u21d2 falls back to systemFont, then to the browser default. When both are set the ASSET wins.', accept: ['.ttf', '.otf', '.woff', '.woff2'], ...S('Text') },
+      fontFamily: { type: 'string', tooltip: 'The typeface for this element\u2019s text \u2014 a FONT ASSET (drag one in, or use the Aa picker). Stored as a GUID like every other asset reference, so the build can see it and ship the font. Inherited by descendants, exactly as CSS font-family is \u2014 but UI ROOTS are siblings of each other, so this reaches only THIS element\u2019s own subtree. For a whole scene, author UISettings.fontFamily instead (one field, every root); this one is the per-element override (#803).\nEmpty \u21d2 falls back to systemFont, then to the browser default. When both are set the ASSET wins.', accept: ['.ttf', '.otf', '.woff', '.woff2'], ...S('Text') },
       systemFont: { type: 'string', tooltip: 'A plain CSS family name (system-ui, Helvetica, or a stack) \u2014 for a typeface no asset can express. Used only when fontFamily is empty or unresolvable. Leave it empty unless you specifically want the device\u2019s own font.', ...S('Text') },
-      lineHeight: { type: 'number', step: 0.1, tooltip: 'Line height multiplier. 0 = auto', ...S('Text') },
+      lineHeight: { type: 'number', step: 1, tooltip: 'Line height in PIXELS, like fontSize \u2014 not a multiplier. 0 = auto (the browser\u2019s normal). UINode emits it as px deliberately: React leaves a bare number unitless and CSS reads THAT as a font-size multiplier, so authoring 1.4 here would render 1.4px lines and squash wrapped text to nothing.', ...S('Text') },
       letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing, in letterSpacingUnit (px by default).', ...S('Text') },
       letterSpacingUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for letterSpacing. Default px.\nMatch it to fontSizeUnit: tracking is only meaningful as a RATIO of the glyph size, so px tracking under a scaling font says something different at every viewport.', ...S('Text') },
       textOverflow: { type: 'enum', options: ['clip', 'ellipsis'], tooltip: 'How to handle text overflow', ...S('Text') },
@@ -1032,19 +1072,31 @@ export function registerAllTraits() {
       imageMode: { type: 'enum', options: ['cover', 'contain', 'fill', 'none'], tooltip: 'How the image fills the element', ...S('Image') },
 
       // ── Size Constraints section (collapsed by default) ──
-      minWidth: { type: 'number', step: 1, tooltip: 'Minimum width (px). 0 = none', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
-      maxWidth: { type: 'number', step: 1, tooltip: 'Maximum width (px). 0 = none', ...S('Size Constraints') },
-      minHeight: { type: 'number', step: 1, tooltip: 'Minimum height (px). 0 = none', ...S('Size Constraints') },
-      maxHeight: { type: 'number', step: 1, tooltip: 'Maximum height (px). 0 = none', ...S('Size Constraints') },
+      minWidth: { type: 'number', step: 1, tooltip: 'Minimum width, in minWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
+      minWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minWidth. Default px.', ...S('Size Constraints') },
+      maxWidth: { type: 'number', step: 1, tooltip: 'Maximum width, in maxWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      maxWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxWidth. Default px.', ...S('Size Constraints') },
+      minHeight: { type: 'number', step: 1, tooltip: 'Minimum height, in minHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      minHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minHeight. Default px.', ...S('Size Constraints') },
+      maxHeight: { type: 'number', step: 1, tooltip: 'Maximum height, in maxHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      maxHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxHeight. Default px.', ...S('Size Constraints') },
 
       // ── Margin section (collapsed by default) ──
-      marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top', ...S('Margin', { sectionDefaultOpen: false }) },
+      // ⚠️ Collapsed ON PURPOSE — margin is deliberately de-emphasised here (owner, 2026-09-05):
+      // anchor offsets, gap and padding are the intended ways to space UI, and margin is kept for
+      // flow layout rather than encouraged. Do not promote it up the panel.
+      //
+      // The "flow layout only" caveat below is not advice, it is what the code does: on an anchored
+      // element `applyAnchorStyle` clears all four margins outright, so an authored value is
+      // discarded (#757). The Inspector greys these fields out and says which anchor is responsible
+      // (`inertMarginTooltip`), and the scene validator reports an authored non-zero one.
+      marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin', { sectionDefaultOpen: false }) },
       marginTopUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginRight: { type: 'number', step: 1, tooltip: 'Outer spacing right', ...S('Margin') },
+      marginRight: { type: 'number', step: 1, tooltip: 'Outer spacing right — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginRightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginBottom: { type: 'number', step: 1, tooltip: 'Outer spacing bottom', ...S('Margin') },
+      marginBottom: { type: 'number', step: 1, tooltip: 'Outer spacing bottom — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginBottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
-      marginLeft: { type: 'number', step: 1, tooltip: 'Outer spacing left', ...S('Margin') },
+      marginLeft: { type: 'number', step: 1, tooltip: 'Outer spacing left — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
       marginLeftUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
 
       // ── Input section (collapsed by default) ──
@@ -1253,6 +1305,7 @@ export function registerAllTraits() {
     fields: {
       referenceWidth: { type: 'number', step: 1, tooltip: 'Design resolution width. Content is authored at this width and scaled to fit.' },
       referenceHeight: { type: 'number', step: 1, tooltip: 'Design resolution height. Content is authored at this height and scaled to fit.' },
+      maxReferenceWidth: { type: 'number', min: 0, step: 10, tooltip: '0 = off (default). On a host wider than the design aspect, widens the design box from Reference Width up to this value instead of pillarboxing.' },
       scaleMode: { type: 'enum', options: ['fitW', 'fitH', 'contain', 'cover', 'fill', 'none'], tooltip: 'fitW = match width (crop vertical), fitH = match height (crop horizontal), contain = fit entirely inside (letterbox), cover = cover area (crop), fill = stretch to fill, none = 1:1 pixels' },
     },
   });
@@ -1402,7 +1455,6 @@ export function registerAllTraits() {
       pivotX: { type: 'number', step: 0.1, tooltip: 'Horizontal pivot (0 = left edge, 0.5 = center, 1 = right edge).\nShifts which point of this element sits at the anchor position.' },
       pivotY: { type: 'number', step: 0.1, tooltip: 'Vertical pivot (0 = top edge, 0.5 = center, 1 = bottom edge).\nShifts which point of this element sits at the anchor position.' },
       safeArea: { type: 'boolean', tooltip: 'Add padding for device notch, Dynamic Island, and home indicator bar' },
-      zIndex: { type: 'number', step: 1, tooltip: 'Stacking order. Higher values render on top' },
     },
   });
 }

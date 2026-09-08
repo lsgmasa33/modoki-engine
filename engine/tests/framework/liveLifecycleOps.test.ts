@@ -8,9 +8,15 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
-  getCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal } from '@modoki/engine/runtime';
+  getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
+  stepOneFrame } from '@modoki/engine/runtime';
+import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
+import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { DEVICE_READ_ASSET_DEF_TYPES } from '../../tools/game-debug-mcp/src/mcp-tools';
+import { classifyReadAssetDef, probePathFor, probeServedTypes, type ReadAssetDefProbe }
+  from '../tools/readAssetDefServed';
 
 registerAllTraits();
 
@@ -167,6 +173,62 @@ describe('sim-step (runtime twin)', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/set-timescale/);
   });
+
+  it('an ordinary step (no world swap) is UNCHANGED — real progress, no worldReplaced flag', async () => {
+    game = createTestWorld({});
+    const world = getCurrentWorld();
+    setTimeScale(world, 0);
+
+    const p = runAgentOp('sim-step', { frames: 2, timeoutMs: 1000 }) as
+      Promise<{ ok?: boolean; stepped?: number; timeScale?: number; worldReplaced?: boolean }>;
+    // No rAF loop runs headless — drive the registered frame callback directly, exactly like a
+    // real frame would (frameDriver.test.ts uses the same `stepOneFrame` for this).
+    stepOneFrame();
+    stepOneFrame();
+    const r = await p;
+
+    expect(r.ok).toBe(true);
+    expect(r.stepped).toBe(2);
+    expect(r.worldReplaced).toBeUndefined();
+    expect(getTimeScale(world)).toBe(0);   // re-frozen
+  });
+
+  // ── #486 finding B — a scene swap mid-step must not assemble a reply from two worlds. ──
+
+  it('a world REPLACED mid-step resolves honestly (no hang, no crash), and touches the old world no further', async () => {
+    game = createTestWorld({});
+    const world = getCurrentWorld();
+    setTimeScale(world, 0);
+
+    // getTime/setTimeScale both go through world.queryFirst / world.query — spying on THOSE two
+    // is what proves the destroyed world is never queried again after the swap, which is the
+    // actual defect (a query on a destroyed koota world can throw, swallowing `resolve`).
+    const queryFirstSpy = vi.spyOn(world, 'queryFirst');
+    const querySpy = vi.spyOn(world, 'query');
+
+    const p = runAgentOp('sim-step', { frames: 3, timeoutMs: 1000 }) as
+      Promise<{ ok?: boolean; error?: string; stepped?: number; requested?: number; worldReplaced?: boolean }>;
+    const callsAtSwap = queryFirstSpy.mock.calls.length + querySpy.mock.calls.length;
+
+    // Simulate a scene load swapping in a NEW world mid-step, destroying the one sim-step
+    // captured — the two-world atomic swap (SceneManager.ts:880-885).
+    const otherWorld = createWorld();
+    setCurrentWorld(otherWorld);
+
+    stepOneFrame(); // drives the registered frame callback synchronously
+
+    const r = await p;
+
+    expect(r.ok).toBe(false);
+    expect(r.worldReplaced).toBe(true);
+    expect(r.stepped).toBe(0);
+    expect(r.requested).toBe(3);
+    // Nothing queried the OLD world after the swap — the load-bearing assertion.
+    expect(queryFirstSpy.mock.calls.length + querySpy.mock.calls.length).toBe(callsAtSwap);
+
+    setCurrentWorld(world);
+    otherWorld.destroy();
+  });
 });
 
 describe('load-scene (runtime twin)', () => {
@@ -193,14 +255,113 @@ describe('load-scene (runtime twin)', () => {
     // from success unless the op looks at the active path afterwards. Mutation-checked: deleting
     // the `after !== p.path` check in agentBridge turns this red (the throw test alone stayed
     // green, which is how this gap was found).
-    const spy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    //
+    // `getNext()` is stubbed to null here too — it mimics the same "couldn't read our own id"
+    // fallback path that a real superseded-detection miss would take, so this exercises the
+    // ORIGINAL path-comparison check rather than the myId-based branches below.
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue(null);
     try {
       const r = await runAgentOp('load-scene', { path: '/looks/fine.scene.json' }) as
         { ok?: boolean; error?: string; current?: string | null };
       expect(r.ok).toBe(false);
       expect(r.error).toMatch(/did not switch/i);
+      expect(r.error).toMatch(/Check the path exists in this build\./);
     } finally {
-      spy.mockRestore();
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+    }
+  });
+
+  // ── #486 finding A — a superseded load must not blame the requested path. ──
+
+  it('superseded by a load of a DIFFERENT scene — ok:false, names the active scene, never blames the path', async () => {
+    game = createTestWorld({});
+    // `getNext()` hands back OUR allocated id (1); by the time the load resolves, `getCurrent()`
+    // reports a DIFFERENT id whose path is a different scene — exactly what a later load winning
+    // the swap looks like from the op's point of view.
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
+    const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/other.scene.json', state: 'active' } as never);
+    try {
+      const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
+        { ok?: boolean; error?: string; superseded?: boolean; current?: string | null };
+      expect(r.ok).toBe(false);
+      expect(r.superseded).toBe(true);
+      expect(r.current).toBe('/other.scene.json');
+      expect(r.error).toMatch(/other\.scene\.json/);
+      expect(r.error).not.toMatch(/Check the path exists/);
+    } finally {
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+      curSpy.mockRestore();
+    }
+  });
+
+  it('an OLDER id still active is not "superseded" — a load that never installed keeps the path message (#486 A)', async () => {
+    game = createTestWorld({});
+    // The discriminator is `cur.id > myId`, not `cur.id !== myId`. Scene ids are monotonic
+    // (`nextSceneId++`), so a SMALLER active id means nothing newer ever installed and our own
+    // load simply never became primary — reporting that as "a LATER scene load won the swap"
+    // would assert from evidence that only says "the current id is not mine", which is the very
+    // over-claim #486 A is about. This case must keep the original bad-path wording.
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
+    const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 3, path: '/old.scene.json', state: 'active' } as never);
+    try {
+      const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
+        { ok?: boolean; error?: string; superseded?: boolean };
+      expect(r.ok).toBe(false);
+      expect(r.superseded).toBeUndefined();          // NOT claimed
+      expect(r.error).toMatch(/Check the path exists/);
+      expect(r.error).not.toMatch(/superseded/);
+    } finally {
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+      curSpy.mockRestore();
+    }
+  });
+
+  it('superseded by a concurrent load of the SAME path — ok:true with a note, entityCount omitted', async () => {
+    game = createTestWorld({});
+    // A different id won the swap, but it loaded the SAME requested path — the caller's requested
+    // end state is actually true, just not because of THIS op's own load.
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
+    const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/requested.scene.json', state: 'active' } as never);
+    try {
+      const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
+        { ok?: boolean; note?: string; entityCount?: number; current?: string | null };
+      expect(r.ok).toBe(true);
+      expect(r.note).toMatch(/superseded/i);
+      expect(r.current).toBe('/requested.scene.json');
+      expect(r.entityCount).toBeUndefined();
+    } finally {
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+      curSpy.mockRestore();
+    }
+  });
+
+  it('ordinary success is UNCHANGED — no false "superseded", entityCount present', async () => {
+    game = createTestWorld({});
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    // getNext()/getCurrent() report the SAME id — our own load won, exactly like the ordinary case.
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
+    const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'active' } as never);
+    try {
+      const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
+        { ok?: boolean; superseded?: boolean; note?: string; current?: string | null; entityCount?: number };
+      expect(r.ok).toBe(true);
+      expect(r.superseded).toBeUndefined();
+      expect(r.note).toBeUndefined();
+      expect(r.current).toBe('/requested.scene.json');
+      expect(r.entityCount).toBeTypeOf('number');
+    } finally {
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+      curSpy.mockRestore();
     }
   });
 });
@@ -283,6 +444,12 @@ describe('read-asset-def (runtime twin, #166 P7)', () => {
       { ok?: boolean; error?: string; options?: string[] };
     expect(unknown.ok).toBe(false);
     expect(unknown.options).toContain('particle');
+    // The 7 kinds that are actually dispatched below (#842b) — material is deliberately excluded,
+    // it gets its own refusal rather than being an "unsupported type" option.
+    expect(unknown.options).toEqual(
+      expect.arrayContaining(['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset']),
+    );
+    expect(unknown.options).not.toContain('material');
   });
 
   it('an asset NOTHING has loaded is said so, never returned as an empty def', async () => {
@@ -293,6 +460,35 @@ describe('read-asset-def (runtime twin, #166 P7)', () => {
       { ok?: boolean; error?: string };
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not in the live particle cache/i);
+  });
+
+  it('a shader miss ERRORS through the shader cache too (#842b — device surface parity)', async () => {
+    // Proves the device dispatch actually has a `shader` arm, not just the suffix inference and
+    // the advertised `options` — a miss must route to "not in the live cache", not "unsupported
+    // type", which is exactly the bug this whole fix closes.
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/glow.shader.json' }) as
+      { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/not in the live shader cache/i);
+  });
+
+  it('reads a LIVE animset back on the device surface too (#842b)', async () => {
+    const { setAnimSet, clearAnimSetCache } = await import('@modoki/engine/runtime');
+    setAnimSet('/assets/fx/hero.animset.json', { source: 'guid-of-glb', clips: [{ name: 'walk', speed: 2 }] });
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/hero.animset.json' }) as
+      { ok?: boolean; type?: string; def?: { clips: { speed?: number }[] } };
+    expect(r.ok).not.toBe(false);
+    expect(r.type).toBe('animset');
+    expect(r.def?.clips[0].speed).toBe(2);
+    clearAnimSetCache();
+  });
+
+  it('material refuses explicitly on the device surface too, and never as "unsupported type"', async () => {
+    const r = await runAgentOp('read-asset-def', { path: '/assets/fx/glow.mat.json' }) as
+      { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/only the compiled THREE\.Material is retained/);
+    expect(r.error).not.toMatch(/unsupported type/);
   });
 
   it('infers the kind from every suffix the project uses', async () => {
@@ -359,4 +555,42 @@ describe('hierarchy: the cycle-safety bound must not cut a LEGAL deep chain shor
     ]);
     expect(answered).not.toBe('HUNG');
   }, 8000);
+});
+
+/** The DEVICE twin of #855's probe. `device_read_asset_def`'s enum is a second hand-kept copy of
+ *  what an op serves, in a package that likewise cannot import the engine — so it drifts for the
+ *  same reason and was covered by the same const-vs-const guard. Rationale + the shared classifier:
+ *  `engine/tests/tools/readAssetDefServed.ts`. Editor twin: `tests/editor/readAssetDef.test.ts`.
+ *
+ *  Two surfaces, two files, on purpose: `registerAgentOp` is register-or-replace on one Map, and
+ *  importing the editor ops would permanently swap this runtime twin out of the registry. */
+describe('device_read_asset_def\'s enum lists exactly what THIS op dispatches (#855)', () => {
+  /** The device op RETURNS `{ok:false, error}` where the editor op throws. */
+  const probe: ReadAssetDefProbe = async ({ path, type }) => {
+    const r = await runAgentOp('read-asset-def', { path, type }) as { ok?: boolean; error?: string };
+    return r.ok === false ? (r.error ?? 'refused with no error text') : '';
+  };
+
+  it('the probe DISTINGUISHES a dispatched type from one with no arm', async () => {
+    // Non-vacuity: an assertion resting on a probe that cannot tell these apart proves nothing.
+    game = createTestWorld({});
+    expect(classifyReadAssetDef('particle', await probe({ path: probePathFor('particle'), type: 'particle' })))
+      .toBe('served');
+    expect(classifyReadAssetDef('atlas', await probe({ path: probePathFor('atlas'), type: 'atlas' })))
+      .toBe('no-branch');
+  });
+
+  it('every type in the device enum is one the op actually dispatches, and no other is', async () => {
+    game = createTestWorld({});
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...report.served].sort());
+  });
+
+  it('serves the SAME set as the editor twin — two ops, one advertised contract', async () => {
+    // The editor op cannot be probed here (see the header), so this is the honest const-vs-const
+    // half: both enums are hand-kept copies, and each is pinned to its OWN op in its own file.
+    // What this adds is that the two ops have not diverged from each other.
+    const { READ_ASSET_DEF_TYPES_FOR_TESTS } = await import('../../tools/modoki-mcp/src/tools/assets');
+    expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort());
+  });
 });

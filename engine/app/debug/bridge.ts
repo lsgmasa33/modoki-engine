@@ -10,19 +10,21 @@
  */
 
 import { makeDeviceEvalApi } from './deviceEvalApi';
-import { setConsoleSource } from './consoleSource';
+import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { setJournalEnabled } from '@modoki/engine/runtime';
+import { setJournalEnabled, getFrameLoopHealth } from '@modoki/engine/runtime';
+import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
+import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
+import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
 import {
   safeStringify,
+  describeShape,
   handleEval as evalCode,
   screenshotToCSS as toCSS,
-  createConsoleRing,
   clampEvalTimeout,
   DEVICE_EVAL_TIMEOUT_MS,
   DEVICE_EVAL_MAX_TIMEOUT_MS,
-  MAX_CONSOLE_LOGS,
   type LastScreenInfo,
   type ScreenInfoParam,
 } from './bridgeHelpers';
@@ -62,16 +64,45 @@ function withMechanismSuffix(reply: string): string {
   return reply.startsWith('Error:') ? reply : `${reply} [input:${INPUT_MECHANISM}]`;
 }
 
-// Original console for bridge's own logging (avoids feedback loop)
-const _log = console.log.bind(console);
+/** Refuse an input dispatch when the frame loop cannot actually deliver it (#682).
+ *
+ *  The "hold ~1-2 frames" `setTimeout`s below (and in `handlePressKey`/`handlePointer`) assume
+ *  per-frame `Input` sampling is running so the down/up edge gets seen — true only while the ECS
+ *  pipeline is registered as a frame callback and rAF is actually pumping it. On a dead chain the
+ *  wall-clock timer still fires (timers keep running — `declareUnrecoverable`'s own text), the
+ *  dispatch below still runs, and the reply still says `ok`, but zero frames pass and
+ *  `inputSystem` never samples anything: a false success, worse than a hang because the caller
+ *  acts on it.
+ *
+ *  `device_step`'s existing refusal (`agentBridge.ts`) GUESSES — "the frame loop may be stopped".
+ *  `getFrameLoopHealth()` can say it FOR CERTAIN: `.detail` already states how long, whether the
+ *  watchdog has given up (`unrecoverable`), and whether the GPU device was lost, so this reuses it
+ *  rather than re-deriving the same facts. Returns `null` (proceed) unless the loop is genuinely
+ *  `'stalled'` or `unrecoverable` — `'idle'`/`'hidden'` are left alone: a loop that never armed at
+ *  all (no viewport mounted yet) or is merely throttled by an occluded window is not this bug. */
+function frameLoopRefusal(op: string): string | null {
+  const h = getFrameLoopHealth();
+  if (h.status !== 'stalled' && !h.unrecoverable) return null;
+  return `Error: refusing ${op} — ${h.detail ?? `the frame loop has not ticked for ${h.msSinceLastFrame}ms`} `
+    + 'Dispatching this input now would report success while the game never receives it.';
+}
+
+// The bridge's OWN logging, deliberately kept OUT of `consoleRing` (avoids a feedback loop, and
+// stops 25 chatter call sites evicting the 200-entry ring that `device_console_logs` reads).
+// ⚠️ Imported, NOT `console.log.bind(console)` here: since #591 installs the capture eagerly from
+// `main.tsx`, `console.log` is ALREADY the ring wrapper by the time this module evaluates, so a
+// local bind would capture the wrapper and put every `[debug-bridge]` line into the ring. See
+// `unpatchedLog`'s comment in ./deviceConsoleCapture.ts.
+const _log = unpatchedLog;
 /** The ERROR twin of `_log`. Separate because a bridge that failed to start must not report it at
  *  `log` level: on a device the only readable channel is logcat/OSLog, and a `console.log` line
  *  there is indistinguishable from ordinary chatter — see `initDebugBridge`'s note on #164 for the
  *  hour that cost.
  *
- *  LATE-bound (a wrapper, not a `.bind()` like `_log`) on purpose: `patchConsole` replaces
- *  `console.error` with a wrapper that ALSO pushes into `consoleRing`, and every `_err` call site
- *  fires after that runs. A `.bind()` captures the pre-patch function and so reaches logcat only.
+ *  It reads live `console.error` (NOT `unpatchedLog`'s error twin) on purpose, and that is the whole
+ *  difference between the two: `_log` must stay out of `consoleRing`, `_err` must land IN it.
+ *  `installDeviceConsoleCapture` replaces `console.error` with a wrapper that also pushes into the
+ *  ring, so a failure reported through `_err` is readable via `device_console_logs`.
  *  That distinction is invisible for a boot failure — if the server never binds, nothing can read
  *  the ring anyway — but it is not for the port-lifecycle failure, which is RECOVERABLE: a later
  *  foreground can succeed, and then `device_console_logs` is reachable again with a gap it cannot
@@ -81,58 +112,13 @@ const _err = (...args: unknown[]) => console.error(...args);
 
 // Screen info from the last native screenshot — used for iOS tap coordinate mapping.
 let lastScreenInfo: LastScreenInfo | null = null;
-
-// Console capture ring buffer.
-const consoleRing = createConsoleRing(MAX_CONSOLE_LOGS);
-
-// --- Console Capture ---
-
-function patchConsole() {
-  const levels = ['log', 'warn', 'error', 'info'] as const;
-  for (const level of levels) {
-    const original = console[level].bind(console);
-    console[level] = (...args: unknown[]) => {
-      original(...args);
-      consoleRing.push(level, args);
-    };
-  }
-  // An uncaught error or a rejected promise never reaches `console.*`, so the patch above cannot
-  // see it — and a failed dynamic import or a throw deep in scene/resource loading is exactly the
-  // kind of thing worth diagnosing on a phone. `agentBridge` records these for the editor; the
-  // device had no equivalent, so its ring was silent on the whole class (#157).
-  // Each wrapped in try/catch for the same reason `agentBridge`'s twin is ("never let capture break
-  // logging"), and it matters MORE here: this handler runs INSIDE the window error handler, so a
-  // throw while describing an error becomes another error event. `e.error` is attacker-shaped in the
-  // general case — a value whose `stack` getter throws, or a Proxy — and `String(e.message)` can
-  // throw on an object with a hostile `toString`. Without the guard the entry is lost AND an
-  // exception escapes into the host, at precisely the moment something is already going wrong.
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', (e) => {
-      try {
-        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
-        consoleRing.push('error', [`[uncaught] ${msg}${where}`]);
-      } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      try {
-        const r = (e as PromiseRejectionEvent).reason;
-        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
-        consoleRing.push('error', [`[unhandledrejection] ${msg}`]);
-      } catch { /* ignore */ }
-    });
-  }
-  // Publish the ring so `diagnose` / the `console-logs` op can READ what this surface captured.
-  // Without this the device captured faithfully and nothing could reach it — see consoleSource.ts.
-  setConsoleSource(() => consoleRing.entries.map((e) => ({
-    // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
-    // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
-    // class of silent omission this whole seam exists to end.
-    level: e.level === 'info' ? 'log' : e.level,
-    ts: e.timestamp,
-    text: e.args.join(' '),
-  })));
-}
+// A retried `screenshot` request (the MCP client times out and re-sends while the native
+// `GameDebug.captureScreen()` for the FIRST request is still in flight) can resolve out of order —
+// the newer request's response can land before the older one's. Without this, the older, in-flight
+// call's `await` resumes last and overwrites `lastScreenInfo` with stale dimensions (e.g. from
+// before a device rotation the newer capture already reflects), corrupting tap-coordinate mapping
+// until the next screenshot. A newer request always wins.
+const screenshotEpoch = createSupersessionToken();
 
 // --- Command Handlers ---
 
@@ -264,7 +250,11 @@ interface DomResolution {
   matched?: string | null; hitTarget?: string | null; occluded?: boolean; error?: string;
 }
 
-type Aim = { x: number; y: number; label: string } | { error: string };
+// `hitTarget` is set ONLY by the selector branch of `resolveAim` — a raw x/y aim never claimed
+// anything was under it, so there is nothing for a later re-check to have drifted FROM. `undefined`
+// (not resolved by selector) and `null` (selector resolved, but nothing was there) are both real,
+// distinct answers; see `aimDriftSuffix` below, which is the sole reader of this field.
+type Aim = { x: number; y: number; label: string; hitTarget?: string | null } | { error: string };
 
 /** Resolve a CSS selector to a viewport point (+ occlusion) via the shared runtime op — reused so a
  *  device tap/drag can aim by selector, occlusion-checked server-side, with no screenshot round-trip. */
@@ -287,11 +277,39 @@ async function resolveAim(params: Record<string, unknown>, selKey: string, xKey:
     if (r.occluded) {
       return { error: `Error: ${JSON.stringify(selector)} (${r.matched}) is occluded by ${r.hitTarget} — not aiming there` };
     }
-    return { x: r.x, y: r.y, label: `${selector}→${r.hitTarget}` };
+    return { x: r.x, y: r.y, label: `${selector}→${r.hitTarget}`, hitTarget: r.hitTarget };
   }
   const screenInfo = params.screenInfo as { imgW: number; imgH: number; nativeW: number; nativeH: number } | undefined;
   const { x, y } = screenshotToCSS(params[xKey] as number, params[yKey] as number, screenInfo);
   return { x, y, label: `css(${Math.round(x)},${Math.round(y)})` };
+}
+
+/** #486 finding C: `resolveAim`'s selector branch crosses a dynamic import PLUS a round trip through
+ *  the shared agent-op registry (`resolve-dom-point`) before it ever returns — real async hops, not
+ *  a same-tick lookup. `layoutSettle.ts` exists because that window is not instantaneous: #261
+ *  measured 0–1 frames of settle after a dock change, which is exactly long enough for the element
+ *  under a resolved point to no longer be the one the resolution named. `handleHover`/`handleScroll`
+ *  then dispatch at the OLD coordinates and, without this, would still label the reply with the
+ *  PRE-await `hitTarget` — a claim that can go stale in the gap.
+ *
+ *  `dispatchTapAt` already draws the shape this follows: re-check after the gap, and say plainly
+ *  what you can no longer stand behind rather than silently keep the old claim. This is the same
+ *  honesty extended to an aim that is USED, not pressed.
+ *
+ *  Deliberately a WARNING, not a refusal — matching `modoki_dnd`'s documented behavior for a
+ *  compromised aim (#260). The event has already been (or is about to be) dispatched at real
+ *  coordinates; refusing to report success would discard a gesture that in fact landed. Comparing
+ *  against `describeElement` is not optional: it is the SAME function `hitTarget` came from
+ *  (`domResolve.ts`), so "did it change" is a like-for-like comparison — `describeEl` in this file
+ *  is a different, differently-formatted function, and diffing across the two would report drift
+ *  that never happened. */
+function aimDriftSuffix(aim: { hitTarget?: string | null }, nowEl: Element | null): string {
+  if (aim.hitTarget === undefined) return ''; // a pixel aim claimed nothing, so nothing can have drifted
+  const now = describeElement(nowEl);
+  if (now === (aim.hitTarget ?? null)) return '';
+  return ` — ⚠ the element under this aim CHANGED between resolving it and acting on it: resolved `
+    + `${aim.hitTarget}, acted on ${now ?? 'nothing'}. The layout moved in that window; re-aim before `
+    + `resting a verdict on this.`;
 }
 
 /** Resolve-ONLY twin of `resolveAim`, for the trusted-CDP route (#32 Phase 1): the backend needs a
@@ -475,6 +493,8 @@ function handleReleaseHeldPointer(): { released: string | null } {
 }
 
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('tap');
+  if (refusal) { _log(`[debug-bridge] TAP → ${refusal}`); return refusal; }
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
@@ -483,6 +503,8 @@ export async function handleTap(params: Record<string, unknown>): Promise<string
 }
 
 export async function handleDrag(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('drag');
+  if (refusal) { _log(`[debug-bridge] DRAG → ${refusal}`); return refusal; }
   const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY');
   if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return fromAim.error; }
   const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY');
@@ -501,6 +523,15 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   showMarker(to.x, to.y, 'cyan', `to(${Math.round(to.x)},${Math.round(to.y)})`);
   showDragLine(from.x, from.y, to.x, to.y);
 
+  // #486 finding C: `fromAim` was resolved before any of the above — re-check what's under `from`
+  // right before acting on it, and fold the verdict into BOTH replies below. A drag resolves two
+  // aims at two different instants and reports them as one gesture; this covers the one that is
+  // actually USED to pick/drive the drag (`from`, via `grabEl`/`pickCanvasAt`). Computed once,
+  // independently of `grabEl`'s own selection (which prefers `fromSelector`'s `querySelector` over
+  // `elementFromPoint`) — this must always compare against what `elementFromPoint` says NOW, the
+  // same kind of read `hitTarget` came from.
+  const driftAtFrom = aimDriftSuffix(fromAim, document.elementFromPoint(from.x, from.y));
+
   // DOM-element-targeted drag: move DOM chrome (a debug widget, slider) by dispatching the pointer
   // sequence ON the grabbed element — the world path below dispatches on the canvas, which never
   // reaches a DOM element's React handlers. Auto-engaged when the grab lands on a non-canvas element
@@ -515,7 +546,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas') && !grabEl.querySelector('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
-    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${superseded}`);
+    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${driftAtFrom}${superseded}`);
   }
 
   // World-space drag: dispatch a real pointer sequence ON the canvas under the GRAB point so it
@@ -538,11 +569,20 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   }
   canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
   _log(`[debug-bridge] DRAG → canvas:${how}`);
-  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${superseded}`);
+  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${driftAtFrom}${superseded}`);
 }
 
-function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
-  return consoleRing.query((params.limit as number) || 50, params.level as string | undefined);
+/** ⚠️ SHAPE CHANGE, coordinated with `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s
+ *  `device_console_logs` (the only consumer of this bridge method — do not change one without the
+ *  other). Used to return the bare array `consoleRing.query()` produces; now wraps it with
+ *  `dropped`, for the same reason the editor's `console-logs` agent op does (see its own comment,
+ *  `agentBridge.ts`) — the ring is `[pinned] ++ [tail]`, discontiguous once it wraps, and on device
+ *  there is no devtools console to notice the gap any other way. */
+function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number } {
+  return {
+    logs: consoleRing.query((params.limit as number) || 50, params.level as string | undefined),
+    dropped: getConsoleRingDropped(),
+  };
 }
 
 // --- App identity (#88) ---
@@ -706,16 +746,16 @@ let heldPointer: { button: number; x: number; y: number; target: Element; how: H
  *  aim landed on a DOM UI element and the press went there instead (#299). */
 type HeldHow = CanvasPick['how'] | 'dom';
 
-/** Bumped by every `releaseHeldPointer` call, i.e. every point at which a held press was supposed
- *  to end. `handlePointer` samples it on entry and re-checks after its awaits, because a `down`
- *  whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER the
- *  disconnect handler's release had already run and found nothing to release — leaving a press
+/** Invalidated by every `releaseHeldPointer` call, i.e. every point at which a held press was
+ *  supposed to end. `handlePointer` captures it on entry and re-checks after its awaits, because a
+ *  `down` whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER
+ *  the disconnect handler's release had already run and found nothing to release — leaving a press
  *  nothing can ever lift, which is exactly the state these defences exist to make unreachable.
  *  The window is one async hop (`resolveSelectorPoint`'s dynamic import), and the consequence is
- *  the unrecoverable one, so it is worth a counter. Counting releases rather than disconnects
+ *  the unrecoverable one, so it is worth a token. Invalidating on releases rather than disconnects
  *  keeps the whole mechanism reachable from `releaseHeldPointer` alone — nothing needs a
  *  test-only seam to exercise it. */
-let leaseEpoch = 0;
+const leaseLiveness = createTeardownToken();
 
 /** Release a press left held, by dispatching its matching `pointerup` at the held point (#299).
  *
@@ -728,7 +768,7 @@ let leaseEpoch = 0;
  *
  *  Returns a description of what it released, or null if nothing was held. */
 export function releaseHeldPointer(): string | null {
-  leaseEpoch++; // counted even with nothing held — that is the case `handlePointer` must notice
+  leaseLiveness.invalidateAll(); // invalidated even with nothing held — `handlePointer` must notice that case too
   return dropHeldPress('lease');
 }
 
@@ -754,18 +794,18 @@ function heldLossNote(): string {
     + `released for you — ${why}. Send a fresh down.`;
 }
 
-/** The DISPATCH half of a release, without the `leaseEpoch` bump.
+/** The DISPATCH half of a release, without invalidating `leaseLiveness`.
  *
- *  The split keeps `leaseEpoch` meaning exactly one thing: "a release happened because the agent
- *  can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a `down`
- *  whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE is not
- *  that — the lease is alive and the agent is actively driving — so routing it through the
- *  exported `releaseHeldPointer` (which bumps the counter even with nothing held, deliberately)
- *  would overload the signal.
+ *  The split keeps `leaseLiveness` meaning exactly one thing: "a release happened because the
+ *  agent can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a
+ *  `down` whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE
+ *  is not that — the lease is alive and the agent is actively driving — so routing it through the
+ *  exported `releaseHeldPointer` (which invalidates even with nothing held, deliberately) would
+ *  overload the signal.
  *
  *  ⚠️ The concrete consequence is NOT demonstrated, and this comment is deliberately weaker than
- *  its first draft. A `down` that entered before such a bump and latched after it would read the
- *  changed epoch and cancel itself — a stranded-gesture shape invented by the fix for the old one.
+ *  its first draft. A `down` that entered before such an invalidation and latched after it would
+ *  read it as stale and cancel itself — a stranded-gesture shape invented by the fix for the old one.
  *  The transport makes that reachable in principle: the `message` listener is async with no queue,
  *  so two requests genuinely interleave. But a single agent drives the lease sequentially, and no
  *  test here pins it — every attempt raced the wrong way, because `handleTap`'s own 50 ms hold
@@ -818,8 +858,20 @@ function mkButtonedPointerEvent(type: string, x: number, y: number, button: numb
 // backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
 // module import cleanly (measured), so a direct call is the honest way to cover them.
 export async function handlePointer(params: Record<string, unknown>): Promise<string> {
-  const epochOnEntry = leaseEpoch;
   const action = params.action as string;
+  // `frameLoopRefusal` exists to stop an ACQUIRE from reporting success into a dead loop — it must
+  // not also block the RELEASE half of an already-held gesture. Refusing 'up' here strands the
+  // press down forever (down landed while healthy, the loop then stalled, up gets refused), which
+  // is exactly the state-leaking failure this guard's own error text warns against — just on the
+  // other end of the gesture. `deviceCdp.ts`'s `releaseHeldBeforeTrustedGesture` treats "a failure
+  // after one landed leaves a finger DOWN" as the hazard to avoid, not to cause (#682 close-out
+  // round 3, MEDIUM 3 — round 1's defect in a new hat: a guard meant for the acquire half applied
+  // to both).
+  if (action !== 'up') {
+    const refusal = frameLoopRefusal('pointer');
+    if (refusal) return refusal;
+  }
+  const stillLive = leaseLiveness.capture();
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
   }
@@ -893,7 +945,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // The lease died while this call was resolving its aim, so the disconnect handler's release ran
   // before there was anything to release. Release it here instead of returning a held press nobody
   // can ever lift.
-  if (heldPointer && leaseEpoch !== epochOnEntry) {
+  if (heldPointer && !stillLive()) {
     releaseHeldPointer();
     _log(`[debug-bridge] POINTER ${action} → ${where}, then released: the lease dropped mid-call`);
     return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:false) @ ${aim.label} — the lease dropped during this call, so the press was released rather than left held`);
@@ -967,6 +1019,9 @@ function readFocusedValue(el: HTMLElement): string | null {
  *  ` [input:synthetic]` suffix those use; a failure carries no field, matching the string handlers'
  *  rule that a refusal never claims a mechanism because nothing was dispatched. */
 export async function handleType(params: Record<string, unknown>): Promise<{ ok: boolean; typed: number; activeElement: string | null; valueAfter?: string | null; error?: string; inputMechanism?: typeof INPUT_MECHANISM }> {
+  // Object-shaped twin of the string handlers' refusal above — see `frameLoopRefusal`.
+  const refusal = frameLoopRefusal('type-text');
+  if (refusal) return { ok: false, typed: 0, activeElement: null, error: refusal };
   const text = params.text;
   if (typeof text !== 'string') return { ok: false, typed: 0, activeElement: null, error: 'type-text needs a `text` string' };
 
@@ -1053,6 +1108,8 @@ function keyToCode(key: string): string {
  *  drive gameplay keys. Dispatched on the focused element (bubbles to `window`, where the menu +
  *  input sources listen). The hold lets per-frame input sampling see the down edge. */
 export async function handlePressKey(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('press-key');
+  if (refusal) return refusal;
   const key = params.key as string;
   if (!key) return 'Error: press-key needs a key';
   const mods = (params.modifiers as string[]) ?? [];
@@ -1071,6 +1128,8 @@ export async function handlePressKey(params: Record<string, unknown>): Promise<s
 /** Hover: move the pointer over the resolved element/point (pointerover/enter/move + mousemove) so
  *  :hover styles, tooltips, and hover-gated UI light up. */
 export async function handleHover(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('hover');
+  if (refusal) return refusal;
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) return aim.error;
   const el = document.elementFromPoint(aim.x, aim.y);
@@ -1080,20 +1139,29 @@ export async function handleHover(params: Record<string, unknown>): Promise<stri
   el.dispatchEvent(new PointerEvent('pointerenter', { ...base, bubbles: false }));
   el.dispatchEvent(new PointerEvent('pointermove', base));
   el.dispatchEvent(new MouseEvent('mousemove', { clientX: aim.x, clientY: aim.y, bubbles: true, cancelable: true }));
-  return withMechanismSuffix(`ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}`);
+  return withMechanismSuffix(`ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}${aimDriftSuffix(aim, el)}`);
 }
 
 /** Scroll: dispatch a wheel event at the resolved point (defaults to viewport center). */
 export async function handleScroll(params: Record<string, unknown>): Promise<string> {
+  const refusal = frameLoopRefusal('scroll');
+  if (refusal) return refusal;
   const hasAim = typeof params.selector === 'string' || (typeof params.x === 'number' && typeof params.y === 'number');
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const aim = await resolveAim(p, 'selector', 'x', 'y');
   if ('error' in aim) return aim.error;
-  const el = document.elementFromPoint(aim.x, aim.y) ?? document.scrollingElement ?? document.body;
+  const hit = document.elementFromPoint(aim.x, aim.y);
+  const el = hit ?? document.scrollingElement ?? document.body;
   const dx = (params.dx as number) ?? 0;
   const dy = (params.dy as number) ?? 0;
   el.dispatchEvent(new WheelEvent('wheel', { clientX: aim.x, clientY: aim.y, deltaX: dx, deltaY: dy, bubbles: true, cancelable: true }));
-  return withMechanismSuffix(`ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}`);
+  // `hit` is passed even when NULL, deliberately. For a SELECTOR aim a null hit is the loudest
+  // drift there is — the resolution named an element, nothing is under that point any more, and
+  // the wheel just went to the scrollingElement/body fallback instead: precisely the false claim
+  // this suffix exists to stop (`@ selector→X` on an event X never saw). `aimDriftSuffix` already
+  // returns '' for a pixel aim, and returns '' when the resolution ALSO found nothing there, so
+  // passing the fallback element instead would be the only way to manufacture a wrong answer here.
+  return withMechanismSuffix(`ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}${aimDriftSuffix(aim, hit)}`);
 }
 
 // --- Message Router ---
@@ -1210,13 +1278,19 @@ async function initNativeBridge() {
       // iOS screenshot: native capture via drawHierarchy (captures WebGL on iOS)
       // Android screenshots are handled by adb screencap in the MCP server
       if (method === 'screenshot') {
+        const stillLatest = screenshotEpoch.begin();
         const result = await GameDebug.captureScreen();
-        lastScreenInfo = {
-          imageWidth: result.imageWidth,
-          imageHeight: result.imageHeight,
-          screenWidth: result.screenWidth,
-          screenHeight: result.screenHeight,
-        };
+        // Superseded by a retried/newer screenshot request that already resolved — do not let this
+        // stale capture overwrite the newer one's `lastScreenInfo`. This request's OWN response
+        // still goes out below regardless; only the shared coordinate-mapping state is guarded.
+        if (stillLatest()) {
+          lastScreenInfo = {
+            imageWidth: result.imageWidth,
+            imageHeight: result.imageHeight,
+            screenWidth: result.screenWidth,
+            screenHeight: result.screenHeight,
+          };
+        }
         await GameDebug.sendResponse({
           id,
           result: safeStringify({
@@ -1231,13 +1305,44 @@ async function initNativeBridge() {
       }
       // iOS native logs via OSLogStore, Android native logs via logcat (in-process)
       if (method === 'nativeLogs') {
-        const { logs } = await GameDebug.getNativeLogs({
+        // #648: this used to be `const { logs } = await …` — which DROPPED the declared `error`
+        // field entirely. `getNativeLogs` returns `Promise<{logs: string[]; error?: string}>`
+        // (capacitor-game-debug/src/definitions.ts), so a native failure answering
+        // `{logs: [], error: 'OSLogStore denied'}` reached the agent as an empty log list:
+        // "could not look" collapsed into "nothing is there", which are opposite findings and
+        // lead to opposite next moves.
+        //
+        // ⚠️ The TS type is NOT a guarantee here. The value crosses the Capacitor bridge from
+        // Swift/Kotlin in the INSTALLED BINARY, while this JS is rebuilt and OTA'd independently
+        // — the same producer/consumer version skew that made #644 happen. So decode, don't trust.
+        const raw = await GameDebug.getNativeLogs({
           limit: params?.limit ?? 50,
           seconds: params?.seconds ?? 60,
           filter: params?.filter,
           subsystem: params?.subsystem,
-        });
-        await GameDebug.sendResponse({ id, result: safeStringify(logs) });
+        }) as unknown;
+        // A native side answering a BARE ARRAY (an older binary) is still a valid answer.
+        const asObj = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as { logs?: unknown; error?: unknown } : null;
+        const logs = Array.isArray(raw) ? raw as string[]
+          : Array.isArray(asObj?.logs) ? asObj.logs as string[]
+            : null;
+        const nativeError = typeof asObj?.error === 'string' && asObj.error ? asObj.error : null;
+        if (logs === null) {
+          // No readable `logs` at all. Report it as a failure rather than as an empty list —
+          // `safeStringify(undefined)` used to return undefined here (despite its `: string`
+          // type), shipping a RESULT-LESS reply that the MCP could not distinguish from silence.
+          await GameDebug.sendResponse({
+            id,
+            error: nativeError
+              ?? `getNativeLogs returned a shape this build cannot read: ${describeShape(raw)}. `
+                + 'The native plugin in the installed binary may predate this JS bundle.',
+          });
+          return;
+        }
+        // `{logs, error}` ONLY when there is something extra to say. The happy path stays a bare
+        // array so an older game-debug MCP keeps reading it unchanged (the consumer tolerates
+        // both — see parseNativeLogsReply in game-debug-mcp/src/reply.ts).
+        await GameDebug.sendResponse({ id, result: safeStringify(nativeError ? { logs, error: nativeError } : logs) });
         return;
       }
 
@@ -1260,7 +1365,7 @@ async function initNativeBridge() {
     } else {
       _log('[debug-bridge] MCP client disconnected');
       // Never leave a press the agent can no longer release (#299) — see `releaseHeldPointer`.
-      const released = releaseHeldPointer(); // bumps `leaseEpoch` — see there
+      const released = releaseHeldPointer(); // invalidates `leaseLiveness` — see there
       if (released) _log(`[debug-bridge] released a pointer left held by the dropped lease: ${released}`);
     }
   });
@@ -1287,7 +1392,11 @@ export function initDebugBridge() {
   if (initialized) return;
   initialized = true;
 
-  patchConsole();
+  // `main.tsx`'s eager `./installDeviceConsoleCapture` side-effect import already calls this on
+  // every build that reaches here (#591) — this call stays anyway so `initDebugBridge` does not
+  // DEPEND on that having fired. `installDeviceConsoleCapture()` is idempotent, so the two never
+  // double-wrap.
+  installDeviceConsoleCapture();
 
   if (Capacitor.isNativePlatform()) {
     _log('[debug-bridge] Initializing native bridge');

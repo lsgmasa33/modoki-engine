@@ -22,9 +22,11 @@
  *  worker-clone launches landed on 5179, one (modoki-qa, 2026-08-25) with a live hub editor. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
   HUB_BACKEND_PORT,
@@ -33,9 +35,24 @@ import {
   cdpPortForBackend,
   backendUrlForClone,
 } from '../../scripts/editorPorts.mjs';
+import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
+
+/** Mirrors `pathIdentity.mjs`'s own platform test. Asked of the module rather than re-derived,
+ *  so this file cannot drift from the rule it is pinning. */
+const CASE_INSENSITIVE_FS = pathCaseKey('A') === 'a';
 
 const REPO = path.resolve(__dirname, '../../..');
-const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
+/**
+ * A documentation file, read as PROSE (#812).
+ *
+ * Every read in this guard is a `.md` doc — it compares the port TABLES humans read against the
+ * authored table in code, which it imports directly rather than scanning. So there is no code
+ * scan here to strip, and Markdown carries no comment syntax a scan could be blinded by.
+ */
+const readDoc = (rel: string) => readScannedSource(path.join(REPO, rel), {
+  comments: 'include',
+  reason: 'the assertions are about the port TABLES written in this doc — prose is the subject',
+}).raw;
 // engine/scripts/** and the committed agent-CLI configs are private-repo-only; the public
 // engine snapshot ships neither, so there is nothing to assert there.
 const skip = !hasPrivateTooling();
@@ -93,6 +110,90 @@ describe.skipIf(skip)('editorPorts.mjs is the one home for the clone → backend
     expect(backendPortForClone('/Users/someone/Projects/modoki-ai/')).toBe(5180);
   });
 
+  it('no two clone names fold to one case key (#881)', () => {
+    // The fallback map in `editorPorts.mjs` is a `Map` keyed by `pathCaseKey`, so two table names
+    // differing only in case would collapse and silently drop a clone onto auto ports.
+    //
+    // ⚠️ This lives HERE and not as a module-load `throw` in the source, which is what #881 first
+    // wrote. That throw fired only on case-INSENSITIVE platforms — so the Linux CI leg would stay
+    // green on the exact edit that broke every Mac clone — and it would take down `modoki-mcp`,
+    // which imports that module, instead of degrading one clone. This assertion fires on every
+    // platform, at the moment the table is edited, with no blast radius.
+    const folded = new Set(Object.keys(CLONE_BACKEND_PORTS).map((n) => pathCaseKey(n)));
+    expect(folded.size).toBe(Object.keys(CLONE_BACKEND_PORTS).length);
+    // Non-vacuity: the check must be capable of failing. Two names that DO collide must collapse.
+    expect(new Set(['modoki-qa', 'MODOKI-QA'].map((n) => pathCaseKey(n))).size)
+      .toBe(CASE_INSENSITIVE_FS ? 1 : 2);
+  });
+
+  /** #881 — the anchor. A case-flipped clone directory found NO pinned port and fell through to
+   *  auto ports, which is #349 wearing a different cause: the editor comes up somewhere no sibling
+   *  expects and every `MODOKI_BACKEND` aimed at this clone drives a different one.
+   *
+   *  ⚠️ Two independent halves, and each needs its own case because either alone leaves the bug:
+   *  `canonicalPath` repairs the spelling only where the directory EXISTS (`.native` throws
+   *  otherwise), and `pathCaseKey` carries every path that does not. The second is not
+   *  hypothetical — the scaffolder asks for a port before the directory is created. */
+  describe('a case-flipped clone directory still finds its pinned port (#881)', () => {
+    it('folds a name whose directory does NOT exist — the half realpath cannot reach', () => {
+      // No stat can succeed here, so this passes only via `pathCaseKey`.
+      expect(existsSync('/nonexistent-for-tests/MODOKI-QA')).toBe(false);
+      expect(backendPortForClone('/nonexistent-for-tests/MODOKI-QA'))
+        .toBe(CASE_INSENSITIVE_FS ? 5183 : null);
+      expect(backendPortForClone('/nonexistent-for-tests/Modoki-AI2'))
+        .toBe(CASE_INSENSITIVE_FS ? 5181 : null);
+    });
+
+    it('resolves a real directory reached by a case-flipped spelling', () => {
+      // On a case-insensitive volume the flipped spelling opens the SAME directory, so `.native`
+      // hands back the on-disk name and the exact lookup hits without needing the fold at all.
+      const base = mkdtempSync(path.join(tmpdir(), 'modoki-ports-'));
+      try {
+        const real = path.join(base, 'modoki-ai3');
+        mkdirSync(real);
+        expect(backendPortForClone(real)).toBe(5182);
+        const flipped = path.join(base, 'MODOKI-AI3');
+        expect(backendPortForClone(flipped)).toBe(CASE_INSENSITIVE_FS ? 5182 : null);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('resolves a clone reached through a SYMLINK — the half the case-fold cannot reach', (ctx) => {
+      // ⚠️ This case exists because the other two do NOT discriminate `canonicalPath` from a bare
+      // `path.resolve` on a case-insensitive volume: the fold alone already carries them, so
+      // reverting the canonicalisation leaves them green. Here the link's own basename is not a
+      // clone name in any casing, so only resolving the link finds the port. It is the closest a
+      // non-Windows machine can get to the `subst`/junction cases that motivated `.native`.
+      const base = mkdtempSync(path.join(tmpdir(), 'modoki-ports-'));
+      try {
+        const real = path.join(base, 'modoki-qa');
+        mkdirSync(real);
+        const link = path.join(base, 'some-other-name');
+        try {
+          symlinkSync(real, link, 'dir');
+        } catch {
+          // SKIP loudly, never a silent `return` — this is the only case that discriminates
+          // `canonicalPath` from `path.resolve`, so a quiet pass here is a vacuous green on
+          // exactly the platform (#881 is a Windows defect) where it would matter most.
+          ctx.skip('cannot create a directory symlink here (needs a privilege this machine lacks)');
+          return;
+        }
+        expect(backendPortForClone(link)).toBe(5183);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('still refuses an unknown clone whatever its case — the fold must not widen the table', () => {
+      // The accept side above is only half the claim. A fold that made every directory match
+      // something would be a worse bug than the one being fixed.
+      expect(backendPortForClone('/nonexistent-for-tests/MY-MODOKI')).toBeNull();
+      expect(backendPortForClone('/nonexistent-for-tests/MODOKI-AI4')).toBeNull();
+      expect(backendPortForClone('/nonexistent-for-tests/MODOKI-AI-SCRATCH')).toBeNull();
+    });
+  });
+
   it('derives Vite and CDP from the backend port the way the launcher does', () => {
     // Mirrors launch-editor.sh's DERIVED_VITE / DERIVED arithmetic. Duplicated there in bash
     // (it cannot import this), so pin the formula on both sides of the seam.
@@ -116,7 +217,7 @@ describe.skipIf(skip)('the docs still say what the table says', () => {
     ['docs/clones-and-ports.md', '§ RULE 2'],
   ] as const) {
     it(`${doc} ${section} lists the same clone → backend port pairs`, () => {
-      const documented = portsFromMarkdownTable(read(doc));
+      const documented = portsFromMarkdownTable(readDoc(doc));
       expect(
         Object.keys(documented).length,
         `${doc} — parsed no \`~/Projects/<clone>\` table rows at all. Either the table moved or its `
@@ -140,7 +241,7 @@ describe.skipIf(skip)('the docs still say what the table says', () => {
   }
 
   it('docs/clones-and-ports.md § RULE 2 also agrees on the derived Vite and CDP columns', () => {
-    const src = read('docs/clones-and-ports.md');
+    const src = readDoc('docs/clones-and-ports.md');
     let checked = 0;
     for (const line of src.split('\n')) {
       const dir = /~\/Projects\/([A-Za-z0-9._-]+)/.exec(line)?.[1];
@@ -193,18 +294,12 @@ describe.skipIf(skip)('no shared script re-introduces a hardcoded hub-port defau
   //  missed the regression written in the same style as the fix.
   const DEFAULTED_PORT = /(?::-|=|:)\s*["']?(?:http:\/\/(?:127\.0\.0\.1|localhost):)?(517[3-9]|518[0-3]|922[2-6])\b/;
 
-  function stripComments(src: string, rel: string): string {
-    const lines = src.split('\n');
-    const isComment = rel.endsWith('.mjs')
-      ? (l: string) => /^\s*(\/\/|\*|\/\*)/.test(l)
-      : (l: string) => /^\s*#/.test(l);
-    return lines.filter((l) => !isComment(l)).join('\n');
-  }
-
   for (const rel of SHARED) {
     it(`${rel} derives its backend port instead of defaulting to one`, () => {
       if (!existsSync(path.join(REPO, rel))) return;
-      const code = stripComments(read(rel), rel);
+      // Dual language (`.sh` vs `.mjs` vs `.json`) — the shared scanner (#419/#812) picks the
+      // right stripper by extension, so no hand-rolled per-language branch is needed here.
+      const code = readScannedSource(path.join(REPO, rel)).code;
       const hit = DEFAULTED_PORT.exec(code);
       expect(
         hit?.[0] ?? null,

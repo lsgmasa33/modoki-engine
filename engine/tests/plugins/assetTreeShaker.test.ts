@@ -989,6 +989,56 @@ describe('asset-tree-shaker', () => {
     expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
   });
 
+  /** #803 — the scene-wide default. `UISettings.fontFamily` is the ONLY font ref in Court's scene
+   *  now that its per-root `UIElement.fontFamily` was removed, so if the keep-walk cannot see this
+   *  field the face is shaken out of the production build and every UI string falls back to
+   *  system-ui ON DEVICE ONLY — the #53 class of "a ref the build cannot see", which no editor
+   *  session can reveal.
+   *
+   *  Deliberately authored with NO `resources[]` entry and NO `UIElement.fontFamily` anywhere:
+   *  `SceneManager` acquires from the saved `resources` array as well as the entity walk, so a
+   *  stale saved entry would mask a broken walk at runtime while the next editor save silently
+   *  dropped the font. This asserts the ENTITY walk alone is sufficient. */
+  it('resolves a UISettings.fontFamily GUID — the scene-wide default — to its file AND variants', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000004';
+    fx.writeVirtual('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeVirtual('/modoki/assets/fonts/Varela/VarelaRound-Bold.ttf', 'fake');
+    fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');
+
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UISettings: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf');
+    // The variant half: authored via the dedicated 'font-family' kind, not the registry's generic
+    // 'asset' push, which would keep only the one file the GUID names. A `fontWeight: 700` on any
+    // root would otherwise get a browser-synthesized fake bold in production.
+    expect(result.kept, 'sibling variant of the same family').toContain('/modoki/assets/fonts/Varela/VarelaRound-Bold.ttf');
+    expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Regular.ttf');
+    // A DOM consumer — what makes `shipSource:'auto'` ship the source `.ttf` at all.
+    expect(result.domFontFiles).toContain('/modoki/assets/fonts/Varela/VarelaRound-Regular.ttf');
+    expect(result.warnings.filter((w) => /unresolved GUID|no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** Same one-ref-one-warning rule as `UIElement.fontFamily` above: `UISettings.fontFamily` is in
+   *  BOTH `REF_FIELDS_BY_TRAIT` and the dedicated 'font-family' handler, so it must be listed in
+   *  `DEDICATED_REF_FIELDS` or a single stale ref reports as two broken fonts. */
+  it('reports an unresolved UISettings.fontFamily GUID exactly once', () => {
+    const MISSING = '99999999-9999-4999-8999-999999999998';
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UISettings: { fontFamily: MISSING } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
+  });
+
   it('drops all fonts when no scene sets fontFamily', () => {
     fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
     fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');
@@ -1562,5 +1612,114 @@ describe('asset-tree-shaker', () => {
 
     expect(result.warnings.some(w => /unresolved GUID/i.test(w))).toBe(true);
     expect(result.kept).toContain('/games/test/assets/scenes/main.json');
+  });
+
+  // ── #731: a swallowed parse error inside an inline bank/members string used to read back as
+  // "nothing here" — indistinguishable from a correctly-authored empty one — so the assets it
+  // would have named were silently shaken out of the prod build with no signal. These pin the
+  // fix: warn on the shared `warnings` channel and keep building, exactly like every OTHER parse
+  // failure in this walker already does (scene/mesh/material/particle/…). Each pairs a malformed
+  // case with an ACCEPT-side case on the same shape, so a fix that broke the well-formed path
+  // could not hide behind a green malformed-only suite.
+  describe('warns instead of silently dropping refs on malformed inline data (#731)', () => {
+    it('warns when an .atlas.json cannot be parsed, and keeps building', () => {
+      fx.writeVirtual('/games/test/assets/textures/broken.atlas.json', '{ not valid json');
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.some(w => /failed to parse atlas members:.*broken\.atlas\.json/.test(w))).toBe(true);
+    });
+
+    it('accept side: a well-formed .atlas.json parses with no warning and its member still redirects', () => {
+      const atlasGuid = '10101010-1111-4222-8333-444444444444';
+      const memberGuid = '20202020-1111-4222-8333-444444444444';
+      fx.writeJson('/games/test/assets/textures/ok.atlas.json', { id: atlasGuid, members: [memberGuid] });
+      // A trait the shaker has never heard of, carrying the member's GUID on an arbitrary field —
+      // same trick as the generic-trait-field video test above — so keeping the ATLAS (not just
+      // "no crash") is what proves buildGuidIndex's member→atlas redirect still ran.
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8, entities: [{ traits: { SomeTrait: { ref: memberGuid } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.filter(w => /failed to parse atlas members/i.test(w))).toEqual([]);
+      expect(result.kept).toContain('/games/test/assets/textures/ok.atlas.json');
+    });
+
+    it('warns when a UIEntries prefab bank cannot be parsed, and keeps building', () => {
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { UIEntries: { prefabs: '{ not valid json' } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.some(w => /failed to parse UIEntries prefab bank:.*main\.json/.test(w))).toBe(true);
+    });
+
+    it('accept side: a well-formed UIEntries prefab bank parses with no warning and keeps its prefab', () => {
+      fx.writeJson('/games/test/assets/prefabs/card.prefab.json', { entities: [] });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { UIEntries: { prefabs: JSON.stringify([{ name: 'card', prefab: '/games/test/assets/prefabs/card.prefab.json' }]) } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.filter(w => /failed to parse UIEntries/i.test(w))).toEqual([]);
+      expect(result.kept).toContain('/games/test/assets/prefabs/card.prefab.json');
+    });
+
+    it('warns when an Animator.clips bank is malformed JSON, and keeps building', () => {
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { Animator: { clips: '{ not valid json', clip: 'idle' } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.some(w => /failed to parse Animator\.clips bank:.*main\.json/.test(w))).toBe(true);
+    });
+
+    it('accept side: a well-formed Animator.clips bank parses with no warning and keeps its clip', () => {
+      const clipGuid = '30303030-1111-4222-8333-444444444444';
+      fx.writeJson('/games/test/assets/animations/spin.anim.json', { id: clipGuid, duration: 1, tracks: [] });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { Animator: { clips: JSON.stringify([{ name: 'spin', clip: clipGuid }]), clip: 'spin' } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.filter(w => /failed to parse Animator\.clips/i.test(w))).toEqual([]);
+      expect(result.kept).toContain('/games/test/assets/animations/spin.anim.json');
+    });
+
+    it('warns when an AudioSource.clips bank is malformed JSON, and keeps building', () => {
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { AudioSource: { clips: '{ not valid json' } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.some(w => /failed to parse AudioSource\.clips bank:.*main\.json/.test(w))).toBe(true);
+    });
+
+    it('accept side: a well-formed AudioSource.clips bank parses with no warning and keeps its clip', () => {
+      const audioGuid = '40404040-1111-4222-8333-444444444444';
+      fx.writeVirtual('/games/test/assets/audio/music.mp3', 'fake-mp3');
+      fx.writeJson('/games/test/assets/audio/music.mp3.meta.json', { id: audioGuid, version: 2 });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 8,
+        entities: [{ traits: { AudioSource: { clips: JSON.stringify([{ key: 'music', ref: audioGuid }]) } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.warnings.filter(w => /failed to parse AudioSource\.clips/i.test(w))).toEqual([]);
+      expect(result.kept).toContain('/games/test/assets/audio/music.mp3');
+    });
   });
 });

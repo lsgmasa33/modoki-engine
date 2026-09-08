@@ -31,8 +31,18 @@ import { findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world'
 type SubtreePath = string;
 
 /** Walk `rootId`'s subtree depth-first in a canonical order (siblings by sortOrder, then
- *  name, then id — the same order the Hierarchy shows), returning each entity's id and
- *  structural path. Both instantiations of one prefab produce the same paths. */
+ *  name, then id), returning each entity's id and structural path. Both instantiations of
+ *  one prefab produce the same paths.
+ *
+ *  ⚠️ This is DELIBERATELY not `compareSiblings` (the Hierarchy/serializer rule, which
+ *  tiebreaks on the GUID) — it used to claim it matched the Hierarchy, and #500 made that
+ *  false when the panel moved to a guid tiebreak. Keeping the claim would have been the
+ *  tempting fix; changing the order to restore it is the dangerous one. This function
+ *  exists to map guids BY STRUCTURAL PATH, so ordering by guid is circular: the path is
+ *  built from `name#index`, and a guid tiebreak would let a re-instantiation that mints
+ *  different guids produce a different sibling order, shifting every path one slot and
+ *  breaking exactly the re-identification this is for. Name-then-id is structural, which
+ *  is the property that matters here. Agreement with the panel is not. */
 function subtreePaths(rootId: number, flat: EntityInfo[]): { id: number; path: SubtreePath }[] {
   const childrenByParent = new Map<number, EntityInfo[]>();
   for (const e of flat) {

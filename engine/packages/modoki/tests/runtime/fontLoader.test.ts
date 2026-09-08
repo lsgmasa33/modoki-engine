@@ -886,4 +886,106 @@ describe('fontLoader', () => {
       }
     });
   });
+
+  /** #856 — `doLoadFont`'s liveness capture/`invalidateFontFace` used a SHARED, module-wide
+   *  generation (`liveness.capture()` / `liveness.invalidateAll()`), not one keyed by path. So
+   *  re-importing font A superseded every OTHER font's in-flight `FontFace.load()` in the same
+   *  module — a font B loading concurrently would silently fail to register, exactly like the
+   *  cross-asset supersession fixed for `spriteMaterialCache.invalidateShader` in #852. Per-key
+   *  now: `invalidateFontFace(path)` invalidates only that path's own liveness key. */
+  describe('cross-font liveness (#856 per-key)', () => {
+    let instances: any[];
+    let addedFaces: any[];
+
+    function installFontFaceMock() {
+      instances = [];
+      class FakeFontFace {
+        resolve!: () => void;
+        reject!: (e: Error) => void;
+        constructor(public family: string, public source: string, public descriptors: { weight: string; style: string }) {
+          instances.push(this);
+        }
+        load() {
+          return new Promise<this>((resolve, reject) => {
+            this.resolve = () => resolve(this);
+            this.reject = reject;
+          });
+        }
+      }
+      (globalThis as any).FontFace = FakeFontFace;
+
+      addedFaces = [];
+      (globalThis as any).document = {
+        fonts: {
+          add: vi.fn((f: any) => addedFaces.push(f)),
+          delete: vi.fn(),
+        },
+      };
+    }
+
+    it('invalidating font A does not discard font B\'s unrelated in-flight load', async () => {
+      installFontFaceMock();
+      const { loadFont, invalidateFontFace, getLoadedFonts } = await getLoader();
+
+      // Font A must already be registered so invalidateFontFace(A) has something to act on
+      // (its guard is `faces.has(path) || loading.has(path)`).
+      const pA1 = loadFont('/fonts/Alpha-Regular.woff2');
+      await Promise.resolve();
+      instances[0].resolve();
+      await pA1;
+
+      // Font B: start loading, deliberately left in flight.
+      const pB = loadFont('/fonts/Beta-Regular.woff2');
+      await Promise.resolve();
+      expect(instances.length).toBe(2);
+
+      // Re-import A while B is still in flight — must supersede ONLY A's key.
+      invalidateFontFace('/fonts/Alpha-Regular.woff2');
+
+      // Resolve B now — B was never invalidated, so its load must land normally.
+      instances[1].resolve();
+      await pB;
+
+      expect(getLoadedFonts().get('Beta') ?? []).toHaveLength(1);
+      expect(addedFaces).toContain(instances[1]);
+    });
+
+    it('invalidating font A still discards its OWN in-flight load', async () => {
+      installFontFaceMock();
+      const { loadFont, invalidateFontFace, getLoadedFonts } = await getLoader();
+
+      const pA1 = loadFont('/fonts/Alpha-Regular.woff2'); // in flight, never resolved yet
+      await Promise.resolve();
+      expect(instances.length).toBe(1);
+
+      invalidateFontFace('/fonts/Alpha-Regular.woff2'); // loading.has(path) is true — proceeds
+      await Promise.resolve();
+      expect(instances.length, 'a reload for the same path was started').toBe(2);
+
+      // Resolve the STALE (first) instance — it must not register.
+      instances[0].resolve();
+      await pA1;
+
+      expect((globalThis as any).document.fonts.add).not.toHaveBeenCalledWith(instances[0]);
+      expect(getLoadedFonts().get('Alpha') ?? []).not.toContain(instances[0]);
+
+      // Let the fresh reload settle too, so nothing is left hanging.
+      instances[1].resolve();
+    });
+
+    it('full teardown (disposeAllFontFaces) still supersedes every outstanding load', async () => {
+      installFontFaceMock();
+      const { loadFont, disposeAllFontFaces, getLoadedFonts } = await getLoader();
+
+      const pB = loadFont('/fonts/Beta-Regular.woff2'); // in flight
+      await Promise.resolve();
+
+      disposeAllFontFaces();
+
+      instances[0].resolve();
+      await pB;
+
+      expect(getLoadedFonts().get('Beta') ?? []).toHaveLength(0);
+    });
+  });
 });

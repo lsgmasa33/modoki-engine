@@ -25,11 +25,16 @@ import {
   createTestWorld, type TestWorld, setPlayState,
   setParticleEffect, clearParticleCache, setAnimationClip, clearAnimationClipCache, registerAsset,
   setSpriteAnim, clearSpriteAnimCache, setRig2D, clearRig2DCache, type Rig2DFile,
+  setAnimSet, clearAnimSetCache,
 } from '@modoki/engine/runtime';
 import { clearHistory, clearDirtyAssets, markSceneSaved } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { READ_ASSET_DEF_TYPES_FOR_TESTS } from '../../tools/modoki-mcp/src/tools/assets';
+import { classifyReadAssetDef, probePathFor, probeServedTypes, type ReadAssetDefProbe }
+  from '../tools/readAssetDefServed';
 
 /** `particle-set`/`anim-set-clip`/`timeline-set` REPLACE an existing def and now refuse a path no
  *  asset exists at (a typo used to be applied to nothing, reported ok, and then materialised as a
@@ -50,6 +55,9 @@ const PARTICLE = '/assets/fx/spark.particle.json';
 const CLIP = '/assets/animations/walk.anim.json';
 const SPRITEANIM = '/assets/fx/hero.spriteanim.json';
 const RIG2D = '/assets/fx/hero.rig2d.json';
+const ANIMSET = '/assets/fx/hero.animset.json';
+const SHADER = '/assets/fx/glow.shader.json';
+const MATERIAL = '/assets/fx/glow.mat.json';
 const MINIMAL_RIG: Rig2DFile = {
   bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
   sprite: 'sp1',
@@ -71,13 +79,14 @@ beforeEach(() => {
   clearAnimationClipCache();
   clearSpriteAnimCache();
   clearRig2DCache();
+  clearAnimSetCache();
   markSceneSaved();
   vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
 });
 afterEach(() => {
   game?.dispose(); game = undefined;
   clearDirtyAssets(); clearParticleCache(); clearAnimationClipCache();
-  clearSpriteAnimCache(); clearRig2DCache();
+  clearSpriteAnimCache(); clearRig2DCache(); clearAnimSetCache();
   vi.unstubAllGlobals();
 });
 
@@ -110,6 +119,13 @@ describe('reading a definition back', () => {
     const r = await runAgentOp('read-asset-def', { path: RIG2D }) as Def;
     expect(r.type).toBe('rig2d');
     expect((r.def as { sprite: string }).sprite).toBe('sp1');
+  });
+
+  it('reads an animset too — the suffix picks the cache (#842b)', async () => {
+    setAnimSet(ANIMSET, { source: 'guid-of-glb', clips: [{ name: 'walk', speed: 2 }] });
+    const r = await runAgentOp('read-asset-def', { path: ANIMSET }) as Def;
+    expect(r.type).toBe('animset');
+    expect((r.def as { clips: { name: string; speed?: number }[] }).clips[0].speed).toBe(2);
   });
 
   it('reports a rig2d at its AUTHORED precision, not the parsed rig (QA-ASSET-0015)', async () => {
@@ -172,6 +188,40 @@ describe('refusals — a miss must not look like an answer', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('an animset miss ERRORS too, and PEEKS without starting a background fetch (#844)', async () => {
+    // `getAnimSet` used to have no `{load:false}` peek variant, so a miss here kicked off a
+    // background fetch that could only fail and, on device with no watcher to heal it, permanently
+    // poisoned the path via `failed.add` — the same class of bug the spriteanim/rig2d tests above
+    // pin for their own caches.
+    const fetchSpy = vi.fn(() => Promise.reject(new Error('no network in test')));
+    vi.stubGlobal('fetch', fetchSpy);
+    await expect(runAgentOp('read-asset-def', { path: '/assets/fx/missing.animset.json' }))
+      .rejects.toThrow(/not in the live animset cache/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('a shader miss ERRORS the same way (#842b) — proves the suffix routes to the shader cache', async () => {
+    // `getSpriteMaterialProgram` is a bare map read, so this also confirms it starts no compile.
+    await expect(runAgentOp('read-asset-def', { path: SHADER }))
+      .rejects.toThrow(/not in the live shader cache/);
+  });
+
+  it('material refuses with its OWN reason, not the generic "not in the live cache" miss (#842c)', async () => {
+    // materialCache (meshTemplateCache.ts) keeps only the BUILT THREE.Material; the raw
+    // `.mat.json` is never retained live, for ANY material — not merely "not loaded yet". So this
+    // is a dedicated, always-fires refusal that says why and what to do instead, matching the
+    // device surface's wording exactly (agentBridge.ts).
+    const err = await runAgentOp('read-asset-def', { path: MATERIAL }).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/only the compiled THREE\.Material is retained/);
+    expect((err as Error).message).toMatch(/dirtyAssetPaths/);
+    expect((err as Error).message).not.toMatch(/not in the live material cache/);
+  });
+
+  it('material is excluded from the accepted-types list — it is not a passable `type`', async () => {
+    const err = await runAgentOp('read-asset-def', { path: '/assets/fx/mystery.json' }).catch((e: Error) => e);
+    expect((err as Error).message).not.toMatch(/'material'/);
+  });
+
   it('refuses a path whose kind it cannot infer, naming the accepted types', async () => {
     const err = await runAgentOp('read-asset-def', { path: '/assets/fx/mystery.json' }).catch((e: Error) => e);
     expect((err as Error).message).toMatch(/cannot tell what kind of asset/);
@@ -185,11 +235,68 @@ describe('refusals — a miss must not look like an answer', () => {
   });
 
   it('refuses an unsupported `type` instead of silently reading nothing', async () => {
-    const err = await runAgentOp('read-asset-def', { path: PARTICLE, type: 'material' }).catch((e: Error) => e);
-    expect((err as Error).message).toMatch(/unsupported type 'material'/);
+    // A type genuinely outside the 8 ASSET_SCHEMA_TYPES — 'material' is IN the schema but gets its
+    // own dedicated refusal above, not this generic "unsupported type" one.
+    const err = await runAgentOp('read-asset-def', { path: PARTICLE, type: 'mesh' }).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/unsupported type 'mesh'/);
+  });
+
+  it('the "unsupported type" list matches the accepted-types list — both are the same 7', async () => {
+    const noKind = await runAgentOp('read-asset-def', { path: '/assets/fx/mystery.json' }).catch((e: Error) => e);
+    const badKind = await runAgentOp('read-asset-def', { path: PARTICLE, type: 'mesh' }).catch((e: Error) => e);
+    const SEVEN = ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'];
+    for (const kind of SEVEN) {
+      expect((noKind as Error).message).toContain(kind);
+      expect((badKind as Error).message).toContain(kind);
+    }
+    expect((noKind as Error).message).not.toMatch(/'material'/);
+    expect((badKind as Error).message).not.toMatch(/material/);
   });
 
   it('requires a path', async () => {
     await expect(runAgentOp('read-asset-def', {})).rejects.toThrow(/requires \{ path \}/);
+  });
+});
+
+/** The MCP enum is a hand-kept COPY of what this op serves, and until #855 nothing checked it
+ *  against the op — only against a sibling constant minus a hand-maintained exemption map. That is
+ *  what let `de3cdce48` widen the enum to `atlas`, a type the op has no arm for, with the guard
+ *  green. These tests ask the op instead. Rationale + the shared classifier:
+ *  `engine/tests/tools/readAssetDefServed.ts`. Device twin: `tests/framework/liveLifecycleOps.test.ts`. */
+describe('modoki_read_asset_def\'s enum lists exactly what THIS op dispatches (#855)', () => {
+  /** The editor op THROWS; hand the classifier the message. */
+  const probe: ReadAssetDefProbe = async ({ path, type }) => {
+    try {
+      await runAgentOp('read-asset-def', { path, type });
+      return '';
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
+
+  it('the probe DISTINGUISHES a dispatched type from one with no arm', async () => {
+    // Non-vacuity, first: an assertion built on a probe that cannot tell the two apart would pass
+    // for the wrong reason. `atlas` is in ASSET_SCHEMA_TYPES and has no arm; `particle` has one.
+    expect(classifyReadAssetDef('particle', await probe({ path: probePathFor('particle'), type: 'particle' })))
+      .toBe('served');
+    expect(classifyReadAssetDef('atlas', await probe({ path: probePathFor('atlas'), type: 'atlas' })))
+      .toBe('no-branch');
+  });
+
+  it('every type in the MCP enum is one the op actually dispatches, and no other is', async () => {
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    // THE assertion: the shipped enum, against the op — not against a constant beside it.
+    expect([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort()).toEqual([...report.served].sort());
+  });
+
+  it('names WHY each excluded type is excluded, from the op\'s own words', async () => {
+    const report = await probeServedTypes(ASSET_SCHEMA_TYPES, probe);
+    // `atlas` cannot be served — it holds no engine-side cache to read back (assetInvalidation.ts;
+    // persist.ts's `invalidateAtlasFile` is a documented no-op), so there is no arm to write.
+    expect(report.noBranch).toEqual(['atlas']);
+    // `material` IS dispatched and refuses on purpose — the built THREE.Material is all that is
+    // retained. "will not" and "cannot" are different facts; the old exemption map collapsed them.
+    expect(Object.keys(report.other)).toEqual(['material']);
+    expect(report.other.material).toMatch(/only the compiled THREE\.Material is retained/);
   });
 });

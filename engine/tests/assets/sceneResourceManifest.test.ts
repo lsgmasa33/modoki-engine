@@ -38,24 +38,34 @@ import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../..
 import { registerAsset, deriveGuid, type AssetType } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { collectResourceRefsFromEntities, type SceneResourceRef, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { hasAnyProject } from '../helpers/repoLayout';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 // engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const hasProjectAssets = hasAnyProject();
 
-function* walk(dir: string): Generator<string> {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.name.startsWith('.')) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walk(full);
-    else yield full;
-  }
+/** Every file under an asset root, git-enumerated (#771/#799) rather than a hand-rolled recursive
+ *  walk. A dotfile/dot-dir segment is dropped, same as the old walker's `e.name.startsWith('.')` —
+ *  git enumeration additionally drops `*.meta.local.json` for free (gitignored machine-local
+ *  sidecars — `.gitignore:41`), which `detectType()` below already classifies as `null` and
+ *  discards, so nothing downstream changes. */
+function walk(absDir: string): Array<{ rel: string; abs: string }> {
+  return repoFiles({
+    under: absDir,
+    match: (rel) => !rel.split('/').some((seg) => seg.startsWith('.')),
+    floor: 0,
+  });
 }
 
-function urlFor(abs: string, roots: AssetRoot[]): string | null {
+/** Matches on `rel` — git's own repo-relative POSIX string — rather than on two independently
+ *  derived absolute paths (#849). `roots[].relDir` is `absDir` made repo-relative ONCE per root
+ *  (a handful, not once per file); compared case-insensitively, same convention `repoCorpus.mjs`'s
+ *  own `under` matching already uses. */
+function urlFor(rel: string, roots: (AssetRoot & { relDir: string })[]): string | null {
+  const relLower = rel.toLowerCase();
   for (const r of roots) {
-    if (abs.startsWith(r.absDir + path.sep)) {
-      return (r.urlPrefix + '/' + path.relative(r.absDir, abs).replace(/\\/g, '/')).normalize('NFC');
+    if (relLower.startsWith(r.relDir.toLowerCase() + '/')) {
+      return (r.urlPrefix + '/' + rel.slice(r.relDir.length + 1)).normalize('NFC');
     }
   }
   return null;
@@ -64,11 +74,14 @@ function urlFor(abs: string, roots: AssetRoot[]): string | null {
 /** Collect (url, type, abs) for every shippable asset under the real project roots —
  *  same approach as assetRefIntegrity.test.ts, deliberately not reinvented. */
 function collectAssets() {
-  const roots = findAssetRoots(PROJECT_ROOT);
+  const roots = findAssetRoots(PROJECT_ROOT).map((r) => ({
+    ...r,
+    relDir: path.relative(PROJECT_ROOT, r.absDir).split(path.sep).join('/'),
+  }));
   const assets: { url: string; type: string; abs: string }[] = [];
   for (const r of roots) {
-    for (const abs of walk(r.absDir)) {
-      const url = urlFor(abs, roots);
+    for (const { rel, abs } of walk(r.absDir)) {
+      const url = urlFor(rel, roots);
       if (!url) continue;
       const ext = path.extname(url).toLowerCase();
       const type = detectType(url, ext);

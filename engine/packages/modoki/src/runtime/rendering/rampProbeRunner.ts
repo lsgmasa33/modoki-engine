@@ -194,22 +194,6 @@ const GPU_NOMINAL_INTERVAL_MS = 16.7;
  *  statement about a device whose first step already costs more than a whole frame. */
 const GPU_RAMP_BUDGET_MS = 400;
 
-/** Reject if `p` has not settled in `ms`. The timer is CLEARED on the happy path — an uncancelled
- *  one is the bug that made this workstream believe in a phantom 8-second WebGPU timeout for a
- *  whole session (see `gpuDetect.ts`). Same shape as `gpuClock.ts`'s, which is module-private
- *  there.
- *
- *  Exported so a test can assert the timeout MECHANISM rejects a promise that never settles,
- *  rather than only exercising the call sites through a fast mock that proves nothing about a
- *  hang. */
-export function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms); }),
-  ]).finally(() => clearTimeout(timer)) as Promise<T>;
-}
-
 /** Clamp the interval fed to a presentation-paced ramp's escape threshold so it stays in the
  *  relation every ramp assumes: `ESCAPE_MULTIPLE x interval < ABORT_FRAME_MS` (#205 R5.4).
  *  Nothing enforced this before.

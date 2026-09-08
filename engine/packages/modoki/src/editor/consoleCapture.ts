@@ -1,10 +1,38 @@
-/** consoleCapture — intercepts console.log/warn/error plus uncaught errors and
- *  unhandled promise rejections, buffering them for the Console panel.
+/** consoleCapture — the editor Console panel's PROJECTION of the shared console ring (#626).
  *
- *  This is split out of Console.tsx so the capture can be installed at the VERY
- *  beginning of editor launch (from createEditor, before any lazy panel bundle
- *  loads). Console.tsx imports the shared buffer + install fn from here so that
- *  nothing fired during early init is missed. */
+ *  This USED TO BE its own independent `console.*`/`window` wrapper, installed as early as the
+ *  editor itself could call it (`createEditor()`) so no early-init log or error was missed —
+ *  measured live, it still missed a ~1.16s window of boot that the shared ring
+ *  (`runtime/core/consoleRing.ts`) caught, because "as early as the editor could call it" is later
+ *  than the ring's own eager install (`engine/app/installConsoleRing.ts`, a side-effect import above
+ *  `App.tsx` in `main.tsx`). This module no longer patches `console.*` or listens on `window` at
+ *  all: it is a PROJECTION of the shared ring, exactly like `runtime/debug/consoleCapture.ts` (the
+ *  in-game debug menu's own projection of the same ring) — its own view (`getEditorLogs`), its own
+ *  clear-via-watermark (`clearEditorLogs`), nothing more. Resource-load errors and the
+ *  ResizeObserver-loop-noise swallow moved to `engine/app/debug/uncaughtCapture.ts` (a second,
+ *  capture-phase `window` listener) — see its own doc comment.
+ *
+ *  THE ONE GENUINE DIFFERENCE this panel still needs, which the shared ring does not model by
+ *  default: a `warn`/`error` row needs a stack even when the call passed no `Error` object — so it
+ *  can still say WHERE `console.warn(...)` was called from — and formatting `.stack` is the
+ *  expensive part in V8, so it must stay LAZY. That is `ConsoleRingOptions.retainCallSite`:
+ *  `installConsoleRing.ts` turns it on for the editor only (a device build must never pay for
+ *  retaining a live `Error` object per warn/error entry), and the ring itself allocates the `Error`
+ *  at the console call site and exposes `entry.stack` as a lazily-memoized getter. This module just
+ *  reads it.
+ *
+ *  ⚠️ `formatError` USED TO live here (a `String(err)` + `cause`-chain formatter) but had ZERO
+ *  production callers by the time #626/#633 were adversarially reviewed: `getEditorLogs()` below
+ *  projects the ring's own `stringifyArg` output, which is `err.stack || err.message` — no
+ *  `formatError` in that path at all — so an Error's `cause` chain (F3) reached this panel erased,
+ *  while two test suites kept asserting a function nothing calls. Deleted; the fix moved to the
+ *  RING'S `stringifyArg` (`runtime/core/consoleRing.ts`) so every projection gains it, not just
+ *  this one. */
+
+import {
+  getConsoleRingEntries, getConsoleRingVersion, getConsoleRingEpoch, subscribeConsoleRing,
+  getConsoleRingDropped, getConsoleRingBootPrefixCount,
+} from '../runtime/core/consoleRing';
 
 export interface LogEntry {
   id: number;
@@ -14,183 +42,172 @@ export interface LogEntry {
   stack: string;
 }
 
-let logIdCounter = 0;
-export const logBuffer: LogEntry[] = [];
-export const MAX_LOGS = 1000;
-let captureInstalled = false;
-
-/** Set by the Console panel to be notified when a new log lands. */
-let _onNewLog: (() => void) | null = null;
-export function setOnNewLog(cb: (() => void) | null) { _onNewLog = cb; }
-
-// Coalesce notifications: a burst of N logs in one tick (a loop that logs, a
-// hot-reload dumping warnings) would otherwise fire `_onNewLog` N times → N Console
-// re-renders, each re-filtering the whole buffer. Batch to ONE notification per
-// frame. rAF in the editor (Electron/browser); setTimeout(0) fallback for headless.
-// (editor-core F2 / panels F4)
-let _notifyScheduled = false;
-const scheduleFlush: (cb: () => void) => void =
-  typeof requestAnimationFrame === 'function'
-    ? (cb) => { requestAnimationFrame(cb); }
-    : (cb) => { setTimeout(cb, 0); };
-
-function notifyNewLog() {
-  if (!_onNewLog || _notifyScheduled) return;
-  _notifyScheduled = true;
-  scheduleFlush(() => {
-    _notifyScheduled = false;
-    _onNewLog?.(); // re-check: the panel may have unmounted during the frame
-  });
-}
-
-/** Current high-water mark of the id counter — Console uses this to bump a
- *  re-render version and to force a refresh after clearing the buffer. */
-export function getLogIdCounter() { return logIdCounter; }
-export function bumpLogIdCounter() { return ++logIdCounter; }
-
-// Original console methods, captured before patching. The error/rejection
-// handlers below MUST use these (not the patched methods) to avoid recursion.
-const origLog = console.log.bind(console);
-const origWarn = console.warn.bind(console);
-const origError = console.error.bind(console);
-
 function formatTime(now: Date): string {
   return `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 }
 
-// Stack source: either an already-resolved string (window error/rejection handlers
-// already hold one) or an `Error` whose `.stack` is formatted LAZILY. Reading
-// `Error.stack` triggers V8 to format the structured trace into a string — the
-// expensive part — so for console-method captures we defer it until the Console
-// panel actually displays the selected entry's stack (Console.tsx reads `.stack`
-// only for the clicked row). `log`-level captures pass '' (no stack) entirely.
-// (editor-core F2 part b)
-type StackSource = string | Error;
+/** Per-consumer watermark: `getEditorLogs()` only returns entries with `seq >` this.
+ *  `clearEditorLogs()` advances it to the ring's current highest seq — it NEVER truncates the shared
+ *  ring itself.
+ *
+ *  ⚠️ This is a VIEW operation, not a truncation, and that distinction matters more here than it
+ *  used to: the old `logBuffer.length = 0` wiped the ONE buffer this panel owned, but the ring is
+ *  now shared with three other consumers (`agentBridge`, the device bridge, the in-game debug menu's
+ *  `ConsoleTab`) and `/api/console-logs` — truncating it from a Clear click in the editor Console
+ *  panel would silently erase THEIR history too. Mirrors `runtime/debug/consoleCapture.ts`'s
+ *  identical `clearedBeforeSeq`. */
+let clearWatermark = 0;
 
-function makeEntry(level: LogEntry['level'], message: string, src: StackSource): LogEntry {
-  const base = { id: logIdCounter++, time: formatTime(new Date()), level, message };
-  if (typeof src === 'string') return { ...base, stack: src };
-  // Lazy: format `Error.stack` once, on first read, dropping the 3 internal frames
-  // (Error header + addEntry + the patched console method — see addEntry note).
-  const err = src;
-  let computed: string | undefined;
-  const entry = base as LogEntry;
-  Object.defineProperty(entry, 'stack', {
-    enumerable: true,
-    configurable: true,
-    get() {
-      if (computed === undefined) {
-        computed = (err.stack || '').split('\n').slice(3).join('\n').trim();
-      }
-      return computed;
-    },
-  });
-  return entry;
-}
+/** Bumped by `clearEditorLogs()`, on top of the shared ring's own version — mirrors
+ *  `runtime/debug/consoleCapture.ts`'s identical `localVersion`/`getConsoleVersion()` pair (see its
+ *  own doc comment for the full rationale). The ring's version does not move on a clear (nothing was
+ *  recorded), but what `getEditorLogs()` returns DOES change — so the version Console.tsx's
+ *  `useMemo` keys on must move too, or a Clear would silently no-op whenever the ring's version
+ *  already matched what the panel last rendered (the common case: autoscroll/scrollTop/selection all
+ *  still at their defaults). */
+let clearVersion = 0;
 
-function pushEntry(level: LogEntry['level'], message: string, src: StackSource) {
-  logBuffer.push(makeEntry(level, message, src));
-  if (logBuffer.length > MAX_LOGS) logBuffer.splice(0, logBuffer.length - MAX_LOGS);
-  notifyNewLog();
-}
+/** Self-heal `clearWatermark`/`clearVersion` when the shared ring has been reset OUT FROM UNDER
+ *  this projection. The ring's counters restart at 0 but a watermark set before the reset does not
+ *  — left alone, every later `getConsoleRingEntries(clearWatermark)` would filter out EVERY entry
+ *  until `seq` climbed back past a now-impossible value, so the panel would read as "captures
+ *  nothing" with nothing failing anywhere. That is the same silent-empty failure this whole issue
+ *  exists to remove, one level up.
+ *
+ *  Mirrors `runtime/debug/consoleCapture.ts`'s `syncClearWatermarkToRing` — that twin hit this
+ *  exact case first and documented it; this projection was written from the same pattern and
+ *  initially copied everything EXCEPT the guard. Called from every entry point that reads or writes
+ *  the watermark, not just one, so staleness is detected even if a caller only ever asks for the
+ *  version. */
+let lastRingEpoch = -1;
 
-/** `String(err)` plus the `cause` chain (depth-capped). Exported for unit testing. */
-export function formatError(err: Error, depth = 0): string {
-  const head = `${err.name || 'Error'}: ${err.message}`;
-  const cause = (err as { cause?: unknown }).cause;
-  if (depth >= 4 || !(cause instanceof Error)) return head;
-  return `${head}\n  caused by: ${formatError(cause, depth + 1)}`;
-}
+/** Belt-and-braces alongside `lastRingEpoch` (close-out review of #626/#633) — see
+ *  `syncClearWatermarkToRing`'s doc comment for why a version going backwards is checked TOO, not
+ *  just the epoch. */
+let lastRingVersion = -1;
 
-function stringifyArgs(args: unknown[]): string {
-  const parts: string[] = [];
-  for (const a of args) {
-    if (typeof a === 'string') parts.push(a);
-    else if (a == null) parts.push(String(a));
-    // An Error has no enumerable own properties, so JSON.stringify(err) === '{}'.
-    // That is how "[Editor] scene load failed: {}" reached the Console panel and the
-    // agent log bridge with the ACTUAL cause (a rendererReady timeout) erased — the
-    // single most expensive silent failure in the editor's history. Format errors
-    // explicitly, including the `cause` chain, so the reason always survives.
-    else if (a instanceof Error) parts.push(formatError(a));
-    else {
-      try { parts.push(JSON.stringify(a, null, 2)); }
-      catch { parts.push('[Circular]'); }
-    }
+function syncClearWatermarkToRing(): number {
+  // Keyed on the ring's EPOCH — its identity — not on any counter's value. `seq` and `version` both
+  // restart at 0 on a reset, so `reset -> log once` puts them back on values already observed:
+  // "version went backwards" never fires, and "watermark above highest seq" compares 1 > 1 and says
+  // no. Both were written here and both were wrong; the test below pins that exact sequence.
+  //
+  // PLUS `ringVersion < lastRingVersion` — belt-and-braces, close-out review of #626/#633. Neither
+  // this module nor its runtime twin supports HMR today, so nobody has built a real path where this
+  // second leg fires on its own: it is cheap insurance against a hypothetical, not a fix for
+  // anything demonstrated. The hypothetical: a genuinely FRESH ring module instance always starts
+  // at `epoch === 0`, which could collide with an already-remembered `0` left behind by an EARLIER
+  // ring instance this projection tracked before it was replaced — the epoch check alone would then
+  // miss the reset. A version that has gone backwards is an independent signal for exactly that
+  // case.
+  const ringEpoch = getConsoleRingEpoch();
+  const ringVersion = getConsoleRingVersion();
+  if (ringEpoch !== lastRingEpoch || ringVersion < lastRingVersion) {
+    clearWatermark = 0;
+    clearVersion = 0;
+    lastRingEpoch = ringEpoch;
+    cachedRingVersion = -1; // the cache below describes a ring that no longer exists
   }
-  return parts.join(' ');
+  lastRingVersion = ringVersion;
+  return ringVersion;
 }
 
-/** Install console + window error/rejection interception. Idempotent. */
-export function installConsoleCapture() {
-  if (captureInstalled) return;
-  captureInstalled = true;
+/** Memo for `getEditorLogs()`, keyed on the ring's RAW version plus this module's watermark — the
+ *  only two inputs that can change what it returns. Console.tsx calls it on every render (scroll,
+ *  resize, selection), and without this each of those would re-map the whole ring — up to 1000
+ *  entries, each allocating a `Date` — where the pre-#626 panel just read a stable array reference.
+ *  Mirrors `runtime/debug/consoleCapture.ts`'s identical cache, which exists for the same reason.
+ *
+ *  ⚠️ F9 (#626/#633 adversarial review): `getEditorLogs()` never hands out THIS array itself — same
+ *  reasoning as `getConsoleRingEntries()`'s own ⚠️ (`runtime/core/consoleRing.ts`). Console.tsx is
+ *  not the only reader of a Console-panel projection convention, and a stray `.reverse()`/`.sort()`/
+ *  `.push()` on a returned array would otherwise corrupt what every LATER call sees, since they'd
+ *  all be looking at this same cached array. The cache still pays for the expensive part (the
+ *  per-entry mapping, including a `Date` allocation each); only the O(n) array copy repeats. */
+let cachedRingVersion = -1;
+let cachedWatermark = -1;
+let cachedLogs: LogEntry[] = [];
 
-  function addEntry(level: LogEntry['level'], args: unknown[]) {
-    const message = stringifyArgs(args);
-    // Stack capture: `log`-level entries rarely need a trace and capturing one on
-    // EVERY log is the hot cost, so skip it. warn/error keep a stack, but hand the
-    // raw `Error` to `makeEntry` so the (expensive) `.stack` string is formatted
-    // LAZILY, only if the user clicks the entry to expand it. The `Error` is
-    // allocated HERE (not in makeEntry/pushEntry) so the frame depth the `slice(3)`
-    // assumes is stable: line 0 is the "Error" header, then addEntry, then the
-    // patched console method, then the real caller. (V8/Chromium-only by design —
-    // the editor ships in Electron; on a non-V8 engine the header line is absent and
-    // one real frame would be dropped, acceptable since it never runs there.)
-    // (editor-core F2 part b / F10)
-    pushEntry(level, message, level === 'log' ? '' : new Error());
-  }
-
-  console.log = (...args: unknown[]) => { origLog(...args); addEntry('log', args); };
-  console.warn = (...args: unknown[]) => { origWarn(...args); addEntry('warn', args); };
-  console.error = (...args: unknown[]) => { origError(...args); addEntry('error', args); };
-
-  if (typeof window !== 'undefined') {
-    // Uncaught errors — including resource load errors (which arrive as a plain
-    // Event, not an ErrorEvent, and carry no .error). Use the original console
-    // methods inside the handler to avoid recursion through the patched ones.
-    window.addEventListener('error', (event: Event) => {
-      try {
-        if (event instanceof ErrorEvent) {
-          const err = event.error;
-          const message = event.message || (err instanceof Error ? err.message : String(err));
-          // "ResizeObserver loop completed with undelivered notifications" is a
-          // benign browser warning fired when an observer callback dirties layout
-          // and the next batch spills into a follow-up frame. Nothing actually
-          // breaks (there's no .error, no stack) and it's emitted by our own
-          // resize-driven editor overlays. Swallow it so it doesn't masquerade as
-          // an uncaught error in the Console.
-          if (message.includes('ResizeObserver loop')) {
-            event.stopImmediatePropagation();
-            return;
-          }
-          const stack = err instanceof Error ? (err.stack || '') : '';
-          pushEntry('error', `Uncaught: ${message}`, stack);
-        } else {
-          // Resource load error (img/script/link). target has src/href.
-          const target = event.target as (HTMLElement & { src?: string; href?: string }) | null;
-          const url = target?.src || target?.href || '';
-          const tag = target?.tagName?.toLowerCase() || 'resource';
-          pushEntry('error', `Resource load error: <${tag}> ${url}`.trim(), '');
-        }
-      } catch (e) {
-        origError('[consoleCapture] error handler failed', e);
-      }
-    }, true); // capture phase so resource errors (which don't bubble) are seen
-
-    window.addEventListener('unhandledrejection', (event: PromiseRejectionEvent) => {
-      try {
-        const reason = event.reason;
-        const message = reason instanceof Error ? reason.message : stringifyArgs([reason]);
-        const stack = reason instanceof Error ? (reason.stack || '') : '';
-        pushEntry('error', `Unhandled rejection: ${message}`, stack);
-      } catch (e) {
-        origError('[consoleCapture] rejection handler failed', e);
-      }
+/** The shared ring, projected into this panel's `LogEntry` shape and filtered to entries past the
+ *  local clear watermark. `'info'` folds to `'log'` — the panel's own level union has no `'info'`
+ *  row (it never has; the toolbar only offers Log/Warn/Err). `time` is recovered from the ring's
+ *  MONOTONIC `mono` at DISPLAY time (`performance.timeOrigin + entry.mono`), matching
+ *  `runtime/core/consoleRing.ts`'s own doc comment on why that arithmetic does not belong in the
+ *  ring itself. */
+export function getEditorLogs(): LogEntry[] {
+  const ringVersion = syncClearWatermarkToRing();
+  if (ringVersion === cachedRingVersion && clearWatermark === cachedWatermark) return cachedLogs.slice();
+  cachedRingVersion = ringVersion;
+  cachedWatermark = clearWatermark;
+  cachedLogs = getConsoleRingEntries(clearWatermark).map((e) => {
+    const row = {
+      id: e.seq,
+      level: e.level === 'info' ? 'log' : e.level,
+      message: e.args.join(' '),
+      time: formatTime(new Date(performance.timeOrigin + e.mono)),
+    } as LogEntry;
+    // ⚠️ `stack` is re-exposed as a GETTER, never read here. The ring's own `stack` is itself a lazy
+    // getter (`retainCallSite`), and formatting `Error.stack` is the expensive part in V8 — the whole
+    // reason the capture is deferred. A plain `stack: e.stack ?? ''` in this map would READ it for
+    // every entry on every projection, formatting up to 1000 stacks each time the ring's version
+    // moves (i.e. on every new log line), which is worse than the pre-#626 panel and quietly undoes
+    // the capability this issue set out to keep. Console.tsx reads `.stack` for the SELECTED row only.
+    Object.defineProperty(row, 'stack', {
+      enumerable: true,
+      configurable: true,
+      get() { return e.stack ?? ''; },
     });
-  }
+    return row;
+  });
+  return cachedLogs.slice();
 }
 
-// Install at module load so logs/errors that fire during early app init (before
-// the Console panel mounts) are still captured into the buffer.
-installConsoleCapture();
+/** How many rolling-tail entries have been evicted from the shared ring so far — see
+ *  `consoleRing.ts`'s own doc comment (`getConsoleRingDropped`, "THE DISCLOSURE THAT MATTERS").
+ *
+ *  F2 (#626/#633 adversarial review): Console.tsx reads this to decide whether to draw a gap
+ *  marker at all — mirrors `runtime/debug/tabs/ConsoleTab.tsx`'s identical use of
+ *  `runtime/debug/consoleCapture.ts`'s `getConsoleDropped()`. Before this, the editor Console panel
+ *  was the ONE projection of the four the ring's own doc comment names that never surfaced it: its
+ *  `[pinned] ++ [tail]` concatenation reads as one continuous log, and the toolbar's `n/total`
+ *  counter can read as healthy (e.g. `1000/1000`) while the ring is silently discontiguous. */
+export function getEditorLogsDropped(): number {
+  return getConsoleRingDropped();
+}
+
+/** The boundary `seq` between the pinned boot prefix and the rolling tail — see
+ *  `getConsoleRingBootPrefixCount`'s own doc comment. Console.tsx reads this to find WHERE to draw
+ *  the gap marker (F2). */
+export function getEditorLogsBootPrefixCount(): number {
+  return getConsoleRingBootPrefixCount();
+}
+
+/** Advance the local watermark to the ring's current highest seq, and bump `clearVersion` so a
+ *  reader keyed on `getEditorLogsVersion()` sees the change even when the ring's own version didn't
+ *  move. A VIEW operation, never a truncation of the shared ring — see `clearWatermark`'s own doc
+ *  comment above. */
+export function clearEditorLogs(): void {
+  syncClearWatermarkToRing();
+  const all = getConsoleRingEntries();
+  clearWatermark = all.length ? all[all.length - 1].seq : clearWatermark;
+  clearVersion++;
+}
+
+/** Composed version for Console.tsx's `useMemo` invalidation key: the shared ring's own version
+ *  (bumps on every new log) plus this module's own counter (bumps on every Clear) — see
+ *  `clearVersion`'s doc comment above for why the plain ring version alone is not enough. Monotonic:
+ *  both addends only ever increase. */
+export function getEditorLogsVersion(): number {
+  return syncClearWatermarkToRing() + clearVersion;
+}
+
+/** Set by the Console panel to be notified when a new log lands. Backed directly by the shared
+ *  ring's own subscription — already coalesced to one microtask-scheduled flush per burst (see
+ *  `consoleRing.ts`'s `notify()`), so this module no longer needs its own rAF-based coalescing. Only
+ *  ONE callback is tracked at a time, matching the original API (the Console panel is a singleton
+ *  tab). */
+let unsubscribeOnNewLog: (() => void) | null = null;
+export function setOnNewLog(cb: (() => void) | null): void {
+  unsubscribeOnNewLog?.();
+  unsubscribeOnNewLog = cb ? subscribeConsoleRing(cb) : null;
+}

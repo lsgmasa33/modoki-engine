@@ -43,13 +43,19 @@ vi.mock('@modoki/engine/runtime', () => ({
   appServices: () => ({ attribution: { init: vi.fn() }, ads: { init: vi.fn(), cleanup: vi.fn() } }),
   clearAppServices: vi.fn(),
   getCurrentWorld: vi.fn(() => ({})),
-  PlayerPrefs: { init: vi.fn(async () => {}), flush: vi.fn(async () => {}) },
+  PlayerPrefs: { init: vi.fn(async () => ({ discardedPending: [] })), flush: vi.fn(async () => {}) },
   selectDefaultBackend: vi.fn(() => 'memory'),
   audioDispose: vi.fn(),
   audioResume: vi.fn(),
   VideoOverlay: () => null,
   onTierSwitchOverlay: vi.fn(() => () => {}),
   waitForScenePaint: spies.waitForScenePaint,
+  // App.tsx derives its two-frame ceiling from this (#682), so the explicit list must carry it or
+  // the module binding fails and this file collects ZERO tests. Value mirrors
+  // `runtime/rendering/scenePaintSignal.ts`'s `SCENE_PAINT_MAX_WAIT_MS`; nothing here asserts on
+  // it, and spreading `importActual` instead would pull the real barrel and defeat the point of an
+  // explicit list — which is what caught this import in the first place.
+  SCENE_PAINT_MAX_WAIT_MS: 5000,
 }));
 
 vi.mock('@modoki/engine/runtime/debug', () => ({ DebugMenu: () => null }));

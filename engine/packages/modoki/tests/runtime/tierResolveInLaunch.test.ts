@@ -51,7 +51,7 @@ function fakeMeasurement(fillUnitsPerMs: number, cpuUnitsPerMs = 9_000): ProbeMe
   } as ProbeMeasurement;
 }
 
-let write: ReturnType<typeof vi.fn<(verdict: CachedProbeVerdict | null) => void>>;
+let write: ReturnType<typeof vi.fn<(verdict: CachedProbeVerdict | null, session?: unknown) => void>>;
 
 beforeEach(() => {
   resetProbeInFlightForTest();
@@ -64,8 +64,8 @@ beforeEach(() => {
   runBootRampProbe.mockReset();
   // 2.81 Mpx/ms on a 1 Mpx buffer — the Galaxy A23's measured 2D figure, i.e. `middle`.
   runBootRampProbe.mockResolvedValue(fakeMeasurement(2.81));
-  write = vi.fn<(verdict: CachedProbeVerdict | null) => void>();
-  probeVerdictStore.provide({ read: () => null, write });
+  write = vi.fn<(verdict: CachedProbeVerdict | null, session?: unknown) => void>();
+  probeVerdictStore.provide({ read: () => null, write, session: () => undefined });
   setRenderSettings({
     ...BASE,
     three: { ...BASE.three, qualityTier: 'auto', tiers: TWO_CONFIGS as never },
@@ -111,6 +111,7 @@ describe('the boot probe settles within ONE launch (#221 W2)', () => {
         samples: [{ cpuUnitsPerMs: 9_000, shadeMfragPerMs: 0, fillMpxPerMs: 2.81 }],
       } as CachedProbeVerdict),
       write,
+      session: () => undefined,
     });
     await resolveActiveTierForNo3D();
     // The fingerprint will not match jsdom's, so this asserts the general shape rather than a hit;
@@ -169,6 +170,51 @@ describe('the boot probe settles within ONE launch (#221 W2)', () => {
   });
 });
 
+/** #487 item 2: `resolveProbeClass` must capture `store.session()` BEFORE the probe's awaits and
+ *  hand it back to `store.write()`, so a namespace-aware provider can refuse a write that resumes
+ *  after a sub-game swap. `rendering/` itself stays ignorant of what the session MEANS — it just
+ *  has to pass it through unexamined, which is what these pin. The provider's own drop/keep
+ *  behaviour is covered directly in `storage/probeVerdictProvider.test.ts`. */
+describe('resolveProbeClass passes the store session through to write() (#487 item 2)', () => {
+  it('captures session() before the probe awaits and hands the FIRST token to write()', async () => {
+    // A stub returning the SAME object on every call would let a capture made anywhere — even
+    // right above `write()`, i.e. the exact bug this pins against — satisfy `toBe(sentinel)`. A
+    // fresh object per call is the only way `lastCall[1]` can distinguish "captured once, up
+    // front" from "captured just before the write".
+    let n = 0;
+    const session = vi.fn(() => ({ n: ++n }));
+    probeVerdictStore.provide({ read: () => null, write, session });
+
+    await resolveActiveTierForNo3D();
+
+    // Captured once, up front — not re-read after the probe's awaits.
+    expect(session).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalled();
+    const lastCall = write.mock.calls.at(-1)!;
+    // The FIRST token, not a later one — this is what an ordering assertion on call counts alone
+    // cannot tell apart from the bug.
+    expect(lastCall[1]).toEqual({ n: 1 });
+    // And ordered before the probe itself runs, not merely called once at some point during it.
+    expect(session.mock.invocationCallOrder[0]).toBeLessThan(runBootRampProbe.mock.invocationCallOrder[0]);
+  });
+
+  it('a store whose session() has no real property at all still gets a normal write, and does not throw (#487 item 1 / FIX 2)', async () => {
+    // Not a stub returning `undefined` from a real `session()` — a store object that predates the
+    // `session()` member entirely, the shape every game and partial mock had before #487. If
+    // `resolveProbeClass` calls `store.session()` unconditionally, this throws `TypeError:
+    // store.session is not a function` OUTSIDE the probe's own try/catch, failing the whole boot.
+    const bareStore = { read: () => null, write };
+    probeVerdictStore.provide(bareStore as unknown as Parameters<typeof probeVerdictStore.provide>[0]);
+
+    // No try/catch on purpose — an unhandled throw here fails the test on its own, which is
+    // exactly what FIX 2's reversion would produce.
+    await resolveActiveTierForNo3D();
+
+    expect(write).toHaveBeenCalled();
+    const lastCall = write.mock.calls.at(-1)!;
+    expect(lastCall[1]).toBeUndefined();
+  });
+});
 
 /** ⭐ **THE SECOND HALF: SETTLING ACROSS LAUNCHES, WHICH #221 BROKE AND #240 MEASURED (issue #240).**
  *
@@ -193,6 +239,7 @@ describe('the boot probe also settles ACROSS launches (#240)', () => {
       store: {
         read: () => box.record,
         write: (v: CachedProbeVerdict) => { box.record = v; },
+        session: () => undefined,
       },
     };
   }

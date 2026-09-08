@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { render } from '@testing-library/react';
 import { SectionIdContext, particleFieldSlug, useFieldId } from '../../src/editor/panels/particle/fieldIds';
+import { readScannedSource } from '../helpers/sourceScanner';
 
 const SRC = path.resolve(__dirname, '../../src/editor/panels/ParticleEditor.tsx');
 
@@ -75,7 +76,7 @@ describe('the Section context tags a field', () => {
 /** Every `particle.<section>.<label>` the panel's call sites produce, with the sections each
  *  one came from. Read from source because the property is about all call sites at once. */
 function idsFromSource(): Map<string, string[]> {
-  const chunks = fs.readFileSync(SRC, 'utf8').split(/<Section title="([^"]+)"/);
+  const chunks = readScannedSource(SRC).code.split(/<Section title="([^"]+)"/);
   const out = new Map<string, string[]>();
   for (let i = 1; i < chunks.length; i += 2) {
     const section = particleFieldSlug(chunks[i]);

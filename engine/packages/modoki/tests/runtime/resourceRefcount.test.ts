@@ -68,6 +68,12 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
 // Track fetch() calls per path so we can assert dedup
 let fetchCalls: Record<string, number> = {};
 
+// Per-path gate so a mid-load-guard test can hold one fetch() open while the
+// rest resolve immediately as usual. Set fetchGates[suffix] = a pending promise
+// before the acquire, then resolve it to let that one fetch proceed. Cleared
+// (no gates) in beforeEach so every other test is unaffected.
+const fetchGates: Record<string, Promise<void>> = {};
+
 // ── GUID ↔ path map ──
 // References are GUID-only now (assetManifest.resolveRef rejects internal asset
 // paths). Each path used AS A REFERENCE (acquire args, nested refs in canned
@@ -87,6 +93,9 @@ const GUIDS: Record<string, { guid: string; type: 'material' | 'mesh' | 'model' 
   '/tree.prefab.json': { guid: '10000000-0000-4000-8000-000000000030', type: 'prefab' },
   '/rock.prefab.json': { guid: '10000000-0000-4000-8000-000000000031', type: 'prefab' },
   '/nested.prefab.json': { guid: '10000000-0000-4000-8000-000000000032', type: 'prefab' },
+  '/entry-percent.prefab.json': { guid: '10000000-0000-4000-8000-000000000033', type: 'prefab' },
+  '/entry-nounit.prefab.json': { guid: '10000000-0000-4000-8000-000000000034', type: 'prefab' },
+  '/entry-px.prefab.json': { guid: '10000000-0000-4000-8000-000000000035', type: 'prefab' },
   '/env/sky.hdr':      { guid: '10000000-0000-4000-8000-000000000040', type: 'environment' },
 };
 const G = (path: string) => GUIDS[path].guid;
@@ -108,6 +117,14 @@ const fetchResponses: Record<string, any> = {
   '/nested.prefab.json': { version: 2, name: 'nested', rootLocalId: 1,
     entities: [{ localId: 1, name: 'Root', traits: {} },
       { localId: 2, name: 'Child', prefab: '10000000-0000-4000-8000-000000000030' }] },
+  // #765 fixtures — a pooled-row root authored `%`, no unit key at all (the on-disk shape a
+  // scene/prefab save leaves once a `%` field equals its trait default), and explicit `px`.
+  '/entry-percent.prefab.json': { version: 1, name: 'entry-percent', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, widthUnit: '%', height: 80, heightUnit: '%' } } }] },
+  '/entry-nounit.prefab.json': { version: 1, name: 'entry-nounit', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, height: 80 } } }] },
+  '/entry-px.prefab.json': { version: 1, name: 'entry-px', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' } } }] },
   '/unknown.mat.json': { type: 'totally-bogus-material-type', color: 0x123456 },
   // '/bad.mat.json' intentionally absent → fetch returns ok:false (404 path).
 };
@@ -117,6 +134,8 @@ global.fetch = vi.fn(async (url: string) => {
   fetchCalls[url] = (fetchCalls[url] || 0) + 1;
   for (const [suffix, body] of Object.entries(fetchResponses)) {
     if (url.endsWith(suffix)) {
+      const gate = fetchGates[suffix];
+      if (gate) await gate;
       // completeResponse fills in text() — parseAssetJson reads the body as text so it can spot
       // Vite's index.html SPA fallback (see tests/stubs/assetResponse.ts).
       return completeResponse({ ok: true, json: async () => body }) as Promise<Response>;
@@ -128,6 +147,7 @@ global.fetch = vi.fn(async (url: string) => {
 beforeEach(async () => {
   vi.resetModules();
   fetchCalls = {};
+  for (const k of Object.keys(fetchGates)) delete fetchGates[k];
   hdr.loads = {};
   hdr.textures = [];
   // Re-import the cache module after reset to get a fresh instance
@@ -382,6 +402,36 @@ describe('refcount cache — prefab', () => {
       await acquirePrefab(1, G('/nested.prefab.json'));
       expect((getCachedPrefab(G('/nested.prefab.json')) as { version?: number })?.version).toBe(2);
       expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'version 2 caches like any other').toBe(true);
+    });
+  });
+
+  /** #765 — `rootSize` against the REAL cache, not a fake that hands back a hardcoded unitless
+   *  number. This is the test whose absence let the bug live: `rootSize` used to read
+   *  `UIElement.width`/`height` and ignore `widthUnit`/`heightUnit`, so a `%`-authored root was
+   *  silently pinned to its raw number in px. */
+  describe('entryPrefabProvider.rootSize (#765)', () => {
+    it('reads an explicitly `%`-unit root as %, not px', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-percent.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-percent.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('an ABSENT unit key means %, not px — the common on-disk shape after a save strips the default', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-nounit.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-nounit.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('reads an explicit `px`-unit root as px, unchanged', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-px.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-px.prefab.json')))
+        .toEqual({ width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' });
     });
   });
 });
@@ -693,5 +743,49 @@ describe('re-import-mid-scene transitive snapshot (Missing Test #3)', () => {
     expect(stats.meshAssets['/sphere.mesh.json']).toBeUndefined();
     expect(stats.models['/island.glb']).toBeUndefined();
     expect(stats.materials['/m1.mat.json']).toBeUndefined();
+  });
+});
+
+describe('acquireMesh mid-load guard (#485)', () => {
+  it('mid-load guard: a mesh whose only owner is released before its fetch resolves does not re-acquire the GLB or material (#485)', async () => {
+    const { acquireMesh, releaseAllForScene, getResourceStats } = await getCache();
+
+    // Hold the .mesh.json fetch open so releaseAllForScene can land inside acquireMesh's await.
+    let openGate!: () => void;
+    fetchGates['/sphere.mesh.json'] = new Promise((resolve) => { openGate = resolve; });
+
+    // Do NOT await — the fetch is parked on the gate.
+    const p = acquireMesh(1, G('/sphere.mesh.json'));
+    releaseAllForScene(1); // scene torn down while the load is still in flight
+    openGate();
+    await p;
+
+    // The dead scene must have re-established NO ownership: not of the mesh asset,
+    // not of the transitively-acquired model, not of the transitively-acquired material.
+    const stats = getResourceStats();
+    expect(stats.meshAssets['/sphere.mesh.json']).toBeUndefined();
+    expect(stats.models['/island.glb']).toBeUndefined();
+    expect(stats.materials['/m1.mat.json']).toBeUndefined();
+  });
+
+  it('a second, still-live owner keeps the mesh acquired when another scene is released mid-load (#485)', async () => {
+    const { acquireMesh, releaseAllForScene, getResourceStats } = await getCache();
+
+    let openGate!: () => void;
+    fetchGates['/sphere.mesh.json'] = new Promise((resolve) => { openGate = resolve; });
+
+    // Two scenes race to acquire the same gated mesh.
+    const p1 = acquireMesh(1, G('/sphere.mesh.json'));
+    const p2 = acquireMesh(2, G('/sphere.mesh.json'));
+    releaseAllForScene(1); // only scene 1 is released mid-load
+    openGate();
+    await Promise.all([p1, p2]);
+
+    // Scene 2's ownership must survive — the guard must not evict a resource a
+    // live scene still owns.
+    const stats = getResourceStats();
+    expect(stats.meshAssets['/sphere.mesh.json']).toBe(1);
+    expect(stats.models['/island.glb']).toBe(1);
+    expect(stats.materials['/m1.mat.json']).toBe(1);
   });
 });

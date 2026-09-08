@@ -23,6 +23,7 @@ import type { Plugin } from 'vite';
 import path from 'node:path';
 import { findGamesEntry } from './findGamesEntry';
 import { SUBGAME_SHARED_KEYS } from '../app/sharedRegistryKeys';
+import { SUBGAME_MANIFEST_SCHEMA_VERSION } from '../packages/modoki/src/runtime/core/version';
 
 const SUBGAME_ENTRY_VIRTUAL_ID = 'virtual:modoki-subgame-entry';
 const SUBGAME_ENTRY_RESOLVED_ID = '\0' + SUBGAME_ENTRY_VIRTUAL_ID;
@@ -51,8 +52,10 @@ export interface SubgameBuildOptions {
 
 /** `virtual:modoki-subgame-entry`'s source — assigns the project's `game` plus a
  *  build-stamped `engineApi` onto `globalThis.__MODOKI_SUBGAME__`, so the shell can
- *  check BOTH that AND `subgame.json.engineApi` (the design's belt-and-suspenders
- *  check) without trusting a single hand-editable value.
+ *  check BOTH that AND `subgame.json.engineApi` — the design's belt-and-suspenders
+ *  check, which covers `engineApi` specifically (not `subgame.json` as a whole) —
+ *  without trusting a single hand-editable value. `subgame.json.schema` is a
+ *  separate, earlier FORMAT gate: see `SUBGAME_MANIFEST_SCHEMA_VERSION`.
  *
  *  A plain `export` does NOT work here: this Vite's bundler is Rolldown, which does
  *  not expose IIFE named exports the way classic Rollup does — measured, an
@@ -92,7 +95,7 @@ export function subgameBuildPlugin(opts: SubgameBuildOptions): Plugin {
 
     generateBundle() {
       const manifest: SubgameManifest = {
-        schema: 1,
+        schema: SUBGAME_MANIFEST_SCHEMA_VERSION,
         engineApi: opts.engineApi,
         sharedDeps: [...usedSharedDeps].sort(),
         entry: 'subgame.js',

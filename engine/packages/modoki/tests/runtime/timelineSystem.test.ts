@@ -363,4 +363,57 @@ describe('timelineSystem — self-deactivation is a ONE-WAY DOOR, and says so', 
     expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('targets its OWN Director'))).toHaveLength(0);
     warn.mockRestore();
   });
+
+  it('re-warns for a NEW Director that inherits a RECYCLED root id (#738)', () => {
+    // `_warnedSelfDeact` was keyed by `entity.id()` alone — koota's free list is LIFO, so a
+    // despawn+respawn WITHIN one world hands the newcomer the dead Director's id, and an
+    // id-only warn-once would silently suppress the newcomer's own genuine self-deactivation
+    // warning. Same fix, same idiom as `_warnedSubCycle` below and `_defaultBaseCache` (#336).
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    selfDeactTimeline();
+    const msgs = () => warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('targets its OWN Director'));
+
+    const a = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    tw.step(40);
+    expect(msgs()).toHaveLength(1);
+
+    a.destroy();
+    const b = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    // Precondition: the id really was reused, but it's a different packed entity — fail loudly
+    // rather than pass vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    tw.step(40);
+    expect(msgs()).toHaveLength(2); // the newcomer's OWN warning fired — not suppressed
+    warn.mockRestore();
+  });
+});
+
+describe('timelineSystem — sub-director cycle warns once, keyed by (id, generation) (#738)', () => {
+  const selfSubdirectorTimeline = () => seed({
+    duration: 5,
+    tracks: [{ id: 'c', name: 'Control', target: '', type: 'control', clips: [{ start: 0, duration: 1, subdirector: true }] }],
+  });
+
+  it('re-warns for a NEW Director that inherits a RECYCLED root id', () => {
+    // `_warnedSubCycle` was keyed by `childId` alone (here childId === rootId, the self-reference
+    // case) — same recycling hazard as `_warnedSelfDeact` above.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    selfSubdirectorTimeline();
+    const msgs = () => warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('cycle/self-reference'));
+
+    const a = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    tw.step(2);
+    expect(msgs()).toHaveLength(1);
+
+    a.destroy();
+    const b = tw.spawn(EntityAttributes({ name: 'root' }), Director({ timeline: PATH }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    tw.step(2);
+    expect(msgs()).toHaveLength(2);
+    warn.mockRestore();
+  });
 });

@@ -18,18 +18,24 @@ const Canvas2DMount = __MODOKI_MODULE_RENDER2D__
 const UIVideoMount = __MODOKI_MODULE_VIDEO__
   ? lazy(() => import('../video/UIVideoMount').then((m) => ({ default: m.UIVideoMount })))
   : null;
+import { fitFontSizePx, refineFontSizePx, resolveMinPx, MAX_FIT_PASSES, FIT_EPSILON_PX } from './autoFitText';
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
 import { onWorldSwap } from '../core/ecs/world';
 import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
+// The anchor-stretched-axis predicate, shared with the Inspector and the scene validator so none
+// of them can disagree about which axes an anchor sizes (#744 reuses it — see `trackStyle`).
+import { isSizeInert } from './anchorLayout';
 import { NineSliceImage } from './NineSliceImage';
-import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
+import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
-import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
+import { UI_PRESS_ORIGIN_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
+import { useScrollAnchoring } from './scrollAnchor';
 import { driveEntriesFromScroll } from './entriesSystem';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
@@ -58,8 +64,10 @@ const AnimatedText = React.memo(function AnimatedText(
     // fadeIn off → each glyph appears/vanishes instantly (mechanical typewriter feel):
     // a steps() timing on the one-shot, and the -cycle-hard keyframe for the loop.
     const fade = perCharFade !== false;
+    // `display: 'block'`, not `'inline-block'` (#646) — see `AutoFitText`'s span below +
+    // `docs/ui-system.md`'s `maxLines` callout for why.
     return (
-      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap' }}>
         {chars.map((ch, i) => {
           const delay = i * perCharStagger;
           const anim = perCharLoop
@@ -70,7 +78,8 @@ const AnimatedText = React.memo(function AnimatedText(
       </span>
     );
   }
-  const style: React.CSSProperties = { display: 'inline-block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
+  // `display: 'block'`, not `'inline-block'` — same fix as the typewriter span above (#646).
+  const style: React.CSSProperties = { display: 'block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
   // ⚠️ **em, not px** (#245). The amplitude is a MULTIPLE of the font size — `uiTextAnimation`'s
   // own doc calls it "em" — and it used to be resolved to px by multiplying the authored
   // `fontSize` NUMBER. That silently breaks the moment `fontSizeUnit` is not px, because the
@@ -78,6 +87,325 @@ const AnimatedText = React.memo(function AnimatedText(
   // so it is correct for every unit and needs no resolution step at all.
   if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
   return <span {...{ [UI_PAINT_ATTR]: 'text' }} style={style}>{text}</span>;
+});
+
+/** Content-box width of `elem` at sub-pixel precision: the border-box rect minus padding and
+ *  border, read the SAME way `fit()` measures the span so the two sides of every fit comparison
+ *  can't disagree over rounding — SCALED to the rect's own space first. Pre-fix this was
+ *  `elem.getBoundingClientRect().width - pad - border` with NO scaling: a TRANSFORM-AWARE rect
+ *  (screen px) minus TRANSFORM-BLIND computed lengths (layout px). A CSS `transform` between
+ *  `elem` and its reference frame — the editor's SceneView/GameView preview-frame scale, or
+ *  `applyRotationStyle`'s rotate()/scale() on ANY UIElement with an authored rotation/scale —
+ *  scales the rect but not the computed padding/border, so the old expression computed `S·W − pad`
+ *  where the correct content width is `S·(W−pad)`. Exact only at `S=1` (every earlier measurement
+ *  here happened to run under one) — measured live (Chromium 151, 300px parent, 20px padding, 2px
+ *  border): +9.5% at `S=0.667` (the editor's typical docked-panel scale), +67.2% at `S=0.3`, so
+ *  `fit()`'s `availablePx` could be badly wrong exactly where `UIElement.rotation`/`scale` or a
+ *  scaled preview frame make this common, not exotic.
+ *
+ *  The fix derives `scale` LOCALLY from `elem` itself — `rectWidth / elem.offsetWidth`, the ratio
+ *  between `elem`'s own screen-space and layout-space border-box width — rather than switching to
+ *  a transform-blind read (`clientWidth`) everywhere, which was tried first and REGRESSED a real
+ *  fit: `naturalPx`/`measuredPx` would then need the same integer-rounded space too (to stay
+ *  comparable), and two INDEPENDENT integer roundings (parent + span) can each round up to 0.5px
+ *  in opposite directions — enough combined error to push a genuinely-fitting label past
+ *  `FIT_EPSILON_PX` and wrap it (caught live by `editor-ui-autofit.spec.ts`, not by a unit test —
+ *  jsdom can't see either failure mode). Multiplying `scale` back onto just the padding/border
+ *  keeps `availablePx` in the SAME sub-pixel screen-px space `naturalPx` already reads (unchanged
+ *  below), so precision is unaffected by this fix — verified live at every measured `S` above:
+ *  the shipped:true ratio error stays pinned to the untransformed baseline's own ~0.14%, not
+ *  growing with `S` the way the pre-fix ratio did. `elem.offsetWidth`'s own integer rounding only
+ *  enters through this multiplicative `scale` term (not an ADDITIVE term subtracted from a
+ *  differently-scaled quantity, which is what made the original bug non-cancelling), so its error
+ *  stays proportionally tiny. `scale` falls back to 1 (the pre-fix, `S=1` behaviour) when
+ *  `elem.offsetWidth` is 0 (detached/`display:none`), matching what an unmeasurable read already
+ *  degrades to elsewhere in this component.
+ *
+ *  This is exact only for a uniform, non-rotating `scale()` — `rectWidth / offsetWidth` is a
+ *  WIDTH-axis ratio, which is what a horizontal padding/border correction needs, uniform or not,
+ *  but a ROTATED ancestor still degrades `rectWidth` itself to an axis-aligned bounding box no
+ *  per-axis ratio can undo. That was already just as wrong pre-fix (see the module docblock on
+ *  `AutoFitText`) — not a regression this fix introduces, just a gap it does not close. */
+function contentWidthOf(elem: HTMLElement): number {
+  const rectWidth = elem.getBoundingClientRect().width;
+  const layoutWidth = elem.offsetWidth;
+  const scale = layoutWidth > 0 ? rectWidth / layoutWidth : 1;
+  const s = getComputedStyle(elem);
+  const layoutPadBorder =
+    parseFloat(s.paddingLeft || '0') + parseFloat(s.paddingRight || '0')
+    + parseFloat(s.borderLeftWidth || '0') + parseFloat(s.borderRightWidth || '0');
+  return rectWidth - scale * layoutPadBorder;
+}
+
+/** Shrink-only auto-fit (#614, `UIElement.autoFitText`) — reduces the rendered font size, never
+ *  past the authored `fontSize`, until the text fits its box on one line, down to `fontSizeMin`.
+ *  Same `React.memo`-on-primitives reason as `AnimatedText` above: the game UI re-renders every
+ *  frame, and an un-memoized layout read here would force a reflow per frame. Memoized on
+ *  `fontSize`/`fontSizeMin`/`text`/`children`/`clampLines` (React.memo shallow-compares every
+ *  prop, so `children`'s identity still matters here even though `fit()` itself never keys off
+ *  it — see `text` below), so a per-frame re-render that changes none of these bails out before
+ *  `fit()` is even considered.
+ *
+ *  `fit()` re-runs on: a `fontSize`/`fontSizeMin`/`text` prop change (its own `useCallback`
+ *  deps); the parent's box actually resizing (`ResizeObserver`, guarded against the write
+ *  `fit()` itself makes re-firing the same callback); a WINDOW resize with no parent px-width
+ *  change (a `vh`-authored `fontSize` moves with the viewport even when the parent doesn't,
+ *  coalesced through `requestAnimationFrame` so a drag-resize doesn't re-fit per event); and the
+ *  first `document.fonts.ready` landing after mount (metrics before the real webfont arrives are
+ *  wrong). `text` is a FIT-INVALIDATION KEY ONLY, never rendered — `children` is what renders,
+ *  and its identity is UNSTABLE on the animated path (`AnimatedText`'s own per-frame-stable memo
+ *  intentionally lets a new element through only when the animation itself changes, not on every
+ *  frame, but never so reliably that it belongs in a measurement dependency list) — so `text` is
+ *  threaded down separately as the plain string `children` was built from. Without it in `fit`'s
+ *  deps, a `{storeField}` template or a localised string re-rendering with new text never
+ *  re-measures: the font size (and `nowrap`) stay pinned to whatever the FIRST string fit.
+ *
+ *  The actual shrink DECISION is `autoFitText.ts`'s `fitFontSizePx`/`refineFontSizePx` (pure,
+ *  unit-tested); this component is only the DOM measurement + re-fit scheduling around it.
+ *
+ *  ⚠️ INVARIANT: auto-fit may only ever change the rendering when it is ACTIVELY SHRINKING — it
+ *  shrank the font AND the shrunk size measured back as fitting. Every other outcome (already
+ *  fits at the authored size, an unmeasurable/inert reading, or floored short of a fit) renders
+ *  IDENTICALLY to `autoFitText: false` — see the `whiteSpace` write at the end of `fit()`. That
+ *  is what makes a bad/contaminated measurement SAFE: the worst a wrong answer can do is fail to
+ *  shrink, never make the box worse than the feature being off would have. */
+const AutoFitText = React.memo(function AutoFitText(
+  { children, text, fontSize, fontSizeMin, clampLines }:
+  { children: React.ReactNode; text: string; fontSize: number; fontSizeMin: number; clampLines?: number },
+) {
+  const ref = React.useRef<HTMLSpanElement | null>(null);
+  // The `availablePx` the last COMPLETED fit() was computed at — set at the end of every fit()
+  // that actually measured (never on the early `!el || !parent` return). The ResizeObserver
+  // callback below compares against this to tell a real parent resize from its own write re-firing
+  // the observer.
+  const lastFitAvailablePxRef = React.useRef<number | null>(null);
+
+  const fit = React.useCallback(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+    // ⚠️ ORDERING IS LOAD-BEARING — measured BEFORE this function writes anything to the span's
+    // style, in particular before the `width: max-content` scaffold below. `UIElement.width`
+    // defaults to 0 (auto), so a content-sized parent is the DEFAULT case, not an exotic one —
+    // and that scaffold, which exists to unstretch THIS span from a flex-stretch parent (see the
+    // comment on it below), also inflates a content-sized PARENT to the text's own natural width
+    // one level up. Read `availablePx` after the scaffold and it converges on `naturalPx` by
+    // construction — "it fits" every time — which is the identical contaminated-measurement bug
+    // the scaffold itself exists to close, just recreated one level up. Reading it here, against
+    // the parent's box as authored before this component has touched anything, is the only
+    // measurement that isn't self-referential.
+    const availablePx = contentWidthOf(parent);
+    // Clear a previous shrink AND a previous floor-wrap before measuring — otherwise a re-fit
+    // (e.g. on resize) measures the already-shrunk/already-wrapped box, not the text's natural
+    // single-line width at the authored size.
+    el.style.fontSize = '';
+    el.style.whiteSpace = 'nowrap';
+    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on every node BY DEFAULT, so this
+    // span (its own authored `display: block`, #646) is virtually always a FLEX ITEM of its
+    // parent, never a normal block box in flow. (Since #655 a clamped node — and, since #725/#727,
+    // a single-line `textOverflow: 'ellipsis'` node too — puts a wrapper between this span and the
+    // host, so the parent is then that BLOCK wrapper rather than the flex host. The scaffold below
+    // is still required: the stretch case is the common one, and a
+    // `max-content` width is correct in both.) The default `align-items:
+    // stretch` then stretches a flex item's cross size to the parent's — so WITHOUT this line,
+    // the span's measured width reads the parent's AVAILABLE width, not the span's natural
+    // content width. Measured live on a `games/text_demo` fixture (42px "UI TEXT ANIMATION" in a
+    // 40%-wide box): the measurement read 319.59px (== the parent's content width) instead of the
+    // real 446.93px, so `naturalPx === availablePx` on every call, the pure fit function always
+    // concluded "it fits", and the span was left `white-space: nowrap` — one line overflowing its
+    // box, strictly worse than the wrap it replaced. An explicit `width` overrides `stretch` (a
+    // sized flex item is not stretched), so `max-content` here forces the rect back to the span's
+    // true natural width regardless of flex context. It is a measurement scaffold ONLY — it stays
+    // set across every re-measurement below (the refine loop re-applies a smaller font size and
+    // re-reads the same unstretched rect) and is cleared once, after the LAST measurement, before
+    // the fitted font size is written, so it never reaches paint (this whole function runs inside
+    // `useLayoutEffect`, before the browser paints).
+    // ⚠️ In a `flexDirection: 'row'` parent this width is the item's MAIN size, so the default
+    // `flexShrink: 1` (UIElement.ts:31) is free to shrink it back below `max-content` — which
+    // would collapse `naturalPx` to `availablePx`, make the fit conclude "it fits", and leave
+    // autoFitText SILENTLY INERT. It does not, and the reason is not this line: a flex item's
+    // default `min-width: auto` floors shrinking at min-content, and the `white-space: nowrap`
+    // set just above makes min-content == max-content. Measured (Chromium 151, 320px row parent,
+    // 399.16px natural): the ONLY combination that defeats the scaffold is
+    // `row` + `flex-shrink:1` + `min-width:0` — every other permutation reads the true 399.16.
+    // Shipped code never hits it because `UIElement.minWidth` defaults to 0 and `cssVal` drops
+    // falsy values, so `min-width: 0` is never written to the DOM — i.e. the scaffold was safe
+    // by COINCIDENCE, one refactor away from dying silently. The `minWidth` line below makes it
+    // safe by CONSTRUCTION instead: it pins the floor the flex auto-minimum was supplying for
+    // us, so the measurement no longer depends on nobody ever authoring a `min-width`. It is a
+    // no-op against today's DOM (with `nowrap`, min-content == max-content) and is torn down
+    // with the width scaffold below.
+    el.style.width = 'max-content';
+    el.style.minWidth = 'max-content';
+    const authoredPx = parseFloat(getComputedStyle(el).fontSize);
+    // `scrollWidth` is rounded to an integer px, which can under-report a natural width like
+    // 100.6px as 100 — combined with the pure function's 0.5px FIT_EPSILON_PX that lets a
+    // genuinely-overflowing label read as fitting. `el` is `display: block; white-space: nowrap;
+    // width: max-content` (unstretched by the flex parent), so its border-box rect width IS the
+    // natural single-line width, at sub-pixel precision.
+    const naturalPx = el.getBoundingClientRect().width;
+    // `availablePx` was already captured above, via `contentWidthOf` (not the rounded
+    // `clientWidth`) — same sub-pixel precision as `naturalPx` here (both screen-px rects; see
+    // `contentWidthOf`'s header for how it corrects for a CSS transform without losing that
+    // precision), so both sides of the fit comparison agree to the same precision, and BEFORE the
+    // max-content scaffold, so it can't be contaminated by it (see the comment at the top of this
+    // function).
+    const minPx = resolveMinPx(authoredPx, fontSize, fontSizeMin);
+    const first = fitFontSizePx({ authoredPx, naturalPx, availablePx, minPx });
+
+    // `first` is only a PROPORTIONAL ESTIMATE — exact when width(fontSize) passes through the
+    // origin, an OVER-estimate whenever a size-independent term exists (px `letterSpacing`, px
+    // word-spacing, a text-stroke, a px-padded inline child). Measured live on `games/text_demo`'s
+    // "UI TEXT ANIMATION" (3px letterSpacing, a 319.59px box): the proportional model predicted
+    // 30.03px would fit, but 30.03px still measures 336.06px wide — 17px of overflow the pure
+    // function could not see, because it never re-measures its own answer. So the estimate is
+    // only ever a STARTING point here: re-measure at the candidate size and refine
+    // (`refineFontSizePx`), up to `MAX_FIT_PASSES` times, converging to ~28.4px for that case —
+    // and take the fit/overflow decision (`fits` below) from what was actually MEASURED at the
+    // final size, never from `first`'s own predicted `fits`/`fontSizePx`. A future "optimisation"
+    // that deletes this loop and trusts `fitFontSizePx` alone reintroduces exactly this bug.
+    //
+    // Cost: `fit()` runs on mount / prop change / parent resize / `fonts.ready` — never per frame
+    // — so up to `MAX_FIT_PASSES` + 1 extra layout reads here (the loop, plus the one final
+    // re-measurement below) is not a hot path.
+    let fits: boolean;
+    if (first.shrunk) {
+      let candidatePx = first.fontSizePx;
+      for (let pass = 0; pass < MAX_FIT_PASSES; pass++) {
+        el.style.fontSize = `${candidatePx}px`;
+        const measuredPx = el.getBoundingClientRect().width;
+        const refined = refineFontSizePx({ currentPx: candidatePx, measuredPx, availablePx, minPx });
+        candidatePx = refined.nextPx;
+        if (refined.done) break;
+      }
+      // Commit the loop's final decision AND take one more measurement AT it — the loop's last
+      // reading was taken at the size fed INTO the last `refineFontSizePx` call, which the
+      // "shrink-only, stop on no more progress" branch can return a smaller `nextPx` than (see
+      // that function's header). Reusing the stale reading here reintroduces the exact bug this
+      // loop exists to close: a real case measured 342.14px (overflowing 340px) on the pass that
+      // decided "no more progress" and committed 31.95px — but 31.95px itself actually measures
+      // ~340.4px, WITHIN tolerance. Trusting the stale 342.14 wrongly declared `fits: false` and
+      // wrapped a label that, at the size actually left on screen, did not need to.
+      el.style.fontSize = `${candidatePx}px`;
+      const finalMeasuredPx = el.getBoundingClientRect().width;
+      // MEASURED, not predicted — trusting `fitFontSizePx`'s own `fits` here is exactly what
+      // produced the #614 follow-up overflow: it believed the proportional model's answer instead
+      // of asking the DOM what actually rendered.
+      fits = finalMeasuredPx <= availablePx + FIT_EPSILON_PX;
+    } else {
+      // Common case: already fits at the authored size. One measurement, no loop, no write.
+      // `first.fits` is always `true` on this branch — including the "nothing was measurable"
+      // guard in `fitFontSizePx` (a garbage/detached measurement) — so this is also what keeps a
+      // bad reading from tripping the floor-wrap fallback below: re-deriving `fits` from
+      // `naturalPx` here would re-introduce a guess exactly where `fitFontSizePx` refused one.
+      el.style.fontSize = '';
+      fits = first.fits;
+    }
+    el.style.width = '';
+    el.style.minWidth = '';   // torn down with the width scaffold — both are measurement-only.
+    // `nowrap` ONLY when auto-fit actively did something AND that something measured as fitting
+    // — `first.shrunk && fits`. Every other outcome (already fit at the authored size, an
+    // unmeasurable/inert `first.fits`, or floored short of a fit) ends at `pre-wrap`, the SAME
+    // rendering `autoFitText: false` gets — hand off to the existing wrap/textOverflow behaviour
+    // instead of leaving one nowrap line hanging past its box. This is the invariant from the
+    // component docblock: a bad or contaminated measurement can only ever cost a missed shrink,
+    // never a worse box than the feature being off. Auto-fit is the shrink-FIRST step, never a
+    // replacement for the wrap/textOverflow fallback.
+    el.style.whiteSpace = (first.shrunk && fits) ? 'nowrap' : 'pre-wrap';
+    lastFitAvailablePxRef.current = availablePx;
+  }, [fontSize, fontSizeMin, text]);
+
+  React.useLayoutEffect(() => {
+    let alive = true;
+    fit();
+    const parent = ref.current?.parentElement;
+    // The text's available width tracks its parent box, which can change on resize/orientation
+    // without `fontSize`/`fontSizeMin` themselves changing — a ResizeObserver is the only one of
+    // the three triggers that is not already a React prop change. Guard its existence like
+    // `safeArea.ts` does — an older WebView may not implement it.
+    const ro = parent && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => {
+      if (!alive) return;
+      // fit() writes el.style.fontSize, which can resize this observed PARENT and re-fire this
+      // very callback. Skip a re-entrant fire whose parent content width hasn't actually moved
+      // (0.5px tolerance — a font-size change can perturb it by a sub-pixel) — otherwise even a
+      // converging loop trips the browser's "ResizeObserver loop completed with undelivered
+      // notifications" error, which globalErrors.ts mirrors to Crashlytics as telemetry noise.
+      // This guards only OUR OWN write re-entering — it is not about skipping a real resize, so a
+      // genuine parent resize (this check finds a moved width) still fits.
+      const p = ref.current?.parentElement;
+      if (!p) return;
+      // Same `contentWidthOf` helper `fit()` uses for `availablePx` — comparing like with like
+      // means this guard can't diverge from what the next `fit()` would actually measure.
+      const currentAvailablePx = contentWidthOf(p);
+      if (lastFitAvailablePxRef.current != null && Math.abs(currentAvailablePx - lastFitAvailablePxRef.current) < 0.5) return;
+      fit();
+    }) : undefined;
+    if (ro && parent) ro.observe(parent);
+    // A `vh`-authored `fontSize` (`cssVal`'s `vh`/`vw`/`vmin`/`vmax` cases) moves with the
+    // VIEWPORT even when the parent's own px width does not — the ResizeObserver above watches
+    // only the parent's content box, so that case is invisible to it and the fit goes stale
+    // (measured: the authored size changes, `fit()` never re-runs, the old shrunk/unshrunk size
+    // stays on screen). `window` may be absent (a non-browser host); guard it like the others
+    // here. Coalesced through `requestAnimationFrame` so a drag-resize re-fits once per frame,
+    // not once per `resize` event.
+    let resizeRaf: number | null = null;
+    const onWindowResize = () => {
+      if (resizeRaf != null) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        if (alive) fit();
+      });
+    };
+    if (typeof window !== 'undefined') window.addEventListener('resize', onWindowResize);
+    // A webfont landing after the first measure changes the metrics — measuring before it
+    // arrives is the classic wrong answer here. `document.fonts` may be absent; guard it.
+    // .catch: a font that never resolves must not surface as an unhandled rejection (globalErrors
+    // mirrors those to Crashlytics too) — we just keep the first measurement.
+    document.fonts?.ready.then(() => { if (alive) fit(); }).catch(() => { /* a font that never resolves just means we keep the first measurement */ });
+    return () => {
+      alive = false;
+      ro?.disconnect();
+      if (typeof window !== 'undefined') window.removeEventListener('resize', onWindowResize);
+      if (resizeRaf != null) cancelAnimationFrame(resizeRaf);
+    };
+  }, [fit]);
+
+  // `whiteSpace` is set BOTH here in the JSX style prop ('pre-wrap' — the SAME value the
+  // invariant above requires for every non-shrinking outcome, i.e. the state this span is in
+  // before `fit()` has ever run) AND imperatively by `fit()` ('nowrap' only while a shrink is
+  // active and measured to fit; 'pre-wrap' in every other outcome, restated here). React only
+  // ever writes a style prop that CHANGED from its last render, so once `fit()` sets 'nowrap'
+  // imperatively, a re-render with this same unchanged 'pre-wrap' prop does not stomp it back.
+  // This looks like the two fighting and isn't — don't "fix" it by removing either one.
+  //
+  // `UI_PAINT_ATTR` (#337 close-out, mirrors `AnimatedText` above): this span pulls the text out
+  // of the host entity div's direct children, same as `AnimatedText`'s does — without the
+  // marker, `isPaintOpaque` (editor/panels/uiPreviewPick.ts) finds no direct text-node child and
+  // no marker, credits the entity as purely decorative, and a SceneView click falls through to
+  // whatever sits behind it. A nested `AutoFitText` wrapping a playing `AnimatedText` stamps the
+  // marker twice (once per span) — harmless: `isPaintOpaque` only asks whether ANY marked
+  // descendant's nearest `[data-entity-id]` ancestor is the host div, and both spans agree on
+  // that answer via the same host.
+  // `display: 'block'`, NOT `'inline-block'` (#646) — an `inline-block` child defeats the
+  // `node.maxLines > 0` clamp (on the wrapper since #655 — it can't split an atomic inline), and
+  // does not reopen #614's flex-stretch bug (`block` and `inline-block` compute identically as
+  // a flex item). Full reasoning + verification: `docs/ui-system.md`'s `maxLines` callout.
+  // `clampLines` (#727): the `clip` + `autoFitText` maxLines cap, put on THIS span instead of the
+  // `clampStyle` wrapper above it in the tree — `fit()` above writes a SHRUNK `font-size` onto
+  // this exact span, so `${clampLines}lh` resolves against the size that actually rendered,
+  // instead of the wrapper's authored (larger) one. `fit()` only ever measures WIDTH (this
+  // component's whole docblock), so this `maxHeight`/`overflow` addition cannot contaminate it —
+  // it is inert during every `fit()` measurement pass and only ever affects paint. No explicit
+  // `line-height` is set here (nor anywhere for this purpose): `line-height` inherits, and setting
+  // one would change the shrunk text's line spacing, a visual change #727 explicitly rules out.
+  const clampStyleProps: React.CSSProperties | undefined = clampLines != null
+    ? { maxHeight: `${clampLines}lh`, overflow: 'hidden' }
+    : undefined;
+  return (
+    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap', ...clampStyleProps }}>
+      {children}
+    </span>
+  );
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
@@ -102,16 +430,144 @@ export function cssVal(value: number, unit: string): string | number | undefined
  *  this repo real time. Warn, never throw: an authoring mistake must not blank the
  *  screen mid-render. */
 const _deadToggles = new Set<string>();
-// ⚠️ Cleared on world swap, because the fallback key is an ENTITY ID and runtime ids are reassigned
-// on every scene reload — so a stale entry could swallow a DIFFERENT dead toggle's warning after a
-// reload, which is the one moment an author is most likely to be looking for it. (A guid-bearing
-// entity is unaffected; guid-less ones are the runtime-spawned case.)
+// ⚠️ The fallback key is `entityId:generation` (#759), not entityId alone — koota recycles entity
+// ids, so a guid-less (runtime-spawned) entity that despawns and respawns WITHIN one world can
+// inherit the dead entity's id, and an id-only key would silently swallow the newcomer's genuine
+// warning forever. `generation` closes that within-world hole (to koota's generation-wrap period);
+// it does NOT make the `onWorldSwap` clear below redundant — a fresh world restarts BOTH id and
+// generation from zero, so `id 2 / gen 0` can still collide ACROSS a swap, which only the clear
+// catches. Neither one subsumes the other. (A guid-bearing entity is unaffected by either hole —
+// a guid is stable across recycling, and authored entities are the common case for this warning.)
 onWorldSwap(() => _deadToggles.clear());
 
 function warnDeadToggle(key: string): void {
   if (_deadToggles.has(key)) return;
   _deadToggles.add(key);
   console.warn(`[UIToggle] ${key} has no 'change' binding, so tapping it does nothing. A toggle does not write its own value — add a UIAction binding on event 'change' that sets UIToggle.value to '$value'. NOTE a 'click' binding will NOT work here (the Inspector defaults to 'click'): the switch dispatches 'change', and applyBindings skips rows whose event differs.`);
+}
+
+/** Warn ONCE per entity that a `UIScrollView` is doing nothing because the element it sits on was
+ *  never opted into scrolling (#743). Exactly the same shape, and the same reason, as
+ *  `warnDeadToggle` above: the trait renders perfectly and is inert, and inert is
+ *  indistinguishable from not-wired-yet without being told.
+ *
+ *  ⚠️ Before #743 this combination was not inert — it half-worked, which is why it needed a fix
+ *  before it needed a warning. `scrollViewStyle`'s cross-axis pin promoted the author's `visible`
+ *  axis to `auto`, so the box scrolled with unstyled scrollbars and could not take the wheel.
+ *
+ *  ⚠️ Fires on `'visible'` ONLY. `'hidden'` is a scroll container with no scrolling UI — a
+ *  legitimate `scrollToEntry`-driven pager — see the call site. */
+const _inertScrollViews = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _inertScrollViews.clear());
+
+function warnInertScrollView(key: string, overflow: string): void {
+  if (_inertScrollViews.has(key)) return;
+  _inertScrollViews.add(key);
+  console.warn(`[UIScrollView] ${key} has UIElement.overflow: '${overflow}', which establishes no scroll container — so the scroll view does nothing: the box does not scroll, scrollTo moves it nowhere, and snap/overscroll have nothing to apply to. Whether the box scrolls at all is UIElement.overflow's call, deliberately: set it to 'scroll' for a draggable view, or 'hidden' for one driven only by scrollToEntry/buttons.`);
+}
+
+/** Warn ONCE per entity that authored `text` is dropped because this element type never renders
+ *  it (#745). Same shape and same reason as `warnDeadToggle`/`warnInertScrollView`. */
+const _droppedText = new Set<string>();
+onWorldSwap(() => _droppedText.clear());
+
+function warnDroppedText(key: string, why: string): void {
+  if (_droppedText.has(key)) return;
+  _droppedText.add(key);
+  console.warn(`[UINode] ${key} authors UIElement.text, which will NOT render: ${why}. Its text STYLING is still applied to the box, so devtools and the Inspector will show a styled text element that paints nothing. Move the text to a sibling or child entity.`);
+}
+
+/** The text-STYLE fields an `<input>`/`<range>` silently drops, listed for the dev warning (#745).
+ *
+ *  Only fields the author actually moved off the default are reported: the whole point is to name
+ *  what someone authored and will not get, and a list padded with untouched defaults is noise that
+ *  gets ignored. The four the input branch DOES re-emit — `fontFamily`, `fontSize`, `fontWeight`,
+ *  `color` — are deliberately absent.
+ *
+ *  ⚠️ Keep in sync with the `if (text)` block: a field added there that an input cannot honour
+ *  belongs here too. Pure and exported so a test can pin the list without a DOM. */
+export function droppedTextStyleFields(n: Pick<UINodeData,
+  'textAlign' | 'lineHeight' | 'letterSpacing' | 'fontStyle' | 'textOverflow' | 'maxLines' |
+  'textShadowOffsetX' | 'textShadowOffsetY' | 'textShadowBlur' | 'textStrokeWidth' |
+  'fontFamily' | 'fontSize' | 'fontWeight' | 'textOpacity'>, elementType: string): string[] {
+  const out: string[] = [];
+  // ⚠️ **`input` and `range` do NOT drop the same set, and assuming they did made this warning
+  // LIE.** The `input` branch re-emits `fontSize`/`fontWeight`/`color`; the `range` branch re-emits
+  // none of those three — its only style write is `accentColor` from `textColor` — so a slider
+  // drops them too, along with `textOpacity` (`textColor` survives only as an OPAQUE accent, so
+  // the colour is honoured and its alpha is not).
+  //
+  // ⚠️ **`fontFamily` is NOT in that set, and claiming it was is a mistake this function already
+  // made once.** It is emitted unconditionally near the top of `UINode`, far above the branch
+  // split, precisely so a container can set the typeface for its subtree — so it reaches a `range`
+  // like everything else and must not be reported as dropped. (The `input` branch's own
+  // `style.fontFamily` write is redundant for the same reason.)
+  if (elementType === 'range') {
+    // ⚠️ Compared against the DEFAULT, not tested for truthiness. `uiTreeStore` normalises
+    // `fontSize: ui.fontSize || 16`, so this field is NEVER falsy by the time it reaches here —
+    // `if (n.fontSize)` fired on every slider in every project and told its author they had
+    // authored a font size they had not touched. The other entries in this function all compare
+    // against their default; this one now does too.
+    if (n.fontSize !== UI_DEFAULT_FONT_SIZE) out.push('fontSize');
+    if (n.fontWeight !== 'normal') out.push('fontWeight');
+    if (n.textOpacity !== 1) out.push('textOpacity');
+  }
+  if (n.textAlign !== 'left') out.push('textAlign');
+  if (n.lineHeight) out.push('lineHeight');
+  if (n.letterSpacing) out.push('letterSpacing');
+  if (n.fontStyle !== 'normal') out.push('fontStyle');
+  if (n.textOverflow !== 'clip') out.push('textOverflow');
+  if (n.maxLines > 0) out.push('maxLines');
+  // The two gated groups, reported by their GATE rather than field-by-field — `textShadowColor`
+  // and `textStrokeColor` are inert on their own (they do nothing until the gate opens), so
+  // naming them would report a field that is dropped and would have done nothing anyway.
+  if (n.textShadowOffsetX || n.textShadowOffsetY || n.textShadowBlur) out.push('textShadow*');
+  if (n.textStrokeWidth > 0) out.push('textStroke*');
+  return out;
+}
+
+const _droppedTextStyle = new Set<string>();
+onWorldSwap(() => _droppedTextStyle.clear());
+
+function warnDroppedTextStyle(key: string, elementType: string, dropped: string[]): void {
+  if (_droppedTextStyle.has(key)) return;
+  _droppedTextStyle.add(key);
+  // The "what IS honoured" half is per element type, because the two branches differ — see
+  // `droppedTextStyleFields`. Getting this wrong is worse than saying nothing: it tells the author
+  // their font size is fine when it is the thing that vanished.
+  const honoured = elementType === 'range'
+    ? `a range re-emits only accentColor (from textColor), on top of the fontFamily every node gets`
+    : `an input re-emits only fontSize, fontWeight and color, on top of the fontFamily every node gets`;
+  console.warn(`[UINode] ${key} authors ${dropped.join(', ')}, which an elementType '${elementType}' silently drops — the text-style block is gated on UIElement.text, which a form control never uses, and ${honoured}. A form control's text rendering is the platform's, so these are not wired on purpose.`);
+}
+
+/** The size a `UIToggle` falls back to when NOTHING else sizes its track (#744) — not a tuning
+ *  knob but the value-kind table's "genuine no-scene fallback" row. `UIElement.width`/`height` are
+ *  the authored surface and win outright; these are applied as `min-*`, so any anchor stretch,
+ *  flex stretch or authored size larger than them also wins. Reached only by the shape that
+ *  previously rendered an INVISIBLE knob, so nothing that renders today can change size.
+ *
+ *  44×24 keeps the 1.75:1 capsule proportion of the repo's only authored toggle (`games/court`,
+ *  56×32) at a size that sits in a settings row; iOS's native switch is 51×31 for comparison.
+ *  Exported so a test can assert against the constant rather than restate the number. */
+/** `UIElement.fontSize`'s trait default, and what `uiTreeStore` normalises an unset value TO
+ *  (`fontSize: ui.fontSize || 16`) — which is why "did the author set this?" has to be a comparison
+ *  against it rather than a truthiness test. Kept beside its one consumer with the coupling named,
+ *  the way this function's other default comparisons (`'left'`, `'normal'`, `'clip'`) already are. */
+const UI_DEFAULT_FONT_SIZE = 16;
+
+export const DEFAULT_TOGGLE_TRACK_WIDTH = 44;
+export const DEFAULT_TOGGLE_TRACK_HEIGHT = 24;
+
+/** The knob's own size floor, DERIVED from the track fallback so the two cannot drift: it is the
+ *  content box the track's `minHeight` leaves once the author's `knobInset` is taken off both
+ *  sides — i.e. exactly what `height: '100%'` would have resolved to had the track been authored
+ *  at `DEFAULT_TOGGLE_TRACK_HEIGHT`. Clamped at 0 for an inset large enough to eat the track.
+ *  Pure and exported so the arithmetic is unit-testable without a DOM (jsdom computes no layout,
+ *  so the CSS half is verified in a real browser instead — see the #744 notes in `knobStyle`). */
+export function toggleKnobFloor(knobInset: number, trackHeight: number = DEFAULT_TOGGLE_TRACK_HEIGHT): number {
+  return Math.max(0, trackHeight - 2 * knobInset);
 }
 
 export function hexToRgba(hex: number, opacity: number): string {
@@ -138,9 +594,26 @@ interface UINodeProps {
    *  (so nested Canvas2D canvases still mount/position) while the UI layer is
    *  toggled off. Canvas content is unaffected (gated separately by renderCanvas2D). */
   uiVisualsHidden?: boolean;
+  /** The font this node would inherit through the CSS cascade (#803) — i.e. the NEAREST ancestor's
+   *  authored `UIElement.fontFamily`, falling back to the scene-wide `UISettings` default that
+   *  `UIRenderer` sets on the shared container. Each level passes `node.fontFamily || inherited`
+   *  down, so it tracks the cascade rather than jumping straight to the scene default.
+   *
+   *  A plain `div` never needs it explicitly — the real CSS cascade already gives it exactly this
+   *  value — but an `<input>`/`<range>` does NOT inherit `font-family`: the UA stylesheet gives
+   *  form controls their own default, and an explicit declared value beats inheritance. So a form
+   *  control with no authored font would render in the UA font while its `div` siblings render in
+   *  the inherited one, and this prop is how it gets the same answer they do.
+   *
+   *  ⚠️ It must be the INHERITED value, not the scene default: a modal root authoring its own
+   *  `fontFamily` makes those two differ, and handing the input the scene default would render it
+   *  in a different typeface from the labels beside it. `''` when nothing up the chain authored a
+   *  font, which is what keeps the repo's two existing `<input>`s (`games/chess`,
+   *  `games/llm-test`, neither authoring one) on the UA font exactly as before. */
+  inheritedFontFamily?: string;
 }
 
-function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisualsHidden }: UINodeProps) {
+function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisualsHidden, inheritedFontFamily }: UINodeProps) {
   // Focus ring (controller/keyboard navigation, Part B). Runtime only — the editor's
   // click-to-select mode (onSelectEntity set) is authoring, not gameplay nav. The
   // selector subscribes THIS node to the focus store, so only the entering/leaving
@@ -152,6 +625,27 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // of nodes. It writes scroll position back into ECS WITHOUT dirtying the UI tree.
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
   useScrollView(node, scrollRef);
+
+  // Scroll anchoring (#531). Same before-any-early-return rule, and gated on the SAME one field
+  // that makes the box scroll at all rather than on `node.scroll` — the bug was found on a panel
+  // that carries no `UIScrollView` at all, just `overflow: 'scroll'`, so hanging this off the
+  // trait would have left the reported case unfixed. See scrollAnchor.ts for what it holds still.
+  //
+  // ⚠️ It takes the ELEMENT, not `scrollRef`: this call sits ABOVE the `isVisible` early return
+  // and a hidden-but-mounted node renders null, so an effect keyed on the (stable) ref object
+  // would run once against null and never re-attach when the box appeared.
+  const [scrollEl, setScrollEl] = React.useState<HTMLDivElement | null>(null);
+  // ⚠️ A virtualized view is EXCLUDED, by trait and not by child count. Its rows all live under
+  // one `__uiEntriesContent` wrapper whose `offsetTop` never moves, so anchoring degrades to
+  // restoring the raw number — and doing that with the browser's anchoring switched off is worse
+  // than leaving the box alone. See scrollAnchor.ts § "Where it does NOT apply".
+  const isScrollBox = node.overflow === 'scroll' && !node.isEntriesView;
+  const attachScroll = React.useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    // Only a scroll box pays for the extra render; every other UI node keeps the plain ref.
+    if (isScrollBox) setScrollEl(el);
+  }, [isScrollBox]);
+  useScrollAnchoring(isScrollBox, scrollEl);
 
   // isVisible is authored (or flipped by a button's UIAction `kind:'set'` binding). A
   // state-driven visibility binding (UIBinding.visibleBinding) can additionally hide the element
@@ -219,6 +713,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // author's mistake to make, but nothing errors, so it is stated here and in the trait docs
   // rather than left to be discovered.
   if (node.overflow === 'scroll') {
+    // ⚠️ `overflow-anchor` is deliberately NOT set here. `useScrollAnchoring` owns it at runtime,
+    // because whether we may take the browser's anchoring away depends on something only the DOM
+    // knows: a box with one flow child (a `UIEntries` content wrapper) is one this file cannot
+    // anchor, and disabling the browser's mechanism there would be a regression. See
+    // scrollAnchor.ts § "Where it does NOT apply".
     if (node.scrollbarStyle === 'hidden') {
       style.scrollbarWidth = 'none';
     } else if (node.scrollbarStyle === 'tinted') {
@@ -294,8 +793,29 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // field is on every UIElement and the Inspector shows it everywhere, so honouring it only on
   // leaves was an authoring surface that lied.
   if (node.fontFamily) style.fontFamily = node.fontFamily;
+  // A form control (`input`/`range`) does NOT inherit `font-family` from this style cascade —
+  // the browser's UA stylesheet gives it its own explicit default, which beats plain
+  // inheritance — so with no authored `UIElement.fontFamily` it would miss the scene-wide
+  // `UISettings` default every `div` sibling gets for free through `UIRenderer`'s container
+  // (#803, one element type over from the container fix). Gated to input/range ONLY: a `div`
+  // already inherits correctly and must be left alone, and using `'inherit'` unconditionally
+  // here was rejected — `games/chess` and `games/llm-test` author the repo's only two
+  // `<input>`s and neither authors a scene font, so an unconditional `inherit` would visibly
+  // change both from the platform's form font to `body`'s `system-ui` for a change neither
+  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps them byte-identical.
+  else if (inheritedFontFamily && (node.elementType === 'input' || node.elementType === 'range')) {
+    style.fontFamily = inheritedFontFamily;
+  }
 
   // ── Text styling (only when text content exists) ──
+  // Built here, applied to a wrapper around the text near the end of render — see the maxLines
+  // block below for why it cannot live on the host.
+  let clampStyle: React.CSSProperties | undefined;
+  // Set only in the `clip` + `autoFitText` + `maxLines > 0` + no-authored-`lineHeight` combination
+  // (#727) — the one case where the cap can't live on `clampStyle`'s wrapper (see the block below)
+  // and instead has to live on the span `AutoFitText` itself resizes. `undefined` everywhere else,
+  // so `AutoFitText`'s `clampLines` prop stays absent and every other text node is unaffected.
+  let autoFitClampLines: number | undefined;
   if (text) {
     // `cssVal` so a non-px `fontSizeUnit` resolves through the same `--ui-*` custom properties
     // every other length uses (#245). Default 'px' returns the bare number, i.e. unchanged.
@@ -321,16 +841,174 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // outer half shows — i.e. a true outline.
       (style as any).paintOrder = 'stroke fill';
     }
+    // ── maxLines: the clamp lives on an INNER wrapper, never on the host (#655) ──
+    // `-webkit-box` is not a flex container, so setting it here silently killed
+    // `justifyContent`/`alignItems`/`flexDirection`/`gap` authored on this same entity — while
+    // `getComputedStyle` went on REPORTING them (`center`), so the fields read alive in devtools
+    // and in the Inspector while doing nothing. That is this repo's "an unwired field is a lie
+    // with a tooltip" class, and it went from theoretical to reachable when #646 made the clamp
+    // actually engage. `clampStyle` is applied to a wrapper around the text further down.
     if (node.maxLines > 0) {
-      style.overflow = 'hidden';
-      style.display = '-webkit-box' as any;
-      (style as any).WebkitLineClamp = node.maxLines;
-      (style as any).WebkitBoxOrient = 'vertical';
-      if (node.textOverflow === 'ellipsis') style.textOverflow = 'ellipsis';
+      // `shrinkWrapAlign` for the same reason #657 needed it, one element over: this wrapper is a
+      // FLEX ITEM. In the default `column` host with `alignItems: 'stretch'` it fills the width
+      // and `text-align` still works — but in a `row` host (or `alignItems: flex-start/flex-end`)
+      // it shrink-wraps, and `text-align` then has nothing to centre. Measured pre-fix on a 400px
+      // row host with `textAlign: 'center'`: wrapper x=0 w=149 (flush left) against x~125 when the
+      // clamp lived on the host. Latent — no scene authors `row` + `maxLines` today — but #655 is
+      // precisely what makes `flexDirection` authorable on these entities, so it is newly
+      // reachable BECAUSE of this change.
+      clampStyle = { overflow: 'hidden', ...shrinkWrapAlign(node.textAlign) };
+      if (node.textOverflow === 'ellipsis') {
+        clampStyle.display = '-webkit-box';
+        (clampStyle as any).WebkitLineClamp = node.maxLines;
+        (clampStyle as any).WebkitBoxOrient = 'vertical';
+        clampStyle.textOverflow = 'ellipsis';
+      } else {
+        // `clip` is the field's DEFAULT and used to be UNHONOURABLE (#656): `-webkit-line-clamp`
+        // paints its own ellipsis unconditionally and never consults `text-overflow`, so an
+        // author who chose `clip` — or who never touched the field — got an ellipsis they could
+        // not turn off. A height cap truncates with no ellipsis instead.
+        //
+        // `lh` is the element's OWN line box, so `${maxLines}lh` is exact whether or not
+        // `lineHeight` was authored, and it cuts at a line boundary rather than through the
+        // middle of a glyph row. An authored `lineHeight` is emitted in px above, so use px
+        // there — same number, and it does not depend on the unit at all.
+        // ⚠️ `lh` needs Safari 16.4, which is EXACTLY this repo's iOS floor (CLAUDE.md § Device
+        // Info). Below it the declaration is dropped, the cap does not apply, and the text
+        // renders unclamped — more text than asked for, never a sliver.
+        // ⚠️ A HEIGHT CAP IS NOT EQUIVALENT TO COUNTING LINES, and the difference bites exactly
+        // once: when a DESCENDANT renders at a different font size than this wrapper. `lh` and
+        // `em` both resolve against the wrapper's own (authored) size, while `AutoFitText` writes
+        // a SHRUNK `font-size` onto its inner span. Measured: host 42px, span floored at 16px,
+        // `max-height: 1lh` = 48px against an 18px line box — 2.67 lines rendered where 1 was
+        // authored. `-webkit-line-clamp` counts LINE BOXES and is immune by construction.
+        //
+        // So the cap is used only where it is provably equivalent:
+        //   authored lineHeight  -> px, and a px line-height INHERITS as a fixed value, so the
+        //                           span's line boxes stay that tall whatever the font does.
+        //   no autoFitText       -> nothing changes the font below here; `lh` is exact.
+        //   otherwise (#727)     -> the cap can't live here at all: `lh`/`em` on THIS wrapper
+        //                           resolve against ITS font size, but `AutoFitText` writes the
+        //                           shrunk size onto its own inner span one level down, so a cap
+        //                           here is too tall (measured: host 42px, span floored at 16px,
+        //                           `1lh` here = 48px against an 18px line box — 2.67 lines
+        //                           rendered where 1 was authored). Leave this wrapper uncapped
+        //                           and hand `maxLines` down as `autoFitClampLines` instead, so
+        //                           `AutoFitText` can put `${maxLines}lh` on the SPAN it resizes,
+        //                           where `lh` resolves against the size it actually wrote.
+        clampStyle.display = 'block';
+        if (node.lineHeight) {
+          clampStyle.maxHeight = `${node.lineHeight * node.maxLines}px`;
+        } else if (!node.autoFitText) {
+          clampStyle.maxHeight = `${node.maxLines}lh`;
+        } else {
+          autoFitClampLines = node.maxLines;
+        }
+      }
     } else if (node.textOverflow === 'ellipsis') {
-      style.overflow = 'hidden';
-      style.textOverflow = 'ellipsis';
-      style.whiteSpace = 'nowrap';
+      // Moved off the host onto `clampStyle`'s wrapper (#725) — `text-overflow` never did
+      // anything here because the host entity div is ALWAYS `display: flex` (`style.display`
+      // above), and `text-overflow` does not apply to a flex container. It silently painted
+      // nothing while every other ellipsis field (`overflow`, `whiteSpace`) kept reading back
+      // from `getComputedStyle` as set — the same "lie with a tooltip" class as #656.
+      //
+      // ⚠️ Do NOT spread `shrinkWrapAlign(node.textAlign)` in here (it was here briefly, #725→#727
+      // fixup). `align-items: stretch` — the DEFAULT `alignItems` on every host — only applies when
+      // NEITHER cross-axis margin is `auto` (CSS Flexbox §8.3), and `shrinkWrapAlign('center'|'right')`
+      // returns exactly such a margin. With it present the wrapper falls back to fit-content, which
+      // for `white-space: nowrap` text is the ENTIRE line — i.e. it disables the very stretch the
+      // ellipsis needs to ever engage, and does so worse than having no fix at all, since `overflow:
+      // hidden` lives on this wrapper, not the host: the un-stretched line spills past the host
+      // uncropped. Measured live (Chromium, 120px host, 24px text, `textAlign: 'center'`): wrapper
+      // 345.1px wide, no ellipsis, 225px of overflow outside the host. Removing the spread and
+      // stretching the wrapper full-width is not a loss of alignment — `text-align` inherits onto a
+      // stretched block and centres/right-aligns the text exactly as before, just without shrinking
+      // the box around it. (This is a `nowrap`-only difference from the `maxLines > 0` clamp branch
+      // above, which keeps `shrinkWrapAlign` — that wrapper WRAPS, so its fit-content collapses to
+      // the available width and the auto margin is harmless there. Don't re-add it here "for
+      // symmetry" with that branch.)
+      //
+      // `maxWidth: '100%'` is the second half of the fix: it caps the wrapper even when the HOST
+      // authors a non-stretch `alignItems` (e.g. `flex-start`), which would otherwise reproduce the
+      // same shrink-wrap-to-the-whole-line spill by a different route (no auto margin needed — a
+      // flex item with `align-items` other than `stretch` just never gets a cross-size in the first
+      // place).
+      //
+      // Zero blast radius today: no `games/**`/`demos/**` entity authors `textOverflow: 'ellipsis'`
+      // with `maxLines: 0` — the only authored instances (`e2e-smoke.scene.json`) all set
+      // `maxLines: 1` and already go through the `maxLines > 0` branch above. Unlike the #725 zero-
+      // blast-radius note this replaces, nothing GUARDS that this stays true — it is today's fact,
+      // not a standing invariant a test enforces.
+      //
+      // `minWidth: 0` was here too and was a no-op, not load-bearing (#727 review): `clampStyle`
+      // always carries `overflow: hidden`, which makes this a SCROLL CONTAINER, and a scroll
+      // container's automatic minimum size is already 0 (CSS Flexbox §4.5) — `min-width: auto`
+      // never entered the picture. Measured both ways in a row host: wrapper 120, scrollWidth 345,
+      // ellipsizes — identical. Left out; don't re-add it thinking it does something.
+      //
+      // ⚠️ KNOWN RESIDUAL GAP, not fixed here: this stays inert when the node ALSO has
+      // `autoFitText` or `textAnim`. Either wraps `textContent` in a span authored
+      // `display: block; white-space: pre-wrap` (`AutoFitText`/`AnimatedText` above), and that
+      // span's own `pre-wrap` overrides this wrapper's `nowrap` — `text-overflow` only ellipsizes
+      // inline content laid out directly in the block container, not a nested block's overflow.
+      // Measured: a bare string ellipsizes at 28px (one line); the same text through either wrapper
+      // renders 84px (three wrapped lines, no ellipsis). Confirmed NOT a regression of this fix —
+      // it measured 84px before this change too. No code fix attempted; see `docs/ui-system.md`.
+      clampStyle = {
+        display: 'block',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        maxWidth: '100%',
+      };
+    } else {
+      // ── The no-wrapper path (#742) ──
+      // Every branch above wraps the text because it needs to (a clamp, an ellipsis). The bare
+      // string here needs NO wrapper for its own sake — it only needs one because `text-align`,
+      // written on the HOST a few lines up, is inert on a shrink-wrapped anonymous flex item
+      // (`uiTextAnimation.ts`'s #657 comment: "a shrink-wrapped block has no inline content left
+      // to align"). The three wrapper paths above (and `AnimatedText`, `AutoFitText`) each carry
+      // `shrinkWrapAlign` already; this is the common path that didn't, so `textAlign: 'center'`/
+      // `'right'` painted flush-left whenever the host didn't stretch the text box for it.
+      //
+      // Mount ONLY when it can matter and can't be handled elsewhere:
+      //   - `textAlign` is `'center'`/`'right'` — `shrinkWrapAlign('left')` returns `{}`, so a
+      //     wrapper would be pure DOM churn for no visual effect. (`'left'` under a centring
+      //     `alignItems` is a separate, KNOWN, deliberately-unfixed gap — see `docs/ui-system.md`:
+      //     `left` is the trait default, and the scene serializer strips a field equal to its
+      //     default, so an authored `left` is indistinguishable from "never touched the field".)
+      //   - the box actually shrink-wraps: `alignItems !== 'stretch'` (the default) OR
+      //     `flexDirection === 'row'` (where a column's `stretch` doesn't reach — the text sits on
+      //     the MAIN axis instead, which content-sizes regardless of `alignItems`).
+      //   - the text is a genuine bare string: not `autoFitText` (mounts its own span, its own
+      //     handling) and not a text node whose `textAnim` actually resolves (mounts `AnimatedText`
+      //     with `shrinkWrapAlign` already carried via `rainbowStyleFor`).
+      //
+      // ⚠️ `shrinkWrapAlign` disables `align-items: stretch` via its auto cross-axis margin (CSS
+      // Flexbox §8.3) — the same mechanism the #725→#727 trap above warns is a cure worse than the
+      // disease on an alignItems:stretch box. It is SAFE here specifically because the shrink-wrap
+      // condition above only lets this branch fire when the box is already not being stretched (or
+      // stretch doesn't apply on this axis) — so disabling stretch is a no-op, not a regression.
+      // Don't drop that guard thinking it's redundant with the alignment check.
+      //
+      // Measured (Court + Wordweave, #742): 82 entities meet these conditions, and every one of
+      // them also authors `alignItems: 'center'` with `textAlign: 'center'` — a degenerate
+      // combination where `align-items: center` already centres the shrink-wrapped box exactly
+      // where `text-align: center` would put the glyphs. Zero-pixel change in both shipping games;
+      // guarded by an e2e case that measures that exact combination's geometry is unchanged.
+      // ⚠️ That 82 is COURT + WORDWEAVE ONLY, not a repo total — the other games were deliberately
+      // NOT swept (owner, 2026-09-05: their alignment gets corrected later, when a problem is
+      // actually seen). So a game outside those two MAY move when this branch starts firing, and
+      // that is an accepted, known consequence rather than an oversight. Nothing guards the count.
+      const resolvedTextAnim = !!(node.textAnim && uiTextAnimation(node.textAnim, node.textAlign));
+      if (
+        (node.textAlign === 'center' || node.textAlign === 'right') &&
+        (node.alignItems !== 'stretch' || node.flexDirection === 'row') &&
+        !node.autoFitText &&
+        !resolvedTextAnim
+      ) {
+        clampStyle = shrinkWrapAlign(node.textAlign);
+      }
     }
   }
 
@@ -351,7 +1029,28 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one
   // owner. A UIScrollView on an element left at `overflow:'visible'` therefore does not scroll,
   // which is the honest outcome rather than two fields silently fighting.
-  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll));
+  //
+  // ⚠️ `node.overflow` is passed in because that sentence was NOT true until #743: the cross-axis
+  // pin `scrollViewStyle` emits lands AFTER the `overflow` write above, and per CSS one axis set
+  // to `hidden` promotes the other from `visible` to `auto`. See its banner for the full shape.
+  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll, node.overflow));
+  // The inert-trait warning that makes the invariant HONEST rather than merely true (#743). A
+  // `UIScrollView` on a non-scrolling element now does exactly nothing, which is the documented
+  // outcome — but "nothing" is indistinguishable from "not wired yet", and this is the same
+  // silent-authoring-failure class `warnDeadToggle` already covers one control over. Warn, never
+  // throw: an authoring mistake must not blank the screen mid-render.
+  // ⚠️ **`'visible'` ONLY — an `overflow: 'hidden'` box is NOT inert, and warning there was wrong.**
+  // `hidden` still establishes a scroll CONTAINER: it has a scrollable overflow region, just no
+  // user-facing scrolling UI. `useScrollView` gates on `node.scroll`, not on overflow, so
+  // `pendingScrollTo` → `el.scrollTo()` still drives it, and `scrollViewStyle` still emits
+  // `scrollSnapType`/`overscrollBehavior` above its own early return, where both genuinely apply.
+  // That is a real design — a button- or `scrollToEntry`-driven pager that deliberately suppresses
+  // finger-dragging — and the remedy this warning prescribes would re-enable the drag its author
+  // went out of their way to suppress. `visible` is the genuinely inert one: no scroll container,
+  // so `scrollTo` moves nothing and snap has nothing to apply to.
+  if (import.meta.env?.DEV && node.scroll && node.overflow === 'visible') {
+    warnInertScrollView(node.guid || `${node.entityId}:${node.generation}`, node.overflow);
+  }
   // The snap TARGET half, stamped by the enclosing scroll view during the tree build — snapping
   // is declared on the box and honoured on the target, and those are different elements.
   if (node.snapChild) Object.assign(style, node.snapChild);
@@ -404,6 +1103,25 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // A button is interactive if it dispatches an action OR applies declarative
   // bindings — any click-event binding (set write or call action).
   const isInteractive = !!node.action?.bindings?.some(b => (b.event || 'click') === 'click');
+  // #728 — an author's explicit "consume a tap that lands here, but I am NOT a button". Kept
+  // separate from `isInteractive` on purpose: a swallow takes the pointer and stops the bubble,
+  // but it must not paint a finger cursor, must not run bindings, and so must not fire the click
+  // cue or take the input lock — which is the whole reason the field exists.
+  //
+  // ⚠️ `&& !node.pointerThrough` is load-bearing, and it is here rather than in the style cascade
+  // below because CSS cannot express it. `pointer-events: none` stops this node being HIT-TESTED;
+  // it does NOT remove it from the event path of a click that starts on a descendant with `auto`
+  // — which is the case `pointerThrough`'s own doc advertises ("a decorative panel that still
+  // holds a working button"). So a React `onClick` on a `pointer-events: none` node still fires
+  // for such a click, and without this gate a band authored with BOTH fields swallowed every tap
+  // that began on a Canvas2D mount or a scroll box inside it, never reaching what the band was
+  // supposed to be transparent to. MEASURED, not reasoned: with the gate removed, a
+  // `pointerThrough` band holding one `overflow:'scroll'` child received the child's click and
+  // stopped it dead (ancestor handler calls: 0). That is the pointer-blocker passthrough bug
+  // `pointerThrough` exists to prevent. The docs claimed `pointerThrough` won here long before
+  // the code did — see #728's close-out.
+  const swallowsClicks = node.swallowClicks === true && !node.pointerThrough;
+  const takesClick = isInteractive || swallowsClicks;
 
   // In editor mode, skip click handler on canvas2D containers — they're just mount points,
   // not something worth selecting. Let clicks pass through to children.
@@ -411,9 +1129,23 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     ? node.canvas2D
       ? undefined
       : (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
-    : isInteractive
+    : takesClick
       ? (e: React.MouseEvent) => {
           e.stopPropagation();
+          if (!isInteractive) {
+            // A pure swallow (#728) stops propagation WITHOUT consulting `pressBelongsTo` — see
+            // pressOrigin.ts's "The rule for a handler that swallows a click": left uncleared,
+            // React's synthetic stopPropagation also stops the native event at the React root, so
+            // the document-level sweep never runs and the pair survives to be misread by a later
+            // click. Same contract as the text-input/range/toggle branches below.
+            clearPressOrigin();
+            return;
+          }
+          // #664 — a press that started on a descendant control and released past this node
+          // (a horizontal swipe outrunning a panel's edge, say) must not fire this node's
+          // bindings just because the browser resolved the click to this common ancestor. See
+          // pressOrigin.ts's module doc for why per-control stopPropagation can't cover this.
+          if (!pressBelongsTo(e.currentTarget as Element)) return;
           // Run every click binding (set writes + call actions). Inert in edit mode.
           applyBindings(node.action!.bindings, 'click', { selfGuid: node.guid });
         }
@@ -425,6 +1157,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   } else if (isInteractive) {
     style.pointerEvents = 'auto';
     style.cursor = 'pointer';
+  } else if (swallowsClicks) {
+    // A pure swallow still needs the pointer to receive the click at all (a container otherwise
+    // left at its structural default), but it is not a button — no cursor. `pointerThrough`
+    // below runs AFTER this and still wins if both are authored.
+    style.pointerEvents = 'auto';
   } else if (node.children.length === 0) {
     // Only disable pointer events on leaf nodes (containers must pass events to children)
     style.pointerEvents = 'none';
@@ -541,8 +1278,43 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     );
   }
 
+  // ⚠️ **The fourth door, and the only one that had NO warning — which is why it is the silent
+  // one (#745).** Every branch above tells the author when a neighbouring field is dropped, but
+  // `text` itself is dropped on four element types and nothing said so: the Canvas2D return
+  // renders the nine-slice, video, canvas and children layers and never `textContent`; the toggle
+  // return draws only track + knob; `<input>`/`<range>` take their value from `inputBinding`.
+  //
+  // What makes it worse than a plain no-op is that the STYLING still lands: `style.fontSize`,
+  // `color`, `textAlign` and (since #725) the clamp wrapper are all built from this text and
+  // spread onto the element regardless. So devtools and the Inspector show a fully-styled text
+  // element that paints nothing — the one shape where reading the authored data tells you the
+  // opposite of what the screen does.
+  if (import.meta.env?.DEV && text && (node.canvas2D || node.toggle || node.elementType !== 'div')) {
+    const why = node.canvas2D ? 'a Canvas2D node renders its canvas, not text'
+      : node.toggle ? 'a UIToggle draws only a track and a knob'
+        : `elementType '${node.elementType}' takes its value from its inputBinding, not from 'text'`;
+    warnDroppedText(node.guid || `${node.entityId}:${node.generation}`, why);
+  }
+  // The same class one field group over: the whole text-STYLE block is gated on `node.text`, which
+  // an input/range never uses, and the input branch below re-emits only `fontFamily`, `fontSize`,
+  // `fontWeight` and `color`. Everything else an author sets is dropped — and unlike the case
+  // above there is no text to make the omission visible, so nothing on screen hints at it.
+  //
+  // `UIElement.ts` documented this hole for `autoFitText` ALONE, which reads as "that one field is
+  // special" rather than "an entire field group does not apply here"; #745 widened that note and
+  // this is its runtime half.
+  if (import.meta.env?.DEV && (node.elementType === 'input' || node.elementType === 'range')) {
+    const dropped = droppedTextStyleFields(node, node.elementType);
+    if (dropped.length > 0) warnDroppedTextStyle(node.guid || `${node.entityId}:${node.generation}`, node.elementType, dropped);
+  }
+
   // Input element: render <input> instead of <div> when elementType is 'input'.
   // In editor mode, render read-only so it looks the same but doesn't steal focus.
+  //
+  // `node.autoFitText` is DELIBERATELY not read on this path (#614): an <input>'s value is
+  // player-entered text, not an authored label, and shrinking it as the user types is a
+  // different feature. autoFitText does nothing on an input today — the field's Inspector
+  // tooltip says so, so the surface doesn't lie about it.
   if (node.elementType === 'input') {
     const inputValue = node.binding?.inputBinding
       ? String(storeState[node.binding.inputBinding] ?? '')
@@ -566,6 +1338,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           onClick={(e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); onSelectEntity(node.entityId); }}
           onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
           data-entity-id={node.entityId}
+          {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
         />
       );
     }
@@ -578,7 +1351,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         value={inputValue}
         placeholder={node.placeholder}
         onChange={node.action?.bindings?.length
-          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: e.target.value })
+          // continuous: true — this fires once per KEYSTROKE on a controlled input, not a
+          // discrete activation. Locking it would swallow every character typed within the
+          // input-lock window after the first, and since this binding write IS what produces
+          // the field's value, those keystrokes are LOST, not merely delayed (#466 follow-up:
+          // typing "hello" would land only "h"). See uiInputLock.test.ts's typing regression.
+          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: e.target.value, continuous: true })
           : undefined}
         onKeyDown={node.action?.bindings?.length
           ? (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -591,8 +1369,13 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         // Same contract as the range below and the toggle further down: focusing a text field is
         // not a click on whatever sits behind it. Latent rather than reported — no shipped game
         // has yet put a text input inside a dismiss-on-backdrop panel — but it is the same bug.
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        // `clearPressOrigin()` because this stops propagation WITHOUT consulting `pressBelongsTo`
+        // — see pressOrigin.ts's "The rule for a handler that swallows a click": left uncleared,
+        // React's synthetic stopPropagation also stops the native event at the React root, so the
+        // document-level sweep never runs and the pair survives to be misread by a later click.
+        onClick={(e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); }}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       />
     );
   }
@@ -624,6 +1407,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           onClick={(e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); onSelectEntity(node.entityId); }}
           onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
           data-entity-id={node.entityId}
+          {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
         />
       );
     }
@@ -636,15 +1420,20 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         step={node.rangeStep || 1}
         value={sliderValue}
         onChange={node.action?.bindings?.length
-          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value) })
+          // continuous: true — this 'change' fires repeatedly during a drag, not a discrete
+          // activation, so it must not take (or be blocked by) the global input lock (#466).
+          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value), continuous: true })
           : undefined}
         // A click that lands on an interactive control has been CONSUMED by it, and must not also
         // read as a click on an ancestor. Without this a slider inside the canonical
         // click-the-backdrop-to-dismiss panel closes that panel on every adjustment — reported on
         // games/court's settings sliders, which dismissed the dialog mid-drag. The toggle branch
         // below has always done this; `range` and the text input above simply never did.
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+        // `clearPressOrigin()` for the same reason as the text input above: this stops
+        // propagation without consulting the gate, so it must clear the pair itself.
+        onClick={(e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); }}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       />
     );
   }
@@ -681,13 +1470,102 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // button defaults to `event: 'click'` (`UIActionBindingsField.tsx`), so an author who adds a
     // binding and does not change the dropdown lands exactly here — and now gets told.
     const canFire = !!node.action?.bindings?.some(b => (b.event || 'click') === 'change');
-    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || String(node.entityId));
+    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || `${node.entityId}:${node.generation}`);
 
+    // Does something OTHER than the fallback already size each axis? A definite CSS size covers
+    // both the authored case and the pooled-row pin; `isSizeInert` covers the anchor-stretched
+    // axis, whose CSS size `applyAnchorStyle` deliberately clears. See `trackStyle` below.
+    // ⚠️ A `%` size is NOT definite — it is the indeterminate case this whole fix is about. Against
+    // an indefinite containing block `height: 100%` resolves to `auto` exactly like an unset
+    // height, so treating it as "already sized" would switch the fallback off in the one shape it
+    // exists for. Every other unit resolves without the parent (px, and vw/vh/vmin/vmax via the
+    // `--ui-*` custom properties), so those are definite. The pooled-row pin writes px, so it
+    // stays covered.
+    const definite = (v: React.CSSProperties['width'], unit: string) => v !== undefined && unit !== '%';
+    const sizedW = definite(style.width, node.widthUnit) || (!!node.anchor && isSizeInert(node.anchor.anchor, 'width'));
+    const sizedH = definite(style.height, node.heightUnit) || (!!node.anchor && isSizeInert(node.anchor.anchor, 'height'));
+    // ⚠️ Clamped to an authored px `maxWidth`/`maxHeight`, because CSS resolves `min-*` ABOVE
+    // `max-*` — an unclamped 24px floor under an authored `maxHeight: 16` would render a 24px
+    // track, i.e. the fallback silently beating the authored surface, which is the exact failure
+    // this commit exists to remove. A non-px cap is left alone: it cannot be compared here, and
+    // guessing is worse than the floor.
+    const capped = (fallback: number, max: number, unit: string) =>
+      max > 0 && unit === 'px' ? Math.min(fallback, max) : fallback;
+    const trackFloorW = capped(DEFAULT_TOGGLE_TRACK_WIDTH, node.maxWidth, node.maxWidthUnit);
+    const trackFloorH = capped(DEFAULT_TOGGLE_TRACK_HEIGHT, node.maxHeight, node.maxHeightUnit);
+    // The knob's floor is skipped with the track's on a sized axis, for the same reason: on a
+    // track shorter than the floor it would push the knob outside its own capsule.
+    //
+    // ⚠️ It derives from the SMALLER of the two effective floors, and taking the height alone was
+    // wrong. The knob is square (`aspectRatio: 1/1`) with `flexShrink: 0`, so it must fit the
+    // track's content box on BOTH axes — an authored `maxWidth: 20` leaves a 14px content width
+    // (20 − 2×3 inset) while a height-derived floor is 18px, and the knob then spills 4px past the
+    // capsule edge with `justify-content`'s flip left in NEGATIVE slack: the two states become
+    // indistinguishable, which is the same "one wrong render traded for another" this fallback
+    // exists to avoid. Normally `min(44, 24) = 24` is the height anyway, so this changes nothing
+    // outside an authored cap.
+    const knobFloor = sizedH ? undefined : toggleKnobFloor(t.knobInset, Math.min(trackFloorW, trackFloorH));
     const fire = () => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: !t.value });
     const interactive = canFire && !t.disabled && !onSelectEntity;
 
     const trackStyle: React.CSSProperties = {
       ...style,
+      // ⚠️ **A definite fallback size, because the DEFAULT authoring shape was the broken one
+      // (#744).** `UIToggle`'s own contract is that "the knob is square and its size falls out of
+      // the track's height minus twice `knobInset`" — and `knobStyle` implements that as
+      // `height: '100%'` + `aspectRatio`. A percentage height resolves against the containing
+      // block's height, so with `UIElement.height` unauthored the track is a flex container of
+      // INDEFINITE height, `height: 100%` resolves to `auto` → zero content height → and
+      // `aspect-ratio` then derives zero WIDTH from it. An invisible knob. `UIElement.height`
+      // defaults to 0 (auto), so dropping a `UIToggle` on an entity and not setting a height —
+      // the thing an author does first — produced exactly that. The repo's only toggle
+      // (`games/court`, 56×32) escapes by having authored a size, i.e. by chance.
+      //
+      // Fixed HERE and not on the knob deliberately: giving the knob its own intrinsic size would
+      // make it stop tracking an AUTHORED track height, regressing Court's toggle. This keeps one
+      // rule — knob size follows the track — and only supplies a track size when nothing else did.
+      //
+      // ⚠️ **`minWidth`/`minHeight`, NOT `width`/`height`, and that is the load-bearing choice.**
+      // A definite `height` would override every shape whose size comes from somewhere other than
+      // `UIElement.height` — and two of those WORK today, so writing `height` would have fixed the
+      // default by breaking them:
+      //   - an anchor-stretched toggle (`anchorCss` clears the CSS size and sizes it from the two
+      //     offsets, giving the track a definite height the knob already resolves against);
+      //   - a toggle in a `flexDirection: 'row'` parent, where `alignItems` DEFAULTS to `'stretch'`
+      //     so a sibling label's line box makes the track's height definite — the ordinary
+      //     settings-row shape.
+      // A `min-*` can only ever raise a size, so both keep the size they have now; the clamp
+      // engages precisely in the case that had none. `knobStyle` carries a matching floor of its
+      // own, because this one cannot reach it — see there.
+      //
+      // ⚠️ **And it is skipped outright on an axis something else already SIZES**, which `min-*`
+      // alone does not cover — a min can still raise a definite size that is smaller than it. Two
+      // cases, one of them live:
+      //   - a **pooled `UIEntries` row root**, which `entriesSystem` pins to a definite
+      //     `entryW`/`entryH` in px every tick. That block pins `minWidth`/`maxWidth`/`minHeight`/
+      //     `maxHeight` to 0 for exactly this reason — "a min/max constraint overrides the
+      //     definite width/height from INSIDE the border box" — and it warns when it discards an
+      //     AUTHORED one. A fallback invented down here in `UINode` is invisible to that warning,
+      //     so on an entry smaller than 44×24 it would silently reintroduce the desync the pin
+      //     exists to prevent, with no diagnostic at all.
+      //   - an **anchor-stretched axis**, sized by its two offsets. `applyAnchorStyle` clears the
+      //     CSS size there, so the axis reads as unsized from here while being anything but —
+      //     `isSizeInert` is the shared predicate for that, the same one the Inspector and the
+      //     scene validator use.
+      // The residual this cannot see is a flex CROSS-axis stretch (a `row` parent sizing the track
+      // from a sibling's line box): nothing in the node data reports it, so a settings row whose
+      // label is under 24px tall now gets a 24px toggle instead of a ~14px one. Accepted — that
+      // size was accidental, not authored, and the measured realistic case (a 28px label → 33px
+      // line box) is unaffected.
+      //
+      // Width as well as height: with only a height, the track shrink-wraps to the knob plus its
+      // insets and comes out SQUARE, where `justifyContent`'s flip between the two ends has no
+      // slack to move through — a switch whose two states are distinguishable only by colour.
+      // 44×24 keeps Court's 1.75:1 capsule proportion at a size that sits in a settings row.
+      // These are the "genuine no-scene fallback" row of the value-kind table, not tuning knobs:
+      // `UIElement.width`/`height` are the authored surface and still win outright.
+      minWidth: sizedW ? style.minWidth : (style.minWidth ?? trackFloorW),
+      minHeight: sizedH ? style.minHeight : (style.minHeight ?? trackFloorH),
       display: 'flex',
       flexDirection: 'row',
       alignItems: 'center',
@@ -708,6 +1586,28 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     const knobStyle: React.CSSProperties = {
       height: '100%',
       aspectRatio: '1 / 1',
+      // ⚠️ **The knob needs its OWN floor — the track's `minHeight` cannot reach it (#744).** A
+      // percentage height resolves against the containing block's COMPUTED height, and a
+      // `min-height` does not make an `auto` height computed, so on an unsized track `height:
+      // '100%'` still resolves to `auto` → 0 and `aspect-ratio` derives a zero WIDTH from it.
+      //
+      // ⚠️ **`alignSelf: 'stretch'` instead of `height: '100%'` does NOT fix this** — it was tried
+      // and measured (headless Chromium, this file's four shapes). It gives the knob the track's
+      // used cross size, so the HEIGHT came out right at 18px — and the width stayed **0**: a flex
+      // item's main size is resolved BEFORE cross-axis stretching, so `aspect-ratio` has no
+      // definite cross size to derive it from yet. Half-fixed and still invisible. Do not
+      // reintroduce it.
+      //
+      // A `min-*` pair is what works, because it constrains the knob directly rather than through
+      // a resolution order. It only ever RAISES a size, so every shape that renders today keeps
+      // the size it has: measured 26×26 authored / 27×27 row-stretched / 74×74 anchor-stretched,
+      // identical before and after, with the default shape going 0×0 → 18×18.
+      //
+      // The floor is the track fallback minus the author's own insets, so the knob lands exactly
+      // where the track's own `minHeight` puts its content box — one size, derived, not a second
+      // number to keep in sync. Clamped at 0 for an inset large enough to eat the whole track.
+      minWidth: knobFloor,
+      minHeight: knobFloor,
       flexShrink: 0,
       backgroundColor: hexToRgba(t.knobColor, t.knobOpacity),
       borderRadius: t.knobRadius,
@@ -728,7 +1628,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         onClick={onSelectEntity
           ? (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
           : interactive
-            ? (e: React.MouseEvent) => { e.stopPropagation(); fire(); }
+            // `clearPressOrigin()` for the same reason as the range/text-input branches above:
+            // this stops propagation without consulting `pressBelongsTo`, so it must clear the
+            // pair itself or a later click could misread it as its own.
+            ? (e: React.MouseEvent) => { e.stopPropagation(); clearPressOrigin(); fire(); }
             : undefined}
         onKeyDown={interactive
           ? (e: React.KeyboardEvent) => {
@@ -736,6 +1639,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           }
           : undefined}
         data-entity-id={node.entityId}
+        {...{ [UI_PRESS_ORIGIN_ATTR]: '' }}
       >
         <div style={knobStyle} />
       </div>
@@ -760,12 +1664,19 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
-      <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+      // `takesClick`, not `isInteractive` (#728) — a `swallowClicks` node must ALSO get the
+      // press-origin marker below. If it didn't, the TAP case would still look fixed
+      // (propagation stops, the panel doesn't dismiss — a tap test passes), but the DRAG case
+      // would silently regress to #664: a press starting on this panel and released on the scrim
+      // resolves past the unstamped panel to the scrim, `pressBelongsTo` returns true (fail-open,
+      // nothing recorded belongs to the panel), and the dialog dismisses. See pressOrigin.ts's
+      // "⚠️ LIMIT" section — the gate only protects nodes carrying the marker.
+      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
-          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
         ))}
       </div>
     );
@@ -778,21 +1689,55 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // geometry paths), and its presence/absence drives the re-render on Play/Stop.
   let textContent: React.ReactNode = text;
   if (text && node.textAnim) {
-    const a = uiTextAnimation(node.textAnim);
+    // textAlign is passed so a shrink-wrapped rainbow span keeps the authored alignment —
+    // `fit-content` alone made a centred label jump to the left edge (#657, measured on screen).
+    const a = uiTextAnimation(node.textAnim, node.textAlign);
     if (a) {
       ensureUITextAnimStyles();
       textContent = <AnimatedText text={text} animation={a.animation} amp={a.amp} extra={a.style}
         perCharStagger={a.perChar?.staggerSec} perCharLoop={a.perChar?.loop} perCharFade={a.perChar?.fadeIn} />;
     }
   }
+  // Shrink-only auto-fit (#614) — wraps whatever textContent already is (a bare string, or the
+  // AnimatedText span above), so it composes with text animation rather than competing with it.
+  if (text && node.autoFitText) {
+    // `clampLines` (#727) is only ever set for the `clip` + `autoFitText` + `maxLines > 0` +
+    // no-authored-`lineHeight` combination — see where `autoFitClampLines` is assigned above.
+    textContent = <AutoFitText text={text} fontSize={node.fontSize} fontSizeMin={node.fontSizeMin} clampLines={autoFitClampLines}>{textContent}</AutoFitText>;
+  }
+  // The maxLines clamp (#655/#656), OUTERMOST so it clamps whatever the two wrappers above
+  // produced. Mounted when `maxLines > 0`, and ALSO for a single-line `textOverflow: 'ellipsis'`
+  // since #725 (the host is a flex container, where `text-overflow` does nothing) — every other
+  // text node still keeps byte-identical DOM. This changes the shape every game's UI text renders
+  // into, so confining it to the elements that actually clamp or ellipsize is what keeps that
+  // blast radius small: one authored entity for the clamp, and ZERO for the single-line case —
+  // no `games/**`/`demos/**` entity authors `ellipsis` with `maxLines: 0` today.
+  //
+  // A `div`, not a `span`: `editor-ui-autofit.spec.ts` resolves the text span with
+  // `box.locator('span')`, and a second span there is a Playwright strict-mode violation, not a
+  // behavioural failure — a confusing way to learn about a wrapper.
+  //
+  // `UI_PAINT_ATTR` is load-bearing, not decoration. `isPaintOpaque` (editor/panels/
+  // uiPreviewPick.ts) credits an entity with paint via a DIRECT text-node child; a bare string
+  // moved inside this wrapper is no longer direct, so without the marker a clamped label reads
+  // as purely decorative and a SceneView click falls through to whatever sits behind it. The
+  // marker's `closest('[data-entity-id]')` is still the host, which is what that check asks.
+  // `text &&` as well as `clampStyle`: `uiVisualsHidden` blanks `text` AFTER clampStyle is built,
+  // so without it the editor's 2D-only layer mounts an EMPTY `<div data-ui-paint="text">`, which
+  // `isPaintOpaque` would credit as paint. It does not misfire today only because that same block
+  // sets `pointerEvents: 'none'` — i.e. one edit away from a blank label stealing 2D picks.
+  if (text && clampStyle) {
+    textContent = <div {...{ [UI_PAINT_ATTR]: 'text' }} style={clampStyle}>{textContent}</div>;
+  }
 
   return (
-    <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+    // `takesClick`, not `isInteractive` — see the canvas2D return above for why (#728).
+    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}
       {node.children.map(child => (
-        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} />
+        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
       ))}
     </div>
   );
@@ -896,12 +1841,17 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
   React.useEffect(() => {
     const el = ref.current;
     if (!el || !scroll || !guid) return;
+    // #665: the true fractional box size, refreshed only on RESIZE (see `pushResize` below) —
+    // `push()` reads this cached value rather than re-measuring, so the cheap scroll path stays
+    // cheap.
+    let precise: { width: number; height: number } | null = null;
+    const refreshPrecise = () => { precise = readPreciseBoxSize(el); };
     const push = () => {
-      const changed = writeScrollState(guid, {
-        scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
-        viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
-        contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
-      });
+      // #413: an element with no box (a hidden editor dock tab) must not overwrite the other
+      // mount's real measurement — see `readScrollMeasurement`.
+      const measured = readScrollMeasurement(el, precise);
+      if (!measured) return;
+      const changed = writeScrollState(guid, measured);
       // Re-drive the pool NOW, in the same frame the browser is painting this offset in — a
       // `scroll` event lands before rAF, so the projection still picks it up this frame. Waiting
       // for the next pipeline tick costs a frame, and that frame is what makes a fast scroll go
@@ -911,13 +1861,40 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
       // pool spawns and needs the system-tick flag for `Transient`.
       if (changed) driveEntriesFromScroll();
     };
-    push();                                   // seed, so a system sees real numbers on frame 1
+    // `refreshPrecise` calls `getComputedStyle`, which forces a style recalc — cheap once per
+    // resize, but #677 reports the `scroll` listener's path as frame-rate critical, so `push`
+    // alone (using the cached `precise`) is what runs on every scroll event, and this combined
+    // form is reserved for the resize/mutation paths below.
+    const pushResize = () => { refreshPrecise(); push(); };
+    pushResize();                              // seed, so a system sees real numbers on frame 1
     el.addEventListener('scroll', push, { passive: true });
     // The geometry stands on the viewport size, so measure it rather than assuming the authored
     // width/height resolved to what we think (percentages, flex, safe-area insets).
-    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(push) : null;
-    ro?.observe(el);
-    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); };
+    //
+    // ⚠️ **Observing `el` alone is not enough — `contentHeight`/`contentWidth` (`scrollHeight`/
+    // `scrollWidth`) can change with NO resize of `el` itself.** A row mounting/unmounting inside a
+    // `flexShrink:0` scroll box (Court's store shelf: `syncStoreChrome` toggles row `isVisible` every
+    // frame the modal is open) changes the CONTENT height while the box's own border box, capped by
+    // an authored `maxHeight`, never moves — exactly the case `scrollAnchor.ts`'s own header warns
+    // about for the identical reason ("Court's panel stayed 585px tall while its content went 888 ->
+    // 836"). Left unfixed, a consumer reading `contentHeight` for a "is there more to scroll"
+    // affordance (`docs/ui-system.md`'s own stated use case) can go stale exactly while it matters —
+    // scrolled to the bottom, a row mounts, there IS more below now, and the number does not move
+    // until some OTHER event happens to fire a `scroll`. Mirrors `scrollAnchor.ts`'s own fix for
+    // this: watch every direct child too, and re-observe on any child-list mutation.
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(pushResize) : null;
+    const observeAll = () => {
+      if (!ro) return;
+      ro.disconnect();
+      ro.observe(el);
+      for (const child of Array.from(el.children)) ro.observe(child);
+    };
+    observeAll();
+    const mo = typeof MutationObserver !== 'undefined'
+      ? new MutationObserver(() => { observeAll(); pushResize(); })
+      : null;
+    mo?.observe(el, { childList: true });
+    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); mo?.disconnect(); };
   }, [ref, guid, scroll ? 1 : 0]);           // eslint-disable-line react-hooks/exhaustive-deps
 
   // One-shot scrollTo request. Keyed on the request VALUES, so re-requesting the same offset

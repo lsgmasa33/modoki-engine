@@ -3,24 +3,32 @@
  *  `resolveMemberPath(world, rootId, 'Tile3/Solved/Num')` walks the parent/child hierarchy
  *  from `rootId` and returns exactly the entity at that path.
  *
- *  ## Why this is not `findAllInInstance` promoted out of Court
+ *  ## Why this is a different mechanism from `sceneChrome`'s name lookup
  *
- *  Court's helper (`games/court/runtime/sceneChrome.ts`) scans for
- *  `PrefabInstance.rootInstanceId === rootEcsId`, which is FLAT by construction —
- *  `instantiatePrefabIntoWorld` stamps `rootInstanceId` on *"this prefab's OWN members only
- *  (never inner members)"*. So on a page prefab holding 25 nested tile instances, that scan
- *  reaches ZERO of the tiles: each tile's members carry the TILE's rootInstanceId, not the
- *  page's. Walking `EntityAttributes.parentId` instead is agnostic to how many prefab
- *  boundaries the path crosses, which is exactly what a compound entry needs.
+ *  `sceneChrome`'s `findByName` (`runtime/ui/sceneChrome.ts`) resolves a chrome entity by a
+ *  single FLAT name, scanning every `EntityAttributes` entity in the world for the first match —
+ *  deliberately scoped to TOP-LEVEL scene entities only (see that module's own banner). It has no
+ *  notion of "inside instance X": on a page prefab holding 25 nested tile instances, all of whose
+ *  members share names like `Num`/`Mark`/`Solved` across instances, a flat scan cannot tell them
+ *  apart. `resolveMemberPath` exists for exactly that case — reaching a member INSIDE one
+ *  particular instantiated subtree, by walking `EntityAttributes.parentId` from a known root,
+ *  which is agnostic to how many prefab boundaries the path crosses and is exactly what a
+ *  compound entry needs.
  *
  *  ## Full paths, and ambiguity is an ERROR
  *
  *  A segment names a DIRECT child. Two siblings with the same name make the path ambiguous
- *  and it resolves to `undefined` with a reason, rather than silently picking the first.
- *  This deliberately differs from Court's `patchUIInInstance`, which writes EVERY match and
- *  returns a count: a silent multi-write is the failure class this repo keeps rediscovering.
- *  `level-tile.prefab.json` alone carries three entities named `Num` (one per state face), so
- *  `'Tile3/Num'` names three things and must say so instead of writing one of them.
+ *  and it resolves to `undefined` with a reason, rather than silently picking the first. This is
+ *  the discipline a member-reaching helper needs and a flat name scan cannot enforce: Court once
+ *  had its own such helper (`patchUIInInstance`, scoped by `PrefabInstance.rootInstanceId`,
+ *  deleted when its only caller — the level selector's 25 tiles — moved to a pooled scroll view
+ *  in #316) that wrote EVERY match and returned a count instead, and a silent multi-write is the
+ *  failure class this repo keeps rediscovering. The worked example this rule was written from:
+ *  `level-tile.prefab.json` USED to carry three entities named `Num`, one per state face, so
+ *  `'Tile3/Num'` named three things and had to say so rather than writing one of them. ⚠️ That
+ *  prefab was collapsed to a single face in #344 and now holds four entities with exactly one
+ *  `Num` — the ambiguity rule is unchanged and still right, but do not re-derive it from this
+ *  prefab expecting to find three.
  */
 import type { World } from 'koota';
 import { getTraitByName } from './traitRegistry';

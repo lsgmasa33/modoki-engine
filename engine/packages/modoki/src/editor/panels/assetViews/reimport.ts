@@ -8,6 +8,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import { invalidateModel, invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
 import { invalidateTexture } from '../../../runtime/loaders/textureResolver';
 import { invalidateAudio } from '../../../runtime/loaders/audioBufferCache';
+import { flushPendingMetaFor } from '../../scene/pendingMeta';
 
 export type ReimportItem = { path: string; type: string };
 export type SetImportStatus = (active: boolean, message?: string, step?: number, totalSteps?: number) => void;
@@ -35,6 +36,13 @@ export async function reimportPaths(
     const a = items[i];
     setImportStatus(true, a.path, i, total);
     try {
+      // #845: `/api/reimport` reads the CURRENT `.meta.json` off disk to know what to convert
+      // with. A still-parked settings edit for this path has not reached disk yet, so without
+      // this the reimport would bake the OLD settings while the panel already shows the new
+      // ones — and the stale park would go on to overwrite the reimport's own fresh write at the
+      // next Cmd+S. Flushing first makes both a single-asset Apply and this shared batch loop see
+      // the same disk truth the panel does. A no-op when nothing is parked for `a.path`.
+      await flushPendingMetaFor(a.path);
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: a.path, recursive: false }),

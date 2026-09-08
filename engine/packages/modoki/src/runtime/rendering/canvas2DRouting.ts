@@ -95,7 +95,8 @@ export function findUnrenderable2D(
  *  same split as the routing walk above, and the same reason: the component owns the draw loop,
  *  this module owns what the draw loop DECIDES.
  *
- *  Two properties it exists to hold, both of which regressed silently in the class version:
+ *  Three properties it exists to hold, all of which regressed silently in the class version (or a
+ *  rewrite of it):
  *
  *  1. **It FORGETS an entity that recovers.** The warned set is keyed by guid (so it survives a
  *     hot-reload's id reassignment), and nothing dropped a key when the entity found a canvas —
@@ -104,7 +105,27 @@ export function findUnrenderable2D(
  *     break is the silent one. Same gap `resolveRefWarnOnce` had (QA-ASSET-0005).
  *  2. **The guid lookup stays OFF the hot path.** `key()` is a callback, not a value, and it is
  *     invoked only on the frame an entity crosses the warn threshold or recovers — never for the
- *     healthy entities that make up the whole scene, which is every entity, every frame. */
+ *     healthy entities that make up the whole scene, which is every entity, every frame.
+ *  3. **It FORGETS an entity that dies.** `frames` is keyed by the numeric entity id, which koota
+ *     recycles — an entity deleted while still orphaned left its count in `frames` forever, so the
+ *     next entity to inherit that id started from a stale count and could never again hit `note()`'s
+ *     exact-equality trigger. `prune()` closes this the same way `clear()` closes (1): a caller
+ *     that calls it once per frame/sweep with the frame's live ids keeps `frames` bounded by
+ *     currently-orphaned entities, not by every entity ever orphaned. */
+/** The key an entity warns under when it has no guid. koota recycles entity ids, so this form —
+ *  and ONLY this form — can outlive its entity and silence an unrelated one that inherits the id
+ *  (#700). Exported so `Scene2D.orphan2DKey` mints it and {@link Orphan2DTracker.prune} can
+ *  recognise it: one format, one place, so the two cannot drift apart. */
+export function orphan2DFallbackKey(entityId: number): string { return `id:${entityId}`; }
+
+/** The entity id inside a fallback key, or null when `key` is a guid — which is unique for the
+ *  life of the project and therefore never recycles, so it is not prunable by id. */
+function orphan2DFallbackId(key: string): number | null {
+  if (!key.startsWith('id:')) return null;
+  const n = Number(key.slice(3));
+  return Number.isInteger(n) ? n : null;
+}
+
 export class Orphan2DTracker {
   private readonly frames = new Map<number, number>();
   private readonly warned = new Set<string>();
@@ -133,4 +154,40 @@ export class Orphan2DTracker {
 
   /** Forget everything (teardown / tests). */
   reset(): void { this.frames.clear(); this.warned.clear(); }
+
+  /** Drop `frames` tracking for any id NOT in `aliveIds` — the fix for the id-recycling gap:
+   *  `note()`/`clear()` only run on frames Scene2D actually visits an entity, so one that DIES
+   *  while still orphaned leaves its count in `frames` forever. koota then recycles that same
+   *  numeric id for an unrelated entity, which inherits a count >= `afterFrames` and can never
+   *  again hit `note()`'s exact-equality trigger — the warn-once-must-forget failure this class
+   *  exists to prevent, reintroduced one level down (it forgot on recovery, not on death).
+   *
+   *  Call once per frame/sweep with the frame's live entity ids — the same prune-by-active-set
+   *  shape this codebase already uses for the same recycling hazard (e.g. `videoTextureSync.ts`'s
+   *  `seen` set).
+   *
+   *  `warned` is pruned here too (#700), for the SAME collision one level down: `orphan2DKey`
+   *  falls back to {@link orphan2DFallbackKey} whenever `EntityAttributes.guid` is empty or
+   *  unreadable, so a guid-less orphan's `id:` key could outlive it and permanently silence the
+   *  unrelated entity that recycles the same numeric id. Only the `id:` form is dropped — a guid
+   *  is unique for the life of the project, so it cannot alias a different entity; guid keys are
+   *  released wholesale by {@link reset} at teardown and on world swap, which is also what bounds
+   *  `warned` across scenes (ids collide by the NORM across a swap, not by accident).
+   *
+   *  ⚠️ KNOWN REMAINING GAP, stated so nobody reads the above as complete: a GUID-keyed orphan
+   *  that DIES is not forgotten within its own world. Delete a guid-bearing orphaned entity and
+   *  undo it (same guid, same world, so `reset()` never runs) and it stays suppressed, because
+   *  `prune` is given ids and cannot tell which guids are still live. Not an id COLLISION — it
+   *  suppresses only the same entity — so it is the mild end of this shape, but it is the same
+   *  forget-on-death failure. Tracked in #738 with the rest of the family. */
+  prune(aliveIds: ReadonlySet<number>): void {
+    if (this.frames.size === 0 && this.warned.size === 0) return;
+    for (const id of this.frames.keys()) if (!aliveIds.has(id)) this.frames.delete(id);
+    // Deleting the current element while iterating a Set is well-defined — visited entries are
+    // unaffected and the iterator continues from the next one.
+    for (const key of this.warned) {
+      const id = orphan2DFallbackId(key);
+      if (id !== null && !aliveIds.has(id)) this.warned.delete(key);
+    }
+  }
 }

@@ -10,6 +10,8 @@ import { pushAction } from '../../undo/undoManager';
 import type { AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateAnimSetFile } from './persist';
+import { pendingAssetDoc } from '../pendingAssetDoc';
+import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 
 export function AnimSetAssetView({ path }: { path: string }) {
   const [data, setData] = useState<{ source?: string; clips?: AnimSetClipDef[] } | null>(null);
@@ -17,10 +19,19 @@ export function AnimSetAssetView({ path }: { path: string }) {
   dataRef.current = data;
 
   useEffect(() => {
+    // ⚠️ A parked (unsaved) edit is NOT on disk (#831), so fetching the file here would re-seed
+    // the panel — and, through the refresher, the live cache — with the PRE-edit document while
+    // the registry still holds the newer one. The panel then shows a document that disagrees with
+    // what Cmd+S would write, which `pendingAssetDoc`'s docblock calls the worst of the three
+    // states; it has been filed three times already (QA-CTX-0008 and two more). Ask the registry
+    // first, exactly as the five asset EDITORS do, and fall back to the file when nothing pends.
+    const parked = pendingAssetDoc(path, 'animset');
+    if (parked) { setData(parked as { source?: string; clips?: AnimSetClipDef[] }); return; }
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
-      .then(r => r.ok ? r.json() : null)
-      .then(setData)
+      .then(r => parseAssetJson(r, path))
+      .catch(e => { if (isMissingAsset(e)) return null; throw e; })
+      .then((data) => setData(data as { source?: string; clips?: AnimSetClipDef[] } | null))
       .catch(e => { if (e.name !== 'AbortError') setData(null); });
     return () => ac.abort();
   }, [path]);
@@ -29,12 +40,12 @@ export function AnimSetAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: typeof data, label: string) => {
     const old = dataRef.current;
     if (!old || !updated) return;
-    persistAssetEdit(path, updated, invalidateAnimSetFile);
+    persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile);
     pushAction({
-      _isFileDirect: true, // already on disk (persistAssetEdit) — see MaterialAssetView for why
+      _isFileDirect: true, // parked, not scene state (persistAssetEdit) — see MaterialAssetView for why
       label,
-      undo: () => persistAssetEdit(path, old, invalidateAnimSetFile),
-      redo: () => persistAssetEdit(path, updated, invalidateAnimSetFile),
+      undo: () => persistAssetEdit(path, 'animset', old, invalidateAnimSetFile),
+      redo: () => persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile),
     });
   }, [path]);
 
@@ -62,13 +73,13 @@ export function AnimSetAssetView({ path }: { path: string }) {
         <div key={clip.name + i} style={{ borderTop: '1px solid #333', paddingTop: 6, marginTop: 6 }}>
           <div style={{ color: '#ddd', fontSize: '11px', fontWeight: 'bold', marginBottom: 2 }}>{clip.name}</div>
           <NumberField label="Speed" value={clip.speed ?? 1} step={0.1} wide
-            onChange={v => writeClipField(i, 'speed', v)} />
+            onChange={v => writeClipField(i, 'speed', v)} dataUiId={`assetView.animSet.clip.${i}.speed`} />
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
             <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Loop</span>
             <input type="checkbox" checked={clip.loop ?? true} onChange={e => writeClipField(i, 'loop', e.target.checked)} />
           </div>
           <NumberField label="Fade Duration" value={clip.fadeDuration ?? 0} step={0.05} wide
-            onChange={v => writeClipField(i, 'fadeDuration', Math.max(0, v))} />
+            onChange={v => writeClipField(i, 'fadeDuration', Math.max(0, v))} dataUiId={`assetView.animSet.clip.${i}.fadeDuration`} />
         </div>
       ))}
     </>

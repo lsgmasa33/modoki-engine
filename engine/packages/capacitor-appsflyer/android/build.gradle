@@ -1,0 +1,60 @@
+ext {
+    junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
+    androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.7.1'
+    appsflyerSdkVersion = project.hasProperty('appsflyerSdkVersion') ? rootProject.ext.appsflyerSdkVersion : '7.0.1'
+    playServicesAdsIdentifierVersion = project.hasProperty('playServicesAdsIdentifierVersion') ? rootProject.ext.playServicesAdsIdentifierVersion : '18.3.0'
+}
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.0'
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = "com.modokiengine.capacitor.appsflyer"
+    compileSdk = project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 36
+    defaultConfig {
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+        targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 36
+        versionCode 1
+        versionName "1.0"
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation project(':capacitor-android')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "com.appsflyer:af-android-sdk:$appsflyerSdkVersion"
+
+    // GAID (Google Advertising ID) — Android's IDFA, and the SAME failure shape the iOS ATT
+    // work guards against. Without this, the SDK logs "[Advertising Id] Google Play Services is
+    // missing com.google.android.gms.ads.identifier.AdvertisingIdClient", fetches no GAID, and
+    // falls back to weaker matching — so PAID installs attribute worse. Measured on a Galaxy S22
+    // 2026-08-19: the install postback still returned 200 OK and conversion data still resolved,
+    // which is exactly why its absence would have shipped unnoticed. The SDK does NOT pull this
+    // in itself; it is an optional dependency by design (Play-Services-free distribution).
+    implementation "com.google.android.gms:play-services-ads-identifier:$playServicesAdsIdentifierVersion"
+}

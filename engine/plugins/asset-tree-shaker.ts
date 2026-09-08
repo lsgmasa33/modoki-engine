@@ -19,8 +19,8 @@ import { MATERIAL_TEXTURE_SLOTS } from '../packages/modoki/src/runtime/assets/ma
 import { resolveTextureType } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
-import { parseAnimClipBank } from '../packages/modoki/src/runtime/animation/animClipBank';
-import { parseClipBank } from '../packages/modoki/src/runtime/audio/clipBank';
+import { parseAnimClipBankResult } from '../packages/modoki/src/runtime/animation/animClipBank';
+import { parseClipBankResult } from '../packages/modoki/src/runtime/audio/clipBank';
 import { entityGuid } from '../packages/modoki/src/runtime/scene/sceneMutate';
 
 /** UUID v4 shape — matches the runtime assetManifest GUID_RE. */
@@ -348,7 +348,15 @@ function pushRef(state: WalkState, type: string, value: unknown, referencedBy: R
  *  runtime manifest: JSON assets carry a top-level `id`; binary assets carry a
  *  `.meta.json` sidecar. Reuses readAssetGuid from the scanner so both pipelines
  *  read ids the same way. */
-function buildGuidIndex(roots: AssetRoot[], origin = new Map<string, GuidOrigin>()): Map<string, string> {
+function buildGuidIndex(
+  roots: AssetRoot[],
+  origin = new Map<string, GuidOrigin>(),
+  // No default here (unlike `origin` above) — both call sites already pass the SAME array their
+  // caller reads warnings back from (#731's own `state.warnings` channel); a default `[]` would be
+  // a throwaway a future caller could pass into silently, swallowing every parse warning this
+  // function raises exactly the fail-open shape #731 exists to close.
+  warnings: string[],
+): Map<string, string> {
   const index = new Map<string, string>();
   // Collected in the first pass, applied after: a packed atlas MEMBER's slice GUID is
   // redirected from its parent texture (mapped below) to the ATLAS file, so the ref
@@ -388,7 +396,18 @@ function buildGuidIndex(roots: AssetRoot[], origin = new Map<string, GuidOrigin>
     // so this works on a CLEAN build too — the frames don't exist until the atlas-shaker
     // packs, which only runs for atlases already in the keep-set.
     if (type === 'atlas') {
-      const src = (() => { try { return JSON.parse(fs.readFileSync(abs, 'utf-8')) as { members?: unknown[] }; } catch { return {}; } })();
+      // ⚠️ #731: an unparseable atlas file used to read back as "{} — no members", so every one
+      // of its members' GUIDs stayed unredirected and the atlas itself could be shaken out of the
+      // prod build with no signal — the same fail-open shape #714 fixed one level up. Warn on the
+      // shared `state.warnings` channel instead (same template every OTHER parse failure in this
+      // file already uses) and keep going with no members, exactly the previous fallback.
+      const src = (() => {
+        try { return JSON.parse(fs.readFileSync(abs, 'utf-8')) as { members?: unknown[] }; }
+        catch (e) {
+          warnings.push(`failed to parse atlas members: ${virtual} — ${e instanceof Error ? e.message : String(e)}`);
+          return {};
+        }
+      })();
       for (const m of src.members ?? []) {
         if (typeof m === 'string' && isGuid(m)) atlasMemberOverrides.push({ memberGuid: m, atlasVirtual: virtual });
       }
@@ -413,6 +432,7 @@ function buildGuidIndex(roots: AssetRoot[], origin = new Map<string, GuidOrigin>
  *  pushing the same value a second time. */
 const DEDICATED_REF_FIELDS = new Set([
   'UIElement.fontFamily',   // pushed as 'font-family' — also keeps the family's other variants
+  'UISettings.fontFamily',  // the scene-wide default (#803) — same GUID, so it must shake the SAME
 ]);
 
 function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, referencedBy: RefSource): void {
@@ -499,11 +519,34 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
 
   // ── Refs that are NOT a scalar guid field, so they can't live in the registry ──
 
-  // UIElement.fontFamily is a CSS family NAME, not an asset guid — resolved to
-  // physical font files at the end of the walk via the dedicated 'font-family' kind.
-  const ui = traits['UIElement'] as Record<string, unknown> | undefined;
-  if (ui && typeof ui === 'object') {
-    pushRef(state, 'font-family', ui.fontFamily, { ...referencedBy, trait: 'UIElement' }, 'fontFamily');
+  // A DOM font ref is a font-ASSET GUID (#231), but it cannot go through the generic registry
+  // loop above: that pushes the `'asset'` kind, which keeps only the ONE file the GUID names.
+  // The dedicated `'font-family'` kind resolves it to the family and keeps every VARIANT, so an
+  // authored `fontWeight: 700` gets the real Bold file instead of a browser-synthesized fake.
+  //
+  // Two fields carry one, and they must shake IDENTICALLY (#803): `UIElement.fontFamily` is the
+  // per-element override, `UISettings.fontFamily` the scene-wide default every UI root inherits.
+  // A scene can author only the latter — Court does — so a scene-wide font is reachable by no
+  // other trait field, and without this the walk cannot see it at all.
+  //
+  // ⚠️ That does NOT mean deleting `UISettings` here breaks Court's build today — and the reason
+  // is worth stating, because the obvious test of this line comes back green and the obvious
+  // explanation for that is wrong. `processSceneOrPrefab` also pushes `type:'font-family'` from
+  // the scene's SAVED `resources[]` array, and Court's carries the entry. That mask does NOT lift
+  // on the next save: `collectResourceRefsFromEntities` reads `UISettings.fontFamily` too (its own
+  // wiring in `sceneValidation.ts` + `loadSceneFile.ts`), so a save REGENERATES the same entry.
+  // For any scene the editor has saved, a shaker-only break is masked indefinitely.
+  //
+  // So what this line actually buys is narrower than "Court's font ships": it is the second,
+  // independent guard — the one that still holds when the COLLECTOR wiring is what broke, leaving
+  // no `resources[]` entry to fall back on — plus the variant-keeping behaviour above, which the
+  // `resources[]` path gets right only because it pushes the same `'font-family'` kind.
+  // `tests/plugins/assetTreeShaker.test.ts` pins it against a scene with no `resources[]` entry,
+  // which is that shape.
+  for (const traitName of ['UIElement', 'UISettings'] as const) {
+    const t = traits[traitName] as Record<string, unknown> | undefined;
+    if (!t || typeof t !== 'object') continue;
+    pushRef(state, 'font-family', t.fontFamily, { ...referencedBy, trait: traitName }, 'fontFamily');
   }
 
   // AnimationLibrary (P6) → shared cross-model clips: an ARRAY of .animset.json
@@ -522,8 +565,17 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
   if (uiEntries && typeof uiEntries === 'object' && typeof uiEntries.prefabs === 'string' && uiEntries.prefabs) {
     // Parsed inline rather than importing the engine's parseEntryPrefabs: this is a BUILD
     // plugin, and the same shape is already banked as JSON by Animator.clips / AudioSource.clips.
+    //
+    // ⚠️ #731: a malformed bank used to read back as `null` — indistinguishable from "no bank" —
+    // and silently skip every entry, which is exactly the outcome this comment block's own header
+    // warns about ("every pooled entry's prefab is shaken out … while dev looks perfect"). Warn on
+    // the shared `state.warnings` channel instead, matching every other parse failure in this file.
     let bank: unknown;
-    try { bank = JSON.parse(uiEntries.prefabs); } catch { bank = null; }
+    try { bank = JSON.parse(uiEntries.prefabs); }
+    catch (e) {
+      state.warnings.push(`failed to parse UIEntries prefab bank: ${referencedBy.virtual} — ${e instanceof Error ? e.message : String(e)}`);
+      bank = null;
+    }
     if (Array.isArray(bank)) {
       for (const k of bank) {
         const ref = (k as { prefab?: string } | null)?.prefab;
@@ -550,7 +602,12 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
   // prefab lacks) survives — probeTraitRefs is the only walker of override bags.
   const animator = traits['Animator'] as Record<string, unknown> | undefined;
   if (animator && typeof animator === 'object') {
-    for (const c of parseAnimClipBank(animator.clips)) pushRef(state, 'asset', c.clip, { ...referencedBy, trait: 'Animator' }, `clips[${c.name}]`);
+    // ⚠️ #731: parseAnimClipBank's own never-throws contract collapses "no bank" and "malformed
+    // bank" into the same `[]` — the Result variant tells them apart so a corrupt bank warns
+    // instead of silently shaking out every clip it named.
+    const { entries: animClips, malformed: animClipsMalformed } = parseAnimClipBankResult(animator.clips);
+    if (animClipsMalformed) state.warnings.push(`failed to parse Animator.clips bank: ${referencedBy.virtual} — malformed JSON`);
+    for (const c of animClips) pushRef(state, 'asset', c.clip, { ...referencedBy, trait: 'Animator' }, `clips[${c.name}]`);
   }
 
   // SkinnedMeshRenderer.materials (#237) — per-material-slot overrides: original material
@@ -585,7 +642,11 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
   // `audio.play` on any other key silently played nothing on device.
   const audioSource = traits['AudioSource'] as Record<string, unknown> | undefined;
   if (audioSource && typeof audioSource === 'object') {
-    for (const c of parseClipBank(audioSource.clips)) pushRef(state, 'asset', c.ref, { ...referencedBy, trait: 'AudioSource' }, `clips[${c.key}]`);
+    // ⚠️ #731: same fail-open shape as Animator.clips above — a malformed bank must not read as
+    // an empty, correctly-authored one.
+    const { entries: audioClips, malformed: audioClipsMalformed } = parseClipBankResult(audioSource.clips);
+    if (audioClipsMalformed) state.warnings.push(`failed to parse AudioSource.clips bank: ${referencedBy.virtual} — malformed JSON`);
+    for (const c of audioClips) pushRef(state, 'asset', c.ref, { ...referencedBy, trait: 'AudioSource' }, `clips[${c.key}]`);
   }
 }
 
@@ -1000,14 +1061,17 @@ export function computeKeptAssets(
   } = {},
 ): TreeShakeResult {
   const guidOrigin = opts.guidIndex?.origin ?? new Map<string, GuidOrigin>();
+  // Declared before `state` so `buildGuidIndex` (below, only when no index was handed in) can
+  // push straight into the SAME array `state.warnings` ends up holding (#731).
+  const warnings: string[] = [];
   const state: WalkState = {
     keep: new Set(),
     fontFamilies: new Set(),
     guidResolvedFamilies: new Set(),
     domFontPaths: new Set(),
-    warnings: [],
+    warnings,
     queue: [],
-    guidIndex: opts.guidIndex?.index ?? buildGuidIndex(roots, guidOrigin),
+    guidIndex: opts.guidIndex?.index ?? buildGuidIndex(roots, guidOrigin, warnings),
     guidOrigin,
     onRef: opts.onRef,
     onEntity: opts.onEntity,
@@ -1142,6 +1206,10 @@ export function computeKeptAssets(
     // reading real fixtures that they're pure ASCII grids (floor/ramp/zones layers, a spawn-chart
     // `rows` array) with no embedded asset refs — they ARE leaves today. If a future level format
     // ever embeds a guid, its walk branch goes here.
+    // Also deliberately includes 'animation' — WALKABLE_TYPES (above) omits it on purpose:
+    // AnimationClipDef holds only number/color/boolean/enum keys, no GUID-bearing field, so a
+    // `.anim.json` IS a leaf. Verified, not overlooked — if a future clip format adds a ref
+    // (e.g. an embedded material/texture), its walk branch goes here.
   }
 
   // Resolve font families → actual files.
@@ -1341,7 +1409,11 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
   const edges: RefEdge[] = [];
   const entities: GraphEntity[] = [];
   const guidOrigin = new Map<string, GuidOrigin>();
-  const guidIndex = buildGuidIndex(roots, guidOrigin);
+  // Built OUTSIDE computeKeptAssets here (handed in via `guidIndex` below), so any atlas-member
+  // parse warning it raises (#731) would otherwise miss `result.warnings` — collected separately
+  // and merged into the returned `warnings` below.
+  const guidWarnings: string[] = [];
+  const guidIndex = buildGuidIndex(roots, guidOrigin, guidWarnings);
 
   const result = computeKeptAssets(projectRoot, roots, {
     seedAllWalkable: true,
@@ -1367,7 +1439,7 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
       .filter(f => classify(f.virtual) !== 'meta')
       .map(f => f.virtual),
     seeds: [...new Set([...keepList, ...findSceneFiles(roots)])],
-    warnings: result.warnings,
+    warnings: [...guidWarnings, ...result.warnings],
   };
 }
 

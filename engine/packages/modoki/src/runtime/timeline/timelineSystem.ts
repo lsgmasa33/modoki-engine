@@ -54,7 +54,7 @@ import { beginDeform2DFrame } from '../animation/deform2DBuffers';
 import { resolveClipByName } from '../animation/animClipBank';
 import { animationAssetProvider } from '../animation/assetProviders';
 function getAnimationClip(ref: string) { return animationAssetProvider.get()?.getAnimationClip(ref) ?? null; }
-import type { TimelineDef, AnimationTrackDef, AnimationClipBlock, ControlTrackDef, ControlClipBlock } from './types';
+import type { TimelineDef, AnimationTrackDef, AnimationClipBlock, ControlTrackDef, ControlClipBlock, ActivationTrackDef } from './types';
 
 /** Scrub window (seconds) an IMPULSE particle control clip (no duration) is treated as "on" so a
  *  scrub onto it reveals the burst. Editor-preview affordance only — forward Play/preview fires the
@@ -85,6 +85,18 @@ function crossed(prev: number, cur: number, t: number, loop: boolean, duration: 
   if (loop && cur < prev) return (t > prev && t <= duration) || (t >= 0 && t <= cur);
   if (justStarted) return t >= prev && t <= cur;
   return t > prev && t <= cur;
+}
+
+/** Is `t` inside a clip's span — `[start, start+duration)`, or `[start, ∞)` for a duration-less
+ *  impulse clip? Matches how `previewControlAt` computes `end` for a PREFAB clip (its scrub twin),
+ *  so a mute reconcile and the scrub agree on what "inside" means (#446).
+ *
+ *  ⚠️ It does NOT match the scrub's PARTICLE `end`, which widens a duration-less clip to
+ *  `clip.start + PARTICLE_IMPULSE_SCRUB_S` so scrubbing onto a one-shot burst still reveals it.
+ *  That divergence is harmless only because the particle mute path additionally gates on
+ *  `duration !== undefined`; drop that gate and the two surfaces disagree again. */
+function insideClipSpan(t: number, clip: { start: number; duration?: number }): boolean {
+  return t >= clip.start && (clip.duration === undefined || t < clip.start + clip.duration);
 }
 
 /** The index of the clip block active at time `t` on an animation track: the last block whose
@@ -158,18 +170,62 @@ function scrubAnimator(entity: Entity, clipName: string, localT: number): void {
  *  animators are NOT scrubbed (v1); their clip is triggered on the boundary by the system. */
 export function applyTimelineState(world: World, rootId: number, def: TimelineDef, t: number, index?: EntityIndex): void {
   const idx = index ?? buildEntityIndex(world);
+
+  // Identifies THIS pass (one Director's timeline, this call) as an `_activationBase` owner — see
+  // that map's doc comment for why a captured base must be owned by the pass that captured it.
+  const rootEntity = idx.byId.get(rootId) as unknown as Entity | undefined;
+  const owner = `${rootId}:${rootEntity?.generation() ?? 0}:${def.id}`;
+
+  // PHASE 1 — SWEEP every activation track into a per-TARGET decision before anything is written
+  // (#452). Two hazards this closes:
+  //  - a base captured mid-loop from an entity another activation track already wrote this pass
+  //    (the sweep completes, and captures, before phase 2 writes a single `isActive`);
+  //  - track-order dependence for a doubly-targeted entity — an unmuted track must always win over
+  //    a muted one regardless of which appears first in `def.tracks`.
+  // `track` here tracks the LAST unmuted track seen for this target (last-track-wins, matching the
+  // pre-#452 single-unmuted-track behaviour), and is also what the self-deactivation warning below
+  // names.
+  interface ActivationDecision { hasUnmuted: boolean; desired: boolean; track: ActivationTrackDef; hasMuted: boolean }
+  const activationDecisions = new Map<number, ActivationDecision>(); // targetId -> decision
   for (const track of def.tracks) {
-    if (track.muted) continue;
+    if (track.type !== 'activation') continue;
     const targetId = resolveTrackTarget(idx, rootId, track.target);
     if (targetId === null) continue;
     const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
     if (!entity) continue;
-    if (track.type === 'animation') {
-      const clip = activeClipAt(track, t);
-      if (clip && clip.scrub !== false && entity.has(Animator)) scrubAnimator(entity, clip.clip, t - clip.start);
-    } else if (track.type === 'activation') {
-      const desired = track.spans.some((s) => t >= s.start && t < s.end);
-      const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    let decision = activationDecisions.get(targetId);
+    if (!decision) { decision = { hasUnmuted: false, desired: false, track, hasMuted: false }; activationDecisions.set(targetId, decision); }
+    if (track.muted) {
+      decision.hasMuted = true;
+      // A muted track never captures a base — it never DRIVES the entity, so it must never license
+      // a hand-back either (see _activationBase's doc comment: absent means "never captured", and
+      // a track authored muted:true from the start must stay absent forever, not capture-on-sight).
+    } else {
+      decision.hasUnmuted = true;
+      decision.desired = track.spans.some((s) => t >= s.start && t < s.end);
+      decision.track = track; // last unmuted track wins — matches today's single-unmuted-track semantics
+      // Capture the pre-timeline base the FIRST time this TARGET is driven by an UNMUTED track this
+      // sweep, before either this or any other activation track in `def.tracks` writes it — see
+      // _activationBase's doc comment for why this sweep-before-write ordering (and this pass's
+      // `owner`) is what makes the base authoritative.
+      if (cur) {
+        const key = activationBaseKey(targetId, entity.generation());
+        if (!_activationBase.has(key)) _activationBase.set(key, { value: cur.isActive === true, owner });
+      }
+    }
+  }
+
+  // PHASE 2 — APPLY: an unmuted track (if any) always wins for its target; only when NO unmuted
+  // activation track targets an entity does a muted one hand it back to its captured base.
+  for (const [targetId, decision] of activationDecisions) {
+    const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
+    if (!entity) continue;
+    const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    if (!cur) continue;
+    if (decision.hasUnmuted) {
+      const desired = decision.desired;
+      const track = decision.track;
       // SELF-DEACTIVATION IS A ONE-WAY DOOR — say so, loudly, once. An activation track whose
       // target resolves to its OWN Director root (target "" is the root) switches the Director's
       // entity off; a deactivated entity FREEZES its Director (see timelineSystem's PASS 1), so
@@ -179,8 +235,24 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
       // activation tracks mean something different depending on who they point at. But a SILENT
       // soft-lock is exactly the failure class this subsystem keeps getting bitten by, so it is
       // reported instead. Author the track against the object being shown/hidden, not the Director.
-      if (cur && cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(rootId)) {
-        _warnedSelfDeact.add(rootId);
+      //
+      // ⚠️ #452 CHANGED WHEN THIS FIRES, deliberately (owner, 2026-08-30). It is now evaluated ONCE
+      // per target against the WINNING `desired` — the last unmuted track — instead of once per
+      // track. Where two unmuted tracks both target the Director root and an earlier one says OFF
+      // while a later one says ON, HEAD warned and this does not: the entity never actually ends up
+      // deactivated there, so that warning was a false alarm about a freeze that never happened.
+      // The warning now fires exactly when the soft-lock really occurs, and `track` names the track
+      // that produced the winning `desired`. Kept noisy-when-real over noisy-always on purpose — a
+      // warning that cries wolf is a warning that gets ignored.
+      // `?? '?'` is a SENTINEL, not a real fallback: this branch is currently UNREACHABLE — by the
+      // time `targetId === rootId` is true here, phase 1 already required `idx.byId.get(rootId)`
+      // to be live to set `decision.hasUnmuted`, and `rootEntity` above is that same lookup, so the
+      // `?.generation()` miss can't actually happen. `0` would be a real generation value, so if a
+      // future change ever made this reachable, a plain `?? 0` would silently alias a genuine
+      // generation-0 entity under this key; `'?'` cannot collide with any real generation.
+      const selfDeactKey = `${rootId}:${rootEntity?.generation() ?? '?'}`;
+      if (cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(selfDeactKey)) {
+        _warnedSelfDeact.add(selfDeactKey);
         console.warn(
           `[timeline] activation track "${track.name}" targets its OWN Director (entity ${rootId}) and is ` +
           `switching it OFF at t=${t.toFixed(3)}. A deactivated entity freezes its Director, so this ` +
@@ -189,8 +261,42 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
         );
         emit('@timeline-selfdeact', { director: rootId, track: track.name, t });
       }
-      if (cur && cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
+      if (cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
+    } else if (decision.hasMuted) {
+      // MUTED HAND-BACK (#452): a muted activation track must not freeze the entity at whatever it
+      // last wrote — hand it back to the base captured in phase 1, completing #446's "a muted track
+      // contributes nothing" contract for this track kind. Absent = never captured, deliberately
+      // distinct from a captured `false` (mirrors `_trackMuted`'s absent/false distinction) — a
+      // track authored `muted:true` from the start never drove the entity, so there is nothing to
+      // hand back and this does nothing.
+      const key = activationBaseKey(targetId, entity.generation());
+      const base = _activationBase.get(key);
+      // OWNERSHIP GUARD: only the pass that CAPTURED this base may hand it back. Without this, a
+      // muted track on Director B could restore a base an UNMUTED track on Director A is actively
+      // driving — a base is per-target, but two Directors can target the same entity, and B muting
+      // must not reach into A's territory. A non-owner leaves the entry alone (does NOT delete it)
+      // so the actual owner still finds it on its own pass this frame or the next.
+      if (base !== undefined && base.owner === owner) {
+        if (cur.isActive !== base.value) entity.set(EntityAttributes, { ...cur, isActive: base.value });
+        _activationBase.delete(key); // bounded map; a later unmute re-captures from the restored value.
+        // ⚠️ NOT bounded against every leak: a track that RETARGETS mid-playback, or whose target is
+        // destroyed and never respawned, leaves ITS entry alive (and the former target un-restored)
+        // until the next `onWorldSwap`/`clearPreviewControls` sweep clears the whole map. Not fixed
+        // here — see the review note on #452.
+      }
     }
+  }
+
+  // Animation tracks: unrelated to activation, kept as their own pass (a keyframe pose has no
+  // stored "base" to restore, so a muted animation track stays a blanket skip).
+  for (const track of def.tracks) {
+    if (track.type !== 'animation' || track.muted) continue;
+    const targetId = resolveTrackTarget(idx, rootId, track.target);
+    if (targetId === null) continue;
+    const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
+    if (!entity) continue;
+    const clip = activeClipAt(track, t);
+    if (clip && clip.scrub !== false && entity.has(Animator)) scrubAnimator(entity, clip.clip, t - clip.start);
   }
 }
 
@@ -349,6 +455,7 @@ export function previewControlAt(world: World, rootId: number, def: TimelineDef,
 export function clearPreviewControls(): void {
   for (const [key, id] of listControlSpawns()) { deleteEntity(id); deleteControlSpawn(key); }
   resetScrubParticleReflect(); // drop scrub particle-span on/off memory on teardown
+  _trackMutedEpoch++; _trackMuted.clear(); _activationBase.clear();  // drop the mute-transition memos too (#446, #452)
 }
 
 // ── Control track (prefab spawn/despawn) ──────────────────────────────────────────────────────
@@ -410,14 +517,30 @@ function controlParticle(world: World, director: Entity, targetId: number, actio
  *  cycles; an activation track switching off its own Director). Both would otherwise log every
  *  frame — an editor scrub drags across the same boundary dozens of times a second.
  *
- *  ⚠️ These are keyed by ENTITY ID, which is world-local and REASSIGNED on every scene load, so
- *  they MUST NOT survive a world swap: a stale id would silently suppress a genuine warning for
- *  an unrelated entity in the next scene — a warn-once that degrades into a warn-never, which is
- *  precisely the silent-failure class this system keeps getting bitten by. (Measured: a second
- *  test world reusing id 1 got no warning at all.) Hence the `onWorldSwap` reset below, mirroring
- *  `controlSpawnRegistry`. */
-const _warnedSubCycle = new Set<number>();
-const _warnedSelfDeact = new Set<number>();
+ *  Keyed `${id}:${generation()}` (#738), not id alone — an id-only key carries the SAME hazard
+ *  `trackMuteKey` documents below, one step worse: koota's free list is LIFO, so a despawn+respawn
+ *  within one world hands a new, unrelated entity the dead one's id, and an id-only warn-once
+ *  would silently suppress that newcomer's genuine warning forever. `generation()` closes that
+ *  WITHIN-world hole — for 255 recycles of an id; koota's generation is 8-bit and wraps.
+ *
+ *  ⚠️ These are ALSO world-local — a fresh world restarts both id and generation from zero, so
+ *  `id 2 / gen 0` in a second world would otherwise collide with the first. Generation does NOT
+ *  make the `onWorldSwap` reset below redundant — it closes the ACROSS-world hole that generation
+ *  cannot (the same pairing as `_trackMuted` + `_trackMutedEpoch`). (Measured pre-generation: a
+ *  second test world reusing id 1 got no warning at all.) Hence both mechanisms, mirroring
+ *  `controlSpawnRegistry`.
+ *
+ *  ⚠️ NEITHER warn site below is DEV-gated (unlike `materialInstanceSystem`'s `_noBaseWarned` &
+ *  co.) — these two log in every build. Keying them on generation is therefore a SHIPPED BEHAVIOUR
+ *  change, not just a test fix: before #738 a foot-gun warned once per (world-local) id, so
+ *  respawning the SAME prefab onto a recycled id suppressed the warning after the first spawn; now
+ *  it warns once per (id, generation) — i.e. once per spawned INSTANCE. A game spawning a Director
+ *  prefab per VFX instance with a self-deactivating activation track (or a sub-director
+ *  cycle/self-reference) now warns once per spawn instead of once per id. This is the intended
+ *  trade-off (a real per-instance authoring mistake should not go silent after the id's first
+ *  occupant), but it was not written down before, so it is here now. */
+const _warnedSubCycle = new Set<string>();
+const _warnedSelfDeact = new Set<string>();
 
 /** Drop the warn-once bookkeeping (scene swap / test teardown) — see the note above. */
 export function clearTimelineWarnings(): void {
@@ -425,6 +548,93 @@ export function clearTimelineWarnings(): void {
   _warnedSelfDeact.clear();
 }
 onWorldSwap(() => clearTimelineWarnings());
+
+/** Per (timeline asset, director instance, track) mute state as of the PREVIOUS frame, so
+ *  `applyDirectorFrame` can detect the mute FLIP — muting is not a time edge, so `crossed()`
+ *  cannot express it and the flip itself is the event that turns a stateful track's effect
+ *  off (#446).
+ *
+ *  Absent = never seen, deliberately DISTINCT from `false`: a track authored muted from the start
+ *  must not be read as "just muted" on its first frame and fire an off-edge for something that
+ *  was never on. **That invariant is only as good as the key**, and two within-scene routes broke
+ *  an earlier `${rootId}:${trackId}` version of it (both measured, review of #446):
+ *
+ *   - **Entity-id recycling.** koota reuses an id immediately, so a Director destroyed after one
+ *     unmuted frame left `2:vid -> false` behind, and a BRAND NEW Director spawning onto id 2 with
+ *     that track authored `muted:true` read it as a flip and paused a video it never started. No
+ *     world swap is involved, so the `onWorldSwap` reset below cannot cover it — the same hazard
+ *     the warn-once sets above now also carry generation to close (#738), one step worse here
+ *     since a mute-state read-back is wrong rather than merely under-warned. Hence `generation()`
+ *     in the key.
+ *   - **A timeline swap on one Director.** Reassigning `Director.timeline` from a def whose track
+ *     `vid` is unmuted to one whose `vid` is muted read as a flip for the same reason. Hence
+ *     `def.id` in the key — see `trackMuteKey` for why that is the asset GUID and emphatically
+ *     NOT the def object's identity.
+ *
+ *  ⚠️ The inner key still contains a world-local entity id, so the `onWorldSwap` reset stays. */
+const _trackMuted = new Map<string, boolean>();
+let _trackMutedEpoch = 0;   // bumped on world swap / preview teardown — see `trackMuteKey`
+onWorldSwap(() => { _trackMutedEpoch++; _trackMuted.clear(); _activationBase.clear(); });
+
+/** Key for {@link _trackMuted}, and every part of it is load-bearing:
+ *   - `epoch` — invalidates everything on a world swap / preview teardown without a walk.
+ *   - `rootId` + `generation()` — the id ALONE is recycled onto an unrelated entity within one
+ *     scene, which is how a new Director inherited the previous occupant's mute state.
+ *   - `def.id` — the timeline asset's stable GUID, NOT the def object's identity. An edit in the
+ *     Timeline panel (including the mute toggle itself) re-normalizes and REPLACES the def object,
+ *     so object identity would make every mute edit look like a first sighting and detect no flip
+ *     at all — measured: it broke all six behavioural tests. The GUID is stable across an edit and
+ *     differs across a genuine `Director.timeline` reassignment, which is the case that needs to
+ *     read as "never seen" rather than as a flip. */
+function trackMuteKey(p: Pending, trackId: string): string {
+  return `${_trackMutedEpoch}:${p.rootId}:${p.entity.generation()}:${p.def.id}:${trackId}`;
+}
+
+/** Per-TARGET-ENTITY authored `EntityAttributes.isActive`, captured before an UNMUTED activation
+ *  track writes it this pass, so muting can hand the entity BACK to it instead of freezing it at
+ *  whatever the track last wrote (#452) — completes #446's "muted contributes nothing" contract
+ *  for the activation track, which was skipped by #446's blanket mute guard.
+ *
+ *  Keyed by the TARGET, not the track: `EntityAttributes.isActive` is a property of the entity,
+ *  and more than one activation track (in one timeline, or even across two Directors) can target
+ *  the same entity. `applyTimelineState` sweeps every activation track into a per-target decision
+ *  BEFORE writing anything (see PHASE 1 there), which is what makes the captured value authoritative
+ *  — it is not that `isActive` has no other writer, it's that the capture always runs before the
+ *  first write in this pass. "Unmuted beats muted" holds WITHIN one timeline's tracks: an unmuted
+ *  activation track always wins for its target regardless of track order; only when NO unmuted
+ *  activation track (in THAT def) targets the entity does a muted one in that def hand it back.
+ *
+ *  ONLY an unmuted track ever captures — a track authored `muted:true` never drives the entity, so
+ *  it must never capture and must never hand back either. Absent therefore means "never captured
+ *  by any unmuted track", deliberately DISTINCT from a captured `false` (mirrors `_trackMuted`'s
+ *  absent/false distinction above).
+ *
+ *  `owner` records WHICH pass captured the value — `${rootId}:${rootGeneration}:${def.id}`, i.e.
+ *  one Director's one timeline. Only that owner may hand the base back (checked at the hand-back
+ *  site): two Directors can target the same entity's activation, and without this a MUTED track on
+ *  one Director could restore a base an UNMUTED track on the OTHER Director is actively driving —
+ *  contested activation across Directors is otherwise undefined (see the residual-ambiguity note at
+ *  the hand-back site), but a muted track reaching into a different Director's territory is not that
+ *  ambiguity, it is a bug (#452 round 3). A non-owner leaves the entry untouched rather than deleting
+ *  it, so the real owner still finds it.
+ *
+ *  Restored on mute (by the owner only), then DELETED — bounded map, and a later unmute re-captures
+ *  from the restored value. ⚠️ NOT bounded against every leak: see the hand-back site for the
+ *  retarget/destroyed-target case this doesn't cover.
+ *
+ *  Shares `_trackMutedEpoch` with `_trackMuted` (one epoch, one world-swap reset). */
+const _activationBase = new Map<string, { value: boolean; owner: string }>();
+
+/** Key for {@link _activationBase} — world epoch + the resolved target entity's id + generation.
+ *  Deliberately NOT `trackMuteKey`'s key (no root id, no def id, no track id): the base belongs to
+ *  the TARGET entity, not to any one track, which is what lets two activation tracks on the same
+ *  target share one captured value instead of the second one capturing the first one's write.
+ *  `generation()` guards the same id-recycling hazard `trackMuteKey` documents above, but on the
+ *  TARGET half of the key this time — a destroyed-and-respawned target recycling the id must not
+ *  inherit the previous occupant's base. */
+function activationBaseKey(targetId: number, targetGeneration: number): string {
+  return `${_trackMutedEpoch}:${targetId}:${targetGeneration}`;
+}
 
 /** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable
  *  once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a stable,
@@ -493,7 +703,17 @@ function driveSubdirector(
   // A director can't be its own sub-director (target "" / itself): recursing would rewind its own
   // playhead via the read-back below. Guard both self and any A→…→A chain already on the stack.
   if (childId === p.rootId || visited.has(childId)) {
-    if (!_warnedSubCycle.has(childId)) { _warnedSubCycle.add(childId); console.warn(`[timeline] sub-director cycle/self-reference at entity ${childId} — skipping to avoid infinite recursion`); }
+    // Look the entity up here (rather than reuse the `child` lookup below, which never runs on
+    // this early-return path) so the warn-once key can carry its generation — see _warnedSubCycle.
+    const cycleEntity = index.byId.get(childId) as unknown as Entity | undefined;
+    // `?? '?'` is a SENTINEL, not a real fallback: this branch is currently UNREACHABLE — `childId`
+    // here is either `p.rootId` (the Director already driving this pass, so live by construction)
+    // or an id already in `visited` (added only for an entity this same walk already found live),
+    // so `cycleEntity` can't actually be undefined. `0` would be a real generation value, so if a
+    // future change ever made this reachable, a plain `?? 0` would silently alias a genuine
+    // generation-0 entity under this key; `'?'` cannot collide with any real generation.
+    const subCycleKey = `${childId}:${cycleEntity?.generation() ?? '?'}`;
+    if (!_warnedSubCycle.has(subCycleKey)) { _warnedSubCycle.add(subCycleKey); console.warn(`[timeline] sub-director cycle/self-reference at entity ${childId} — skipping to avoid infinite recursion`); }
     return;
   }
   const child = index.byId.get(childId) as unknown as Entity | undefined;
@@ -594,9 +814,19 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
   if (p.justStarted) routeSequence(world, p.entity, 'start');
   opts.poseFor(p.rootId, p.def, p.cur);
   for (const track of p.def.tracks) {
-    if (track.muted) continue;
+    // Detect the mute FLIP for this track (see `_trackMuted`'s doc comment) — muting is not a time
+    // edge, so `crossed()` can't express it; the flip itself is the event a stateful track (control,
+    // video) needs to turn its effect off immediately, matching the editor scrub (#446).
+    const trackKey = trackMuteKey(p, track.id);
+    const prevMuted = _trackMuted.get(trackKey);
+    const justMuted = track.muted === true && prevMuted === false;
+    const justUnmuted = !track.muted && prevMuted === true;
+    _trackMuted.set(trackKey, track.muted === true);
     switch (track.type) {
       case 'signal': {
+        // STATELESS impulse (a marker dispatch) — nothing to turn off, so a mute has no off-edge
+        // and an unmute has no catch-up. Keep the blanket skip.
+        if (track.muted) break;
         // Resolve the track's OWN target (relative name-path from the Director root) —
         // same as every other track kind. A bare dispatch to p.entity (the Director) would
         // silently ignore `track.target`, so a signal aimed at a descendant (e.g. a UI label)
@@ -613,6 +843,9 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         break;
       }
       case 'audio':
+        // STATELESS impulse (a one-shot cue) — same reasoning as signal above: no off-edge, no
+        // unmute catch-up.
+        if (track.muted) break;
         for (const c of track.cues) {
           if (crossed(p.prev, p.cur, c.t, p.loop, p.duration, p.justStarted, p.advanced)) {
             cueClip(c.clip, { bus: c.bus as 'master' | 'music' | 'sfx' | 'ui' | undefined, volume: c.volume, pitch: c.pitch }, world);
@@ -621,6 +854,9 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         }
         break;
       case 'animation': {
+        // STATELESS trigger (`engine.playClip` is a one-shot cue, like audio) — no off-edge, no
+        // unmute catch-up.
+        if (track.muted) break;
         // Keyframe Animators are posed by pose(); skeletal/sprite are triggered here (Play) or
         // seeked by pose() (preview → skeletalTrigger false, skip).
         if (!opts.skeletalTrigger) break;
@@ -649,16 +885,53 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         for (let ci = 0; ci < track.clips.length; ci++) {
           const clip = track.clips[ci];
           if (clip.subdirector) {
+            // Muting a subdirector clip means the PARENT stops driving the child (docs/timeline.md
+            // :152) — the child then runs on its own clock instead of freezing. This is existing,
+            // documented behaviour, unrelated to the new muted handling below: preserve it as-is.
+            if (track.muted) continue;
             if (opts.driveSubdirectors) driveSubdirector(world, p, index, opts, track, clip, visited, driven);
             continue;
           }
           const key = `${p.rootId}:${track.id}:${ci}`;
+          // Computed BEFORE the unmute reconcile below, which must not fire on top of the very
+          // edge it stands in for: an unmute landing exactly on `atStart` would otherwise run
+          // spawn → destroy → spawn in one frame, journaling `@control spawn` TWICE at the same
+          // tick with no despawn between. That breaks the journal's role as the deterministic
+          // verification trace and re-runs every side effect inside the prefab. (Reachable any
+          // time an author unmutes near a clip boundary, and on a looping Director every frame
+          // where `advanced >= duration` makes `crossed` true for everything.)
           const atStart = crossed(p.prev, p.cur, clip.start, p.loop, p.duration, p.justStarted, p.advanced);
           const atEnd = clip.duration !== undefined && crossed(p.prev, p.cur, clip.start + clip.duration, p.loop, p.duration, p.justStarted, p.advanced);
           if (clip.particle) {
+            // Only a clip WITH a duration has an off state — an impulse clip (no duration) never
+            // fires `atEnd` either, muted or not, so there is nothing for a mute to turn off.
+            if (track.muted) {
+              if (justMuted && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
+                controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+              }
+              continue; // skip this clip's normal edges while muted
+            }
+            if (justUnmuted && !atStart && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
+              controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
+            }
             if (atStart) controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
             if (atEnd) controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
           } else {
+            // Prefab clip — PRESENCE is the truth (controlSpawnRegistry already holds it), so the
+            // span test is only needed to keep the JOURNAL balanced: `controlDespawn` emits
+            // `@control despawn` on the edge whether or not anything was actually spawned (see its
+            // doc comment — that parity is what makes the journal a reliable headless trace even
+            // with an unloadable prefab), so a mute inside the span must journal the despawn even
+            // when nothing is present, or a `spawn` would sit in the trace with no partner.
+            if (track.muted) {
+              if (justMuted && (hasControlSpawn(key) || insideClipSpan(p.cur, clip))) {
+                controlDespawn(world, p.entity, key);
+              }
+              continue; // skip this clip's normal edges while muted
+            }
+            if (justUnmuted && !atStart && insideClipSpan(p.cur, clip) && !hasControlSpawn(key)) {
+              controlSpawn(world, p.entity, key, clip.prefab ?? '', parentId, `control:${dirRef}:${track.id}:${ci}`, clip.transform);
+            }
             if (atStart) controlSpawn(world, p.entity, key, clip.prefab ?? '', parentId, `control:${dirRef}:${track.id}:${ci}`, clip.transform);
             if (atEnd) controlDespawn(world, p.entity, key);
           }
@@ -678,6 +951,21 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         const entity = index.byId.get(targetId) as unknown as Entity | undefined;
         if (!entity) break;
         for (const clip of track.clips) {
+          if (track.muted) {
+            // Muting pauses immediately (#446), matching the editor scrub — same dispatch the end
+            // edge makes below. NO duration gate here, unlike the particle clip above: a
+            // duration-less VIDEO clip is not an impulse, it plays on to the media's own end, so
+            // it is exactly the clip shape a mute most needs to stop. `insideClipSpan` already
+            // reads a missing duration as `[start, ∞)`.
+            if (justMuted && insideClipSpan(p.cur, clip)) {
+              dispatchGameAction('video.pause', { target: entity });
+            }
+            continue; // skip this clip's normal edges while muted
+          }
+          // Deliberate asymmetry with the control track: on UNMUTE we do NOT restart the clip. A
+          // video is a playback with a POSITION, not a presence — restarting it mid-span would show
+          // the wrong part of the cutscene, and unlike the control track there's no scrub twin to
+          // disagree with (`previewControlAt` skips non-`control` tracks entirely).
           if (crossed(p.prev, p.cur, clip.start, p.loop, p.duration, p.justStarted, p.advanced)) {
             // Rewind BEFORE setting the clip. On a looping Director (or a re-entered span) the
             // element is mid-playback and `setClip` with the same GUID is a no-op in the video

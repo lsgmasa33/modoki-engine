@@ -14,7 +14,7 @@
  */
 
 import { ParticleContainer, Particle, Texture, Rectangle } from 'pixi.js';
-import type { RenderConfig, BlendMode } from './types';
+import { resolveTiles, type RenderConfig, type BlendMode } from './types';
 import type { ParticleOutputs } from './cpuSimulator';
 import { applyParticleOutputs, type ParticleMapOptions } from './pixiParticleMap';
 
@@ -25,6 +25,13 @@ export interface PixiParticleObject {
   outputs: ParticleOutputs;
   /** Sync `aliveCount` particles from `outputs` to the pool this frame. */
   commit(aliveCount: number): void;
+  /**
+   * Rewrite `aspect`/`anchor`/`offset` in place (#769) — no rebuild, no texture reload, no
+   * lost particles. Unlike the 3D backends there's no quad geometry to guard: `aspect`/
+   * `offset` are per-frame multipliers read out of the mapping options on the next `commit()`,
+   * and `anchor` is each pooled `Particle`'s own `anchorY` (set once here, not per frame).
+   */
+  setQuad(render: RenderConfig): void;
   dispose(): void;
 }
 
@@ -87,8 +94,8 @@ export function createPixiParticles(
   render: RenderConfig,
   opts: PixiParticleOptions = {},
 ): PixiParticleObject {
-  const tilesX = Math.max(1, Math.floor(opts.tilesX ?? 1));
-  const tilesY = Math.max(1, Math.floor(opts.tilesY ?? 1));
+  const tilesX = resolveTiles(opts.tilesX);
+  const tilesY = resolveTiles(opts.tilesY);
   const hasFlipbook = !!opts.texture && (tilesX > 1 || tilesY > 1);
   const frames = hasFlipbook ? buildFrames(opts.texture!, tilesX, tilesY) : null;
   // The texture every particle starts with: frame 0 for a sheet, the whole texture for a single
@@ -142,6 +149,13 @@ export function createPixiParticles(
     outputs,
     commit(aliveCount: number) {
       prevAlive = applyParticleOutputs(pool, outputs, aliveCount, prevAlive, mapOpts);
+    },
+    setQuad(render: RenderConfig) {
+      mapOpts.aspect = render.aspect && render.aspect > 0 ? render.aspect : 1;
+      mapOpts.offsetX = render.offset?.[0] ?? 0;
+      mapOpts.offsetY = render.offset?.[1] ?? 0;
+      const anchorY = render.anchor === 'bottom' ? 1 : 0.5;
+      for (const p of pool) p.anchorY = anchorY;
     },
     dispose() {
       container.destroy();

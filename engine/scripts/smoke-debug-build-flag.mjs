@@ -39,8 +39,25 @@ const distDir = path.join(projectDir, 'dist');
  *  bridge's own wire protocol + module identity rather than from a variable name a minifier could
  *  rename — a marker that mangles is a marker that reports a false clean. */
 const MARKERS = [
-  'app-identity',   // a debug-bridge protocol message type
-  'GameDebug',      // the Capacitor plugin name the bridge calls through
+  'app-identity',        // a debug-bridge protocol message type
+  // 'GameDebug' USED to be a marker here and was retired — MEASURED (2026-09-03, two real
+  // `games/sling` builds) as a FALSE POSITIVE: it reported "1 hits LEAKED" with debugBuild:false,
+  // pointing at `engine/packages/modoki/src/runtime/rendering/deviceCaps.ts:128`, which reads
+  // `globalThis.Capacitor?.Plugins?.GameDebug?.getDeviceHardware()` off the GLOBAL for device-model
+  // quality tiering — deliberate and shipped in EVERY build, including web-only demos, since
+  // `1d9f73c86` (2026-08-07, "the iOS quality-tier allowlist could never fire — same dead-plugin
+  // read as #146"). A release build legitimately names the plugin to probe for it, so the string
+  // 'GameDebug' cannot discriminate a real leak from that probe — this gate had been red for ~a
+  // month for a reason unrelated to what it guards, and a permanently-red instrument can't tell a
+  // real leak from its own noise. ⚠️ Do not restore it.
+  '[debug-bridge]',      // the bridge's own log prefix (a string literal, so it can't be mangled) —
+                         // only bridge.ts emits it
+  'startServer',         // the plugin method only bridge.ts calls (engine/app/debug/bridge.ts:1167,
+                         // 1201) — the only other references are in runtime/debug/**, itself
+                         // debug-gated
+  '[console-capture]',  // #591's eager install — now in main.tsx's STATIC graph, not a lazy chunk,
+                         // so this is the one piece of the debug surface whose stripping is not
+                         // guaranteed by lazy-chunking alone; pin it to the same build-constant gate.
 ];
 
 if (!fs.existsSync(configPath)) {

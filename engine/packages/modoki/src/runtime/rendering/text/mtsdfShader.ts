@@ -194,11 +194,42 @@ export function makeMtsdfMaterial(
   const store = (mat as THREE.Material & { userData: MtsdfUserData }).userData;
   store.mtsdfUniforms = u;
   store.mtsdfShadowScale = new THREE.Vector2(atlasSize / atlasWidth, atlasSize / atlasHeight);
-  store.mtsdfAtlas = { size: atlasSize, distanceRange };
+  store.mtsdfAtlas = { size: atlasSize, distanceRange, width: atlasWidth, height: atlasHeight, hasTrueSdf };
+  store.mtsdfTexture = tex;
   return mat;
 }
 
-interface MtsdfUserData { mtsdfUniforms?: MtsdfUniforms; mtsdfShadowScale?: THREE.Vector2; mtsdfAtlas?: { size: number; distanceRange: number } }
+interface MtsdfUserData {
+  mtsdfUniforms?: MtsdfUniforms;
+  mtsdfShadowScale?: THREE.Vector2;
+  mtsdfAtlas?: { size: number; distanceRange: number; width: number; height: number; hasTrueSdf: boolean };
+  mtsdfTexture?: THREE.Texture;
+}
+
+/** Can `mat` be kept when the text's LAYOUT changed but the atlas did not (#692)? True only when
+ *  every input BAKED INTO THE NODE GRAPH is identical — the sampled texture (closed over by
+ *  `texNode`), the atlas dimensions/metrics, and `hasTrueSdf`, which is a build-time branch and
+ *  therefore not fixable by any uniform write. Style is deliberately NOT compared: `updateMtsdfStyle`
+ *  re-derives every style uniform, and `syncText3D` calls it for every page on every frame.
+ *
+ *  `mtsdfUniforms` is checked because it is what makes the material STYLEABLE: without it
+ *  `updateMtsdfStyle` returns early, so reusing such a material would freeze its style silently. */
+export function canReuseMtsdfMaterial(
+  mat: THREE.Material,
+  tex: THREE.Texture,
+  atlasWidth: number,
+  atlasHeight: number,
+  distanceRange: number,
+  atlasSize: number,
+  hasTrueSdf: boolean,
+): boolean {
+  const store = (mat as THREE.Material & { userData: MtsdfUserData }).userData;
+  const at = store.mtsdfAtlas;
+  return !!at && !!store.mtsdfUniforms && store.mtsdfTexture === tex
+    && at.width === atlasWidth && at.height === atlasHeight
+    && at.distanceRange === distanceRange && at.size === atlasSize
+    && at.hasTrueSdf === hasTrueSdf;
+}
 
 /** Update an existing material's style uniforms in place (renderer calls this when
  *  a Text trait's style fields change — no node-graph rebuild). */
