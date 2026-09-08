@@ -32,7 +32,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { binInAppDir, killPackaged } from './packagedAppPaths.mjs';
+import { binInAppDir, killPackaged, REAP_ERROR } from './packagedAppPaths.mjs';
 import { clonePort } from './clonePort.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -85,7 +85,16 @@ function freePort() {
 // leftover app instance, (2) pick a guaranteed-free port, (3) tell the app that port via
 // MODOKI_CDP_PORT — do NOT also pass --remote-debugging-port (the app appends it; a
 // duplicate/mismatched flag was the bug).
-killPackaged(app);
+// ⚠️ **Do not discard this outcome.** The reap exists because a leftover instance holds the CDP
+// port and Chromium then fails to bind it SILENTLY — so a reap that did not actually run is the
+// precise cause of the confusing failure this whole file exists to avoid, and it used to be
+// indistinguishable from "nothing was running" (#944/#959). REAP_ERROR is a warning, not a throw:
+// the leftover may not exist at all, in which case the probe below still succeeds and failing
+// here would be worse than the bug.
+if (killPackaged(app) === REAP_ERROR) {
+  console.warn('[csp] WARNING: the reap did not run — if the probe below fails to bind CDP, a '
+    + 'stale packaged instance is holding the port, not the app under test.');
+}
 await new Promise((r) => setTimeout(r, 1500)); // let the OS release the old CDP port
 const CDP_PORT = Number(process.env.CSP_CDP_PORT) || (await freePort());
 

@@ -186,6 +186,19 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
       + 'docCitations.test.ts\'s own DOC_CITATION_EXEMPT entry explains for its rule.',
   },
   {
+    file: 'engine/scripts/typecheck-projects.mjs', rule: 'ls-files',
+    reason: 'Change DETECTION, not corpus enumeration (#967). It spawns '
+      + `\`git ${LS_FILES_MARKER} --others --exclude-standard\` under a PATHSPEC to answer "is `
+      + 'there an untracked file under games/<id> or demos/<id>" — the one signal that makes a '
+      + 'brand-new, never-committed project visible to the scoped typecheck gate, which would '
+      + 'otherwise skip exactly the project most likely to be broken. The result is collapsed '
+      + 'immediately to a set of project DIRECTORIES; no file it returns is ever read or scanned, '
+      + 'so there is no second corpus definition here to drift from repoFiles(). repoFiles() could '
+      + 'answer it only as the difference between its includeUntracked true and false '
+      + 'enumerations — two whole-repo walks standing in for one pathspec-restricted query. Not '
+      + 'awaiting migration.',
+  },
+  {
     file: 'engine/tests/architecture/repoCorpus.test.ts', rule: 'ls-files',
     reason: 'The POSITIVE CONTROL in its nested-checkout test must spawn raw `git ls-files` to '
       + 'establish that git surfaces a nested checkout as a bare directory entry at all — that is '
@@ -200,6 +213,13 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
     file: 'engine/tests/electron/newProject.test.ts', rule: 'walker',
     reason: 'walk(target) walks an mkdtemp SCRATCH dir the test scaffolds into and deletes — '
       + 'ephemeral test output, not repo/tracked content at all.',
+  },
+  {
+    file: 'engine/tests/electron/scaffoldCliParity.test.ts', rule: 'walker',
+    reason: 'Same shape as newProject.test.ts above, for the same reason: tree() walks the two '
+      + 'mkdtemp SCRATCH dirs the CLI and the API scaffold into, to diff them against each other '
+      + '(#945 B2). Ephemeral test output, not repo/tracked content — repoFiles() enumerates '
+      + 'git-tracked-or-untracked-but-not-ignored files and so could never produce this corpus.',
   },
   /* -------------------------------------------------------------- Rule 2: genuinely neither — walks
    * build output, a cache, a packaged bundle, or scratch output, none of which are repo/tracked

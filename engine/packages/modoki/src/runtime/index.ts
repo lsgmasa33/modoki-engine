@@ -101,8 +101,8 @@ export {
   purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
   balanceOf as iapBalanceOf, productInfo as iapProductInfo,
   describeStoreError as iapDescribeStoreError,
-  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
-  type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
+  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend, isStoreCancelled,
+  type ConfigureIapOptions, type StoreBackend, type StoreCancelled, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
   type PurchaseOutcome, type PurchaseResult, type IapGrant,
 } from './iap';

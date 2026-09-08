@@ -93,6 +93,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, rotation: 0, scale: 1, overflow: 'visible', isVisible: true, pointerThrough: false,
     swallowClicks: false,
+    minTapSize: 0, minTapSizeUnit: 'px',
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
@@ -2315,5 +2316,121 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// ── minTapSize (#948) ──
+// Raise the area that RECEIVES a tap without moving the area that DRAWS. Court authors 16 icon
+// controls whose glyph is ~22.7pt against a 44pt finger, and the owner's constraint is that the
+// visual must not change — so the two boxes, which every other field on the trait moves together,
+// have to come apart. The expander is a transparent child; these tests pin that it appears only
+// when it can actually do something, and that it never disturbs the element's own box.
+describe('UINode minTapSize (#948)', () => {
+  /** The expander is the one child carrying an absolute `max(100%, …)` box. */
+  const tapZoneOf = (el: HTMLElement): HTMLElement | undefined =>
+    Array.from(el.children).find(
+      c => (c as HTMLElement).style.position === 'absolute'
+        && (c as HTMLElement).style.width.startsWith('max('),
+    ) as HTMLElement | undefined;
+
+  const clickable = { action: { bindings: [{ event: 'click', kind: 'call', action: 'x' }] } } as Partial<UINodeData>;
+
+  it('emits an expander sized max(100%, value) in BOTH axes', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    const zone = tapZoneOf(el);
+    expect(zone).toBeDefined();
+    expect(zone!.style.width).toBe('max(100%, 48px)');
+    expect(zone!.style.height).toBe('max(100%, 48px)');
+  });
+
+  // The whole constraint, in one assertion. If this ever fails the field has become a layout
+  // field, which is the thing padding/minWidth already do and the reason neither could be used.
+  it('does NOT touch the element\'s own box — no width, height, padding or margin moves', () => {
+    const base = renderNode(makeNode({ ...clickable, width: 34, height: 34, widthUnit: 'px', heightUnit: 'px' }));
+    const grown = renderNode(makeNode({ ...clickable, width: 34, height: 34, widthUnit: 'px', heightUnit: 'px', minTapSize: 48, minTapSizeUnit: 'px' }));
+    for (const prop of ['width', 'height', 'paddingTop', 'paddingLeft', 'paddingRight', 'paddingBottom', 'marginTop', 'marginLeft', 'marginRight', 'marginBottom', 'minWidth', 'minHeight'] as const) {
+      expect(grown.style[prop]).toBe(base.style[prop]);
+    }
+  });
+
+  // zIndex:-1 + isolation is what stops the expander eating clicks meant for this element's own
+  // text and children — inside the box the real content wins the hit test, and only outside it,
+  // where nothing else is, does the expander take the press.
+  it('sits at zIndex -1 inside an isolated stacking context', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)!.style.zIndex).toBe('-1');
+    expect(el.style.isolation).toBe('isolate');
+  });
+
+  it('resolves a viewport unit through the same --ui-* custom property as every other length', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 6, minTapSizeUnit: 'vmin' }));
+    expect(tapZoneOf(el)!.style.width).toBe('max(100%, calc(6 * var(--ui-vmin, 1vmin)))');
+  });
+
+  it('emits nothing at 0 — the default is the pre-existing behaviour', () => {
+    expect(tapZoneOf(renderNode(makeNode({ ...clickable, minTapSize: 0 })))).toBeUndefined();
+    expect(renderNode(makeNode({ ...clickable, minTapSize: 0 })).style.isolation).toBe('');
+  });
+
+  // An enlarged zone on a node that handles no click would start swallowing taps meant for
+  // whatever is behind it — so the field is deliberately inert there, not merely useless.
+  it('emits nothing on a node that takes no click, however large the value', () => {
+    expect(tapZoneOf(renderNode(makeNode({ minTapSize: 48, minTapSizeUnit: 'px' })))).toBeUndefined();
+  });
+
+  it('DOES emit on a swallowClicks node — it takes the press, so it owns a tap zone', () => {
+    expect(tapZoneOf(renderNode(makeNode({ swallowClicks: true, minTapSize: 48, minTapSizeUnit: 'px' })))).toBeDefined();
+  });
+
+  // The expander is a CHILD, so an element that clips its own overflow cuts the zone back to the
+  // box and the field silently does nothing. Warn rather than leave it inert-and-invisible.
+  // ⚠️ A DISTINCT guid per case, and it is load-bearing: the warning is once-per-entity, so
+  // reusing one guid makes the second case pass on the FIRST case's suppression and assert
+  // nothing. That is exactly how this test failed when it was first written.
+  it.each(['hidden', 'scroll'] as const)('warns and emits nothing under overflow: %s', overflow => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `clip-${overflow}`, overflow, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
+  });
+
+  it('warns ONCE per entity, not once per render', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({ ...clickable, guid: 'clip-repeat', overflow: 'hidden', minTapSize: 48, minTapSizeUnit: 'px' });
+    renderNode(node);
+    renderNode(node);
+    renderNode(node);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('minTapSize'))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  // ── close-out review finding 3 ──
+  // The expander is a CHILD, and three element types return before the container branches: an
+  // <input>/<input type=range> is a void element, and a UIToggle owns its inner layout. Court has
+  // three such controls under the 44pt floor already, so this is the inert case an author hits
+  // next — it must warn, and it must NOT leave a stacking context behind for nothing.
+  it.each(['input', 'range'] as const)('warns and emits nothing on elementType: %s', kind => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `host-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    expect(tapZoneOf(el)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
+  });
+
+  // ⚠️ The half that is easy to get wrong: an inert field that still creates a stacking context
+  // traps its descendants' zIndex for nothing. The guard has to run BEFORE isolation is set.
+  it.each(['input', 'range'] as const)('leaves NO stacking context behind on elementType: %s', kind => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `iso-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    expect(el.style.isolation).toBe('');
+    vi.restoreAllMocks();
+  });
+
+  it('does not warn under overflow: visible — the supported case must stay quiet', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    renderNode(makeNode({ ...clickable, overflow: 'visible', minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
   });
 });

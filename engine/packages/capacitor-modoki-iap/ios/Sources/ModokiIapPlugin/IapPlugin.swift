@@ -348,7 +348,13 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                 case .userCancelled:
                     probe.segment("B", "userCancelled")
                     // A normal outcome, never an error.
-                    call.resolve(["transaction": NSNull()])
+                    //
+                    // ⚠️ `cancelReason` is the RESULT constant, not a classified error, and the two
+                    // must stay distinguishable (#946). StoreKit RETURNING `.userCancelled` is the
+                    // one case where "the player cancelled" is unambiguous; a THROWN error that
+                    // merely looks like a cancel is the ambiguous one, and conflating them would
+                    // throw away the distinction this field exists to record.
+                    call.resolve(["transaction": NSNull(), "cancelReason": "storekit.result.userCancelled"])
                 case .pending:
                     // Ask-to-Buy awaiting a guardian: no transaction exists yet. It arrives later
                     // as a re-delivery that unfinished() reports. Distinguished from a cancel so
@@ -368,7 +374,23 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                 // report it as a failure — including to `purchase_failed` analytics, which the
                 // design says a cancel must never reach (#499).
                 if isCancellation(error) {
-                    call.resolve(["transaction": NSNull()])
+                    // ⚠️ **#946 — carry `classify(error)` out, do not discard it.** This is #499's
+                    // fix failing to generalise: that ticket added `classify`/`errorDetail` and
+                    // threaded them into the REJECT arm below, and this arm — the one where the
+                    // ambiguity actually lives — kept resolving a bare null. `classify` is already
+                    // computed a few lines up for the timing probe, so the identity was in hand at
+                    // the moment it was thrown away, and a purchase the player CONFIRMED came back
+                    // `cancelled` with nothing recorded able to say whether Apple cancelled it or
+                    // an ASD/AMS fault was misclassified as one. The two need opposite responses.
+                    //
+                    // ⚠️ Still a RESOLVE, and still outcome `cancelled` — the analytics split
+                    // (`purchase_cancelled`, never `purchase_failed`) is deliberate and unchanged.
+                    // This adds a field; it does not reclassify anything.
+                    call.resolve([
+                        "transaction": NSNull(),
+                        "cancelReason": classify(error),
+                        "storeError": errorDetail(error),
+                    ])
                     return
                 }
                 // Carry the domain, code and underlying chain through, because

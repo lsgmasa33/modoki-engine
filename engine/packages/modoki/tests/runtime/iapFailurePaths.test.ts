@@ -19,10 +19,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createTestWorld, journalEvents } from '../../src/runtime';
 import {
   configureIap, resetIap, purchase, reconcile, restorePurchases, refreshEntitlements,
   balanceOf, isEntitled, spend, productInfo,
-  type StoreBackend, type StoreTransaction, type IapLedgerStore, type IapProduct, type IapProductInfo,
+  type StoreBackend, type StoreCancelled, type StoreTransaction, type IapLedgerStore, type IapProduct, type IapProductInfo,
 } from '../../src/runtime/iap';
 import type { ConfigureIapOptions } from '../../src/runtime/iap/purchaseService';
 
@@ -43,8 +44,9 @@ class MemStore implements IapLedgerStore {
 /** A store whose every step can be made to fail — the thing the crash matrix's fake deliberately is not. */
 class FlakyStore implements StoreBackend {
   readonly available = true;
-  /** `null` = the player dismissed the sheet. */
-  purchaseResult: StoreTransaction | null = { transactionId: 'tx-1', productId: COINS.id };
+  /** `null` = the player dismissed the sheet with no reason given; a `StoreCancelled` = the same
+   *  outcome, with the platform's classification attached (#946). */
+  purchaseResult: StoreTransaction | StoreCancelled | null = { transactionId: 'tx-1', productId: COINS.id };
   purchaseThrows = false;
   acknowledgeThrows = false;
   finishThrows = false;
@@ -56,7 +58,7 @@ class FlakyStore implements StoreBackend {
   async products(ids: readonly string[]): Promise<IapProductInfo[]> {
     return ids.map((id) => ({ id, displayPrice: '¥1', title: id, description: '' }));
   }
-  async purchase(): Promise<StoreTransaction | null> {
+  async purchase(): Promise<StoreTransaction | StoreCancelled | null> {
     if (this.purchaseThrows) throw new Error('simulated store error');
     return this.purchaseResult;
   }
@@ -710,5 +712,85 @@ describe('a failure must name the RIGHT cause, not merely fail (#487, #499)', ()
     } finally {
       cap.restore();
     }
+  });
+});
+
+// ── #946: a cancel must be able to say WHICH cancel it was ──
+// A purchase the owner CONFIRMED on an iPhone 8 came back `cancelled`, and nothing recorded could
+// separate "Apple cancelled it" from "a sandbox/account fault was misclassified as a cancel" — an
+// ASD/AMS fault reports the same "Request Canceled" string a user cancel does. The two need
+// opposite responses, so the ambiguity WAS the defect. This is #499's fix generalised to the arm
+// where the ambiguity lives; that ticket only ever reached the reject path.
+describe('#946: the cancel reason', () => {
+  it('rides along on the result and the journal when the backend gives one', async () => {
+    store.purchaseResult = { cancelled: true, reason: 'ASDErrorDomain:509' };
+    const r = await purchase(COINS.id);
+    expect(r.outcome).toBe('cancelled');
+    expect(r.cancelReason).toBe('ASDErrorDomain:509');
+  });
+
+  // ⚠️ THE property. A named cancel and a bare null are ONE outcome — a plugin build predating the
+  // field still resolves null, and nothing may start behaving differently because a string arrived.
+  it('changes NOTHING else — a named cancel behaves exactly like a bare null', async () => {
+    store.purchaseResult = null;
+    const bare = await purchase(COINS.id);
+    const bareBalance = balanceOf(COINS.id);
+    launch();
+    store.purchaseResult = { cancelled: true, reason: 'storekit.userCancelled' };
+    const named = await purchase(COINS.id);
+    expect(named.outcome).toBe(bare.outcome);
+    expect(named.productId).toBe(bare.productId);
+    expect(balanceOf(COINS.id)).toBe(bareBalance);
+    expect(store.finished).toEqual([]);
+  });
+
+  // ── close-out review finding 1 ──
+  // `detail` was a producer with no consumer: capacitorStore built it, purchaseService read only
+  // `.reason`, and the `underlying` chain — which #499 added PRECISELY because a top-level
+  // domain/code does not separate an ASD fault from an AMS one — was dropped one line before the
+  // journal. Both fields are documented "log-only"; without this there was no log. The reject arm
+  // three lines away had always carried it, so this was the same failure-to-generalise one layer up.
+  //
+  // ⚠️ Asserts on the JOURNAL, not on the returned result. `PurchaseResult` never carried `detail`
+  // and is not supposed to — the journal is the only consumer, so a test reading the result would
+  // pass with the fix reverted.
+  it('carries `detail` to the JOURNAL, not just `reason` (close-out)', async () => {
+    const tw = createTestWorld();
+    try {
+      launch();
+      store.purchaseResult = {
+        cancelled: true,
+        reason: 'ASDErrorDomain:509',
+        detail: { domain: 'ASDErrorDomain', code: 509, underlying: { domain: 'AMSErrorDomain', code: 204 } },
+      };
+      await purchase(COINS.id);
+      const ev = journalEvents({ type: 'iap.purchase.cancelled' }, tw.world).at(-1);
+      expect(ev?.payload).toMatchObject({
+        productId: COINS.id,
+        reason: 'ASDErrorDomain:509',
+        detail: { underlying: { domain: 'AMSErrorDomain', code: 204 } },
+      });
+    } finally {
+      tw.dispose();
+    }
+  });
+
+  it('is ABSENT, not empty, when the backend gives none — a plugin predating the field', async () => {
+    store.purchaseResult = null;
+    expect((await purchase(COINS.id)).cancelReason).toBeUndefined();
+  });
+
+  it('never appears on a successful purchase', async () => {
+    store.purchaseResult = { transactionId: 'tx-1', productId: COINS.id };
+    expect((await purchase(COINS.id)).cancelReason).toBeUndefined();
+  });
+
+  // A cancel is resolved, never rejected — a thrown error is a FAILURE and must not be able to
+  // arrive wearing a cancel reason, or the funnel's cancelled/failed split stops meaning anything.
+  it('a thrown store error stays `failed` and carries no cancel reason', async () => {
+    store.purchaseThrows = true;
+    const r = await purchase(COINS.id);
+    expect(r.outcome).toBe('failed');
+    expect(r.cancelReason).toBeUndefined();
   });
 });

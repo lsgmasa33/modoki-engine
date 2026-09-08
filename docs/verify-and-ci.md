@@ -199,6 +199,92 @@ Windows measurement).
   looks clean** (an `exclude` inherited via `extends` beats a local `include`, compiling zero
   files and reporting a cheerful pass), which is why the guard checks coverage, not just errors.
 
+### The SCOPED per-project typecheck — `typecheck:projects` (#24, #967)
+
+`npm run typecheck` compiles ONE WIDE program: `engine/tsconfig.app.json` includes `app` plus ALL
+of `../games` and `../demos`. **A per-game web build does not** — `build-web.mjs` generates a
+SCOPED config holding `app` plus the one active project. So a project file can typecheck in the
+gate purely because a SIBLING project puts something in the shared program, and then fail the
+release build. That is #24. `npm run typecheck:projects` is the gate for it: it regenerates that
+same scoped shape (via `scopedTsconfig.mjs`, shared with `build-web.mjs` so the two cannot drift)
+and runs `tsc -p` per project.
+
+⚠️ **It used to run in exactly one place — the private `ci.yml` — so when that stopped being run
+it ran NOWHERE** (#967). No local gate called it, and the free public runner carries no `games/`
+at all, so #24's hole was open with nothing behind it. It is now a leg of `verify` (lane 2, after
+`typecheck`).
+
+**It checks the projects the branch TOUCHED, not all of them**, which is what makes it affordable:
+a full sweep on every `verify` would roughly triple an 82-86s gate. ⚠️ **The per-project and
+full-sweep timings live in ONE place — `engine/scripts/typecheck-projects.mjs`'s own header — along
+with the caveat that the project COUNT is a per-clone filesystem fact (this clone has 29
+directories; `git ls-files` knows 25) and must not be quoted as a repo fact.** Don't copy them
+here; that is how the ~110s `verify` figure above went stale.
+
+⚠️ **On `main` this leg roughly DOUBLES `verify`.** A clean checkout of `main` is the degenerate
+`merge-base === HEAD` case, which fails safe to a full sweep, so lane 2 becomes the pole there and
+the 82-86s wall-clock does not hold. Owner's call, taken deliberately (2026-09-08): a fresh clone
+that checks nothing and reports green is the failure this gate exists to prevent. The hub's normal
+path is the cheap one — right after `git merge origin/<branch>` the `--first-parent --no-merges`
+walk sees nothing, so the leg selects 0 projects.
+
+A
+typical worker branch selects 2. ⚠️ **The in-lane cost is stated in ONE place — the scoped leg's
+own comment in `engine/scripts/verify.mjs`** — because the in-lane figure and the standalone one
+differ by ~1.7x and quoting the wrong one understates the gate (I did exactly that in the first
+draft of this section). What matters here: it has not made lane 2 the pole in any measured run,
+lane 2's documented "~30s of slack" is a pre-#967 figure and the margin is thinner than it reads,
+and the run it was measured in had Court's suite in the app lane — the Court-excluded
+configuration has NOT been re-measured, so do not assume the leg is free there.
+
+Scoping it that way is *sound*, not merely cheap — the mask can only bite the project you touched:
+
+| What changed | Why the touched-only default still catches it |
+|---|---|
+| A project gains the offending import | Checking THAT project catches it — the real case |
+| The sibling DROPS the dep it was leaking | The WIDE program stops resolving too, so plain `npm run typecheck` goes red first |
+| A new project is added | It is "touched" by definition (the selection reads untracked files too) |
+| Engine `app/**` changes | Present in the wide program AND in every scoped one; already covered |
+
+The one thing that changes the scoped SHAPE for a project you did *not* touch is the scoping
+machinery itself, so touching `engine/tsconfig.app.json`, `scopedTsconfig.mjs`, `build-web.mjs` or
+`projectRoots.mjs` escalates to a full sweep.
+
+⚠️ **Selection FAILS TOWARD SWEEPING EVERYTHING.** No git, no `origin/main`, or a degenerate
+`merge-base === HEAD` range (true of any fresh checkout of `main`) all mean *cannot tell*, and
+that maps to `--all`. Same contract, and the same reasoning, as `courtTouched()` in
+`courtAuthored.mjs`: a detector that cannot answer must never be indistinguishable from one
+answering "nothing changed". The committed half of the diff is `--first-parent --no-merges`, so
+merging someone else's game work does not make the hub re-check it — CLAUDE.md's "merging is not
+re-testing AT THE HUB".
+
+⚠️ **A green run is not automatically coverage — read the `selection:` line it prints.** "0
+projects" is a legitimate and common result (a branch that touched no game), but it is also what a
+broken detector would print. `--list` prints the selection and checks nothing; `--all` (or
+`npm run typecheck:projects:all`, which `verify:all` and `ci.yml` use) forces the full sweep; a
+bare project name checks just that one, and an unknown name is a hard error rather than an empty
+green run.
+
+⚠️ **Exit 0 is not coverage, so the leg checks that each project actually contributed files.**
+`app` alone makes the scoped program non-empty, so `tsc` never raises TS18003 and a run that
+compiled NOTHING of the project would report PASS — the same "a config can be wrong in a way that
+looks clean" trap the section above describes. The leg therefore runs `--listFiles` and fails a
+project that contributed zero files *while git says it has TypeScript sources*; a project with no
+TypeScript at all (`games/agy`) reports `no TypeScript` rather than a hollow PASS.
+⚠️ **Widening `SCOPED_EXCLUDE` is NOT the way to trigger that** — measured 2026-09-08, it does not
+empty the program, because `tsc` still pulls a file in when an included file IMPORTS it, so an
+exclude only strips what nothing reaches. The include shape (`buildInclude()`) is the lever, which
+is why that file is in `MACHINERY_PATHS`.
+
+**Re-proving this leg can fail — and why the obvious probe no longer works.** #24's original
+symptom was `node:*` resolving repo-wide because some project pulled in `@types/node`. That shape
+**no longer reproduces**: `@types/node` now sits in the repo-root `node_modules`, which every
+scoped program can reach, so a game importing `node:path` passes both the wide and the scoped
+program. The difference between the two is now only *which project sources are in the program*, so
+a faithful probe has to be a cross-project source reference — declare an ambient global in one
+project's `.d.ts` and consume it from another. Verified 2026-09-08: wide exit 0, scoped exit 1
+with `TS2304: Cannot find name`.
+
 ## Coverage
 
 **`npm run coverage` runs BOTH suites and merges them — never quote one leg alone.** The repo's
@@ -219,10 +305,29 @@ Never trigger it yourself (`gh workflow run ci.yml`) unless asked — it is bill
 2026-07-31, and once exhausted every run failed in 3-12s with a budget error that MASKED a real
 test failure for a day. A gate that is silently off is worse than one that is deliberately off.
 
+⚠️ **As of 2026-09-08 it is not run at all** (owner). "Manual" has become "retired in practice",
+so do not describe it as a gate that exists — read the two paragraphs below for what that
+orphaned before assuming something is still covered.
+
 **So the local gate is now the ONLY gate: run `npm run verify` before every push** (typecheck +
-lint + app tests + engine tests). Nothing remote will catch what you skip. When the owner asks
-for a CI run, use `gh workflow run ci.yml --ref main` then `gh run watch <id>`, and **read BOTH
-legs** (or the `gh-ci` skill).
+scoped per-project typecheck + lint + app tests + engine tests). Nothing remote will catch what
+you skip. If the owner ever does ask for a CI run, use `gh workflow run ci.yml --ref main` then
+`gh run watch <id>`, and **read BOTH legs** (or the `gh-ci` skill).
+
+**What retiring it orphaned.** Every other step in that workflow (`typecheck`, `lint`, `npm test`,
+the engine suite) is `npm run verify` re-spelled, so only two things were lost:
+- **`typecheck:projects`** — the scoped per-project typecheck was reachable from nowhere else.
+  Fixed in #967 by making it a leg of `verify`; see the section above.
+- **Nothing else — and in particular NOT Windows.** ⚠️ It is tempting to conclude the Windows
+  matrix died with this workflow. It did not: `oss/.github/workflows/ci.yml` runs the same
+  `[ubuntu-latest, windows-latest]` matrix on the PUBLIC mirror, free and automatic on every push
+  to `main` (#96 — that file's header explains that Actions is unbilled on standard public-repo
+  runners, windows-latest included, so the leg that costs ~47 billed minutes privately is free
+  there). #847 is a `ci/main` run going red *on windows-latest*, i.e. direct evidence the leg
+  fires. The residual gap is narrow and specific: the public snapshot carries **no `games/`**, so
+  a game project's Windows behaviour — and `typecheck:projects`, which needs `games/` to have
+  anything to check — is gated on no runner anywhere, only on someone running `verify` on the
+  `win` clone ([windows.md](./windows.md)).
 
 CI (`.github/workflows/ci.yml`) runs on a **matrix of `ubuntu-latest` + `windows-latest`**
 (`fail-fast: false`; lint is Linux-only, being OS-invariant), so CI is strictly broader than any

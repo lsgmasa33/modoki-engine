@@ -32,6 +32,20 @@ import { handleBackendRequest, type BackendContext, type Manifest } from '../../
 
 let projectRoot = '';
 
+/** A renderer that answers the #889 unsaved-work probe and holds NOTHING.
+ *
+ *  ⚠️ `covers` is not decoration — `unsavedGate` treats a reply that omits it as a SKEWED renderer
+ *  and answers `unknown`, which refuses. That check is deliberate (a renderer that answers but does
+ *  not implement a registry the caller asked about is otherwise indistinguishable from a clean
+ *  one), so a stub standing in for "answers normally" has to send it. */
+const clearUnsavedReply = (params: unknown) => ({
+  ok: true,
+  holds: [],
+  discarded: [],
+  covers: (params as { registries?: string[] } | undefined)?.registries
+    ?? ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+});
+
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
     projectRoot,
@@ -41,7 +55,7 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     firstRootDir: () => null,
     getManifest: () => ({ version: 2, assets: [] }) as Manifest,
     rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
-    requestBrowser: async () => ({}),
+    requestBrowser: async (_op: string, params: unknown) => clearUnsavedReply(params),
     getSchema: () => undefined,
     markEditorWrite: () => {},
     ssrLoadModule: async () => ({}),

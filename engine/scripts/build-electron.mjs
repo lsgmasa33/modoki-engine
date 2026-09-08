@@ -8,6 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+// The MCP bundle's options live in a DECLARATION-ONLY module so the test that verifies the
+// shipped artifact can import them instead of restating them (#945 B1) — this file runs
+// esbuild at top level, so it cannot be imported for them.
+import { mcpDir, mcpOpts } from './mcpBuildOpts.mjs';
 
 const watch = process.argv.includes('--watch');
 
@@ -49,7 +53,6 @@ const opts = {
 // `files: engine/**/*` and unpacks via `asarUnpack: **/engine/**`; the "Connect
 // Claude Code" flow points the packaged .mcp.json at it. Dev is unaffected — it
 // keeps running src/index.ts through tsx.
-const mcpDir = path.resolve(electronDir, '..', 'tools', 'modoki-mcp');
 
 // The tool is deliberately NOT a root workspace, so NOTHING in the standard install
 // flow populates its node_modules — a fresh clone, a `npm ci --ignore-scripts` CI
@@ -65,18 +68,6 @@ if (!existsSync(mcpSdkMarker)) {
   console.log('[build-electron] modoki-mcp deps missing → npm install in engine/tools/modoki-mcp');
   execSync('npm install --no-audit --no-fund', { cwd: mcpDir, stdio: 'inherit' });
 }
-/** @type {import('esbuild').BuildOptions} */
-const mcpOpts = {
-  entryPoints: [path.join(mcpDir, 'src', 'index.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'esm',
-  target: 'node20',
-  outfile: path.join(mcpDir, 'dist', 'index.js'),
-  packages: 'bundle', // inline node_modules (not external) → zero runtime deps
-  sourcemap: true,
-  logLevel: 'info',
-};
 
 if (watch) {
   const ctx = await esbuild.context(opts);

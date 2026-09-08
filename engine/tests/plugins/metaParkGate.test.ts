@@ -41,18 +41,31 @@ let asked: Array<{ op: string; params: unknown }> = [];
 
 type RendererStub = (op: string, params: unknown) => unknown;
 
-/** The renderer answers normally, reporting exactly `parked` as parked. */
+/** The renderer answers normally, reporting exactly `parked` as held in `pendingMeta`.
+ *
+ *  ⚠️ Speaks the #889 `resolve-unsaved` shape — per-path/per-registry `holds` rows plus the
+ *  MANDATORY `covers`. A stub that omitted `covers` would be treated as a skewed renderer and
+ *  answer `unknown`, which is the behaviour that field exists to produce. */
 const rendererWithParks = (parked: string[]): RendererStub => (op, params) => {
-  if (op !== 'resolve-meta-park') return {};
-  const p = (params ?? {}) as { paths?: string[]; discard?: boolean };
-  const hit = (p.paths ?? []).filter((x) => parked.includes(x));
-  return { ok: true, parked: hit, discarded: p.discard ? hit : [] };
+  if (op !== 'resolve-unsaved') return {};
+  const p = (params ?? {}) as { paths?: string[]; registries?: string[]; discard?: string[] };
+  const covers = p.registries ?? ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+  // This stub models `pendingMeta` ONLY, which is what these four routes ask about — except
+  // duplicate-asset, which asks about all four and gets a truthful "nothing in the other three".
+  const hit = covers.includes('pendingMeta') ? (p.paths ?? []).filter((x) => parked.includes(x)) : [];
+  const holds = hit.map((path) => ({ path, registry: 'pendingMeta', detail: 'unsaved import settings' }));
+  return {
+    ok: true,
+    holds,
+    discarded: p.discard?.includes('pendingMeta') ? holds : [],
+    covers,
+  };
 };
 
 /** A SECOND page is connected that does not have the editor ops — the dev server's runtime route,
  *  a very ordinary thing to have open. `ws.send` broadcasts and the request registry is
  *  first-reply-wins, so this page can answer before the editor tab that actually holds the park. */
-const rendererWithoutEditorOps: RendererStub = () => { throw new Error("unknown agent op 'resolve-meta-park'"); };
+const rendererWithoutEditorOps: RendererStub = () => { throw new Error("unknown agent op 'resolve-unsaved'"); };
 
 /** The renderer is definitively GONE — Electron rejects synchronously when the window is closed,
  *  and the Vite host says the socket is not ready. Either way there is no registry to hold a park. */
@@ -132,8 +145,11 @@ describe('/api/write-meta — a park DESTROYED is a refusal (#872)', () => {
     // gone and nothing written (see the F5 cases below). The residual window the split reopens is
     // the opposite way round and strictly smaller: a park created between a SUCCESSFUL write and
     // the discard, and only when the caller explicitly asked to discard.
-    expect(asked.map((a) => [a.op, (a.params as { discard?: boolean }).discard]))
-      .toEqual([['resolve-meta-park', undefined], ['resolve-meta-park', true]]);
+    // ⚠️ The discard is now SCOPED to a registry list rather than a boolean (#889): a shared probe
+    // that took `discard: true` would let this route drop a dirty particle document it never asked
+    // about. `undefined` on the probe call, `['pendingMeta']` on the discard call.
+    expect(asked.map((a) => [a.op, (a.params as { discard?: string[] }).discard]))
+      .toEqual([['resolve-unsaved', undefined], ['resolve-unsaved', ['pendingMeta']]]);
   });
 
   it('ACCEPTS when nothing is parked, and does not ask to discard', async () => {
@@ -146,7 +162,9 @@ describe('/api/write-meta — a park DESTROYED is a refusal (#872)', () => {
     expect(res.body.discardedParked).toBeUndefined();
     expect(res.body.editorConnected).toBeUndefined();
     expect(readMeta().texture).toEqual({ maxSize: 512 });
-    expect(asked[0].params).toEqual({ paths: [ASSET] });
+    // ⚠️ SCOPED to the one registry this route can destroy (#889). Unscoped, a shared probe
+    // would refuse a sidecar write because an unrelated particle document is dirty.
+    expect(asked[0].params).toEqual({ paths: [ASSET], registries: ['pendingMeta'] });
   });
 });
 
@@ -233,7 +251,7 @@ describe('/api/reimport — a park merely UN-INCLUDED takes `force` (#882)', () 
     expect(res.body.bakedFromDisk).toEqual([ASSET]);
     expect(String(res.body.note)).toContain('PRE-EDIT');
     // Forcing must never DISCARD — the human's edit is untouched, merely not used.
-    expect((asked[0].params as { discard?: boolean }).discard).toBeUndefined();
+    expect((asked[0].params as { discard?: string[] }).discard).toBeUndefined();
   });
 
   it('ACCEPTS with no note when nothing is parked', async () => {
@@ -255,7 +273,7 @@ describe('/api/reimport — a park merely UN-INCLUDED takes `force` (#882)', () 
     const res = await post('/api/reimport', { path: '/', recursive: true },
       makeCtx(rendererWithParks(['/b.png']), manifest([{ path: '/a.png' }, { path: '/b.png' }])));
 
-    expect(asked[0].params).toEqual({ paths: ['/a.png', '/b.png'] });
+    expect(asked[0].params).toEqual({ paths: ['/a.png', '/b.png'], registries: ['pendingMeta'] });
     expect(res.body.code).toBe('REQUIRES_SAVE');
     expect(res.body.parked).toEqual(['/b.png']);
     expect(baked).toEqual([]);
@@ -278,7 +296,13 @@ describe('/api/duplicate-asset — the copy is seeded from the SOURCE file (#882
 
     await post('/api/duplicate-asset', { from: ASSET, to: '/copy.png' }, makeCtx(rendererWithParks([])));
 
-    expect(asked[0].params).toEqual({ paths: [ASSET] });
+    // ⚠️ ALL FOUR registries here, unlike the two sidecar routes: `duplicateAssetFile`'s
+    // `.json` branch copies the DOCUMENT, and `ext === '.json'` catches .scene.json too, so
+    // liveScene is load-bearing (#889 member 4).
+    expect(asked[0].params).toEqual({
+      paths: [ASSET],
+      registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+    });
   });
 
   it('force:true copies, and says the copy carries the pre-edit settings', async () => {
@@ -381,7 +405,7 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
       expect(res.status).toBe(500);
       // The ONE probe that ran must not have discarded anything.
       expect(asked).toHaveLength(1);
-      expect((asked[0].params as { discard?: boolean }).discard,
+      expect((asked[0].params as { discard?: string[] }).discard,
         'the probe must not discard — the discard call comes after a SUCCESSFUL write').toBeUndefined();
     } finally {
       fs.chmodSync(projectRoot, 0o755);
@@ -399,7 +423,139 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
     expect(res.body.ok).toBe(true);
     expect(res.body.discardedParked).toEqual([ASSET]);
     expect(readMeta().texture).toEqual({ maxSize: 512 });
-    expect(asked.map((a) => (a.params as { discard?: boolean }).discard)).toEqual([undefined, true]);
+    expect(asked.map((a) => (a.params as { discard?: string[] }).discard))
+      .toEqual([undefined, ['pendingMeta']]);
+  });
+
+  it('a write whose DISCARD then fails does NOT report a clean success', async () => {
+    // ⚠️ Found by review, and it is #872's exact defect wearing a success reply. The three
+    // disclosures on this route all branch on the FIRST gate, and the second (discard) call
+    // collapsed every non-`held` outcome — including a rejection — to `[]`. So: first probe says
+    // held, caller passes discardUnsaved:true, the write lands, the second probe times out or
+    // loses the first-reply-wins race to a second HMR client → `{ok:true, sha256}` with no
+    // `discardedParked` and no note. The human's park SURVIVED, and their next Cmd+S flushes the
+    // older document back over this write, reported as clean.
+    //
+    // `unknown` on the second call is the LIKELY branch, not the exotic one: the budget is 1500ms
+    // and a GLB parse or a shader compile eats it.
+    seed();
+    let call = 0;
+    const parkThenGoSilent: RendererStub = (op, params) => {
+      if (op !== 'resolve-unsaved') return {};
+      call += 1;
+      if (call === 1) return rendererWithParks([ASSET])(op, params);   // the probe: a park is here
+      throw new Error('timed out waiting for the renderer');            // the discard: unanswered
+    };
+
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(parkThenGoSilent));
+
+    expect(res.body.ok, 'the write DID land — this is a disclosure, not a refusal').toBe(true);
+    expect(readMeta().texture, 'and it really wrote').toEqual({ maxSize: 512 });
+    expect(res.body.discardedParked, 'nothing was confirmed discarded').toBeUndefined();
+    expect(res.body.discardUnconfirmed, 'the caller must be able to tell this apart from a clean run').toBe(true);
+    expect(String(res.body.note), 'and be told what it costs them')
+      .toMatch(/could NOT be discarded|may still be there|flush it back/i);
+  });
+
+  it('ACCEPT SIDE: a confirmed discard reports discardedParked and NOT discardUnconfirmed', async () => {
+    // ⚠️ Without this, the assertion above is satisfied by a route that flags every discard as
+    // unconfirmed — which would make the flag noise, and noise is read as absent.
+    seed();
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(rendererWithParks([ASSET])));
+
+    expect(res.body.discardedParked).toEqual([ASSET]);
+    expect('discardUnconfirmed' in res.body, 'absent, not false').toBe(false);
+  });
+
+  it('a discard whose second probe says CLEAR is not described as an unanswered renderer', async () => {
+    // ⚠️ Close-out review 2. One shared sentence covered every non-`held` outcome and said "the
+    // renderer did not confirm it (the renderer went away)" — for a probe that ANSWERED and a
+    // renderer that is still there. The real case: the human hits Cmd+S between the two probes, so
+    // the park is legitimately gone by the time the discard runs. Nothing is wrong, and the reply
+    // must not describe it as a failure.
+    seed();
+    let call = 0;
+    const parkThenClean: RendererStub = (op, params) => {
+      if (op !== 'resolve-unsaved') return {};
+      call += 1;
+      return call === 1 ? rendererWithParks([ASSET])(op, params) : rendererWithParks([])(op, params);
+    };
+
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(parkThenClean));
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.discardUnconfirmed, 'nothing was discarded, so the caller is told').toBe(true);
+    expect(String(res.body.note), 'but NOT told the renderer went away — it answered')
+      .not.toMatch(/did not answer|went away/i);
+    expect(String(res.body.note)).toMatch(/already gone|saved, or discarded it themselves/i);
+  });
+
+  it('a discard whose renderer went ABSENT is not told its park may survive', async () => {
+    // ⚠️ The sharper half of the same finding: the shared sentence said "the human's older parked
+    // document may still be there" on `absent` — which THIS ROUTE'S OWN `editorConnected` branch,
+    // five lines further down the same response, says is impossible ("a park is renderer-only
+    // state and there is no renderer"). A disclosure that contradicts its sibling branch teaches
+    // the reader the field is noise.
+    seed();
+    let call = 0;
+    const parkThenGone: RendererStub = (op, params) => {
+      if (op !== 'resolve-unsaved') return {};
+      call += 1;
+      if (call === 1) return rendererWithParks([ASSET])(op, params);
+      throw new Error('no editor renderer window');
+    };
+
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(parkThenGone));
+
+    expect(res.body.ok).toBe(true);
+    expect(String(res.body.note), 'the park went WITH the renderer — nothing stale survives')
+      .not.toMatch(/may still be there/i);
+    expect(String(res.body.note)).toMatch(/went with the renderer|nothing stale survives/i);
+  });
+
+  it('a `held` second probe that discarded NOTHING is not a confirmed discard', async () => {
+    // ⚠️ Latent today — the renderer computes `holds` before the discard and keys off that same
+    // list, so the two cannot disagree — but it is one `&&` from being the exact shape this flag
+    // exists to close: "the park is still there and I dropped none of it" reading as success.
+    seed();
+    let call = 0;
+    const parkThenDiscardNothing: RendererStub = (op, params) => {
+      if (op !== 'resolve-unsaved') return {};
+      call += 1;
+      const p = (params ?? {}) as { paths?: string[]; registries?: string[] };
+      const covers = p.registries ?? ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+      const holds = [{ path: ASSET, registry: 'pendingMeta', detail: 'unsaved import settings' }];
+      // Second call: still holding, and discarded NOTHING.
+      return { ok: true, holds, discarded: call === 1 ? [] : [], covers };
+    };
+
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(parkThenDiscardNothing));
+
+    expect(res.body.discardedParked, 'nothing came back discarded').toBeUndefined();
+    expect(res.body.discardUnconfirmed, 'so it must NOT read as a confirmed discard').toBe(true);
+  });
+
+  it('ACCEPT SIDE: nothing parked → no discard call, and no unconfirmed flag', async () => {
+    // The third path: `discardUnsaved:true` over a CLEAN editor must not invent a second probe or
+    // a warning about a discard that was never needed.
+    seed();
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } }, discardUnsaved: true,
+    }, makeCtx(rendererWithParks([])));
+
+    expect(res.body.ok).toBe(true);
+    expect('discardUnconfirmed' in res.body).toBe(false);
+    expect(asked, 'one probe, no discard call').toHaveLength(1);
   });
 
   it('F7 — the gate is keyed on the CANONICAL asset URL, not the raw request string', async () => {
@@ -431,5 +587,222 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
     expect(res.body.ok).toBe(true);
     expect(String(res.body.note)).toContain('FORCED past');
     expect(String(res.body.note)).toContain('not "there was none"');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// #889 B + C — the stale-READ half: a read never refuses, and never answers as if it had looked.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** A renderer holding one dirty asset document — the state neither read route could ever see. */
+const rendererHoldingDirtyAsset: RendererStub = (op, params) => {
+  if (op !== 'resolve-unsaved') return {};
+  const p = (params ?? {}) as { registries?: string[] };
+  const covers = p.registries ?? ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+  return {
+    ok: true,
+    holds: covers.includes('dirtyAsset')
+      ? [{ path: '/a.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' }]
+      : [],
+    discarded: [],
+    covers,
+  };
+};
+
+const get = (urlPath: string, ctx: BackendContext, query = new URLSearchParams()) =>
+  handleBackendRequest(ctx, { method: 'GET', urlPath, query, body: undefined }) as
+    Promise<{ status?: number; body: Record<string, unknown> }>;
+
+/** `computeUnused`/`computeRefEdges` are the route's inputs; the shaker itself is not under test
+ *  here, so they are stubbed to the smallest shape the routes read. */
+const withShaker = (renderer: RendererStub): BackendContext => ({
+  ...makeCtx(renderer),
+  computeUnused: () => ({ orphanDetails: [], stats: { scenes: 0 }, warnings: [] }),
+  // The minimum `buildRefGraph` reads. The shaker is not under test here — only whether the
+  // route discloses what it could not see.
+  computeRefEdges: () => ({
+    edges: [], entities: [], guidIndex: new Map(), guidOrigin: new Map(),
+    allFiles: [], seeds: [], warnings: [],
+  }),
+  isUnderOrSame: undefined,
+} as unknown as BackendContext);
+
+/** A renderer running an OLDER build: it answers, but implements fewer registries than the backend
+ *  asked about. It reports NOTHING held — truthfully, for the registries it knows. */
+const rendererSkewed: RendererStub = (op) => {
+  if (op !== 'resolve-unsaved') return {};
+  return { ok: true, holds: [], discarded: [], covers: ['pendingMeta'] };
+};
+
+/** A renderer that answers with no `covers` at all — the shape a hand-written or half-migrated
+ *  reply has. */
+const rendererNoCovers: RendererStub = (op) => {
+  if (op !== 'resolve-unsaved') return {};
+  return { ok: true, holds: [], discarded: [] };
+};
+
+describe('a SKEWED renderer is `unknown`, never "all clear" (#889)', () => {
+  // ⚠️ **This suite exists because a mutation check found the hole.** Deleting the `covers`
+  // comparison entirely left every other test in this file green: nothing exercised a renderer
+  // that answers WITHOUT covering what was asked, so the field I had called the skew guard was
+  // pinned by nothing. A version-skew reply reporting `holds: []` for the two registries it knows
+  // is indistinguishable from a clean editor unless somebody checks the list.
+  //
+  // The realistic path: a backend that asks about `liveScene` talking to a tab loaded before the
+  // op learned it. `unknown agent op` covers the OLD-op case; this covers the half-old one.
+  it('a renderer covering FEWER registries than asked refuses with NO_RENDERER', async () => {
+    seed();
+    // duplicate-asset asks for all four; this renderer implements only pendingMeta.
+    const res = await post('/api/duplicate-asset', { from: ASSET, to: '/copy.png' },
+      makeCtx(rendererSkewed));
+
+    expect(res.status, 'it could not look at three of the four — that is not "nothing is there"').toBe(503);
+    expect(res.body.code).toBe('NO_RENDERER');
+    expect(String(res.body.error), 'the reason has to name the skew, or the reader retries forever')
+      .toMatch(/did not cover|older build/i);
+    expect(fs.existsSync(path.join(projectRoot, 'copy.png')), 'and it copied nothing').toBe(false);
+  });
+
+  it('a reply with NO `covers` at all is `unknown` too', async () => {
+    seed();
+    const res = await post('/api/duplicate-asset', { from: ASSET, to: '/copy.png' },
+      makeCtx(rendererNoCovers));
+
+    expect(res.status).toBe(503);
+    expect(String(res.body.error)).toMatch(/covers/i);
+  });
+
+  it('ACCEPT SIDE: a renderer covering EXACTLY what was asked proceeds', async () => {
+    // ⚠️ Without this the two above are satisfied by a gate that refuses every reply, which would
+    // break every headless call in the repo. The scoped routes ask for one registry, and a
+    // renderer answering for that one must be enough.
+    seed();
+    const res = await post('/api/write-meta',
+      { path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } } },
+      makeCtx(rendererSkewed));
+
+    expect(res.status ?? 200, 'write-meta asks only for pendingMeta, which this renderer covers')
+      .toBe(200);
+  });
+
+  it('a stale-READ route discloses the skew rather than refusing', async () => {
+    // The read half of the same fact: unused-assets asks for all four, so a skewed renderer means
+    // its answer could not be checked — disclosed, not refused, per the consequence class.
+    const res = await get('/api/unused-assets', withShaker(rendererSkewed));
+
+    expect(res.status ?? 200).toBe(200);
+    expect(res.body.staleInputsUnknown).toBeDefined();
+    expect(String(res.body.staleInputsNote)).toMatch(/could NOT be checked|stale/i);
+  });
+});
+
+describe('/api/unused-assets DISCLOSES unsaved work rather than refusing (#889 B)', () => {
+  // ⚠️ THE HIGHEST-CONSEQUENCE MEMBER, and not the one #889 was filed about. This answer feeds
+  // CleanupAssetsDialog, which posts the selection to /api/delete-asset — so an asset referenced
+  // ONLY by an unsaved edit reads as an orphan and can be trashed.
+  //
+  // ⚠️ Disclose, do NOT refuse (owner, 2026-09-08). A read that refuses is worse than one that
+  // caveats: this route backs a human dialog, and refusing it is #872's Sprite-Editor regression
+  // one route over. §8's "lost or OMITTED" is what licenses the softer half — a read omits nothing
+  // if it says what it could not see.
+  it('still ANSWERS, and names what the answer was computed without', async () => {
+    const res = await get('/api/unused-assets', withShaker(rendererHoldingDirtyAsset));
+
+    expect(res.status ?? 200, 'a read must not refuse').toBe(200);
+    expect(res.body.orphans, 'the answer is still delivered').toBeDefined();
+    expect(res.body.staleInputs).toEqual([
+      { path: '/a.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' },
+    ]);
+    expect(String(res.body.staleInputsNote)).toMatch(/on DISK|does not reflect/);
+    expect(String(res.body.staleInputsNote), 'and the remedy').toMatch(/save/i);
+  });
+
+  it('ACCEPT SIDE: a clean editor gets NO disclosure field at all — not an empty one', async () => {
+    // ⚠️ The half that decides whether the disclosure means anything. `staleInputs: []` on every
+    // clean call is a field readers learn to skip, and then the call that matters is skipped too.
+    // Asserting ABSENCE rather than emptiness is the only way to catch an always-emitted field.
+    const res = await get('/api/unused-assets', withShaker(rendererWithParks([])));
+
+    expect(res.status ?? 200).toBe(200);
+    expect(res.body.orphans).toBeDefined();
+    expect('staleInputs' in res.body, 'absent, not []').toBe(false);
+    expect('staleInputsNote' in res.body).toBe(false);
+    expect('staleInputsUnknown' in res.body).toBe(false);
+  });
+
+  it('an UNANSWERABLE probe is disclosed too — "could not look" is not "nothing is there"', async () => {
+    // The §5 rule, on the read side. Collapsing this into the clean case would make a busy renderer
+    // indistinguishable from a clean one, which is the fail-open the whole gate exists to close.
+    const res = await get('/api/unused-assets', withShaker(rendererSilent));
+
+    expect(res.status ?? 200, 'still not a refusal').toBe(200);
+    expect(res.body.staleInputsUnknown).toBeDefined();
+    expect('staleInputs' in res.body, 'it could not look, so it names nothing specific').toBe(false);
+    expect(String(res.body.staleInputsNote)).toMatch(/could NOT be checked|may be computed from stale/);
+  });
+
+  it('a renderer that is definitively ABSENT gets no disclosure — there is nothing to hold', async () => {
+    // The other side of `unknown`: with no renderer, every registry is empty by construction, so a
+    // caveat here would be noise on every headless call.
+    const res = await get('/api/unused-assets', withShaker(rendererAbsent));
+    expect('staleInputs' in res.body).toBe(false);
+    expect('staleInputsUnknown' in res.body).toBe(false);
+  });
+});
+
+describe('the disclosure survives the branches that DROP an answer (#889 close-out review)', () => {
+  it('find-references 404 carries the disclosure — the branch where it is most load-bearing', () => {
+    // ⚠️ Found by review: `staleness` was awaited and then dropped on exactly this branch. An
+    // unresolvable target is very often unresolvable BECAUSE the thing exists only in unsaved
+    // state — an agent runs mutate_scene to create an entity, then asks what references that
+    // entity's guid, and the graph (built from disk) has never heard of it. Without the
+    // disclosure the reply is a bare 404 saying the guid is not an asset or entity guid, so the
+    // agent re-derives the guid or concludes its own mutation did not land.
+    //
+    // The branch's own comment two lines up says it refuses "precisely so that 'could not look'
+    // is never reported as 'nothing is there'" — and it was doing that for the target while
+    // staying silent about the unsaved state that explains it.
+    return get('/api/find-references', withShaker(rendererHoldingDirtyAsset),
+      new URLSearchParams({ target: 'no-such-guid' })).then((res) => {
+      expect(res.status, 'still a refusal — the disclosure does not soften it').toBe(404);
+      expect(res.body.error, 'and still says why the target did not resolve').toBeDefined();
+      expect(res.body.staleInputs, 'and now says what it could not see').toEqual([
+        { path: '/a.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' },
+      ]);
+    });
+  });
+
+  it('ACCEPT SIDE: a 404 on a CLEAN editor carries no disclosure', async () => {
+    const res = await get('/api/find-references', withShaker(rendererWithParks([])),
+      new URLSearchParams({ target: 'no-such-guid' }));
+    expect(res.status).toBe(404);
+    expect('staleInputs' in res.body).toBe(false);
+    expect('staleInputsNote' in res.body).toBe(false);
+  });
+
+  it('a 400 for a MISSING target carries none — that is a caller error, not a lookup', async () => {
+    // The deliberate asymmetry. Unsaved work cannot have affected a lookup that never happened,
+    // and a caveat here would train readers to skip the one on the 404.
+    const res = await get('/api/find-references', withShaker(rendererHoldingDirtyAsset),
+      new URLSearchParams());
+    expect(res.status).toBe(400);
+    expect('staleInputs' in res.body).toBe(false);
+  });
+});
+
+describe('/api/find-references DISCLOSES unsaved work (#889 C)', () => {
+  // Its own unresolvable-target branch already insists "'Could not look' is never reported as
+  // 'nothing is there'" — while a "0 references" verdict computed past a human's unsaved edit did
+  // exactly that, six lines below.
+  it('a 404 for an unresolvable target still refuses, unchanged', async () => {
+    const res = await get('/api/find-references', withShaker(rendererWithParks([])),
+      new URLSearchParams({ target: 'no-such-guid' }));
+    expect(res.status).toBe(404);
+  });
+
+  it('ACCEPT SIDE: a clean editor gets no disclosure', async () => {
+    const res = await get('/api/find-references', withShaker(rendererWithParks([])),
+      new URLSearchParams({ target: 'no-such-guid' }));
+    expect('staleInputs' in res.body).toBe(false);
   });
 });

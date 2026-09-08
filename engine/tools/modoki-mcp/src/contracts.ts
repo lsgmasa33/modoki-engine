@@ -210,6 +210,7 @@ const DECLS: Record<string, Decl> = {
     // unconditionally: an unknown target is a refusal here, because answering
     // `unreferenced: true` for a file that does not exist reads as "safe to delete".
     minimalArgs: { target: '/assets/scenes/main.scene.json' },
+    notes: "⚠️ It walks FILES ON DISK, so a '0 references' verdict is computed from the PRE-EDIT graph whenever the editor holds unsaved work — the same blindness as modoki_unused_assets, and the reason its unresolvable-TARGET branch refuses rather than answering zero. It discloses rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, `staleInputsNote` carries both. ABSENT when the editor is clean, never an empty array. modoki_save_all first if you just changed something.",
   },
   modoki_reimport_asset: {
     kind: 'asset', method: 'POST', route: '/api/reimport',
@@ -770,7 +771,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_unused_assets: {
     kind: 'read', method: 'GET', route: '/api/unused-assets', requires: ['project'],
-    notes: "The single owner of 'what would the build DROP?' — it runs the real tree-shaker from the scene seeds, so it answers about what SHIPS. A `?unreferenced=1` mode on find_references was measured against it and DELETED (docs/build.md): its answer was a strict subset on every committed project, and weaker where they differed. Scoped to the project's own assets; the engine's shared /modoki/assets root is excluded as engine-owned.",
+    notes: "The single owner of 'what would the build DROP?' — it runs the real tree-shaker from the scene seeds, so it answers about what SHIPS. A `?unreferenced=1` mode on find_references was measured against it and DELETED (docs/build.md): its answer was a strict subset on every committed project, and weaker where they differed. Scoped to the project's own assets; the engine's shared /modoki/assets root is excluded as engine-owned. ⚠️ It reads every scene/prefab/material off DISK, so when the editor holds unsaved work the answer is computed from the PRE-EDIT graph — and this answer feeds a DELETE (the Clean Up dialog trashes what it lists). It discloses rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, and `staleInputsNote` carries both in one sentence. All three are ABSENT when the editor is clean — never an empty array — so their presence is the signal. modoki_save_all first for an accurate list.",
   },
   modoki_write_asset_meta: {
     kind: 'asset', method: 'POST', route: '/api/write-meta',

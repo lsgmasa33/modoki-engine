@@ -29,6 +29,12 @@ const { execFileSync, spawnSync } = require('child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const BIN_DIR = path.join(PROJECT_ROOT, 'build', 'bin');
 
+/** Drop a half-staged artifact so the NEXT pack re-stages and re-verifies instead of
+ *  short-circuiting on its presence. See the throw sites for why this is load-bearing. */
+function rmStaged(paths) {
+  for (const p of paths) { try { fs.rmSync(p, { force: true }); } catch { /* best effort */ } }
+}
+
 /** Resolve the toktx binary: MODOKI_TOKTX, then PATH, then the standard install. */
 function findToktx() {
   if (process.env.MODOKI_TOKTX && fs.existsSync(process.env.MODOKI_TOKTX)) return process.env.MODOKI_TOKTX;
@@ -91,8 +97,27 @@ async function stageToktxWin32() {
   // Sanity-run the staged copy. `toktx --version` prints to stderr on Windows (stdout on
   // macOS), so read both streams for the log line.
   const r = spawnSync(out, ['--version'], { encoding: 'utf8' });
-  if (r.error) {
-    console.warn(`[stage-toktx] staged toktx.exe but it failed to run: ${r.error.message}`);
+  // ⚠️ `r.status` too, not just `r.error`. `spawnSync` sets `error` only when the process could
+  // not be STARTED; a binary that starts and exits non-zero (a missing DLL surfaced at runtime,
+  // a corrupt copy) leaves `error` undefined with a non-zero status, and the old check passed it
+  // — logging `bundled toktx.exe` with an empty version string. The macOS twin uses
+  // `execFileSync`, which throws on a non-zero exit, so only this branch had the hole.
+  if (r.error || r.status !== 0) {
+      // ⚠️ **Remove the staged copy BEFORE throwing.** Both win32 stagers short-circuit on
+      // `fs.existsSync(out)` at the top — *before* this sanity run — so leaving a broken binary
+      // in build/bin means the NEXT pack skips staging AND verification and signs a shipping app
+      // around the same broken tool, silently. macOS does not have this hole (it re-copies and
+      // re-verifies every run); the asymmetry is the idempotence early-return. Found in
+      // close-out review of #945 B3.
+      rmStaged([out, path.join(BIN_DIR, 'ktx.dll')]);
+    // ⚠️ **THROW — the staged copy is verified and the verdict must not be discarded**
+    // (#945 B3). The check below already existed; its result was logged and dropped, so a
+    // relocation or dylib-resolve failure staged a binary that CANNOT RUN and the pack
+    // continued, signed it, and shipped it. That is distinct from the tool being ABSENT on
+    // this build machine, which stays a graceful skip above (before-pack.cjs's documented
+    // contract: a missing optional tool never fails the build). Staged-but-broken is not a
+    // missing tool — it is a bad artifact, and it must stop the pack.
+    throw new Error(`[stage-toktx] staged toktx.exe but it failed to run: ${r.error ? r.error.message : `exit ${r.status}`}`, { cause: r.error });
   } else {
     const ver = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
     console.log(`[stage-toktx] bundled ${ver || 'toktx.exe'} (+ ktx.dll) → build/bin/`);
@@ -128,6 +153,14 @@ exports.default = async function stageToktx(context) {
     const ver = execFileSync(path.join(BIN_DIR, 'toktx'), ['--version'], { encoding: 'utf8' }).trim();
     console.log(`[stage-toktx] bundled ${ver} (+ libktx) → build/bin/`);
   } catch (e) {
-    console.warn(`[stage-toktx] staged toktx but it failed to run: ${e instanceof Error ? e.message : e}`);
+    // ⚠️ **THROW — the staged copy is verified and the verdict must not be discarded**
+    // (#945 B3). The check below already existed; its result was logged and dropped, so a
+    // relocation or dylib-resolve failure staged a binary that CANNOT RUN and the pack
+    // continued, signed it, and shipped it. That is distinct from the tool being ABSENT on
+    // this build machine, which stays a graceful skip above (before-pack.cjs's documented
+    // contract: a missing optional tool never fails the build). Staged-but-broken is not a
+    // missing tool — it is a bad artifact, and it must stop the pack.
+    rmStaged([path.join(BIN_DIR, 'toktx'), path.join(BIN_DIR, 'libktx.4.dylib')]);
+    throw new Error(`[stage-toktx] staged toktx but it failed to run: ${e instanceof Error ? e.message : e}`, { cause: e });
   }
 };

@@ -1,7 +1,7 @@
 /**
  * Shared generator for the SCOPED tsconfig shape used by both `build-web.mjs` (one
  * active project, for a real build) and `typecheck-projects.mjs` (one project at a
- * time, for the CI sweep — see #24). Kept in one place so the two never drift.
+ * time, as a leg of `npm run verify` — see #24, and #967 for why it is no longer CI-only). Kept in one place so the two never drift.
  *
  * A generated `include` REPLACES the base config's, and TypeScript does not merge
  * `exclude` from an extended config either — so the base's tools/ exclusion has to be

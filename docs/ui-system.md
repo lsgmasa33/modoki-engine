@@ -1181,6 +1181,66 @@ Same ruling #746 made for the (now-unified) `zIndex` fields in the § sortOrder 
 defect was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape
 when this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
 
+### Tap zones — `UIElement.minTapSize` (#948)
+
+**A tappable element has two boxes: the one that DRAWS and the one that RECEIVES the tap. Every
+other field on `UIElement` moves them together; this is the only one that separates them.**
+
+A finger needs ~44pt (Apple HIG) / 48dp (Material). An icon control's artwork is routinely half
+that — Court authored 16 of them at 21–35pt, and a `3.4vh` close button measures **22.66pt on an
+iPhone 8** (measured: 17.242px rendered in a 507.53px-tall viewport standing for 667 logical pt).
+`minTapSize` raises the receiving box to a floor without touching the drawing box, the layout, or
+where any sibling sits.
+
+The renderer emits a transparent, absolutely-positioned child sized `max(100%, minTapSize)` per
+axis, at `zIndex: -1` inside an `isolation: isolate` stacking context. `max()` makes a value below
+the element's own size a no-op rather than a shrink — it is a minimum, and it must never take tap
+area away.
+
+⚠️ **The two obvious alternatives both fail SILENTLY, and both were measured failing.** This is the
+whole reason the field exists rather than an authoring convention:
+
+- **`padding` does nothing at all — in either direction.** `UINode.tsx` sets
+  `boxSizing: 'border-box'`, so with a definite `width`/`height` padding is carved *out of* the
+  fixed box rather than added to it, and the click handler is bound to that same box. And the icon
+  is a CSS `background-image` with nothing overriding `background-origin`, so it keeps the default
+  `padding-box` and padding does not shrink the glyph either. Measured on a live editor: Court's
+  `SettingsClose` given `padding: 10px` on all four sides re-rendered at **exactly** its original
+  17.242 × 17.242.
+- **`minWidth`/`minHeight` do grow the box — and scale a `contain` background with it.** They are
+  layout minimums. That is why `minTapSize` is documented beside the pointer fields and not beside
+  them.
+
+Three guards, all of which exist because the failure would otherwise be invisible:
+
+- **Emitted only for a node that takes a click** (a click binding, or `swallowClicks`). An
+  enlarged zone on a decorative element would start swallowing taps meant for what is behind it.
+- **`overflow: hidden`/`scroll` clips the expander back to the box**, so the field does nothing
+  there. That combination WARNS rather than sitting inert.
+- **An element type that cannot HOST a child** — `input`, `range` and `UIToggle` all return before
+  the container branches, and an `<input>` is a void element besides. Also a DEV warning, and the
+  check runs *before* `isolation` is set so an inert field does not leave a stacking context
+  behind. Court has three such controls under the floor already (`SettingsHapticsToggle`,
+  `SettingsMusicSlider`, `SettingsSfxSlider`) — to grow one, wrap it in a `div` that carries the
+  binding and author `minTapSize` on the wrapper.
+
+⚠️ **The expander protects this element's own children — NOT its siblings, and that limit is the
+one that decides where the field is safe to author.** `isolation` puts the expander at the
+*parent's* z-order among siblings, so a zone overhanging a sibling that paints lower will take
+presses inside the overlap. That is inherent to growing a hit area in place. **`minTapSize` is
+therefore an authoring decision about a specific layout, not a value that is safe everywhere**: use
+it on a control with clearance, and fix the spacing instead on one packed against an interactive
+neighbour. #948's close-out computed `LevelPagePrev`/`LevelPageNext` overhanging the scrollable
+`LevelScroll` beneath them by `24 − 0.028 × viewportHeight` px (~5.3px at 667) — **computed from the
+scene graph and CSS paint order, not observed.**
+
+The #664 press-origin gate needs no special handling: `pressBelongsTo` resolves a press through
+`closest('[data-press-origin]')`, and the expander is a descendant of the marked element.
+
+⚠️ **A tap zone is authored data, not a code constant** — it is exactly the "could the owner
+plausibly want this different after seeing it on screen?" case, so it lives on the trait and is set
+in the scene. Court authors `48` (clearing both platform minimums with one number) on all 16.
+
 ---
 
 ## `UIRenderer` — ECS → DOM

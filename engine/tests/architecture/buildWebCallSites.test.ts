@@ -36,6 +36,16 @@ const ENGINE_ROOT = path.join(REPO_ROOT, 'engine');
  *  "inspect" generally, which would be unreliable and could hide a real regression. */
 const ALLOWLIST: Array<{ file: string; needle: string; reason: string }> = [
   {
+    file: 'scripts/scopedTypecheckLib.mjs',
+    // No trailing comma in the needle: baking one in turns the guard red for a non-issue the
+    // day somebody reorders MACHINERY_PATHS so this entry lands last.
+    needle: "'engine/scripts/build-web.mjs'",
+    reason: 'a MACHINERY_PATHS entry (#967) — the path is COMPARED against git\'s changed-file ' +
+      'list to decide whether the scoped per-project typecheck must escalate to a full sweep, ' +
+      'because build-web.mjs is what generates the scoped config shape. It is data being ' +
+      'matched, never a command being spawned, so it carries no --target.',
+  },
+  {
     file: 'plugins/vite-asset-scanner.ts',
     needle: "steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')",
     reason: "checks an already-built step's cmd PREFIX to decide whether to drop it from the " +

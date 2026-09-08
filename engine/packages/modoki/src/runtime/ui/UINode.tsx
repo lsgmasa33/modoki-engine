@@ -467,6 +467,49 @@ function warnInertScrollView(key: string, overflow: string): void {
   console.warn(`[UIScrollView] ${key} has UIElement.overflow: '${overflow}', which establishes no scroll container — so the scroll view does nothing: the box does not scroll, scrollTo moves it nowhere, and snap/overscroll have nothing to apply to. Whether the box scrolls at all is UIElement.overflow's call, deliberately: set it to 'scroll' for a draggable view, or 'hidden' for one driven only by scrollToEntry/buttons.`);
 }
 
+/** `cssVal` for a context that needs a LENGTH STRING rather than a style value: it returns a bare
+ *  number for `px` (React appends the unit when assigning to a style property, but a value being
+ *  interpolated into a `max()` expression has nobody to do that for it). Returns '' for 0/falsy,
+ *  matching `cssVal`'s undefined. */
+function cssLen(value: number, unit: string): string {
+  const v = cssVal(value, unit);
+  return v === undefined ? '' : typeof v === 'number' ? `${v}px` : v;
+}
+
+/** Warn ONCE per entity that `UIElement.minTapSize` is authored but clipped away (#948). Same
+ *  shape and same reason as `warnDeadToggle` / `warnInertScrollView` above: the expander is a
+ *  CHILD, so an element that clips its own overflow cuts the enlarged tap zone back to the box and
+ *  the field does nothing — inert, and indistinguishable from not-wired-yet without being told.
+ *
+ *  ⚠️ Cannot trip on existing content: `minTapSize` is new in #948 and defaults to 0, so the
+ *  corpus authoring BOTH halves of this combination is empty by construction. */
+const _clippedTapZones = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _clippedTapZones.clear());
+
+function warnClippedTapZone(key: string, overflow: string): void {
+  if (_clippedTapZones.has(key)) return;
+  _clippedTapZones.add(key);
+  console.warn(`[UIElement] ${key} authors minTapSize but also overflow: '${overflow}', which clips the tap zone back to the element's own box — so minTapSize does nothing here. The enlarged zone is a child element, and this element's clip cuts it off. Either set overflow to 'visible', or move minTapSize onto an unclipped ancestor that carries the click binding.`);
+}
+
+/** Warn ONCE per entity that `minTapSize` is authored on an element type that cannot HOST the
+ *  expander (#948 close-out). Same shape and reason as the three warns above.
+ *
+ *  ⚠️ Distinct from the clipped case: that one is fixable by the author (drop the clip), this one
+ *  is not — an `<input>` is a void element and a `UIToggle` owns its inner layout, so the fix is a
+ *  wrapper element carrying the binding, which is a different authoring shape. The message says so
+ *  rather than implying a value will help. */
+const _unhostableTapZones = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _unhostableTapZones.clear());
+
+function warnUnhostableTapZone(key: string, kind: string): void {
+  if (_unhostableTapZones.has(key)) return;
+  _unhostableTapZones.add(key);
+  console.warn(`[UIElement] ${key} authors minTapSize but renders as '${kind}', which cannot hold the tap zone — so minTapSize does nothing here. The enlarged zone is a child element, and an <input>/<input type=range> is a void element while a UIToggle owns its own inner layout. To grow one of these, wrap it in a div that carries the click binding and author minTapSize on the wrapper.`);
+}
+
 /** Warn ONCE per entity that authored `text` is dropped because this element type never renders
  *  it (#745). Same shape and same reason as `warnDeadToggle`/`warnInertScrollView`. */
 const _droppedText = new Set<string>();
@@ -1238,6 +1281,76 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // authoring surface, so it is what distinguishes them — the running game wins, because
   // that is the picture the human is judging. Without this the last host to tick won, which
   // was the Scene panel ("the video plays only on Scene view, not on the game view").
+  // ── Tap zone (#948) ──
+  // `UIElement.minTapSize` raises the area that RECEIVES a tap without touching the area that
+  // DRAWS. A finger needs ~44pt; an icon control's artwork is routinely half that, and every
+  // other field on the trait moves the two boxes together (see the trait's own doc for the
+  // measurement that killed `padding` and `minWidth`/`minHeight` as alternatives).
+  //
+  // ⚠️ `takesClick`, not `minTapSize > 0` alone. An enlarged zone on a node that handles no click
+  // would start swallowing taps meant for whatever is behind it — so a node that would not have
+  // handled the tap anyway gets no expander, and the field is documented as inert there.
+  //
+  // ⚠️ `zIndex: -1` is what stops it covering this element's OWN text and children. A negative
+  // z-index child paints after its stacking context's background but BEFORE its in-flow content,
+  // so inside the box the real content still wins the hit test. `isolation: 'isolate'` below pins
+  // it into this element's own stacking context so it cannot fall behind an ancestor instead; the
+  // nine-slice layer a few hundred lines up uses exactly this pair for the same reason.
+  //
+  // ⚠️ **It does NOT protect SIBLINGS, and an earlier version of this comment claimed it did**
+  // ("outside the box, where nothing else is" — false: outside the box is exactly where siblings
+  // are). `isolation` puts the expander at the PARENT's z-order among its siblings, so an expander
+  // overhanging a sibling that paints lower will take presses inside the overlap. That is inherent
+  // to growing a hit area in place, not a bug in this implementation — but it makes minTapSize an
+  // AUTHORING decision about a specific layout, not a value that is safe everywhere. Author it on
+  // a control with clearance; a control packed against an interactive neighbour needs the spacing
+  // fixed instead. Caught in #948's close-out review, on `LevelPagePrev`/`LevelPageNext`, whose
+  // 48px zones are computed to overhang the scrollable `LevelScroll` beneath them by
+  // `24 - 0.028*viewportHeight` px — ~5.3px at 667 — where a tap meant for a level tile would page
+  // the list instead. COMPUTED from the scene graph and CSS paint order, **not observed**: see the
+  // issue for the `document.elementFromPoint` recipe that would settle it.
+  //
+  // The press-origin gate (#664) needs no change: `pressBelongsTo` resolves a press through
+  // `closest('[data-press-origin]')`, and the expander is a DESCENDANT of the marked element, so
+  // a press landing on it already resolves to this node.
+  const tapZone = cssLen(node.minTapSize, node.minTapSizeUnit);
+  let tapZoneLayer: React.ReactNode = null;
+  if (tapZone && takesClick) {
+    // ⚠️ **The THIRD inert case, and the one an author hits next.** The expander is a CHILD, so it
+    // can only exist on a node that renders a container. `input`/`range` render a VOID element
+    // (nothing can be nested inside an `<input>` at all) and `UIToggle` owns its own inner layout
+    // — all three return before the container branches below. Court has three of them under the
+    // floor already (`SettingsHapticsToggle`, `SettingsMusicSlider`, `SettingsSfxSlider`), so this
+    // is reachable, not theoretical. ⚠️ It must be checked BEFORE `style.isolation` is set: an
+    // inert field that still creates a stacking context would trap its descendants' `zIndex` for
+    // nothing, which is the hazard `registerTraits.ts`'s `scale` tooltip spells out.
+    const hosts = node.elementType === 'div' && !node.toggle;
+    if (!hosts) {
+      if (import.meta.env?.DEV) {
+        warnUnhostableTapZone(node.guid || `${node.entityId}:${node.generation}`,
+          node.toggle ? 'UIToggle' : node.elementType);
+      }
+    } else if (node.overflow === 'hidden' || node.overflow === 'scroll') {
+      if (import.meta.env?.DEV) {
+        warnClippedTapZone(node.guid || `${node.entityId}:${node.generation}`, node.overflow);
+      }
+    } else {
+      style.isolation = 'isolate';
+      tapZoneLayer = (
+        <div
+          aria-hidden
+          style={{
+            position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+            // `max()`, so a value SMALLER than the element is a no-op rather than a shrink —
+            // this is a minimum, and it must never take a tap area away.
+            width: `max(100%, ${tapZone})`, height: `max(100%, ${tapZone})`,
+            zIndex: -1,
+          }}
+        />
+      );
+    }
+  }
+
   const videoLayer = node.hasVideo && UIVideoMount && !uiVisualsHidden
     ? (
       <Suspense fallback={null}>
@@ -1672,6 +1785,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // nothing recorded belongs to the panel), and the dialog dismisses. See pressOrigin.ts's
       // "⚠️ LIMIT" section — the gate only protects nodes carrying the marker.
       <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+        {tapZoneLayer}
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -1733,6 +1847,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   return (
     // `takesClick`, not `isInteractive` — see the canvas2D return above for why (#728).
     <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+      {tapZoneLayer}
       {nineSliceLayer}
       {videoLayer}
       {textContent}

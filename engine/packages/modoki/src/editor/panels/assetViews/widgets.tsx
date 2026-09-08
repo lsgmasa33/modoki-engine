@@ -14,6 +14,12 @@ import {
   useBufferedValue, parseNumber, clampRange, Tooltip, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER,
 } from '../fields';
 import { metaCameFromFailedRead } from '../../scene/metaReadFallback';
+// ⚠️ No cycle: `store/editorStore.ts` imports zustand, undo/**, runtime/loaders/** and scene/** —
+// no panels. `scene/pendingMeta.ts` already imports BOTH this file and the store, which is the
+// proof the store sits below both. Reaching `showToast` through the store is what makes delivery
+// available here at all: `pendingMeta`'s own `refuseWithToast` could not be imported back from a
+// panel module without the cycle that produced `scene/metaReadFallback.ts`.
+import { useEditorStore } from '../../store/editorStore';
 
 /** Single source of truth for the per-type color default (F11). White, not 0/black,
  *  so a newly-bound color `set`-value / un-set material color isn't a surprise
@@ -83,12 +89,31 @@ export async function writeMetaConditional(path: string, meta: unknown, ifMatch?
   // refuses the same document EARLIER — at edit time rather than save time — which is a better
   // moment, not a duplicate of this.
   if (metaCameFromFailedRead(meta)) {
+    // BOTH channels (#901, on #890/#891's ruling). ⚠️ THE TOAST IS THE ONLY THING THE HUMAN SEES —
+    // every caller collapses this result (`writeMetaOrWarn` is `.then((r) => r.ok)`, and
+    // `writeMetaWholesale` goes through it), so a structured flag on `MetaWriteResult` is read by
+    // nobody. One was written and reverted: carried into `MetaFlushResult` with its own
+    // `toastForSave` clause, which is UNREACHABLE a second way too — `classifyMetaPark` refuses a
+    // failed-read document at PARK time, so the pending map never holds one and the flush never
+    // produces that failure. Both facts are pinned: `writeMetaRefusalSurfaced.test.ts` covers the
+    // collapse, `pendingMeta.test.ts` covers the park.
+    //
+    // A toast rather than an in-flow notice because this endpoint owns no panel — it is shared by
+    // the eight explicit-action writers and reached from wherever they live. Same rule as
+    // `panels/saveRefusal.ts` states for the modals, applied to the case with nowhere to look.
     console.error(
       `[Inspector] refusing to write ${path} — this document was built on a FAILED .meta.json `
       + 'read, so it has no GUID and the write would REPLACE the file: the scanner would mint a '
       + 'fresh GUID and every scene/prefab reference to this asset would dangle. Reselect or '
       + 'reopen the asset to re-read it, then retry.',
     );
+    try {
+      useEditorStore.getState().showToast(
+        '⚠ Not saved — this asset\'s import settings were never read, so writing would strip its '
+        + 'ID and break every reference to it. Reselect the asset to re-read it, then try again.',
+        'warn',
+      );
+    } catch { /* reported above — a missing toast host must not swallow the refusal */ }
     return { ok: false, conflict: false, error: 'the document was built on a failed .meta.json read' };
   }
   try {

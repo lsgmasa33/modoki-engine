@@ -25,7 +25,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { productName, killPackaged } from './packagedAppPaths.mjs';
+import { productName, killPackaged, REAP_ERROR } from './packagedAppPaths.mjs';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from './pathIdentity.mjs';
 
@@ -172,7 +172,30 @@ if (isPackagedRunning()) {
     process.exit(1);
   }
   console.log(`[clean-packaged-cache] killing running "${NAME}"…`);
-  if (!DRY_RUN) killPackaged();
+  if (!DRY_RUN) {
+    // ⚠️ **The reap's outcome decides whether the wipe below is safe, so it must not be
+    // discarded** (close-out review of #944/#959). We are on this branch because
+    // `isPackagedRunning()` said TRUE; if the reap then fails to run at all, the `rmSync` below
+    // deletes this app's userData WHILE IT IS LIVE — which this file's own header calls
+    // "corrupts rather than cleans", the exact outcome the running-check exists to prevent.
+    const outcome = killPackaged();
+    // Re-ask the question rather than trusting the verdict alone: `REAP_KILLED` means a signal
+    // was delivered, not that the process is gone yet, and a `--force` run that proceeds into
+    // the wipe a beat too early has the same consequence as one that never killed anything.
+    // `Atomics.wait`, not `execFileSync('sleep')` — Windows has no `sleep`, and this script is
+    // the one that runs there too. Up to 2s, re-asking each 100ms.
+    const nap = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    for (let i = 0; i < 20 && isPackagedRunning(); i += 1) nap();
+    if (outcome === REAP_ERROR || isPackagedRunning()) {
+      console.error(
+        `[clean-packaged-cache] refusing to continue: "${NAME}" is STILL RUNNING after the reap`
+        + `${outcome === REAP_ERROR ? ' (and the reap itself failed to run)' : ''}. `
+        + 'Wiping its userData now would corrupt a live app rather than clean it. Quit it by hand '
+        + 'and re-run.',
+      );
+      process.exit(1);
+    }
+  }
 }
 
 let removed = 0;

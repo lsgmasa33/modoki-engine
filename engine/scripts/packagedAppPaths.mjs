@@ -15,7 +15,7 @@
  *   node packagedAppPaths.mjs kill [appDir]
  *   node packagedAppPaths.mjs clearViteCache
  */
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -130,25 +130,90 @@ export function winKillCommand(appDir, name = productName()) {
     : '';
   // -Force because Electron ignores WM_CLOSE when it has no window — exactly how the smoke
   // launches it. -EA SilentlyContinue: "already gone" is the normal case, not an error.
-  return `${select}${scope} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }`;
+  // Emit the matched COUNT on stdout. `Stop-Process -EA SilentlyContinue` exits 0 whether it
+  // stopped a process or matched nothing, so unlike pkill the exit status cannot distinguish
+  // killed-something from matched-nothing — and that silence is #944's half of this bug. The
+  // count is materialised BEFORE stopping (@(...) forces an array, so a single match still
+  // counts 1 rather than collapsing to a scalar); stopping first would leave nothing to count.
+  return `$p = @(${select}${scope}); $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }; Write-Output $p.Count`;
 }
+
+/** The clone's OTHER spelling of an absolute path, or null when there is no distinct one.
+ *
+ *  A reap matches our pattern against a string we do NOT control — the command line a foreign
+ *  process was launched with — so there is nothing to canonicalise on the other side, and
+ *  canonicalising only ours is strictly worse: it breaks the ordinary case that works today
+ *  while fixing the symlinked one. The only correct shape is to match a SET of spellings
+ *  (#913). This is `reap_alt_pattern`'s contract from `lib/repo-reap.sh`, in JS.
+ *
+ *  ⚠️ **Returns null rather than echoing the input back.** Callers run "the pattern, then
+ *  whatever this returns", so returning the input would reap the same pattern twice. Every
+ *  branch here is a guard against WIDENING the match: no path, an unresolvable one (the
+ *  directory is gone — the common case when there is nothing to reap anyway), a non-absolute
+ *  result, or an identical spelling all yield no second reap at all.
+ *
+ *  `.native`, never the JS `realpathSync` walk: the JS implementation does not fold a
+ *  case-flipped path component and has already dropped a clone's pinned port that way (#881). */
+export function altPathSpelling(p) {
+  if (typeof p !== 'string' || p === '') return null;
+  let real;
+  try { real = realpathSync.native(p); } catch { return null; }
+  if (!path.isAbsolute(real)) return null;
+  return real === p ? null : real;
+}
+
+/** How a reap turned out. `exit 0` is right for all three — "nothing running" is the normal
+ *  case — but they are NOT the same event, and collapsing them into one silent `catch` is what
+ *  made every bash caller append `|| true` and made the silence structural (#944). */
+export const REAP_KILLED = 'killed';
+export const REAP_NONE = 'none';
+export const REAP_ERROR = 'error';
 
 /** Kill a leftover packaged instance. Chromium's --remote-debugging-port fails SILENTLY
  *  when the port is held, so a stale process makes the CSP probe look at a port its app
- *  never opened. Best-effort by design — "nothing to kill" is the normal case. */
+ *  never opened. Best-effort by design — "nothing to kill" is the normal case.
+ *
+ *  Returns one of REAP_KILLED / REAP_NONE / REAP_ERROR — see those constants for why the
+ *  three are distinguished rather than swallowed together. */
 export function killPackaged(appDir, name = productName()) {
   // The .sh scripts have the same hazard guarded with bash's `${VAR:?msg}` (reapScoping.test.ts
   // §2, #69 follow-up): a `pkill -f` pattern built from a variable that turns out empty
   // silently widens to match every clone's process on this machine, not just this one. JS has
   // no expansion-time equivalent, so this is the explicit form — thrown OUTSIDE the try/catch
-  // below on purpose: that catch exists for "pkill/taskkill found nothing to kill" (their
-  // normal, expected non-zero exit), and swallowing THIS guard the same way would silently
-  // defeat it. Only triggers when appDir is PASSED but comes out empty/implausibly short (a
+  // below on purpose: that catch DECODES pkill's exit status (0 signalled / 1 no match /
+  // >=2 usage or fatal), and routing THIS guard through it would report a caller-side bug as
+  // one of those three ordinary outcomes and continue. Only triggers when appDir is PASSED but comes out empty/implausibly short (a
   // caller-side bug) — an appDir that's deliberately OMITTED (undefined) is a separate,
   // documented case (see the fallback-to-bare-name comment below) and is left alone here.
   if (appDir !== undefined && (appDir === '' || appDir.length < 10)) {
     throw new Error(`[packagedAppPaths] refusing to reap with an empty/short appDir (${JSON.stringify(appDir)}) — that pattern would match every clone`);
   }
+  // Both spellings this clone's app dir can be reached by, most specific first. Two SEPARATE
+  // invocations below, never an ERE alternation: `pkill -f` takes an ERE, so a pattern built as
+  // "$A|$B" with either side empty matches EVERY PROCESS ON THE MACHINE — #69's disaster
+  // reintroduced by the fix meant to prevent it (`lib/repo-reap.sh` carries the same warning).
+  // The no-appDir fallback has no path to canonicalise, so it stays a single reap.
+  // ⚠️ The alternate must clear the SAME width guard as the argument. A 40-char `appDir` can be
+  // a symlink to a very short real path, and the check above only ever saw the argument — so an
+  // unchecked `alt` would slip a pattern past the one guard whose stated contract is that every
+  // branch here guards against WIDENING the match.
+  const altRaw = appDir === undefined ? null : altPathSpelling(appDir);
+  const alt = altRaw !== null && altRaw.length >= 10 ? altRaw : null;
+  const dirs = alt === null ? [appDir] : [appDir, alt];
+  let outcome = REAP_NONE;
+  for (const dir of dirs) {
+    const one = _killOne(dir, name);
+    // KILLED wins over NONE, and an ERROR is never masked by a later success — a usage/fatal
+    // failure on either spelling means this reap cannot be trusted to have done its job.
+    if (one === REAP_ERROR) outcome = REAP_ERROR;
+    else if (one === REAP_KILLED && outcome !== REAP_ERROR) outcome = REAP_KILLED;
+  }
+  return outcome;
+}
+
+/** One spelling, one reap. Split out of killPackaged so the two-spelling loop above reads as
+ *  the policy it is, and so the exit-status decoding lives in exactly one place. */
+function _killOne(appDir, name) {
   try {
     if (process.platform === 'win32') {
       // Scope by executable PATH, mirroring the macOS branch below. This used to be
@@ -164,7 +229,29 @@ export function killPackaged(appDir, name = productName()) {
       // this goes through PowerShell + Win32_Process.ExecutablePath. Dev editors run
       // `electron.exe` and so never match the Name filter at all; the path filter is what keeps
       // one PACKAGED instance from reaping another.
-      execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', winKillCommand(appDir, name)], { stdio: 'ignore' });
+      // `Stop-Process -EA SilentlyContinue` exits 0 whether it stopped something or matched
+      // nothing, so the status cannot carry the answer the way pkill's does. winKillCommand
+      // emits the matched COUNT on stdout instead — hence `pipe` rather than `ignore` here.
+      //
+      // ⚠️ **Decoded HERE, not in the shared catch below — the two branches have incompatible
+      // exit-code vocabularies.** `powershell.exe -Command` exits **1** on a terminating error
+      // (WMI unavailable, access denied, a `Get-CimInstance` failure), and pkill's 1 means "no
+      // match". Routing PowerShell through pkill's decode therefore reported a WMI failure as
+      // `REAP_NONE`/"nothing running" — reintroducing, on the branch that had just gained the
+      // count plumbing, precisely the silence #944 exists to remove.
+      //
+      // So: a clean exit with a parseable count is the ONLY non-error outcome. `Number('')` is
+      // 0, which would read as a legitimate "nothing running", so the parse is checked
+      // explicitly — an empty stdout means the command did not get far enough to print, which
+      // is an ERROR, not an empty match.
+      try {
+        const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', winKillCommand(appDir, name)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const n = Number(String(out).trim());
+        if (!Number.isFinite(n)) return REAP_ERROR;
+        return n > 0 ? REAP_KILLED : REAP_NONE;
+      } catch {
+        return REAP_ERROR; // any non-zero exit here is a failure to RUN the reap, never "no match"
+      }
     } else {
       // Match the FULL app path, not its basename: every clone's packaged app is called
       // "Modoki Editor.app", so a basename pattern reaps a sibling clone's app too (#69).
@@ -191,14 +278,45 @@ export function killPackaged(appDir, name = productName()) {
       // the packaged app's own helpers are still reaped.
       const pattern = appDir ? `${appDir}/Contents/` : `${name}.app/Contents/`;
       execFileSync('pkill', ['-f', pattern], { stdio: 'ignore' });
+      return REAP_KILLED; // pkill exits 0 only when it matched AND signalled
     }
-  } catch { /* nothing running — the normal case */ }
+  } catch (e) {
+    // POSIX ONLY — the win32 branch above decodes and returns without reaching here (see its
+    // comment for why sharing this decode was a live bug).
+    //
+    // `pkill`'s exit codes are three states, and this catch used to flatten all of them into
+    // one silent "nothing running": 0 = signalled, 1 = no match, >=2 = usage error or fatal.
+    // A usage error therefore read as "nothing was running" — indistinguishable from success,
+    // which is exactly the shape #944 was filed for. Decode it instead.
+    //
+    // A non-numeric status (ENOENT: no `pkill` on this box at all) is an ERROR for the same
+    // reason — the reap did not happen and the caller must not be told it did.
+    const status = /** @type {{ status?: unknown }} */ (e).status;
+    if (status === 1) return REAP_NONE;
+    return REAP_ERROR;
+  }
 }
 
 // ── CLI (for smoke-packaged.sh) ─────────────────────────────────────────────
 if (isEntryPoint(import.meta.url)) {
   const [a, b] = process.argv.slice(2);
-  if (a === 'kill') { killPackaged(b); process.exit(0); }
+  // `exit 0` for all three outcomes — "nothing running" is the normal case and every bash caller
+  // appends `|| true` anyway — but SAY which one happened. A reap that cannot report the
+  // difference between "killed it", "nothing there" and "pkill itself failed" is why that `|| true`
+  // became structural (#944); the message is what makes the third state visible at all.
+  if (a === 'kill') {
+    const outcome = killPackaged(b);
+    if (outcome === REAP_KILLED) console.log('[kill] reaped a packaged instance', b ?? '(any clone)');
+    else if (outcome === REAP_NONE) console.log('[kill] nothing running', b ?? '(any clone)');
+    // ⚠️ **stdout, NOT stderr.** All five bash callers invoke this as
+    // `node "$PATHS" kill … 2>/dev/null || true` (they always have — it hid pkill's own noise,
+    // which `stdio:'ignore'` already suppresses), so an alarm on stderr is discarded by every
+    // consumer that exists. Measured: the two HARMLESS outcomes printed and the one that
+    // matters did not, which made the whole reporting half of #944 a no-op. Found in
+    // close-out review.
+    else console.log('[kill] FAILED to reap — the reap did not run, so a stale instance may still hold the port', b ?? '(any clone)');
+    process.exit(0);
+  }
   // `binIn <appDir>` — the executable inside an app dir the caller was HANDED (release.yml points
   // the gates at a signed artifact). Distinct from `<outDir> bin`, which SEARCHES a build output
   // dir; conflating them re-derives a platform subdirectory that is already part of the path.

@@ -11,7 +11,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
-import { describeRefusedDeletes } from './assetOps';
+import { describeRefusedDeletes, readUnusedStaleness } from './assetOps';
 
 interface Orphan { path: string; type: string; bytes: number }
 interface UnusedResponse {
@@ -20,6 +20,24 @@ interface UnusedResponse {
   sceneCount?: number;
   warnings?: string[];
   error?: string;
+  /** ⚠️ **THE STALENESS DISCLOSURE, and this dialog is the reason it exists** (#889).
+   *
+   *  The tree-shaker reads every scene/prefab/material off DISK. While the editor holds unsaved
+   *  work, the orphan list below is computed from the PRE-EDIT graph — so an asset referenced ONLY
+   *  by an edit that has not been saved reads as unused. This dialog pre-selects every orphan and
+   *  posts the selection to `/api/delete-asset`, so that asset gets trashed.
+   *
+   *  The route computes these and the close-out review found nothing consuming them: the disclosure
+   *  reached agents through the MCP surface while the HUMAN path — the one that actually deletes —
+   *  threw it away. Absent when the editor is clean, never an empty array, so presence IS the signal.
+   *
+   *  ⚠️ Read from the RESPONSE rather than re-polled client-side. `FindReferencesDialog` grows its
+   *  own banner from `unsavedChangeCauses()` and checks only `sceneDirty || dirtyAssetPaths` — a
+   *  hand-list that misses three of the five causes (#972). The server's note is derived from the
+   *  same probe that computed this very answer, so it cannot disagree with it. */
+  staleInputs?: Array<{ path: string; registry: string; detail?: string }>;
+  staleInputsUnknown?: { reason: string };
+  staleInputsNote?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -75,6 +93,10 @@ export default function CleanupAssetsDialog() {
   if (!open) return null;
 
   const orphans = data?.orphans ?? [];
+
+  // #889 — the DECISION lives in assetOps so it is testable without mounting this dialog.
+
+  const staleness = readUnusedStaleness(data);
   const toggle = (path: string) => setSelected((prev) => {
     const next = new Set(prev);
     if (next.has(path)) next.delete(path); else next.add(path);
@@ -150,6 +172,37 @@ export default function CleanupAssetsDialog() {
             defeating the point of showing it next to the file (#884 close-out review). */}
         {refusalNote && (
           <div style={{ color: '#e0a030', fontSize: 11, padding: '6px 0', whiteSpace: 'pre-wrap' }}>{refusalNote}</div>
+        )}
+
+        {/* #889: the scan read DISK. Say so BEFORE the list, because the list is pre-selected and the
+            next click trashes it. Rendered above the results rather than beside them for the same
+            reason `AssetLoadRefusedBanner` sits above a batch view's controls: a caveat under the
+            thing it qualifies is read after the decision. */}
+        {staleness && (
+          <div
+            data-testid="cleanup-stale"
+            data-ui-id="assets.cleanup.stale"
+            role="alert"
+            style={{
+              color: '#e0a030', fontSize: 11, marginBottom: 8, padding: '6px 8px',
+              border: '1px solid #7a5a20', borderRadius: 4, background: '#2a2410', whiteSpace: 'pre-wrap',
+              // ⚠️ BOUNDED. `staleness.note` comes from `describeHolds`, which names EVERY held
+              // path grouped by kind, and the probe is global — so on a busy editor this is
+              // arbitrarily long. The modal is maxHeight:80vh with no overflow of its own and the
+              // orphan list below holds a minHeight, so an uncapped banner pushes Close/Delete
+              // outside the box with nothing to scroll. The `warnings` block below caps itself at
+              // 72px for exactly this reason (close-out review 2).
+              maxHeight: 96, overflowY: 'auto', flexShrink: 0,
+            }}
+          >
+            ⚠ {staleness.note}
+            {staleness.inputs.length ? (
+              <div style={{ marginTop: 4, color: '#c9a35a' }}>
+                An asset referenced only by that unsaved work is listed below as unused — deleting it
+                would break a reference you cannot see yet.
+              </div>
+            ) : null}
+          </div>
         )}
 
         {loading ? (

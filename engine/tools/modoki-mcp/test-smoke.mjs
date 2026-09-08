@@ -1564,7 +1564,7 @@ if (canUC3) {
 //
 // ⚠️ **The `editorConnected` assertion is the load-bearing half, not the round trip.** The write
 // now asks the renderer whether a human's Inspector import-settings edit is parked, and answers
-// `editorConnected:false` when no renderer answered at all — including when the `resolve-meta-park`
+// `editorConnected:false` when no renderer answered at all — including when the `resolve-unsaved`
 // op is not registered ("unknown agent op" classifies as a definitively-absent renderer, correctly:
 // a runtime with no editor ops has no registry either). An editor IS attached while this suite
 // runs, so `editorConnected:false` here means the probe did not reach the op — the gate silently
@@ -1574,6 +1574,136 @@ if (canUC3) {
 // The REFUSAL side is deliberately not here: parking an import-settings edit is a human Inspector
 // gesture with no agent equivalent, so no case in this suite can create one. It is hand-verified
 // against a live editor instead, and that limitation is stated rather than left to be discovered.
+// ── UC14b: the stale-read DISCLOSURE reaches the agent surface (#889) ──────────────────────────
+//
+// ⚠️ **The live tier cannot reach this on its own, and that is the point of adding a case.**
+// `test:live` calls non-mutating tools with `minimalArgs` against the human's editor, which will
+// normally be CLEAN — so `modoki_unused_assets` hits the "nothing held" path on every run, forever,
+// and a disclosure that never fires is indistinguishable from one that is wired up. `npm test`
+// cannot see this class at all (docs/mcp-tool-conventions.md §10), so without a case here the
+// `COVERED_BY_SMOKE` claim would have nothing behind it.
+//
+// What this asserts is the SHAPE contract in both directions: when the editor is clean the
+// disclosure fields are ABSENT (not `[]` — an always-present field is one readers learn to skip),
+// and when something IS held they are well-formed. It does not park an edit itself: doing that in
+// the human's open project to satisfy a smoke case is the wrong trade, and the held path is
+// hand-verified against a live editor instead. That limitation is stated rather than left to be
+// discovered.
+{
+  const uc14bRaw = text(await client.callTool({ name: 'modoki_unused_assets', arguments: {} }));
+  const uc14b = JSON.parse(uc14bRaw);
+  if (!uc14b || typeof uc14b !== 'object') throw new Error(`UC14b unused_assets returned no object: ${uc14bRaw.slice(0, 200)}`);
+  const hasInputs = 'staleInputs' in uc14b;
+  const hasUnknown = 'staleInputsUnknown' in uc14b;
+  if (hasInputs && hasUnknown) {
+    throw new Error(`UC14b reported BOTH staleInputs and staleInputsUnknown — they are alternatives: ${uc14bRaw.slice(0, 300)}`);
+  }
+  if (hasInputs) {
+    if (!Array.isArray(uc14b.staleInputs) || uc14b.staleInputs.length === 0) {
+      throw new Error(`UC14b staleInputs is present but empty — it must be ABSENT when clean, never []: ${uc14bRaw.slice(0, 300)}`);
+    }
+    for (const row of uc14b.staleInputs) {
+      if (typeof row?.path !== 'string' || typeof row?.registry !== 'string') {
+        throw new Error(`UC14b staleInputs row is not {path, registry}: ${JSON.stringify(row)}`);
+      }
+    }
+  }
+  if ((hasInputs || hasUnknown) && typeof uc14b.staleInputsNote !== 'string') {
+    throw new Error(`UC14b disclosed staleness with no human-readable note: ${uc14bRaw.slice(0, 300)}`);
+  }
+  // ⚠️ The one thing that would make this case vacuous: `staleInputsUnknown` on every run means the
+  // probe never reaches the renderer, so the disclosure is structurally "could not look" forever —
+  // the same inert-gate class the `editorConnected` assertion above exists for.
+  if (hasUnknown) {
+    throw new Error(
+      'UC14b unused_assets could NOT check for unsaved editor work while an editor IS attached — '
+      + `the resolve-unsaved probe did not reach the renderer: ${uc14bRaw.slice(0, 300)}`,
+    );
+  }
+
+  // ── The half that makes this case FALSIFIABLE ────────────────────────────────────────────────
+  //
+  // ⚠️ **Everything above passes with the disclosure DELETED.** On a clean editor `hasInputs` and
+  // `hasUnknown` are both false either way, so the shape assertions never fire and the ✓ would
+  // claim "reached the renderer" from the ABSENCE of a field — equally consistent with no probe
+  // having run at all. That is a check passing under both hypotheses, which is the exact shape
+  // this whole ticket is about, committed inside its own test (#889 close-out review).
+  //
+  // So: make the editor genuinely dirty, assert the disclosure APPEARS and names `liveScene`, then
+  // put it back. `liveScene` is deliberately the registry used — it is the PRIMARY scene's
+  // pathless boolean, the fifth source a registry-module enumeration is blind to, and the one the
+  // unit tests structurally cannot drive.
+  const uc14bState = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  if (uc14bState?.unsavedChanges !== false) {
+    // ⚠️ NEVER manufacture dirt on top of a human's own unsaved work: the restore below discards,
+    // and discarding someone else's edit to satisfy a smoke case is the trade this suite must not
+    // make. Skipping is the honest outcome, and it says which half went unrun.
+    skipped.push('UC14b (disclosure FIRES) — the editor already has unsaved work; refusing to add probe dirt on top of it, because the restore discards');
+  } else {
+    // ⚠️ `scenePathRef`, not `scenePath` — same value today, but `scenePath` is documented as the
+    //    `/@fs/<abs>` form the edit routes reject, and every other case in this file uses the ref.
+    const uc14bScene = uc14bState.scenePathRef ?? uc14bState.scenePath;
+    if (!uc14bScene) {
+      // ⚠️ NO SCENE OPEN. Without this the mutate below silently no-ops (a NOT_FOUND ToolResult,
+      // not a throw), the editor stays clean, and the assertion further down throws a CONFIDENT
+      // WRONG diagnosis — "unused_assets did NOT disclose them" — about a mechanism that was never
+      // exercised. The `finally` would then call load_scene with `path: undefined` and mask the
+      // first error with a schema error. Two wrong messages for one unmet precondition.
+      skipped.push('UC14b (disclosure FIRES) — no scene is open, so there is no live world to dirty');
+    } else {
+    const mutated = JSON.parse(text(await client.callTool({
+      name: 'modoki_mutate_scene',
+      arguments: { ops: [{ op: 'addEntity', name: '__uc14b-probe', traits: { Transform: { x: 0, y: 0, z: 0 } } }] },
+    })));
+    // ⚠️ ASSERT THE SETUP LANDED before asserting on what it was supposed to cause. A no-op mutate
+    // makes the disclosure check fail for a reason that has nothing to do with the disclosure —
+    // the failure this case exists to report becomes indistinguishable from a broken fixture.
+    if (mutated?.ok !== true || mutated?.changed !== 1) {
+      throw new Error(`UC14b could not dirty the live world, so its assertion would be vacuous: ${JSON.stringify(mutated).slice(0, 300)}`);
+    }
+    let dirtyRaw;
+    try {
+      dirtyRaw = text(await client.callTool({ name: 'modoki_unused_assets', arguments: {} }));
+      const dirty = JSON.parse(dirtyRaw);
+      if (!Array.isArray(dirty.staleInputs) || !dirty.staleInputs.length) {
+        throw new Error(
+          'UC14b the editor has unsaved live-world edits and unused_assets did NOT disclose them — '
+          + `the answer is computed from disk and says nothing about it: ${dirtyRaw.slice(0, 300)}`,
+        );
+      }
+      if (!dirty.staleInputs.some((r) => r.registry === 'liveScene')) {
+        throw new Error(
+          'UC14b disclosed staleness but not under `liveScene` — the PRIMARY scene\'s live-world '
+          + `edits are the source a registry-module enumeration misses: ${dirtyRaw.slice(0, 300)}`,
+        );
+      }
+      if (typeof dirty.staleInputsNote !== 'string' || !dirty.staleInputsNote) {
+        throw new Error(`UC14b disclosed staleInputs with no human-readable note: ${dirtyRaw.slice(0, 300)}`);
+      }
+    } finally {
+      // Reload the SAME scene, discarding only the probe entity. Not `save_all` — that would write
+      // the probe to the human's file — and not `undo`, which leaves the scene still dirty (an
+      // undo is itself an edit that bumps the edit version).
+      await client.callTool({
+        name: 'modoki_load_scene', arguments: { path: uc14bScene, discardUnsaved: true },
+      });
+    }
+    const restored = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (restored?.unsavedChanges !== false) {
+      throw new Error(`UC14b left the editor dirty after its restore: ${JSON.stringify(restored?.unsavedCauses ?? {}).slice(0, 200)}`);
+    }
+    console.log('UC14b disclosure FIRES on a dirty live world and clears on restore ✓ (liveScene)');
+    }
+  }
+  // ⚠️ Say so out loud. Every other case here prints its ✓, and a case that passes SILENTLY is
+  // indistinguishable in the log from one that never ran — which is the same class of invisibility
+  // this whole ticket is about.
+  console.log(
+    `UC14b unused_assets disclosure reached the renderer ✓ (${uc14b.orphans?.length ?? 0} orphans, `
+    + `staleInputs ${hasInputs ? `present: ${uc14b.staleInputs.length}` : 'absent — editor clean'})`,
+  );
+}
+
 const uc14Assets = JSON.parse(text(await client.callTool({
   name: 'modoki_list_assets', arguments: { type: 'texture', limit: 5 },
 })));
@@ -1599,7 +1729,7 @@ if (!uc14Path) {
     if (wrote.editorConnected === false) {
       throw new Error(
         'UC14 the write reported editorConnected:false while an editor IS attached — the '
-        + 'resolve-meta-park probe did not reach the renderer, so the park gate is inert and this '
+        + 'resolve-unsaved probe did not reach the renderer, so the unsaved-work gate is inert and this '
         + `write was unguarded. Reply: ${JSON.stringify(wrote).slice(0, 300)}`,
       );
     }

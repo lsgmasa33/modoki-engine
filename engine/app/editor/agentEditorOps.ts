@@ -29,7 +29,7 @@ import {
   enterPlay, stopPlay, pausePlay,
   undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
-  getPendingBaseScenePaths,
+  getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
   isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
@@ -2687,51 +2687,270 @@ export function registerEditorAgentOps(): void {
     };
   });
 
-  /** Is a parked Inspector import-settings edit in the way of a Node-side sidecar operation — and,
-   *  if the caller said so, drop it. The WRITE-side counterpart to `read-asset-meta` (#872/#882).
+  /** The four kinds of unsaved state a Node route can be blind to (#889).
    *
-   *  `pendingMeta` lives HERE, in the renderer. Every `.meta.json` access that runs in the Node
-   *  backend is blind to it, and only two routes have ever asked the renderer back
-   *  (`read-asset-meta`, `apply-asset-path-moves`) — which is why this defect arrived one route at
-   *  a time: `/api/write-meta` destroys the park, `/api/reimport` bakes with the pre-edit disk
-   *  value and then loses its own fresh cache block to the park's next flush, and
-   *  `/api/duplicate-asset` copies the pre-edit document. One probe for all three, so route four
-   *  does not get to invent a fourth answer.
+   *  This is the vocabulary the Node side speaks; `CAUSE_REGISTRY` below is what ties it to the
+   *  renderer's own accounting so the two cannot drift. */
+  type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene';
+  /** ⚠️ `liveScene` is absent BY TYPE, not by a runtime check — see the op's header. */
+  type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>;
+  const ALL_REGISTRIES: readonly UnsavedRegistry[] =
+    ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+
+  type UnsavedCauses = ReturnType<typeof unsavedChangeCauses>;
+
+  /** Every cause `unsavedChangeCauses()` reports → the registry name it answers under.
    *
-   *  ⚠️ **`peekPendingMeta`, deliberately NOT `readMetaPreferringPark`.** The peek reads the map
-   *  and touches nothing; the helper records. That is the correction `read-asset-meta` already
-   *  carries as `passive` (see its header): an observer must not disarm the guard it observes.
-   *  Here it matters twice over, because a WRITE gate reading the registry has more power to
-   *  corrupt the state it is consulting than a read does, not less.
+   *  ⚠️ **`satisfies Record<keyof UnsavedCauses, …>` is the load-bearing part.** Add a sixth cause
+   *  in `serialize.ts` and this fails to compile until it is mapped, which is the only thing
+   *  standing between this probe and the silent under-coverage that made #889 a class rather than
+   *  a bug. Two causes deliberately share `liveScene`: `sceneDirty` is the PRIMARY scene (a bare
+   *  boolean, no path) and `dirtyScenes` is the loaded BASES (guids). One row for both, because
+   *  "does this file back a scene with unsaved live edits?" is one question to a caller. */
+  const CAUSE_REGISTRY = {
+    dirtyAssetPaths: 'dirtyAsset',
+    pendingImportSettings: 'pendingMeta',
+    pendingBaseScenes: 'pendingBaseScene',
+    sceneDirty: 'liveScene',
+    dirtyScenes: 'liveScene',
+  } as const satisfies Record<keyof UnsavedCauses, UnsavedRegistry>;
+
+  /** Does this cause hold something for `path`? Returns a `detail` string, `''` for "held, nothing
+   *  more to say", or `null` for "not held".
    *
-   *  ⚠️ **Probe and discard are ONE op, not two calls.** Two round trips leave a window in which a
-   *  human's park can land between "is anything parked?" and the write that was cleared to
-   *  proceed. Node is single-threaded and so is the renderer, so answering both in one op closes
-   *  it as far as this seam can.
+   *  ⚠️ **`null` vs `''` is the distinction, not truthiness.** A verdict string is always truthy
+   *  and an empty one is always falsy — branching on the return value rather than on `!== null`
+   *  is how a "held" row with no detail would silently vanish.
    *
-   *  ⚠️ **A discard cannot make a failed-read document parkable, and since #880 that is
-   *  STRUCTURAL rather than a decision this op makes.** It used to be one: the guard was a
-   *  path-keyed `readFailed` flag, `discardPendingMeta` deliberately left it armed, and the
-   *  accepted cost was that an agent discard could leave a path WEDGED for the panel. That flag
-   *  is gone. The guard is a tag on the fallback DOCUMENT now (`scene/metaReadFallback.ts`), so
-   *  this op has nothing to clear even in principle: a component still holding the `{}` fallback
-   *  is still refused, and a component whose OWN read succeeded is no longer punished for it.
-   *  #880's second face was removed rather than traded away. */
-  registerAgentOp('resolve-meta-park', (params) => {
-    const { paths, discard } = (params ?? {}) as { paths?: unknown; discard?: unknown };
-    if (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== 'string' || !p)) {
+   *  Same exhaustiveness contract as `CAUSE_REGISTRY`: a new cause must be given a matcher here
+   *  too, or this does not compile. Mapping it in one table and forgetting the other would be a
+   *  probe that names a registry it never actually inspects. */
+  type CauseMatcher = (
+    path: string, causes: UnsavedCauses, ctx: { primaryScenePath: string | null | undefined },
+  ) => string | null;
+  const CAUSE_HOLDS = {
+    dirtyAssetPaths: (p, c) => (c.dirtyAssetPaths.includes(p) ? 'an unsaved asset document' : null),
+    pendingImportSettings: (p, c) => (c.pendingImportSettings.includes(p) ? 'unsaved import settings' : null),
+    // ⚠️ Tri-state upstream: `peekBaseSceneEdit` returns `undefined` for "not pending" and `null`
+    // for "pending a CLEAR". The paths list flattens that correctly — presence IS pendingness —
+    // which is why this asks the list and not the peek.
+    pendingBaseScenes: (p, c) => (c.pendingBaseScenes.includes(p) ? 'an unsaved baseScene ref' : null),
+    sceneDirty: (p, c, x) => (
+      c.sceneDirty && x.primaryScenePath != null && x.primaryScenePath === p
+        ? 'unsaved live-world edits in the OPEN scene' : null),
+    dirtyScenes: (p, c) => {
+      // Path→guid, renderer-side, through the manifest the renderer already owns. A path that
+      // resolves to no guid simply is not a scene this registry could be holding.
+      const guid = getGuidForPath(p);
+      return guid !== undefined && c.dirtyScenes.includes(guid)
+        ? 'unsaved live-world edits in a loaded base scene' : null;
+    },
+  } as const satisfies Record<keyof UnsavedCauses, CauseMatcher>;
+
+  /** The registries a caller may ask this op to DROP, and how.
+   *
+   *  ⚠️ Keyed by registry so `Object.keys` is the honest answer to "what can be discarded" in the
+   *  refusal below — a hand-written second list there would drift from this one. `liveScene` is
+   *  absent because it is not discardable at all (see the op header), and its absence from
+   *  `DiscardableRegistry` is what makes that a type error rather than a runtime surprise. */
+  const DISCARDERS = {
+    dirtyAsset: (paths: string[]) => discardDirtyAssets(paths),
+    pendingMeta: (paths: string[]) => discardPendingMeta(paths),
+    pendingBaseScene: (paths: string[]) => discardPendingBaseScenes(paths),
+  } as const satisfies Record<DiscardableRegistry, (paths: string[]) => { discarded: string[] }>;
+
+  /** Every (path, detail) this cause is holding right now — the GLOBAL half of the probe.
+   *
+   *  ⚠️ Keyed off the same `CAUSE_*` tables as the per-path matchers, so the two modes cannot
+   *  answer differently about the same state. Two causes need translating rather than listing:
+   *  `sceneDirty` is a pathless boolean and gets the primary scene's own path, and `dirtyScenes`
+   *  holds GUIDs, which are resolved back to paths through the manifest — a guid handed to a Node
+   *  route as if it were a path would name a file that does not exist.
+   *
+   *  A guid that resolves to nothing is reported UNDER THE GUID rather than dropped: it still means
+   *  a scene has unsaved live edits, and silently omitting it would be "could not look" reported as
+   *  "nothing is there" inside the very probe written to stop that. */
+  const heldPathsFor = (
+    cause: keyof UnsavedCauses, causes: UnsavedCauses, primaryScenePath: string | null | undefined,
+  ): Array<[string, string]> => {
+    switch (cause) {
+      case 'dirtyAssetPaths':
+        return causes.dirtyAssetPaths.map((p) => [p, 'an unsaved asset document']);
+      case 'pendingImportSettings':
+        return causes.pendingImportSettings.map((p) => [p, 'unsaved import settings']);
+      case 'pendingBaseScenes':
+        return causes.pendingBaseScenes.map((p) => [p, 'an unsaved baseScene ref']);
+      case 'sceneDirty':
+        return causes.sceneDirty && primaryScenePath
+          ? [[primaryScenePath, 'unsaved live-world edits in the OPEN scene']]
+          : [];
+      case 'dirtyScenes':
+        return causes.dirtyScenes.map((guid) => {
+          const path = getAssetEntry(guid)?.path;
+          return path
+            ? [path, 'unsaved live-world edits in a loaded base scene']
+            : [guid, 'unsaved live-world edits in a loaded base scene (reported by guid — it '
+              + 'resolves to no manifest entry)'];
+        });
+    }
+  };
+
+  /** For the argument-error message only — what is held right now, so a caller that mis-shaped its
+   *  params still learns whether anything was in the way. */
+  const describeHeldNow = (): string => {
+    const c = unsavedChangeCauses();
+    const parts = [
+      ...c.dirtyAssetPaths.map((p) => `${p} (dirtyAsset)`),
+      ...c.pendingImportSettings.map((p) => `${p} (pendingMeta)`),
+      ...c.pendingBaseScenes.map((p) => `${p} (pendingBaseScene)`),
+      ...(c.sceneDirty ? [`${getCurrentScenePath() ?? '(the open scene)'} (liveScene)`] : []),
+      ...c.dirtyScenes.map((g) => `${g} (liveScene, by guid)`),
+    ];
+    return parts.join(', ') || '(nothing)';
+  };
+
+  /** **What unsaved state does this renderer hold for these paths?** The ONE probe every Node
+   *  backend route uses before it treats a file's bytes as current (#889).
+   *
+   *  ## The mechanism this answers
+   *
+   *  While an editor is open, DISK IS NOT THE SOURCE OF TRUTH for asset content — the renderer is.
+   *  Any Node-side decision that reads a file is wrong for exactly as long as the renderer holds a
+   *  newer copy, and the Node process has no way to notice. That arrived one route at a time:
+   *  `/api/write-meta` destroyed a park, `/api/reimport` baked pre-edit values, `/api/duplicate-
+   *  asset` copied a pre-edit sidecar (#872/#882) and then, in its OTHER branch, a pre-edit
+   *  DOCUMENT. Fixing each with its own registry probe is the shape #889 exists to prevent.
+   *
+   *  ## ⚠️ There are FIVE sources, and one of them is not a registry
+   *
+   *  The obvious list — the four modules in `editor/scene/` — is missing the most commonly edited
+   *  thing in the editor. `sceneDirty.ts` tracks BASE scenes only (its own header says so); the
+   *  PRIMARY scene's unsaved live-world state is `getEditVersion() !== _savedAtEditVersion`, a bare
+   *  pathless boolean in `serialize.ts`. A probe built by enumerating registry modules is VACUOUS
+   *  for the open scene, and nothing goes red. The name collision is what hides it: the CAUSE
+   *  called `sceneDirty` is the primary, while the MODULE called `sceneDirty.ts` supplies
+   *  `dirtyScenes` (the bases).
+   *
+   *  So the registry list is **derived from `unsavedChangeCauses()`**, which is already the
+   *  single-source-of-truth total. `CAUSE_HOLDS` below `satisfies` a record over its keys, so
+   *  adding a sixth cause is a COMPILE ERROR until it is mapped — rather than a probe that silently
+   *  stops covering it. A hand-written list here would be `CLAUDE.md`'s "hand-maintained list of
+   *  fields we read", and it would already be wrong by one.
+   *
+   *  ## Why the guid/path mismatch is reconciled HERE
+   *
+   *  `dirtyScenes` is keyed by scene GUID, the other three by asset-root URL. Node could map
+   *  path→guid through the manifest, but only the renderer knows which scenes are LOADED and which
+   *  is primary — and the primary's term is a boolean Node cannot compute at any key. Answering
+   *  here lets Node keep paths end to end, which is what every route already holds, and avoids a
+   *  second path→guid implementation beside `SceneManager`'s. Both scene cases report as one
+   *  `liveScene` row.
+   *
+   *  ⚠️ **`liveScene` is PROBE-ONLY.** Discarding live-world edits means reloading the scene, which
+   *  is `load_scene {discardUnsaved}`'s job; a second way to do it does not belong here. Encoded in
+   *  the type (`DISCARDABLE`), not in prose.
+   *
+   *  ⚠️ **Every read is a PEEK.** `unsavedChangeCauses()` reads the registries and records nothing —
+   *  the correction `read-asset-meta` carries as `passive`, and `resolve-meta-park` carried as
+   *  "`peekPendingMeta`, deliberately NOT `readMetaPreferringPark`". An observer must not disarm
+   *  the guard it observes, and a WRITE gate has more power to corrupt what it consults, not less.
+   *
+   *  ⚠️ **Probe and discard stay ONE op.** Two round trips leave a window in which a human's park
+   *  lands between "is anything held?" and the write that was cleared to proceed.
+   *
+   *  ⚠️ **`covers` is MANDATORY in the reply.** Without it a gate talking to a SKEWED renderer —
+   *  one that answers but does not implement a registry the caller asked about — is indistinguish-
+   *  able from "everything is clean". Node treats a short `covers` as `unknown`, not as clear.
+   *
+   *  Replaces `resolve-meta-park` outright rather than sitting beside it: two ops answering one
+   *  question is the parity problem in `docs/mcp-tool-conventions.md` §9, and it would leave the
+   *  next author the same choice that produced #889. Version skew fails in the SAFE direction — a
+   *  new backend against a stale tab gets `unknown agent op`, which Node classifies as `unknown`
+   *  and refuses on. */
+  registerAgentOp('resolve-unsaved', (params) => {
+    const { paths, registries, discard } = (params ?? {}) as {
+      paths?: unknown; registries?: unknown; discard?: unknown;
+    };
+    // ⚠️ `paths` OMITTED means "everything you hold", and that is a real mode rather than a
+    // convenience. `/api/unused-assets` and `/api/find-references` compute over the WHOLE project
+    // graph, so ANY unsaved document can change their answer — a dirty material adds a texture
+    // reference, a dirty scene adds or removes one. A path-scoped probe would under-report there
+    // and hand back a disclosure that looked precise and was incomplete. An EMPTY ARRAY is still
+    // an error: that is a caller who meant to name paths and computed none, and answering "nothing
+    // is held" to it is the fail-open this op exists to close.
+    const global = paths === undefined || paths === null;
+    if (!global && (!Array.isArray(paths) || !paths.length || paths.some((p) => typeof p !== 'string' || !p))) {
       throw new Error(
-        'resolve-meta-park requires { paths: [assetRootUrl, …] } — one or more non-empty asset-root '
-        + `URLs (e.g. /assets/textures/rock.png). Parked now: ${getPendingMetaPaths().join(', ') || '(none)'}`,
+        'resolve-unsaved requires { paths: [assetRootUrl, …] } — one or more non-empty asset-root '
+        + 'URLs (e.g. /assets/textures/rock.png) — or `paths` omitted entirely to ask about ALL '
+        + `unsaved state. Held now: ${describeHeldNow()}`,
       );
     }
-    const list = paths as string[];
-    const parked = list.filter((p) => peekPendingMeta(p) !== undefined);
-    // `discarded` is reported separately from `parked` rather than inferred from it: a caller that
-    // asked to discard needs to know what actually went, and the two lists differ the moment a
-    // path is named twice or the registry is emptied concurrently.
-    const discarded = discard === true && parked.length ? discardPendingMeta(parked).discarded : [];
-    return { ok: true, parked, discarded };
+    const list = global ? [] : paths as string[];
+    const asked = new Set<UnsavedRegistry>(
+      Array.isArray(registries) && registries.length
+        ? (registries as unknown[]).filter((r): r is UnsavedRegistry =>
+          (ALL_REGISTRIES as readonly string[]).includes(r as string))
+        : ALL_REGISTRIES,
+    );
+
+    const causes = unsavedChangeCauses();
+    const primaryScenePath = getCurrentScenePath();
+
+    const holds: Array<{ path: string; registry: UnsavedRegistry; detail?: string }> = [];
+    const push = (path: string, registry: UnsavedRegistry, detail: string) => {
+      // Two causes map to `liveScene`; a scene that is both primary-dirty and a dirty base must not
+      // produce two rows for one path, or every count downstream is doubled.
+      if (holds.some((h) => h.path === path && h.registry === registry)) return;
+      holds.push({ path, registry, ...(detail ? { detail } : {}) });
+    };
+    if (global) {
+      for (const [cause, registry] of Object.entries(CAUSE_REGISTRY) as Array<
+        [keyof UnsavedCauses, UnsavedRegistry]
+      >) {
+        if (!asked.has(registry)) continue;
+        for (const [path, detail] of heldPathsFor(cause, causes, primaryScenePath)) push(path, registry, detail);
+      }
+    }
+    for (const path of list) {
+      // ⚠️ Binds the KEY and indexes the table, rather than destructuring the matcher into a
+      // callable binding. Both spellings work; this one is not shaped like a listener fan-out, so
+      // it does not trip #888's guard — whose docblock says a fifth exemption is a decision rather
+      // than an append, and it is right. Restructuring costs nothing here.
+      for (const cause of Object.keys(CAUSE_HOLDS) as Array<keyof UnsavedCauses>) {
+        const registry = CAUSE_REGISTRY[cause];
+        if (!asked.has(registry)) continue;
+        // ⚠️ `!== null`, never truthiness — a matcher returns '' for "held, nothing more to say",
+        // and an empty string is falsy. Branching on the value would silently drop those rows.
+        const detail = CAUSE_HOLDS[cause](path, causes, { primaryScenePath });
+        if (detail !== null) push(path, registry, detail);
+      }
+    }
+
+    // Scoped discard. A bare boolean would let `discardUnsaved` on a sidecar route throw away a
+    // dirty particle document it never asked about — the over-reach `metaParkGate`'s single-
+    // registry scope hid by accident and a shared probe would expose for real.
+    const wantDiscard = new Set<string>(
+      Array.isArray(discard) ? (discard as unknown[]).filter((d): d is string => typeof d === 'string') : [],
+    );
+    const refusedDiscard = [...wantDiscard].filter((d) => !(d in DISCARDERS));
+    if (refusedDiscard.length) {
+      throw new Error(
+        `resolve-unsaved cannot discard ${refusedDiscard.join(', ')} — discardable registries are `
+        + `${Object.keys(DISCARDERS).join(', ')}. Live-world scene edits are dropped by reloading `
+        + 'the scene (load_scene with discardUnsaved), never by this probe.',
+      );
+    }
+    const discarded: Array<{ path: string; registry: UnsavedRegistry }> = [];
+    for (const registry of Object.keys(DISCARDERS) as DiscardableRegistry[]) {
+      if (!wantDiscard.has(registry)) continue;
+      const targets = holds.filter((h) => h.registry === registry).map((h) => h.path);
+      if (!targets.length) continue;
+      for (const path of DISCARDERS[registry](targets).discarded) discarded.push({ path, registry });
+    }
+
+    // `covers` is what the caller checks BEFORE reading `holds` as an answer — see the header.
+    return { ok: true, holds, discarded, covers: [...asked] };
   });
 }
 

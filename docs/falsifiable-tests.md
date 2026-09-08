@@ -277,6 +277,122 @@ world resolves correctly. Under a shared map the second registration simply over
 that assertion still passes. **Two instances is necessary, not sufficient — the assertion has to
 interrogate the STALE one.**
 
+### The World axis (#851) — and what running the census actually showed
+
+The third axis of shape (A)/(B): **a per-`World` cache's discriminant is unfalsifiable because no
+test holds two live `World`s while exercising that cache's read/write path in the same assertion.**
+The fixture is `engine/packages/modoki/tests/helpers/twoWorlds.ts`; copy it rather than deriving a
+fourth shape.
+
+⚠️ **The ordering is the whole mechanism: write A, write B, then read A BACK.** "Two worlds exist"
+is necessary and NOT sufficient. `guidIndex.test.ts` built two worlds, registered the same guid in
+both, and asserted only that the CURRENT world resolved correctly — which is exactly what a shared
+map produces under last-write-wins. Never assert on the world you wrote last.
+
+⚠️ **Honest scope.** Two koota `World`s coexist only transiently, during the two-world atomic scene
+swap, unlike #828's renderer axis where SceneView and GameView coexist permanently. This is a cover
+gap first and only possibly a live defect; a row count is not severity.
+
+⚠️ **A hand-traced census is a hypothesis. Running it moved a row.** #851 was filed READ-ONLY with
+the verdicts reached by reading each declaration and hand-tracing the suites. Executed, the
+`zoneEventBus` row was **wrong**: collapsing its `WeakMap` reddens 29 of 39 existing zone tests —
+not through any isolation assertion, but incidentally, because the module-level singleton then
+leaks subscribers between tests. `physicsEventBus` (32 tests) and `timelineEventBus` were confirmed
+blind, as filed. Two lessons: **incidental cross-test contamination is not coverage** (reorder the
+file and it may stop failing, which is why the deliberate assertion still earns its place), and a
+census that has not been run belongs in the issue as a hypothesis, not as a count.
+
+⚠️ **Mutate the way a careless FIX would, not by deleting the declaration.** Removing
+`subsByWorld` outright also breaks `__clear`'s reference to it, so the suite fails to compile and
+39 tests go red — which reads exactly like detection and is not. The valid mutation KEEPS the map
+and ignores the key (`get(ONE)`/`set(ONE, …)`): it compiles, it preserves every other behaviour,
+and it isolates the one property under test.
+
+⚠️ **Two live instances is not enough if the TEST supplies both key and value.** A case that does
+`registry.worlds.set(a, …)` then `registry.worlds.get(a)` asserts `Map.prototype`, not any
+production keying — it cannot fail under the prescribed mutation, because the mutation changes code
+the test never calls. Ask where the keying actually happens: for the physics registry it is at the
+CONSUMERS (`physics2DSystem` / `physics3DSystem` take `registry.worlds` and do their own
+`get(world)`/`set(world, st)`), so no test in the registry's own file can reach it. Test the thing
+the module itself decides — for that registry, WHICH world each teardown path frees.
+
+`physicsWorldRegistry` was flagged in the issue for escalation on the grounds that two koota
+`World`s sharing one Rapier instance might be prevented somewhere. It is not: `worlds` is a
+`Map<World, S>` whose `disposeAll` iterates it, and `onWorldSwap((next, old) => dispose(old))`
+frees the old world's WASM while the new one is already live. **Two entries coexisting is a
+designed state during the swap**, so a test is the right artifact — not an assertion at a
+prevention point that does not exist.
+
+### Shape (C): the test drives the WRONG COPY of the code
+
+The two shapes above are about how many INSTANCES a suite builds. This one is about which **copy**
+it runs. A file is a SOURCE that gets copied, bundled, staged or vendored into the place it
+actually executes — and the verification reads the source, or rebuilds its own private copy, so a
+stale or wrong SHIPPED artifact cannot fail it.
+
+Closed instances, which are the same sentence with different nouns: **#909** (a git hook is copied
+into the hooks dir, git runs the copy, the test spawned the source), **#685** (a re-vendored plugin
+tarball is never EXTRACTED — `npm install` says "up to date" and the native build ships the old
+plugin), **#215** (`bootstrap-game-deps` skips a project whose `node_modules` is stale, so "already
+installed" is true and wrong), and **#945** across the Electron packaging pipeline.
+
+**The rule: the test drives the artifact the shipping path produces.** Not a faithful rebuild of
+it — the rebuild is a second implementation, and it drifts.
+
+⚠️ **A rebuild does not merely fail to catch staleness; it drifts on its own.** `mcpBundle.test.ts`
+re-ran esbuild with options its own comment said "mirror `build-electron.mjs`", and by the time
+#945 was written the two had already diverged in two fields while staying green. The fix is a
+**declaration-only** module both sides import (`scripts/mcpBuildOpts.mjs`) — declaration-only
+because the builder runs `await esbuild.build(...)` at top level, so importing *it* for the options
+would run a build as an import side effect.
+
+⚠️ **Two claims, not one — do not collapse them.** "The shipped artifact runs" and "the bundle is
+self-contained" need different setups: the first spawns `dist/index.js` where it actually lives,
+the second builds into an isolated dir holding nothing else. The shipped file sits beside its own
+`node_modules` and cannot make the second claim. Keep both cases; the mutation check that proves
+they are different is *break the shipped file and watch only one go red*.
+
+⚠️ **Where the check already exists, look at whether its VERDICT survives.** The sharpest form of
+this class is not "nothing verifies it" but "something verifies it and throws the answer away".
+Both toolchain stagers already ran their staged binary (`toktx --version`; `msdf-atlas-gen`, which
+exits non-zero when dyld cannot resolve the dylibs the stager just relocated) and then
+`console.warn`ed the failure and continued — so a binary that could not run was staged, signed and
+shipped. Distinguish a **missing** optional tool (a legitimate graceful skip, `before-pack.cjs`'s
+documented contract) from a **staged-but-broken** one (a bad artifact that must stop the pack).
+
+The reference implementations of the right shape, for copying rather than re-deriving:
+`vendorPluginsIntegration.test.ts` (a real `npm pack`, then `verifyInstalledMatchesTarball`
+through the unmocked path), `packagedViteConfig.test.ts` (including its stale-leftover case), and the publish scanners, which run over `$STAGE` rather than the working tree.
+
+⚠️ **A staleness check keyed on MTIME is the wrong instrument twice over.** The first version of
+the MCP guard compared `dist/index.js`'s mtime against `src/index.ts`'s. The bundle inlines 22
+source files plus `node_modules`, so touching any of the other 21 left it green with a genuinely
+stale artifact — and an mtime comparison against a TRACKED file goes red after any
+`git merge`/`checkout` that rewrites that file's mtime without changing what it produces, i.e. a
+false red on the worker-merges-main flow, on a step `verify` does not even run. **Compare CONTENT**:
+rebuild with the shared options into a tmpdir and diff the bytes. Any change to any input changes
+the output and nothing else does. That rebuild is an *oracle for currency*, not a substitute for
+the artifact — the shipped file is still the thing that gets spawned.
+
+⚠️ **A byte comparison also tells you when a mutation was INVALID, and this matters for the bar.**
+Two obvious-looking mutations of that guard left it green and were both correct to: a comment-only
+edit, and adding an unused export (tree-shaken). Neither changes the artifact, so the bundle really
+was current. Only a *reachable semantic* change reddens it. "The test stayed green" is a finding
+about your mutation before it is a finding about the test.
+
+⚠️ **Know which runs your guard is actually live on.** `dist/` is gitignored and CI never runs
+`build:electron`, so both shipped-artifact cases skip on every CI run — they are a
+developer-machine guard, not a CI gate. Say that in the suite rather than letting the coverage be
+overread; what actually stops a stale bundle shipping is that every packaging path re-runs the
+builder.
+
+⚠️ **What a text scan of a build script CANNOT tell you** is whether the artifact works — only that
+the code says it will check. Where a hook is context-driven (`copy-three-addons`'s `appOutDir` /
+`projectDir`) drive the real hook against a staged tree in a tmpdir. Where it writes to a fixed
+repo path (the stagers' module-level `BIN_DIR`), a unit test would write into the checkout, so the
+end-to-end claim belongs to `verify:packaged` and stays open until a pack fixture exists. Say which
+half you covered.
+
 ## Gotchas
 
 ⚠️ **`onWorldSwap` is a re-export, and that is what makes this invisible.** It is defined in

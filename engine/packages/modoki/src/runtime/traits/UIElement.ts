@@ -244,6 +244,52 @@ export const UIElement = trait({
    * "swallow even though I have no binding of my own."
    */
   swallowClicks: false,
+  /**
+   * Minimum size of this element's TAP ZONE, in both axes. `0` (the default) = off.
+   *
+   * The rule: a finger needs ~44pt (Apple HIG) / 48dp (Material) to hit reliably, but an icon
+   * control's ARTWORK is usually smaller than that. This field raises the area that RECEIVES the
+   * tap without changing the area that DRAWS — the two are separate boxes, and every other field
+   * on this trait moves them together.
+   *
+   * ⚠️ **It changes NO layout.** Not width, not height, not the drawn glyph, not where a sibling
+   * sits. The renderer emits a transparent, absolutely-positioned expander INSIDE this element
+   * (`UINode.tsx`), centred on it and sized `max(100%, minTapSize)` per axis, so a value smaller
+   * than the element is a no-op and a larger one grows only the hit region. That is why this
+   * field lives here beside the pointer fields and NOT beside `minWidth`/`minHeight`: those are
+   * layout minimums and they scale a `contain` background with the box, which is precisely the
+   * thing this field exists to avoid.
+   *
+   * ⚠️ **`minWidth`/`minHeight` and `padding` are NOT alternatives to this, and both fail
+   * SILENTLY** (#948, measured on a live editor). Padding does nothing at all: `UINode.tsx` sets
+   * `boxSizing: 'border-box'`, so with a definite `width`/`height` padding is carved out of the
+   * fixed box rather than added to it, and the background is drawn at the CSS default
+   * `background-origin: padding-box`, so it does not shrink the glyph either. Court's
+   * `SettingsClose` given `padding: 10px` on all four sides re-measured at exactly its original
+   * 17.242px. `minWidth`/`minHeight` DO grow the box — and scale the artwork with it.
+   *
+   * ⚠️ **Inert on a node that takes no click** (no click binding and no `swallowClicks`). An
+   * enlarged tap zone on a decorative element would start swallowing taps meant for what is
+   * behind it, so the expander is only emitted for a node that would have handled the tap anyway.
+   *
+   * ⚠️ **Clipped away by `overflow: 'hidden' | 'scroll'`** — the expander is a child, so the
+   * element's own clip cuts it back to the box and this field does nothing. A DEV warning names
+   * that combination rather than leaving it silent.
+   *
+   * ⚠️ **Inert on an element type that cannot HOST a child** — `input`, `range` and `UIToggle`.
+   * An `<input>` is a void element and a toggle owns its own inner layout. Also a DEV warning; to
+   * grow one of these, wrap it in a `div` carrying the click binding and author this there.
+   *
+   * ⚠️ **It protects this element's own children, NOT its siblings — so this is an authoring
+   * decision about a layout, not a value that is safe everywhere.** The expander sits at the
+   * PARENT's z-order among siblings, so a zone overhanging a sibling that paints lower takes
+   * presses inside the overlap. Use it where there is clearance; fix the spacing instead on a
+   * control packed against an interactive neighbour.
+   *
+   * Reference, and the two fix shapes that were rejected: `docs/ui-system.md` § "Tap zones".
+   */
+  minTapSize: 0,
+  minTapSizeUnit: 'px' as UILengthUnit,
 
   // ── Style (box visuals) ──
   /** Background fill colour. ⚠️ **Inert on its own** — see `backgroundOpacity` below, which

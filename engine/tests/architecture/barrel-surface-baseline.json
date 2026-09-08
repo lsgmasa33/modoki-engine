@@ -612,6 +612,7 @@
   "isRecoveryAbandoned",
   "isScenePaintPending",
   "isSimRunning",
+  "isStoreCancelled",
   "isTierCalibrationArmed",
   "isTimelinePreviewActive",
   "isTouchDevice",

@@ -704,7 +704,39 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
  *  own save looks external and bounces the live scene (the Windows Ctrl+S full-reload
  *  bug). Fold the drive letter to a single case and unify separators so both spellings
  *  collapse to one key. A no-op on POSIX paths (no drive letter, no backslashes), so
- *  Linux/macOS keying is unchanged. */
+ *  Linux/macOS keying is unchanged.
+ *
+ *  ⚠️ **TWO consumers, not one.** `engine/electron/assetBackend.ts` imports this for the
+ *  Electron main-process watcher's own inline guard (deliberately not `createEditorWriteGuard`,
+ *  to keep a Vite-plugin module out of the main process). Any cost added here is paid at BOTH
+ *  watchers, on the chokidar hot path — several events per save.
+ *
+ *  ⚠️ **This deliberately does NOT resolve symlinks, and that is settled — do not "fix" it**
+ *  (#960, closed not-planned). The two operands genuinely come from DIFFERENT producers, so the
+ *  "same producer, correct by construction" reasoning does not apply: `mark` receives
+ *  `fromFsUrl(<client-supplied /@fs string>)` (`editorBackendRouter.ts`), while `isWrite`
+ *  receives chokidar's path, built from `findAssetRoots(projectRoot)`. Neither chain calls
+ *  `realpath` anywhere.
+ *
+ *  What makes the symlink direction unreachable is a check UPSTREAM of this one: the same
+ *  `/@fs/` branch gates on containment first —
+ *      `const rel = path.relative(ctx.projectRoot, abs)` → `..` ⇒ **403**
+ *  — so a client spelling that differs from `projectRoot`'s by a symlink is REFUSED before a key
+ *  is ever built. Measured both directions against a real symlinked tree (logical root + physical
+ *  client, and the reverse): both 403, with a positive control confirming the probe does report a
+ *  guard miss when one exists. A `realpathSync.native` here would be insurance against a state
+ *  the containment check already rejects — and a syscall per watcher event to buy it.
+ *
+ *  The drive-letter direction, which this DOES fold, is the reachable one: `path.relative` on
+ *  win32 is case-insensitive, so a case-flipped drive passes containment and then misses the Map.
+ *
+ *  ⚠️ **Adjacent and NOT resolved** (noted here so the next reader does not have to re-derive the
+ *  above to reach it): if a client's `/@fs/` spelling can ever differ from `projectRoot`'s, that
+ *  403 is itself the bug — every save through a symlinked `MODOKI_PROJECT` would fail, which is
+ *  worse than a missed guard. `buildProjectRoot` is a lexical `path.resolve` of `MODOKI_PROJECT`
+ *  while Vite mints `/@fs/` from its own module resolution. NOT OBSERVED — the question was found
+ *  while refuting #960 and is out of its scope. The cheap check is to open the editor through a
+ *  symlinked project path and Ctrl+S. */
 export function normalizeWriteGuardKey(absPath: string): string {
   return absPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
 }

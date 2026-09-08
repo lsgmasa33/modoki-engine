@@ -52,6 +52,7 @@ export interface UINodeData {
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
   alignSelf: string; zIndex: number; rotation: number; scale: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean; swallowClicks: boolean;
+  minTapSize: number; minTapSizeUnit: string;
   scrollbarStyle: string; scrollbarThumbColor: number; scrollbarTrackColor: number;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
@@ -422,6 +423,7 @@ function buildTree(world: World): UINodeData[] | null {
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         swallowClicks: ui.swallowClicks === true,
+        minTapSize: ui.minTapSize || 0, minTapSizeUnit: ui.minTapSizeUnit || 'px',
         scrollbarStyle: ui.scrollbarStyle || 'auto',
         scrollbarThumbColor: ui.scrollbarThumbColor ?? 0x888888,
         scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,

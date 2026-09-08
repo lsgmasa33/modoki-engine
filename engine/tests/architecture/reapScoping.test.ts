@@ -16,12 +16,18 @@
  *  (a variable holding one — `$REPO/...`, `$APP/...`). Anything starting with a bare word
  *  is a shared name and fails.
  *
- *  KNOWN GAP, accepted: the Windows branch of `killPackaged` uses
- *  `taskkill /F /IM <productName>.exe`, which matches by image name and so is
- *  clone-agnostic by construction — `taskkill` has no command-line matching to scope it
- *  with. It is tolerated because the Windows setup is one clone per machine (CLAUDE.md
- *  § Clones); if that ever stops being true, this needs a PID-based reap, not a wider
- *  regex here. Stated so the guard is not mistaken for covering it. */
+ *  ⚠️ **A KNOWN GAP recorded here is now CLOSED — do not reinstate it.** This header used to
+ *  accept that the Windows branch of `killPackaged` was `taskkill /F /IM <productName>.exe`,
+ *  clone-agnostic by construction. That branch is now PowerShell + `Win32_Process` filtered on
+ *  `ExecutablePath`, scoped to the app dir as a directory prefix, and `packagedAppPaths.test.ts`
+ *  asserts `taskkill /IM` never comes back. The note is kept in this form rather than deleted
+ *  because a stale "accepted gap" reads as licence, and someone re-reading it would conclude the
+ *  Windows reap is still unscoped.
+ *
+ *  What this guard STILL does not cover on either platform is the SECOND SPELLING (#913/#959) —
+ *  a pattern can be perfectly absolute and still miss, because the clone was reached by a
+ *  symlink and the process's argv carries the other spelling. Rule 4 below covers the bash side;
+ *  `killPackagedGuard.test.ts` covers the JS side by driving a manufactured symlink. */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -128,6 +134,55 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
       offenders,
       'a `pkill -f` pattern led by a bare $VAR/${VAR} looks scoped in source but is not — use '
         + '${VAR:?message} so an empty variable aborts loudly instead of silently reaping every clone',
+    ).toEqual([]);
+  });
+
+  it('a `pkill -f` fragment reaped under a clone root is reaped under BOTH spellings (#959)', () => {
+    // Rules 1-3 make a pattern ABSOLUTE and non-empty. None of them makes it HIT. A clone (or a
+    // temp dir — on macOS `/var` is itself a symlink to `/private/var`) reached through a symlink
+    // puts the LOGICAL spelling in `pwd` while a process launched another way carries the
+    // PHYSICAL one in its argv, so a reap holding one spelling matches nothing and the `|| true`
+    // swallows it. `dev:stop` shipped exactly that for months (#908), and `test-packaged.sh` kept
+    // it after #913 fixed the shared helper (#959).
+    //
+    // The check: group every named-variable `pkill -f` pattern in a file by the fragment that
+    // follows the variable. Each fragment must be reaped under at least TWO distinct root
+    // variables — `${REPO:?…}/x` alongside `${REPO_PHYS:?…}/x`. Two sequential invocations,
+    // never an ERE alternation: `pkill -f "$A|$B"` with either side empty matches every process
+    // on this machine (#69), so the shape has to be incapable of it.
+    //
+    // ⚠️ **This deliberately does NOT accept a computed alternate** (`ALT="$(reap_alt_pattern …)"`,
+    // then `pkill -f "$ALT"`). That is the obvious move and rule 3 above rejects it — a
+    // variable-led pattern must use `${VAR:?}`, while `${ALT:?}` is WRONG here because an empty
+    // alternate is the NORMAL case (no symlink in the path) and would abort the script on every
+    // ordinary run. The two spellings are spelled out. The cost is a little duplication against
+    // `lib/repo-reap.sh`; the alternative is a pattern this guard cannot see.
+    const offenders: string[] = [];
+    for (const file of scriptFiles()) {
+      if (!file.endsWith('.sh')) continue;
+      const src = stripComments(fs.readFileSync(file, 'utf8'), true);
+      // <leading named variable> <the rest of the pattern>
+      const re = /pkill\s+(?:-\w+\s+)*-f\s+"\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::\?[^}]*)?\}?([^"]*)"/g;
+      const byFragment = new Map<string, Set<string>>();
+      for (let m = re.exec(src); m; m = re.exec(src)) {
+        const [, varName, fragment] = m;
+        if (!byFragment.has(fragment)) byFragment.set(fragment, new Set());
+        byFragment.get(fragment)!.add(varName);
+      }
+      for (const [fragment, vars] of byFragment) {
+        if (vars.size < 2) {
+          offenders.push(
+            `${path.relative(scriptsDir, file)}: "${fragment}" is reaped only under `
+              + `\${${[...vars][0]}} — no second spelling`,
+          );
+        }
+      }
+    }
+    expect(
+      offenders,
+      'a reap holding ONE spelling of the clone root silently matches nothing when the clone is '
+        + 'reached through a symlink (#913/#959) — derive the physical root too (`pwd -P`) and '
+        + 'reap the same fragment under both, as two separate pkill calls (never "$A|$B", #69)',
     ).toEqual([]);
   });
 

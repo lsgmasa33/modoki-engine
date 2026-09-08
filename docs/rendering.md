@@ -510,7 +510,21 @@ would ship the whole Three node pipeline into a `render3d:false` build (#214). I
 still dies with its source; a 2D-only build never imports the module and the registry stays empty.
 It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
-### The r185 bump — measured, and what it did NOT fix
+### The r185 bump — measured, REVERTED, and now capped
+
+⚠️ **WE ARE NOT ON r185 AND MUST NOT GO THERE. `three` is pinned to `0.184.0`** (#956): r185
+**black-screens EVERY iOS device on first launch after a clean install**. Everything below is a
+record of what the bump *would* buy, kept because the measurement is real and #957 will want it —
+**it is not a recommendation, and it was read as one.** This section previously ended on "a 67% cut
+in texture-memory growth for a dependency bump" with no mention of the regression, which made the
+doc a developer reads before touching three's version argue for crossing the ceiling (#966).
+
+⚠️ **No gate can catch the regression.** The repro is first-launch-on-a-cold-install only; a warm
+pipeline cache hides it, and `npm run verify`, `verify:all`, both CI legs and both signed release
+builds were all green on the affected tree. The ceiling is therefore asserted as a DECLARATION:
+`engine/tests/architecture/threeVersionCeiling.test.ts` (the installed version, plus both manifests
+that declare `three`) and a `three` ignore entry in `.github/dependabot.yml`. Raising it needs an
+on-device clean-install check — that is #957, and it is the only thing that can observe the defect.
 
 three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
 fixture, same probe, same island↔empty cycle:
@@ -525,9 +539,10 @@ fixture, same probe, same island↔empty cycle:
 A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
 as predicted — it was the `modelOwners` ownership gap, not a three defect.
 
-⚠️ `"three": "^0.184.0"` is a 0.x caret (`>=0.184.0 <0.185.0`), so a plain `npm install` will NOT pick
-0.185.1 up; the range must be bumped explicitly. **0.185.0 and 0.185.1 are the only releases after
-0.184.0** — there is nothing further to bump to.
+⚠️ `"three"` is now an **exact pin** (`0.184.0`, no caret) and the engine package's peer range carries
+the matching ceiling (`>=0.183.0 <0.185.0`), so neither a plain `npm install` nor a lockfile
+regeneration can pick 0.185.x up. **0.185.0 and 0.185.1 are the only releases after 0.184.0** — so
+the cap costs nothing today beyond the env-leak win recorded above.
 
 **What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
 `pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to

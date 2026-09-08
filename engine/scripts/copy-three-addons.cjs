@@ -22,9 +22,22 @@ exports.default = async function copyThreeAddons(context) {
   const src = path.join(packager.projectDir, 'node_modules', 'three', 'examples', 'jsm');
   const dest = path.join(resourcesDir, 'app.asar.unpacked', 'node_modules', 'three', 'examples', 'jsm');
 
+  // ⚠️ **FAIL the pack — do not warn and return** (#945 B4). This used to skip silently, and a
+  // skip here ships an app in which three/examples/jsm is absent: no GLTFLoader, no HDRLoader,
+  // no OrbitControls, so NO GLB OR HDR LOADS AND NO SCENE RENDERS. Nothing downstream catches
+  // it — the app starts, the window opens, and the viewport is empty — so the only signal was a
+  // warning in a packaging log nobody reads.
+  //
+  // Unlike the toolchain stagers in before-pack.cjs, "absent" is not a legitimate state here:
+  // those stage OPTIONAL native tools that a build machine may genuinely lack (the app degrades
+  // to source textures), whereas `three` is a hard dependency that npm install always provides.
+  // Its absence means the packing environment is broken, and a broken pack must not be signed.
   if (!fs.existsSync(src)) {
-    console.warn(`[copy-three-addons] source not found, skipping: ${src}`);
-    return;
+    throw new Error(
+      `[copy-three-addons] three/examples/jsm not found at ${src} — refusing to pack. `
+        + 'Without it the packed app cannot load any GLB or HDR and renders nothing. '
+        + 'Run `npm install` in the project dir before packing.',
+    );
   }
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.cpSync(src, dest, { recursive: true });

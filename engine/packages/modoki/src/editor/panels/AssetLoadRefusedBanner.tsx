@@ -156,3 +156,26 @@ export function ParkAdoptedBanner(
 }
 
 export default AssetLoadRefusedBanner;
+
+/** The notice a modal asset editor shows IN the dialog when its **Save** did not write (#901).
+ *
+ *  ⚠️ **Not an `AssetLoadRefusedBanner`, deliberately.** That one is about a failed LOAD and offers
+ *  a Retry; this is about a refused SAVE in a dialog that is already staying open, where the retry
+ *  is the dialog's own Save button and a second one beside it would be two ways to do one thing.
+ *  What they share is the palette — and this file's header warns that a hand-rolled copy of those
+ *  colour literals is exactly what it exists to prevent, which is why this lives here rather than
+ *  in each modal.
+ *
+ *  The WORDING is not here: it is `panels/saveRefusal.ts`, so the two modals cannot drift and the
+ *  decision is unit-testable without mounting a dialog (`docs/editor.md` § Panels).
+ *
+ *  ⚠️ **`role="alert"` is load-bearing, not decoration.** The message appears in a modal the human
+ *  is already looking at, but it appears *after* a click on a control that visibly did nothing —
+ *  the exact case a screen reader user gets no signal for otherwise. */
+export function SaveRefusedNotice({ message, uiId }: { message: string; uiId: string }) {
+  return (
+    <div data-ui-id={uiId} role="alert" style={{ ...wrap, margin: 0, flex: 1, textAlign: 'left' }}>
+      <span>{message}</span>
+    </div>
+  );
+}

@@ -15,7 +15,7 @@ export type {
   IapGrant,
   ProductKind, IapProduct, IapProductInfo, StoreTransaction, PurchaseOutcome, PurchaseResult,
 } from './types';
-export { type StoreBackend, NoopStoreBackend } from './storeBackend';
+export { type StoreBackend, type StoreCancelled, NoopStoreBackend, isStoreCancelled } from './storeBackend';
 export { IapLedger, type IapLedgerStore } from './ledger';
 export { type PurchaseVerifier, LocalVerifier } from './verifier';
 export {

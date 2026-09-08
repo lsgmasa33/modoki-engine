@@ -138,4 +138,16 @@ export interface PurchaseResult {
   readonly transactionId?: string;
   /** Present only when `outcome === 'failed'` — for logs, never for display verbatim. */
   readonly error?: string;
+  /** WHICH cancel this was, when the platform could say — `'storekit.result.userCancelled'` for
+   *  StoreKit returning `.userCancelled` outright, a `classify()` string like
+   *  `'storekit.userCancelled'` or `'ASDErrorDomain:...'` for a THROWN error that merely looked
+   *  like one, `'play.userCanceled'` on Android. Absent when the backend offered no reason.
+   *
+   *  ⚠️ **Diagnostic only — it must never change what the player is told or which analytics event
+   *  fires** (#946). A cancel stays `purchase_cancelled` and never `purchase_failed`; that split is
+   *  about the funnel, not about the error identity. This field exists because a purchase the
+   *  player CONFIRMED came back `cancelled` and nothing recorded could say whether Apple cancelled
+   *  it or an ASD/AMS fault was misclassified as one — the two need opposite responses, and until
+   *  this field there was no way to tell them apart on the NEXT occurrence either. */
+  readonly cancelReason?: string;
 }

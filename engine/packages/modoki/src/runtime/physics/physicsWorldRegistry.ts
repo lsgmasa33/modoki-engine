@@ -21,6 +21,15 @@ export interface PhysicsWorldRegistry<S> {
   dispose(world: World): void;
   /** Free ALL worlds' WASM (called on Play→Stop so the next Play rebuilds fresh). */
   disposeAll(): void;
+  /** Free everything AND unregister this registry's global Stop/world-swap hooks.
+   *
+   *  Production never calls this — the two registries are module-load singletons and are meant to
+   *  live for the process. It exists because the factory otherwise has NO teardown at all, so
+   *  every extra call leaks two listeners onto module-global sets that keep firing afterwards.
+   *  That is invisible in production (two calls, ever) and not invisible in a test file that
+   *  builds a registry per case: the survivors run `disposeAll()` on dead registries at the next
+   *  `setPlayState('stopped')` or world swap. Added in the #851 close-out review. */
+  disposeRegistry(): void;
 }
 
 /** Build a physics world registry. `freeState(state)` must release every WASM handle the state
@@ -41,11 +50,14 @@ export function createPhysicsWorldRegistry<S>(freeState: (state: S) => void): Ph
   };
 
   // On Stop, discard every sim so the next Play rebuilds from the reverted authored transforms.
-  onPlayStateChange(() => { if (getPlayState() === 'stopped') disposeAll(); });
+  const offPlayState = onPlayStateChange(() => { if (getPlayState() === 'stopped') disposeAll(); });
   // Each scene load creates a NEW koota world and destroys the old one; setCurrentWorld fires
   // this synchronously with the old world still alive, so free its Rapier state here —
   // otherwise a shipped game (which never Stops) leaks a Rapier world per scene swap.
-  onWorldSwap((_next, old) => dispose(old));
+  const offWorldSwap = onWorldSwap((_next, old) => dispose(old));
+  // Both unsubscribes were previously DISCARDED. Keeping them costs nothing and is what makes
+  // `disposeRegistry` possible — see its doc comment for why that matters.
+  const disposeRegistry = (): void => { disposeAll(); offPlayState(); offWorldSwap(); };
 
-  return { worlds, dispose, disposeAll };
+  return { worlds, dispose, disposeAll, disposeRegistry };
 }

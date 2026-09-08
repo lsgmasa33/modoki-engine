@@ -910,6 +910,38 @@ the walk.
 ⚠️ **It reads FILES ON DISK.** An unsaved live-world edit is invisible to it, so a user who just
 wired something up and did not save will be told "0 references". Save first.
 
+## What verifies a copied-into-place artifact (#945)
+
+Several steps in this pipeline COPY, bundle, stage or vendor a file into the place it actually
+runs: `build-electron.mjs` bundles the MCP into `engine/tools/modoki-mcp/dist/index.js`;
+`before-pack.cjs` stages `toktx`/`msdf-atlas-gen` into `build/bin/`; `copy-three-addons.cjs`
+(`afterPack`) restores `three/examples/jsm` into `app.asar.unpacked`; `scaffold-project.mjs` copies
+the starter template.
+
+⚠️ **A verification aimed at the SOURCE, or at a private rebuild, cannot fail when what ships is
+stale or wrong** — the whole class, its closed members and the fix shape are in
+[falsifiable-tests.md](falsifiable-tests.md) § "Shape (C): the test drives the WRONG COPY".
+Before adding a step here, read it: the rule is that **the test drives the artifact the shipping
+path produces**, and a faithful-looking rebuild of the build options is a second implementation
+that drifts.
+
+Two consequences worth knowing when touching this pipeline:
+- **`mcpOpts` lives in `engine/scripts/mcpBuildOpts.mjs`**, a declaration-only module, so the test
+  and the builder share one copy. Do not restate those options anywhere.
+- ⚠️ **A hook that can now THROW must not strand `beforePack`'s output.** `after-pack.cjs` runs
+  `cleanViteConfig` in a `finally`, because it deletes the `engine/vite.config.cjs` that
+  `beforePack` emitted into the SOURCE tree — skip it and `packagedViteConfig.test.ts` reddens
+  `npm run verify` until a human deletes the file, and every later dev build uses a config frozen
+  at the failed pack.
+- ⚠️ **A stager that fails must remove what it staged.** Both win32 stagers short-circuit on
+  `fs.existsSync(out)` *before* their sanity run, so a broken binary left in `build/bin` makes the
+  NEXT pack skip staging AND verification and sign an app around it. macOS re-copies every run and
+  does not have this hole — the asymmetry is the idempotence early-return.
+- **A stager that finds its tool ABSENT still skips gracefully** (`before-pack.cjs`'s contract — a
+  build machine may legitimately lack `toktx`). A stager that stages a binary which then FAILS TO
+  RUN now throws and stops the pack, and `copy-three-addons` throws on a missing source rather
+  than shipping an app in which no GLB or HDR loads. Those two states are different; keep them so.
+
 ## Packaged editor loop (test the DMG faithfully, fast)
 
 ⚠️ **Why the packaged reaper is anchored to a bundle PATH, and must stay that way.** For months,

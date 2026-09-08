@@ -1472,3 +1472,61 @@ describe('a park must be built on a read OF THAT PATH (#890/#891/#897)', () => {
     expect(errors.join('\n'), 'the failed-read message, not the never-read one').toContain('read failed');
   });
 });
+
+describe('the flush can NEVER carry a failed-read document — the reachability fact (#901)', () => {
+  /** ⚠️ **This test exists because a fix of mine was UNREACHABLE and two mutation checks stayed
+   *  green while I believed otherwise.**
+   *
+   *  The reasoning that produced the dead code: `writeMetaConditional` refuses a document built on
+   *  a failed read, that refusal reaches `MetaFlushResult.failed`, so give it a structured flag and
+   *  its own `toastForSave` sentence — the way `conflict` already works. Every step follows from
+   *  the last, and the FIRST one is false: `classifyMetaPark` refuses such a document at PARK time
+   *  (`reason: 'failed-read'`), so it never enters the pending map, so the flush never writes it,
+   *  so the endpoint's refusal is unreachable from here. The flag, the carry and the toast clause
+   *  were all written, all passed their tests, and could not fire in production.
+   *
+   *  So this pins the FACT rather than the dead branch: park refuses first. If that ever changes,
+   *  this goes red and whoever changes it learns that `flushPendingMeta` suddenly has a new failure
+   *  mode the save toast says nothing about. */
+  it('parkMetaEdit refuses a failed-read document, so it never reaches the flush', () => {
+    const verdict = parkMetaEdit(TEX, metaReadFallback());
+
+    expect(verdict.parked, 'the park is the FIRST guard, and it is the one that fires').toBe(false);
+    expect(hasPendingMeta(), 'nothing parked means nothing for the flush to write').toBe(false);
+    expect(getPendingMetaPaths()).toEqual([]);
+  });
+
+  it('and so a flush over it writes nothing and reports nothing', async () => {
+    parkMetaEdit(TEX, metaReadFallback());
+    const out = await flushPendingMeta();
+
+    expect(out.saved).toEqual([]);
+    expect(out.failed, 'no failure to report — the work never became pending').toEqual([]);
+    expect(bodies, 'and nothing was POSTed').toEqual([]);
+  });
+
+  it('ACCEPT SIDE: a properly-read document parks and flushes normally', async () => {
+    // The control. Without it the two assertions above are equally satisfied by a park that
+    // refuses EVERYTHING, which would be a far worse bug wearing a passing test.
+    parkAsPanel(TEX, { id: 'guid-1', maxSize: 512 });
+    expect(hasPendingMeta()).toBe(true);
+
+    const out = await flushPendingMeta();
+    expect(out.saved).toEqual([TEX]);
+    expect(out.failed).toEqual([]);
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('a plain write failure IS reported, and carries no unreadable remedy', async () => {
+    // The other control: the flush's failure path still works and still says the retryable thing.
+    // `toastForSave` has exactly two import-setting buckets — conflict and plain — and this is why
+    // a third would have had no input.
+    reply = { status: 500, body: {} };
+    parkAsPanel(TEX, { id: 'guid-1', maxSize: 512 });
+    const out = await flushPendingMeta();
+
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].conflict, 'a 500 is not a 409').toBeFalsy();
+    expect(hasPendingMeta(), 'report, never revert').toBe(true);
+  });
+});

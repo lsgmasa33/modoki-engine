@@ -29,8 +29,21 @@ export declare function clearViteCache(): string[];
  *  instance, any clone" — the deliberate machine-wide case. */
 export declare function winKillCommand(appDir?: string, name?: string): string;
 
+/** The clone's OTHER spelling of an absolute path (`realpathSync.native`), or null when there is
+ *  no distinct one — no path, unresolvable, non-absolute, or identical. `reap_alt_pattern`'s
+ *  contract from `lib/repo-reap.sh`, in JS (#959). */
+export declare function altPathSpelling(p?: string): string | null;
+
+/** How a reap turned out. `exit 0` is right for all three, but they are not the same event and
+ *  collapsing them into one silent catch is what made every bash caller's `|| true` structural
+ *  (#944). */
+export declare const REAP_KILLED: 'killed';
+export declare const REAP_NONE: 'none';
+export declare const REAP_ERROR: 'error';
+export type ReapOutcome = typeof REAP_KILLED | typeof REAP_NONE | typeof REAP_ERROR;
+
 /** Kill a leftover packaged instance. `appDir` omitted means "any packaged instance, any
  *  clone" (a caller that means that deliberately — see the .mjs source comment). Throws on EVERY
  *  platform when `appDir` is passed but empty/implausibly short: since the Windows branch became
  *  path-scoped too, an empty value would widen the match there just as it does on POSIX. */
-export declare function killPackaged(appDir?: string, name?: string): void;
+export declare function killPackaged(appDir?: string, name?: string): ReapOutcome;

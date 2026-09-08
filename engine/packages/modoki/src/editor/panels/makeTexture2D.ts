@@ -15,6 +15,36 @@ import { backendFetch } from '../backend/editorBackend';
 import { deriveSettingsForType, type TextureImportSettings } from '../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
 import { flushPendingMetaFor, writeMetaWholesale } from '../scene/pendingMeta';
+import { useEditorStore } from '../store/editorStore';
+
+/** #901: this action has NO panel of its own — it fires from the SpritePicker's list of spriteless
+ *  textures and, when it refuses, nothing stays on screen to carry an in-flow notice. That is the
+ *  case the toast exists for (the rule, and the inline alternative for surfaces that DO own a
+ *  window, is in `panels/saveRefusal.ts`).
+ *
+ *  ⚠️ Reached through the store, not through `scene/pendingMeta`'s local `refuseWithToast`.
+ *  `pendingMeta.ts` imports `assetViews/widgets.tsx`, so importing the helper back from a panel
+ *  module risks the cycle that produced `scene/metaReadFallback.ts` — but `showToast` is a STORE
+ *  action and `store/editorStore.ts` imports no panels, so this seam has no cycle at all. */
+function refuseWithToast(consoleMessage: string, toastMessage: string): void {
+  console.error(consoleMessage);
+  // Never let a reporting failure swallow the refusal itself — the console line above is the
+  // record, and the guard must behave identically whether or not a toast host is mounted.
+  try { useEditorStore.getState().showToast(toastMessage, 'warn'); } catch { /* reported above */ }
+}
+
+/** ⚠️ Hoisted, not inlined at the call sites. `metaReadPreferringPark.test.ts`'s positive control
+ *  for this file's `'aborts'` exemption matches an `if (!x.ok)` whose body reaches `return false`
+ *  within a proximity window — a deliberate shape check, and a multi-line message inlined in the
+ *  branch pushes the return outside it. Keeping the wording out here preserves that guard at full
+ *  strength instead of widening its window to accommodate prose, and it puts the two sentences
+ *  side by side where a drift between them is visible. */
+const UNREADABLE_TOAST =
+  '⚠ Could not make that texture 2D — its import settings could not be read, and converting '
+  + 'anyway would strip the asset\'s ID. Try again once the dev server responds.';
+const UNPARSEABLE_TOAST =
+  '⚠ Could not make that texture 2D — its .meta.json did not parse (a merge conflict or a '
+  + 'truncated write?). Repair the file, then try again.';
 
 /** Sets a texture's type to `2d` and re-imports it so it gets a whole-image
  *  sprite. Resolves `true` on success; the caller (SpritePicker) is responsible
@@ -46,12 +76,12 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   await flushPendingMetaFor(path);
   const metaRes = await backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`).catch(() => null);
   if (!metaRes || !metaRes.ok) {
-    console.error(`[SpritePicker] could not read the meta for ${path} (${metaRes ? metaRes.status : 'network error'}) — not converting, because overwriting the sidecar from a failed read would discard its GUID.`);
+    refuseWithToast(`[SpritePicker] could not read the meta for ${path} (${metaRes ? metaRes.status : 'network error'}) — not converting, because overwriting the sidecar from a failed read would discard its GUID.`, UNREADABLE_TOAST);
     return false;
   }
   const meta = await metaRes.json().catch(() => null);
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
-    console.error(`[SpritePicker] the meta for ${path} did not parse as an object — not converting (see above).`);
+    refuseWithToast(`[SpritePicker] the meta for ${path} did not parse as an object — not converting (see above).`, UNPARSEABLE_TOAST);
     return false;
   }
 

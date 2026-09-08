@@ -241,6 +241,14 @@ public class ModokiIapPlugin extends Plugin {
                 unpark(call);
                 JSObject r = new JSObject();
                 r.put("transaction", JSObject.NULL);
+                // #946 — say WHICH cancel this was, so the two platforms answer the same question.
+                // Android reaches here by a response code rather than a thrown error, so unlike
+                // iOS there is no ambiguity to resolve: USER_CANCELED is checked before the generic
+                // failure branch and is the only route to a resolved-null cancel. The field is
+                // emitted anyway so a journal entry means the same thing on both platforms, and so
+                // that a cancel with NO reason attached identifies an older build rather than
+                // silently reading as Android.
+                r.put("cancelReason", "play.userCanceled");
                 call.resolve(r);
             }
             return;

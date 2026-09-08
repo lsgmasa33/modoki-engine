@@ -277,6 +277,57 @@ every other clone at yours.**
   #908's instance). Pinned by `engine/tests/architecture/devStopPathIdentity.test.ts`, which drives
   the real script against a FAKE repo root in a tmpdir — pointing it at a real checkout would reap
   a developer's own dev server as a side effect of testing it.
+
+  **Where the shared helper cannot reach, the two spellings are written OUT — and that is
+  deliberate, not laziness** (#959). `lib/repo-reap.sh` registers the clone's logical and physical
+  roots once (`reap_repo_register_roots`) and every caller inherits them, so most reaps never think
+  about this. Two sites cannot use it: `packagedAppPaths.killPackaged`, whose pattern is built from
+  a **caller-supplied** app dir (five callers), and `test-packaged.sh`, which reaps a fragment of
+  the clone root directly.
+  - `killPackaged` canonicalises its argument **inside** the function (`altPathSpelling`, which is
+    `reap_alt_pattern`'s contract in JS — `realpathSync.native`, never the JS walk, per #881) and
+    issues one `pkill` per spelling. Inside rather than at the callers, because a missed caller is
+    a silent partial fix — the same reasoning that made the bash helper inherit rather than take an
+    argument.
+  - `test-packaged.sh` spells both patterns **inline**, as two `${VAR:?}`-led literal lines.
+    ⚠️ **It must not route through `reap_alt_pattern`**, which is the obvious move:
+    `reapScoping.test.ts` rule 3 rejects a variable-led `pkill` pattern that is not `${VAR:?}`
+    -guarded, and `${ALT:?}` is *wrong* here because an EMPTY alternate is the normal case (no
+    symlink) and would abort the gate on every ordinary run. Migrating would also delete the one
+    line rule 1 can see and move the safety inside a helper the guard cannot resolve — a coverage
+    loss disguised as a refactor.
+
+  **Two `pkill` calls, never `pkill -f "$A|$B"`.** The pattern is an ERE, so an alternation with
+  either side empty matches every process on the machine — #69's disaster reintroduced by the fix
+  meant to prevent it. Guarding the operands is not enough; the shape has to be incapable of it.
+
+  **And the reap says which of THREE things happened.** `pkill` exits 0 (signalled), 1 (no match)
+  or ≥2 (usage/fatal), and `killPackaged` used to flatten all three into one silent `catch` — so a
+  usage error read as "nothing was running", which is why every bash caller's `|| true` became
+  structural (#944). It now returns `killed`/`none`/`error`; `exit 0` stays right for all three,
+  but the caller can tell. On Windows `Stop-Process -EA SilentlyContinue` always exits 0, so
+  `winKillCommand` emits the matched **count** on stdout to carry the same distinction.
+  ⚠️ **A verdict nobody can hear is not a verdict — and the first version of this shipped one.**
+  The ERROR line went to STDERR while all five bash callers invoke the CLI as
+  `node "$PATHS" kill … 2>/dev/null || true`, so the two harmless outcomes printed and the alarm
+  was discarded by every consumer that exists. It goes to **stdout**. Before adding a third
+  outcome anywhere, check which stream the callers actually read.
+
+  ⚠️ **The two platforms have incompatible exit-code vocabularies, so they decode separately.**
+  `pkill` exits 1 for "no match"; `powershell.exe -Command` exits 1 for a TERMINATING error. One
+  shared catch mapped both to "nothing running", which put #944's silence back on the Windows
+  branch. The win32 path decodes its own count and treats any non-zero exit — and any unparseable
+  count — as an ERROR.
+
+  ⚠️ **A caller that discards the outcome re-creates the bug one level up**, and two did:
+  `assert-app-csp` (where a reap that did not run IS the cause of the silent CDP-bind failure the
+  file exists to avoid) and `clean-packaged-cache` (which then wiped a LIVE app's userData). Both
+  now read it.
+
+  Pinned by `killPackagedGuard.test.ts` (a manufactured symlink, each `altPathSpelling`
+  precondition yielding NOTHING rather than something wider, the alternate clearing the same width
+  guard as the argument, the ERROR stream, and the win32 decode) and by `reapScoping.test.ts`
+  rule 4, which fails any fragment reaped under only one root variable.
 - **Serialize on-device builds** — only one clone at a time should install/launch on a given
   physical device (iPhone Air, Samsung); they share the hardware. **Now ENFORCED, not merely
   written down** (#149): a device is claimed machine-wide in `~/.modoki/device-claims.json`

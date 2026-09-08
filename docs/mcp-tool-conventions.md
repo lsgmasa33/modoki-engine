@@ -316,6 +316,13 @@ Rules:
 - **"Could not look" is never reported as "nothing is there."** `ota_status` currently maps every
   gcloud failure — expired auth, no network, bucket typo — onto `release:null, note:'No release.json
   published yet'`. An unreachable source is `NOT_AVAILABLE_HERE`, not an answer.
+- **"I looked at a stale copy" is not "this is current"** — the READ half of the rule above (#889).
+  A route that computes an answer from files on disk while the renderer holds newer unsaved versions
+  must say so, in a TYPED field a guard can check for, not a warning string. It does not refuse: a
+  read that refuses is worse than one that caveats, and §8 covers work that would be *omitted*, which
+  a disclosed read does not omit. ⚠️ The field is ABSENT when clean — a disclosure present on every
+  call is one readers learn to skip. Mechanism: `docs/mcp-persistence.md` § "Disk is not the source
+  of truth while an editor is open".
 - **A no-op is a failure when the caller asked for a change.** `changed:0`, or a write whose keys
   the loader ignores, is `REFUSED_BY_OP` with the real field names — not `{ok:true, changed:1}` (V1).
 

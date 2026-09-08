@@ -16,6 +16,8 @@ import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
+import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
 import {
   gridSlices, makeSlice, inferGridFromRects, DEFAULT_PIVOT,
@@ -62,6 +64,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
+  // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
+  // Save attempt so a stale reason can never sit under a later, different outcome.
+  const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
+  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
+  // asset views with no `key`, and an agent can re-open this modal on another texture
+  // (`TextureAssetView` does exactly that) — so the component survives the swap while
+  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
+  // refusal, which is a notice describing work the human is no longer looking at.
+  useEffect(() => { setSaveRefusal(null); }, [path]);
   const [sprites, setSprites] = useState<SpriteSlice[]>([]);
   // Store-backed, not local `useState`: an agent needs a route to change which slice is
   // selected (`select-sprite-slice`), and `modoki_get_editor_state` needs to be able to report
@@ -610,6 +621,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   // ── Persist ──
   const save = async () => {
+    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
+    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
+    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
+    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
+    // over from before the swap; this closes the other direction (close-out review 2).
+    const attemptPath = path;
+    // ⚠️ Clear FIRST, on every attempt — see NineSliceEditor.save for why a stale refusal standing
+    // under a later successful write is the same lie in the opposite direction.
+    setSaveRefusal(null);
     if (!imgDims) return;
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
@@ -632,14 +652,26 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
     // the edit is not thrown away for a reason that has nothing to do with the edit.
     if (!metaLoadedRef.current) {
-      console.error(`[SpriteEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      // BOTH channels (#901) — the console keeps path + mechanism for a debugger, the notice
+      // carries consequence + remedy to the person looking at the dialog.
+      const refusal: SaveRefusal = { kind: 'meta-never-read' };
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
-      console.error(`[SpriteEditor] save failed for ${path} — the dialog is staying open so the slices are not lost. See the /api/write-meta error above.`);
+      const refusal: SaveRefusal = { kind: 'write-failed' };
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
@@ -762,7 +794,13 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
           </div>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 10 }}>
+          {/* #901: beside the Save button that did nothing. A slice set is the most expensive thing
+              in this editor to re-author, and a transient toast is exactly what someone mid-drag
+              in the slicer misses. */}
+          {saveRefusal && (
+            <SaveRefusedNotice uiId="spriteEditor.saveRefused" message={saveRefusalMessage(saveRefusal)} />
+          )}
           <button data-ui-id="spriteEditor.cancel" style={btn} onClick={onClose}>Cancel</button>
           <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>

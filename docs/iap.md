@@ -565,12 +565,46 @@ Both cost a cycle here, and neither is discoverable from the tool description:
   human** — and while that sheet is up, Court's debug bridge stops accepting the Modoki lease, so the
   agent is blind for exactly that window.
 
-#### Still open
+#### Still open — but the INSTRUMENT now exists (#946, 2026-09-08)
 
 Whether run 5's `cancelled` was a real user cancel or a sandbox/account fault **misclassified** as
-one. `isCancellation()` cannot tell them apart — a cancel and an ASD/AMS fault both surface as
-`"Request Canceled"`, which is #499's shape. The player tapped Purchase, not Cancel. Needs a device
-run to separate.
+one is still unanswered, and still needs a device run: a cancel and an ASD/AMS fault both surface as
+`"Request Canceled"`. What has changed is that the **next** occurrence can be told apart, which it
+could not before.
+
+⚠️ **The root cause was #499's fix failing to generalise, not a missing capability.** #499 added
+`classify()`/`errorDetail()` and threaded them into `purchase()`'s REJECT arm. The CANCEL arm — the
+one where the ambiguity actually lives — kept resolving a bare `null`, and `isCancellation()`
+short-circuited before the reject that would have carried the identity. `classify(error)` was
+already being computed four lines above for the timing probe, so **the answer was in hand at the
+exact moment it was discarded.** The fix widened #499 rather than adding a second mechanism.
+
+⚠️ **iOS reaches "cancelled" by TWO routes, and they are different facts.** StoreKit *returning*
+`.userCancelled` is unambiguous — the player said no. A *thrown* error that merely looks like a
+cancel is the ambiguous one. They now carry `'storekit.result.userCancelled'` and `classify()`'s
+string respectively, so nothing downstream can conflate them again. Android emits
+`'play.userCanceled'` from its response-code branch — no equivalent ambiguity there, but the field
+is emitted anyway so a journal entry means the same thing on both platforms, and a cancel carrying
+NO reason identifies an older plugin build rather than reading as Android.
+
+The reason rides `iap.purchase.cancelled` → `court.store.settled` → `track('purchase_cancelled',
+{ reason })`. ⚠️ **Nothing about behaviour changed**: a cancel is still resolved rather than
+rejected, still `purchase_cancelled` and never `purchase_failed`, and the player sees the same
+sentence. The analytics split is about the funnel, not about the error identity — which is the
+point, since a misclassified fault was previously counted as a player DECISION with nothing able to
+separate the two after the fact.
+
+⚠️ **NOT verified by any gate, and this is a real gap rather than an oversight.**
+`npm run test:native` (`engine/scripts/test-native.mjs`) has legs for `capacitor-game-debug` and
+`capacitor-modoki-ota` only — **`capacitor-modoki-iap` has none**, so nothing in this repo compiles
+that Swift or Java. The TS half is unit-tested (`iapFailurePaths.test.ts`,
+`analyticsPurchaseFunnel.test.ts`, with mutation checks); the native half is verifiable only on
+device, and only on the next occurrence. **A green gate does not mean the iOS change works.**
+Whether that plugin should gain a `test:native` leg — extracting a pure classification core the way
+`OtaCore` is replayed against shared vectors — is open follow-up, deliberately not bundled here.
+
+Reproduce, unchanged: `court.shopOpen`, `court.storeBuyCoins300`, leave Apple's sheet untouched past
+90 s, then tap **Purchase**.
 
 ### Android — every device iteration costs a Play upload
 

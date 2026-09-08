@@ -20,6 +20,11 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# The PHYSICAL spelling of the same root. A clone reached through a symlink puts the LOGICAL
+# spelling in `pwd` while a process launched another way carries the resolved one in its argv, so
+# a reap holding only one of them matches nothing (#913). `pwd -P` resolves the link; on a clone
+# with no symlink in its path the two are identical and the second reap below is skipped.
+REPO_PHYS="$(cd "$(dirname "$0")/../.." && pwd -P)"
 cd "$REPO"
 PROJECT="${1:-}"
 [ -n "$PROJECT" ] && export MODOKI_PROJECT="$(cd "$PROJECT" && pwd)"
@@ -58,10 +63,25 @@ APPDIR="$(node "$PATHS" "$OUT" appDir)"
 # LOUD, not fail open into a machine-wide pkill.
 # The packaged reap goes through the helper (`kill <appDir>`), which carries the same
 # empty/short-appDir guard in JS — see killPackaged's comment — because `pkill` does not exist on
-# Windows at all; there it is `taskkill /IM`. The bash `${VAR:?msg}` form is kept on the line below,
-# which is still a genuine POSIX-only pkill.
+# Windows at all; there it goes through PowerShell + Win32_Process. The bash `${VAR:?msg}` form is
+# kept on the lines below, which are still genuine POSIX-only pkills.
+#
+# ⚠️ **TWO patterns, as SEPARATE invocations, NEVER an ERE alternation.** `pkill -f` takes an ERE,
+# so "$A|$B" with either side empty matches EVERY PROCESS ON THE MACHINE — #69's disaster
+# reintroduced by the fix meant to prevent it. Sequential calls cannot collapse that way.
+#
+# ⚠️ **And spelled INLINE here, not via `lib/repo-reap.sh`'s `reap_alt_pattern`.** That helper
+# computes the alternate into a shell variable, and `reapScoping.test.ts` rule 3 rejects a
+# variable-led `pkill` pattern that is not `${VAR:?}`-guarded — while `${ALT:?}` would be wrong,
+# because an EMPTY alternate is the normal case (no symlink) and would abort this gate on every
+# ordinary run. Two `${VAR:?}`-led literals keep the pattern the guard can actually see. Migrating
+# to the helper would delete the one line that guard watches and move the safety inside a function
+# it cannot resolve — a coverage loss disguised as a refactor (#959).
 node "$PATHS" kill "${APPDIR:?refusing to reap with an empty APPDIR — that pattern would match every clone}" 2>/dev/null || true
 pkill -f "${REPO:?refusing to reap with an empty REPO — that pattern would match every clone}/engine/electron/dist/main.cjs" 2>/dev/null || true
+if [ "$REPO_PHYS" != "$REPO" ]; then
+  pkill -f "${REPO_PHYS:?refusing to reap with an empty REPO_PHYS — that pattern would match every clone}/engine/electron/dist/main.cjs" 2>/dev/null || true
+fi
 npm run dev:stop >/dev/null 2>&1 || true
 sleep 0.5
 

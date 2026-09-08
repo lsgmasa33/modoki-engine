@@ -494,3 +494,47 @@ export async function createPrefabFromEntity(
   };
   return { savePath, prefab, action };
 }
+
+/** The unsaved-work staleness a `/api/unused-assets` answer disclosed, or `null` when it disclosed
+ *  none. (#889)
+ *
+ *  ⚠️ **This exists as a plain function so the Clean Up dialog's DECISION is testable without
+ *  mounting the dialog** (`docs/editor.md` § Panels — a jsdom mount asserts the mock). The close-out
+ *  review found the wire fields being computed by the route and consumed by nothing: the disclosure
+ *  reached agents through the MCP surface while the HUMAN path — the one that actually deletes —
+ *  dropped it. A field nobody reads is the same as a field nobody sends.
+ *
+ *  Why the dialog reads the RESPONSE rather than polling `unsavedChangeCauses()` itself, as
+ *  `FindReferencesDialog` does: the server's answer is derived from the same probe that computed
+ *  the orphan list, so it cannot disagree with it — and that dialog's own client-side check is a
+ *  hand-list of two of the five causes (#972). */
+export interface UnusedStaleness {
+  /** What the scan could not see. Non-empty when known; absent when the renderer could not be asked. */
+  readonly inputs: ReadonlyArray<{ path: string; registry: string; detail?: string }>;
+  /** True when the renderer never answered — "could not look", which is not "nothing is there". */
+  readonly unknown: boolean;
+  /** The sentence to show. Always present when this object is. */
+  readonly note: string;
+}
+
+/** Read the disclosure off an `/api/unused-assets` body.
+ *
+ *  ⚠️ Returns `null` — not an empty object — when the editor was clean, because the dialog must
+ *  render NOTHING in that case. The route omits the fields entirely rather than sending
+ *  `staleInputs: []`, and a reader that turned absence into a falsy-but-present value would put an
+ *  always-on caveat back on every clean scan, which is the banner people learn to ignore. */
+export function readUnusedStaleness(body: {
+  staleInputs?: Array<{ path: string; registry: string; detail?: string }>;
+  staleInputsUnknown?: { reason: string };
+  staleInputsNote?: string;
+} | null | undefined): UnusedStaleness | null {
+  if (!body) return null;
+  const note = typeof body.staleInputsNote === 'string' ? body.staleInputsNote : '';
+  const inputs = Array.isArray(body.staleInputs) ? body.staleInputs : [];
+  const unknown = !!body.staleInputsUnknown;
+  // The note is what the human reads, so no note means nothing to show — even if a field arrived.
+  // That also makes a half-populated body (a field without its note) fail closed rather than
+  // rendering an empty warning box.
+  if (!note || (!inputs.length && !unknown)) return null;
+  return { inputs, unknown, note };
+}

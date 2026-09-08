@@ -27,7 +27,24 @@ vi.mock('../../plugins/meta-sidecar', async (importOriginal) => {
 import { assertSidecarWritable } from '../../plugins/meta-sidecar';
 
 /** A full mock context — every field a vi.fn/stub; tests override the few they read. */
-function makeCtx(manifest: Manifest, requestBrowser = vi.fn().mockResolvedValue({ ok: true })): BackendContext {
+/** A renderer that answers the #889 unsaved-work probe and holds NOTHING.
+ *
+ *  ⚠️ `covers` is not decoration — `unsavedGate` treats a reply that omits it as a SKEWED renderer
+ *  and answers `unknown`, which refuses. That check is deliberate (a renderer that answers but does
+ *  not implement a registry the caller asked about is otherwise indistinguishable from a clean
+ *  one), so a stub standing in for "answers normally" has to send it. */
+const clearUnsavedReply = (params: unknown) => ({
+  ok: true,
+  holds: [],
+  discarded: [],
+  covers: (params as { registries?: string[] } | undefined)?.registries
+    ?? ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+});
+
+function makeCtx(
+  manifest: Manifest,
+  requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params))),
+): BackendContext {
   return {
     projectRoot: '/proj',
     resolveAssetPath: (p: string) => '/abs' + p,   // truthy so the handler runs
@@ -64,7 +81,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
 
   it('notifies the renderer with the baked MODEL path after a single reimport', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/models/thing.glb', type: 'model' }] };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/models/thing.glb' }));
@@ -95,7 +112,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
         { path: '/assets/a/s.wav', type: 'audio' },
       ],
     };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a', recursive: true }));
@@ -114,7 +131,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
 
   it('does NOT notify when nothing converts (no handler for the type)', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/x/data.json', type: 'json' }] };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/x/data.json' }));
@@ -157,7 +174,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
     registerReimportHandler('model', async (p: string) => {
       if (p === '/assets/a/bad.glb') throw new Error('bake blew up');
     });
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a', recursive: true }));
@@ -177,7 +194,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
   it('an ALL-error batch returns 500 and never notifies the renderer', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/a/only.glb', type: 'model' }] };
     registerReimportHandler('model', async () => { throw new Error('bake blew up'); });
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a/only.glb' }));
@@ -192,7 +209,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
 
   it('a path matching NO manifest asset → ok:false 404, and never notifies the renderer (F4)', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/models/thing.glb', type: 'model' }] };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     // A typo/casing/derived path resolves to zero targets. Before F4 the loop was skipped and
@@ -209,7 +226,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
 
   it('a recursive path under which NO asset lives → ok:false 404 (F4)', async () => {
     const manifest: Manifest = { version: 2, assets: [{ path: '/assets/models/thing.glb', type: 'model' }] };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/nonexistent', recursive: true }));
     expect((res as { body: { ok: boolean } }).body.ok).toBe(false);
@@ -228,7 +245,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
         { path: '/games/x/c.glb', type: 'model' },
       ],
     };
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/', recursive: true }));
@@ -263,7 +280,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
       // propagates through, not that we verified the real wording.
       if (abs.includes('toonew')) throw new Error('SENTINEL_TOO_NEW_MOCK_ERROR_xyz');
     });
-    const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
+    const requestBrowser = vi.fn().mockImplementation((_op: string, params: unknown) => Promise.resolve(clearUnsavedReply(params)));
     const ctx = makeCtx(manifest, requestBrowser);
 
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/a', recursive: true }));

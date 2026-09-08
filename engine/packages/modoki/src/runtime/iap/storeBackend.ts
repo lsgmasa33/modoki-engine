@@ -21,6 +21,21 @@
 
 import type { IapProductInfo, StoreTransaction } from './types';
 
+/** A cancel the platform could NAME — see `PurchaseResult.cancelReason` for what the strings mean
+ *  and why this is diagnostic-only. Distinguished from a `StoreTransaction` by the `cancelled` tag
+ *  rather than by absence, so a caller cannot confuse it with a real transaction. */
+export interface StoreCancelled {
+  readonly cancelled: true;
+  readonly reason: string;
+  /** The platform's own error detail, when it had one. Log-only; shape is platform-specific. */
+  readonly detail?: unknown;
+}
+
+/** Is this `purchase()` resolution a cancel rather than a transaction? */
+export function isStoreCancelled(v: StoreTransaction | StoreCancelled | null): v is StoreCancelled {
+  return v !== null && (v as StoreCancelled).cancelled === true;
+}
+
 export interface StoreBackend {
   /** Is there a real store here at all? False in the editor, the browser and every headless test. */
   readonly available: boolean;
@@ -29,9 +44,15 @@ export interface StoreBackend {
    *  rather than throwing — a typo'd product should degrade to "not for sale", not a crash. */
   products(ids: readonly string[]): Promise<IapProductInfo[]>;
 
-  /** Open the platform purchase sheet. Resolves with the transaction, or `null` if the player
-   *  dismissed it. Rejects only on a genuine store error. */
-  purchase(productId: string): Promise<StoreTransaction | null>;
+  /** Open the platform purchase sheet. Resolves with the transaction, `null` if the player
+   *  dismissed it, or a `StoreCancelled` when the platform could say WHICH cancel it was.
+   *  Rejects only on a genuine store error.
+   *
+   *  ⚠️ `null` and `StoreCancelled` are the SAME outcome — a backend that cannot name the reason
+   *  keeps returning `null`, and every caller must treat the two identically apart from the
+   *  diagnostic string (#946). The union exists so a reason can be carried, not so cancels can be
+   *  sorted into two kinds. */
+  purchase(productId: string): Promise<StoreTransaction | StoreCancelled | null>;
 
   /**
    * Every transaction the store still considers UNFINISHED — the recovery source, and the reason

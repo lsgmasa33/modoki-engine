@@ -72,6 +72,17 @@ describe('guid→entity index', () => {
     expect(getCurrentWorld()).toBe(worldB);
     expect(b.id()).not.toBe(a.id());
     expect(findEntityByGuid('g-e')?.id()).toBe(b.id()); // resolves in the NEW world
+
+    // ⚠️ **The line that makes this test falsifiable at all** (#851). Everything above passes
+    // under a SHARED guid index: the second `registerEntity` simply overwrites the first, and
+    // "the current world resolves to b" is exactly what last-write-wins produces. Two live worlds
+    // is necessary and NOT sufficient — the assertion has to interrogate the STALE one. Ask the
+    // FIRST world explicitly, after the second has been written.
+    expect(
+      findEntityByGuid('g-e', world)?.id(),
+      'world A no longer resolves its own guid after world B registered the same one — '
+        + 'the guid index is not keyed by World',
+    ).toBe(a.id());
   });
 
   it('resolves to an entity carrying the guid even if two illegally share one', () => {

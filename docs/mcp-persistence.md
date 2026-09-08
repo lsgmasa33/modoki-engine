@@ -569,17 +569,18 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   renderer, and reports `source: 'parked' | 'disk'`; with no renderer it falls back to disk and says
   `editorConnected:false` rather than passing a pre-edit file off as the answer.
 
-  The write half is **one gate on three routes**, `metaParkGate` in `editorBackendRouter.ts`, asking
-  the new `resolve-meta-park` op. The rule it generalises is worth more than the three fixes:
-  **a registry that lives in the RENDERER is invisible to a NODE route, and consulting it is a
-  round trip nobody makes unless a specific bug forces them to** — which is why this arrived one
-  route at a time, each site individually correct.
+  The write half was **one gate on three routes** (`metaParkGate`, #872/#882). It is now **one probe
+  for every route**, `unsavedGate` asking `resolve-unsaved` (#889) — see
+  § "Disk is not the source of truth while an editor is open" below for why the narrow version was
+  the wrong shape, and what replaced it.
 
-  | Route | What a parked edit costs it | §8 consequence → hatch |
+  | Route | What unsaved work costs it | §8 consequence → hatch |
   |---|---|---|
   | `/api/write-meta` | replaces the sidecar wholesale; the park then flushes back over the write | **DESTROYED** → `discardUnsaved` |
   | `/api/reimport` | every handler reads the sidecar off DISK, so the bake uses the PRE-EDIT values | **un-included** → `force` |
-  | `/api/duplicate-asset` | seeds the copy's sidecar from the source's FILE | **un-included** → `force` |
+  | `/api/duplicate-asset` | seeds the copy from the source's FILE — the sidecar AND the document | **un-included** → `force` |
+  | `/api/unused-assets` | the orphan list is computed from the pre-edit graph, and it feeds a DELETE | **stale read** → disclosed |
+  | `/api/find-references` | a "0 references" verdict computed from the pre-edit graph | **stale read** → disclosed |
 
   Four things a reader should not have to re-derive:
 
@@ -631,7 +632,7 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
 
   - ⚠️ **The gate cannot see the EDITOR'S OWN save, and no flag makes it — `flushPendingMeta`
     takes the batch out and `pending.clear()`s it BEFORE issuing any request**. By the time
-    `/api/write-meta` asks `resolve-meta-park`, the registry is empty for every path in that flush,
+    `/api/write-meta` asks `resolve-unsaved`, the registry is empty for every path in that flush,
     so the probe honestly answers `clear` and the write proceeds. The clear-first ordering is
     correct for its own reason (a `flushPendingMetaFor` landing mid-flush must not see a document
     this flush is about to overwrite), and `rendererWrite:true` is not what is doing the work here
@@ -876,6 +877,125 @@ so they carry the same generic wording regardless of which kind of unsaved work 
 Because that seam is a boolean-returning callback rather than a call site that can simply be
 swapped for a richer one, fixing it means widening the `DirtyProbe` seam itself, not just
 changing what a caller passes.
+
+## Disk is not the source of truth while an editor is open (#889)
+
+> **While an editor is open, disk is not the source of truth for asset content — the renderer is.
+> Any Node-side decision that treats a file's bytes as current is wrong for exactly as long as the
+> renderer holds a newer copy, and the Node process has no way to notice.**
+
+That is the mechanism `metaParkGate` (#872/#882) fixed three instances of. Stating it at the
+`.meta.json` level is what made it look like three bugs: the same defect reaches asset DOCUMENTS,
+scene files, and — worst — routes that merely READ, one of which feeds a delete.
+
+### ⚠️ There are FIVE sources of unsaved state, and one of them is not a registry
+
+The obvious list is the four modules under `editor/scene/` — `dirtyAssets`, `pendingMeta`,
+`pendingBaseScene`, `sceneDirty`. **It is missing the most commonly edited thing in the editor.**
+
+`sceneDirty.ts` tracks **base scenes only** (its own header says so, and explains why: `saveAll`
+always attempts the primary anyway). The **primary** scene's unsaved live-world state is
+`getEditVersion() !== _savedAtEditVersion` — a bare, pathless boolean in `serialize.ts`, in no
+registry module at all.
+
+⚠️ **A name collision is what hides it.** The *cause* called `sceneDirty` is the PRIMARY scene; the
+*module* called `sceneDirty.ts` supplies the cause called `dirtyScenes`, which is the loaded BASES.
+A probe assembled by enumerating registry modules is therefore **vacuous for the open scene**, and
+nothing goes red.
+
+So the probe does not enumerate modules. **`unsavedChangeCauses()` (`serialize.ts`) is already the
+single-source-of-truth total**, and `resolve-unsaved` derives its registry list from it: two tables
+`satisfies Record<keyof UnsavedCauses, …>`, so adding a sixth cause is a **compile error in three
+places** until it is mapped. A hand-written list here would be `CLAUDE.md`'s "hand-maintained list
+of fields we read", and it would already have been wrong by one.
+
+| Registry name (the wire vocabulary) | Cause it answers for | Keyed by |
+|---|---|---|
+| `dirtyAsset` | `dirtyAssetPaths` | asset-root URL |
+| `pendingMeta` | `pendingImportSettings` | asset-root URL |
+| `pendingBaseScene` | `pendingBaseScenes` | asset-root URL |
+| `liveScene` | `sceneDirty` (the PRIMARY — a boolean) **and** `dirtyScenes` (the BASES — guids) | resolved renderer-side |
+
+**The guid/path mismatch is reconciled in the RENDERER, and that is not an implementation detail.**
+Node holds the manifest and *could* map path→guid — but only the renderer knows which scenes are
+loaded and which is primary, and the primary's term is a boolean Node cannot compute at any key.
+Answering there lets Node keep paths end to end (what every route already holds) and avoids a second
+path→guid implementation beside `SceneManager`'s. Both scene cases report as one `liveScene` row,
+because *"does this file back a scene with unsaved live edits?"* is one question to a caller.
+
+⚠️ **`liveScene` is probe-only.** Dropping live-world edits means RELOADING the scene, which is
+`load_scene {discardUnsaved}`'s job; a second way to do it does not belong in a probe. Encoded as
+`DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>` rather than as prose.
+
+### The caller declares a CONSEQUENCE; the policy follows from it
+
+`metaParkGate` failed closed. `/api/scene-mutate` fails **open** with a warning, deliberately and
+with a written rationale. Those are not two policies — they are one policy applied to two different
+consequences, plus one real divergence.
+
+| `consequence` | Proceeding means | `held` | `unknown` | Hatch |
+|---|---|---|---|---|
+| `destroys` | the unsaved work is lost irrecoverably | 409 `REQUIRES_SAVE` | 503 `NO_RENDERER` | `discardUnsaved` |
+| `stale-write` | bytes written from stale input; the human's copy survives | 409 `REQUIRES_SAVE` | 503 `NO_RENDERER` | `force` |
+| `stale-read` | an answer REPORTED from stale input; nothing written | 200 + `staleInputs` | 200 + `staleInputsUnknown` | — |
+
+**Why this is not the whack-a-mole it replaces.** The author declares *what their route does with
+the bytes* — a fact about their own code they cannot get wrong by inattention — not *what the gate
+should do*, which is the judgement that kept being re-litigated per route. The mapping lives in one
+function; a new route picks one of three words and cannot invent a fourth. And a declared word is
+**machine-checkable**, which a hand-rolled `if (probeFailed) warnings.push(…)` is not.
+
+⚠️ **A read that refuses is worse than a read that caveats**, and §8 licenses the softer half in as
+many words: it refuses when work would be *"lost or **omitted**"*, and a read omits nothing if it
+says what it could not see. Every `stale-read` route is also called by the editor's own panels, so
+refusing them is #872's Sprite-Editor regression one route over. But answering *silently* is §5's
+cardinal sin, so the disclosure is **mandatory and typed** rather than a `warnings.push` no guard
+can check for. The sibling rule §5 gains:
+
+> **"I looked at a stale copy" is not "this is current"** — the read half of *"could not look is
+> never reported as nothing is there."*
+
+⚠️ **The disclosure is ABSENT when clean, never `staleInputs: []`.** A field present on every call
+is one readers learn to skip, and then the call that matters is skipped with it.
+
+### `covers` — the skew guard, and why it needed its own test
+
+The reply carries a mandatory `covers` list, and Node treats a reply that omits a registry the
+caller asked about as `unknown`, not as clear. Without it, a renderer running an older build answers
+`holds: []` **truthfully for the registries it knows** and is indistinguishable from a clean editor.
+`unknown agent op` covers the fully-old renderer; `covers` covers the half-old one.
+
+⚠️ **Deleting that comparison left all 44 tests green** when it was written — nothing exercised a
+renderer that answers *without covering what was asked*, so the field called the skew guard was
+defended by its own docblock and no assertion. It is pinned now
+(`plugins/metaParkGate.test.ts` § "a SKEWED renderer is `unknown`"), and the episode is the general
+lesson: **a three-link chain tested only at its end is a mechanism that can be deleted in silence.**
+
+### What is NOT fixed, and where it is tracked
+
+Phase 1 covers `/api/duplicate-asset` (both branches), `/api/unused-assets` and
+`/api/find-references`. The rest are in `unsavedGateCoverage.test.ts`'s **`KNOWN_GAPS`** table —
+deliberately a separate table from `EXEMPT`, because an exemption says *"unsaved state cannot be in
+this route's way"* and these say *"it can, we know, and here is the ticket"*. One table for both is
+how a documented gap becomes a licence.
+
+- `/api/validate-scene`, `/api/validate-prefab` — validate the DISK copy while the live world holds
+  edits. The better answer may be to validate the parked/live document instead of caveating the
+  disk one; that is a product call.
+- `/api/asset-write` — reads disk for CAS and dropped-field decisions while `dirtyAssets` may hold
+  newer bytes. ⚠️ **Not a mechanical fix**: `flushDirtyAssets`/`saveAll` POST to it, so a naive gate
+  refuses the editor's own save and deadlocks the only path from a park to disk.
+- ⚠️ **`/api/write-file`, `/api/move-file` and `/api/delete-asset` are gaps this doc names and the
+  GUARD DOES NOT** — they call none of `CONTENT_CALLS`' trigger symbols, so `unsavedGateCoverage`
+  never classifies them and they are in neither `EXEMPT` nor `KNOWN_GAPS`. Said plainly because the
+  list above otherwise reads as a ledger the guard keeps, and for these three it is prose only
+  (found by the #889 close-out review). `/api/move-file` + `/api/delete-asset` are also a *different*
+  defect: `applyAssetPathMoves` remaps `dirtyAssets` + `pendingMeta` and **not** `pendingBaseScene`,
+  so a moved `.scene.json` strands the parked base edit on a dead path and it never flushes.
+- `/api/scene-mutate` — already gated, by a different mechanism with the opposite fail policy
+  (8s `editor-state` probe, fails open on a dead probe). §8 says a renderer that did not answer must
+  be a refusal, so this is a divergence **on the record** rather than an accident; converging it is
+  an owner decision.
 
 ## 6. Prior fix this generalizes
 

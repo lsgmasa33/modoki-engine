@@ -22,7 +22,7 @@ import { registerPlugin } from '@capacitor/core';
 
 import type { ModokiIapPlugin } from 'capacitor-modoki-iap';
 import { reconcile } from './purchaseService';
-import type { StoreBackend } from './storeBackend';
+import type { StoreBackend, StoreCancelled } from './storeBackend';
 import type { IapProduct, IapProductInfo, StoreTransaction } from './types';
 
 /**
@@ -142,15 +142,19 @@ export class CapacitorStoreBackend implements StoreBackend {
     return products;
   }
 
-  async purchase(productId: string): Promise<StoreTransaction | null> {
-    const { transaction, pending } = await iap().purchase({
+  async purchase(productId: string): Promise<StoreTransaction | StoreCancelled | null> {
+    const { transaction, pending, cancelReason, storeError } = await iap().purchase({
       productId,
       kind: this.kindOf(productId),
     });
     if (transaction) return transaction;
     // Distinguish "waiting for a guardian" from "the player said no" — reporting a pending
     // purchase as cancelled would tell someone their purchase failed while it is still alive.
-    return pending ? syntheticPending(productId) : null;
+    if (pending) return syntheticPending(productId);
+    // #946 — carry the native side's classification out when it gave one. Still a cancel; the
+    // reason is diagnostic and changes nothing about the outcome. `null` stays the answer for a
+    // plugin build that predates the field, which is why the caller must treat both identically.
+    return cancelReason ? { cancelled: true, reason: cancelReason, detail: storeError } : null;
   }
 
   async unfinished(): Promise<StoreTransaction[]> {

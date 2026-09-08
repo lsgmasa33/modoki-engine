@@ -140,6 +140,16 @@ export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
 // The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
 export { runSaveAll, toastForSave, sceneNeedsWriting, type SaveOutcome } from './scene/saveCommand';
+// #901 — the wording a modal editor shows when Save does not write. Exported for its unit test:
+// the DECISION is a plain module precisely so it can be asserted without mounting a dialog
+// (docs/editor.md § Panels). The `SaveRefusedNotice` component that renders it stays internal.
+export {
+  saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal,
+} from './panels/saveRefusal';
+// #889 — the Clean Up dialog's staleness DECISION, exported for its unit test. The dialog itself
+// is .tsx; the decision is a plain module so it is assertable without a jsdom mount
+// (docs/editor.md § Panels).
+export { readUnusedStaleness, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

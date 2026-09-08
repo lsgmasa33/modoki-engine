@@ -325,10 +325,32 @@ export interface FindReferencesResult {
  *  import this module, which pulls filesystem code into the browser bundle), and
  *  `engine/tests/plugins/findReferencesWireShape.test.ts` fails typecheck if the
  *  mirror stops accepting what this sends. A hand-sync promise is not a guard. */
-export interface FindReferencesResponse extends FindReferencesResult {
+export interface FindReferencesResponse extends FindReferencesResult, StaleInputDisclosure {
   /** Guid-shaped values ON THE TARGET that resolved to neither an asset nor an
    *  entity. A lead, not a verdict — see `RefGraph.dangling`. */
   unresolvedRefsFromTarget: Array<{ via: string; guid: string }>;
+}
+
+/** The `stale-read` disclosure a route adds when the editor holds unsaved work its answer could
+ *  not see (#889).
+ *
+ *  ⚠️ **Declared here, structurally, rather than imported from the router.** `editorBackendRouter`
+ *  imports THIS module, so the arrow only points one way; a shared type living there would be a
+ *  cycle. The three fields are the wire contract, so the dialog mirror in
+ *  `findReferencesWireShape.test.ts` sees them too.
+ *
+ *  ⚠️ **Every field is OPTIONAL and ABSENT when the editor is clean** — never `staleInputs: []`.
+ *  A disclosure present on every call is one readers learn to skip, and then the call that matters
+ *  is skipped with it. */
+export interface StaleInputDisclosure {
+  /** What the editor holds that this answer was computed WITHOUT. */
+  staleInputs?: Array<{ path: string; registry: string; detail?: string }>;
+  /** Set instead when the renderer could not be asked at all — "could not look" is not "nothing is
+   *  there" (`docs/mcp-tool-conventions.md` §5), and a read must not imply it checked. */
+  staleInputsUnknown?: { reason: string };
+  /** One human sentence naming the consequence and the remedy. Present whenever either field above
+   *  is. */
+  staleInputsNote?: string;
 }
 
 export interface FindReferencesOptions {

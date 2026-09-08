@@ -813,110 +813,202 @@ export function normalizeAssetUrl(assetPath: string): string {
   return decodeURIComponent(assetPath.startsWith('/') ? assetPath : `/${assetPath}`);
 }
 
-/** What the park probe learned. Four outcomes, because "no park" and "could not look" are
- *  different answers and collapsing them is the fail-open this gate exists to close. */
-export type ParkGateOutcome =
-  /** A renderer answered and nothing is parked for these paths — proceed. */
+/** The four kinds of unsaved state a renderer can hold that a Node route would otherwise miss.
+ *
+ *  Mirrors `resolve-unsaved`'s vocabulary in `agentEditorOps.ts`, which derives it from
+ *  `unsavedChangeCauses()`. ⚠️ Two causes share `liveScene` — the PRIMARY scene's pathless boolean
+ *  and the loaded BASES' guids — because "does this file back a scene with unsaved live edits?" is
+ *  one question here. */
+export type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene';
+/** ⚠️ `liveScene` is not discardable: dropping live-world edits means RELOADING the scene, which is
+ *  `load_scene {discardUnsaved}`'s job. Absent by type so it cannot be asked for. */
+export type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>;
+const ALL_UNSAVED_REGISTRIES: readonly UnsavedRegistry[] =
+  ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+
+export type UnsavedHold = { path: string; registry: UnsavedRegistry; detail?: string };
+
+/** What the probe learned. Four outcomes, because "nothing held" and "could not look" are
+ *  different answers and collapsing them is the fail-open this gate exists to close (§5). */
+export type UnsavedOutcome =
+  /** A renderer answered, covered every registry asked about, and holds nothing — proceed. */
   | { kind: 'clear' }
-  /** No renderer EXISTS (no editor window, no page on the dev server, a runtime without the ops).
-   *  `pendingMeta` is renderer-only module state, so with no renderer there is no park to be in
-   *  the way — proceed, and say `editorConnected:false` so the caller knows which it was. */
+  /** No renderer EXISTS (no editor window, no page on the dev server). Every registry is renderer-
+   *  only module state, so with no renderer there is nothing to be in the way — proceed. */
   | { kind: 'absent' }
-  /** A park is in the way. `discarded` is non-empty only when the caller passed the override. */
-  | { kind: 'parked'; paths: string[]; discarded: string[] }
-  /** A renderer may well be attached and it did not answer. NOT the same as `absent`. */
+  /** Unsaved state is in the way. `discarded` is non-empty only when the caller scoped a discard. */
+  | { kind: 'held'; holds: UnsavedHold[]; discarded: UnsavedHold[] }
+  /** A renderer may well be attached and it did not answer, or it answered without covering what
+   *  was asked. NOT the same as `absent`. */
   | { kind: 'unknown'; reason: string };
 
-/** Ask the renderer whether a parked Inspector import-settings edit is in the way of a Node-side
- *  `.meta.json` operation, and optionally drop it (#872/#882).
+/** Ask the renderer what unsaved state it holds for these paths, and optionally drop some of it.
+ *  The ONE probe for every Node route that reads or writes a file the editor may hold (#889).
  *
- *  The ONE gate for all three sidecar routes. `/api/write-meta` DESTROYS a park (it replaces the
- *  file wholesale and the park then flushes back over it, so both directions lose work);
- *  `/api/reimport` and `/api/duplicate-asset` merely read the pre-edit bytes, so the human's edit
- *  goes UN-INCLUDED. Two consequences, two override names — `discardUnsaved` and `force`,
- *  `docs/mcp-tool-conventions.md` §8 — but ONE probe, so the fourth route to touch a sidecar
- *  inherits the answer instead of inventing one.
+ *  Subsumes the old single-registry `metaParkGate` (#872/#882) rather than sitting beside it: a
+ *  second probe for `dirtyAssets` bolted next to the one for `pendingMeta` is exactly the
+ *  whack-a-mole #889 exists to prevent, and four instances across two registries was evidence of a
+ *  missing abstraction rather than a longer to-do list.
+ *
+ *  ⚠️ **`registries` is a REQUIRED scope, not a convenience.** A sidecar route must not be refused
+ *  by an unrelated dirty particle document, and — more sharply — a scoped `discard` must not throw
+ *  away state the caller never asked about. The old gate got this for free by only ever knowing
+ *  about one registry; a shared probe has to be told.
  *
  *  ⚠️ **It must not fail OPEN, and that is the whole difficulty.** `requestBrowser` rejects on a
- *  timeout, and "the renderer did not answer" is not "there is no park" (§5: *could not look is
- *  never reported as nothing is there*). The classifier is `isRelayTransportFailure` +
- *  `isRelayTimeout` — the SAME pair `applyMovesInRenderer` uses, deliberately not a second copy:
- *  that list has been found incomplete by review three times, and #867 extracted it precisely
- *  because a hand-written second regex was born missing every Electron string.
+ *  timeout, and "the renderer did not answer" is not "nothing is held" (§5: *could not look is
+ *  never reported as nothing is there*). `docs/mcp-tool-conventions.md` §8 settles the policy and
+ *  says so in as many words: *"the renderer did not answer" must be a refusal, not a proceed.*
+ *  The classifier is `isRelayTransportFailure` + `isRelayTimeout` — the SAME pair
+ *  `applyMovesInRenderer` uses, deliberately not a second copy.
  *
- *  On Electron a timeout can only mean an attached-but-busy renderer (the window being gone
- *  rejects synchronously). On Vite it is genuinely ambiguous — the dev server can be up with no
- *  page open — and nothing here can tell those apart, so it is reported as `unknown` rather than
- *  guessed. A caller turns `unknown` into a refusal; guessing "clear" would be the #872 defect
- *  rebuilt inside its own fix.
+ *  ⚠️ **`unknown agent op` is `unknown`, NOT `absent`** (#872 review, kept verbatim in force). The
+ *  transport is a BROADCAST — `ws.send` reaches every HMR client and the request registry is
+ *  first-reply-wins — and `registerEditorAgentOps()` runs only from `editor/setup.ts`. So a second
+ *  tab on the dev server's runtime route answers "unknown agent op" INSTANTLY and beats the editor
+ *  tab that actually holds the state. One client's "I do not have that op" says nothing about
+ *  whether another does. Widening this probe to more routes raises how often that matters, which
+ *  is why the 503 text names it.
  *
- *  The timeout is `RENDERER_REPAIR_TIMEOUT_MS`, shared with the move repair for the same reason it
- *  was chosen there: this is in-memory bookkeeping that answers in milliseconds or not at all, and
- *  the default 3000ms would be paid by every headless sidecar write. */
-async function metaParkGate(
+ *  ⚠️ **A short `covers` is `unknown`.** A renderer that answers but does not implement a registry
+ *  the caller asked about would otherwise be indistinguishable from one reporting "all clear" — the
+ *  skew failure this reply field exists to make visible. */
+async function unsavedGate(
   ctx: BackendContext,
-  paths: string[],
-  opts: { discard?: boolean } = {},
-): Promise<ParkGateOutcome> {
-  const wanted = paths.filter((p) => typeof p === 'string' && p);
-  if (!wanted.length) return { kind: 'clear' };
+  /** The paths to ask about — or **`null` for "everything you hold"**, which the `stale-read`
+   *  routes need because their answer is computed over the WHOLE project graph.
+   *
+   *  ⚠️ `null` and `[]` are deliberately DIFFERENT. `null` is a caller asking the global question on
+   *  purpose; `[]` short-circuits to `clear` without asking the renderer. They were briefly the
+   *  same value here, and that made both `stale-read` routes report clean unconditionally — a
+   *  disclosure that could never fire, which is worse than none because it reads as a guarantee.
+   *
+   *  ⚠️ **`[]` → `clear` is a real short-circuit, not a guard.** An earlier version of this note
+   *  claimed an empty array was refused as "a caller that meant to name paths and computed none";
+   *  it is not, and a note promising a guard the code does not have is worse than no note (found
+   *  by the #889 close-out review). It is safe TODAY only because no caller can reach it with a
+   *  computed-empty list — `/api/reimport` 404s on an empty target set first, and the other two
+   *  pass single-element arrays. ⚠️ **If you add a caller that BUILDS its path list, do not rely on
+   *  this**: an empty result there means "I found nothing to ask about", which is not the same as
+   *  "nothing is held", and this returns `clear` for both. The renderer op is stricter and throws
+   *  on `paths: []`; the two halves disagree on purpose only as long as that stays unreachable. */
+  paths: readonly string[] | null,
+  opts: { registries: readonly UnsavedRegistry[]; discard?: readonly DiscardableRegistry[] },
+): Promise<UnsavedOutcome> {
+  const wanted = paths === null ? null : paths.filter((p) => typeof p === 'string' && p);
+  if (wanted !== null && !wanted.length) return { kind: 'clear' };
+  const registries = opts.registries.length ? opts.registries : ALL_UNSAVED_REGISTRIES;
   try {
     const r = await ctx.requestBrowser(
-      'resolve-meta-park',
-      { paths: wanted, ...(opts.discard ? { discard: true } : {}) },
+      'resolve-unsaved',
+      {
+        ...(wanted !== null ? { paths: wanted } : {}),
+        registries,
+        ...(opts.discard && opts.discard.length ? { discard: opts.discard } : {}),
+      },
       RENDERER_REPAIR_TIMEOUT_MS,
-    ) as { parked?: unknown; discarded?: unknown };
-    const parked = Array.isArray(r?.parked) ? r.parked.filter((p): p is string => typeof p === 'string') : [];
-    if (!parked.length) return { kind: 'clear' };
-    const discarded = Array.isArray(r?.discarded) ? r.discarded.filter((p): p is string => typeof p === 'string') : [];
-    return { kind: 'parked', paths: parked, discarded };
+    ) as { holds?: unknown; discarded?: unknown; covers?: unknown };
+
+    // Decode, never cast (§9-bis). A malformed reply is a renderer that could not answer, not one
+    // that answered "clear".
+    const covers = Array.isArray(r?.covers)
+      ? r.covers.filter((c): c is string => typeof c === 'string')
+      : null;
+    if (!covers) {
+      return { kind: 'unknown', reason: 'the renderer reply carried no `covers` list, so it could not be read as an answer' };
+    }
+    const missing = registries.filter((want) => !covers.includes(want));
+    if (missing.length) {
+      return {
+        kind: 'unknown',
+        reason: `the renderer did not cover ${missing.join(', ')} — it is running an older build than this backend`,
+      };
+    }
+
+    const holds = decodeHolds(r?.holds);
+    if (!holds.length) return { kind: 'clear' };
+    return { kind: 'held', holds, discarded: decodeHolds(r?.discarded) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // ⚠️ **`unknown agent op` is NOT "absent" here, and reading it that way was a fail-open this
-    // gate produced against itself** (#872 review). `applyMovesInRenderer` may treat it as absent
-    // because it is best-effort repair; this is a GUARD, and the transport underneath is a
-    // BROADCAST: `ws.send` goes to every HMR client and `createBrowserRequestRegistry` is
-    // first-reply-wins. `initAgentBridge()` runs on any editor-flagged page but
-    // `registerEditorAgentOps()` runs only from `editor/setup.ts`, so a second tab on the dev
-    // server's runtime route answers `unknown agent op` INSTANTLY and wins the race against the
-    // editor tab that actually holds the park. Measured shape: editor at `#/editor` with a parked
-    // Max Size edit, a plain `/` tab alongside, agent writes — the runtime tab replies first, this
-    // returned `absent`, the write proceeded, and the reply told the caller "there is no renderer"
-    // while an editor sat there with the human's unsaved edit in it.
-    //
-    // One client's "I do not have that op" says nothing about whether ANOTHER client does, so it
-    // is exactly "could not look" (§5). The cost is that a genuinely editor-op-less renderer now
-    // refuses instead of proceeding — over-conservative, and the named override is the exit.
     if (/unknown agent op/i.test(msg)) return { kind: 'unknown', reason: msg };
     if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
     return { kind: 'unknown', reason: msg };
   }
 }
 
-/** The §5 envelope for a gate outcome that must stop the operation, or `null` to proceed.
+/** Rows the renderer sent, with anything malformed dropped rather than trusted. */
+function decodeHolds(raw: unknown): UnsavedHold[] {
+  if (!Array.isArray(raw)) return [];
+  const out: UnsavedHold[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue;
+    const { path, registry, detail } = row as Record<string, unknown>;
+    if (typeof path !== 'string' || !path) continue;
+    if (typeof registry !== 'string' || !(ALL_UNSAVED_REGISTRIES as readonly string[]).includes(registry)) continue;
+    out.push({
+      path,
+      registry: registry as UnsavedRegistry,
+      ...(typeof detail === 'string' && detail ? { detail } : {}),
+    });
+  }
+  return out;
+}
+
+/** What proceeding past unsaved state would COST. The caller declares this; the policy follows.
+ *
+ *  ⚠️ **The caller does NOT choose a fail policy — it states a fact about its own code.** That is
+ *  the difference between one rule and N call sites re-litigating the same judgement, which is the
+ *  whack-a-mole #889 forbids. An author knows what their route does with the bytes; they cannot get
+ *  that wrong by inattention, and `unsavedGateCoverage.test.ts` can read the declaration and check
+ *  it against the helpers the route calls.
+ *
+ *  `destroys` and `stale-write` reproduce `metaParkGate`'s behaviour exactly, including the
+ *  `discardUnsaved`-vs-`force` split `docs/mcp-tool-conventions.md` §8 already draws: one word for
+ *  each consequence, because one word for both is how an agent carries a harmless habit into an
+ *  irreversible one. */
+export type UnsavedConsequence =
+  /** Proceeding LOSES the unsaved work irrecoverably (a wholesale write over a parked document).
+   *  Refuses 409; the override is `discardUnsaved`. */
+  | 'destroys'
+  /** Proceeding writes bytes DERIVED from stale input; the human's own copy survives (a duplicate
+   *  seeded from disk). Refuses 409; the override is `force`. */
+  | 'stale-write'
+  /** Proceeding REPORTS an answer derived from stale input and writes nothing. Answers 200 with a
+   *  mandatory disclosure — see `staleInputDisclosure`. */
+  | 'stale-read';
+
+/** The §5 envelope for an outcome that must STOP the operation, or `null` to proceed.
+ *
+ *  Only `destroys` and `stale-write` reach here; `stale-read` never refuses (it discloses instead)
+ *  and passing it is a programming error rather than a runtime case.
  *
  *  `code` and `options` travel in the BODY: `codeFromBody` in the MCP client lifts a code out of
- *  the payload ahead of the one derived from the HTTP status, and `httpFailure` lifts `options`
- *  the same way — so the refusal an agent reads names its own exits rather than arriving as a
- *  generic REFUSED_BY_OP. A refusal that lists the real options is the highest-value thing this
- *  surface produces (§5); a refusal with no way out is a wedge. */
-function parkGateRefusal(
-  outcome: ParkGateOutcome,
-  what: { verb: string; override: 'discardUnsaved' | 'force'; consequence: string },
+ *  the payload ahead of the one derived from the HTTP status, and `httpFailure` lifts `options` the
+ *  same way — so the refusal an agent reads names its own exits rather than arriving as a generic
+ *  REFUSED_BY_OP. A refusal that lists the real options is the highest-value thing this surface
+ *  produces (§5); a refusal with no way out is a wedge. */
+function unsavedRefusal(
+  outcome: UnsavedOutcome,
+  what: { verb: string; consequence: Exclude<UnsavedConsequence, 'stale-read'>; consequenceText: string },
 ): { body: Record<string, unknown>; status: number } | null {
-  if (outcome.kind === 'parked' && !outcome.discarded.length) {
+  const override = what.consequence === 'destroys' ? 'discardUnsaved' : 'force';
+  if (outcome.kind === 'held' && !outcome.discarded.length) {
     return {
       status: 409,
       body: {
         ok: false,
         code: 'REQUIRES_SAVE',
-        error: `${what.verb} refused: a human's unsaved Inspector import-settings edit is parked for `
-          + `${outcome.paths.join(', ')} and has not reached disk. ${what.consequence}`,
-        parked: outcome.paths,
+        error: `${what.verb} refused: the editor holds unsaved work that has not reached disk — `
+          + `${describeHolds(outcome.holds)}. ${what.consequenceText}`,
+        // `parked` kept as the wire name #872 established, so an agent (and the MCP client's own
+        // hints) do not have to learn a new field for a widened check. `holds` carries the detail
+        // the old shape could not express: WHICH registry, per path.
+        parked: [...new Set(outcome.holds.map((h) => h.path))],
+        holds: outcome.holds,
         options: [
-          'modoki_save_all — flush the human\'s edit to disk first, then repeat this call (it then works from their newest settings)',
-          `${what.override}:true — proceed anyway; see that param's description for exactly what it costs`,
-          'modoki_get_asset_meta reads the PARKED value, so you can see what is pending before deciding',
+          'modoki_save_all — flush the human\'s work to disk first, then repeat this call (it then works from their newest state)',
+          `${override}:true — proceed anyway; see that param's description for exactly what it costs`,
+          'modoki_get_editor_state lists every kind under unsavedCauses, so you can see what is pending before deciding',
         ],
       },
     };
@@ -928,18 +1020,63 @@ function parkGateRefusal(
         ok: false,
         code: 'NO_RENDERER',
         error: `${what.verb} refused: an editor renderer may be attached and it did not answer the `
-          + `parked-import-settings probe (${outcome.reason}), so this could NOT rule out a human's `
-          + 'unsaved edit. "Could not look" is not "nothing is there", and proceeding would be the '
-          + 'silent clobber this check exists to prevent.',
+          + `unsaved-work probe (${outcome.reason}), so this could NOT rule out a human's unsaved `
+          + 'edit. "Could not look" is not "nothing is there", and proceeding would be the silent '
+          + 'clobber this check exists to prevent.',
         options: [
           'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
-          'modoki_get_editor_state lists parked edits under pendingImportSettings; if it answers, the renderer is alive',
-          `${what.override}:true — proceed without the check, accepting that cost`,
+          'modoki_get_editor_state lists unsaved work under unsavedCauses; if it answers, the renderer is alive',
+          'if a SECOND tab is open on the dev server it can answer "unknown agent op" first and win the race — close it and retry',
+          `${override}:true — proceed without the check, accepting that cost`,
         ],
       },
     };
   }
   return null;
+}
+
+/** The `stale-read` half: a read never refuses, and never answers as if it had looked.
+ *
+ *  ⚠️ **A read that refuses is worse than a read that caveats** — every one of these routes is
+ *  called by the editor's own panels, and refusing them is #872's Sprite-Editor regression one
+ *  route over. But answering SILENTLY is §5's cardinal sin, so the disclosure is mandatory and
+ *  TYPED rather than a `warnings.push` a guard cannot check for. The sibling rule §5 gains:
+ *  **"I looked at a stale copy" is not "this is current."**
+ *
+ *  Returns fields to spread into a 200 body, or `null` when there is genuinely nothing to disclose.
+ *  ⚠️ Returning `null` rather than an empty array is deliberate: an always-present field trains
+ *  readers to ignore it, and `staleInputs: []` on every clean call is exactly that. */
+function staleInputDisclosure(outcome: UnsavedOutcome): Record<string, unknown> | null {
+  if (outcome.kind === 'held') {
+    return {
+      staleInputs: outcome.holds,
+      staleInputsNote: `${describeHolds(outcome.holds)} — this answer was computed from the files `
+        + 'on DISK, so it does not reflect that work. Save first (modoki_save_all) for an accurate result.',
+    };
+  }
+  if (outcome.kind === 'unknown') {
+    return {
+      staleInputsUnknown: { reason: outcome.reason },
+      staleInputsNote: 'an editor renderer may be attached and it did not answer the unsaved-work '
+        + `probe (${outcome.reason}), so this answer could NOT be checked against unsaved editor `
+        + 'work. It may be computed from stale files.',
+    };
+  }
+  return null;
+}
+
+/** One sentence naming what is held, grouped by registry so the reader gets a KIND and not just a
+ *  list of paths — "an unsaved asset document" and "unsaved live-world edits in the open scene"
+ *  send someone to different panels. */
+function describeHolds(holds: readonly UnsavedHold[]): string {
+  const byKind = new Map<string, string[]>();
+  for (const h of holds) {
+    const kind = h.detail ?? h.registry;
+    const list = byKind.get(kind) ?? [];
+    list.push(h.path);
+    byKind.set(kind, list);
+  }
+  return [...byKind].map(([kind, paths]) => `${kind} for ${[...new Set(paths)].join(', ')}`).join('; ');
 }
 
 export async function handleBackendRequest(ctx: BackendContext, req: BackendRequest): Promise<BackendResult | null> {
@@ -2503,6 +2640,23 @@ async function describeUnresolvedAgainstLiveWorld(
   // unshipped assets, so "unused" here == "would be tree-shaken out of the build".
   if (urlPath === '/api/unused-assets' && method === 'GET') {
     try {
+      // ── The unsaved-work DISCLOSURE (#889 B) ────────────────────────────────────────────────
+      // ⚠️ The tree-shaker reads every scene/prefab/material/atlas off DISK, so this answer is
+      // computed from the pre-edit graph whenever the editor holds unsaved work — and the answer
+      // FEEDS A DELETE. `CleanupAssetsDialog` lists these and posts the selection to
+      // /api/delete-asset, so an asset referenced ONLY by an unsaved edit reads as an orphan and
+      // can be trashed. That is the highest-consequence member of #889, and it is not the one the
+      // ticket was filed about.
+      //
+      // ⚠️ DISCLOSE, do not refuse (owner, 2026-09-08). A read that refuses is worse than one that
+      // caveats — this route backs a human dialog, and refusing it is #872's Sprite-Editor
+      // regression one route over. But answering SILENTLY is §5's cardinal sin, so the disclosure
+      // is mandatory and typed. §8's "refuses when that work would be lost or OMITTED" is what
+      // licenses the softer half: a read omits nothing if it says what it could not see.
+      //
+      // ⚠️ NO `paths` — the reachability walk spans the WHOLE graph, so ANY unsaved document can
+      // change the answer. A path-scoped probe would look precise and under-report.
+      const staleness = await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES });
       const result = ctx.computeUnused();
       // Only offer the PROJECT's own assets for deletion. The shaker also walks
       // the engine's shared `/modoki/assets` root (built-in fonts/HDRs served to
@@ -2530,6 +2684,9 @@ async function describeUnresolvedAgainstLiveWorld(
         sceneCount: result.stats.scenes,
         // Drop warnings about the engine root we filtered out — they'd be noise here.
         warnings: result.warnings,
+        // ⚠️ Spread, and ABSENT when clean — never `staleInputs: []`. A field present on every call
+        // is a field readers learn to skip, and then the one call that matters is skipped too.
+        ...(staleInputDisclosure(staleness) ?? {}),
       });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
@@ -2568,6 +2725,13 @@ async function describeUnresolvedAgainstLiveWorld(
   // "What would the build drop?" belongs to /api/unused-assets, alone.
   if (urlPath === '/api/find-references' && method === 'GET') {
     try {
+      // ── The unsaved-work DISCLOSURE (#889 C) ────────────────────────────────────────────────
+      // ⚠️ Same enumeration as /api/unused-assets, same blindness, and a sharper irony: the
+      // unresolvable-target branch below refuses precisely so that "could not look" is never
+      // reported as "nothing is there" — while a "0 references" verdict computed past a human's
+      // unsaved edit did exactly that, six lines on. `stale-read`, no `paths` (the reverse walk
+      // spans the whole graph), disclosed rather than refused — see the note on /api/unused-assets.
+      const staleness = await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES });
       const enumeration = ctx.computeRefEdges();
       const graph = buildRefGraph(enumeration);
 
@@ -2579,8 +2743,20 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!node) {
         // "Could not look" is never reported as "nothing is there" — an unresolvable
         // target is a refusal, not an answer of zero references.
+        //
+        // ⚠️ **The disclosure belongs on THIS branch most of all** (#889 close-out review). An
+        // unresolvable target is very often unresolvable BECAUSE the thing exists only in unsaved
+        // state: an agent runs `mutate_scene` to create an entity, then asks what references that
+        // entity's guid, and the graph — built from disk — has never heard of it. Without the
+        // spread the reply is a bare 404 saying the guid is not an asset or entity guid, and the
+        // agent re-derives the guid or concludes its own mutation did not land. The refusal was
+        // right; it was just silent about the one thing that explains it.
+        //
+        // The 400 above deliberately does NOT carry it: a missing `target` is a caller error, not
+        // a lookup that could have been affected by unsaved work.
         return json({
           error: `no asset or entity matches "${target}". Expected an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance's own guid), or a virtual path starting with "/".`,
+          ...(staleInputDisclosure(staleness) ?? {}),
         }, 404);
       }
 
@@ -2595,6 +2771,8 @@ async function describeUnresolvedAgainstLiveWorld(
         // not classify lands here even though the file exists. Scoped to this target
         // so the payload does not carry the whole project's every time.
         unresolvedRefsFromTarget: graph.dangling.filter(d => d.from.id === node.id).map(d => ({ via: d.via, guid: d.guid })),
+        // Absent when clean, for the reason spelled out on /api/unused-assets.
+        ...(staleInputDisclosure(staleness) ?? {}),
       };
       return json(body);
     } catch (e) {
@@ -2897,14 +3075,17 @@ async function describeUnresolvedAgainstLiveWorld(
       // The flag is an assertion about the CALLING PROCESS, not about the document: a write issued
       // from the renderer is never blind to the registry — it either read through the park, flushed
       // it first, or IS the flush. The gate exists for the process that cannot see the registry.
+      // ⚠️ SCOPED to `pendingMeta` — the registry this route can actually destroy. Unscoped, the
+      // shared probe (#889) would refuse a sidecar write because an unrelated particle document is
+      // dirty, which the old single-registry gate avoided only by not knowing about it.
       const gate = rendererWrite === true
-        ? { kind: 'clear' } as ParkGateOutcome
-        : await metaParkGate(ctx, [normalizeAssetUrl(assetPath)]);
-      const refused = discardUnsaved === true ? null : parkGateRefusal(gate, {
+        ? { kind: 'clear' } as UnsavedOutcome
+        : await unsavedGate(ctx, [normalizeAssetUrl(assetPath)], { registries: ['pendingMeta'] });
+      const refused = discardUnsaved === true ? null : unsavedRefusal(gate, {
         verb: 'write-meta',
-        override: 'discardUnsaved',
-        consequence: 'Writing now DESTROYS it: this replaces the file, and their next save flushes '
-          + 'the older parked document back over what you wrote.',
+        consequence: 'destroys',
+        consequenceText: 'Writing now DESTROYS it: this replaces the file, and their next save '
+          + 'flushes the older parked document back over what you wrote.',
       });
       if (refused) return json(refused.body, refused.status);
       // ⚠️ The precondition is checked against the SIDECAR, not the asset. `resolved` is the asset
@@ -2925,11 +3106,35 @@ async function describeUnresolvedAgainstLiveWorld(
       // reported as a bare 500 that never mentioned the discard. A failed write must cost nothing.
       // The residual window is the opposite way round and strictly smaller: a park created between
       // the write and this call is dropped, and only when the caller explicitly asked to discard.
-      const discardedParked = gate.kind === 'parked' && discardUnsaved === true
-        ? await metaParkGate(ctx, [normalizeAssetUrl(assetPath)], { discard: true })
-          .then((d) => (d.kind === 'parked' ? d.discarded : []))
-          .catch(() => [] as string[])
+      //
+      // ⚠️ **The SECOND probe's own outcome is reported, not swallowed** (#889 close-out review).
+      // This used to collapse every non-`held` result — and the rejection — to `[]`, and the
+      // disclosures below all branch on the FIRST gate. So: first probe says `held`, caller passes
+      // `discardUnsaved:true`, the write lands, and the second probe times out or loses the
+      // first-reply-wins race to a second HMR client. Reply: `{ok:true, sha256}`, no
+      // `discardedParked`, no note. The human's park SURVIVED and their next Cmd+S flushes the
+      // older document back over this write — #872's exact defect, reported as a clean success.
+      // `unknown` here is the likely branch, not the exotic one: the budget is 1500ms and a GLB
+      // parse or shader compile eats it.
+      const discardOutcome: UnsavedOutcome = gate.kind === 'held' && discardUnsaved === true
+        // ⚠️ The discard is SCOPED to the same registry the probe asked about. Unscoped it would
+        // drop a dirty asset document this route never looked at — over-reach the old gate could
+        // not commit because it only knew one registry.
+        ? await unsavedGate(ctx, [normalizeAssetUrl(assetPath)], { registries: ['pendingMeta'], discard: ['pendingMeta'] })
+          .catch((e) => ({ kind: 'unknown', reason: e instanceof Error ? e.message : String(e) }) as UnsavedOutcome)
+        : { kind: 'clear' };
+      const discardedParked = discardOutcome.kind === 'held'
+        ? discardOutcome.discarded.map((h) => h.path)
         : [];
+      /** The discard was ASKED FOR and nothing came back discarded.
+       *
+       *  ⚠️ **`held` with an EMPTY `discarded` counts** (close-out review 2). Dropping the
+       *  `!discardedParked.length` term would let "the park is still there and I dropped none of
+       *  it" read as a confirmed discard — latent today (the renderer computes `holds` before the
+       *  discard and keys off that same list, so the two cannot disagree), and one `&&` from being
+       *  the exact shape this flag exists to close. */
+      const discardUnconfirmed = gate.kind === 'held' && discardUnsaved === true
+        && !discardedParked.length;
       // The hash of what we ACTUALLY wrote — the caller cannot derive it, because
       // `writeMetaSidecar` stamps `version`, may salvage an `id`, and splits the cache blocks out
       // into `.meta.local.json`. A panel that keeps editing after a save needs this to advance its
@@ -2951,6 +3156,32 @@ async function describeUnresolvedAgainstLiveWorld(
             note: 'A parked Inspector import-settings edit for this path was DISCARDED before the '
               + 'write, as you asked. The human\'s unsaved change is gone and this file is now the '
               + 'only version. Nothing stale survives to flush back over it.',
+          }
+          : {}),
+        // ⚠️ The write LANDED and the discard did not — say so, because the two failure modes this
+        // leaves are opposite and the caller has to pick. `discardUnsaved` promises nothing stale
+        // survives; here it may.
+        // ⚠️ **One sentence per OUTCOME, not one shared sentence** (close-out review 2). The
+        // shared wording said "the renderer did not confirm it (the renderer went away)" for a
+        // `clear` second probe — which answered, and did not go away — and told the caller the
+        // park "may still be there" on `absent`, which the `editorConnected` branch below says is
+        // impossible in the same response. A disclosure that contradicts its own sibling branch is
+        // worse than none: it teaches the reader that this field is noise.
+        ...(discardUnconfirmed
+          ? {
+            discardUnconfirmed: true,
+            note: discardOutcome.kind === 'unknown'
+              ? 'The file WAS written, but the parked Inspector import-settings edit could NOT be '
+                + `discarded — the renderer did not answer the second probe (${discardOutcome.reason}). `
+                + 'So the human\'s older parked document may still be there, and their next save '
+                + 'would flush it back OVER this write. Re-run this call, or modoki_save_all.'
+              : discardOutcome.kind === 'absent'
+                ? 'The file WAS written. The renderer went away between the write and the discard, '
+                  + 'so nothing was discarded — and nothing needed to be: a park is renderer-only '
+                  + 'state, so it went with the renderer. Nothing stale survives to flush back.'
+                : 'The file WAS written and the parked edit was already gone by the time the '
+                  + 'discard ran — the human saved, or discarded it themselves, between the two '
+                  + 'probes. Nothing stale survives to flush back over this write.',
           }
           : {}),
         ...(gate.kind === 'absent'
@@ -3035,13 +3266,15 @@ async function describeUnresolvedAgainstLiveWorld(
       // the human's edit alone and merely does not USE it.
       // Manifest paths are already canonical, so no `normalizeAssetUrl` here — unlike the two
       // routes below, whose path comes straight off the request body.
-      const reGate = await metaParkGate(ctx, targets.map((a) => a.path));
-      const reRefused = (body as { force?: boolean } | undefined)?.force === true ? null : parkGateRefusal(reGate, {
+      // Scoped to `pendingMeta`: the bake reads the SIDECAR, and nothing else it touches lives in
+      // another registry.
+      const reGate = await unsavedGate(ctx, targets.map((a) => a.path), { registries: ['pendingMeta'] });
+      const reRefused = (body as { force?: boolean } | undefined)?.force === true ? null : unsavedRefusal(reGate, {
         verb: 're-import',
-        override: 'force',
-        consequence: 'The bake reads the sidecar from DISK, so it would convert with the PRE-EDIT '
-          + 'settings — and their next save would then flush that older document over the cache '
-          + 'block this bake writes.',
+        consequence: 'stale-write',
+        consequenceText: 'The bake reads the sidecar from DISK, so it would convert with the '
+          + 'PRE-EDIT settings — and their next save would then flush that older document over the '
+          + 'cache block this bake writes.',
       });
       if (reRefused) return json(reRefused.body, reRefused.status);
       const summary = { converted: 0, skipped: 0, errors: [] as string[] };
@@ -3123,10 +3356,10 @@ async function describeUnresolvedAgainstLiveWorld(
         // The forced path is the one that needs saying out loud: the bake DID run and it did NOT
         // use the human's newest settings. Reporting only on the refusal would make `force:true`
         // a silent downgrade, which is the false success §0 ranks worst (#882).
-        ...(reGate.kind === 'parked'
+        ...(reGate.kind === 'held'
           ? {
-            bakedFromDisk: reGate.paths,
-            note: `${reGate.paths.length} asset(s) had a parked Inspector import-settings edit that `
+            bakedFromDisk: [...new Set(reGate.holds.map((h) => h.path))],
+            note: `${new Set(reGate.holds.map((h) => h.path)).size} asset(s) had a parked Inspector import-settings edit that `
               + 'is NOT on disk, and this bake read the file — so those were converted with the '
               + 'PRE-EDIT settings. The human\'s edit is untouched and their next save will flush it '
               + 'over this bake\'s cache block. modoki_save_all, then re-import, uses their settings.',
@@ -3403,30 +3636,41 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!absFrom || !absTo) return json({ error: 'Path outside allowed directories' }, 403);
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
-      // ── The park gate (#882) ─────────────────────────────────────────────────────────────
-      // `duplicateAssetFile` reads the SOURCE's `.meta.json` off disk to seed the copy's, so a
-      // parked Inspector edit on the source means the duplicate is BORN with the pre-edit import
-      // settings while the panel shows the new ones. Nothing is destroyed here — the copy is
-      // simply built from stale bytes — so the hatch is `force`, the same one `/api/reimport`
-      // takes. The DESTINATION needs no probe: it cannot exist yet (checked above), so no park
-      // can be keyed to it.
-      const dupGate = await metaParkGate(ctx, [normalizeAssetUrl(from)]);
-      const dupRefused = force === true ? null : parkGateRefusal(dupGate, {
+      // ── The unsaved-work gate (#882 for the sidecar, #889 for the DOCUMENT) ──────────────
+      // `duplicateAssetFile` has TWO branches and #882 gated only one of them. The binary branch
+      // reads the source's `.meta.json` off disk to seed the copy's; the `.json` branch reads the
+      // source DOCUMENT and rewrites its id — and that one consulted nothing, so duplicating an
+      // asset with a parked panel edit produced a copy born from the last-SAVED document while the
+      // panel showed a newer one (#889 member 4).
+      //
+      // ⚠️ ALL FOUR registries, and `liveScene` is not optional here. `ext === '.json'` catches
+      // `.scene.json` and `.prefab.json` too, so duplicating the OPEN scene while it has unsaved
+      // live-world edits is the worst case on this route — and a `dirtyAsset`-only widening would
+      // sail straight past it, since the open scene is not an asset document.
+      //
+      // Nothing is destroyed — the copy is simply built from stale bytes — so the hatch stays
+      // `force`, the same one `/api/reimport` takes. The DESTINATION needs no probe: it cannot
+      // exist yet (409'd above), so nothing can be keyed to it.
+      const dupGate = await unsavedGate(ctx, [normalizeAssetUrl(from)], {
+        registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+      });
+      const dupRefused = force === true ? null : unsavedRefusal(dupGate, {
         verb: 'duplicate-asset',
-        override: 'force',
-        consequence: 'The copy is seeded from the source sidecar ON DISK, so it would be born with '
-          + 'the PRE-EDIT import settings while the editor shows the newer ones.',
+        consequence: 'stale-write',
+        consequenceText: 'The copy is seeded from the source ON DISK, so it would be born with the '
+          + 'PRE-EDIT content while the editor shows the newer version.',
       });
       if (dupRefused) return json(dupRefused.body, dupRefused.status);
       const newGuid = duplicateAssetFile(absFrom, absTo);
       return json({
         ok: true,
         guid: newGuid,
-        ...(dupGate.kind === 'parked'
+        ...(dupGate.kind === 'held'
           ? {
-            copiedFromDisk: dupGate.paths,
-            note: 'The source had a parked Inspector import-settings edit that is NOT on disk, so '
-              + 'this copy carries the PRE-EDIT settings. The source itself is untouched.',
+            copiedFromDisk: [...new Set(dupGate.holds.map((h) => h.path))],
+            holds: dupGate.holds,
+            note: `The source had unsaved work that is NOT on disk (${describeHolds(dupGate.holds)}), `
+              + 'so this copy carries the PRE-EDIT content. The source itself is untouched.',
           }
           : {}),
         // The forced-past-an-unanswered-probe case, disclosed here as it already is on

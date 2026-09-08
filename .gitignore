@@ -201,7 +201,8 @@ build/bin/
 
 # Generated scoped typecheck configs. Two producers, one glob: build-web.mjs writes the bare
 # `engine/tsconfig.app.scoped.json`, and typecheck-projects.mjs writes one PER PROJECT
-# (`engine/tsconfig.app.scoped.<root>-<name>.json`, unlinked in a `finally`) — the second was
+# (`engine/tsconfig.app.scoped.<root>-<name>.<pid>.json` — the pid keeps two concurrent
+# runs from unlinking each other's config, #967 — unlinked in a `finally`) — the second was
 # never listed, so for the length of a tsc run it sat untracked in the tree and inside every
 # repoFiles() corpus that enumerates untracked files.
 engine/tsconfig.app.scoped*.json

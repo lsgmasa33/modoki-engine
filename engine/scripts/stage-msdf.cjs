@@ -37,6 +37,12 @@ const { execFileSync } = require('child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const BIN_DIR = path.join(PROJECT_ROOT, 'build', 'bin');
 
+/** Drop a half-staged artifact so the NEXT pack re-stages and re-verifies instead of
+ *  short-circuiting on its presence. See the throw sites for why this is load-bearing. */
+function rmStaged(paths) {
+  for (const p of paths) { try { fs.rmSync(p, { force: true }); } catch { /* best effort */ } }
+}
+
 /** Resolve msdf-atlas-gen: MODOKI_MSDF_ATLAS_GEN, then PATH, then Homebrew. */
 function findMsdf() {
   if (process.env.MODOKI_MSDF_ATLAS_GEN && fs.existsSync(process.env.MODOKI_MSDF_ATLAS_GEN)) {
@@ -117,7 +123,21 @@ async function stageMsdfWin32() {
     execFileSync(out, ['-version'], { stdio: 'pipe' }); // prints "MSDF-Atlas-Gen v1.4.0", exit 0
     console.log('[stage-msdf] bundled msdf-atlas-gen.exe → build/bin/');
   } catch (e) {
-    console.warn(`[stage-msdf] staged msdf-atlas-gen.exe but it failed to run: ${e instanceof Error ? e.message : e}`);
+    // ⚠️ **THROW — the staged copy is verified and the verdict must not be discarded**
+    // (#945 B3). The check below already existed; its result was logged and dropped, so a
+    // relocation or dylib-resolve failure staged a binary that CANNOT RUN and the pack
+    // continued, signed it, and shipped it. That is distinct from the tool being ABSENT on
+    // this build machine, which stays a graceful skip above (before-pack.cjs's documented
+    // contract: a missing optional tool never fails the build). Staged-but-broken is not a
+    // missing tool — it is a bad artifact, and it must stop the pack.
+      // ⚠️ **Remove the staged copy BEFORE throwing.** Both win32 stagers short-circuit on
+      // `fs.existsSync(out)` at the top — *before* this sanity run — so leaving a broken binary
+      // in build/bin means the NEXT pack skips staging AND verification and signs a shipping app
+      // around the same broken tool, silently. macOS does not have this hole (it re-copies and
+      // re-verifies every run); the asymmetry is the idempotence early-return. Found in
+      // close-out review of #945 B3.
+      rmStaged([out]);
+    throw new Error(`[stage-msdf] staged msdf-atlas-gen.exe but it failed to run: ${e instanceof Error ? e.message : e}`, { cause: e });
   }
 }
 
@@ -176,6 +196,14 @@ exports.default = async function stageMsdf(context) {
     execFileSync(outBin, [], { stdio: 'pipe' });
     console.log(`[stage-msdf] bundled msdf-atlas-gen (+ ${dylibNames.length} dylibs: ${dylibNames.join(', ')}) → build/bin/`);
   } catch (e) {
-    console.warn(`[stage-msdf] staged msdf-atlas-gen but it failed to run (dylib resolve?): ${e instanceof Error ? e.message : e}`);
+    // ⚠️ **THROW — the staged copy is verified and the verdict must not be discarded**
+    // (#945 B3). The check below already existed; its result was logged and dropped, so a
+    // relocation or dylib-resolve failure staged a binary that CANNOT RUN and the pack
+    // continued, signed it, and shipped it. That is distinct from the tool being ABSENT on
+    // this build machine, which stays a graceful skip above (before-pack.cjs's documented
+    // contract: a missing optional tool never fails the build). Staged-but-broken is not a
+    // missing tool — it is a bad artifact, and it must stop the pack.
+    rmStaged([outBin, ...dylibNames.map((b) => path.join(BIN_DIR, b))]);
+    throw new Error(`[stage-msdf] staged msdf-atlas-gen but it failed to run (dylib resolve?): ${e instanceof Error ? e.message : e}`, { cause: e });
   }
 };
