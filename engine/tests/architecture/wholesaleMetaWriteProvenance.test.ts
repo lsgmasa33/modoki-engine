@@ -23,6 +23,13 @@
  *  independently reached for "did a read land" instead. A guard that is right in three files by
  *  coincidence is what this table converts into one that is checked.
  *
+ *  ⚠️ **Its sibling on the other route is `assetEditorRefusesUnreadableDoc.test.ts` (#886/#896),
+ *  and neither rule is the whole answer.** That one covers asset DOCUMENTS (the dirty-asset
+ *  registry) and asks whether a failed LOAD was classified before anything was substituted for it;
+ *  this one covers `.meta.json` sidecars and asks whether the document about to replace a file was
+ *  read for that path. Same destruction, two routes, two seams — check which registry a new writer
+ *  is on before deciding which rule it owes.
+ *
  *  Same idiom, and the same both-directions discipline, as `metaReadPreferringPark.test.ts`'s
  *  `baseline`/`fallback`/`readPath` fields: a source scan (editor `.tsx` carries no tests of its
  *  own — `docs/editor.md` § Panels), comment-stripped through the shared scanner so a mechanism

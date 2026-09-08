@@ -36,7 +36,7 @@
  *  `openAssetInEditor` binds by it — so there is no normalization to get wrong; if that
  *  ever stops being true this needs a shared canonicalizer, not a looser match here. */
 
-import { useEditorStore, type SelectedAsset } from '../store/editorStore';
+import { useEditorStore, type SelectedAsset, type EditingAssetField } from '../store/editorStore';
 import {
   getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
 } from '../scene/dirtyAssets';
@@ -90,21 +90,33 @@ export function repairedName(from: string, to: string, move: PathMove): string |
 export interface AssetEditorBinding {
   /** Human-readable, for the console line — none of this should happen silently. */
   readonly label: string;
-  readonly assetField: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
-    | 'editingAnimationAsset' | 'editingTimelineAsset';
+  readonly assetField: EditingAssetField;
   readonly close: 'closeParticleEditor' | 'closeSpriteAnimEditor' | 'closeSkinEditor'
     | 'closeAnimationEditor' | 'closeTimelineEditor';
 }
 
-/** Every asset editor that binds to a file. Adding a sixth means adding it HERE — a new
- *  editor that forgets this line resurrects deleted assets exactly like the first five did. */
-export const ASSET_EDITOR_BINDINGS: readonly AssetEditorBinding[] = [
-  { label: 'particle', assetField: 'editingParticleAsset', close: 'closeParticleEditor' },
-  { label: 'sprite animation', assetField: 'editingSpriteAnimAsset', close: 'closeSpriteAnimEditor' },
-  { label: 'skin', assetField: 'editingSkinAsset', close: 'closeSkinEditor' },
-  { label: 'animation', assetField: 'editingAnimationAsset', close: 'closeAnimationEditor' },
-  { label: 'timeline', assetField: 'editingTimelineAsset', close: 'closeTimelineEditor' },
-];
+/** ⚠️ **A `Record` keyed by the union, NOT an array — and that is what makes "adding a sixth means
+ *  adding it HERE" true rather than merely asserted.** It was `readonly AssetEditorBinding[]`, and
+ *  an array literal is never checked for exhaustiveness over a union one of its element FIELDS
+ *  uses: a sixth `EditingAssetField` compiled green with a five-row table, and a missing row here
+ *  is #186 exactly — delete the bound asset and the parked write resurrects it on the next Cmd+S.
+ *  Keyed, a missing row is a compile error at this line. */
+export type AssetEditorBindings = Readonly<Record<EditingAssetField, AssetEditorBinding>>;
+
+/** Every asset editor that binds to a file. Adding a sixth means adding it HERE — a new editor that
+ *  forgets this line resurrects deleted assets exactly like the first five did — and since this is
+ *  keyed by `EditingAssetField`, forgetting it is now a COMPILE ERROR rather than a promise. */
+export const ASSET_EDITOR_BINDINGS_BY_FIELD: AssetEditorBindings = {
+  editingParticleAsset: { label: 'particle', assetField: 'editingParticleAsset', close: 'closeParticleEditor' },
+  editingSpriteAnimAsset: { label: 'sprite animation', assetField: 'editingSpriteAnimAsset', close: 'closeSpriteAnimEditor' },
+  editingSkinAsset: { label: 'skin', assetField: 'editingSkinAsset', close: 'closeSkinEditor' },
+  editingAnimationAsset: { label: 'animation', assetField: 'editingAnimationAsset', close: 'closeAnimationEditor' },
+  editingTimelineAsset: { label: 'timeline', assetField: 'editingTimelineAsset', close: 'closeTimelineEditor' },
+};
+
+/** The same five, as a list — every consumer iterates, and the ORDER is this one. Derived, so it
+ *  cannot drift from the keyed table above. */
+export const ASSET_EDITOR_BINDINGS: readonly AssetEditorBinding[] = Object.values(ASSET_EDITOR_BINDINGS_BY_FIELD);
 
 export interface BindingChange<T> { readonly binding: T; readonly to: string | null; readonly name?: string }
 

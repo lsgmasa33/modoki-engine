@@ -34,6 +34,7 @@ import {
   noteMetaReadResult, metaReadFallback,
   stampMetaReadPath, metaReadPathOf, metaCameFromFailedRead,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 
 /** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
  *
@@ -67,7 +68,16 @@ beforeEach(() => {
     return { ok: reply.status < 400, status: reply.status, text: async () => '', json: async () => reply.body } as unknown as Response;
   }));
 });
-afterEach(() => { clearPendingMeta(); clearMetaBaselines(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => {
+  clearPendingMeta(); clearMetaBaselines(); vi.unstubAllGlobals(); vi.restoreAllMocks();
+  // ⚠️ The toast too — REDUNDANT ON PURPOSE, and the comment says so rather than claiming a live
+  // leak. It was a live leak: a generic `/not saved[\s\S]*Reselect/` was satisfied on entry by the
+  // refusal the preceding test left behind. What closed it is per-test — each toast test clears the
+  // slot itself and asserts its own BRANCH's wording, and the three regexes are mutually exclusive.
+  // Removing this line reddens nothing (measured); it stays because the next toast test added here
+  // will not necessarily remember to clear, and the cost is one line.
+  useEditorStore.setState({ toast: null });
+});
 
 describe('parking a meta edit', () => {
   it('records the edit and writes nothing', () => {
@@ -1356,6 +1366,94 @@ describe('a park must be built on a read OF THAT PATH (#890/#891/#897)', () => {
     expect(metaReadPathOf(forged)).toBeUndefined();
     parkMetaEdit(A, { ...forged, model: { lodCount: 2 } });
     expect(peekPendingMeta(A)).toBeUndefined();
+  });
+
+  /** ⚠️ A refusal that only reaches the console is indistinguishable from a broken control
+   *  (owner, 2026-09-08). The human toggles a field, it snaps back, nothing is parked, and nothing
+   *  on screen says why — which is exactly what #890's drive saw. Both refusal branches now toast,
+   *  and both are asserted here: the console keeps the full diagnosis, the toast is the human half.
+   *
+   *  ⚠️ Asserted on the STORE rather than on a spy, because the store is what the human sees and a
+   *  spy would pass with the toast wired to nothing. */
+  /** ⚠️ `toast: null` FIRST, and the assertion names THIS branch's wording. Both matter, and both
+   *  were missing: the store slot survives between tests, so a refusal left by the test above
+   *  satisfied a generic `/not saved[\s\S]*Reselect/` on entry — this test passed with its own
+   *  mechanism deleted. A per-branch regex plus a cleared slot is what makes it falsifiable. */
+  it('tells the human, not only the console — the NEVER-READ refusal', async () => {
+    useEditorStore.setState({ toast: null });
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      parkMetaEdit(A, { model: { lodCount: 2 } });
+    } finally { spy.mockRestore(); }
+    // ⚠️ BEFORE the await: the store write is DEFERRED, and nothing else pins that. Deleting the
+    // `queueMicrotask` wrapper leaves every other assertion here green — measured — and puts a
+    // zustand `set` back inside a React render-phase updater, which is the hazard the helper's
+    // docblock spends its length on.
+    expect(useEditorStore.getState().toast, 'nothing may reach the store on the caller\'s stack').toBeNull();
+    await Promise.resolve();   // the store write is deferred off the caller's stack
+
+    const toast = useEditorStore.getState().toast;
+    expect(toast?.kind).toBe('warn');
+    expect(toast?.message, 'the never-read wording, not the foreign-document one')
+      .toMatch(/have not been read yet/);
+  });
+
+  /** ⚠️ The THIRD branch, which nothing covered: a document built on a FAILED read is refused by
+   *  `metaCameFromFailedRead` before the stamp check is reached, so neither test above ever runs
+   *  that line. The mutation that proves it: revert only branch 1's `refuseWithToast(` to
+   *  `console.error(` — varargs, so it typechecks and lints — and every other test here stays
+   *  green while that refusal goes back to console-only, which is the defect the change exists to
+   *  fix. "Wiring the toast to nothing" reddens both branches at once and cannot tell them apart. */
+  it('tells the human on the FAILED-READ branch too — the one the other two never reach', async () => {
+    useEditorStore.setState({ toast: null });
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      parkMetaEdit(A, { ...metaReadFallback(), model: { lodCount: 2 } });
+    } finally { spy.mockRestore(); }
+    // ⚠️ BEFORE the await: the store write is DEFERRED, and nothing else pins that. Deleting the
+    // `queueMicrotask` wrapper leaves every other assertion here green — measured — and puts a
+    // zustand `set` back inside a React render-phase updater, which is the hazard the helper's
+    // docblock spends its length on.
+    expect(useEditorStore.getState().toast, 'nothing may reach the store on the caller\'s stack').toBeNull();
+    await Promise.resolve();
+
+    expect(useEditorStore.getState().toast?.message, "the failed-read wording, which neither other branch produces")
+      .toMatch(/could not be read/);
+  });
+
+  it('tells the human which of the two refusals it was — the foreign-document one', async () => {
+    stubReads({ [A]: { id: 'GUID-A' } });
+    const a = await readMetaPreferringPark(A);
+    useEditorStore.setState({ toast: null });
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      parkMetaEdit(B, { ...a.meta, model: { lodCount: 2 } });
+    } finally { spy.mockRestore(); }
+    // ⚠️ BEFORE the await: the store write is DEFERRED, and nothing else pins that. Deleting the
+    // `queueMicrotask` wrapper leaves every other assertion here green — measured — and puts a
+    // zustand `set` back inside a React render-phase updater, which is the hazard the helper's
+    // docblock spends its length on.
+    expect(useEditorStore.getState().toast, 'nothing may reach the store on the caller\'s stack').toBeNull();
+    await Promise.resolve();
+
+    expect(useEditorStore.getState().toast?.message, 'the two refusals must not read alike — the '
+      + 'recovery is the same but the CAUSE the human can act on is not')
+      .toMatch(/previously selected asset/);
+  });
+
+  /** The accept side of the toast: an ordinary edit must not raise one. A "does it warn?" test
+   *  passes just as happily against a seam that warns on EVERY park. */
+  it('does NOT toast when the park is accepted', async () => {
+    stubReads({ [A]: { id: 'GUID-A' } });
+    const { meta } = await readMetaPreferringPark(A);
+    useEditorStore.setState({ toast: null });
+
+    parkMetaEdit(A, { ...meta, model: { lodCount: 2 } });
+    await Promise.resolve();
+
+    expect(useEditorStore.getState().toast, 'an ordinary field change is silent').toBeNull();
+    expect(peekPendingMeta(A), 'and it really parked — a seam that silently did nothing would '
+      + 'also be "silent"').toBeDefined();
   });
 
   /** The failed-read refusal still owns its own case, and its message is the more specific one —

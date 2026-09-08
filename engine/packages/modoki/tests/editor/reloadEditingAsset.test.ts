@@ -23,7 +23,13 @@ function sharedPreviewState() {
 
 describe('reloadEditingAsset', () => {
   beforeEach(() => {
+    // ⚠️ ALL FIVE slots, not just the two these tests read. The store is a module-level singleton,
+    // and the five-editor loop below leaves three of them bound — harmless only because it happens
+    // to run last, and spuriously red the moment anyone appends a test after it.
     useEditorStore.setState({
+      editingParticleAsset: null, editingParticleDef: null,
+      editingSpriteAnimAsset: null, editingSpriteAnimDef: null,
+      editingSkinAsset: null, editingSkinDef: null,
       editingAnimationAsset: null, editingAnimationClip: null,
       editingTimelineAsset: null, editingTimelineDoc: null,
       isPreviewPlaying: false, previewOwner: null, playheadTime: 0, isRecording: false,
@@ -85,9 +91,13 @@ describe('reloadEditingAsset', () => {
     expect(after.animationEditNonce).toBe(animNonce);
   });
 
-  it('covers all five editors, so no panel is left reaching for an open action instead', () => {
-    // Non-vacuity for the SLOTS table: a field missing from it would throw or silently no-op, and
-    // the panel that needed it would go back to `open<X>Editor` — reintroducing the bug above.
+  it('maps all five editors to distinct document and nonce slots', () => {
+    // ⚠️ Scope, stated because the first version of this test over-claimed it ("so no panel is left
+    // reaching for an open action instead"). This proves the TABLE, not the PANELS — and the two are
+    // not the same claim: when it was written, all five rows existed and `ParticleEditor` reached for
+    // neither the action nor an open action, so the table was complete and a panel was still broken.
+    // The panel wiring is guarded by `tests/architecture/assetEditorRefusesUnreadableDoc.test.ts`,
+    // which scans the source, because the panels are `.tsx` and this repo does not mount those.
     const cases = [
       ['editingParticleAsset', 'editingParticleDef', 'particleEditNonce'],
       ['editingSpriteAnimAsset', 'editingSpriteAnimDef', 'spriteAnimEditNonce'],

@@ -68,6 +68,17 @@ export interface SelectedAsset {
  *  'weights' paints per-vertex influence (heatmap + brush + test-pose). */
 export type SkinMode = 'parts' | 'rig' | 'weights';
 
+/** The five `editing<X>Asset` slots — the asset editors that hold a document and park it.
+ *
+ *  ⚠️ **ONE definition.** This union was hand-written in four places (`remapEditingAssetPath`,
+ *  `reloadEditingAsset`, `AssetEditorBinding['assetField']`, and a test's own copy), which is the
+ *  repo's shadowing-constant class applied to a type: `assetEditorBindings.ts` says "Adding a sixth
+ *  means adding it HERE", and by the time it said so it was no longer the only HERE. Adding a sixth
+ *  editor now updates this line, and every list that must grow with it fails to compile. */
+export type EditingAssetField =
+  | 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
+  | 'editingAnimationAsset' | 'editingTimelineAsset';
+
 interface EditorState {
   /** Primary (anchor) selection — last-clicked entity. Drives the SceneView
    *  gizmo and all single-entity consumers. Always either null or a member of
@@ -477,28 +488,44 @@ interface EditorState {
    *  disk and would discard the in-memory doc, which after a rename is the newer of the
    *  two. The doc is the truth here — only its location changed. A no-op if that editor is
    *  unbound, so a stale move can never conjure a binding out of nothing. */
-  remapEditingAssetPath: (
-    field: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
-      | 'editingAnimationAsset' | 'editingTimelineAsset',
-    path: string,
-    name?: string,
-  ) => void;
+  remapEditingAssetPath: (field: EditingAssetField, path: string, name?: string) => void;
   /** Force an open asset editor to RE-READ its file: null the loaded document and bump that
    *  editor's nonce, so its load effect runs again and cannot take its `if (existing)` early
    *  return. Nothing else changes.
    *
    *  ⚠️ **Deliberately NOT `open<X>Editor(sameAsset)`, and that distinction is the whole reason this
-   *  exists** (#896 review 2). The open actions also reset `playheadTime`, `isRecording`,
-   *  `isPreviewPlaying` and `previewOwner` — correct when the human opens a DIFFERENT asset, and
-   *  wrong for a re-read, because those last two are SHARED with the other timeline-ish panel.
-   *  `closeAnimationEditor`/`closeTimelineEditor` already guard them with `panelMayStopPreview`
-   *  (#810); the open actions clobber them unconditionally. So routing the refused-load Retry button
-   *  through an open action meant clicking Retry in a refused Timeline stopped the Animation panel's
-   *  running preview and snapped the shared playhead to 0. A re-read is not a re-open. */
-  reloadEditingAsset: (
-    field: 'editingParticleAsset' | 'editingSpriteAnimAsset' | 'editingSkinAsset'
-      | 'editingAnimationAsset' | 'editingTimelineAsset',
-  ) => void;
+   *  exists** (#896 review 2). Each open action resets more than the document, and what it resets
+   *  DIFFERS — read off the source rather than generalised from one of them, because the first
+   *  version of this docblock generalised from `openAnimationEditor` and was false of three:
+   *
+   *   - `openAnimationEditor` — `playheadTime`, `isRecording`, `isPreviewPlaying`, `previewOwner`,
+   *     `animatorRootEntityId`
+   *   - `openTimelineEditor`  — `playheadTime`, `isPreviewPlaying`, `previewOwner` (not
+   *     `isRecording`), `directorRootEntityId`
+   *   - `openSkinEditor`      — `activeSkinPart`, `skinPreviewHidden`
+   *   - `openParticleEditor`, `openSpriteAnimEditor` — nothing beyond the doc and the nonce
+   *
+   *  ⚠️ Those two root-entity fields are the strongest argument for this action existing at all:
+   *  they are PARAMETERS of the open actions, so routing a re-read through one would mean inventing
+   *  a root id for a panel that is only re-reading the asset it already has open.
+   *
+   *  `isPreviewPlaying`/`previewOwner` are SHARED between the Animation and Timeline panels, which is
+   *  why `closeAnimationEditor`/`closeTimelineEditor` guard them with `panelMayStopPreview` (#810)
+   *  while the open actions clobber them unconditionally — correct when the human opens a DIFFERENT
+   *  asset, wrong for a re-read. Routing the refused-load Retry through an open action meant clicking
+   *  Retry in a refused Timeline stopped the Animation panel's running preview and snapped the shared
+   *  playhead to 0. A re-read is not a re-open.
+   *
+   *  ⚠️ It follows that this action does NOT restore `activeSkinPart`/`skinPreviewHidden` either. Fine
+   *  for Retry (a refused panel has both at their open-time defaults); if this is ever called on a
+   *  LOADED rig, a re-read with fewer parts leaves `activeSkinPart` pointing past the end.
+   *
+   *  ⚠️ **"Touches nothing else" is about STORE STATE, not about consequences.** The nonce is not
+   *  private: `EditorApp.tsx` subscribes to all five and docks/selects that editor's tab when one
+   *  moves. So a Retry re-focuses the panel where the old local nonce did not — benign, since you
+   *  must be looking at the panel to click Retry, but it is a real difference and the first version
+   *  of this line implied there was none. */
+  reloadEditingAsset: (field: EditingAssetField) => void;
   /** Repoint the ASSET SELECTION at paths a move has changed, WITHOUT an undo entry (#867).
    *  Selection is path-keyed like the editor bindings, and a repair is not a user action — it is
    *  what keeps an existing action's result coherent, so it must not land in the history the user

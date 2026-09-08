@@ -3,13 +3,20 @@
  *  Presentation only — the decision is `assetDocLoad.classifyAssetDocFetchFailure`, and the
  *  refusal is enforced by the panel simply not putting a document in the store (its editing surface
  *  is gated on that document, so editing is disabled by construction rather than by a flag threaded
- *  through every field). This exists because four editors need the identical banner and four copies
- *  of it would go out of sync on the first wording change.
+ *  through every field). This exists because SIX consumers need the identical banner — the five
+ *  asset editors plus `MaterialBatchView` — and six copies of it would go out of sync on the first
+ *  wording change.
  *
- *  ⚠️ `ParticleEditor` and `AtlasAssetView` keep their own — deliberately, not by oversight. Both
- *  render an ABSOLUTELY-POSITIONED overlay inside a viewport, and `AtlasAssetView` distinguishes a
- *  'failed' state from a 'refused' one with a message. This is the in-flow block the four remaining
- *  editors want. The thing that must not fork is the DECISION, and that is shared. */
+ *  ⚠️ **An earlier version of this block said `ParticleEditor` keeps its own "deliberately, not by
+ *  oversight", because it renders an absolutely-positioned overlay.** That stopped being true when
+ *  ParticleEditor adopted this component (#896 review 3) — the `style` override handles the overlay
+ *  case, as `SpriteAnimEditor` and `ParticleEditor` both now demonstrate. The stale version was
+ *  worse than no note: it told the next person that hand-rolling a copy was the sanctioned choice
+ *  for exactly their case.
+ *
+ *  ⚠️ `AtlasAssetView` genuinely does keep its own, and that half was always true: it distinguishes
+ *  a 'failed' state from a 'refused' one with a message, which this component has no shape for. The
+ *  thing that must not fork is the DECISION, and that is shared regardless. */
 
 import type { CSSProperties, ReactNode } from 'react';
 

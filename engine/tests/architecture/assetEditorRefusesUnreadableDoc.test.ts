@@ -80,6 +80,48 @@ describe('every parking asset editor classifies a failed read (#886/#896)', () =
     ]);
   });
 
+  it('each one retries through reloadEditingAsset — not a local nonce, not an open action', () => {
+    // ⚠️ **The guard that was missing, and its absence cost a real defect.** Four panels moved off a
+    // local `reloadNonce` and onto `reloadEditingAsset`; `ParticleEditor` kept the nonce and nothing
+    // noticed, because the only test was on the STORE ACTION and the action's table was complete.
+    // A table can be complete while a panel is still broken — so the population has to be scanned.
+    //
+    // Both rejected shapes are named, because they fail in opposite directions: a local nonce
+    // re-runs the load effect but cannot get past its `if (existing)` early return (so Retry adopts
+    // a document nobody read), and `open<X>Editor` nulls the document but clobbers preview state
+    // shared with the sibling panel.
+    const refusing = parkingEditors()
+      .filter((e) => /\bsetLoadState\s*\(\s*'failed'\s*\)/.test(e.code));   // has a refusal to retry FROM
+
+    // ⚠️ **A COUNT FLOOR, because the filter above is a source-literal match with no other floor.**
+    // Without this the rule fails OPEN under a two-line refactor: extract a `REFUSED` constant, or
+    // write `setLoadState(v.kind === 'refused' ? 'failed' : 'ok')`, or use double quotes, and the
+    // panel silently drops OUT of the filtered set — the guard then examines nothing and reports
+    // green over exactly the defect it exists to catch. Measured: with the literal replaced AND
+    // ParticleEditor put back on a local nonce, the rule passed 3/3. The sibling rule above pins
+    // its corpus by name for the same reason; this one has to pin the filtered subset too.
+    expect(refusing.map((e) => path.basename(e.rel)).sort(), 'every parking editor can refuse a load').toEqual([
+      'AnimationEditor.tsx', 'ParticleEditor.tsx', 'SkinEditor.tsx',
+      'SpriteAnimEditor.tsx', 'TimelineEditor.tsx',
+    ]);
+
+    const offenders = refusing
+      .filter((e) => !/\breloadEditingAsset\s*\(/.test(e.code))
+      .map((e) => e.rel);
+
+    expect(offenders, [
+      'These panels can REFUSE a load but do not retry through `reloadEditingAsset`, so their Retry',
+      'either cannot get past the load effect’s `if (existing)` early return (a local nonce — the',
+      'panel then edits whatever document was already in the store) or clobbers `isPreviewPlaying`/',
+      '`previewOwner`/`playheadTime`, which are SHARED with the sibling panel (`open<X>Editor`).',
+      '',
+      'Fix: `useEditorStore.getState().reloadEditingAsset(\'editing<X>Asset\')`. See that action’s',
+      'docblock for what each open action resets, and why a re-read is not a re-open.',
+      '',
+      ...offenders,
+    ].join('\n')).toEqual([]);
+  });
+
   it('each one routes its load failure through the shared classifier', () => {
     const missing = parkingEditors().filter((e) => !CLASSIFIER.test(e.code)).map((e) => e.rel);
 

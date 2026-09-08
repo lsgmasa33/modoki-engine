@@ -389,10 +389,82 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   the tagged fallback"* — three files right by coincidence, which is what the table converts into
   one thing that is checked.
 
-  ⚠️ **What it does NOT fix, deliberately: #886** — `MaterialBatchView` parking the `{}` fallback of
-  a failed `.mat.json` read. That is the emptiness face on the dirty-asset registry, and its repair
-  is a shared read seam for asset documents, which does not exist yet. Same destruction, same
-  fail-open instinct, different seam.
+  ⚠️ **A refused park TOASTS, and the two panels that refuse do NOT behave alike** (owner,
+  2026-09-08). Both decisions are the owner's and both are deliberate, so neither is a gap to tidy:
+
+  - **The refusal reaches the human, not only the console.** `parkMetaEdit` shows a warn toast on
+    each of its two branches, worded differently (*"have not been read yet"* vs *"the panel was
+    still showing the previously selected asset"*) because the recovery is the same but the cause
+    the human can act on is not; `console.error` keeps the full diagnosis. Without it a refusal is
+    indistinguishable from a broken control — the field snaps back, nothing is parked, nothing on
+    screen says why, which is exactly what #890's drive saw. The store holds ONE toast slot on a
+    3.5s timer, so a per-keystroke field re-shows the same message rather than queueing N.
+    ⚠️ **Four of the eight `.meta.json` refusal sites reach the human, four do not** — counted
+    from the `WRITERS` table in `tests/architecture/wholesaleMetaWriteProvenance.test.ts`, which is
+    the only enumeration of this population that cannot go stale, plus `parkMetaEdit`'s two
+    branches. Reaching the human: those two branches, `EnvironmentAssetView.apply()`, and
+    `scene/modelImport.ts`, whose `ImportWriteAborted` surfaces as an import-failed toast carrying
+    the reason. Console-only: `makeTexture2D`, the Sprite and 9-slice editors' Save, and
+    `writeMetaConditional` at the endpoint (`grep -c showToast` is 0 in all four files).
+    ⚠️ Two earlier drafts of this line said "two of six" and then enumerated seven, and both omitted
+    `modelImport` — which matters because it is the site that already carries the pattern #901 is
+    about to invent. Tracked as one class in **#901**, filed
+    rather than fixed because the fix is a `showToast` call copy-pasted four times, the shared
+    reporter's home is constrained by the `pendingMeta` → `widgets` import direction, and the right
+    answer differs per surface: both modals keep their dialog OPEN on a refused save, so they
+    already signal *that* it failed and only lack the reason.
+  - **A control that cannot work is DISABLED in one place and left live in the other.**
+    `EnvironmentAssetView`'s Apply is `disabled={importing || meta === null}`; the Inspector's
+    postprocessor `<select>` stays enabled after a failed read (its `metaLoaded` is set true in the
+    catch) and relies on the refusal plus the toast. The asymmetry is chosen, not overlooked: Apply
+    spends real work before it can fail (a gainmap encode, a multi-MB file write), so offering it
+    is worse than greying it; a dropdown costs nothing to try, and a greyed control with no
+    explanation is its own dead end. Do not "fix" either one into the other without asking.
+
+  ⚠️ **What it does NOT fix: #886/#896** — a failed `.mat.json`/`.rig2d.json`/`.anim.json` read
+  represented as a loadable DOCUMENT. That is the emptiness face on the dirty-asset registry, and
+  the same destruction with the same fail-open instinct at a different seam.
+  ⚠️ **It was fixed separately, on `main`, while this landed** — the shared read seam this section
+  said "does not exist yet" now does: `panels/assetDocLoad.ts`'s
+  `classifyAssetDocFetchFailure` (with `assetViews/materialBatchLoad.ts` for the batch),
+  guarded by `tests/architecture/assetEditorRefusesUnreadableDoc.test.ts`. Read the two rules as a
+  PAIR covering two routes, not as one answer with a gap:
+
+  | | this page's guard | `assetEditorRefusesUnreadableDoc` |
+  |---|---|---|
+  | route | `.meta.json` sidecars — `parkMetaEdit` + the wholesale writers | asset DOCUMENTS — the dirty-asset registry |
+  | question | *was this document read FOR THIS PATH?* | *was this failure a MISSING file or an unreadable one?* |
+  | when it fires | at the EDIT, and again before a wholesale write | at the LOAD |
+  | what the human sees | **varies, and that is not settled** — see below | the editing surface is not offered; an in-flow banner |
+
+  ⚠️ **The last row deliberately does not state a rule, because the code does not follow one** —
+  the counts and the per-site list are in the refusal bullet above; do not restate them here, or
+  the two copies drift the moment #901 lands. An earlier draft of this row read *"the control stays
+  live; the refusal is a toast"*, which was true of two sites and contradicted the
+  `EnvironmentAssetView` bullet in the same section.
+
+  ⚠️ **The two report differently ON PURPOSE, and neither is the other's holdout.** A load refusal
+  can withhold the whole surface, because there is nothing to edit; a park refusal happens with the
+  human's hand on a control that still works for every other asset, so it reports and leaves the
+  control alone. A distinction worth keeping: the missing-vs-unreadable split the asset-document
+  rule turns on is COLLAPSED BY THE ROUTE here, which is not the same as absent — and an earlier
+  draft of this line said "no sidecar equivalent", which is the wrong direction to be wrong in,
+  because it tells the next reader there is nothing to classify.
+
+  `/api/read-meta` answers `200 {}` for an asset with **no sidecar yet** and for one that **exists
+  and does not PARSE**, and the route says so in its own comment (#778): *"A caller must not read
+  `{}` as 'there was nothing here'"*. So `readMetaPreferringPark` sees `r.ok`, tags nothing, and
+  STAMPS the document — both guards on this page are silent by construction. The live consequence,
+  read off the route rather than driven: a `.meta.json` carrying git conflict markers shows the
+  panel its defaults, one field change parks, and Cmd+S replaces the file. `writeMetaSidecar`
+  quarantines the corrupt bytes and salvages the `id` — so the GUID USUALLY survives, and every
+  other authored field (`border`, sprite slices, `generated`, `rig`) does not.
+  ⚠️ "Usually": `salvageSidecarId` refuses to guess when the damaged text carries two or more
+  different guid-shaped `id` values — both sides of a merge having touched `id` — and returns
+  `undefined`, at which point the GUID goes too. That is the worst case of the mechanism this page
+  describes, so the clause is not a hedge. That is #778's mechanism
+  reached through the panel rather than through `writeAssetGuid`; the classification would have to
+  happen at the ROUTE, which is why it is not a guard this page can add.
 
 - **A wholesale editor write FORGETS the baseline it invalidated** (#874). Make-2D, a 9-slice or
   Sprite Save, a model import and the collision-mesh write all replace the sidecar while a panel is

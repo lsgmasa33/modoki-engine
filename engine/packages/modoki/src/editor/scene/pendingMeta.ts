@@ -78,6 +78,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
 import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
 import { metaReadFallback, metaCameFromFailedRead, stampMetaReadPath, metaReadPathOf } from './metaReadFallback';
+import { useEditorStore } from '../store/editorStore';
 
 /** path -> the full `.meta.json` object to write. Last edit to a path wins, exactly like the
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
@@ -226,6 +227,57 @@ export function subscribePendingMeta(fn: () => void): () => void {
 /** Monotonic change counter — the `getSnapshot` for a `useSyncExternalStore` subscriber. */
 export function getPendingMetaVersion(): number { return _version; }
 
+/** Report a refused park to BOTH channels: the console, for the agent and the log, and a toast,
+ *  for the human who is looking at the control right now (owner, 2026-09-08).
+ *
+ *  ⚠️ **A refusal that only reaches the console is indistinguishable from a broken control.** The
+ *  human toggles Flip Y, the checkbox snaps back, nothing is parked and nothing on screen says
+ *  why — measured in #890's own drive, where the destruction and the refusal both happened with
+ *  no on-screen signal. `EnvironmentAssetView.apply()` already toasted its own refusal; making
+ *  this seam do it means the two refusals behave alike rather than one being the exception.
+ *
+ *  The store keeps ONE toast slot on a 3.5s timer, so a rapid-fire field (a number input firing
+ *  per keystroke) re-shows the same message rather than queueing N of them — no dedupe needed
+ *  here, and adding one would be a second mechanism for a property the store already has.
+ *
+ *  `console.error` keeps the FULL diagnosis (which path, which document, the recovery); the toast
+ *  is the short human half. They are deliberately not the same string — one is read in a log
+ *  afterwards, the other is read in 3.5 seconds while the asset is still selected.
+ *
+ *  ⚠️ **The store write is DEFERRED to a microtask, and that is not tidiness.** Most park sites call
+ *  `parkMetaEdit` from inside a `setState` UPDATER — `setSettings((prev) => { … parkMetaEdit(…) … })`
+ *  in Model/Texture/Font/Audio/Video, and the same shape in both batch views. React invokes an
+ *  updater during the render phase and StrictMode double-invokes it, and this repo has already
+ *  ruled twice that the position must be pure: `AtlasAssetView` ("a setState updater must be pure,
+ *  and React StrictMode double-invokes it in dev, so writing here issued two disk writes per edit")
+ *  and `SpritePicker` — and `runtime/core/consoleRing.ts` defers for this exact reason in its own
+ *  words: *"a synchronous notify from a warn/error raised during render would be a
+ *  setState-during-render from the caller's perspective"*. A synchronous `showToast` here is a
+ *  zustand `set` notifying every subscriber
+ *  of the main editor store from inside another component's render — React's "Cannot update a
+ *  component while rendering a different component". `console.error` was inert in that position;
+ *  this is not.
+ *
+ *  ⚠️ It does NOT make the whole function pure, and the honest statement of the residual is that
+ *  `bump()` below already notifies `useMetaDirty`'s subscribers synchronously from the same
+ *  position — pre-existing, untouched here, and a smaller subscriber set. This defers the write
+ *  this change ADDED rather than claiming to have fixed the seam.
+ *
+ *  A double-invoked updater enqueues the microtask twice; the store's single toast slot collapses
+ *  that to one message with its timer reset, so no dedupe is owed. */
+function refuseWithToast(consoleMessage: string, toastMessage: string): void {
+  console.error(consoleMessage);
+  queueMicrotask(() => {
+    // ⚠️ The try/catch is what `consoleRing.ts` learned to do around the same deferral. A
+    // microtask has no caller: a throwing store subscriber used to propagate into the React stack,
+    // where a boundary could see it and the stack said who was at fault, and would now be an
+    // uncaught exception on an empty stack. `console.error` above already carries the diagnosis,
+    // so swallowing the REPORT's own failure loses nothing the human needed.
+    try { useEditorStore.getState().showToast(toastMessage, 'warn'); } catch { /* reported above */ }
+  });
+}
+
+
 /** Park a `.meta.json` edit for `path`. `meta` is the FULL sidecar object — every call site
  *  already merges onto whatever it loaded (same contract `writeMetaOrWarn` had), so this simply
  *  holds that object instead of POSTing it.
@@ -252,11 +304,13 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
   // The refusal reads the DOCUMENT, so it answers for the component that built it and for no
   // other. The panel next to this one, whose read succeeded, keeps editing (#880).
   if (metaCameFromFailedRead(meta)) {
-    console.error(
+    refuseWithToast(
       `[pendingMeta] refusing to park an import-settings edit for ${path} — this panel's .meta.json `
       + 'read failed, so it is showing defaults with no GUID in hand, and saving would replace the '
       + 'file with a document missing it. RECOVERY: reselect the asset to re-read it. Other panels '
       + 'showing this asset are unaffected.',
+      'That edit was not saved — this asset\'s import settings could not be read. '
+      + 'Reselect the asset to re-read it, then try again.',
     );
     return;
   }
@@ -268,7 +322,7 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
   // second was read successfully — of the wrong file.
   const readFor = metaReadPathOf(meta);
   if (readFor !== path) {
-    console.error(
+    refuseWithToast(
       `[pendingMeta] refusing to park an import-settings edit for ${path} — `
       + (readFor === undefined
         ? 'this panel has no .meta.json for that path (its read threw, or has not landed yet), so '
@@ -277,6 +331,11 @@ export function parkMetaEdit(path: string, meta: unknown, ifMatch?: string): voi
         + 'would write that asset\'s GUID into this one')
       + '. Saving would replace the file wholesale and cost an asset its identity. RECOVERY: '
       + 'reselect the asset to re-read it. Other panels showing this asset are unaffected.',
+      readFor === undefined
+        ? 'That edit was not saved — this asset\'s import settings have not been read yet. '
+        + 'Reselect the asset, then try again.'
+        : 'That edit was not saved — the panel was still showing the previously selected asset. '
+        + 'Reselect this asset, then try again.',
     );
     return;
   }

@@ -99,14 +99,29 @@ export default function AnimationEditor() {
    *  construction — the same shape ParticleEditor/AtlasAssetView use. A genuinely MISSING file is
    *  NOT this: defaults are the correct content there (#896, and see `assetDocLoad.ts`). */
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
-  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
-   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
-   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
-   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
-   *  re-reading the file, leaving the panel editing normally over a document it never read. The
-   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
-   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
-   *  was this button. */
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
   const retryLoad = useCallback(() => {
     useEditorStore.getState().reloadEditingAsset('editingAnimationAsset');
   }, []);

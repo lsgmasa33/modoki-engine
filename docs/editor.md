@@ -1612,6 +1612,34 @@ the classifier is CALLED, not that both branches are handled** — the verdict's
 behaviour is `packages/modoki/tests/editor/assetDocLoad.test.ts`, and the batch view's
 exclusion/write halves are `tests/editor/materialBatchLoad.test.ts`.
 
+**Retrying a refused load is `reloadEditingAsset`, never `open<X>Editor` and never a local nonce.**
+Both alternatives were shipped and both were wrong, in opposite directions — a local nonce re-runs
+the load effect but cannot get past its `if (existing)` early return, so Retry adopts whatever
+document happened to land in the store, with no further check; `open<X>Editor` does null the
+document, but also clobbers `isPreviewPlaying`/
+`previewOwner`/`playheadTime`, which are SHARED between the Animation and Timeline panels and which
+`closeAnimationEditor`/`closeTimelineEditor` guard with `panelMayStopPreview` for that reason
+(#810). **A re-read is not a re-open**, and the two open actions that reset preview state are
+exactly the two whose close actions guard it. `reloadEditingAsset`'s docblock lists what each of the
+five open actions actually resets — they differ, and the first version of that docblock generalised
+from one of them and was false of three.
+
+⚠️ **Nulling the document removes that early return; it does NOT guarantee a disk read** — and five
+docblocks plus this section said it did until #896's fourth review. The next branch is
+`pendingAssetDoc`, which adopts a PARKED document before any `fetch`, deliberately: a park is
+unsaved work newer than the file, and re-reading over it is the destruction #831/#843 and
+QA-CTX-0008 are about. Every agent op parks (`persistOrMarkDirty` is unconditional under manual
+persistence) and so does a redo — the two cases the old wording named as what a re-read PREVENTS —
+so "Retry re-reads the file" holds only when nothing is parked for that path. A refused panel's
+instruction to the human must say so, or repairing the file and clicking Retry silently yields the
+parked document instead, and Cmd+S then writes it over the repair.
+
+⚠️ **A store-level test cannot see whether a PANEL is wired to it.** `reloadEditingAsset` had a
+complete five-row table and a passing test while `ParticleEditor` was still on a local nonce — a
+table can be complete and a panel still broken. The panel half is a source scan
+(`tests/architecture/assetEditorRefusesUnreadableDoc.test.ts`), over the same corpus derived from
+`useParkedAssetDoc(`, because the panels are `.tsx` and this repo does not mount those.
+
 ⚠️ **`SkinEditor`'s fallback is EMPTY by owner ruling (#423 item 2) and stays that way** — a
 phantom `root` bone would claim content the file does not have. That ruling is about what is
 DISPLAYED and is compatible with refusing (a refused load shows nothing either); what changed in

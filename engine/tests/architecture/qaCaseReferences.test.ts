@@ -2252,6 +2252,64 @@ describeCases('QA case references', () => {
   });
 
   /**
+   * A case's executable probe must not hardcode ONE of the Assets panel's two group labels (#712).
+   *
+   * The Assets panel groups rows either by asset TYPE (`\u25b6 Particle (1)`) or by FOLDER
+   * (`\u25b6 \ud83d\udcc1 particles (1)`), and a row is unreachable — `[data-asset-path]` matches
+   * nothing — until its group is expanded. Which label renders is decided by `viewMode`, which
+   * `assetFolderState.ts` persists in `localStorage` under a key that is deliberately NOT
+   * project-scoped, so it follows the runner across relaunches and across projects.
+   *
+   * Measured 2026-09-08 on `work-qa`: QA-PARTICLE-0007's probe matched `/^\u25b6Particle/`, the
+   * CATEGORY form, and returned zero candidates on a live editor sitting in folder view where the
+   * asset was present and fine. The tap is then refused with "no element matches selector", which
+   * reads like a missing asset — so this fails as a wrong diagnosis, not as a visible break.
+   *
+   * The rule is scoped to FENCED BLOCKS in cases, which is the executable half. Prose is free, and
+   * `qa/knowledge.md` is absent from `cases` entirely — \u00a7 3 has to show BOTH labels to explain
+   * the difference, so a rule that scanned it would fire on the doc that owns the rule.
+   *
+   * \u26a0\ufe0f If this fires, do NOT delete the arrow — write a probe that accepts both views. \u00a7 3
+   * carries one; the shape is to match on the trailing count both forms share.
+   *
+   * \u26a0\ufe0f **What this guard does NOT prove, stated because a shape check reads like a
+   * correctness check.** It asserts the probe MENTIONS the folder form; it cannot evaluate the
+   * regex, so it cannot tell whether the probe actually MATCHES both. The #712 review found
+   * exactly that gap live: `/^\u25b6(\ud83d\udcc1)?particles\\(\\d+\\)$/i` names the folder emoji and
+   * still matched folder view ONLY, because the category header renders the SINGULAR type name
+   * (`Particle`) while the folder header is the PLURAL directory (`particles`). A green result
+   * here means "the author knew there were two views", not "the probe works in both".
+   */
+  it('no case probe hardcodes one Assets view-mode group label (#712)', () => {
+    const offenders: string[] = [];
+    // Anti-vacuity: the detector must be shown to be looking at something. If `fences` ever stops
+    // matching, an empty offender list would otherwise mean "clean" forever.
+    let fencesScanned = 0;
+    for (const { rel, body } of cases) {
+      for (const fence of body.match(/```[\s\S]*?```/g) ?? []) {
+        fencesScanned += 1;
+        // Only an arrow followed by a NAME is view-mode-dependent. Matching the bare triangle
+        // (`el.textContent.trim() === '\u25b6'`) is already view-agnostic — it expands whatever
+        // group is collapsed — and flagging it would be crying wolf, which this file's header
+        // warns is how a guard gets disabled. `atlas-view-members-and-bad-ref-refused` uses
+        // exactly that idiom and must stay green. The `\\s*` alternative catches the label
+        // spelled as a regex (`/^\u25b6\\s*Material\\s*\\(\\d+\\)$/`), which is how the live
+        // instance was written.
+        // The arrow may be spelled inside a character class (`[\u25b6\u25bc]`) and followed by regex
+        // punctuation before the name, so the lookahead steps over `] ) ( ?` and an `\\s*`/`\\s+`
+        // escape. Without that, `/^[\u25b6\u25bc]Particle/` walks straight past this guard.
+        const NAMED_GROUP_ARROW = /[\u25b6\u25bc][\u25b6\u25bc\])(?\ud83d\udcc1]*(?:\\s[*+])*[A-Za-z]/u;
+        if (NAMED_GROUP_ARROW.test(fence) && !fence.includes('\ud83d\udcc1')) {
+          offenders.push(`${rel}: a fenced probe matches "\u25b6<name>" without the folder-view form`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    // The suite's cases carry hundreds of fenced probes; 100 is a floor no accident meets.
+    if (HAS_CASES) expect(fencesScanned).toBeGreaterThan(100);
+  });
+
+  /**
    * The same rule, for line numbers written in PROSE. (#680)
    *
    * `codeTokens` only reads backticked spans, so the check above is blind to "the `onMove` handler

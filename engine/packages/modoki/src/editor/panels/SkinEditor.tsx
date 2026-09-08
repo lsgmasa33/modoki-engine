@@ -173,16 +173,38 @@ export default function SkinEditor() {
    *  #423-item-2 ruling requires) AND cannot be parked over the file (#896). A genuinely MISSING
    *  file is NOT this — see `assetDocLoad.ts`. */
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
-  /** Retry a refused load. ⚠️ It must go through the store's `open*Editor` action rather than a
-   *  local nonce (#896 review, finding 4): every load effect early-returns on `if (existing)`
-   *  BEFORE it fetches, so a bare re-run would ADOPT whatever document happened to be in the store
-   *  — an agent op's park, or a redo of an earlier entry — and clear the banner without ever
-   *  re-reading the file, leaving the panel editing normally over a document it never read. The
-   *  open action nulls the doc and bumps the nonce the effect already depends on, so a retry is a
-   *  real re-read by construction. It also removes the dead `reloadNonce` state whose only setter
-   *  was this button. */
-  /** The rig the human just CLOSED, so the retarget effect above does not re-open it. Cleared as
-   *  soon as anything is open again — an explicit re-open (double-click) is always honoured. */
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** Both alternatives have been tried and both are wrong, in
+   *  opposite directions:
+   *
+   *   - a **local nonce** re-runs the load effect, which early-returns on `if (existing)` BEFORE it
+   *     reaches anything else — so if a document was put in the STORE meanwhile, Retry clears the
+   *     banner and adopts it with no further check at all. That is #896's original failure mode
+   *     (#896 review 1, finding 4).
+   *
+   *  ⚠️ **Nulling the doc removes that early return; it does NOT guarantee a disk read, and an
+   *  earlier version of this block said it did** (#896 review 4). The next branch is
+   *  `pendingAssetDoc(path, …)`, which adopts a PARKED document before any `fetch` — deliberately,
+   *  because a park is unsaved work newer than the file and re-reading over it is the destruction
+   *  #831/#843 and QA-CTX-0008 are about. Both scenarios the old wording named do park:
+   *  `persistOrMarkDirty` (every agent op) parks unconditionally under manual persistence, and
+   *  `pushAssetUndo`'s redo re-parks. So Retry re-reads the FILE only when nothing is parked for the
+   *  path; otherwise it adopts the park, which is correct and is not what "re-read" means.
+   *   - **`open<X>Editor`** does null the document, but also clobbers `isPreviewPlaying`/
+   *     `previewOwner`/`playheadTime`, which are SHARED with the sibling panel — so Retry here
+   *     stopped a preview running over there (#896 review 2, finding 1).
+   *
+   *  `reloadEditingAsset` nulls the doc and bumps the nonce and touches nothing else. See its own
+   *  docblock in `editorStore.ts` for exactly what each open action resets. */
+  /** The rig the human CLOSED, so the selection-retarget effect below does not immediately
+   *  re-open it. ⚠️ Stamped with the SELECTED path, not the open one — they differ (single-click rig
+   *  B while rig A is open, or an agent `open_skin_editor` that touches no selection), and stamping
+   *  the open path made ✕ SWAP to the selected rig instead of closing (#896 review 4). What the
+   *  human means by ✕ is "leave this panel empty", so what must be suppressed is whatever the
+   *  retarget effect would open next. Cleared as soon as anything is open, or the selection moves —
+   *  it suppresses ONE auto-open, not the rig forever (#896 review 3, finding 3: the first version
+   *  cleared only on `asset`, so closing a rig and then re-selecting it in Assets never re-opened
+   *  it, silently killing the single-click retarget this panel exists to offer). */
   const dismissedPath = useRef<string | null>(null);
 
   const retryLoad = useCallback(() => {
@@ -229,22 +251,30 @@ export default function SkinEditor() {
   const [testPose, setTestPose] = useState<Record<number, { x: number; y: number; rot: number }>>({});
   useEffect(() => { setTestPose({}); }, [asset?.path, paintMode]);
 
-  // Retarget on selection: if the panel is EMPTY and a .rig2d asset gets selected,
-  // open it — parity with the Animation/Particle editors (which follow selection), and
-  // it means the panel is reachable without a double-click (e.g. from tooling). Guarded
-  // to "nothing open yet" so a stray selection never hijacks an in-progress rig edit.
+  // Retarget on selection: if the panel is EMPTY and a .rig2d asset gets selected, open it — so the
+  // panel is reachable without a double-click (e.g. from tooling). Guarded to "nothing open yet" so
+  // a stray selection never hijacks an in-progress rig edit.
+  //
+  // ⚠️ This said "parity with the Animation/Particle editors (which follow selection)". They do not:
+  // `grep selectedAsset` across all five asset editors returns hits in THIS FILE ONLY. The claim was
+  // load-bearing in the wrong direction — it reads as licence to add selection-following elsewhere,
+  // and as a hint that those panels need the same dismissal guard. This panel is the only member.
   //
   // ⚠️ …and it must not undo a CLOSE (#896 review 2). `closeSkinEditor` clears the open asset but
-  // not `selectedAsset`, and a double-click in Assets selects before it opens — so closing left the
-  // rig still selected, this effect's deps changed (asset: object → null), and it immediately
-  // re-opened the very file the human had just dismissed. Harmless-looking for a good rig (it
-  // re-renders identically); for a REFUSED one it made the refused view's only escape a no-op that
-  // silently re-fetched. `dismissedPath` is the one-shot memory that makes Close mean close.
+  // not `selectedAsset`, and a double-click in Assets SELECTS before it opens — so closing left the
+  // rig still selected, this effect's deps changed (asset: object → null), and it re-opened the very
+  // file the human had just dismissed. Both Close buttons set `dismissedPath` for that reason.
+  //
+  // ⚠️ **It is NOT "harmless for a good rig", which this comment claimed on nothing but inference.**
+  // `openSkinEditor` also resets `activeSkinPart` and `skinPreviewHidden` and bumps `skinEditNonce`,
+  // forcing a fresh disk fetch — so hide three parts, select part 5, click ✕, and the panel comes
+  // back with the rig still open and that state gone. The refused view made it worse (its only
+  // escape became a no-op that silently re-fetched), not different in kind.
   useEffect(() => {
-    if (asset) { dismissedPath.current = null; return; }  // something is open → nothing dismissed
-    if (selectedAsset?.type === 'rig2d' && selectedAsset.path !== dismissedPath.current) {
-      useEditorStore.getState().openSkinEditor(selectedAsset);
-    }
+    if (asset) { dismissedPath.current = null; return; }        // something open → nothing dismissed
+    if (selectedAsset?.type !== 'rig2d') { dismissedPath.current = null; return; } // moved off → forget
+    if (selectedAsset.path === dismissedPath.current) return;   // the one the human just closed
+    useEditorStore.getState().openSkinEditor(selectedAsset);
   }, [selectedAsset, asset]);
 
   // ── Load the rig def when the open target changes ──
@@ -790,8 +820,12 @@ export default function SkinEditor() {
         />
         <div style={{ margin: 'auto', textAlign: 'center', color: '#555' }}>
           <div>{asset.name} could not be read, so it is not open for editing.</div>
-          <div style={{ fontSize: 10, color: '#666', marginTop: 6 }}>Repair the file on disk (a corrupt or conflict-markered <code>.rig2d.json</code>), then Retry.</div>
-          <button data-ui-id="skin.refused.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = asset.path; useEditorStore.getState().closeSkinEditor(); }} style={{ ...btn, marginTop: 12, padding: '6px 14px' }}>Close</button>
+          {/* ⚠️ Does NOT say "then Retry re-reads the file" — Retry adopts a PARKED edit for this
+              path if one exists, before it ever fetches (#896 review 4). Promising a disk read
+              here was wrong in the one case where it matters: repair the file, Retry, and get the
+              parked doc instead. */}
+          <div style={{ fontSize: 10, color: '#666', marginTop: 6 }}>Repair the file on disk (a corrupt or conflict-markered <code>.rig2d.json</code>), then Retry. If an unsaved edit is parked for this asset, Retry opens that instead of the file.</div>
+          <button data-ui-id="skin.refused.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} style={{ ...btn, marginTop: 12, padding: '6px 14px' }}>Close</button>
         </div>
       </div>
     );
@@ -819,7 +853,10 @@ export default function SkinEditor() {
   return (
     <div style={panelStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexShrink: 0 }}>
-        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
+        {/* ⚠️ `dismissedPath` here too, not only on the refused view's Close (#896 review 3): this
+            is the ✕ people actually use, and without it closing a rig opened from Assets reopens it
+            immediately — see the retarget effect's comment. */}
+        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
         {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
         <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>

@@ -8,6 +8,7 @@
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
@@ -79,10 +80,31 @@ export default function ParticleEditor() {
   // AtlasAssetView's `loadState`/`editingDisabled` pattern: on 'failed' the load effect below
   // never calls `loadParticleDef`, so `def` stays unset and the whole properties panel (gated
   // on `{def && (...)}`) stays unrendered — editing is disabled by construction, not a flag
-  // threaded through every field. A genuinely MISSING file (a brand-new asset) is NOT this —
-  // see `isMissingAsset` in the load effect.
+  // threaded through every field.
+  // ⚠️ **"Stays unset" holds for THIS panel's own paths, not against the store** (#896 review 4):
+  // `applyParticleDef` writes `editingParticleDef` whenever the open path matches, with no
+  // reference to `loadState`, so an agent `particle_set` on a refused asset mounts the properties
+  // panel BESIDE this banner. Do not read this line as "nothing can edit a refused file".
+  // A genuinely MISSING file (a brand-new asset) is NOT this — see `isMissingAsset` in the load
+  // effect.
   const [loadState, setLoadState] = useState<'ok' | 'failed'>('ok');
-  const [reloadNonce, setReloadNonce] = useState(0); // bump (Retry) to re-run the load effect
+  /** Retry a refused load. ⚠️ **`reloadEditingAsset` — never a local nonce, and never
+   *  `open<X>Editor(sameAsset)`.** This panel kept the local nonce when the other four moved off it
+   *  (#896 review 3, finding 1), which left it the one editor still exposed to the failure the other
+   *  four were fixed for: the load effect early-returns on `if (existing)` BEFORE it fetches, so an
+   *  agent `particle_set` landing a def in the store while this panel is refused (`applyParticleDef`
+   *  writes it, because the path matches) meant Retry cleared the banner without re-reading — and the
+   *  panel then edited, and Cmd+S flushed, whatever document was already in the store.
+   *  `open<X>Editor` is the other wrong answer: it clobbers preview state shared with the sibling
+   *  panel.
+   *
+   *  ⚠️ **Nulling the doc removes the early return; it does NOT guarantee a disk read** (#896 review
+   *  4). The next branch is `pendingAssetDoc`, which adopts a PARKED document before any `fetch` —
+   *  deliberately, since a park is unsaved work newer than the file. Retry re-reads the FILE only
+   *  when nothing is parked for this path. */
+  const retryLoad = useCallback(() => {
+    useEditorStore.getState().reloadEditingAsset('editingParticleAsset');
+  }, []);
   // Set once a GPU-context/device loss tears the viewport down (finding 7, third adversarial
   // review of #795). Before this, a loss correctly blocked the zombie apply-effect (finding 1) but
   // showed the user NOTHING — `sceneReady` has no overlay consumer, so the surface just went
@@ -341,10 +363,10 @@ export default function ParticleEditor() {
     return () => { cancelled = true; };
     // Intentionally key on the asset PATH, not the `asset` object: the store
     // hands back a stable ref, and we only want to re-load when the path (or the
-    // explicit reopen `nonce`, or a local Retry `reloadNonce`) changes — not on incidental
+    // explicit reopen `nonce`, which a Retry bumps through `reloadEditingAsset`) changes — not on incidental
     // identity churn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [asset?.path, nonce, reloadNonce, dropHandle]);
+  }, [asset?.path, nonce, dropHandle]);
 
   // ── Apply def to the live preview + shared cache ──
   useEffect(() => {
@@ -493,16 +515,18 @@ export default function ParticleEditor() {
             <button data-ui-id="particle.empty.new" data-ui-kind="button" onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
           </div>
         )}
-        {/* Load-failure / refusal banner (#784, mirrors AtlasAssetView's loadBanner) — `def` stays
-            unset while this shows, so the properties panel below never mounts and there is no
-            edit path that could write a default doc over the real file. */}
+        {/* Load-failure / refusal banner (#784, mirrors AtlasAssetView's loadBanner) — this panel
+            never calls `loadParticleDef` on a refusal, so the properties panel below does not mount
+            from THIS path.
+            ⚠️ It is not "there is no edit path", which this comment used to say: `applyParticleDef`
+            can seat a def from an agent op regardless of `loadState` (#896 review 4). */}
         {asset && loadState === 'failed' && (
-          <div data-ui-id="particle.loadBanner" style={{ position: 'absolute', left: 8, right: 8, top: 8, color: '#e0a06c', fontSize: '11px', lineHeight: 1.4, padding: '5px 8px', background: '#3a2e1e', border: '1px solid #5a452a', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 8, zIndex: 5 }}>
-            <span style={{ flex: 1 }}>
-              {`⚠ Could not load ${asset.path.split('/').pop() || asset.name} — editing disabled so it is not overwritten.`}
-            </span>
-            <button data-ui-id="particle.loadBanner.retry" data-ui-kind="button" data-ui-label="Retry" onClick={() => setReloadNonce((n) => n + 1)} style={{ ...btn, padding: '2px 8px' }}>Retry</button>
-          </div>
+          <AssetLoadRefusedBanner
+            fileName={asset.path.split('/').pop() || asset.name}
+            uiId="particle.loadBanner"
+            onRetry={retryLoad}
+            style={{ position: 'absolute', left: 8, right: 8, top: 8, margin: 0, zIndex: 5 }}
+          />
         )}
       </div>
 
