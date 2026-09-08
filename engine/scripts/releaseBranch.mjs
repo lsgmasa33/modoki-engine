@@ -139,6 +139,22 @@ export function checkReleaseState({
     };
   }
   if (actual !== expected) {
+    // ⚠️ Being on a release branch for a DIFFERENT version is not "wrong branch" — it is the
+    // ordinary state between the release ritual's step 2b (cut the branch, named for the version
+    // being released) and step 4 (bump package.json to it). Told "expects release_0_6_0", the
+    // operator would cut a branch for the version they are LEAVING. The fix is the bump, and the
+    // message has to say so: a refusal that misdirects is worse than one that only refuses.
+    if (/^release_\d+_\d+_\d+$/.test(actual)) {
+      return {
+        ok: false,
+        code: 'branch-version-skew',
+        message:
+          `--release: you are on ${actual} but package.json says ${version}.\n` +
+          `  That is the gap between cutting the branch and bumping the version.\n` +
+          `  Bump it (release-version skill § 4), or pass --version to match the branch.\n` +
+          `  Do NOT cut ${expected} — that names the version you are releasing FROM.`,
+      };
+    }
     return {
       ok: false,
       code: 'wrong-branch',

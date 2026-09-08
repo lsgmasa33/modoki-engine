@@ -11,7 +11,8 @@ export type ReleaseVersion =
   | { ok: false; reason: 'not-semver-triple' };
 
 /** Which precondition failed, or `'ok'`. `'bad-version'` — not a semver core `X.Y.Z`; `'detached'` —
- *  no branch checked out; `'wrong-branch'` — on a branch other than the derived one; `'dirty'` —
+ *  no branch checked out; `'wrong-branch'` — on a branch other than the derived one; `'branch-version-skew'` — on a release
+ *  branch for a DIFFERENT version, i.e. the gap between cutting it and bumping `package.json`; `'dirty'` —
  *  tracked files differ from HEAD; `'untracked-overlay'` — untracked files under `oss/`, which DO
  *  ship via the overlay's unfiltered rsync; `'version-mismatch'` — an explicit `--version` disagrees
  *  with `package.json`. Ordered as checked: branch before dirt, so a dirty tree on the wrong branch
@@ -21,6 +22,7 @@ export type ReleaseStateCode =
   | 'bad-version'
   | 'detached'
   | 'wrong-branch'
+  | 'branch-version-skew'
   | 'dirty'
   | 'untracked-overlay'
   | 'version-mismatch';

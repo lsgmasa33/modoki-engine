@@ -141,6 +141,34 @@ describe('checkReleaseState — the REJECT side, one code each', () => {
     expect(v.message).toContain('git switch -c release_0_7_0');
   });
 
+  it('distinguishes a release branch for ANOTHER version from a wrong branch', () => {
+    // The state between step 2b (cut release_0_7_0) and step 4 (bump package.json to 0.7.0) — an
+    // ordinary stop on every release. Told "expects release_0_6_0", an operator would cut a branch
+    // for the version they are LEAVING, so the code and the advice both have to differ here.
+    const v = checkReleaseState({ version: '0.6.0', branch: 'release_0_7_0', dirty: false });
+    expect(v.ok).toBe(false);
+    expect(v.code).toBe('branch-version-skew');
+    expect(v.message).toContain('release_0_7_0');
+    expect(v.message).toContain('0.6.0');
+    // It must NOT tell them to cut a branch — that is the misdirection this case exists to remove.
+    expect(v.message).not.toContain('git switch -c');
+  });
+
+  it('still says wrong-branch for a branch that is not a release branch at all', () => {
+    // The distinguishing case: the skew branch must not swallow the ordinary refusal. Without this,
+    // widening the release_* test to match anything keeps both green.
+    expect(checkReleaseState({ version: '0.7.0', branch: 'main', dirty: false }).code).toBe(
+      'wrong-branch',
+    );
+    expect(checkReleaseState({ version: '0.7.0', branch: 'work-ai2', dirty: false }).code).toBe(
+      'wrong-branch',
+    );
+    // …and a branch that merely STARTS like one is not one.
+    expect(checkReleaseState({ version: '0.7.0', branch: 'release_x', dirty: false }).code).toBe(
+      'wrong-branch',
+    );
+  });
+
   it('refuses a dirty tree on the right branch', () => {
     const v = checkReleaseState({ version: '0.7.0', branch: 'release_0_7_0', dirty: true });
     expect(v.ok).toBe(false);
