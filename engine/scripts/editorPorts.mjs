@@ -123,6 +123,14 @@ export function backendPortForClone(repoRoot) {
   // wearing a different cause: the editor comes up on a port no sibling expects, and every
   // `MODOKI_BACKEND` aimed at this clone drives someone else's.
   //
+  // ⚠️ **Drive-letter case is in that list because `resolve` does not fix it — NOT because it can
+  // break THIS lookup. It cannot: the key is a `basename`, which no drive letter reaches.** Driven
+  // on `win` (#893): `e:\Projects\modoki` and `E:\Projects\modoki` both key `"modoki"`, and so does
+  // the drive-relative `e:`. The misses that actually land here are a `subst` (basename `""`), a
+  // case-flipped NAME (`"MODOKI"`), and a junction whose own name is not a clone name. Reading the
+  // sentence above as "flip the drive letter and lose your port" is a real misreading — #893's
+  // checklist made it and went looking for the wrong half. Table: docs/windows.md § Paths.
+  //
   // `canonicalPath` fixes the spelling where the directory EXISTS (`.native` expands `subst`,
   // junctions and drive case). `pathCaseKey` carries the rest: `.native` throws on a path that is
   // gone and the fallback is bare `resolve`, which folds nothing — and this function is called with

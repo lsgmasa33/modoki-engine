@@ -3,10 +3,16 @@
 
 /** The canonical SPELLING of `p`: resolved, and realpath'd via `fs.realpathSync.native` where the
  *  path exists (falling back to `path.resolve` where it does not). A usable path, NOT a
- *  case-folded comparison key — the fold lives in `samePath`. */
+ *  case-folded comparison key — the fold lives in `samePath`.
+ *
+ *  ⚠️ **This is the spelling canonicaliser, not the comparison one** (#892). Its `resolve`
+ *  fallback follows no symlinks, so do NOT build a predicate on it — use `samePath` /
+ *  `isUnderOrSame`, which compare in a space that resolves links even for a missing path. */
 export declare function canonicalPath(p: string): string;
 
-/** Do `a` and `b` name the same directory or file? Canonicalises both sides and compares
+/** Do `a` and `b` name the same directory or file? Canonicalises both sides — resolving links in
+ *  the longest EXISTING ancestor and re-appending the missing tail, so a symlinked, junctioned or
+ *  `subst`ed spelling matches whether or not the path exists (#892) — and compares
  *  case-insensitively on win32/darwin. Answers sameness, not trust — gate an untrusted side
  *  first (`deviceClaimsStore.isFullyQualified` is the worked example). */
 export declare function samePath(a: string, b: string): boolean;

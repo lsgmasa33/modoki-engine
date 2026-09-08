@@ -125,15 +125,97 @@ load-bearing and commented as such).
 
   So a comparison that canonicalises with the JS walk still fails on a `subst`ed checkout or a
   lower-cased drive letter. `path.resolve` repairs neither.
+
+  ⚠️ **#881 migrated nine call sites onto `.native` on darwin evidence alone; #893 drove all three
+  rows on `win` and they hold.** Measured 2026-09-08 against `backendPortForClone`, with the
+  pre-#881 lookup key (`path.basename(path.resolve(p))`) computed alongside as the control:
+
+  | case | pre-#881 key | JS walk | `.native` |
+  |---|---|---|---|
+  | `subst X: E:\Projects\modoki`, then `X:\` | `""` → **auto ports** | `""` — unresolved | `E:\Projects\modoki` ✓ |
+  | `E:\Projects\MODOKI` (case-flipped NAME) | `"MODOKI"` → **auto ports** | `"MODOKI"` — unresolved | `E:\Projects\modoki` ✓ |
+  | a junction whose own name is not a clone name | `"NOTACLONE"` → **auto ports** | resolves ✓ | resolves ✓ |
+  | `C:\Users\…\MODOKI~2` (a real dir, 8.3 alias) | `"MODOKI~2"` | **left SHORT** | `modoki83probe` ✓ |
+
+  Three things this pins that reading the table above does **not** tell you:
+  - **Row 2 of THIS table is about the directory NAME, not the drive letter** (row 2 of the
+    three-row table above *is* the drive-letter one — the two rows do not correspond). `e:\` vs
+    `E:\` never reached `backendPortForClone` at all: `path.basename` is drive-letter-independent,
+    so that lookup was always right, and no input shape changes it — `e:\Projects\modoki`,
+    `E:\Projects\modoki` and the drive-relative `e:` all key `"modoki"`. Drive case is a hazard for
+    **comparisons**, and its pre-#869 instances were the electron `resolve`+`===` guards;
+    `samePath` is what CLOSES it, via the `pathCaseKey` fold. #893's checklist expected it to move
+    the port and was looking at the wrong half.
+  - **The junction row needs *a* realpath, not specifically `.native`** — the JS walk resolves it.
+    The rows where `.native` is genuinely load-bearing are `subst`, case-flipped names, and 8.3.
+  - **8.3 is the one that would have shipped.** `samePath('…\MODOKI~2', '…\modoki83probe')` is
+    `true` under `.native` and the old JS-walk comparison returned **`false`** — #878's exact
+    failure, now measured rather than inferred.
+- ⚠️ **The `win` clone's `E:` is ReFS — so no path under the clone, or under its `%TEMP%`
+  (`E:\dev-temp`), can have an 8.3 short form at all.** The observation that establishes this is
+  `Get-Volume` (`E  ReFS`, `C  NTFS`, `D  NTFS`), **not** the two `fsutil` outputs it is tempting to
+  cite: `fsutil 8dot3name query E:` reporting creation DISABLED and `fsutil file setshortname`
+  failing *"A local NTFS volume is required"* together establish only "8.3 creation is off" and "not
+  local NTFS" — and on NTFS, disabling *creation* leaves pre-existing short names intact, so neither
+  supports the "cannot, structurally" claim. ReFS is what does. (The owner reports `E:` is a Dev
+  Drive; that designation needs elevated `fsutil devdrv query` to confirm and is immaterial here —
+  ReFS is the operative fact.) `C:` is NTFS with 8.3 **enabled**, so the short-path case IS drivable
+  on this machine — on `C:`, and with no elevation, because generation there is automatic.
+
+  This matters beyond one probe: it is a second, structural reason a short-path bug is invisible from
+  the `win` clone, on top of the account-name reason #878 recorded. A test that reaches for
+  `os.tmpdir()` to build one gets a ReFS path and silently measures nothing.
 - ⚠️ **`.native` only normalises a path that EXISTS**, and throws otherwise. That is why the
   canonicaliser alone is not enough, and it is where #865's fix still had a hole: callers fall
   back to `path.resolve`, which folds nothing, and **a persisted path naming a directory that is
   gone — a stale recents entry, a stale device claim — is exactly that case.**
 
   ⚠️ **This does NOT mean such a comparison is unfixable**, which an earlier version of this
-  section claimed. The residue belongs to the COMPARATOR, not the canonicaliser: case-fold at the
-  comparison and two spellings of a missing path match again. Measured on `win`.
-- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
+  section claimed. The residue belonged to the COMPARATOR, not the canonicaliser — and case-folding
+  at the comparison closed only HALF of it. The sentence that used to stand here — *"case-fold at the
+  comparison and two spellings of a missing path match again"* — was an over-claim (#892). It closes
+  the **case** half. `path.resolve` follows no symlinks either, so two spellings of a missing path
+  reached through a symlinked ancestor still compared unequal after the fold. Measured on darwin,
+  where it is not exotic: `os.tmpdir()` is `/var/…`, a symlink to `/private/var/…`.
+
+  The comparator needs **both** halves, and the shape is `canonicalWithMissingTail` — canonicalise
+  the longest ANCESTOR that exists, re-append the missing tail literally, then fold:
+
+  | | resolves links for a MISSING path | folds case |
+  |---|---|---|
+  | `path.resolve` | no | no |
+  | `canonicalPath` | no (falls back to `resolve`) | no — it returns a spelling, not a key |
+  | `canonicalWithMissingTail` + `pathCaseKey` | **yes** | **yes** |
+
+  ✅ **Both halves have landed** (#892, closed): `samePath` is now
+  `pathCaseKey(canonicalWithMissingTail(a)) === pathCaseKey(canonicalWithMissingTail(b))`. The table
+  below is the PRE-FIX measurement, kept because it is the only Windows evidence that exists and
+  because its third row names a trigger #892 never did.
+
+  **Measured on `win` 2026-09-08 (#893), `samePath` on a path that does NOT exist — before #892:**
+
+  | spelling of the missing path | `samePath` (pre-fix) | `isUnderOrSame` |
+  |---|---|---|
+  | through a `subst`ed drive | **false** ✗ | true |
+  | through a junction | **false** ✗ | true |
+  | under an 8.3 SHORT ancestor | **false** ✗ | true |
+  | drive-letter case / case-flipped name | true | true |
+
+  The last row is the case-fold working; the first three are what it could not reach, because
+  `.native` throws on a missing path and the fallback resolves no links. **#892 listed
+  `subst`/junction as *inferred* and never named the 8.3 row at all** — `win` found it by measuring.
+  The `isUnderOrSame` column is #881's `canonicalWithMissingTail` handling all four, which is exactly
+  the shape #892 then borrowed.
+
+  ⚠️ **The post-fix Windows behaviour is EXPECTED, not measured.** `samePath` now calls the same
+  helper that produced the `true` column above, so all four rows should pass — but nobody has re-run
+  the table on Windows since #892 landed, and #893 (the verification ticket) closed before it. Worth
+  one run on `win`.
+
+  ⚠️ **This over-claim reached its SECOND retraction before it died.** #881 retracted it inside
+  `pathIdentity.mjs` and left the copy here standing, so #892 was diagnosed against a doc that said
+  the hole was already closed. **A retraction has to sweep every copy of the claim** — and note the
+  fold itself is now the subject of a follow-up, #905 (it over-matches on a case-SENSITIVE volume).- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
   `engine/scripts/pathIdentity.mjs`** — the one implementation (#869, #881), reachable from
   electron TS, `engine/plugins/**` TS and the bare-node `.mjs` CLIs alike. Before it existed the
   repo had hand-rolled this **eight** times in four mutually inconsistent recipes.
@@ -147,6 +229,20 @@ load-bearing and commented as such).
   | `samePath(a, b)` | same directory or file? |
   | `pathCaseKey(s)` | the platform's comparison KEY for a canonical path or one segment — for a **lookup** rather than a comparison |
   | `isUnderOrSame(parent, child)` | same path, or inside it? |
+
+  ⚠️ **The module has TWO canonicalisers and only one of them is exported** (#892). Know which
+  question you are asking:
+
+  - **`canonicalPath` — a spelling you KEEP.** A human reads it (`deviceClaimsStore`'s refusal
+    message names the holding clone), a record stores it. Its `resolve` fallback for a missing
+    path is deliberate and pinned by a #865 test.
+  - **`canonicalWithMissingTail` — a space you COMPARE in.** Module-private, and **every predicate
+    here uses it**: `samePath` and `isUnderOrSame` both. It is not exported precisely because a
+    caller wanting sameness wants `samePath` and a caller wanting a value wants `canonicalPath`.
+
+  Getting this backwards is what both #881 and #892 were: a predicate built on the SPELLING
+  canonicaliser, inheriting `resolve`'s blindness to links for every path that is gone or not yet
+  created. They were found a fix apart, in the two predicates, for the same reason.
 
   ⚠️ **The guard also bans a bare `fs.realpathSync(...)` in those roots (#881).** The census that
   decided it found **nine** calls in **six** files still using the JS walk. (Seven is the count of

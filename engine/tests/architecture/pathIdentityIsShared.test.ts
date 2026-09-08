@@ -114,8 +114,93 @@ const ENTRYPOINT_IDIOM = /import\.meta\.url|process\.argv\[1\]/;
  *
  *  The word boundary also lets `import { realpathSync } from 'node:fs'` through at the IMPORT
  *  (no paren follows) while still catching the call — the same destructured-import escape the
- *  `resolve` regex above had to be widened for. */
+ *  `resolve` regex above had to be widened for.
+ *
+ *  ⚠️ **This is a SOURCE-TEXT guard, so an ALIAS defeats it — measured, not reasoned (#893).**
+ *  `const rp = fs.realpathSync; return rp(resolved);` is the banned walk with identical behaviour
+ *  and no literal match, and this guard goes green on it. That is the same class as the async twin
+ *  conceded in the table below ("an accepted gap, not an endorsement"), reached by a second route.
+ *  Deliberately NOT widened: the shapes are unbounded, and a regex chasing them starts failing the
+ *  honest spellings. The OUTCOME is covered instead, spelling-independently, by
+ *  `pathIdentity.test.ts` → *"win32: an 8.3 SHORT path is the same directory"*, which asserts the
+ *  ANSWER and fails on the aliased mutation this one misses. **Two complementary guards: this bans
+ *  a spelling, that pins the result — do not delete either as redundant.** */
 const BANNED_REALPATH = /\brealpathSync\s*\(/;
+
+/** `canonicalPath(...)` on either side of a `===`/`!==` (#892).
+ *
+ *  The third shape, and the one the first two guards were structurally unable to see. #869 banned
+ *  the RAW recipe (`resolve(x) === y`) and #881 banned the wrong realpath, so the remaining way to
+ *  write this defect is with the SSOT's own export — `canonicalPath(a) === canonicalPath(b)` reads
+ *  as maximally correct and is the exact body `samePath` had to be moved OFF.
+ *
+ *  ⚠️ **`canonicalPath` is the SPELLING canonicaliser, and a comparison built on it inherits its
+ *  `path.resolve` fallback for a path that does not exist** — which resolves no symlinks, so two
+ *  spellings of a missing path compare unequal. That was #892 in `samePath` itself and #881 in
+ *  `isUnderOrSame`: the same mistake, found once per predicate, a fix apart. Nothing was stopping
+ *  a third.
+ *
+ *  ⚠️ **Zero live offenders when this landed** — measured, and stated because a guard's first run
+ *  finding nothing is the case where a silently-broken pattern is indistinguishable from a clean
+ *  repo. The `it.each` table below and the non-vacuity assertion are what carry it instead.
+ *
+ *  ⚠️ **`ARG` allows ONE level of nested parens, and dropping it reintroduces a blind spot this
+ *  file already has a scar for.** A first cut used a flat `[^;()]*` to keep the false positives
+ *  below out, and went blind to every argument that is not a bare identifier — including the
+ *  literal house spelling at `deviceClaimsStore.mjs:626` and `:660`:
+ *
+ *      canonicalClonePath(opts.clone ?? process.cwd()) === held.clone   // MISSED
+ *      canonicalPath(process.cwd()) === own                             // MISSED
+ *      pathCaseKey(canonicalPath(path.dirname(p))) === key              // MISSED
+ *
+ *  That is exactly why `BANNED` above uses `[^;]*` rather than `[^)]*` — its docblock records the
+ *  fix, and docs/windows.md § Paths records the census grep that missed #869's eighth site the
+ *  same way. Third time; hence `ARG` rather than a flat class. A `(?:^|[^.\w])` prefix would be
+ *  pointless here (`canonicalPath` is not a method name on anything) and is omitted rather than
+ *  copied without a reason.
+ *
+ *  ⚠️ **This does NOT ban `canonicalPath`.** Assigning it, returning it, storing it and using it
+ *  as a Map key are all correct and untouched — `context-cost-guard`'s budget key and
+ *  `deviceClaimsStore.canonicalClonePath`'s refusal message are exactly what it is for. Only
+ *  putting it in a `===` is banned, and the fix is `samePath`, never deleting the canonicalisation
+ *  (the "a guard can push the fix the wrong way" hazard the realpath table above pins).
+ *
+ *  ⚠️ **The compared value must BE the canonicalisation, not merely contain it** — which is why
+ *  this is two explicit alternatives rather than `BANNED`'s `[^;]*`. Copying that pattern here
+ *  matched two shapes that are correct, and one of them is live code (close-out review):
+ *
+ *      path.relative(canonicalPath(repoRoot), p) !== ''   // projects.ts `isUnderRepo`
+ *      path.basename(canonicalPath(p)) === 'games'        // one `===` from editorPorts.mjs:130
+ *
+ *  `isUnderRepo` answers STRICT containment and docs/windows.md says explicitly it must NOT
+ *  migrate to `isUnderOrSame` — so the guard's own message would have offered no valid fix, and
+ *  the cheapest green would have been deleting the `canonicalPath(...)`. That is precisely the
+ *  hazard the paragraph above claims to avoid, committed in the guard that claims it. So the
+ *  wrapper whitelist is exactly `pathCaseKey`, the one wrapper that preserves the question.
+ *
+ *  ⚠️ **`canonicalClonePath` is in the pattern too** — `deviceClaimsStore` exports it as a thin
+ *  alias for `canonicalPath`, so `canonicalClonePath(a) === canonicalClonePath(b)` is the same
+ *  defect under a second name.
+ *
+ *  ⚠️ **Per-LINE, so the assign-then-compare form escapes — this is a FLOOR, exactly as `BANNED`
+ *  is.** The commonest house spelling is not caught:
+ *
+ *      const A = pathCaseKey(canonicalPath(a));   // …later…   return A === B;
+ *
+ *  and `isUnderOrSame` ten lines away in the SSOT is written that way. `BANNED`'s docblock has
+ *  said this since #869; this one omitted it, and commit `80c5536f8`'s "a third had no guard in
+ *  front of it" overstated what landed. Catching it needs dataflow, not a line regex. */
+const CANONICALISER = String.raw`(?:canonicalPath|canonicalClonePath)`;
+/** An argument list with ONE level of nesting — `process.cwd()`, `path.dirname(p)`,
+ *  `opts.clone ?? process.cwd()`. Deeper nesting is an accepted gap; a flat class is not. */
+const ARG = String.raw`(?:[^;()]|\([^;()]*\))*`;
+const BANNED_CANONICAL_COMPARE = new RegExp(
+  // the canonicalisation IS the left operand, bare or folded by `pathCaseKey`
+  `${CANONICALISER}\\s*\\(${ARG}\\)\\s*[!=]==`
+  + `|pathCaseKey\\s*\\(\\s*${CANONICALISER}\\s*\\(${ARG}\\)\\s*\\)\\s*[!=]==`
+  // …or the right operand, same two shapes
+  + `|[!=]==\\s*(?:pathCaseKey\\s*\\(\\s*)?${CANONICALISER}\\s*\\(`,
+);
 
 const files = ROOTS.flatMap(sourceFiles);
 
@@ -215,7 +300,59 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ).toHaveLength(0);
   });
 
-  /** Non-vacuity for BOTH scans, and the half that is easy to forget: a guard collecting offenders
+  it.each([
+    ['plain, both sides', 'if (canonicalPath(a) === canonicalPath(b)) return;', true],
+    ['the pre-#892 body, wrapped in the fold', 'return pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b));', true],
+    ['RIGHT operand only', 'const differs = state.root !== canonicalPath(chosen);', true],
+    ['LEFT operand only', 'if (canonicalPath(stored) === own) return null;', true],
+    ['space before paren', 'if (canonicalPath (a) === b) return;', true],
+    // ⚠️ The three nested-argument rows. A flat `[^;()]*` missed all three, and the second is
+    // live house style at `deviceClaimsStore.mjs:626`. Deleting `ARG` reddens exactly these.
+    ['a nested call as the argument', 'if (canonicalPath(process.cwd()) === own) return;', true],
+    ['the alias, with a ?? default', 'if (canonicalClonePath(opts.clone ?? process.cwd()) === held.clone) return;', true],
+    ['nested, and folded', 'if (pathCaseKey(canonicalPath(path.dirname(p))) === key) go();', true],
+    ['the canonicalClonePath alias', 'return canonicalClonePath(stored) === canonicalClonePath(own);', true],
+    ['alias on the right', 'if (own !== canonicalClonePath(c.clone)) continue;', true],
+    // ⚠️ The two rows that made this regex two alternatives instead of `BANNED`'s `[^;]*`. The
+    // first is live code (`projects.ts` `isUnderRepo`), and it must NOT become `isUnderOrSame`.
+    ['canonicalPath as an ARGUMENT, result compared', "if (path.relative(canonicalPath(root), p) !== '') return false;", false],
+    ['…and the basename form, one edit from editorPorts.mjs:130', "if (path.basename(canonicalPath(p)) === 'games') go();", false],
+    // ⚠️ NOT a blessing — this is the assign-then-compare FLOOR, stated in the docblock. If you
+    // are reading this row as permission to write it that way, you have it backwards.
+    ['assign-then-compare — an accepted gap, not an endorsement', 'const A = canonicalPath(a); const B = canonicalPath(b);', false],
+    ['a DERIVED value on the left — not this question', 'if (x === path.dirname(canonicalPath(p))) go();', false],
+    // …and the shapes it must NOT claim. `canonicalPath` is a legitimate, load-bearing export;
+    // a guard that banned every use of it would push the cheapest green towards deleting the
+    // canonicalisation, which is the failure the realpath table above exists to prevent.
+    ['a plain assignment', 'const normalizedPath = canonicalPath(p);', false],
+    ['a return', 'return canonicalPath(raw);', false],
+    ['a Map key', 'seen.set(canonicalPath(p), entry);', false],
+    ['composed into a join', 'return path.join(canonicalPath(path.dirname(p)), path.basename(p));', false],
+    ['samePath, the fix itself', 'if (samePath(projectRoot, repoRoot)) return;', false],
+  ])('canonicalPath-compare regex: %s', (_label, line, shouldMatch) => {
+    expect(BANNED_CANONICAL_COMPARE.test(line)).toBe(shouldMatch);
+  });
+
+  it('no file compares two canonicalPath() results (#892)', () => {
+    const offenders: string[] = [];
+    for (const rel of files) {
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
+      src.split('\n').forEach((line, i) => {
+        if (BANNED_CANONICAL_COMPARE.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
+      });
+    }
+    expect(
+      offenders,
+      '`canonicalPath` is the SPELLING canonicaliser: for a path that does not exist it falls\n'
+      + 'back to `path.resolve`, which resolves no symlinks — so a comparison built on it says\n'
+      + '"different" about two spellings of one missing path (#892, and #881 before it).\n'
+      + 'Use `samePath` / `isUnderOrSame` from engine/scripts/pathIdentity.mjs, which compare in\n'
+      + '`canonicalWithMissingTail`. Do NOT fix this by removing the canonicalisation:\n'
+      + offenders.join('\n'),
+    ).toHaveLength(0);
+  });
+
+  /** Non-vacuity for ALL THREE scans, and the half that is easy to forget: a guard collecting offenders
    *  and asserting the list is empty goes GREEN when its matching silently breaks (docs/windows.md
    *  § Paths — "the loud failure is the lucky one"). `files.length > 0` above proves we read
    *  something; this proves the two regexes still FIND the shapes in a real repo file when they
@@ -239,5 +376,11 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     expect(BANNED_REALPATH.test('fs.realpathSync.native(resolved)')).toBe(false);
     expect(BANNED_REALPATH.test('fs.realpathSync(resolved)')).toBe(true);
     expect(BANNED.test('if (path.resolve(a) === b) return;')).toBe(true);
+    // (#892) The third scan, held to the same bar: it must find the shape in the SSOT's OWN
+    // history — this is `samePath`'s body as it stood before #892 — and must not fire on the body
+    // that replaced it, which is what the file really contains now.
+    expect(BANNED_CANONICAL_COMPARE.test('return pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b));')).toBe(true);
+    expect(BANNED_CANONICAL_COMPARE.test('return pathCaseKey(canonicalWithMissingTail(a)) === pathCaseKey(canonicalWithMissingTail(b));')).toBe(false);
+    expect(ssot).toMatch(/canonicalWithMissingTail\(a\)/);
   });
 });

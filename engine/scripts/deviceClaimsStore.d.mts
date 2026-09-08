@@ -119,9 +119,21 @@ export interface ForeignClaimOpts extends StaleOpts {
  *  Returns `false` for a non-string, so a corrupt record cannot throw. */
 export declare function isFullyQualified(p: string): boolean;
 
-/** (#865) A clone path in the ONE spelling every claim comparison uses: `fs.realpathSync` of the
- *  resolved path, falling back to `path.resolve` when it does not exist. */
-export declare function canonicalClonePath(p: string): string;
+/** (#865) A clone path in the ONE spelling every claim comparison uses. A thin alias for the shared
+ *  `canonicalPath` (#869) — see `pathIdentity.mjs`, which OWNS the recipe; do not restate it here.
+ *
+ *  ⚠️ **It is `.native`, not the bare `fs.realpathSync` walk this line used to name (#881)** — the
+ *  reason the alias is worth a comment at all. The walk resolves symlinks and junctions but neither
+ *  a `subst`ed drive nor drive-letter case, so it is never right on Windows. Measured on `win`
+ *  (#893): the walk leaves a `subst`ed drive AND an 8.3 SHORT path exactly as typed, so two
+ *  spellings of one clone compared UNEQUAL and a claim read as another clone's. (Not asserted to be
+ *  Windows-ONLY: nothing has measured darwin, where `realpath(3)` may differ from the lstat-walk on
+ *  case too.) This mattered because a `.d.mts` is what a consumer reads, and it named the one
+ *  spelling #881 had removed.
+ *
+ *  Fixed independently on `win` (#893 review) and `work-ai3` (#892 sweep) — the two resolved here.
+ *  work-ai3's copy said "fixed here so `win` need not"; `win` had already fixed it, so that line is
+ *  dropped rather than merged. */export declare function canonicalClonePath(p: string): string;
 
 /** (#865) Does the STORED clone path name the same clone as OWN? The single comparison behind
  *  `foreignClaimFor`, `ownAdbClaim`, `claim-guard.mjs` and `device.mjs`'s WiFi-claim filter.

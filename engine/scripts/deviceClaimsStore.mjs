@@ -535,6 +535,17 @@ export function canonicalClonePath(p) {
   // at the COMPARISON, which is what closes it; this still returns the on-disk spelling, because
   // callers put it in refusal messages a human reads.
   //
+  // (#892) `samePath` now does more than fold there: it canonicalises in the longest EXISTING
+  // ancestor and re-appends the missing tail, so a stale claim written through a symlinked or
+  // `subst`ed checkout matches too. ⚠️ An earlier version of this comment added "and that changes
+  // nothing for `sameClone` below, because a new equality needs BOTH sides absent" — which is
+  // FALSE on a case-sensitive volume, where the fold can collide an existing path with a missing
+  // one reached through a symlink. See `pathIdentity.mjs`'s `CASE_INSENSITIVE` note: a widening of
+  // an accepted hazard, not a new one, but `sameClone` IS reachable by it.
+  //
+  // None of that changes why this alias exists: it must NOT be "simplified" into the comparison,
+  // because the two answer different questions — a spelling to show a human, versus a verdict.
+  //
   // Retained as a named export rather than deleted: it is the vocabulary the claim family reads
   // in ("a clone path in the ONE spelling"), and `sameClone` below is asymmetric in a way a bare
   // `samePath` is not.
