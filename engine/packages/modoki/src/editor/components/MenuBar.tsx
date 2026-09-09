@@ -1,4 +1,5 @@
-/** Shared menu bar component used by EditorApp and GameView. */
+/** The in-window menu bar. Rendered ONLY by `EditorApp` (`EditorApp.tsx:765`), and only in the
+ *  WEB editor — under Electron the OS-level menu replaces it, so nothing here is reachable there. */
 
 import { useState, useEffect } from 'react';
 import type React from 'react';
@@ -109,12 +110,46 @@ function MenuRow({ item, onPick }: { item: BarMenuItem; onPick: () => void }) {
 export default function MenuBar({ menus, title }: { menus: Record<string, BarMenuItem[]>; title?: string }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
 
-  // Close menu when clicking outside
+  // Close menu when pressing outside.
+  //
+  // ⚠️ CAPTURE-phase `pointerdown` on `document` with a containment guard — not `click` on
+  // `window`, and not bubble-phase `mousedown` either (#999/#1001).
+  //
+  // Two separate things defeat the simpler spellings, and `SceneView`'s 2D pick handler does BOTH
+  // on the same event (`installScene2DInteraction`'s `onPointerDown`, on a successful pick):
+  //   - `stopPropagation()` — so any DOCUMENT-level listener in the bubble phase never runs. That
+  //     rules out bubble `mousedown`/`pointerdown`, which is what the editor's six other
+  //     outside-dismisses use (`ContextMenu`, `ViewOptionsMenu`, `AddComponentPicker`,
+  //     `DeviceConnectSection`, `treeChrome`, `rendering/DevicePicker` — all `document` + bubble
+  //     `mousedown`, so ALL of them are starved the same way and none dismisses on a 2D pick.
+  //     Pre-existing and deliberately not fixed here; raised in the close-out report instead.
+  //   - `preventDefault()` — which SUPPRESSES the compatibility `mousedown` altogether, so there
+  //     is no `mousedown` to hear even setting propagation aside.
+  // And the UI-preview arbiter separately swallows the trailing `click` in the capture phase to
+  // stop it re-selecting the UI root, which is what ruled out the original `click` on `window`.
+  //
+  // Capture-phase `pointerdown` on `document` runs BEFORE the canvas handler can stop anything,
+  // and `pointerdown` is the raw event rather than a compatibility one, so `preventDefault` on it
+  // cannot suppress what we are already listening to. It also covers touch and pen, which
+  // `mousedown` only approximates.
+  // ⚠️ Measured, not reasoned: an e2e that opens a menu and then clicks a 2D entity FAILED with
+  // bubble `mousedown` and passes with this. The first version of this fix was `mousedown`.
+  //
+  // The guard is what makes the switch safe: without it, pressing the open menu's own button
+  // would close on `pointerdown` and the button's `onClick` toggle would immediately REOPEN it,
+  // breaking click-to-close. `stopPropagation` on the button/dropdown cannot help — those are
+  // `onClick` handlers and never see this `pointerdown`. It keys off `[data-menubar-menu]` on the
+  // existing per-menu wrapper rather than a ref on a new container element, because this
+  // component returns a FRAGMENT into a flex row — wrapping it to hang a ref off would change
+  // the toolbar's layout.
   useEffect(() => {
     if (!openMenu) return;
-    const close = () => setOpenMenu(null);
-    window.addEventListener('click', close);
-    return () => window.removeEventListener('click', close);
+    const onDown = (e: Event) => {
+      if ((e.target as Element | null)?.closest?.('[data-menubar-menu]')) return;
+      setOpenMenu(null);
+    };
+    document.addEventListener('pointerdown', onDown, { capture: true });
+    return () => document.removeEventListener('pointerdown', onDown, { capture: true });
   }, [openMenu]);
 
   return (
@@ -122,7 +157,7 @@ export default function MenuBar({ menus, title }: { menus: Record<string, BarMen
       {title && <span style={{ color: '#f1c40f', fontWeight: 'bold', marginRight: 12, padding: '0 8px' }}>{title}</span>}
 
       {Object.entries(menus).map(([name, items]) => (
-        <div key={name} style={{ position: 'relative' }}>
+        <div key={name} data-menubar-menu style={{ position: 'relative' }}>
           <button
             onClick={(e) => { e.stopPropagation(); setOpenMenu(openMenu === name ? null : name); }}
             onMouseEnter={() => { if (openMenu && openMenu !== name) setOpenMenu(name); }}

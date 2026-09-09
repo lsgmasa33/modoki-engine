@@ -119,7 +119,7 @@ function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown
   return { halfW: layout.width / 2, halfH: layout.height / 2, pivotX: (t.anchorX as number) ?? 0.5, pivotY: (t.anchorY as number) ?? 0.5 };
 }
 import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './picking';
-import { resolvePreviewPick, readPreviewStack } from './uiPreviewPick';
+import { resolvePreviewPick, readPreviewStack, resolveHostBoundedPick, hostRelationOf } from './uiPreviewPick';
 import { safeAreaCssVars } from '../scene/devicePresets';
 import SafeAreaOverlay from '../rendering/SafeAreaOverlay';
 import { UIResizeOverlay } from './UIResizeOverlay';
@@ -856,8 +856,20 @@ function getPaintOrder(): Map<number, number> {
  *  pick overlay div (`data-2d-pick`, Phase 2) — otherwise elementFromPoint returns
  *  the overlay itself, whose ancestor is the Canvas2D UINode wrapper (which carries
  *  `data-entity-id`), and every 2D miss would mis-select the Canvas2D root instead
- *  of falling through to deselect / Three.js / the true underlying UI child. */
-function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null {
+ *  of falling through to deselect / Three.js / the true underlying UI child.
+ *
+ *  ⚠️ #999/#1001 — `hostEntityId` STOPS THE UPWARD ESCAPE. A Canvas2D UINode is a leaf in the
+ *  UI tree (its 2D children are not UI nodes), so `UINode` gives it `pointerEvents:'none'` and
+ *  no `onClick` at all. `elementFromPoint` therefore skips straight PAST the canvas host to its
+ *  nearest ancestor that does paint/handle — in practice the UI ROOT — and a click on empty
+ *  board space selected the whole screen's root container. Measured in three games (wordweave
+ *  #999, court #1001, chess): winner `ChessRoot`/`GameRoot`, canvas host skipped, and the
+ *  winner's own opacity was irrelevant (court's painted nothing, chess's was opaque).
+ *  Owner ruling 2026-09-09: an empty-canvas click selects THE CANVAS HOST — the thing actually
+ *  under the cursor — rather than escaping upward. A genuine UI element INSIDE the host (a
+ *  child showing through the transparent canvas) is unaffected, which is the case the
+ *  neutralization above exists for. */
+function pickUnderlyingUIEntity(clientX: number, clientY: number, hostEntityId?: number): number | null {
   const surfaces = Array.from(document.querySelectorAll<HTMLElement>('canvas[data-2d-overlay], [data-2d-pick], [data-canvas2d-mount]'));
   const prev = surfaces.map((c) => c.style.pointerEvents);
   surfaces.forEach((c) => { c.style.pointerEvents = 'none'; });
@@ -867,7 +879,11 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
   const uiEl = el?.closest('[data-entity-id]') as HTMLElement | null;
   if (!uiEl) return null;
   const id = Number(uiEl.getAttribute('data-entity-id'));
-  return Number.isFinite(id) ? id : null;
+  if (!Number.isFinite(id)) return null;
+  if (hostEntityId == null) return id;
+  // The rule itself lives in uiPreviewPick.ts, pure and unit-tested (this is a .tsx, so its
+  // decisions belong in a plain .ts beside it — docs/editor.md § Panels).
+  return resolveHostBoundedPick(id, hostEntityId, hostRelationOf(uiEl, id, hostEntityId));
 }
 
 /** #337 — predicts what a real click at a viewport point would select in the "ui" preview mode,
@@ -881,7 +897,22 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
 function resolvePreviewPickAt(clientX: number, clientY: number): number | null {
   const stack = readPreviewStack(clientX, clientY);
   const pick2DAt = (canvasEntityId: number) => _pick2DByCanvas.get(canvasEntityId)?.(clientX, clientY) ?? null;
-  const pick = resolvePreviewPick(stack, pick2DAt);
+  // ⚠️ #999/#1001 — this MUST carry the same host bound as `pickEntityAtViewportPoint`, or the
+  // two picking paths registered under 'scene-view' become two POLICIES. This one is priority 20
+  // and therefore owns `modoki_tap`'s prediction, while a real click on the canvas runs the
+  // priority-10 one — so an unbounded resolver here means the tool predicts the UI ancestor for a
+  // point where a real click selects the canvas host: `modoki_tap` refuses a reachable entity as
+  // "occluded", and reports ok for one the click never lands on. `screenPick.ts`'s header is the
+  // rule being honoured — a provider must answer for the same code path a real click runs.
+  const frame = document.querySelector('[data-ui-preview-frame]');
+  const isAncestorOfCanvasHost = (uiEntityId: number, canvasEntityId: number) => {
+    // Scoped to the preview frame, never document-wide: the same UI host is mounted in BOTH the
+    // SceneView preview and the Game panel, so a document-wide lookup can answer with the other
+    // panel's copy (the same trap `hostRelationOf` documents).
+    const uiEl = frame?.querySelector(`[data-entity-id="${uiEntityId}"]`);
+    return !!uiEl && hostRelationOf(uiEl, uiEntityId, canvasEntityId) === 'ancestor-of-host';
+  };
+  const pick = resolvePreviewPick(stack, pick2DAt, isAncestorOfCanvasHost);
   return pick ? pick.id : null;
 }
 
@@ -1286,8 +1317,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       if (id2d !== null) return id2d;
       // No 2D entity here. This canvas (pointerEvents:'auto') sits above the DOM
       // UI layer, so without this it would swallow clicks meant for a UI element
-      // showing through the transparent canvas. Select the UI node beneath, if any.
-      return pickUnderlyingUIEntity(clientX, clientY);
+      // showing through the transparent canvas. Select the UI node beneath, if any —
+      // bounded by THIS canvas's host (#999/#1001), so a miss cannot escape upward
+      // past it to the UI root.
+      return pickUnderlyingUIEntity(clientX, clientY, canvasEntityId);
     }
 
     // Registered so the "ui" preview mode's paint-order arbiter (`UIEditorOverlay`,
@@ -2400,7 +2433,24 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       // Not on a UI-attributed element at all (empty space, a resize handle, a raw click on the
       // pick canvas itself) — leave normal DOM routing / the canvas's own handler untouched.
       if (!uiTarget) return;
-      if (target?.closest('[data-2d-pick]')) return; // landed on the pick canvas — its own handler owns this
+      if (target?.closest('[data-2d-pick]')) {
+        // ⚠️ #999/#1001 — ABSTAINING IS NOT ENOUGH, and this bare `return` was the whole defect.
+        // The pick canvas's own capture handler (`installScene2DInteraction`) DOES select
+        // correctly on this very pointerdown, and stops propagation of it — but the browser then
+        // dispatches a SEPARATE `click` for the same gesture. A Canvas2D host is a leaf in the UI
+        // tree, so `UINode` gives it neither an `onClick` nor pointer events; that click therefore
+        // bubbles past it to the nearest ancestor UI node that DOES have a handler — in practice
+        // the UI root — which re-selects itself and silently overwrites the correct pick a few ms
+        // later. Nothing logs, so it reads as "2D is unpickable" rather than "picked, then undone".
+        // Measured in chess (2026-09-09): dispatching pointerdown+pointerup alone at a cell's
+        // centre selects `sq_e4`; replaying the identical pair WITH the trailing click yields
+        // `ChessRoot`. The header above already states the rule this branch needs — "swallow BOTH
+        // this pointerdown and the `click` React dispatches after it" — it was simply never
+        // applied to the one target that cannot defend itself.
+        overrodeClickRef.current = true;
+        swallowGenRef.current++;
+        return; // the canvas's own handler owns the SELECTION; we only shield it from the click
+      }
       const winner = resolvePreviewPickAt(e.clientX, e.clientY);
       const domId = Number(uiTarget.getAttribute('data-entity-id'));
       if (winner === null || winner === domId) return; // arbiter agrees with default DOM routing

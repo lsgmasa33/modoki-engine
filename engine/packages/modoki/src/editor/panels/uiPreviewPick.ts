@@ -39,15 +39,35 @@ export type PreviewPick = { kind: 'ui' | '2d'; id: number };
 export function resolvePreviewPick(
   stack: readonly PreviewStackEntry[],
   pick2DAt: (canvasEntityId: number) => number | null,
+  isAncestorOfCanvasHost: (uiEntityId: number, canvasEntityId: number) => boolean = () => false,
 ): PreviewPick | null {
   let decorative: PreviewPick | null = null;
+  // The TOPMOST canvas whose own hit-test missed at this point — not a list of every canvas that
+  // missed. A real click is delivered to the topmost pick canvas, and its handler calls
+  // `pickUnderlyingUIEntity(x, y, canvasEntityId)` with THAT canvas's id alone, so binding
+  // against any lower one here would answer for a canvas the click never touched and re-open the
+  // predictor/real-click divergence this bound exists to close (opus-reviewer, close-out §2d).
+  // A 2D HIT returns immediately, so the first `2d` entry the loop survives is the topmost.
+  let topMissedCanvas: number | null = null;
   for (const entry of stack) {
     if (entry.kind === '2d') {
       const id = pick2DAt(entry.canvasEntityId);
       if (id != null) return { kind: '2d', id };
+      if (topMissedCanvas === null) topMissedCanvas = entry.canvasEntityId;
       continue; // this canvas painted nothing at the point — keep descending
     }
     // entry.kind === 'ui'
+    // ⚠️ #999/#1001 — an ANCESTOR of a canvas that just missed is not a legitimate winner. The
+    // canvas host is what the cursor is actually over; its ancestor only wins because the host
+    // itself is a UI leaf with no handler and no pointer events. Bound it here, BEFORE the
+    // opaque test, because an opaque ancestor (chess's `ChessRoot`) escapes exactly as readily
+    // as a transparent one (court's `GameRoot`) — opacity is not the discriminator on this path.
+    // A decorative element ABOVE the canvas keeps its claim, preserving #337's stated behaviour
+    // that a transparent full-bleed container over empty 2D space stays selectable: that element
+    // really is at the point, whereas the ancestor is only behind it.
+    if (topMissedCanvas !== null && isAncestorOfCanvasHost(entry.entityId, topMissedCanvas)) {
+      return decorative ?? { kind: 'ui', id: topMissedCanvas };
+    }
     if (entry.opaque) return { kind: 'ui', id: entry.entityId };
     // Decorative — remember the FIRST (topmost) one as a fallback, but keep looking for
     // either an opaque UI element or a genuine 2D hit underneath it.
@@ -181,4 +201,48 @@ export function readPreviewStack(
     if (entry) out.push(entry);
   }
   return out;
+}
+
+/** Where a 2D miss's UI fall-through landed, RELATIVE to the Canvas2D host whose hit-test missed.
+ *  Only `ancestor-of-host` is an escape; the other two keep their own answer.
+ *  ⚠️ A DESCENDANT of the host — a UI child showing through a transparent canvas — reports
+ *  `'unrelated'`, not a relation of its own: it does not contain the host, and keeping its own
+ *  answer is exactly what the escape bound must not disturb. */
+export type HostRelation = 'host' | 'ancestor-of-host' | 'unrelated';
+
+/** #999/#1001 — bound a 2D miss to the canvas host it missed inside.
+ *
+ *  A Canvas2D host is a LEAF in the UI tree (its 2D children are not UI nodes), so `UINode` gives
+ *  it `pointerEvents:'none'` and no `onClick`. A `elementFromPoint` fall-through therefore skips
+ *  straight past it to the nearest ancestor that paints or handles — in practice the UI ROOT — and
+ *  a click on empty board space selected the whole screen's root container. Reproduced in three
+ *  games (wordweave #999, court #1001, chess); the winner's own opacity was irrelevant in all
+ *  three, because the winner is simply the nearest ancestor with a click handler.
+ *
+ *  Owner ruling 2026-09-09: an empty-canvas click selects THE CANVAS HOST — the thing actually
+ *  under the cursor. Deliberately narrow: only an element that CONTAINS the host is treated as an
+ *  escape. A descendant of the host (the "true underlying UI child" showing through a transparent
+ *  canvas) and an unrelated subtree both keep their own answer, which is what leaves SceneView's
+ *  Three.js and deselect fall-throughs alone. */
+export function resolveHostBoundedPick(
+  pickedId: number | null,
+  hostEntityId: number | null,
+  relation: HostRelation,
+): number | null {
+  if (pickedId === null) return null;
+  if (hostEntityId === null) return pickedId;
+  return relation === 'ancestor-of-host' ? hostEntityId : pickedId;
+}
+
+/** DOM adapter for {@link resolveHostBoundedPick}.
+ *
+ *  ⚠️ Asks whether `uiEl` CONTAINS the host, rather than looking the host up by id and asking
+ *  whether it contains `uiEl`. The two are not equivalent here: the editor mounts the same UI
+ *  host in BOTH the SceneView preview and the Game panel, so a `document`-wide
+ *  `[data-entity-id="<host>"]` lookup can return the OTHER panel's copy and report `unrelated`
+ *  for a genuine escape. Scoping the search to `uiEl`'s own subtree keeps it in whichever UI
+ *  root the click actually landed in, with no root plumbing. */
+export function hostRelationOf(uiEl: Element, pickedId: number, hostEntityId: number): HostRelation {
+  if (pickedId === hostEntityId) return 'host';
+  return uiEl.querySelector(`[data-entity-id="${hostEntityId}"]`) !== null ? 'ancestor-of-host' : 'unrelated';
 }

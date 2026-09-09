@@ -1180,7 +1180,32 @@ passes plain values in):
   (or candidates lacking an order) falling back to closest box-center.
 
 UI mode picking is DOM-native — the `UIRenderer` reports the clicked element's entity via
-`onSelectEntity`.
+`onSelectEntity`. Two things about that are load-bearing and were each a shipped bug:
+
+- **A click on a 2D canvas is decided on `pointerdown`, but can be UNDONE by the `click` that
+  follows it** (#999/#1001). `installScene2DInteraction` selects the 2D entity on `pointerdown` and
+  stops that event — but the browser dispatches a separate `click` for the same gesture, and a
+  Canvas2D host is a LEAF in the UI tree, so `UINode` gives it neither an `onClick` nor pointer
+  events. That click therefore bubbles PAST the host to the nearest ancestor UI node that does have
+  a handler — in practice the UI root — which re-selects itself. Nothing logs, so the symptom reads
+  as "2D is unpickable" rather than "picked, then overwritten". `UIEditorOverlay`'s arbiter arms its
+  existing click-swallow (`overrodeClickRef`/`swallowGenRef`) on every pick-canvas `pointerdown` to
+  shield the canvas's own selection; the canvas handler still owns the selection itself.
+  ⚠️ The winner's own OPACITY is irrelevant to this path — it is simply the nearest ancestor with a
+  handler. Reproduced in three games whose winners disagreed on opacity (wordweave's and court's
+  painted nothing, chess's was opaque), which is why `isPaintOpaque` was a red herring in all three.
+- **A genuine 2D miss is bounded by the canvas host.** `pickUnderlyingUIEntity` looks through the
+  2D surfaces for a UI element beneath, and without a bound it escaped upward to the root the same
+  way. `resolveHostBoundedPick` + `hostRelationOf` (`uiPreviewPick.ts`, pure + DOM adapter, so the
+  rule is unit-testable — this is the § Panels rule about a `.tsx`'s decisions living in a `.ts`)
+  substitute the host when the fall-through landed on an ANCESTOR of it. Owner ruling 2026-09-09: an
+  empty-canvas click selects the canvas host. A descendant of the host — a UI child showing through
+  a transparent canvas — and an unrelated subtree both keep their own answer, which is what leaves
+  the Three.js and deselect fall-throughs intact.
+  ⚠️ `hostRelationOf` asks whether the PICKED element contains the host, scoped to its own subtree,
+  rather than looking the host up document-wide: the editor mounts the same UI host in BOTH the
+  SceneView preview and the Game panel, so a document-wide lookup can answer with the other panel's
+  copy.
 
 ### 3D collider outline overlay + collider-only mode
 

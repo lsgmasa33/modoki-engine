@@ -61,3 +61,44 @@ test('the submenu closes when the pointer leaves its parent row', async ({ page 
   await page.getByRole('button', { name: /^\s*Build Support…/ }).hover();
   await expect(page.getByRole('button', { name: 'Refresh devices' })).toBeHidden();
 });
+
+/** #999/#1001 close-out — the DISMISS half, which nothing above exercises.
+ *
+ *  Every test above only ever OPENS a menu. The close-out changed how `MenuBar` dismisses: from
+ *  `click` on `window` to `mousedown` on `document` plus a `[data-menubar-menu]` containment
+ *  guard, because `SceneView`'s UI-preview arbiter swallows the `click` in the CAPTURE phase to
+ *  stop a trailing click re-selecting the UI root — and `MenuBar` was the only outside-dismiss in
+ *  the editor keyed to `click`, so an open dropdown survived every click on the 2D canvas.
+ *
+ *  ⚠️ The guard is the load-bearing half and these are its tests. Without it, pressing the OPEN
+ *  menu's own button closes on `mousedown` and the button's `onClick` toggle immediately REOPENS
+ *  it, so click-to-close silently stops working — a regression no existing spec would catch,
+ *  because opening still works perfectly. */
+
+test('clicking the open menu\'s own button closes it (the containment guard preserves click-to-close)', async ({ page }) => {
+  await gotoEditorWithScene(page);
+
+  const build = page.getByRole('button', { name: 'Build', exact: true });
+  await build.click();
+  // A row that only exists while the menu is open — the same probe the submenu tests use.
+  const iosItem = page.getByRole('button', { name: /^\s*iOS Device — / });
+  await expect(iosItem).toBeVisible();
+
+  await build.click();
+  await expect(iosItem, 'a second press on the same button must CLOSE the menu, not reopen it')
+    .toBeHidden();
+});
+
+test('pressing outside the menus dismisses an open menu', async ({ page }) => {
+  await gotoEditorWithScene(page);
+
+  await page.getByRole('button', { name: 'Build', exact: true }).click();
+  const iosItem = page.getByRole('button', { name: /^\s*iOS Device — / });
+  await expect(iosItem).toBeVisible();
+
+  // The "Modoki" title sits inside the menubar strip but OUTSIDE every `[data-menubar-menu]`
+  // wrapper, so it is an honest outside-press with no side effect of its own — unlike clicking
+  // into a panel, which would select or dirty something.
+  await page.getByText('Modoki', { exact: true }).click();
+  await expect(iosItem, 'an outside press must dismiss the open menu').toBeHidden();
+});
