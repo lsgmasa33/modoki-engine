@@ -345,8 +345,18 @@ describe('captureViewport failure path', () => {
     return captureRefusalBody(err as CaptureUnavailableError);
   };
 
+  /** ⚠️ EVERY FAULT TEST PAIRS ITS FAULT WITH A SUPPORTED-LOOKING FACT, and that is not padding.
+   *
+   *  The first cut of these did not, and four of the five classifier branches were GREEN WHEN
+   *  DELETED — including the flagship "a CRASHED renderer" one. The reason is structural: the fault
+   *  list and the fall-through both answer `false`, so a fixture carrying ONLY a fault cannot tell
+   *  "the fault branch fired" from "nothing matched at all". Pairing forces the fault to be the only
+   *  thing that can produce the verdict, so deleting its clause flips the answer to NO_RENDERER and
+   *  the test goes red. Same defect class as the bug this whole change is about — a guard that
+   *  cannot fire — committed in the tests written to prove the fix. */
   it('a CRASHED renderer is NOT environmental — NOT_AVAILABLE_HERE, and relaunch leads the options', async () => {
-    const body = await bodyFor(brokenWindow({ wc: { isCrashed: () => true } }));
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle', refCount: 0 } }));
+    const body = await bodyFor(brokenWindow({ wc: { isCrashed: () => true } }), probe);
     expect(body.code).toBe('NOT_AVAILABLE_HERE');
     expect(body.error).toMatch(/CRASHED/);
     expect(body.options[0]).toMatch(/relaunch/i);
@@ -355,29 +365,80 @@ describe('captureViewport failure path', () => {
   });
 
   it('a LOST GPU device is NOT environmental — it explicitly never self-recovers', async () => {
-    const probe = vi.fn<SurfaceProbe>(async () => ({ gpu: { deviceLost: true, reason: 'destroyed' } }));
+    const probe = vi.fn<SurfaceProbe>(async () => ({
+      gpu: { deviceLost: true, reason: 'destroyed' }, frameLoop: { status: 'idle', refCount: 0 },
+    }));
     const body = await bodyFor(brokenWindow({}), probe);
     expect(body.code).toBe('NOT_AVAILABLE_HERE');
     expect(body.options[0]).toMatch(/relaunch/i);
   });
 
   it('a STALLED frame loop is a real wedge, not editor state', async () => {
-    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'stalled' } }));
+    const probe = vi.fn<SurfaceProbe>(async () => ({
+      frameLoop: { status: 'stalled' }, rendererGate: { status: 'ready' },
+    }));
+    expect((await bodyFor(brokenWindow({}), probe)).code).toBe('NOT_AVAILABLE_HERE');
+  });
+
+  it("a FAILED renderer gate is a real fault — 'never self-recovers (relaunch the editor)'", async () => {
+    // This branch had no test at all in the first cut. `gate:'failed'` WITH `frameLoop:'idle'` is a
+    // real pairing, not a contrived one: a renderer that failed to come up holds no frame-driver
+    // start ref, so the loop is legitimately idle at the same time.
+    const probe = vi.fn<SurfaceProbe>(async () => ({
+      rendererGate: { status: 'failed', detail: 'WebGPU init threw.' }, frameLoop: { status: 'idle', refCount: 0 },
+    }));
     expect((await bodyFor(brokenWindow({}), probe)).code).toBe('NOT_AVAILABLE_HERE');
   });
 
   it('a MINIMISED window IS editor state — NO_RENDERER, and the options say how to undo it', async () => {
+    // Deliberately NO probe, so the minimised clause is the only thing that can answer "ordinary":
+    // with a probe present the healthy-shape branch would carry the test on its own.
     const win = { ...brokenWindow({}) } as unknown as BrowserWindow;
     (win as unknown as { isMinimized: () => boolean }).isMinimized = () => true;
-    const body = await bodyFor(win, vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle' } })));
+    const body = await bodyFor(win);
     expect(body.code).toBe('NO_RENDERER');
     expect(body.options.join(' ')).toMatch(/unminimise/i);
+    // ⚠️ This is also the accepted trade recorded at the classifier's fall-through: a JS-wedged
+    // renderer kills the probe, so `minimized` answers first and a real wedge scores environmental
+    // here. Unminimising is still the right first move, and the next capture reports the wedge.
+  });
+
+  it('a COLLAPSED pane (zero-sized bounds) IS editor state — NO_RENDERER', async () => {
+    // No probe, for the same reason as the minimised test: with one present the healthy-shape
+    // branch would carry this on its own and the zero-bounds clause could be deleted unnoticed —
+    // which is exactly what the first round of these tests let happen to four other branches.
+    const win = { ...brokenWindow({}) } as unknown as BrowserWindow;
+    (win as unknown as { getBounds: () => Record<string, number> }).getBounds =
+      () => ({ x: 0, y: 0, width: 0, height: 0 });
+    const body = await bodyFor(win);
+    expect(body.code).toBe('NO_RENDERER');
+    expect(body.error).toMatch(/zero-sized bounds/);
+  });
+
+  /** ⚠️ THE HEALTHY SHAPE — the branch whose absence made the first cut wrong in mirror image.
+   *
+   *  `agentEditorOps.ts` OMITS `frameLoop`/`rendererGate`/`gpu` while healthy, on purpose ("a
+   *  running loop is the norm and needs no words"), so a real editor's probe answers with none of
+   *  them. Reading that as "could not look" told the agent to RELAUNCH a healthy editor while the
+   *  error string in the same body said retrying usually works — and it scores DEFECT on the live
+   *  sweep, which is #994's inversion one case over.
+   *
+   *  ⚠️ This fixture is the REAL producer's shape, not a hand-built `{frameLoop:{status:'running'}}`.
+   *  `explainCaptureFailure`'s own comment records that exact trap: "the unit tests passed because
+   *  they hand-build {frameLoop:{status:'running'}}, a shape the real probe never produces." */
+  it('an ANSWERED probe with no fault fields is the HEALTHY shape, not a missing one', async () => {
+    const probe = vi.fn<SurfaceProbe>(async () => ({} as never));
+    const body = await bodyFor(brokenWindow({}), probe);
+    expect(body.code, 'a healthy editor must never be reported as could-not-look').toBe('NO_RENDERER');
+    expect(body.error).toMatch(/frame loop IS running|NOT wedged/);
+    // The error says the renderer is NOT wedged; options telling the reader to relaunch would
+    // contradict the same body they travel in.
+    expect(body.options.join(' ')).not.toMatch(/relaunch/i);
   });
 
   it('NO renderer facts at all is "could not look", not a supported state — the probe failing must not read as green', async () => {
-    // Absence of a known fault is not evidence of a healthy editor. `explainCaptureFailure` says
-    // as much ("the renderer could not be asked why"), and defaulting the unknown case to
-    // NO_RENDERER would make every un-probeable failure environmental.
+    // Absence of a known fault is not evidence of a healthy editor — but an ANSWERED probe IS (see
+    // above). The discriminator is whether the probe replied, not whether a fault was found.
     const body = await bodyFor(brokenWindow({}));
     expect(body.code).toBe('NOT_AVAILABLE_HERE');
     expect(body.error).toMatch(/could not be asked why/);

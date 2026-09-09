@@ -653,14 +653,16 @@ export const NO_RENDERER_REFUSAL = Object.freeze({
     + 'when the project is built without the 3D renderer module (build.modules.render3d:false) or '
     + 'sets disable3D, and before the app shell has mounted it. This is the editor\'s STATE — NOT a '
     + 'missing route, NOT a wedged editor, and NOT a reason to relaunch.',
-  options: [
+  options: Object.freeze([
     'modoki_get_editor_state — `surfaces` lists `game-3d` exactly when a scene renderer is registered; if it is missing, this refusal is why',
     'if the 3D surface should be up but is not, modoki_diagnose and modoki_get_console_logs report a renderer that failed to come up',
     'read the scene as DATA instead — modoki_get_scene_state / modoki_diagnose need no renderer at all',
-  ],
-  // FROZEN: one object is returned BY REFERENCE to every caller of this op, so an accidental
-  // mutation anywhere would rewrite the refusal for every future call. Nothing mutates it today
-  // (the router spreads rather than assigns) — freezing is what keeps that true.
+  ]),
+  // FROZEN, and `options` frozen WITH it: one object is returned BY REFERENCE to every caller of
+  // this op, so an accidental mutation anywhere would rewrite the refusal for every future call.
+  // Nothing mutates it today (the router spreads rather than assigns) — freezing is what keeps that
+  // true. ⚠️ `Object.freeze` is SHALLOW, so freezing the outer object alone left `options.push(…)`
+  // and `options[0] = …` working and the claim above only half-kept.
 });
 
 // Deterministic offscreen frame → JPEG data URL. The backend decodes it to a temp

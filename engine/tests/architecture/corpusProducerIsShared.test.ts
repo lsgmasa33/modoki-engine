@@ -298,6 +298,21 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
     reason: 'Walks Court\'s asset tree to resolve font GUIDs. Same #29 bar as courtCache.ts.',
   },
   {
+    file: 'games/court/tests/sceneChrome.test.ts', rule: 'walker',
+    reason: 'Walks Court\'s runtime/ to parse every patchUI call site against the scene (#804). '
+      + 'The walk REPLACED a hand-listed pair of files, which was the narrowing surface a close-out '
+      + 'review flagged: palette.ts calls patchUI and was not read at all. Same #29 bar as '
+      + 'courtCache.ts — a game cannot import engine/scripts/repoCorpus.mjs.',
+  },
+  {
+    file: 'games/court/tests/courtConfigFields.test.ts', rule: 'walker',
+    reason: 'Walks Court\'s own runtime/ + packages/ to prove every CourtConfig field is READ '
+      + '(#804). Landed USING repoFiles() and had to be reverted: gamePortability.test.ts failed '
+      + 'on the ../../../engine/scripts/ reach. Same #29 bar as courtCache.ts — the two gates '
+      + 'genuinely disagree here and portability wins, because there is nothing to migrate TO '
+      + 'from inside a game.',
+  },
+  {
     file: 'games/sling/tests/sling-assets.test.ts', rule: 'walker',
     reason: 'Walks games/sling/runtime/assets to build a GUID->path map. Same #29 bar.',
   },

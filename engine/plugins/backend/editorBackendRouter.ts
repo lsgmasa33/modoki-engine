@@ -2097,8 +2097,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             refusalStatus(frameRefusal.code));
         }
         const result = raw as { dataUrl: string };
-        tMs.push(Date.now() - t0);
+        // WRITE FIRST, then stamp (#994 close-out round 2, F4). `tMs` used to be pushed first,
+        // which was harmless only while it was invisible to the catch — now that a partial result
+        // REPORTS it, a `writeDataUrlToTemp` throw on frame N (a full or read-only tmpdir) would
+        // hand back `framesWritten: N-1` alongside N timestamps, i.e. a timing array describing a
+        // frame the caller never received. The stamp belongs to a frame that exists.
         paths.push(writeDataUrlToTemp(result.dataUrl));
+        tMs.push(Date.now() - t0);
         // A FIXED interval between frames, deliberately — do NOT deadline-schedule this.
         //
         // Deadline scheduling ("the frame took 473ms, so we're behind — fire the rest
@@ -5057,9 +5062,10 @@ function opRefusal(result: unknown): { code: ErrorCode; error?: string; options?
  *  lying to anything that reads the status alone — and 200 would, since `writeDataUrlToTemp` never
  *  ran and there is no frame.
  *
- *  503 for `NO_RENDERER` matches every envelope this router already emits for it — the two
- *  `unsavedRefusal`/probe-unknown sites and `/api/scene-mutate`'s (grep `code: 'NO_RENDERER'`;
- *  all are 503). One code, one status, so the mapping is a rule rather than a per-site choice.
+ *  503 for `NO_RENDERER` matches every envelope this router already emits for it — one in the
+ *  unsaved-work probe and two in `/api/scene-mutate` (grep `code: 'NO_RENDERER'`; all three are
+ *  503). ⚠️ That count was wrong on the first attempt too, in the very comment written to stop
+ *  citing stale line numbers — so grep it, do not trust this sentence's arithmetic either. One code, one status, so the mapping is a rule rather than a per-site choice.
  *  ⚠️ Deliberately NOT citing line numbers: they were `:1028`/`:2372` when written and one of
  *  them already pointed at nothing two commits later. A line number in a comment is the
  *  shadowing-constant class — it has to be kept in sync by hand and silently goes stale. Anything else the ops start naming is the op ANSWERING, which `relayFailureStatus`

@@ -232,9 +232,13 @@ const DECLS: Record<string, Decl> = {
     notes: 'Does NOT force a render — capturePage() returns whatever the window last drew, so an '
       + 'unchanged capture is NOT evidence a change failed to render (the SceneView is '
       + 'render-on-demand). Use modoki_render_scene to force one, or CDP for a true framebuffer. '
-      + 'Refuses NO_RENDERER (503) when the compositor cannot produce a frame — window minimised, '
-      + 'not visible, viewport unmounted, webContents destroyed (#994). That is the editor\'s state, '
-      + 'not a dead route: it used to escape as a bare throw and arrive as NOT_AVAILABLE_HERE.',
+      + 'A capture failure is a §5 refusal, not a bare throw (#994), and the CODE says which kind: '
+      + 'NO_RENDERER (503) for an ordinary state the caller can undo — window minimised, not '
+      + 'visible, collapsed pane, no viewport mounted — and NOT_AVAILABLE_HERE for a broken editor '
+      + 'that does not self-recover: renderer crashed, window/webContents destroyed, GPU device '
+      + 'lost, frame loop stalled, renderer gate failed. The split is deliberate: NO_RENDERER is in '
+      + 'test-live-tools.ts\'s ENV_CODES, so using it for a dead editor would turn the live gate '
+      + 'green through one. Options differ per branch — relaunch leads for the second.',
   },
   modoki_render_scene: {
     kind: 'read', method: 'POST', route: '/api/render-scene', requires: ['editor', 'renderer', 'scene'],

@@ -233,8 +233,11 @@ export class CaptureUnavailableError extends Error {
  *  a known fault is not the same as a healthy editor: with no renderer facts at all the probe
  *  itself failed, and `explainCaptureFailure` says so in as many words ("the renderer could not be
  *  asked why"). "Could not look" is exactly `NOT_AVAILABLE_HERE`, and it is not environmental — so
- *  an unknown cause reddens the sweep rather than being waved through. The two lists below mirror
- *  `explainCaptureFailure`'s own branches, which already separate a fault from a supported state.
+ *  an unknown cause reddens the sweep rather than being waved through.
+ *
+ *  ⚠️ It must mirror `explainCaptureFailure`'s branches EXACTLY — that function is the same
+ *  classification written as prose, and the first cut of this one silently dropped its
+ *  answered-probe-with-no-fault-fields branch, which is the HEALTHY shape. See that branch below.
  *
  *  ⚠️ The FAULTS are checked FIRST, and the order matters: a destroyed window can still report a
  *  stale `frameLoop: 'idle'` from the last successful probe, and reading that as "no viewport is
@@ -254,7 +257,32 @@ function isOrdinaryState(f: { window: CaptureWindowFacts | null; surface: Render
   if (loop === 'idle' || loop === 'hidden' || loop === 'running') return true;
   const gate = s?.rendererGate?.status;
   if (gate === 'pending' || gate === 'ready') return true;
-  return false;                                                // could not look
+  // ⚠️ AN ANSWERED PROBE WITH NO FAULT FIELDS IS THE HEALTHY SHAPE — not a missing one, and this
+  // branch is why the first cut of this function was wrong in mirror image.
+  //
+  // `agentEditorOps.ts`'s producers OMIT the fields above while healthy, deliberately, to keep the
+  // common payload small: `frameLoopFields()` returns `{}` for a running loop with no recoveries
+  // ("a running loop is the norm and needs no words"), `rendererGateFields()` returns `{}` for a
+  // ready gate, `gpuFields()` returns `{}` with no fault. So a perfectly healthy editor answers
+  // with NONE of them, every check above misses, and the fall-through classified it as "could not
+  // look" — NOT_AVAILABLE_HERE, with options telling the reader to relaunch, while the `error`
+  // string in the SAME body said the renderer is NOT wedged and retrying usually works. It also
+  // scores DEFECT on the live sweep, which is #994's inversion one case over.
+  //
+  // `s` being a non-null object IS the evidence the probe answered — `explainCaptureFailure` uses
+  // exactly this test and reached it via the same mistake in its own 2026-07-30 review. Its comment
+  // there is the warning this function did not heed: "the unit tests passed because they hand-build
+  // `{frameLoop:{status:'running'}}`, a shape the real probe never produces."
+  if (s && !loop && (!gate || gate === 'ready')) return true;
+  // Only `s === null` reaches here — the probe failed, or none was offered. "The renderer could not
+  // be asked why" is precisely could-not-look, and NOT_AVAILABLE_HERE is not environmental, so an
+  // un-probeable failure reddens the sweep rather than being waved through.
+  //
+  // ⚠️ Known and accepted: a JS-wedged (not crashed) renderer on a MINIMISED window kills the probe
+  // (`s === null`) but `w.minimized` above answers first, so it scores NO_RENDERER/environmental.
+  // Fault-first ordering cannot help — every fault fact comes FROM the probe, and the probe is what
+  // died. Unminimising is still the correct first move, and the next capture reports the wedge.
+  return false;
 }
 
 /** The §5 refusal a failed capture answers with (#994).

@@ -834,8 +834,14 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
     fault — a diagnosis, and a wrong one for a fully-supported state, which sent the reader
     hunting a renderer fault that did not exist. **An error message that guesses a cause is
     worse than one that reports what it observed.**
-  - **A failure to capture, and a `render_scene` with no 3D surface mounted, are both
-    `NO_RENDERER` refusals — not transport failures** (#994). They used to escape as throws, which
+  - **A failure to capture, and a `render_scene` with no 3D surface mounted, are §5 refusals — not
+    transport failures** (#994). ⚠️ **Read the CODE, not just the sentence:** `NO_RENDERER` means an
+    ordinary state you can undo (window minimised or not visible, collapsed pane, no viewport
+    mounted); **`NOT_AVAILABLE_HERE` means a BROKEN editor** that will not self-recover — renderer
+    crashed, window/webContents destroyed, GPU device lost, frame loop stalled, renderer gate
+    failed — and there the only real exit is a relaunch, which is what its `options` say. The split
+    is load-bearing rather than cosmetic: `NO_RENDERER` is in `test-live-tools.ts`'s `ENV_CODES`, so
+    reporting a dead editor with it would turn the live gate green through one. They used to escape as throws, which
     the routes turn into a 504/500 and the MCP client reads as `NOT_AVAILABLE_HERE`, *"the route is
     absent"* — so an ordinary editor state (a project built without the 3D renderer module; a Game
     tab never opened this session; a minimised window) was reported as a dead tool, and
