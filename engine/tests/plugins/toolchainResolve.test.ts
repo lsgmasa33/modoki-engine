@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 import { makeDirLink } from '../helpers/linkFixture';
 
 /**
@@ -1068,6 +1068,176 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     fs.mkdirSync(notTc)
     expect(() => uninstallAll(notTc)).toThrow(/refusing/i)
     expect(fs.existsSync(notTc)).toBe(true) // untouched
+  })
+
+  // #1004 — forceRemoveDir had NO link pre-flight, so a junctioned tool dir was unlinked, the
+  // payload orphaned, and the route returned {ok:true}. #883 fixed this mechanism in
+  // clean-packaged-cache.mjs and NOWHERE ELSE, which is exactly how it survived here.
+  //
+  // ⚠️ Every case asserts the PAYLOAD, not just the throw. A test that only checks for a rejection
+  // passes just as happily on a version that throws AFTER deleting — which is the failure being
+  // fixed, and the assertion that separates the two is `payload survives`.
+  describe('uninstall REFUSES rather than orphaning a junctioned payload (#1004)', () => {
+    const payloadIn = (base: string) => {
+      const payload = path.join(base, 'PAYLOAD')
+      fs.mkdirSync(payload, { recursive: true })
+      fs.writeFileSync(path.join(payload, 'big.bin'), 'x'.repeat(512))
+      return payload
+    }
+
+    it("uninstall('android-sdk') refuses when <toolchain>/android-sdk is a link OUT of the tree", async () => {
+      const payload = payloadIn(root)
+      makeDirLink(payload, path.join(tc, 'android-sdk'))
+      await expect(uninstall('android-sdk', { toolchainDir: tc })).rejects.toThrow(/not self-contained/i)
+      expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+      expect(fs.existsSync(path.join(tc, 'android-sdk'))).toBe(true) // the link is left ALONE
+    })
+
+    it('uninstallAll refuses when the toolchain dir ITSELF is a link — the basename guard passes it', () => {
+      // ⚠️ The link is NAMED `toolchain`, so `basename !== 'toolchain'` is satisfied. That guard
+      // asks a question about the NAME; this one is about the DATA, and the measured failure went
+      // straight through the first to reach the second.
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-un2-'))
+      try {
+        const payload = payloadIn(base)
+        const link = path.join(base, 'toolchain')
+        makeDirLink(payload, link)
+        expect(() => uninstallAll(link)).toThrow(/not self-contained/i)
+        expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+      } finally { fs.rmSync(base, { recursive: true, force: true }) }
+    })
+
+    it("refuses on a link NESTED below the tool dir, not just the tool dir itself (#990's axis)", async () => {
+      const payload = payloadIn(root)
+      fs.mkdirSync(path.join(tc, 'jdk', '21.0.11+10'), { recursive: true })
+      makeDirLink(payload, path.join(tc, 'jdk', '21.0.11+10', 'lib'))
+      await expect(uninstall('java', { toolchainDir: tc })).rejects.toThrow(/not self-contained/i)
+      expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+    })
+
+    // ⚠️ **The ACCEPT side, and it is the half that keeps this usable.** A guard that refuses
+    // everything is not this guard: npm's `node_modules/.bin` shims are symlinks pointing INSIDE
+    // the tree on POSIX, and the toolchain installs npm tools into MODOKI_TOOLCHAIN_DIR — so a
+    // predicate that refused on any nested link would refuse every POSIX uninstall. Without this
+    // case, that regression lands green.
+    it('does NOT refuse a link pointing INSIDE the tree — the npm .bin shim shape', async () => {
+      fs.mkdirSync(path.join(tc, 'jdk', 'real'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', 'real', 'tool'), 'x')
+      makeDirLink(path.join(tc, 'jdk', 'real'), path.join(tc, 'jdk', 'shim'))
+      await uninstall('java', { toolchainDir: tc })
+      expect(fs.existsSync(path.join(tc, 'jdk'))).toBe(false) // it really was removed
+    })
+
+    it('does NOT refuse an ordinary real tree — the plain accept side', async () => {
+      fs.mkdirSync(path.join(tc, 'jdk', '21.0.11+10', 'bin'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', '21.0.11+10', 'bin', 'java'), 'x')
+      await uninstall('java', { toolchainDir: tc })
+      expect(fs.existsSync(path.join(tc, 'jdk'))).toBe(false)
+    })
+  })
+
+  // #988 — the sweep's scope clause. Pure string, so this runs on every host; the defect is
+  // Windows-only but the logic is not.
+  describe('winSweepCommand — a PREFIX test, not a wildcard, and no quoted path (#988)', () => {
+    /** What the emitted command will actually compare against — decoded back out of the base64 the
+     *  command carries. Asserting on the DECODED value rather than on a quoted substring is the
+     *  point: there is no quoted substring any more, and a test that looked for one would have to
+     *  be deleted the moment the encoding changed rather than telling us the behaviour changed. */
+    const dirsIn = (cmd: string) =>
+      [...cmd.matchAll(/FromBase64String\('([^']*)'\)/g)].map((m) => Buffer.from(m[1], 'base64').toString('utf16le'))
+
+    it('uses StartsWith/OrdinalIgnoreCase and never -like', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk')
+      expect(cmd).toContain('.StartsWith(')
+      expect(cmd).toContain('OrdinalIgnoreCase')
+      expect(cmd).not.toContain('-like')
+    })
+
+    // ⚠️ The measured case. `-like` reads `[1]` as a character class and matches NOTHING, so the
+    // sweep silently kills nothing and the rmSync then fails on the lock it existed to clear.
+    // Asserting the bracket survives VERBATIM is what pins the operator choice.
+    it('carries a bracketed path through verbatim — the shape -like silently dropped', () => {
+      expect(dirsIn(winSweepCommand('E:\\dev-temp\\a[1]b'))).toEqual(['E:\\dev-temp\\a[1]b\\'])
+    })
+
+    it('appends a trailing separator so a SIBLING prefix does not match', () => {
+      // Without it `…\jdk` also matches `…\jdk-old`.
+      expect(dirsIn(winSweepCommand('C:\\tools\\jdk'))).toEqual(['C:\\tools\\jdk\\'])
+    })
+
+    // ⚠️ **The quote cases, and the second one is why the encoding exists.** Windows PowerShell
+    // treats U+2018/U+2019/U+201A as single-quote delimiters too, so an escaper that doubles only
+    // ASCII `'` lets a path break out of the literal and the command fails to PARSE — throwing into
+    // forceRemoveDir's best-effort catch, so the sweep silently kills nothing. That is the identical
+    // end state as the -like bug, one character over. The previous test doubled the ASCII quote and
+    // asserted the doubling, which READ as covering this and did not.
+    it.each([
+      ['ASCII apostrophe', "C:\\it's\\jdk"],
+      ['U+2019 right single quote', 'C:\\it\u2019s\\jdk'],
+      ['U+2018 left single quote', 'C:\\it\u2018s\\jdk'],
+      ['U+201A single low quote', 'C:\\it\u201As\\jdk'],
+      ['a double quote', 'C:\\say "hi"\\jdk'],
+      ['a backtick and a $', 'C:\\a`b$c\\jdk'],
+    ])('carries %s through without any quote reaching the command text', (_label, dir) => {
+      const cmd = winSweepCommand(dir)
+      expect(dirsIn(cmd)).toEqual([dir + '\\'])
+      // The command's only quotes are the ones wrapping base64, which cannot contain a quote.
+      for (const ch of ["\u2018", "\u2019", "\u201A", '"', '`']) expect(cmd).not.toContain(ch)
+    })
+
+    it('emits ONE clause when there is no second spelling — never an empty side (#69)', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk', null)
+      expect(cmd.match(/StartsWith\(/g)).toHaveLength(1)
+      expect(cmd).not.toContain(' -or ')
+    })
+
+    it('ORs in the second spelling when there is one', () => {
+      const cmd = winSweepCommand('C:\\link\\jdk', 'D:\\real\\jdk')
+      expect(cmd.match(/StartsWith\(/g)).toHaveLength(2)
+      expect(cmd).toContain(' -or ')
+      expect(dirsIn(cmd)).toEqual(['C:\\link\\jdk\\', 'D:\\real\\jdk\\'])
+    })
+
+    // ⚠️ The decode is hoisted OUT of the Where-Object block, which runs once per process.
+    it('declares the directories before the pipeline, not inside the filter', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk')
+      expect(cmd.indexOf('$d0 =')).toBeLessThan(cmd.indexOf('Where-Object'))
+      expect(cmd.slice(cmd.indexOf('Where-Object'))).not.toContain('FromBase64String')
+    })
+  })
+
+  // #958 row 3's scar, made falsifiable. The alternate was once recomputed at a layer that SKIPPED
+  // this guard, and a junction targeting `C:\` then produced `StartsWith('C:\')` — every process on
+  // the drive. It was an inline pair of lines, which is precisely why nothing could pin it.
+  describe('sweepAlt — the second spelling, width-guarded (#958 row 3)', () => {
+    it('is null when the path does not resolve to a different spelling', () => {
+      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-alt-'))
+      try { expect(sweepAlt(fs.realpathSync.native(real))).toBeNull() }
+      finally { fs.rmSync(real, { recursive: true, force: true }) }
+    })
+
+    it('is null for a path that does not exist — nothing to reap, so no second pattern', () => {
+      expect(sweepAlt(path.join(root, 'no-such-dir'))).toBeNull()
+    })
+
+    // The load-bearing case. A LINK long enough to pass any naive length check, whose TARGET is
+    // implausibly short — the exact asymmetry that produced StartsWith('C:\').
+    it('REFUSES an implausibly short target even when the argument is long', () => {
+      const shortTarget = process.platform === 'win32' ? 'C:\\' : '/'
+      const link = path.join(root, 'a-comfortably-long-link-name-here')
+      makeDirLink(shortTarget, link)
+      expect(sweepAlt(link)).toBeNull()
+    })
+
+    // ⚠️ The ACCEPT side: proving it rejects a short target says nothing about whether it ever
+    // returns one, and a `sweepAlt` that returned null always would pass every case above.
+    it('DOES return a plausible second spelling — the accept side', () => {
+      const target = path.join(root, 'a-real-and-suitably-long-target')
+      fs.mkdirSync(target, { recursive: true })
+      const link = path.join(root, 'the-link')
+      makeDirLink(target, link)
+      expect(sweepAlt(link)).toBe(fs.realpathSync.native(target))
+    })
   })
 })
 

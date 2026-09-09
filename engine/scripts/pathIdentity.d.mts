@@ -27,3 +27,13 @@ export declare function pathCaseKey(s: string): string;
  *  before `path.relative`, which folds case on win32 but NOT on darwin. Includes equality —
  *  `electron/projects.ts`'s `isUnderRepo` answers STRICT containment and stays separate. */
 export declare function isUnderOrSame(parent: string, child: string): boolean;
+
+/** The OTHER spelling of an absolute path (`fs.realpathSync.native`), or `null` when there is no
+ *  distinct one — no path, unresolvable, non-absolute, or identical. A reap matches our pattern
+ *  against a string we do NOT control, so the only correct shape is to match a SET of spellings
+ *  (#913); canonicalising only our side breaks the case that works today.
+ *
+ *  ⚠️ **The WIDTH GUARD is the CALLER's** — a long path can be a link to a very short real one, and
+ *  an unchecked alternate widened a kill to `StartsWith('C:\')` once (#958 row 3). `killPackaged`
+ *  requires `>= 10`; every other caller must state its own bound. */
+export declare function altPathSpelling(p: string | null | undefined): string | null;

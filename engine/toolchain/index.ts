@@ -21,6 +21,13 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+// Relative first-party .mjs leaves, statically imported — the shape `engine/electron/main.ts`
+// already uses for `pathIdentity.mjs`. ⚠️ NOT `packagedAppPaths.mjs`, which cannot be imported from
+// here at all: it evaluates `fileURLToPath(import.meta.url)` at module scope, and esbuild emits
+// `import_meta = {}` in the bundled Electron main, so the import would throw at load. Neither of
+// these does. (`nodeProvision.ts`'s docblock is about npm PACKAGE specifiers — a different case.)
+import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs'
+import { altPathSpelling } from '../scripts/pathIdentity.mjs'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
@@ -1453,6 +1460,84 @@ export function shouldSweepProcesses(dir: string, platform: NodeJS.Platform = pr
   return containsProcessImage(dir)
 }
 
+/** The second spelling to sweep alongside `dir`, or null — `altPathSpelling` plus THIS caller's
+ *  width guard.
+ *
+ *  Windows reports the spelling a process was LAUNCHED with and normalises nothing, so a reap must
+ *  match a SET of spellings rather than canonicalise its own side (#913/#958).
+ *
+ *  ⚠️ **The width guard is why this is a named function rather than two inline lines.** A long
+ *  `dir` can be a junction to a very short real path, so an unchecked alternate WIDENS the kill:
+ *  #958 row 3 measured a junction targeting `C:\` producing `StartsWith('C:\')`, which with no other
+ *  filter is every process on the drive — #69's blast radius, produced by the fix meant to prevent
+ *  it. That happened because the alternate was recomputed at a layer that skipped the guard, and an
+ *  inline guard is one nobody can write a test against. `>= 10` mirrors `killPackaged`'s bound.
+ *
+ *  ⚠️ **Bound on what this closes**: only the direction where WE hold one spelling and the process
+ *  was launched via the other. You cannot enumerate the aliases pointing AT a directory, so a launch
+ *  through some third alias stays unmatched — that is #961, not something to widen this into. */
+export function sweepAlt(dir: string): string | null {
+  const alt = altPathSpelling(dir)
+  return alt !== null && alt.length >= 10 ? alt : null
+}
+
+/** A PowerShell expression yielding `s` — **encoded, never interpolated as a quoted literal**.
+ *
+ *  ⚠️ **Doubling `'` is NOT sufficient, and the obvious fix (double the smart quotes too) is a
+ *  hand-maintained list of characters that will go stale.** Windows PowerShell treats **U+2018,
+ *  U+2019 and U+201A** as single-quote delimiters as well as ASCII `'`, so a path containing one
+ *  breaks out of the literal and the command fails to PARSE. `execFileSync` then throws into
+ *  `forceRemoveDir`'s best-effort `catch`, and the sweep silently kills nothing — which is the
+ *  identical end state as the `-like` bug this function was just fixed for, one character over.
+ *  Reachable: a smart quote is what you get pasting a path out of a doc or a chat, and
+ *  `MODOKI_TOOLCHAIN_DIR` is user-supplied. Measured on Windows PowerShell 5.1:
+ *
+ *      dir contains        escaping            result
+ *      ASCII '             double ASCII        OK
+ *      U+2018/19/1A        double ASCII        PARSE ERROR   <- the defect
+ *      U+2018/19/1A        double all four     OK
+ *
+ *  Base64 is `[A-Za-z0-9+/=]` and can contain no quote character of any kind, so the surrounding
+ *  literal is safe BY CONSTRUCTION rather than by enumerating what has to be escaped. UTF-16LE
+ *  because that is what .NET's `Unicode` encoding is, so any path a Windows filesystem can hold
+ *  round-trips — including the astral characters a code-unit-wise escaper would also have to think
+ *  about. */
+function psLiteral(s: string): string {
+  return `[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${Buffer.from(s, 'utf16le').toString('base64')}'))`
+}
+
+/** The full PowerShell command for the kill sweep — scoped to process images under `dir` (and
+ *  `alt`, the caller's already-width-guarded second spelling, when there is one).
+ *
+ *  ⚠️ **`.StartsWith(…, OrdinalIgnoreCase)`, NEVER `-like`, and this shipped as `-like` for
+ *  months.** `-like` is a WILDCARD match, so a `[`, `]`, `*` or `?` anywhere in the path — all
+ *  legal on Windows — is read as a character class and matches nothing: a reap that silently does
+ *  nothing, and then an `rmSync` that fails on the lock the sweep existed to clear. The toolchain
+ *  dir is user-influenced (`MODOKI_TOOLCHAIN_DIR`, or a path under `%LOCALAPPDATA%`, where some
+ *  usernames contain brackets), so it is reachable. Measured on Windows PowerShell 5.1 with
+ *  `E:\dev-temp\a[1]b`: `-like` is **False** for the image that IS under the dir while
+ *  `StartsWith` is **True**, and a no-bracket control has `-like` **True** — so the bracket is the
+ *  cause, not a broken probe. `packagedAppPaths.mjs`'s `winKillCommand` already documented this in
+ *  terms that applied here verbatim; the assertion pinning it was scoped to that one file, which is
+ *  why this copy sat undisturbed (#988). Enforced repo-wide now by
+ *  `tests/architecture/winProcessPredicates.test.ts`.
+ *
+ *  Returns the WHOLE command rather than just the `Where-Object` body so the directory literals can
+ *  be hoisted into variables ahead of the pipeline — `Where-Object` evaluates its block once per
+ *  process, and the base64 decode belongs outside that loop. It also keeps the quoting decision in
+ *  one place instead of splitting it across a helper and its caller. */
+export function winSweepCommand(dir: string, alt: string | null = null): string {
+  const dirs = alt === null ? [dir] : [dir, alt]
+  // The trailing separator makes it a DIRECTORY prefix: without it, `…\jdk` also matches a sibling
+  // `…\jdk-old`. Applied AFTER trimming any separator the caller already had.
+  const decls = dirs.map((d, i) => `$d${i} = ${psLiteral(d.replace(/[\\/]+$/, '') + '\\')}`)
+  const clauses = dirs.map((_, i) => `$_.ExecutablePath.StartsWith($d${i}, [System.StringComparison]::OrdinalIgnoreCase)`)
+  // Two clauses OR-ed, never one with an empty side (#69).
+  return `${decls.join('; ')}; Get-CimInstance Win32_Process `
+    + `| Where-Object { $_.ExecutablePath -and (${clauses.join(' -or ')}) } `
+    + '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }'
+}
+
 /** Remove a directory robustly, tolerating Windows file locks. `force+recursive` clears read-only
  *  files but NOT OPEN HANDLES: a lingering Gradle build daemon (a `java.exe` running from the
  *  provisioned JDK) keeps the dir locked, so a naive rmSync bails half-way → a "half-deleted" tool
@@ -1461,13 +1546,38 @@ export function shouldSweepProcesses(dir: string, platform: NodeJS.Platform = pr
  *  then rmSync WITH retries (Node retries EBUSY/EPERM/ENOTEMPTY on Windows). A persistent lock gets
  *  an actionable error instead of a silent partial delete. No-op on POSIX (no exec, plain retries).
  *  The kill sweep is gated by `shouldSweepProcesses` — it is skipped when nothing under `dir` could
- *  be a process image, which is provably equivalent and avoids a multi-second WMI query (#313). */
+ *  be a process image, which is provably equivalent and avoids a multi-second WMI query (#313).
+ *
+ *  ⚠️ **REFUSES rather than deleting when the subtree is not self-contained** (#1004, owner ruling
+ *  2026-09-09). `rmSync` acts on names, not data: a junctioned tool dir — `<toolchain>\android-sdk`
+ *  pointed at another drive, the ordinary "C: is small" move — is UNLINKED, the multi-GB payload is
+ *  orphaned, and Build Support's Remove button returns `{ok:true}`. Measured through the real
+ *  `uninstall()`/`uninstallAll()` on Windows: link removed = true, payload survived = true.
+ *
+ *  The pre-flight is the same walk `clean-packaged-cache.mjs` uses (`deleteBoundary.mjs`), so both
+ *  of this repo's recursive-delete sites refuse on the same inputs for the same reasons — #883
+ *  fixed only the other one, which is how this survived.
+ *
+ *  ⚠️ **The accepted cost, so it is not later read as a regression:** the Remove button is a dead
+ *  end for a user who junctioned a tool dir, until they undo it. The alternative — sever the link
+ *  and report the orphan — was declined because it would leave the two delete sites behaving
+ *  differently on the same input. That makes the message load-bearing rather than decoration: it
+ *  names the boundary, its target, and the action that clears it. */
 function forceRemoveDir(dir: string): void {
   if (!fs.existsSync(dir)) return
+
+  const boundaries = findDeleteBoundaries(dir)
+  if (boundaries.length > 0) {
+    throw new Error(
+      `Refusing to remove ${dir} — it is not self-contained, so a recursive delete would not do `
+      + `what it reports:\n${boundaries.map((b) => '  ' + describeBoundary(b)).join('\n')}\n`
+      + 'Remove the link itself (that deletes no payload), point the toolchain somewhere else, or '
+      + 'unmount the volume — then retry.')
+  }
+
   if (shouldSweepProcesses(dir)) {
     try {
-      const esc = dir.replace(/'/g, "''")
-      const ps = `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${esc}\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+      const ps = winSweepCommand(dir, sweepAlt(dir))
       execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'pipe' })
     } catch { /* best-effort: no PowerShell / nothing to kill */ }
   }
@@ -1513,11 +1623,20 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
     resetToolchainCache()
     return
   }
-  for (const dir of toolOwnedDirs(id, opts.toolchainDir)) {
-    log(`Removing ${dir}…`)
-    forceRemoveDir(dir)
+  // ⚠️ **`finally`, because the loop can now throw PART-WAY** (#1004 close-out review).
+  // `toolOwnedDirs('cocoapods')` returns TWO dirs; if the first is removed and the second refuses,
+  // an unguarded `resetToolchainCache()` never runs and `detect()` keeps answering from a cache
+  // describing a tree that is now half gone — Build Support showing the tool present over a
+  // partial removal. The shape pre-dates the refusal (an EBUSY throw did the same), but the
+  // refusal makes it a first-class reachable path rather than a lock accident.
+  try {
+    for (const dir of toolOwnedDirs(id, opts.toolchainDir)) {
+      log(`Removing ${dir}…`)
+      forceRemoveDir(dir)
+    }
+  } finally {
+    resetToolchainCache()
   }
-  resetToolchainCache()
 }
 
 /** Remove the ENTIRE toolchain folder — a hard reset. Everything (including settings.json) is wiped;
@@ -1547,12 +1666,20 @@ async function npmToolsInstall(toolchainDir: string, specPkg: string, log: (line
       + `error; delete the file to let the toolchain recreate it (this also reinstalls its tools).`)
   }
   if (plan.action === 'absent' || plan.action === 'patch') {
-    fs.writeFileSync(pkgJson, JSON.stringify(plan.pkg, null, 2) + '\n')
     // The override only takes effect on a tree npm re-resolves from scratch — an existing
     // node_modules already has the conflicting nested sharp copy laid out, and a plain `npm install`
     // is not guaranteed to restructure it. Force a clean re-resolve, same as the self-heal path
     // below for a damaged tree.
+    //
+    // ⚠️ **The wipe goes BEFORE the write, and the order is load-bearing** (#1004 close-out
+    // review). `forceRemoveDir` can now THROW — it refuses a subtree a recursive delete would
+    // misreport. Writing the pin first and then throwing leaves `overrides.sharp` recorded with
+    // `node_modules` and the lockfile intact, so the next run's `planSharpOverride` returns `ok`,
+    // skips BOTH the wipe and the lockfile delete forever, and `npmToolsSharpOverrideMissing`
+    // reports nothing wrong — a pin permanently recorded and never applied, silently. Wiping first
+    // means a refusal leaves the tree exactly as it was, which is a state the next run retries.
     forceRemoveDir(path.join(dir, 'node_modules'))
+    fs.writeFileSync(pkgJson, JSON.stringify(plan.pkg, null, 2) + '\n')
     try { fs.rmSync(path.join(dir, 'package-lock.json'), { force: true }) } catch { /* best-effort */ }
   }
   const spec = npmSpawnSpec()

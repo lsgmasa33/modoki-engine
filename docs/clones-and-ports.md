@@ -290,6 +290,18 @@ every other clone at yours.**
     a silent partial fix — the same reasoning that made the bash helper inherit rather than take an
     argument.
   - `test-packaged.sh` spells both patterns **inline**, as two `${VAR:?}`-led literal lines.
+  - **A third site joined them in #988**: `engine/toolchain/index.ts`'s `forceRemoveDir` sweep, whose
+    dir is likewise caller-supplied. Rather than a fourth copy of the alternate-spelling contract,
+    `altPathSpelling` moved to `engine/scripts/pathIdentity.mjs` (the path-identity SSOT);
+    `packagedAppPaths.mjs` re-exports it, so nothing there changed.
+    ⚠️ **`engine/toolchain/` cannot import `packagedAppPaths.mjs` at all** — that module evaluates
+    `fileURLToPath(import.meta.url)` at module scope, and esbuild emits `import_meta = {}` in the
+    bundled Electron main, so the import would throw at load. A leaf shared with the toolchain must
+    have no `import.meta.url` and no module-scope side effects.
+    ⚠️ **The width guard stays the CALLER's** and `altPathSpelling` deliberately does not apply one:
+    a long path can be a link to a very short real one, and an unchecked alternate widened a kill to
+    `StartsWith('C:\')` once (#958 row 3). `killPackaged` requires `>= 10`; `forceRemoveDir` mirrors
+    it in `sweepAlt`, which exists as a named function precisely so a test can reach the guard.
     ⚠️ **It must not route through `reap_alt_pattern`**, which is the obvious move:
     `reapScoping.test.ts` rule 3 rejects a variable-led `pkill` pattern that is not `${VAR:?}`
     -guarded, and `${ALT:?}` is *wrong* here because an EMPTY alternate is the normal case (no

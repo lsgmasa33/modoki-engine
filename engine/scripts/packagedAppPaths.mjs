@@ -15,7 +15,7 @@
  *   node packagedAppPaths.mjs kill [appDir]
  *   node packagedAppPaths.mjs clearViteCache
  */
-import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -180,9 +180,11 @@ export function winKillCommand(appDir, name = productName()) {
   //      fix meant to prevent it.
   //
   // So: keep this function PURE and single-spelling. Anything that needs a second spelling gets it
-  // from `killPackaged`, where the guard lives. `altPathSpelling` is also NOT `reap_alt_pattern`'s
-  // equivalent despite the docblock below claiming it is — that helper additionally requires the
-  // pattern to sit under the registered root, so it cannot return something shallower. This one can.
+  // from `killPackaged`, where the guard lives. (`altPathSpelling` is also NOT `reap_alt_pattern`'s
+  // equivalent — that helper additionally requires the pattern to sit under the registered root, so
+  // it cannot return something shallower, and this one can. That caveat now lives with the
+  // implementation in `pathIdentity.mjs`, which is where it moved in #988; this used to say "the
+  // docblock below" and the docblock below is now the re-export.)
   const scope = appDir
     ? ` | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith('${q(String(appDir).replace(/[\\/]+$/, ''))}\\', [System.StringComparison]::OrdinalIgnoreCase) }`
     : '';
@@ -196,29 +198,17 @@ export function winKillCommand(appDir, name = productName()) {
   return `$p = @(${select}${scope}); $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }; Write-Output $p.Count`;
 }
 
-/** The clone's OTHER spelling of an absolute path, or null when there is no distinct one.
+/** The clone's OTHER spelling of an absolute path — re-exported from the path-identity SSOT.
  *
- *  A reap matches our pattern against a string we do NOT control — the command line a foreign
- *  process was launched with — so there is nothing to canonicalise on the other side, and
- *  canonicalising only ours is strictly worse: it breaks the ordinary case that works today
- *  while fixing the symlinked one. The only correct shape is to match a SET of spellings
- *  (#913). This is `reap_alt_pattern`'s contract from `lib/repo-reap.sh`, in JS.
- *
- *  ⚠️ **Returns null rather than echoing the input back.** Callers run "the pattern, then
- *  whatever this returns", so returning the input would reap the same pattern twice. Every
- *  branch here is a guard against WIDENING the match: no path, an unresolvable one (the
- *  directory is gone — the common case when there is nothing to reap anyway), a non-absolute
- *  result, or an identical spelling all yield no second reap at all.
- *
- *  `.native`, never the JS `realpathSync` walk: the JS implementation does not fold a
- *  case-flipped path component and has already dropped a clone's pinned port that way (#881). */
-export function altPathSpelling(p) {
-  if (typeof p !== 'string' || p === '') return null;
-  let real;
-  try { real = realpathSync.native(p); } catch { return null; }
-  if (!path.isAbsolute(real)) return null;
-  return real === p ? null : real;
-}
+ *  ⚠️ **Moved to `pathIdentity.mjs` in #988/#1004, and this re-export is not a courtesy.** A third
+ *  copy was about to be written for `engine/toolchain/index.ts`, which cannot import THIS module at
+ *  all: the `REPO` const at the top evaluates `fileURLToPath(import.meta.url)`, and esbuild emits
+ *  `import_meta = {}` in the bundled Electron main, so the import would throw at load. The re-export
+ *  keeps this module's five callers and its tests on their existing import; the contract, the
+ *  caller-owns-the-width-guard rule and the `reap_alt_pattern` comparison all live with the
+ *  implementation. Do not re-inline it here. */
+export { altPathSpelling } from './pathIdentity.mjs';
+import { altPathSpelling } from './pathIdentity.mjs';
 
 /** How a reap turned out. `exit 0` is right for all three — "nothing running" is the normal
  *  case — but they are NOT the same event, and collapsing them into one silent `catch` is what

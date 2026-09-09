@@ -29,10 +29,15 @@ export declare function clearViteCache(): string[];
  *  instance, any clone" — the deliberate machine-wide case. */
 export declare function winKillCommand(appDir?: string, name?: string): string;
 
-/** The clone's OTHER spelling of an absolute path (`realpathSync.native`), or null when there is
- *  no distinct one — no path, unresolvable, non-absolute, or identical. `reap_alt_pattern`'s
- *  contract from `lib/repo-reap.sh`, in JS (#959). */
-export declare function altPathSpelling(p?: string): string | null;
+/** Re-export — the implementation and its contract live in `pathIdentity.mjs` since #988.
+ *
+ *  ⚠️ **`export ... from`, NOT a second `declare function`.** It was re-declared here by hand after
+ *  the move, and the two copies had already drifted in one turn: this one said `(p?: string)` while
+ *  `pathIdentity.d.mts` says `(p: string | null | undefined)`, so a caller reaching it through this
+ *  module could not pass the `null` the implementation explicitly handles. `mjsTypeSidecars.test.ts`
+ *  checks the export SET and so was green throughout — a shadowing declaration kept in step by hand
+ *  is exactly the class CLAUDE.md's single-source-of-truth rule names. */
+export { altPathSpelling } from './pathIdentity.mjs';
 
 /** How a reap turned out. `exit 0` is right for all three, but they are not the same event and
  *  collapsing them into one silent catch is what made every bash caller's `|| true` structural

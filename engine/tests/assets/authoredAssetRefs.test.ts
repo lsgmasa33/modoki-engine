@@ -241,6 +241,21 @@ const provenPairs = new Set(
  *  then the browser default — `runtime/ui/fontFamilyRef.ts`). It became a "proven" pair the
  *  moment a root was first migrated from a family NAME to a GUID; nothing about the blanks
  *  changed. */
+/*  ⚠️ `UIElement.imageSrc` was listed here on 2026-09-09 and REMOVED the same day — do not re-add
+ *  it without reading this. It was added to green a real red, but the red had a different cause and
+ *  the entry was dead within the hour:
+ *
+ *  A pair becomes "proven" only when some instance holds a value that is a KNOWN ASSET ID
+ *  (`readAssetGuid` returns an asset's OWN id and nothing else). A correctly-authored
+ *  `UIElement.imageSrc` holds the scanner-DERIVED whole-image sprite guid
+ *  (`deriveGuid('sprite:' + textureGuid)`), which is not any asset's own id — so a correct value
+ *  can never prove this pair. What proved it was `games/wordweave` briefly authoring the raw
+ *  TEXTURE guid, which IS an asset id. Fixing those refs to sprite guids un-proved the pair and
+ *  left this exemption inert (measured: removing it leaves the suite green).
+ *
+ *  ⚠️ And it was worse than inert. The red it suppressed is a genuine tell for the
+ *  texture-guid-in-a-sprite-field mistake, so keeping the exemption would silence — repo-wide, for
+ *  every game — the one signal that fires when someone makes it. */
 const OPTIONAL_BLANK_PAIRS = new Set(['UIElement.fontFamily']);
 
 /** Every instance of a proven asset-ref pair whose value is a blank string. */

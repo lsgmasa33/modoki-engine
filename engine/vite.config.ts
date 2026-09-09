@@ -517,6 +517,7 @@ export default defineConfig(({ command }) => {
         // rather than from `engine/app/**`, which is exactly the case this list exists for.
         // #888 — same shape: games/sling's editor stores import the shared listener-isolation
         // helper by its narrow subpath rather than through the barrel.
+        '@modoki/engine/runtime/core/liveness',
         '@modoki/engine/runtime/core/notifyListeners',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',

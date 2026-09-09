@@ -519,6 +519,65 @@ load-bearing and commented as such).
   every later run refuses on it — with a remedy message blaming a human for hand-deleting the
   target. The script's own success created the state.
 
+- **The predicate above is the FINAL COMPONENT of one candidate, which is one point in a three-axis
+  space** (#990/#989/#1004, landed 2026-09-09). The question that actually decides whether `rmSync`
+  misreports is *"is this subtree SELF-CONTAINED?"*, and #883's guard missed it three ways: in
+  **depth** (a link nested below the final component), in **kind** (a mount point, which `lstat`
+  does not call a link), and in **site** (`engine/toolchain/index.ts`'s `forceRemoveDir` deletes the
+  same directories and had no pre-flight at all). One walk — `engine/scripts/deleteBoundary.mjs` —
+  now answers it for both delete sites.
+
+  ⚠️ **"Refuse on ANY nested link" is not viable, and the Windows evidence is the trap.** A
+  provisioned toolchain here measured **0 symlinks across 23,303 entries**, so the blunt rule looks
+  free — but that is an artifact of npm using `.cmd` shims on Windows. On POSIX the same provision
+  carries `node_modules/.bin` symlinks (60 of 60 in one `.bin`), so the blunt rule refuses on every
+  run. The property that separates them is whether the link's target **escapes the subtree**; a
+  `.bin` shim points inside. **The accept side is the load-bearing half of this guard.**
+
+- ⚠️ **libuv discriminates a reparse point by its substitute-name FORM, not its tag — so a volume
+  mount point is NOT a symlink to `lstat`, and a junction is.** Both carry
+  `IO_REPARSE_TAG_MOUNT_POINT`, so reasoning from the tag gives the wrong answer, and that was the
+  natural wrong guess. Measured on Windows 11 (NTFS), a volume mounted at a directory:
+
+  ```
+  lstat.isSymbolicLink()   false     <- #883's shipped guard is BLIND to it
+  Dirent.isSymbolicLink()  TRUE      <- the directory ENUMERATION disagrees with lstat
+  readlinkSync             throws EINVAL   (a junction returns its target)
+  realpathSync.native      C:\
+  readdirSync              enumerates the MOUNTED volume's entries
+  ```
+
+  Two consequences worth carrying: `lstat` is the **authority** for link-ness and a `Dirent` must
+  never be trusted for it (trusting it classified a nested mount as a link — refusing correctly, but
+  handing the reader "remove the link", which does nothing to a mounted volume); and that
+  **disagreement is itself an exact, free mount detector** during a walk, with no `dev` comparison.
+
+  ⚠️ **Reproducing one needs NO elevation, which is what makes it testable.** `mountvol` requires
+  admin; `mklink /J <link> \\?\Volume{GUID}\` does not, and writes the identical reparse point —
+  confirm with `fsutil reparsepoint query` (Microsoft / Name Surrogate / Mount Point). Get the GUID
+  from `(Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq 'E:' }).DeviceID`.
+
+  ⚠️ **Tear such a fixture down with non-recursive `rmdir`, and NEVER let a recursive delete reach
+  a tree that has held one** — `rmSync(recursive)` walks INTO the mounted volume and starts deleting
+  it. A test whose `afterEach` does that is one thrown assertion away from the bug under test.
+
+- **Detecting "is this path itself a mount root": resolve the PARENT and re-append the component.**
+  ⚠️ This is *not* `realpathSync(p) !== p`, the predicate #883 rejected — that one is true whenever
+  ANY ancestor is aliased (`os.tmpdir()` on macOS is `/var/…` → `/private/var/…`), so it refuses on a
+  clean machine. Resolving the parent first puts both sides in one space, so an aliased ancestor
+  cancels out and only the final component's own redirection survives.
+
+  ⚠️ **Compare with `pathCaseKey`, never `samePath`** — `samePath` canonicalises through links and
+  would resolve the very redirection under test, which is #883's re-opening mistake in a new place.
+  And `path.resolve` **both** sides first: one comes from `path.join` and one from
+  `realpathSync.native`, and the two need not agree on separator style — a mismatch there is a false
+  REFUSAL, the direction that breaks a working setup.
+
+  A `dev` comparison is the POSIX half and is weaker: it is blind to a **same-volume** mount (an
+  identical `dev`), so no message built on it may claim more than "not a mount root onto another
+  volume". Its polarity is **candidate vs its own PARENT** — comparing against anything of ours
+  would refuse the ordinary setup where `MODOKI_TOOLCHAIN_DIR` legitimately lives on another drive.
+
 - ⚠️ **A shell script's node calls: a path inside `-e` code is NOT converted, a path in argv IS**
   (#904). Under Git Bash, MSYS rewrites an argument that *looks* like an absolute path
   (`/e/Projects/…` → `E:\Projects\…`) before native `node.exe` sees it — but it does not touch path
@@ -812,7 +871,8 @@ mechanism different from the other two means widening a reap pattern, which is #
 for a configuration nobody here runs. Same trade as #883's *refuse rather than widen*.
 
 ⚠️ **The bash and JS twins of this contract disagree on how they test "absolute", and only one is
-portable.** `packagedAppPaths.altPathSpelling` uses `path.isAbsolute`, which is correct on both
+portable.** `altPathSpelling` (in `pathIdentity.mjs` since #988 — `packagedAppPaths.mjs` re-exports
+it, and `engine/toolchain/` is the third caller) uses `path.isAbsolute`, which is correct on both
 platforms; `reap_alt_pattern` hand-rolls `case "$PHYS" in /*)`, which is POSIX-only. That is not a
 live defect — every production caller passes bash `pwd` output — but it IS a narrower contract than
 it looks, and a test that fed it a native `E:\…` root was red on the public Windows leg for weeks
@@ -1029,6 +1089,19 @@ Match on `Get-CimInstance Win32_Process` `CommandLine` instead, and:
   like `engine/electron/dist/main.cjs`, so a loose pattern kills a sibling clone's editor.
   Enforced by [engine/tests/architecture/reapScoping.test.ts](../engine/tests/architecture/reapScoping.test.ts),
   which fails any `pkill -f` pattern in `engine/scripts/**` not anchored to `/` or `$`.
+- ⚠️ **Scope a path match with `.StartsWith(dir + '\', OrdinalIgnoreCase)` — NEVER `-like`** (#988).
+  `-like` is a WILDCARD match, so a `[`, `]`, `*` or `?` anywhere in the path (all legal on Windows,
+  and reachable because `MODOKI_TOOLCHAIN_DIR` and `%LOCALAPPDATA%` are user-influenced) is read as
+  a character class and matches **nothing** — a reap that silently does nothing, followed by
+  whatever it was unblocking failing anyway. Measured with `E:\dev-temp\a[1]b`: `-like` **False**
+  for the image that IS under the dir, `StartsWith` **True**, and a no-bracket control at `-like`
+  **True**. Keep the trailing separator, or `…\jdk` also matches a sibling `…\jdk-old`.
+  Enforced across `engine/{scripts,toolchain,electron,plugins}` — `.ps1` included, which no guard
+  here could see before — by
+  [engine/tests/architecture/winProcessPredicates.test.ts](../engine/tests/architecture/winProcessPredicates.test.ts).
+  ⚠️ It sweeps the CORPUS on purpose: the previous assertion was scoped to `packagedAppPaths.mjs`,
+  and the identical defect sat in `engine/toolchain/index.ts` for months — with that file's own
+  comment already explaining why `-like` is wrong. **A scope restriction is a claim.**
 - Killing a process does not kill its children — stopping Vite must take its build tree with it.
 
 ## Shell dependence

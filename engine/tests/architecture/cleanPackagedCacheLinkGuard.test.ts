@@ -166,13 +166,20 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
 
       // ⚠️ The load-bearing half. Without this the suite would pass over a guard that refused and
       // then fell through, or one placed after the loop — and under `--dry-run` neither would be
-      // visible as data loss. `would remove` is the loop's own wording, per-path AND in the
+      // visible as data loss. The loop's wording is `[dry-run] would remove`, per-path AND in the
       // summary, so this one line covers both.
+      //
+      // ⚠️ **The sentinel is the BRACKETED PREFIX, not the fragment `would remove`.** It was the
+      // fragment until #990, and that made it ambiguous rather than wrong: the refusal message now
+      // explains what a recursive delete WOULD REMOVE, so the fragment matched the refusal itself
+      // and this assertion failed on a guard that was working perfectly. A sentinel proving "the
+      // loop was not reached" has to match something only the loop can emit. Tightening, not
+      // relaxing — mutation-checked by disabling the guard and confirming this goes red.
       //
       // (A `not.toContain('[done] removed')` used to sit here too and was deleted as VACUOUS: under
       // `--dry-run` the summary is always `[dry-run] would remove N path(s)`, so no code path can
       // emit `[done] removed` and the assertion could not fail. Close-out review.)
-      expect(out).not.toContain('would remove');
+      expect(out).not.toContain('[dry-run] would remove');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
@@ -249,8 +256,9 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       expect(out, 'a packaged editor is running on this machine — quit it and re-run').not.toMatch(RUNNING);
       expect(status).toBe(1);
       expect(out).toContain('REFUSING to run');
-      // The load-bearing half: neither entry reached the delete loop.
-      expect(out).not.toContain('would remove');
+      // The load-bearing half: neither entry reached the delete loop. Bracketed prefix, not the
+      // bare fragment — see the note on the same assertion above (#990).
+      expect(out).not.toContain('[dry-run] would remove');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

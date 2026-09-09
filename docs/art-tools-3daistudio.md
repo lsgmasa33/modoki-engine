@@ -80,6 +80,36 @@ under this project only. Promote it with `--scope project` if it should reach ev
 alike, so any paid tier covers it. It spends the same monthly credit balance as the web app — the
 OAuth approval screen states which credits it will spend. Free tier is 100 credits/month, no card.
 
+## 2a-bis. Corrections from the FIRST real generation run (measured 2026-09-09, `work-ai`, #914)
+
+Four mood-board images were generated through `generate_image_nano_lite` — the first assets this
+repo has actually produced through the service, so §2a's table stops being vendor-claimed here.
+
+- 🔴 **`resolution: "2K"` is REJECTED by the backend, despite being in the tool's own enum.** The
+  call returns `400 INVALID_ARGUMENT` ("Request contains an invalid argument") and credits are
+  refunded automatically. §2a's "5 credits flat, **any resolution**" is therefore wrong as written —
+  it is 5 credits flat at the resolutions that work. **Isolated properly**: the same prompt, title,
+  aspect ratio and `num_images` succeeded on the very next call with only `resolution` changed to
+  `1K`, so the failure is that argument and not the prompt. `0.5K`/`4K` are untested. The tool
+  description's "Recommended settings: resolution 1K" turns out to be load-bearing advice, not a
+  preference — follow it.
+- **Aspect ratio `16:9` and `num_images: 2` are both fine** (they were live in the failing calls too,
+  and survived the fix).
+- **Failure is only visible on `get_generation`.** The generating call returns
+  `{"status":"working","credits_spent":N}` exactly as a good one does, so **a fired-and-unpolled
+  generation reads as success**. Always poll.
+- **The tool list has DRIFTED since 2026-08-05** and §2a's table is stale in three ways:
+  `generate_meshy_6` is now **`generate_meshy_7`**, and three tools exist that the table does not
+  list — **`generate_p2`**, **`generate_material`**, **`material_from_image`**. Re-read the live
+  surface rather than the table before planning a 3D or material job.
+- **Connection gotcha, cost a session's time:** the §2 recipe's `--scope local` writes to whichever
+  config dir is active. This machine runs `CLAUDE_CONFIG_DIR=~/.claude-b`, so an entry registered
+  under `~/.claude.json` or `~/.claude/.claude.json` is **invisible** to a session started with that
+  variable set — `claude mcp list` simply does not show the server. Re-add it with
+  `claude mcp add --transport http --scope user 3daistudio https://mcp.3daistudio.com/mcp`, which
+  lands in the ACTIVE dir, then authenticate with `/mcp`. The stored entry is only `{type, url}` —
+  the OAuth credential is not in the file, so nothing sensitive moves between config dirs.
+
 ## 2a. What the MCP surface ACTUALLY exposes (measured 2026-08-05, 22 tools)
 
 ⚠️ **The MCP surface is a SUBSET of the web app — plan against this list, not against §3/§4.**

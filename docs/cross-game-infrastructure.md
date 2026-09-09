@@ -171,10 +171,12 @@ reopen it.
   enough to roll the civil DATE onto the next day. The farm still works and the code now *claims* a
   defence it does not have.
   A trusted daily needs a trusted **civil date** — an owner ruling on timezone policy — not a clock
-  swap. ⚠️ And the raw `Date.now()` the daily is fed today is **an accepted written ruling, not a
-  defect**: `games/court/daily.md` § "The clock is not trusted, and it is not defended either" states
-  it as an explicit *Ruling: accept it* (single-player, no leaderboard, every defence needs infra
-  Court does not have). So this work would **overturn a ruling**, not fill a gap — start there.
+  swap. ⚠️ **That ruling was since MADE, and it went both ways (#764, owner 2026-09-09):** the PAID
+  surface is defended and free-daily farming stays accepted, so the calendar's "today" is now a
+  high-water mark rather than a clock reading. `games/court/daily.md` § "The clock is not trusted"
+  carries the split and what is still deliberately open. The raw `Date.now()` the daily is fed
+  remains the accepted half, so this work would still **overturn a ruling**, not fill a gap — but
+  the ruling to read is now the newer one.
 - **Settings + ad policy — deferred on evidence (#661, closed 2026-09-04).** The mechanism in each
   generalizes; the field set does not; and the second consumer the extraction would be written
   against **does not exist and cannot yet**. Measured, not read: the only other shipping-shaped game

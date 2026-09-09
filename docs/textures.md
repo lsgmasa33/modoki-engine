@@ -705,6 +705,36 @@ scraping the log.
   dead ref for a different invariant violation. `assetRefIntegrity.test.ts` now models the same
   exclusion; it used to add the derived guid unconditionally, which made the guard vouch for
   precisely the dead ref it exists to catch.
+- **The INVERSE is not a dead ref, and mistaking it for one costs reverts.** A raw *texture* guid
+  in `Renderable2D.sprite` / `UIElement.imageSrc` **renders correctly**: `resolveSprite` tries the
+  atlas redirect, then a `'sprite'` manifest entry, then falls through to
+  `resolveTextureVariantUrl(ref,'2d')` — which a texture guid satisfies. It is a **build/packing**
+  invariant, not a render one — nothing on screen will ever tell you.
+
+  ⚠️ **And `assetRefIntegrity.test.ts` only sees refs authored in a SCENE or prefab**
+  (`Renderable2D.sprite` / `UIElement.imageSrc` in the JSON). A guid that lives on a game's CONFIG
+  trait and becomes a sprite ref at spawn time is invisible to it, and to every other engine gate —
+  `games/wordweave` shipped exactly that shape and `npm run verify` stayed green with a raw texture
+  guid in it. A game that routes sprite refs through code owes itself a game-local guard;
+  `games/court/tests/pieceSprites.test.ts` and `games/wordweave/tests/cellSprites.test.ts` are the
+  two worked examples.
+
+  ⚠️ **It does NOT drop the asset from the production build.** This bullet claimed exactly that
+  when first written (2026-09-09) and it was wrong: `engine/plugins/asset-tree-shaker.ts` indexes every
+  asset's OWN guid with `origin:'own'` BEFORE the texture branch, so a texture-guid ref resolves
+  and the texture is kept. The derived sprite guid is mapped as well, a few lines later, so both
+  spellings keep the file. What a texture-guid ref actually costs is:
+  - **the FRAME RECT.** A sliced sprite resolves through its parent texture's whole image, so
+    sliced/atlassed art silently draws the entire sheet. This is the consequence Court documented
+    in #51 and the one most likely to bite.
+  - **atlas packing.** A packed member's sprite guid is redirected to the ATLAS file
+    (see that file's `atlasMemberOverrides`) precisely so the now-redundant source texture can be shaken out — and a texture-guid ref is
+    exactly the "some OTHER ref" that keeps it, so the build ships the atlas page *and* the source.
+
+  ⚠️ **A red `assetRefIntegrity` is not an explanation for a rendering failure you are looking at.**
+  Reading it as one cost #1000 three wrong diagnoses and two reverts of a correctly-wired feature.
+  And an *unresolvable* sprite ref is not a crash either — `Scene2D.tsx`'s build loop is
+  `if (!resolved) return;`, so the renderable is silently skipped.
 - **The IMPORT DEFAULT is `3d`, so a freshly imported PNG has no sprite either — and that is
   the surprising half** (#293). The bullet above is about a *sliced* texture; this one is about
   doing nothing at all. `DEFAULT_TEXTURE_SETTINGS.format` is `ktx2-uastc`, and

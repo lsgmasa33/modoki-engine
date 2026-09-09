@@ -12,10 +12,12 @@
  *  under it corrupts rather than cleans) unless `--force` is passed to kill it first.
  *
  *  Also refuses — on every platform, `--dry-run` included, and BEFORE the `--force` kill above —
- *  when a candidate is ITSELF a link (junction or symlink): `rmSync` would remove the link and
- *  leave the payload, so the run would report a wipe that did not happen (#883). ⚠️ That is the
- *  FINAL COMPONENT of a listed candidate only, not a tree walk — a link NESTED inside a candidate
- *  reproduces #883 and is not caught here (#990). See `linkedTargets()`.
+ *  when a candidate's subtree is not SELF-CONTAINED, because `rmSync` acts on names rather than
+ *  data and its report is then wrong in one of two directions: it severs a link out of the subtree
+ *  (payload orphaned, success reported — #883, #990) or recurses INTO a mounted volume (contents
+ *  deleted, then a failure part-way — #989). The walk is `deleteBoundary.mjs`, shared with
+ *  `engine/toolchain/index.ts`'s `forceRemoveDir` so both delete sites refuse alike (#1004).
+ *  See `linkedTargets()` for the ONE exemption this script adds on top.
  *
  *  Usage:
  *    node engine/scripts/clean-packaged-cache.mjs                  # dry-run-safe subset (default = REAL delete, see flags)
@@ -26,7 +28,7 @@
  *    node engine/scripts/clean-packaged-cache.mjs --eject-volumes   # (macOS) eject stale mounted "<productName> *" DMG volumes
  */
 
-import { existsSync, readFileSync, rmSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, readdirSync, lstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -34,6 +36,8 @@ import { fileURLToPath } from 'node:url';
 import { productName, killPackaged, REAP_ERROR, appSupportRoot, defaultToolchainDir } from './packagedAppPaths.mjs';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from './pathIdentity.mjs';
+// The ONE 'would a recursive delete misreport this subtree?' walk (#990/#989/#1004).
+import { findDeleteBoundaries, describeBoundary } from './deleteBoundary.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..', '..');
@@ -182,30 +186,53 @@ function ejectStaleVolumes() {
 // `clean:packaged-cache` script in `package.json`, so no caller passes it.
 const linked = linkedTargets();
 if (linked.length > 0) {
+  // ⚠️ The header must not claim more than every entry establishes. It used to say "are links",
+  // which was already wrong for the UNREADABLE ones (EACCES/EPERM/ELOOP — not known to be links)
+  // and is wrong again for MOUNTS. The per-entry lines carry the distinction, but the header is
+  // what a reader acts on first.
+  const kinds = new Set(linked.map(({ boundary }) => boundary.kind));
   console.error(
-    // ⚠️ "are links" is not what every entry establishes: one pushed from the `lstat` catch is
-    // UNREADABLE (EACCES/EPERM/ELOOP) and is NOT known to be a link. Its per-entry line says so,
-    // but the header is what a reader acts on first, so it must not claim more than it knows.
-    `[clean-packaged-cache] REFUSING to run: ${linked.length} target path(s) are links or cannot be read.\n`
-    + '  Removing a link deletes the LINK and leaves its contents behind, so this run would report\n'
-    + '  success over untouched directories.',
+    `[clean-packaged-cache] REFUSING to run: ${linked.length} boundary(ies) would make this run\n`
+    + '  misreport what it deleted. A recursive delete acts on NAMES, not data — it severs a link\n'
+    + '  out of a directory (payload orphaned, success reported) and recurses INTO a mounted volume\n'
+    + '  (contents deleted, then a failure part-way).',
   );
-  for (const { p, reason, target, unreadable } of linked) {
-    const resolved = unreadable
-      ? `(CANNOT BE READ — ${unreadable}; the target may well exist)`
-      : target ?? '(DANGLING — resolves to nothing)';
-    console.error(`\n  ${p}\n    -> ${resolved}\n    (${reason})`);
+  for (const { p, reason, boundary } of linked) {
+    // The candidate is named separately from the boundary, because after #990 they are often not
+    // the same path: the entry the human recognises is the candidate, the thing that has to be
+    // dealt with is the boundary, and a message giving only one of them is unactionable.
+    const where = boundary.path === p ? '' : `\n    (found inside ${p})`;
+    console.error(`\n  ${describeBoundary(boundary)}${where}\n    (${reason})`);
   }
   // ⚠️ **Remedy order matters, and an earlier version had it backwards.** "Delete the target by
   // hand" was listed FIRST and does not clear the refusal: delete the target and the link DANGLES,
   // `isSymbolicLink()` is still true, and the next run refuses again — now labelled DANGLING. A
   // user following the leading advice has hand-deleted a multi-GB provision AND still cannot run
   // the script. Removing the link is the step that actually unblocks it, so it goes first.
-  console.error(
-    '\nTo proceed: REMOVE THE LINK ITSELF (that alone clears this refusal — it deletes no payload),'
-    + '\nor replace it with a real directory. Deleting only what it points at leaves a dangling link'
-    + '\nand this same refusal.',
-  );
+  if (kinds.has('link')) {
+    console.error(
+      '\nFor a LINK: REMOVE THE LINK ITSELF (that alone clears this refusal — it deletes no payload),'
+      + '\nor replace it with a real directory. Deleting only what it points at leaves a dangling link'
+      + '\nand this same refusal.',
+    );
+  }
+  // ⚠️ A mount needs its OWN remedy and must never inherit the link one (#989). "Remove the link"
+  // is not a thing you can do to a mounted volume, and a reader who tries will either fail or —
+  // worse — unmount and then hand the delete the empty directory underneath.
+  if (kinds.has('mount')) {
+    console.error(
+      '\nFor a MOUNTED VOLUME: point the setting somewhere else (MODOKI_TOOLCHAIN_DIR is the one'
+      + '\nthat is meant to be redirected), or unmount the volume from that path. Do NOT delete its'
+      + '\ncontents by hand to get past this — that is the outcome the refusal exists to prevent.',
+    );
+  }
+  if (kinds.has('unreadable')) {
+    console.error(
+      '\nFor a path that CANNOT BE READ: nothing is being claimed about it — the run stops because'
+      + '\nsomething unreadable must never authorise deleting something else. Fix the permission, or'
+      + '\nremove the path by hand once you have looked at what it is.',
+    );
+  }
   process.exit(1);
 }
 
@@ -252,65 +279,46 @@ if (isPackagedRunning()) {
   }
 }
 
-/** Every candidate whose FINAL COMPONENT is a link (POSIX symlink, or Windows junction/dir-symlink
- *  — `lstat` reports both as `isSymbolicLink()`), with the target it resolves to, or `null` when it
- *  dangles.
+/** Every boundary, at or inside a candidate, that would make this run misreport what it deleted —
+ *  as `{ p, reason, boundary }`, where `p` is the CANDIDATE (the entry a human recognises) and
+ *  `boundary.path` is the thing that has to be dealt with. After #990 those are frequently not the
+ *  same path.
  *
- *  ⚠️ **`lstat` on the final component — NOT `realpathSync(p) !== p`.** That comparison answers a
- *  different question: whether ANY component of the path is aliased. Measured on macOS 26.5, it is
- *  true for `/tmp` and for `os.tmpdir()` (`/var/folders/…` → `/private/var/folders/…`), because
- *  `/var`, `/tmp` and `/etc` are themselves symlinks into `/private`. A guard written that way
- *  refuses on a clean machine the moment a candidate acquires an aliased ancestor — which is
- *  nobody's fault and has nothing to do with this defect. What decides whether the `rmSync` below
- *  does the wrong thing is whether the thing being removed IS a link, and `lstat` on the final
- *  component is exactly that question.
+ *  The walk itself lives in `deleteBoundary.mjs` and is shared with `engine/toolchain/index.ts`'s
+ *  `forceRemoveDir` (#1004); its docblock carries the mechanism, the accept side (a nested link
+ *  resolving INSIDE the subtree is fine — npm's `.bin` shims), and the measured blind spots. This
+ *  function adds exactly ONE thing on top: the exemption below, which is specific to this script's
+ *  candidate list and must not migrate into the shared walk.
  *
- *  ⚠️ **This predicate is NOT a complete answer to "would `rmSync` do the wrong thing here" — it is
- *  the answer for LINKS.** Two shapes defeat it, both measured on macOS 26.5 rather than reasoned
- *  about, and neither is a reason to widen this guard:
- *    - **A Finder alias** is a regular file carrying resolution metadata: `isSymbolicLink()` false,
- *      `isFile()` true, ~1 KB. `rmSync` deletes the alias and the payload survives — #883's exact
- *      symptom through a shape `lstat` cannot see. Nothing writes an alias to these paths; one gets
- *      there only by hand, so it is recorded, not defended against.
- *    - **A mount point** (an external volume at a target path) is also `isSymbolicLink()` false, and
- *      `realpath(p) !== p` is false too, so the rejected predicate misses it as well. Its only
- *      signal is `st.dev !== lstat(dirname(p)).dev`. It is a DIFFERENT failure — `rmSync` traverses
- *      INTO the volume, deletes the contents, then throws on the mount itself — so it wants its own
- *      refusal message and is filed separately (#989) rather than folded in here. Widening a guard
- *      past what its own measurement covers is the mistake this family already made (#958 row 3).
+ *  ⚠️ **Why the previous predicate is gone, so it does not come back.** It `lstat`ed the FINAL
+ *  COMPONENT of each candidate and asked only "is it a symlink?". That was correct for what it
+ *  covered and is preserved as the walk's depth-0 case — but it was one point in a three-axis
+ *  space, and it missed a link NESTED below the final component (#990) and a MOUNT POINT, which
+ *  `lstat` does not report as a link at all (#989).
  *
- *    ⚠️ #989's fix may SUBSUME the alias case for free. Both are "the target is not the KIND of
- *    thing we expect" — an alias is a file where a directory belongs, a mount is a volume where a
- *    directory belongs. If #989 lands as a per-target expected-kind check, the alias dies
- *    everywhere except the one row that legitimately IS a file (`<id>.plist`), where it was already
- *    negligible. Worth knowing before writing a second, narrower check.
+ *  ⚠️ **The `realpathSync(p) !== p` predicate stays REJECTED, and the walk does not use it.** That
+ *  comparison is true whenever ANY component is aliased — measured on macOS 26.5 for `/tmp` and
+ *  `os.tmpdir()`, because `/var`, `/tmp` and `/etc` are themselves symlinks into `/private` — so it
+ *  refuses on a clean machine for a reason unrelated to this defect. What the walk does at depth 0
+ *  instead is resolve the PARENT and re-append the component, which is ancestor-INSENSITIVE and so
+ *  is not that predicate wearing a different name. See `deleteBoundary.mjs`.
  *
- *  ⚠️ **And it is the FINAL COMPONENT of a listed candidate, not a tree walk.** A link NESTED
- *  inside a candidate — `…\Modoki\toolchain\android-sdk` junctioned onto another drive, the same
- *  "C: is small" move one level down — reproduces #883 exactly: `rmSync` unlinks it, the payload is
- *  orphaned, and the script prints "[done] removed N path(s)". Reproduced on `win`.
+ *  ⚠️ **A Finder alias is still not covered, and deliberately.** It is a regular file carrying
+ *  resolution metadata (`isSymbolicLink()` false, `isFile()` true, ~1 KB); `rmSync` deletes it and
+ *  the payload survives — #883's symptom through a shape `lstat` cannot see. An earlier note here
+ *  speculated that #989's fix would subsume it via a per-target expected-KIND check. **It does
+ *  not, and that was not taken**: an expected-kind rule has to carve out the row that legitimately
+ *  IS a file (`<id>.plist`), and nothing writes an alias to these paths — one gets there only by
+ *  hand, and the failure is the benign direction. Recorded, not defended against.
  *
- *  Filed as #990 rather than fixed here, because "refuse on ANY nested link" is **not viable**, and
- *  that took both platforms to establish:
- *    - Windows: `E:\dev-cache\modoki-toolchain`, 23,303 entries, **0 symlinks** — the blunt rule
- *      would be free here.
- *    - POSIX: npm's `node_modules/.bin` shims ARE symlinks (measured on macOS: 60 of 60 entries in
- *      one `.bin`), and this toolchain installs npm tools into `MODOKI_TOOLCHAIN_DIR` —
- *      `npmToolBin` for `gltf-transform` and `gltfpack`. So a provisioned toolchain carries them,
- *      and the blunt rule would refuse on every POSIX run.
- *  ⚠️ **The Windows zero does not transfer** — it is an artifact of npm using `.cmd` shims there
- *  rather than symlinks. Taking it as the answer is exactly the mistake this clone is placed to
- *  avoid. (The POSIX side is a measured MECHANISM, not a count of a real provision: no toolchain
- *  was provisioned on the machine that measured it.) The property that actually separates an npm
- *  shim from #883's shape is whether the link's target ESCAPES the candidate subtree — which is a
- *  design, not a wider `lstat`, and it belongs to #990.
- *
- *  ⚠️ **`throwIfNoEntry: false`, and this runs BEFORE `existsSync`.** `existsSync` FOLLOWS links,
- *  so a DANGLING link reports absent and the delete loop's `if (!existsSync(p)) continue` skips it
- *  in silence — the same fail-open shape as the rest of this family. `lstat` sees it. (Measured:
- *  `existsSync(dangling)` false, `lstatSync(dangling)` succeeds, `realpathSync(dangling)` throws
- *  ENOENT — so a catch-and-return-false resolver would fail open here too. Hence the throw is
- *  caught into a REPORTED `null`, never into a skip.)
+ *  ⚠️ **This runs BEFORE `existsSync`, and that ordering is load-bearing.** `existsSync` FOLLOWS
+ *  links, so a DANGLING candidate reports absent and the delete loop's own skip would drop it in
+ *  silence — the same fail-open shape as the rest of this family. The walk `lstat`s, so it sees
+ *  one. (Measured: `existsSync(dangling)` false, `lstatSync(dangling)` succeeds,
+ *  `realpathSync(dangling)` throws ENOENT — so a catch-and-return-false resolver would fail open
+ *  here too.) Note the asymmetry that follows, because it looks like an inconsistency and is not:
+ *  a dangling candidate is REPORTED, while a dangling link nested inside one is allowed — it points
+ *  at nothing, so severing it orphans nothing.
  */
 /** Can this candidate's own `rmSync` be relied on to delete the payload? Only if it EXISTS and is
  *  not itself a link.
@@ -345,31 +353,15 @@ function linkedTargets() {
   const all = targets();
   const out = [];
   for (const { p, reason } of all) {
-    // ⚠️ `throwIfNoEntry:false` suppresses ENOENT ONLY (libuv folds Windows ENOTDIR in there too —
-    // a candidate under a regular file returns undefined). EACCES/EPERM/ELOOP still THROW, and an
-    // unguarded throw here would abort the script with a raw stack where `existsSync` used to
-    // return false and skip. Fail closed, but say which path and why — `pathIdentity.mjs`'s
-    // `canonicalWithMissingTail` swallows every throw for the opposite reason and says so.
-    let st;
-    try {
-      st = lstatSync(p, { throwIfNoEntry: false });
-    } catch (e) {
-      out.push({ p, reason, target: null, unreadable: e.code ?? String(e) });
-      continue;
-    }
-    if (!st || !st.isSymbolicLink()) continue;
-
-    let target = null;
-    let unreadable = null;
-    try {
-      target = realpathSync.native(p);
-    } catch (e) {
-      // ⚠️ Only ENOENT means DANGLING. Reporting an EACCES as "resolves to nothing" is a false
-      // statement about a target that exists, in the one message a human acts on.
-      if (e.code !== 'ENOENT') unreadable = e.code ?? String(e);
-    }
-
-    // ⚠️ **A link whose target is ITSELF a candidate is not a defect — do not refuse on it.**
+    // ⚠️ **The walk is the SSOT (`deleteBoundary.mjs`), and it answers more than this function used
+    // to.** It used to `lstat` the FINAL COMPONENT of each candidate and ask only "is it a
+    // symlink?" — one point in a three-axis space. The walk covers the other two: a link NESTED
+    // below the final component (#990) and a MOUNT POINT, which `lstat` does not report as a link
+    // at all (#989). `engine/toolchain/index.ts`'s `forceRemoveDir` calls the same walk (#1004), so
+    // the two recursive-delete sites in this repo now refuse on the same inputs for the same
+    // reasons — which is the whole point of moving it out of here.
+    for (const b of findDeleteBoundaries(p)) {
+      // ⚠️ **A link whose target is ITSELF a candidate is not a defect — do not refuse on it.**
     // The shape `targets()`' raw-keyed dedupe exists to rescue: `MODOKI_TOOLCHAIN_DIR` junctioned
     // TO the default location, "an ordinary Windows move when C: is small". Both the link and the
     // real default are listed, so the payload IS deleted — via the default's own entry.
@@ -388,11 +380,20 @@ function linkedTargets() {
     // Found by close-out review; the accept case built link→REAL-DIR, which cannot tell the two
     // predicates apart.
     //
-    // The condition the comment always MEANT: some other candidate must BE the target **and not
-    // itself be a link** — only then does that candidate's own `rmSync` delete the payload.
-    if (target !== null && all.some((c) => c.p !== p && isExistingNonLink(c.p) && samePath(c.p, target))) continue;
+      // The condition the comment always MEANT: some other candidate must BE the target **and not
+      // itself be a link** — only then does that candidate's own `rmSync` delete the payload.
+      //
+      // ⚠️ **Scoped to the CANDIDATE ITSELF (`b.path === p`), never to a nested finding.** The
+      // rescue is about `targets()`' own dedupe listing a link and its target as two entries, so
+      // the payload is deleted via the other entry. A link buried inside a candidate has no such
+      // second entry — exempting it would hand back exactly the orphan #990 is about. And a MOUNT
+      // is never exempt on any of these grounds: no other candidate's `rmSync` deletes a volume,
+      // and we would not want one that did.
+      if (b.kind === 'link' && b.path === p && b.target !== null
+        && all.some((c) => c.p !== p && isExistingNonLink(c.p) && samePath(c.p, b.target))) continue;
 
-    out.push({ p, reason, target, unreadable });
+      out.push({ p, reason, boundary: b });
+    }
   }
   return out;
 }

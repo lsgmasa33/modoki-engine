@@ -115,6 +115,44 @@ and assert three things — the third is the one people forget:
 2. the underlying build counter incremented **once per instance**, not once in total;
 3. touching instance B does **not** disturb a cache hit already established for instance A.
 
+### The FROZEN-PARAMETER shape: a sweep that varies one axis and pins the other (#984, #979)
+
+A test over a *sampled* process has more than one free parameter, and freezing the wrong one makes
+the assertion collapse into something that cannot fail. Both games that hit-test a swept pointer
+stroke shipped this, in two different generations, and the second was written as the FIX for the
+first:
+
+| Generation | Swept | Frozen | What it degenerated into |
+|---|---|---|---|
+| original | the row OFFSET | the x-PHASE, at cell centre → cell centre | "is the offset inside the radius" — a substep lands on every cell's exact centre, so no step size can straddle a chord |
+| its replacement | the x-PHASE | the OFFSET, at 0.35 pitch — outside the band where the failure lives | passed, and declared impossible the defect filed against it days later |
+
+**The rule: sweep every free parameter, and compare against a near-continuous REFERENCE run of the
+same input rather than a literal expected output.** The property is *"the shipped step finds what a
+finer one finds"*; a hardcoded `[6,7,8,9]` cannot express it, because a start phase inside the first
+cell's circle legitimately seeds it and yields `[7,8,9]`, which is not a failure.
+
+Four details that each cost a green-but-empty test:
+
+- **An ABSOLUTE anchor is mandatory.** Both sides call the same sampler, so any mutation that makes
+  the sampler match *nothing* — a radius of zero — collapses them to `[] === []` and the entire
+  sweep passes. Assert the reference itself found a plausible number of hits.
+- **The phase count must be COPRIME with the stride divisor.** `shift = pitch * p / PHASES` against
+  a stride of `pitch/4` gives only `PHASES / gcd` distinct alignments: 16 phases was really FOUR,
+  and the losing phases hid in the aliased set. Use a prime.
+- **The segment must not be a whole number of pitches.** An exact multiple keeps the sample grid
+  commensurate with the cell grid, so a miss becomes all-or-nothing rather than phase-dependent.
+- ⚠️ **Deriving the sweep's BOUNDS from production makes the sweep blind to production's formula.**
+  Court's blind-band edge is computed from the shipped stride. Take that stride from the production
+  function (right — a mirrored copy drifts) and the band moves with it, so a changed formula is
+  still "consistent with itself" and the sweep stays green. That is not a reason to re-mirror it:
+  it means the FORMULA needs its own test, asserting the shipped value and the relationship
+  directly. Measured — with the stride reverted to its pre-fix form, the sweep passed and only the
+  formula test went red.
+
+Worked examples: `games/wordweave/tests/screen.test.ts` (the reference implementation) and
+`games/court/tests/memo.test.ts` § "a swept stroke finds what a near-continuous walk finds".
+
 ### The wrong-subject shape: a guard that interrogates a sibling constant (#855)
 
 The shapes above fail on the INPUT. This one fails on the SUBJECT — and it is harder to see, because

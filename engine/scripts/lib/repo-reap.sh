@@ -62,6 +62,31 @@ reap_alt_pattern() { # $1 = absolute path fragment built from the LOGICAL root
   printf '%s' "${MODOKI_REAP_ROOT_PHYS}${1#"${MODOKI_REAP_ROOT}"}"
 }
 
+# The Windows process filter, defined ONCE so the reap and the "is it alive?" probe cannot drift
+# apart — they are two halves of one contract, and a reap that stops what the probe cannot see (or
+# vice versa) is how `editor:stop` came to print "no editor running" while the editor kept serving.
+#
+# ⚠️ **`.IndexOf(..., OrdinalIgnoreCase) -ge 0`, NOT `-like '*X*'`** (#988's mechanism, found by the
+# corpus guard once it was widened to `.sh`). `-like` is a WILDCARD match, so a `[`, `]`, `*` or `?`
+# anywhere in the clone path is read as a character class and matches NOTHING — a clone at
+# `E:\Projects\modoki[2]` made `reap_repo_alive` report not-running and `stop-editor.sh` report
+# nothing killed, while the editor kept its port. This is the SUBSTRING analogue of the prefix fix
+# in `engine/toolchain/index.ts`; `.Contains` would have been the obvious translation and is WRONG,
+# because .NET's `Contains` is case-SENSITIVE while PowerShell's `-like` is not — that swap would
+# have silently NARROWED the reap. `IndexOf` with `OrdinalIgnoreCase` preserves the old semantics
+# exactly, minus the wildcards.
+#
+# ⚠️ **The patterns arrive by ENVIRONMENT, never interpolated into the script text.** A path can
+# contain `'` — and Windows PowerShell also treats U+2018/U+2019/U+201A as quote delimiters, so an
+# escaper that doubles only the ASCII quote lets the path break out and the command fails to PARSE
+# (measured; the failure is swallowed by `|| true` and the reap silently does nothing). `$env:` has
+# no quoting layer at all.
+#
+# ⚠️ **`$_.CommandLine -and` is load-bearing.** A process whose CommandLine is null is normal
+# (System, and anything this session cannot open); `-like` on null simply did not match, but
+# `.IndexOf` on null THROWS and would abort the whole pipeline mid-enumeration.
+_REAP_WIN_FILTER='Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine.IndexOf($env:MODOKI_REAP_PAT_M, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or $_.CommandLine.IndexOf($env:MODOKI_REAP_PAT_W, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) }'
+
 reap_repo_process() { # $1 = absolute path fragment identifying this repo's process
   _reap_repo_process_one "$1"
   local alt; alt="$(reap_alt_pattern "$1")"
@@ -76,13 +101,18 @@ _reap_repo_process_one() { # $1 = one exact spelling
       # MSYS converts a unix path to a MIXED-mode path (E:/a/b) when it hands an argument
       # to a native exe, so that is the form that actually appears in electron's command
       # line — NOT the backslash form `cygpath -w` returns. Match BOTH so either spelling
-      # is caught. (`\` is not a -like wildcard.)
+      # is caught.
       pat_m="$(cygpath -m "$1" 2>/dev/null || echo "$1")"
       pat_w="$(cygpath -w "$1" 2>/dev/null || echo "$1")"
+      # ⚠️ An EMPTY pattern here is #69's disaster: `IndexOf('')` is 0, so it matches EVERY
+      # process on the machine. This is the `${VAR:?}` guard in the form the PowerShell branch
+      # needs (`reapScoping.test.ts` § 2 exists for exactly this shape). `-like '**'` was
+      # equally catastrophic, so this is a pre-existing hazard now made explicit.
+      [ -n "$pat_m" ] && [ -n "$pat_w" ] || return 0
       # Exclude THIS powershell process: the pattern is part of its own command line, so an
       # unfiltered query matches itself and kills the killer.
-      powershell.exe -NoProfile -NonInteractive -Command \
-        "Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and (\$_.CommandLine -like '*$pat_m*' -or \$_.CommandLine -like '*$pat_w*') } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+      MODOKI_REAP_PAT_M="$pat_m" MODOKI_REAP_PAT_W="$pat_w" powershell.exe -NoProfile -NonInteractive -Command \
+        "$_REAP_WIN_FILTER | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
         >/dev/null 2>&1 || true
       ;;
     *)
@@ -118,8 +148,10 @@ _reap_repo_alive_one() { # $1 = one exact spelling
       local pat_m pat_w n
       pat_m="$(cygpath -m "$1" 2>/dev/null || echo "$1")"
       pat_w="$(cygpath -w "$1" 2>/dev/null || echo "$1")"
-      n="$(powershell.exe -NoProfile -NonInteractive -Command \
-        "@(Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$PID -and (\$_.CommandLine -like '*$pat_m*' -or \$_.CommandLine -like '*$pat_w*') }).Count" \
+      # An empty pattern would report EVERY process as "this repo's" — see the reap above.
+      [ -n "$pat_m" ] && [ -n "$pat_w" ] || return 1
+      n="$(MODOKI_REAP_PAT_M="$pat_m" MODOKI_REAP_PAT_W="$pat_w" powershell.exe -NoProfile -NonInteractive -Command \
+        "@($_REAP_WIN_FILTER).Count" \
         2>/dev/null | tr -d '\r\n ')"
       [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null
       ;;

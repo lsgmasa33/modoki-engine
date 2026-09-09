@@ -324,3 +324,45 @@ export function isUnderOrSame(parent, child) {
   const escapes = rel === '..' || rel.startsWith(`..${path.sep}`);
   return rel !== '' && !escapes && !path.isAbsolute(rel);
 }
+
+/** The OTHER spelling of an absolute path, or `null` when there is no distinct one.
+ *
+ *  A reap matches our pattern against a string we do NOT control — the command line a foreign
+ *  process was launched with — so there is nothing to canonicalise on the other side, and
+ *  canonicalising only ours is strictly worse: it breaks the ordinary case that works today while
+ *  fixing the symlinked one. The only correct shape is to match a SET of spellings (#913). This is
+ *  `reap_alt_pattern`'s contract from `lib/repo-reap.sh`, in JS.
+ *
+ *  ⚠️ **Returns null rather than echoing the input back.** Callers run "the pattern, then whatever
+ *  this returns", so returning the input would reap the same pattern twice. Every branch is a guard
+ *  against WIDENING the match: no path, an unresolvable one (the directory is gone — the common
+ *  case when there is nothing to reap anyway), a non-absolute result, or an identical spelling all
+ *  yield no second reap at all.
+ *
+ *  ⚠️ **The WIDTH GUARD is the CALLER's and is not applied here** — deliberately, because there is
+ *  no single right threshold. A 40-char path can be a symlink to a very short real one, so an
+ *  unchecked alternate can widen a reap to a drive root: measured in #958 row 3, where a junction
+ *  targeting `C:\` produced `StartsWith('C:\')` — every packaged editor on the drive. Each caller
+ *  knows what its own pattern is scoped to; `killPackaged` requires `>= 10`, and anything else
+ *  reaping on this must state its own bound rather than assume this one applied it.
+ *
+ *  ⚠️ **Nor is this `reap_alt_pattern`'s exact equivalent, despite the shared contract above.**
+ *  That helper additionally requires the pattern to sit under the registered root, so it cannot
+ *  return something shallower than where it started. This one can — hence the paragraph above.
+ *
+ *  Lives here rather than in `packagedAppPaths.mjs` (which re-exports it) because a THIRD copy was
+ *  about to be written for `engine/toolchain/index.ts` (#988/#1004), and `engine/toolchain/` cannot
+ *  import `packagedAppPaths.mjs` at all: that module evaluates `fileURLToPath(import.meta.url)` at
+ *  module scope, and esbuild emits `import_meta = {}` in the bundled Electron main, so the import
+ *  would throw at load. This module has no such evaluation, which is why `engine/electron/main.ts`
+ *  can already import it.
+ *
+ *  `.native`, never the JS `realpathSync` walk: the JS implementation does not fold a case-flipped
+ *  path component and has already dropped a clone's pinned port that way (#881). */
+export function altPathSpelling(p) {
+  if (typeof p !== 'string' || p === '') return null;
+  let real;
+  try { real = fs.realpathSync.native(p); } catch { return null; }
+  if (!path.isAbsolute(real)) return null;
+  return real === p ? null : real;
+}
