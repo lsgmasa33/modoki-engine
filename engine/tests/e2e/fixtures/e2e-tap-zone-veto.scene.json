@@ -1,0 +1,249 @@
+{
+  "id": "e2e-tapzoneveto-scene-0000-00000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "Root",
+      "guid": "e2e00000-0000-4000-8000-000000000901",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 100,
+          "height": 100,
+          "widthUnit": "%",
+          "heightUnit": "%",
+          "backgroundOpacity": 1,
+          "backgroundColor": 1118481,
+          "flexDirection": "row",
+          "justifyContent": "space-around",
+          "alignItems": "center",
+          "text": "",
+          "fontSize": 16,
+          "textColor": 16777215,
+          "swallowClicks": true
+        },
+        "EntityAttributes": {
+          "name": "Root",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "RealColumn",
+      "guid": "e2e00000-0000-4000-8000-000000000902",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 200,
+          "height": 200,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 0,
+          "backgroundColor": 16777215,
+          "flexDirection": "column",
+          "alignItems": "center",
+          "justifyContent": "center",
+          "text": "",
+          "fontSize": 16,
+          "textColor": 16777215,
+          "swallowClicks": true
+        },
+        "EntityAttributes": {
+          "name": "RealColumn",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Tile",
+      "guid": "e2e00000-0000-4000-8000-000000000903",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "height": 100,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 1,
+          "backgroundColor": 3447003,
+          "text": "TILE",
+          "fontSize": 14,
+          "textColor": 16777215
+        },
+        "UIAction": {
+          "bindings": [
+            {
+              "event": "click",
+              "kind": "set",
+              "target": "",
+              "component": "UIElement",
+              "property": "text",
+              "value": "TILE-HIT"
+            }
+          ]
+        },
+        "EntityAttributes": {
+          "name": "Tile",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 2,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Arrow",
+      "guid": "e2e00000-0000-4000-8000-000000000904",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 20,
+          "height": 20,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 1,
+          "backgroundColor": 15158332,
+          "minTapSize": 48,
+          "minTapSizeUnit": "px",
+          "text": "A",
+          "fontSize": 10,
+          "textColor": 16777215
+        },
+        "UIAction": {
+          "bindings": [
+            {
+              "event": "click",
+              "kind": "set",
+              "target": "",
+              "component": "UIElement",
+              "property": "text",
+              "value": "ARROW-HIT"
+            }
+          ]
+        },
+        "EntityAttributes": {
+          "name": "Arrow",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 2,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "DecorColumn",
+      "guid": "e2e00000-0000-4000-8000-000000000905",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 200,
+          "height": 200,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 0,
+          "backgroundColor": 16777215,
+          "flexDirection": "column",
+          "alignItems": "center",
+          "justifyContent": "center",
+          "text": "",
+          "fontSize": 16,
+          "textColor": 16777215,
+          "swallowClicks": true
+        },
+        "EntityAttributes": {
+          "name": "DecorColumn",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "Decor",
+      "guid": "e2e00000-0000-4000-8000-000000000906",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 160,
+          "height": 100,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 1,
+          "backgroundColor": 9807270,
+          "text": "DECOR",
+          "fontSize": 14,
+          "textColor": 16777215
+        },
+        "EntityAttributes": {
+          "name": "Decor",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 5,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "name": "DecorArrow",
+      "guid": "e2e00000-0000-4000-8000-000000000907",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "width": 20,
+          "height": 20,
+          "widthUnit": "px",
+          "heightUnit": "px",
+          "backgroundOpacity": 1,
+          "backgroundColor": 15158332,
+          "minTapSize": 48,
+          "minTapSizeUnit": "px",
+          "text": "B",
+          "fontSize": 10,
+          "textColor": 16777215
+        },
+        "UIAction": {
+          "bindings": [
+            {
+              "event": "click",
+              "kind": "set",
+              "target": "",
+              "component": "UIElement",
+              "property": "text",
+              "value": "DECORARROW-HIT"
+            }
+          ]
+        },
+        "EntityAttributes": {
+          "name": "DecorArrow",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": 5,
+          "layer": "ui"
+        }
+      }
+    }
+  ]
+}

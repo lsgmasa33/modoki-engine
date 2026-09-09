@@ -2370,6 +2370,29 @@ describe('UINode minTapSize (#948)', () => {
     expect(el.style.isolation).toBe('isolate');
   });
 
+  // #977 — the marker `pressOrigin.ts` reads to know this element is a courtesy area and not
+  // content. Without it the expander is indistinguishable from ordinary content and the veto rule
+  // cannot exist at all, so this is the structural half of that fix.
+  it('stamps the expander so the press router can tell a courtesy area from content (#977)', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)!.hasAttribute('data-tap-zone')).toBe(true);
+  });
+
+  // ⚠️ RUNTIME ONLY. `UIRenderer` skips installing the press tracker for the editor's authoring
+  // preview, but the tracker GameView installs is registered on the DOCUMENT the two renderers
+  // share — so the marker alone is enough for a preview click to be redirected, stopping the
+  // original before SceneView's own capture listener and selecting the neighbouring entity instead.
+  // The editor surface manipulates selection, not bindings, and wants the pre-#977 behaviour.
+  it('does NOT stamp the marker in the editor authoring preview (#977)', () => {
+    const el = renderNode(
+      makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }),
+      { onSelectEntity: () => {} },
+    );
+    const zone = tapZoneOf(el);
+    expect(zone, 'the expander itself still exists — only the marker is withheld').toBeDefined();
+    expect(zone!.hasAttribute('data-tap-zone')).toBe(false);
+  });
+
   it('resolves a viewport unit through the same --ui-* custom property as every other length', () => {
     const el = renderNode(makeNode({ ...clickable, minTapSize: 6, minTapSizeUnit: 'vmin' }));
     expect(tapZoneOf(el)!.style.width).toBe('max(100%, calc(6 * var(--ui-vmin, 1vmin)))');

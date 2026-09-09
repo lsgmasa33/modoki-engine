@@ -41,6 +41,7 @@ import {
 } from './rendererLossHandling';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
 import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
+import { notePixiApplicationCreated, destroyPixiApplication, releasePixiGlobalsIfIdle } from './pixiGlobalResources';
 import { revalidateSubtreeAfterRendererRebuild } from './gpuResourceInvalidation';
 import { withTimeout } from '../core/abandonment';
 
@@ -85,6 +86,14 @@ export interface Canvas2DSlot {
   /** Consecutive frames this slot's renderer threw — distinguishes a one-frame
    *  teardown blip (swallowed silently) from a genuinely stuck renderer. */
   renderFailFrames?: number;
+  /** Latch: this slot's stuck-render episode has already asked `recovery` for a rebuild.
+   *  ⚠️ **A latch, not a counter check, and it is load-bearing.** `RendererRecovery.request()`
+   *  sets `failures = 0` on every call ("a fresh fault gets the full retry budget",
+   *  `rendererRecovery.ts`), so asking once per stuck FRAME would reset the bounded-attempt
+   *  budget forever and turn `maxAttempts` into an infinite rebuild loop — and, while one is
+   *  in flight, would re-arm `again` every frame and chain rebuilds end to end. Cleared by a
+   *  successful render and by `reclaimIfUnclaimed`, so a LATER episode gets its own request. */
+  stuckRecoveryRequested?: boolean;
   /** This slot's last render THREW, so it owes a redraw regardless of the per-frame dirty set
    *  (#455). An aborted render has already CLEARED the surface, so the frame it presented is
    *  blank — and Scene2D rebuilds `dirtyCanvases` from scratch every frame, so the failed attempt
@@ -138,6 +147,11 @@ export interface Canvas2DSlot {
   /** Rebuild scheduler for this slot's renderer — the SAME policy module the 3D viewports use
    *  (`rendering/rendererRecovery.ts`), so the two cannot disagree about when a rebuild runs. */
   recovery?: RendererRecovery;
+  /** One-shot deregister from `notePixiApplicationCreated`, paired with THIS slot's live GPU
+   *  context (set beside `noteGpuContextCreated()`, spent by `destroyPixiApplication`). Decides
+   *  whether destroying this Application may release Pixi's process-global pools — see
+   *  `pixiGlobalResources.ts`. Undefined until the Application is initialized. */
+  releasePixiApp?: () => void;
   /** Disposer for the FIRST-init watchdog timer (`APP_INIT_TIMEOUT_MS`, see `createSlot`). Called
    *  once `slot.ready` settles AND from `teardownSlot`, so the watchdog can never fire into a
    *  torn-down slot and no fake-timer test is left holding a live timer. Idempotent. */
@@ -172,10 +186,11 @@ export interface Canvas2DSlot {
  *  `initSlotApp` kept running underneath and succeeded at 8.5s regardless, leaving a live,
  *  budget-counted GPU context whose canvas nothing ever appends (Canvas2DMount's `.catch` only
  *  logs). That is strictly worse than the unbounded call this replaced, on exactly the device class
- *  it targeted. A hung first init has nothing to retry either way — `recovery.request()` is
- *  reachable only from a `webglcontextlost` event, which needs a context that came up in the first
- *  place — so the only honest improvement available for the first init is to make a slow bring-up
- *  LOUD, not to fail it. See `createSlot`. */
+ *  it targeted. A hung first init has nothing to retry either way — every path to
+ *  `recovery.request()` needs a context that came up in the first place: the three context-loss
+ *  listeners, and (since #1000) `renderAll`'s stuck-render detection, which is gated on
+ *  `slot.initialized`. So the only honest improvement available for the first init is to make a
+ *  slow bring-up LOUD, not to fail it. See `createSlot`. */
 // Sourced from `rendererRecovery`, not re-typed: the 2D pool and the 3D viewports share one
 // rebuild policy and must not disagree about when a bring-up has failed. This alias exists only
 // because the local name carries the measured history below; the NUMBER has exactly one home.
@@ -388,9 +403,9 @@ export class Canvas2DPool {
    *
    *  ⚠️ The canvas ELEMENT is deliberately kept. It is mounted in the DOM by `Canvas2DMount`,
    *  which holds this exact node; swapping it would need the mount to re-attach, and the element
-   *  is not what died — the context is. `destroy(false)` is load-bearing for the same reason: the
-   *  `destroy(true)` used elsewhere in this file also destroys the canvas, which here would leave
-   *  a mounted, permanently dead node.
+   *  is not what died — the context is. `removeView: false` is load-bearing for the same reason:
+   *  the default (`true`, what every other teardown in this file takes) also removes the canvas,
+   *  which here would leave a mounted, permanently dead node.
    *
    *  Scheduling (delay, single-flight, coalescing, bounded backoff) is NOT here — it belongs to
    *  `rendererRecovery.ts`, which the 3D viewports already use. */
@@ -432,8 +447,18 @@ export class Canvas2DPool {
     slot.detachDeviceLost?.();
     slot.detachDeviceLost = undefined;
     if (slot.initialized) {
-      try { slot.app.destroy(false); } catch { /* a dead renderer often throws on teardown — the
+      // `removeView: false` — the canvas ELEMENT is deliberately kept (see this method's doc).
+      // `mayReleaseGlobals: false` — a rebuild is NOT a terminal teardown. The Application is
+      // replaced immediately and the whole `slot.container` subtree is kept alive across the swap,
+      // so "nothing else is bound" is false however the live count reads — and on the shipped-game
+      // shape (one Canvas2D surface, one Application) it reads zero, which is precisely when a
+      // context-loss rebuild happens on device. The old bare `destroy(false)` could never release
+      // anything; without this flag, routing it through the helper would have silently granted it
+      // that power. Caught in review, not by a test — and now pinned by one.
+      try { destroyPixiApplication(slot.app, slot.releasePixiApp, { removeView: false, mayReleaseGlobals: false }); }
+      catch { /* a dead renderer often throws on teardown — the
         point is to stop referencing it, and a throw here must not abort the rebuild */ }
+      slot.releasePixiApp = undefined;
       noteGpuContextDestroyed();
     }
 
@@ -539,11 +564,19 @@ export class Canvas2DPool {
     // `slot.app !== app` means a rebuild superseded us while we were awaiting (see the capture
     // above): this Application is an orphan the moment it finishes, so destroy it here — nothing
     // else holds a reference and nothing else ever will.
-    if (slot.destroyed || slot.app !== app) { app.destroy(true); return; }
+    // `null` deregister: this Application finished `init()` but was never registered (the
+    // `notePixiApplicationCreated` below is the line it is bailing past), so there is nothing to
+    // hand back — and the live count then answers about the OTHER surfaces, which is exactly the
+    // question that decides whether the global pools may be released. See `pixiGlobalResources.ts`.
+    if (slot.destroyed || slot.app !== app) { destroyPixiApplication(app, null); return; }
     app.ticker.stop();
     app.stage.addChild(slot.container);
     slot.initialized = true;
     noteGpuContextCreated();
+    // Paired with the context, NOT with `new Application()` — `teardownSlot` destroys an
+    // Application only when `initialized`, so registering at construction would strand the count
+    // above zero forever and disarm the release entirely (`pixiGlobalResources.ts`).
+    slot.releasePixiApp = notePixiApplicationCreated();
     // #678/#801 — the post-rebuild cure, on the SAME success path as the bring-up it cures.
     //
     // It used to live in `rebuildSlotApp`'s tail, which meant success was decided in two places
@@ -579,7 +612,9 @@ export class Canvas2DPool {
       // which only happens in a long editor session, where a device log is not the instrument.
       const uids = [...deadRendererUids];
       console.warn(
-        `[canvas2DPool] 2D renderer rebuilt after context loss (entity ${slot.entityId}, `
+        // "after context loss" would be a lie on the #1000 stuck-render path, which reaches this
+        // same rebuild without any loss EVENT. Its sibling at `onError` was fixed and this was not.
+        `[canvas2DPool] 2D renderer rebuilt (entity ${slot.entityId}, `
         + `dead renderer uid(s) ${uids.length <= 8 ? uids.join(', ') : `${uids.length} known process-wide`}). `
         + `Purged ${gpuDataPurged} stale GPU-data entries, re-marked ${viewsMarked} views (#678).`,
       );
@@ -646,10 +681,18 @@ export class Canvas2DPool {
           );
         }
       },
-      onError: (_e, info) => console.error(
-        `[canvas2DPool] 2D renderer rebuild after context loss FAILED (attempt ${info.attempt}` +
+      // "after context loss" would now be a lie half the time — since #1000 a rebuild is also
+      // requested by `renderAll`'s stuck-render detection, which is not a loss EVENT at all.
+      onError: (_e, info) => {
+        // The rebuild's `mayReleaseGlobals: false` DEFERRED a global release on the assumption a
+        // replacement Application was coming. Once recovery gives up, it is not — redeem the
+        // deferral here or the pools are retained for the process lifetime, on a device that has
+        // just failed to bring a renderer back up. (No-op while anything is still live.)
+        if (!info.willRetry) releasePixiGlobalsIfIdle();
+        console.error(
         `${info.willRetry ? ', retrying' : ', giving up'}): ${info.description}`,
-      ),
+        );
+      },
     });
 
     this.attachCanvasListeners(slot, canvas);
@@ -657,8 +700,9 @@ export class Canvas2DPool {
     // Start async init immediately — `ready` tracks completion. NOT bounded by a rejecting timeout
     // — see `APP_INIT_TIMEOUT_MS`'s own comment for why that was actively harmful here: it turned a
     // merely SLOW cold bring-up into a NEVER, on exactly the device class this exists to help. A
-    // hung first init has nothing to retry anyway (`recovery.request()` is reachable only from a
-    // `webglcontextlost` event, which needs a context that came up in the first place), so the only
+    // hung first init has nothing to retry anyway (every path to `recovery.request()` needs a
+    // context that came up in the first place — the loss listeners, and #1000's stuck-render
+    // detection, which `renderAll` gates on `slot.initialized`), so the only
     // honest move is to REPORT a slow bring-up, not reject it: a watchdog fires once at
     // `APP_INIT_TIMEOUT_MS` and, if init has neither settled nor the slot been torn down by then,
     // logs loudly — `slot.ready` itself keeps waiting on the real `initSlotApp` promise and
@@ -669,8 +713,9 @@ export class Canvas2DPool {
       console.error(
         `[canvas2DPool] Pixi Application.init() for entity ${slot.entityId} has not settled after ` +
         `${APP_INIT_TIMEOUT_MS}ms — the surface will stay BLANK until it does. This is the FIRST ` +
-        `init for this slot, so nothing here can retry it: recovery only re-arms after a ` +
-        `webglcontextlost event, which needs a context that came up in the first place.`,
+        `init for this slot, so nothing here can retry it: every path that re-arms recovery (a ` +
+        `context-loss event, or a stuck-render detection) needs a context that came up in the ` +
+        `first place.`,
       );
     }, APP_INIT_TIMEOUT_MS);
     slot.initWatchdog = () => { watchdogSettled = true; clearTimeout(watchdogTimer); };
@@ -755,8 +800,17 @@ export class Canvas2DPool {
       let uid: number | undefined;
       try { uid = slot.app.renderer?.uid; } catch { /* already dead — nothing to record */ }
       if (typeof uid === 'number') deadRendererUids.add(uid);
-      slot.app.destroy(true);
+      // NOT `destroy(true)` — the boolean form also clears Pixi's process-global `TexturePool`,
+      // destroying render textures another live surface's BindGroups still hold (#1000).
+      // `removeView` defaults to true, so the canvas element is removed exactly as before.
+      destroyPixiApplication(slot.app, slot.releasePixiApp);
+      slot.releasePixiApp = undefined;
       noteGpuContextDestroyed();
+    } else {
+      // No Application to destroy, so nothing here can release the global pools — and a slot can
+      // reach this state holding a DEFERRED release, when every rebuild bring-up rejected. Backstop
+      // for the `onError` redemption above, for a slot torn down without recovery ever reporting.
+      releasePixiGlobalsIfIdle();
     }
     slot.recovery?.dispose();
   }
@@ -775,6 +829,7 @@ export class Canvas2DPool {
     // A reused slot must not inherit the previous entity's render-failure state (#455).
     slot.redrawOwed = false;
     slot.renderFailFrames = 0;
+    slot.stuckRecoveryRequested = false;
     // `destroyPool()` kept this slot alive only because something still claimed it (F6) — that
     // claim has now dropped, and the shrink pass that would normally collect it never runs again:
     // `destroyPool` runs after `stopScene2D()` already unregistered the frame callback that drives
@@ -929,6 +984,7 @@ export class Canvas2DPool {
       try {
         renderer.render(slot.app.stage);
         slot.renderFailFrames = 0;
+        slot.stuckRecoveryRequested = false;   // episode over — a later one gets its own request
         slot.redrawOwed = false;
       } catch (err) {
         // A canvas mid-teardown during a world swap (scene reload / Canvas2DMount unmount)
@@ -937,6 +993,34 @@ export class Canvas2DPool {
         // CONSECUTIVE frames is genuinely stuck — surface that, once, in dev.
         slot.renderFailFrames = (slot.renderFailFrames ?? 0) + 1;
         slot.redrawOwed = true; // the aborted render left the surface blank — retry next frame (#455)
+        // #1000 — DETECTION without RECOVERY was the whole gap. `slot.recovery` is a complete,
+        // single-flight, bounded-backoff rebuild scheduler, and until now the ONLY things that
+        // could reach it were the three context-loss LISTENERS (`webglcontextlost`,
+        // `webglcontextrestored`, WebGPU `device.lost`). A renderer wedged by anything that is not
+        // a context-loss EVENT — the `checkAndUpdateTexture` null in #1000, a batcher left holding
+        // a destroyed texture source — therefore retried the same dead renderer forever and was
+        // never rebuilt. Same fault, same cure, and it was one property away.
+        //
+        // ⚠️ Deliberately NOT `import.meta.env?.DEV`-gated, unlike the warn below. Production is
+        // where a permanently blank canvas actually costs something, and it is also where the warn
+        // says nothing at all. A failed rebuild still reports — `onError`/`onSkipped` are
+        // `console.error` on every build.
+        //
+        // ⚠️ `>=`, not `===`, defensively — the counter increments by exactly 1 per throwing frame
+        // today, so nothing can currently step over the threshold and the two forms are
+        // indistinguishable (mutation-checked: swapping to `===` leaves every test green, and this
+        // says so rather than letting a reader assume otherwise). It is kept because the latch is
+        // what bounds repetition, so the comparison does not also have to be exact.
+        //
+        // ⚠️ **Residual, deliberately not fixed here:** one request per episode means a rebuild
+        // that COMPLETES but does not cure the wedge is the end of the road — the latch stays set
+        // until a frame actually renders, so nothing tries again and nothing reports. A rebuild
+        // that FAILS still reports via `onError`. Re-requesting instead would be worse: `request()`
+        // resets `failures`, so it cannot be bounded by `maxAttempts`.
+        if ((slot.renderFailFrames ?? 0) >= STUCK_RENDER_FRAMES && !slot.stuckRecoveryRequested) {
+          slot.stuckRecoveryRequested = true;
+          slot.recovery?.request();
+        }
         if (import.meta.env?.DEV && slot.renderFailFrames === STUCK_RENDER_FRAMES && !this._stuckRenderWarned) {
           this._stuckRenderWarned = true;
           console.warn(`[canvas2DPool] canvas (entity ${slot.entityId}) has failed to render for ${STUCK_RENDER_FRAMES} consecutive frames — possible stuck renderer:`, err);
@@ -1057,13 +1141,26 @@ export class Canvas2DPool {
     // The #213 race, caught and survived. Reported (once) because it is the ONLY way to tell from
     // a device log that the teardown really did land in Canvas2DMount's async gap — a board that
     // renders proves nothing on its own, since the race is lost only some of the time. NOT
-    // dev-gated: the device this was found on is reachable by console log and nothing else.
+    // dev-gated: the device this was found on is reachable by console log and nothing else, and
+    // the editor is also where an engineer working on this class would want to see it fire.
+    //
+    // ⚠️ LEAD WITH THE VERDICT (#1002). This opened with `destroyPool() ran while N slot(s) were
+    // still claimed`, and put "the surface is unaffected" last, after a line break, where it reads
+    // as a qualifier rather than the answer. Measured cost: the repo owner hit it on the hub
+    // editor, copied it out and reported it as a suspected bug — SceneView unmounts routinely on
+    // desktop (panel re-layout, Fast Refresh, a tab change), so a message written for a rare
+    // device race is now a common desktop line. Nothing is gated and nothing is demoted: the
+    // signal is unchanged, only the order is. The same lesson is already applied 800 lines above
+    // on the context-loss path (`describe`), whose comment names the identical failure — "exactly
+    // the misleading diagnostic that made #213 cost what it did".
     if (keptMidMount > 0 && !this._keptMidMountWarned) {
       this._keptMidMountWarned = true;
       console.warn(
-        `[canvas2DPool] destroyPool() ran while ${keptMidMount} slot(s) were still claimed by a ` +
-        `Canvas2DMount whose canvas had not been appended yet — the #213 race. Kept them instead ` +
-        `of destroying their GPU contexts; the surface is unaffected. (Warned once.)`,
+        `[canvas2DPool] No action needed — the #213 teardown race was caught and survived, and ` +
+        `the surface is unaffected. destroyPool() ran while ${keptMidMount} slot(s) were still ` +
+        `claimed by a Canvas2DMount whose canvas had not been appended yet; they were KEPT rather ` +
+        `than having their GPU contexts destroyed, and reclaimIfUnclaimed destroys each one when ` +
+        `its last claim drops. Warned once per page.`,
       );
     }
   }
@@ -1071,8 +1168,12 @@ export class Canvas2DPool {
 
 // ── Default instance + free-function API ──
 // A single default pool backs the runtime / GameView / Canvas2DMount so nothing outside
-// this module changes. The editor SceneView will construct its OWN Canvas2DPool so its 2D
-// surfaces don't collide with GameView's slots (Phase 0c).
+// this module changes. The editor SceneView constructs its OWN Canvas2DPool
+// (`editor/rendering/editorScene2D.ts`) so its 2D surfaces don't collide with GameView's slots —
+// Phase 0c, which LANDED. ⚠️ This sentence stood in the future tense long after the fact, so a
+// reader chasing a SceneView/GameView slot collision could take it as a missing phase and go
+// looking for the cause there; two sessions independently flagged it (#1000, #1002).
+// `getSlotsForMemoryReport`'s doc comment below has stated it in the present tense throughout.
 export const defaultPool = new Canvas2DPool();
 
 export function initPool(): Promise<void> {

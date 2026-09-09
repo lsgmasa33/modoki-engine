@@ -4484,7 +4484,91 @@ A slot has TWO independent claims and is reclaimable only when BOTH drop:
 
 ⚠️ **`mounted` does NOT mean "the canvas is in the DOM", and conflating the two cost #213 five fixes.** `Canvas2DMount` takes the claim synchronously in its effect but appends the canvas only once `slot.ready` resolves — i.e. after an async `Application.init()`. Inside that gap the slot is fully claimed and `canvas.parentElement` is `null`. **Any teardown that asks the DOM "is anyone using this slot?" gets the wrong answer there.** Ask the CLAIM. See the incident below.
 
-Reclaiming only when both clear stops mount/unmount churn from leaking slots AND stops slot reuse from destroying the WebGL context behind a still-visible canvas; `entityId === null` is the canonical "unclaimed" marker. The pool DETACHES children on reclaim but never destroys them — Scene2D owns display-object destruction + texture-refcount release (destroying in both places would double-free). `renderAll` swallows a transient teardown-race throw (a canvas losing its context mid-swap) silently and only warns after 30 consecutive stuck frames.
+Reclaiming only when both clear stops mount/unmount churn from leaking slots AND stops slot reuse from destroying the WebGL context behind a still-visible canvas; `entityId === null` is the canonical "unclaimed" marker. The pool DETACHES children on reclaim but never destroys them — Scene2D owns display-object destruction + texture-refcount release (destroying in both places would double-free). `renderAll` swallows a transient teardown-race throw (a canvas losing its context mid-swap) silently, warns after 30 consecutive stuck frames, and — since #1000 — asks `slot.recovery` for a rebuild at that point.
+
+#### ⚠️ `app.destroy(true)` sweeps pools that belong to the whole PROCESS (#1000)
+
+**The rule: never call `app.destroy(true)`. Tear a Pixi `Application` down through
+`destroyPixiApplication` (`runtime/rendering/pixiGlobalResources.ts`).** Guarded by
+`engine/tests/architecture/pixiApplicationTeardown.test.ts` — the third property over the same
+construction census as `glContextRelease.test.ts` and `rendererLossHandling.test.ts`.
+
+⚠️ Cited by SYMBOL, not by line (#966): a dependency's line numbers move on every bump and nothing
+watches them.
+
+`AbstractRenderer.destroy` tests `options === true || (typeof options === 'object' &&
+options.releaseGlobalResources)`, so the **boolean form always** trips
+`GlobalResourceRegistry.release()`, which calls `clear()` on five registered pools —
+`TexturePool`, `CanvasPool`, `BigPool`, the `canvasCache` map, and an anonymous pooled-`Batch`
+registrant in `rendering/batcher/shared/Batcher`. `TexturePool` is a module-level singleton keyed by
+packed dimensions alone, **with no renderer identity in it at all**. So one surface's slot teardown
+reaches into a pool every other live surface draws from, and the surface that WARNS
+(`BindGroup.onResourceChange` — "a 'textureSource' was destroyed while still bound to a shader") is
+not the one that did it. That is why every report of this pointed at the wrong viewport.
+
+Three live Applications make it reachable: GameView's pool, SceneView's own `Canvas2DPool`, and the
+ShaderPreview panel. `GlobalResourceRegistry.release()` has exactly ONE caller in the installed lib
+(`AbstractRenderer.destroy`), so this sweep is never Pixi's own housekeeping — only ever a renderer
+we destroyed with `true`.
+
+⚠️ **The BindGroup warning has (at least) TWO producers, and this fix addresses only one of them.**
+Measured 2026-09-09 on `games/3d-test`, scene `2D Animation` → `empty`, dev editor, WebGPU: the swap
+emits `[BindGroup] a 'textureSource' … destroyed while still bound` + the matching `'textureSampler'`
+— **identically with and without this fix** (a control run with the boolean form restored produced
+the same two lines). Attribution is clean rather than inferred: with the fix, `livePixiApplications`
+goes 4 → 2 and never reaches 0, so **no global sweep ran at all**, and the warnings appeared anyway.
+On that path they come from the *other* producer — `Scene2D`'s `deferUnload` → `Assets.unload(url)`
+destroying a sprite `TextureSource` whose refcount hit zero, while the renderer's cached `BindGroup`
+still references it. Nothing invalidates that bind group first. `Assets` is not a registry
+registrant, so this fix cannot touch it, and it remains **open on #1000**.
+
+So: the pool sweep is real (the owner's own stack names `TexturePoolClass.clear` explicitly) and is
+fixed here, but it is **not** what a routine scene swap trips, and anyone verifying this fix by
+counting console warnings will measure the wrong thing.
+
+**Scoped honestly:** `clear()` destroys the pool's FREE LIST, not every render texture in the
+process — a checked-out texture has been popped off it. The crash is still explained (a *returned*
+texture can sit in a cached `BindGroup` while another surface's teardown destroys it), but the sweep
+is narrower than "everything". `Assets` is **not** a registrant, so decoded sprite textures survive
+it — which is why `Scene2D`'s `spriteTextureRefs` never protected against this and a session looking
+there finds a correctly-guarded cache and no defect.
+
+**Releasing the pools is still correct, exactly once — when the LAST live Pixi `Application` goes
+away.** That is the same rule `Scene2D.tsx` already applies to the shared `Assets` cache via
+`liveRenderers`, applied to the pools Scene2D does not own. Two things the implementation gets wrong
+if copied naively, both caught in review rather than by a test:
+- **The count must be Pixi-Application-specific.** `liveGpuContextCount()` includes the Three.js
+  renderer and the boot GL probes, so it never reaches zero in a real editor session and the release
+  would be disarmed entirely. `livePixiApplications` is reported beside it in the GPU memory report,
+  because the failure mode of this fix is a count that DRIFTS.
+- **A REBUILD is not a terminal teardown** — pass `mayReleaseGlobals: false`. `rebuildSlotApp`
+  replaces the Application immediately and keeps the whole `slot.container` subtree alive across the
+  swap, so "nothing else is bound" is false however the count reads — and on the shipped-game shape
+  (one Canvas2D surface, one Application) the count *does* read zero there, which is exactly when a
+  context-loss rebuild happens on device.
+
+⚠️ **The dangerous direction is the count reading LOW, and it has one door:** an Application
+destroyed before it was ever registered must pass `null` for its deregister, or it spends a *live*
+surface's registration. That is `initSlotApp`'s orphan bail-out, where a rebuild superseded an
+in-flight init. The `null` there looks like an oversight and is not; it survived every test until a
+review found it, and is now pinned by `canvas2DContextLoss.test.ts`.
+
+#### Detection without recovery — the stuck-canvas half of #1000
+
+`slot.recovery` (`rendererRecovery.ts`) is a complete single-flight, bounded-backoff rebuild
+scheduler, and until #1000 the only things that could reach it were the three context-loss
+**listeners** (`webglcontextlost`, `webglcontextrestored`, WebGPU `device.lost`). `renderAll`
+DETECTED a wedged renderer — 30 consecutive throwing frames — and only `console.warn`ed, DEV-gated
+and once per POOL (`_stuckRenderWarned` is an instance field, and two pools are live in the editor —
+an earlier revision of this line said "per process"). So a canvas wedged by anything that is not a loss EVENT retried the same dead
+renderer forever, and in a production build produced no signal at all.
+
+The request is **not** DEV-gated, and it fires behind a per-slot **latch**, cleared by a successful
+render. The latch is load-bearing: `RendererRecovery.request()` sets `failures = 0` on every call, so
+asking once per stuck frame would reset the bounded-attempt budget forever and chain rebuilds end to
+end. ⚠️ **Residual:** one request per episode means a rebuild that *completes but does not cure* the
+wedge is the end of the road — nothing tries again and nothing reports. A rebuild that FAILS still
+reports through `onError`.
 
 #### Incident: the engine destroying its own GPU context (#213, closed 2026-08-13)
 
@@ -4507,9 +4591,11 @@ Inside `Canvas2DMount`'s async gap (above) that reads `null` on a fully-claimed 
 Step 5 is why "0 of 25,680 sampled pixels ever drawn" was literal rather than "draws into a dead
 context" — nothing ever tried to draw.
 
-**How it was finally pinned, and the transferable technique.** Every destroy path uses
+**How it was finally pinned, and the transferable technique.** Every destroy path then used
 `app.destroy(true)`, which Pixi's `ViewSystem` treats as `removeView` — it removes the canvas from
-its parent. The canvas was measured IN the DOM with a dead context, so it had **no parent when the
+its parent. (Past tense since #1000: the boolean form is gone, replaced by
+`destroyPixiApplication(...)` with an explicit `removeView`. The observation below is unaffected —
+the canvas is still removed — but do not read this paragraph as describing today's call.) The canvas was measured IN the DOM with a dead context, so it had **no parent when the
 context died** and was appended afterwards. That one observation discriminated this from the
 already-fixed "destroyed a mounted slot" case; no amount of source reading could.
 
@@ -4901,6 +4987,44 @@ renders alternating frames from both surfaces — which is why that cache had co
 not. **#828 tracks the six sites where this cover is still missing**, including
 `pixiShaderBuilder.ts`, which shares compiled GPU programs across both live `Scene2DRenderer`s with
 no renderer in the key and may be a live defect rather than a cover gap.
+
+#### `pixiShaderBuilder`'s shared `GlProgram` — MEASURED, and invisible on every engine we can drive (#846)
+
+`programCache` (`runtime/rendering/pixiShaderBuilder.ts`) keys on backend + manifest path + name +
+params + body, with **no renderer identity**, so one `GlProgram` object is handed to all three live
+Pixi `Application`s. Pixi's `generateProgram` then mutates that SHARED object in place —
+`program._attributeData = extractAttributesFromGlProgram(...)`, whose `location` values come from
+`gl.getAttribLocation` and are valid only for the `WebGLProgram` just compiled in **that** context.
+`GlGeometrySystem.activateVao` later reads those locations off the shared object when it lazily
+builds a VAO for a NEW geometry against an ALREADY-CACHED program. So renderer A can, in principle,
+build a VAO from renderer B's attribute locations.
+
+**Whether that is a real defect turns on one physical question, and the answer is measured, not
+reasoned:** do two independent WebGL contexts assign the same attribute locations to byte-identical
+GLSL? On this machine (2026-09-09, macOS, Apple M4 Max) — **yes, on both engines**:
+
+| engine | renderer | ctx A | ctx B |
+|---|---|---|---|
+| Chromium | `ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max)` | `aPosition 0, aUV 1, aColor 2` | identical |
+| WebKit | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+
+A second shader with the declarations deliberately SHUFFLED came back `aColor 0, aUV 1, aPosition 2`
+on both contexts of both engines — i.e. assignment follows **declaration order**, deterministically,
+and Pixi generates identical source for both contexts. The GLSL spec does not guarantee this; these
+two implementations both do it.
+
+⚠️ **Bounds, because this is one machine.** Not measured on iOS 16 / A11 — which is precisely where
+the GL path actually runs, since `pixi.backend` defaults to `'auto'` and resolves to WebGPU
+everywhere it is supported. Playwright's WebKit is not iOS WebKit. And the two-live-`Application`
+condition exists only in the EDITOR, which runs on desktop where WebGPU is available — so GL **and**
+two surfaces co-occur only under an explicitly pinned `pixi.backend: 'webgl'`, or on a desktop
+browser without WebGPU.
+
+**Verdict: a documented caveat, not a fix.** Adding a renderer to our key would diverge from Pixi's
+own design (`GlProgram.from()` is itself a module-level content-addressed cache, so Pixi shares its
+built-in shaders across every `Application` by design) and would cost a duplicate compile per
+surface for a collision nobody can produce. #846 stays filed for the one residual — iOS-16-class
+WebKit on a real device — and nobody should re-run the desktop probe.
 
 ### Retractions worth keeping — each was a confident claim that measurement killed
 

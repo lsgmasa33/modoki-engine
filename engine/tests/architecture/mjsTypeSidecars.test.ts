@@ -24,12 +24,23 @@ import * as path from 'node:path';
 import ts from 'typescript';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
-const scriptsDir = path.resolve(__dirname, '../../scripts');
+/** ⚠️ BOTH script roots, not just engine's. This was `engine/scripts` alone, and the docstring
+ *  above still described that bound as though it were the whole world — #830's shape exactly, a
+ *  hand-declared scope narrower than the claim it makes. Repo-root `scripts/` also ships `.mjs`
+ *  that typechecked consumers import (`gen-memory-index.mjs`, whose constants the memory-index gate
+ *  imports rather than retyping), and a sidecar there was unguarded by construction. Widening costs
+ *  nothing: this guard is driven by the `.d.mts` files it FINDS, so a root script with no sidecar
+ *  is simply not a pair. */
+const repoRoot = path.resolve(__dirname, '../../..');
+const scriptsDirs = [
+  path.resolve(__dirname, '../../scripts'),
+  path.resolve(__dirname, '../../../scripts'),
+];
 
-/** Every `.d.mts` under engine/scripts/, paired with the `.mjs` it describes — via the shared
- *  corpus producer (#799/#771/#805 Phase 4). Floored well under the 28 measured today. */
+/** Every `.d.mts` under either scripts root, paired with the `.mjs` it describes — via the shared
+ *  corpus producer (#799/#771/#805 Phase 4). Floored well under the 29 measured today. */
 function sidecarPairs(): { decl: string; impl: string }[] {
-  return repoFiles({ under: scriptsDir, match: /\.d\.mts$/, exclude: ['node_modules'], floor: 10 })
+  return repoFiles({ under: scriptsDirs, match: /\.d\.mts$/, exclude: ['node_modules'], floor: 10 })
     .map(({ abs }) => ({ decl: abs, impl: abs.replace(/\.d\.mts$/, '.mjs') }));
 }
 
@@ -74,7 +85,9 @@ describe('.d.mts sidecars match their .mjs (issue #23)', () => {
   });
 
   for (const { decl, impl } of pairs) {
-    const rel = path.relative(scriptsDir, decl);
+    // Labelled from the REPO ROOT now that there are two script roots — `scripts/x.d.mts` and
+    // `engine/scripts/x.d.mts` would otherwise render identically and a failure would not say which.
+    const rel = path.relative(repoRoot, decl);
 
     describe(rel, () => {
       it('sits beside the .mjs it declares', () => {

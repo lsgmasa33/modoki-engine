@@ -29,6 +29,10 @@ function mockDeps() {
       Application: MockApplication,
       Container: MockContainer,
       isWebGPUSupported: () => Promise.resolve(false),
+      // #1000: `teardownSlot` redeems a deferred global-pool release through this. A mock that
+      // omits it throws on every teardown — the explicit-export-list trap, where adding an import
+      // to the source breaks the mock at BINDING time, nowhere near the assertion.
+      GlobalResourceRegistry: { release: () => {} },
     };
   });
   vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({
@@ -177,6 +181,49 @@ describe('canvas2DPool', () => {
 
       expect(pool.getAllocatedEntityIds().size).toBe(0);
       expect(pool.getApp()).toBeNull();
+    });
+
+    /** #1002 — the #213 "caught and survived" warning must LEAD WITH THE VERDICT.
+     *
+     *  This is a message-ORDER test, and the order is the whole mechanism: the line is a DEVICE
+     *  diagnostic that also fires on desktop, where SceneView unmounts routinely (panel re-layout,
+     *  Fast Refresh, a tab change). Written alarming-half-first, it cost the repo owner a context
+     *  switch to conclude that nothing had happened — they copied it off the hub editor and filed
+     *  it as a suspected bug. Nothing is gated and nothing is demoted here; only the order changed,
+     *  so the signal an engineer working on #213's class needs is untouched.
+     *
+     *  ⚠️ It asserts POSITION, not just presence. A test that only checked the all-clear text
+     *  appears somewhere would have passed on the message that caused #1002. */
+    it('warns VERDICT-FIRST when a mid-mount slot is kept — the all-clear precedes the alarming half', async () => {
+      const pool = await getModule();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // The kept-mid-mount state: `mounted` is claimed but the canvas has never been appended —
+      // exactly `Canvas2DMount`'s async gap, which is the only thing that increments keptMidMount.
+      pool.mount(1);
+      expect(pool.getSlot(1)!.canvas.parentElement).toBeNull();
+
+      pool.destroyPool();
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = String(warn.mock.calls[0][0]);
+      const verdict = msg.indexOf('No action needed');
+      const alarming = msg.indexOf('destroyPool() ran while');
+      expect(verdict, 'the all-clear must be present').toBeGreaterThanOrEqual(0);
+      expect(alarming, 'the detail must still be present — this reworded, it did not delete').toBeGreaterThan(0);
+      expect(verdict, 'the verdict must come BEFORE the alarming detail').toBeLessThan(alarming);
+      // Still says how many, and still says it is once-per-page: no signal was traded away.
+      expect(msg).toMatch(/1 slot\(s\)/);
+      expect(msg).toMatch(/[Ww]arned once/);
+    });
+
+    it('stays once-per-page — a second destroyPool with a kept slot does not warn again', async () => {
+      const pool = await getModule();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      pool.mount(1);
+      pool.destroyPool();
+      pool.mount(2);
+      pool.destroyPool();
+      expect(warn).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -476,5 +523,89 @@ describe('Application init options (#38)', () => {
   it('still forwards the settings Pixi does own (antialias)', async () => {
     const opts = await initSlot(0);
     expect(opts.antialias).toBe(true);
+  });
+});
+
+// ── #1000: releasing Pixi's PROCESS-GLOBAL pools is a LAST-ONE-OUT decision ──
+//
+// `app.destroy(true)` clears the module-level `TexturePool` singleton for the whole process
+// (`AbstractRenderer.mjs:250-252` -> `GlobalResourceRegistry.release()`), so one surface's slot
+// teardown destroyed render textures another live surface's BindGroups were bound to. The fix is
+// the options object these tests read: `releaseGlobalResources` must be false while any other
+// Application is live, and true for the last one — skipping it forever would trade a crash for a
+// leak.
+//
+// ⚠️ **Two pools on purpose, per docs/rendering.md's #828 rule** ("a per-renderer discriminant is
+// only real if a two-surface test pins it"). With ONE pool, "release when the count hits zero" and
+// "always release" are indistinguishable — every assertion below passes under both, and the defect
+// is exactly the two-surface case. The `expect` that carries the fix is the FALSE one; the `true`
+// ones are the leak side, which is the half a fix for this is most likely to break silently.
+//
+// What these DON'T prove: that `{releaseGlobalResources: false}` actually suppresses Pixi's sweep,
+// or that `{removeView: true}` still removes the canvas. Both are claims about pixi 8.20.1's own
+// source, read at `AbstractRenderer.mjs:250-252` and `ViewSystem.mjs:76-82`; no jsdom test can
+// exercise them, and a mock asserting them would be asserting itself.
+describe('Pixi global resource pools (#1000)', () => {
+  /** The options object our code handed to `Application.destroy`, for the Nth destroy call. */
+  const destroyArg = (app: any, n = 0) => app.destroy.mock.calls[n][0];
+
+  it('does NOT release the global pools while another pool still has a live Application', async () => {
+    const mod = await getModule();
+    const a = new mod.Canvas2DPool();
+    const b = new mod.Canvas2DPool();
+    const sa = a.allocate(1)!;
+    const sb = b.allocate(2)!;
+    await Promise.all([sa.ready, sb.ready]);
+    const appA = sa.app;
+
+    a.destroyPool();
+
+    expect((appA as any).destroy).toHaveBeenCalledTimes(1);
+    expect(destroyArg(appA).releaseGlobalResources).toBe(false);
+    // The canvas must still be removed — this is what `destroy(true)` also did, and dropping it
+    // would leave a dead node mounted.
+    expect(destroyArg(appA).removeView).toBe(true);
+    b.destroyPool();
+  });
+
+  it('DOES release them when the last live Application goes away', async () => {
+    const mod = await getModule();
+    const a = new mod.Canvas2DPool();
+    const b = new mod.Canvas2DPool();
+    const sa = a.allocate(1)!;
+    const sb = b.allocate(2)!;
+    await Promise.all([sa.ready, sb.ready]);
+    const appB = sb.app;
+
+    a.destroyPool();
+    b.destroyPool();
+
+    expect(destroyArg(appB).releaseGlobalResources).toBe(true);
+  });
+
+  it('counts Applications, not pools — a second slot in the SAME pool also holds the release off', async () => {
+    const mod = await getModule();
+    const a = new mod.Canvas2DPool();
+    const s1 = a.allocate(1)!;
+    const s2 = a.allocate(2)!;
+    await Promise.all([s1.ready, s2.ready]);
+    const [app1, app2] = [s1.app, s2.app];
+
+    a.destroyPool();
+
+    // destroyPool tears both down in order; only the second may release.
+    const flags = [destroyArg(app1).releaseGlobalResources, destroyArg(app2).releaseGlobalResources];
+    expect(flags.filter(Boolean)).toHaveLength(1);
+    expect(flags[1]).toBe(true);
+  });
+
+  it('an uninitialized slot never registers, so it cannot strand the count above zero', async () => {
+    const mod = await getModule();
+    const { livePixiApplicationCount } = await import('../../src/runtime/rendering/pixiGlobalResources');
+    const a = new mod.Canvas2DPool();
+    a.allocate(1);            // deliberately NOT awaited — no context yet
+    expect(livePixiApplicationCount()).toBe(0);
+    a.destroyPool();
+    expect(livePixiApplicationCount()).toBe(0);
   });
 });

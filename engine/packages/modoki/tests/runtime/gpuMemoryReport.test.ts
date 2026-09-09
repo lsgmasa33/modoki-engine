@@ -463,6 +463,36 @@ describe('GPU-memory sampling + emission policy', () => {
     expect(getGpuMemoryReport()).not.toBeNull();
   });
 
+  // ⚠️ The floor exemption, which review found covered only `liveGpuContexts` (#1000). A Pixi
+  // Application dying while a non-Pixi context is created leaves `liveGpuContexts` UNCHANGED, so
+  // `shouldLog` fires on the Pixi clause alone and `withinFloor` then swallows the line — i.e. the
+  // only case that clause exists for is the one it never reports. Driven through the real sampler:
+  // the floor lives inside a private function, and asserting `shouldLog` directly would skip it.
+  it('a Pixi-Application change escapes the log floor, like a context change', async () => {
+    const { notePixiApplicationCreated, __resetPixiApplicationTrackingForTest } =
+      await import('../../src/runtime/rendering/pixiGlobalResources');
+    __resetPixiApplicationTrackingForTest();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const release = notePixiApplicationCreated();
+      startGpuMemorySampling();                    // seeds the first sample — always logged
+      const afterSeed = log.mock.calls.length;
+
+      // ⚠️ ONLY the Pixi count moves. A first draft also called `noteGpuContextCreated()` here,
+      // which made `liveGpuContexts` change too — so the OLD exemption covered the line and the
+      // test passed with the fix reverted. It has to be a Pixi-only change or it proves nothing.
+      release();                                   // livePixiApplications 1 -> 0, liveGpuContexts flat
+      tick();                                      // one sample, still far inside the 5s floor
+
+      const lines = log.mock.calls.slice(afterSeed).map((c) => String(c[0]));
+      expect(lines.some((l) => l.includes('pixiApps=0')),
+        'a Pixi-only change must not be suppressed by the floor').toBe(true);
+    } finally {
+      stopGpuMemorySampling();
+      __resetPixiApplicationTrackingForTest();
+    }
+  });
+
   it('is idempotent — a second start() creates no second interval for stop() to miss', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     startGpuMemorySampling();
@@ -652,4 +682,30 @@ describe('GPU-memory sampling + emission policy', () => {
     expect(String(logSpy.mock.calls[0][0])).toContain('geom2dChurn');
     logSpy.mockRestore();
   });
+});
+
+// ── livePixiApplications, and the log floor that nearly ate it (#1000) ──
+//
+// `liveGpuContexts` counts every tracked GL/GPU context — the Three.js renderer and the boot probes
+// included — so it never reaches zero in a real editor session. The decision "may this teardown
+// sweep Pixi's process-global pools?" therefore needs a Pixi-Application-specific count, and the
+// failure mode of that fix is a count that DRIFTS. Reported here so it can be read live.
+describe('livePixiApplications (#1000)', () => {
+  it('tracks registrations independently of the GL/GPU context count', async () => {
+    const { notePixiApplicationCreated, __resetPixiApplicationTrackingForTest } =
+      await import('../../src/runtime/rendering/pixiGlobalResources');
+    __resetPixiApplicationTrackingForTest();
+
+    expect(computeGpuMemoryReport().livePixiApplications).toBe(0);
+    const a = notePixiApplicationCreated();
+    notePixiApplicationCreated();
+    expect(computeGpuMemoryReport().livePixiApplications).toBe(2);
+    // A non-Pixi context must not move it — that separation is the whole reason the field exists.
+    noteGpuContextCreated();
+    expect(computeGpuMemoryReport().livePixiApplications).toBe(2);
+    a();
+    expect(computeGpuMemoryReport().livePixiApplications).toBe(1);
+    __resetPixiApplicationTrackingForTest();
+  });
+
 });

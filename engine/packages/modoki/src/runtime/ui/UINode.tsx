@@ -32,7 +32,7 @@ import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
-import { UI_PRESS_ORIGIN_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
+import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
@@ -1323,9 +1323,18 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // ignores either is wrong in both directions. Verify a new `minTapSize` with the probe, not by
   // reading the scene.
   //
-  // The press-origin gate (#664) needs no change: `pressBelongsTo` resolves a press through
-  // `closest('[data-press-origin]')`, and the expander is a DESCENDANT of the marked element, so
-  // a press landing on it already resolves to this node.
+  // The press-origin gate (#664) needs no change for the ordinary case: `pressBelongsTo` resolves a
+  // press through `closest('[data-press-origin]')`, and the expander is a DESCENDANT of the marked
+  // element, so a press landing on it already resolves to this node.
+  //
+  // ⚠️ **#977 CHANGED the overlap case, and the paragraph above about siblings is now the DESIGN
+  // rather than the caveat.** The expander is stamped `data-tap-zone`, and `pressOrigin.ts` hands a
+  // press that landed on it to whatever real control was underneath — so a zone now LOSES to
+  // anything that would have handled the press itself, and still wins over decoration and empty
+  // space. A zone overhanging a decorative sibling is unaffected, which is the normal use.
+  // ⚠️ It fixes a TAP only. A finger-drag starting inside the overlap still does not reach a scroll
+  // container beneath it — the browser picks the scroll target at pointerdown, before any of this
+  // runs. Owner's call, 2026-09-09; see docs/ui-system.md.
   const tapZone = cssLen(node.minTapSize, node.minTapSizeUnit);
   let tapZoneLayer: React.ReactNode = null;
   if (tapZone && takesClick) {
@@ -1352,6 +1361,25 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       tapZoneLayer = (
         <div
           aria-hidden
+          // #977 — the marker `pressOrigin.ts` reads. An expander sits at the PARENT's z-order among
+          // its SIBLINGS, so it takes presses inside any overlap; the press router uses this to hand
+          // such a press back to whatever would have handled it. Without the attribute the expander
+          // is indistinguishable from ordinary content and the rule cannot exist.
+          //
+          // ⚠️ **RUNTIME ONLY — `onSelectEntity` is the editor's authoring preview, and stamping it
+          // there BREAKS click-to-select.** `UIRenderer.tsx` deliberately skips installing the press
+          // tracker for that renderer, but the tracker GameView installs is registered on the
+          // document both of them share, so the marker alone is enough for a preview click to be
+          // redirected: the original is stopped at document capture (before SceneView's own capture
+          // listener and before React) and the synthetic click lands on the neighbour, selecting the
+          // wrong entity. ⚠️ The example first written here — `DailyClose`'s pad selecting
+          // `DailyHeader` — is FALSIFIED by the ancestor rule added in the same commit: that press
+          // resolves to `DailyRoot`, which contains the host, so it never redirects at all. The real
+          // case is a pad over an interactive SIBLING: `DailyMonthNext`'s pad over `DailyClose` (the
+          // pair #973 measured) would select `DailyClose` in the preview.
+          // The editor surface manipulates selection, not bindings, so it wants the pre-#977
+          // behaviour — the press resolves to the host and selects it. Caught in review.
+          {...(onSelectEntity ? undefined : { [UI_TAP_ZONE_ATTR]: '' })}
           style={{
             position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
             // `max()`, so a value SMALLER than the element is a no-op rather than a shrink —

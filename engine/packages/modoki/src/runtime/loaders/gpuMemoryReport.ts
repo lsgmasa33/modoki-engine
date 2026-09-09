@@ -107,6 +107,7 @@ import { getActiveRenderer } from '../core/activeRenderer';
 import {
   liveGpuContextCount, totalGpuContextsCreated, totalGpuContextsDestroyed,
 } from '../core/gpuContextTracking';
+import { livePixiApplicationCount } from '../rendering/pixiGlobalResources';
 import { setCounter } from '../core/profilerCounters';
 import { gpuMemorySamplerProvider } from '../core/gpuMemorySamplerProvider';
 import { getSlotsForMemoryReport } from '../rendering/canvas2DPool';
@@ -290,6 +291,12 @@ export interface GpuMemoryReport {
   textureCount2D: number;
   /** `core/gpuContextTracking.ts`'s live count, across every tracked context-creation site. */
   liveGpuContexts: number;
+  /** Live Pixi `Application`s (#1000) — a STRICT SUBSET of `liveGpuContexts`, which also counts the
+   *  Three.js renderer and the boot GL probes. Reported because it is the number that decides
+   *  whether a teardown may sweep Pixi's process-global pools, and the failure mode of that fix is
+   *  a count that DRIFTS: reading `1` here with no 2D surface on screen, or `0` with one, is the
+   *  symptom. See `runtime/rendering/pixiGlobalResources.ts`. */
+  livePixiApplications: number;
   /** Cumulative, monotonic (never decreases) — contexts ever created/destroyed this session. See
    *  this module's header on why a live gauge cannot see create/destroy CHURN. */
   totalGpuContextsCreated: number;
@@ -478,6 +485,7 @@ export function computeGpuMemoryReport(): GpuMemoryReport {
     totalBytes: gpu3dBytes + gpu2dBytes,
     textureCount2D: globalSeen.size,
     liveGpuContexts: liveGpuContextCount(),
+    livePixiApplications: livePixiApplicationCount(),
     totalGpuContextsCreated: totalGpuContextsCreated(),
     totalGpuContextsDestroyed: totalGpuContextsDestroyed(),
     rendererGeometries: memory?.geometries ?? null,
@@ -542,6 +550,7 @@ export const CHURN_EVENTS_THRESHOLD = 4;
 function shouldLog(prev: GpuMemoryReport | null, next: GpuMemoryReport): boolean {
   if (!prev) return true;
   if (prev.liveGpuContexts !== next.liveGpuContexts) return true;
+  if (prev.livePixiApplications !== next.livePixiApplications) return true;
   if (fractionalChange(prev.totalBytes, next.totalBytes) >= CHANGE_FRACTION) return true;
   if (fractionalChange(prev.geometryBytes2D, next.geometryBytes2D) >= CHANGE_FRACTION) return true;
   const churnSinceLastLog =
@@ -574,6 +583,7 @@ function sampleGpuMemory(): void {
   setCounter('gpu.2dBytes', report.gpu2dBytes);
   setCounter('gpu.totalBytes', report.totalBytes);
   setCounter('gpu.liveContexts', report.liveGpuContexts);
+  setCounter('gpu.livePixiApps', report.livePixiApplications);
   setCounter('gpu.totalContextsCreated', report.totalGpuContextsCreated);
   setCounter('gpu.totalContextsDestroyed', report.totalGpuContextsDestroyed);
   setCounter('gpu.cumulativeTextureCreates2D', report.cumulativeTextureCreates2D);
@@ -597,8 +607,13 @@ function sampleGpuMemory(): void {
     // ring line even mid-floor). Suppressed samples are not lost: the count rides along on the
     // next line that does get through.
     const isFirstSample = lastLoggedReport === null;
+    // ⚠️ BOTH counts, or the exemption does not cover the clause that triggers the line. A Pixi
+    // Application dying while a non-Pixi GL context is created leaves `liveGpuContexts` unchanged
+    // and `livePixiApplications` down one: `shouldLog` fires on the Pixi clause alone and the floor
+    // then swallows it — i.e. the only case the new clause exists for is the case it never reports.
     const contextChanged = lastLoggedReport !== null
-      && lastLoggedReport.liveGpuContexts !== report.liveGpuContexts;
+      && (lastLoggedReport.liveGpuContexts !== report.liveGpuContexts
+        || lastLoggedReport.livePixiApplications !== report.livePixiApplications);
     const withinFloor = !isFirstSample && !contextChanged
       && report.sampleTimeMs - lastLoggedAtMs < MIN_LOG_INTERVAL_MS;
     if (withinFloor) {
@@ -615,7 +630,7 @@ function sampleGpuMemory(): void {
       `[gpuMemory] 3d=${formatMiB(report.gpu3dBytes)}MiB ` +
       `2d=${formatMiB(report.gpu2dBytes)}MiB(${report.textureCount2D}tex,${report.perSlotBytes2D.length}slots) ` +
       `tracked=${formatMiB(report.totalBytes)}MiB ` +
-      `contexts=${report.liveGpuContexts}(created=${report.totalGpuContextsCreated},destroyed=${report.totalGpuContextsDestroyed}) ` +
+      `contexts=${report.liveGpuContexts}(created=${report.totalGpuContextsCreated},destroyed=${report.totalGpuContextsDestroyed},pixiApps=${report.livePixiApplications}) ` +
       `tex2dChurn(created=${report.cumulativeTextureCreates2D},released=${report.cumulativeTextureReleases2D}) ` +
       `geom2d=${formatMiB(report.geometryBytes2D)}MiB(${report.geometryCount2D}geo) ` +
       `geom2dChurn(created=${report.cumulativeGeometryCreates2D},released=${report.cumulativeGeometryReleases2D}) ` +

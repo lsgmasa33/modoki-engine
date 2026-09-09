@@ -834,6 +834,16 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
     fault — a diagnosis, and a wrong one for a fully-supported state, which sent the reader
     hunting a renderer fault that did not exist. **An error message that guesses a cause is
     worse than one that reports what it observed.**
+  - **A failure to capture, and a `render_scene` with no 3D surface mounted, are both
+    `NO_RENDERER` refusals — not transport failures** (#994). They used to escape as throws, which
+    the routes turn into a 504/500 and the MCP client reads as `NOT_AVAILABLE_HERE`, *"the route is
+    absent"* — so an ordinary editor state (a project built without the 3D renderer module; a Game
+    tab never opened this session; a minimised window) was reported as a dead tool, and
+    `test:mcp:live` scored it a DEFECT. Now each refusal carries `code`, the reason, and `options` naming exits that
+    actually exist. ⚠️ `modoki_focus` is **not** one of them: it moves keyboard scope, it does not
+    mount the tab. The exit that always works is reading the scene as DATA
+    (`modoki_get_scene_state` / `modoki_diagnose`), which needs no renderer at all. Rule and its
+    three riders: [mcp-tool-conventions.md](mcp-tool-conventions.md) §5.
 - `modoki_tap` / `modoki_drag` — **trusted** `sendInputEvent`; hit-tests **PixiJS + Three.js
   together** (Chrome MCP `drag` is DOM-only — you'd have to `evaluate_script` the EventSystem). Both
   now take `button` (`right`→context menu, `middle`→orbit-pan), `clickCount` (`2`→double-click), and

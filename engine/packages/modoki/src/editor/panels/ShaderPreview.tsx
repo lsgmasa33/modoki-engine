@@ -17,6 +17,7 @@ import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram 
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
 import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
+import { notePixiApplicationCreated, destroyPixiApplication } from '../../runtime/rendering/pixiGlobalResources';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { makePreviewLossPolicy } from './previewLossPolicy';
 
@@ -48,7 +49,7 @@ function buildQuad(w: number, h: number): MeshGeometry {
 /** Free this panel's own Mesh. `Application.destroy()` forwards its FIRST argument to the
  *  renderer only — `this.stage.destroy(options)` gets its own, second argument, which the call
  *  sites below never pass, so the stage subtree (this Mesh) is never torn down by
- *  `app.destroy(true)` alone. `Mesh`/`Container` order `unload()` before `destroy()` correctly,
+ *  `destroyPixiApplication` alone. `Mesh`/`Container` order `unload()` before `destroy()` correctly,
  *  so a bare `mesh.destroy()` is safe and frees the mesh's own per-instance GPU state.
  *
  *  The geometry is released SEPARATELY, through `releaseGeometry` (exported from `Scene2D.tsx`):
@@ -95,6 +96,12 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // `markDestroyed` below runs everywhere this effect destroys the app. A fresh `null` per
     // effect run (a new `app` instance), never carried over from a previous shader/path.
     let releaseContextCount: (() => void) | null = null;
+    // #1000 — this panel is a THIRD live Pixi `Application` alongside GameView's and SceneView's,
+    // and its four `destroy(true)` calls each cleared Pixi's process-global `TexturePool` out from
+    // under both of them. Registered on the same line as the context note so the pairing cannot
+    // drift; spent by `destroyPixiApplication`, which releases the pools only when no other
+    // Application is live. See `runtime/rendering/pixiGlobalResources.ts`.
+    let releasePixiApp: (() => void) | null = null;
     const markDestroyed = () => releaseContextCount?.();
     // The mesh THIS run creates, if any — separate from `stateRef.current.mesh` because that ref is
     // shared across every effect run (StrictMode's mount→unmount→mount, or a fast shader-path
@@ -112,7 +119,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // The panel's ONE teardown path — called on unmount AND (#795) on a lost GPU context/device,
     // so a lost context tears the panel down exactly the same way an unmount would. Idempotent by
     // construction: every step below already guards on state a first run clears (`app.renderer`
-    // null after the first `destroy(true)`, `stateRef.current.mesh` null after the first
+    // null after the first destroy, `stateRef.current.mesh` null after the first
     // `destroyMesh`, `texUrls` emptied, the one-shot inside `markDestroyed`'s release), so calling it
     // twice (once from a loss, once from unmount) is safe.
     const teardown = () => {
@@ -125,7 +132,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
       for (const u of stateRef.current.texUrls) releasePanelTexture(u);
       stateRef.current.texUrls = [];
       stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
-      if (!app.renderer) { /* init never finished */ } else app.destroy(true);
+      if (!app.renderer) { /* init never finished */ } else destroyPixiApplication(app, releasePixiApp);
       markDestroyed();
       canvas.remove();
     };
@@ -141,18 +148,19 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         if (disposed || stateRef.current.serial !== serial) return;
         await app.init({ preference, canvas, width: SIZE, height: SIZE, backgroundAlpha: 0, antialias: true, preserveDrawingBuffer: true });
         // The context now exists — note it before any of the early-return teardowns below, so a
-        // stale/disposed resume still pairs its `app.destroy(true)` with a decrement.
+        // stale/disposed resume still pairs its destroy with a decrement.
         releaseContextCount = noteGpuContextCreated();
+        releasePixiApp = notePixiApplicationCreated();
         // Wire loss detection (#795) as soon as the context exists — a preview left open across
         // a GPU driver reset would otherwise stay blank forever with no error anywhere.
         detachLoss = attachRendererLossHandling(
           { canvas, device: (app.renderer as unknown as { gpu?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.gpu?.device },
           { label: 'ShaderPreview', isStale: () => disposed || stateRef.current.serial !== serial, ...makePreviewLossPolicy({ label: 'ShaderPreview', teardown }) },
         );
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); markDestroyed(); return; }
+        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
         app.ticker.stop();
         const program = await buildPixiShaderProgram(path);
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); markDestroyed(); return; }
+        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
         stateRef.current.app = app;
         stateRef.current.program = program;
         if (program) {
@@ -166,7 +174,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         // init/build rejected — free any GL context we opened; leave state cleared. `ownMesh`, not
         // `stateRef.current.mesh`: a later run may already have stored ITS mesh on the shared ref.
         destroyMesh(ownMesh);
-        if (app.renderer) app.destroy(true);
+        if (app.renderer) destroyPixiApplication(app, releasePixiApp);
         markDestroyed(); // no-op unless init actually succeeded before something else threw
       }
     })();

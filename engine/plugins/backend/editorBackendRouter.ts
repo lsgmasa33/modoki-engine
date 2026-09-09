@@ -176,7 +176,7 @@ import {
 import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
-import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
 import { decodeSceneOpsReply } from './sceneOpsReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
@@ -1999,7 +1999,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   if (urlPath === '/api/render-scene' && method === 'POST') {
     pruneOldTempFiles('modoki-render-'); // drop stale frames from prior sessions
     try {
-      const result = await ctx.requestBrowser('render-scene', body ?? {}, 15000) as { width: number; height: number; quality?: number; surface?: string; dataUrl: string };
+      const raw = await ctx.requestBrowser('render-scene', body ?? {}, 15000);
+      // A §5 refusal from the op travels as itself (#994). Without this the destructure below
+      // reads `dataUrl: undefined`, `writeDataUrlToTemp` throws, and the catch turns the op's
+      // correct, coded "no 3D surface is mounted" into a 504 → NOT_AVAILABLE_HERE — "the route is
+      // absent" — sending the agent to relaunch an editor that is answering perfectly well.
+      const refusal = opRefusal(raw);
+      if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
+      const result = raw as { width: number; height: number; quality?: number; surface?: string; dataUrl: string };
       // Echo the EFFECTIVE quality (1–100) the renderer actually used, so an out-of-unit value is
       // visibly converted rather than silently ignored (S3.13).
       // Echo `surface` too — the tool description promises it and used to be alone in doing so
@@ -2008,7 +2015,17 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         ...(result.quality !== undefined ? { quality: result.quality } : {}),
         ...(result.surface !== undefined ? { surface: result.surface } : {}) });
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, 504);
+      // `relayFailureStatus`, not a hard-coded 504 (#994 close-out F1). The envelope above covers
+      // "no renderer registered"; a renderer that IS registered and then FAILS still throws —
+      // `Scene3D`'s readback is wrapped in a 10s `withTimeout`, so a lost GPU device or a stalled
+      // readback rejects here. At a literal 504 that reached the agent as NOT_AVAILABLE_HERE,
+      // "the route is absent", which is the same inversion one case over: the route is present,
+      // the renderer answered, and the render failed. `TimeoutError`'s message matches no
+      // `isRelayTransportFailure` alternative, so it classifies as the op answering → 400 →
+      // REFUSED_BY_OP. Generic (that under-specification is #1012's class) but not a LIE, and not
+      // in the live gate's ENV_CODES — so a genuinely wedged GPU still reddens `test:mcp:live`
+      // rather than being waved through as editor state.
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
     }
   }
 
@@ -2021,6 +2038,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const fps = Math.max(1, Math.min(b.fps ?? 10, 60));
     const frameOpts = { width: b.width, height: b.height, quality: b.quality, camera: b.camera };
     const paths: string[] = [];
+    // Hoisted alongside `paths` (#994 close-out F5) so the catch below can report the timings of
+    // the frames that DID land, not just their count — it lived inside the try and was invisible
+    // there, which is why the 504 path had been dropping it silently since it was written.
+    const tMs: number[] = [];
     pruneOldTempFiles('modoki-render-'); // sweep once before the sequence (new frames are kept)
     try {
       // S2.33 — REFUSE when nothing can move. The whole point of a sequence is motion, and
@@ -2058,10 +2079,24 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // AFTER a synchronous render + IPC round-trip that is never subtracted — so real spacing is
       // 1/fps PLUS render time, and any timing conclusion drawn from frameIndex × 1/fps was wrong
       // by however long the renderer took. Report what actually happened. (S2.34)
-      const tMs: number[] = [];
       const t0 = Date.now();
       for (let i = 0; i < frames; i++) {
-        const result = await ctx.requestBrowser('render-scene', frameOpts, 15000) as { dataUrl: string };
+        const raw = await ctx.requestBrowser('render-scene', frameOpts, 15000);
+        // Same relay as /api/render-scene (#994) — the per-frame path reaches the SAME op, so it
+        // inverts the same way. It is latent rather than absent: a stopped editor is refused above
+        // before the loop is reached, so only a PLAYING editor with no 3D surface gets here.
+        // Stop at whichever frame it fires on and report what WAS written (`framesWritten`/
+        // `paths`), the same shape the 504 catch below already uses — a panel closed mid-sequence
+        // must not read as a sequence that rendered nothing, nor as one that finished.
+        const frameRefusal = opRefusal(raw);
+        if (frameRefusal) {
+          // `tMs` too (#994 close-out F5): this tool's description says to time frames by the
+          // returned tMs[] and NEVER by frameIndex × 1/fps, so handing back 2 real frames with no
+          // tMs leaves the caller holding exactly the basis it was told not to use.
+          return json({ ...(raw as Record<string, unknown>), framesWritten: paths.length, paths, tMs },
+            refusalStatus(frameRefusal.code));
+        }
+        const result = raw as { dataUrl: string };
         tMs.push(Date.now() - t0);
         paths.push(writeDataUrlToTemp(result.dataUrl));
         // A FIXED interval between frames, deliberately — do NOT deadline-schedule this.
@@ -2087,7 +2122,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         ...(runMode ? { runMode } : {}),
       });
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e), framesWritten: paths.length, paths }, 504);
+      // Same reclassification as /api/render-scene above (#994 close-out F1).
+      return json({ error: String(e instanceof Error ? e.message : e), framesWritten: paths.length, paths, tMs },
+        relayFailureStatus(e));
     }
   }
 
@@ -4994,6 +5031,41 @@ async function describeUnresolvedAgainstLiveWorld(
   }
 
   return null; // not a router-owned route
+}
+
+/** An op that answered with a §5 refusal ENVELOPE rather than a result (#994), or null.
+ *
+ *  The discriminator is a `code` from the CLOSED set (`mcpResult.ts`'s `ERROR_CODES`) alongside
+ *  `ok:false` — deliberately narrow, because the ordinary `{ok:false, reason}` an op returns for a
+ *  bad parameter must keep its 200 + `isFailureBody` handling. Only an op that has named a code is
+ *  claiming to know which §5 failure this is, and only that claim earns a status of its own.
+ *
+ *  ⚠️ Why a route must relay this at all, when the op could just throw: it CANNOT. A throw becomes
+ *  a hard-coded 504 at ~24 catch sites, which the MCP client reads as `NOT_AVAILABLE_HERE` — "the
+ *  route is absent". So an op that knows the real code has no way to say it except by RETURNING it,
+ *  and the route has no way to honour it except by looking. That is the inversion #994 fixes. */
+function opRefusal(result: unknown): { code: ErrorCode; error?: string; options?: string[] } | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as { ok?: unknown; code?: unknown };
+  if (r.ok !== false || typeof r.code !== 'string') return null;
+  if (!(ERROR_CODES as readonly string[]).includes(r.code)) return null;
+  return result as { code: ErrorCode; error?: string; options?: string[] };
+}
+
+/** The HTTP status a §5 refusal travels on. The CODE is what the agent reacts to (`codeFromBody`
+ *  in the MCP client lets a body code beat the status-derived one), so this only has to avoid
+ *  lying to anything that reads the status alone — and 200 would, since `writeDataUrlToTemp` never
+ *  ran and there is no frame.
+ *
+ *  503 for `NO_RENDERER` matches every envelope this router already emits for it — the two
+ *  `unsavedRefusal`/probe-unknown sites and `/api/scene-mutate`'s (grep `code: 'NO_RENDERER'`;
+ *  all are 503). One code, one status, so the mapping is a rule rather than a per-site choice.
+ *  ⚠️ Deliberately NOT citing line numbers: they were `:1028`/`:2372` when written and one of
+ *  them already pointed at nothing two commits later. A line number in a comment is the
+ *  shadowing-constant class — it has to be kept in sync by hand and silently goes stale. Anything else the ops start naming is the op ANSWERING, which `relayFailureStatus`
+ *  above already argues is a 400 rather than a gateway failure. */
+function refusalStatus(code: ErrorCode): number {
+  return code === 'NO_RENDERER' ? 503 : 400;
 }
 
 /** Which status a thrown relay error deserves.

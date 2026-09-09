@@ -1224,13 +1224,58 @@ Three guards, all of which exist because the failure would otherwise be invisibl
   `SettingsMusicSlider`, `SettingsSfxSlider`) — to grow one, wrap it in a `div` that carries the
   binding and author `minTapSize` on the wrapper.
 
-⚠️ **The expander protects this element's own children — NOT its siblings, and that limit is the
-one that decides where the field is safe to author.** `isolation` puts the expander at the
-*parent's* z-order among siblings, so a zone overhanging a sibling that paints lower will take
-presses inside the overlap. That is inherent to growing a hit area in place. **`minTapSize` is
-therefore an authoring decision about a specific layout, not a value that is safe everywhere**: use
-it on a control with clearance, and fix the spacing instead on one packed against an interactive
-neighbour.
+#### The sibling rule — a zone LOSES to real content (#977, 2026-09-09)
+
+**A tap zone is a minimum courtesy area, and it only wins a press when nothing else would have
+handled it.** The renderer stamps the expander `data-tap-zone`; `runtime/ui/pressOrigin.ts` sees a
+press land on one, asks `document.elementsFromPoint` what is actually under the point, and hands the
+press to that element when it is a real control belonging to someone else. A zone still wins over
+decoration and over empty space, which is the normal use.
+
+- **Cost is one hit-test, and only for a press that lands on a zone.** ⚠️ That is not the same as
+  "rare": the expander is `zIndex: -1`, which is above the host's own BACKGROUND, so a press
+  anywhere on a `minTapSize` control not covered by a child element targets the zone — for a
+  background-image button with no element children, every press on it. The walk is cheap and the
+  veto almost always resolves to nothing; an earlier revision of this line claimed it "never runs on
+  an ordinary press", which is false.
+- **The first non-zone entry decides, and the walk stops there.** That is what the browser would
+  have hit; looking past it would hand the press to something a decorative element was legitimately
+  covering.
+- **A zone never loses to its own host, nor to any interactive ANCESTOR of it.** An ancestor
+  receives the click by bubbling anyway, so the host is the more specific handler. ⚠️ This is the
+  load-bearing half: every one of Court's 16 authored zones sits inside a panel carrying
+  `swallowClicks`, so without the ancestor test each pad vetoed to its own panel root — whose
+  handler swallows — and the courtesy area was **deleted** rather than narrowed.
+- Two overlapping zones fall through to whatever real control is under them.
+- **The redirect only fires when the RELEASE landed in the same zone as the press.** Otherwise a
+  drag that starts on a pad and ends anywhere else would be redirected and fired, which is precisely
+  the gesture #664 exists to reject. ⚠️ Two consequences worth knowing: a CANCELLED touch gesture
+  lands its `pointercancel` on the zone (implicit pointer capture), so the veto is cleared there
+  rather than by this gate; and a MOUSE press that drifts onto a child of the host before releasing
+  gets the host's binding instead of the neighbour's — that is a drag, so the pre-#977 outcome is
+  defensible, but it is a consequence rather than an oversight.
+- **The marker is runtime-only.** The editor's authoring preview does not emit it: the press tracker
+  is registered per DOCUMENT, which the two renderers share, so stamping it there would redirect
+  click-to-select onto the neighbouring entity.
+- ⚠️ **The redirect happens at CLICK time, in a document capture listener, and that is forced.** The
+  obvious implementation — dropping `pointer-events` on the zone at pointerdown so the release
+  re-hits the neighbour — *loses* the press: `click` fires on the nearest common ancestor of the down
+  and up targets, so down-on-zone plus up-on-neighbour fires the click on their shared **parent**.
+
+⚠️ **It fixes a TAP and not a DRAG.** A finger-drag STARTING inside the overlap still does not reach
+a scroll container underneath — the browser picks the scroll target at pointerdown, before any of
+this runs, and no JS can move the expander out of the way in time. So a zone overhanging a scrollable
+still costs that band its swipe. **This is the owner's explicit call (2026-09-09)**, taken over the
+alternative (portal every zone into a layer beneath all content, which fixes the drag too but falls
+behind a dialog's scrim and needs a per-stacking-context layer). ⚠️ Scroll containers are not *stamped* interactive, but that is not the same as being invisible to
+the rule: `closest` resolves past a scroll container to whatever interactive ancestor encloses it.
+What keeps that from swallowing a pad is the ancestor test above, not the absence of a marker.
+
+**What this changed for authors:** `minTapSize` used to be "an authoring decision about a specific
+layout, not a value that is safe everywhere" — a control packed against an interactive neighbour
+needed its spacing fixed instead. That is no longer true for taps, and #969's nine adjacent Court
+controls are unblocked to the same extent. The history below is kept because it is what the rule was
+derived from.
 
 **#973 OBSERVED it, twice, on the shipped Court scene** (#948's close-out only computed it). Driven
 with `document.elementsFromPoint` on the live DOM: at 375x667 the level-select pager arrows took the
@@ -1259,10 +1304,15 @@ load-bearing:
   is not there.
 
 A sound static check is a layout engine. **Verify a new `minTapSize` with the live probe** (recipe in
-#973), not by reading the scene.
+#973), not by reading the scene. ⚠️ Since #977 the engine rule makes the *tap* half of this harmless,
+so the probe is now checking the drag half and any layout the rule cannot see — not whether a control
+steals taps.
 
-The #664 press-origin gate needs no special handling: `pressBelongsTo` resolves a press through
-`closest('[data-press-origin]')`, and the expander is a descendant of the marked element.
+The #664 press-origin gate needs no special handling for the ordinary case: `pressBelongsTo`
+resolves a press through `closest('[data-press-origin]')`, and the expander is a descendant of the
+marked element. In the vetoed case the recorded press/release pair is cleared before the replacement
+click is dispatched — it was recorded against the ZONE, so leaving it would make `pressBelongsTo`
+fail *closed* on the element now receiving the click.
 
 ⚠️ **A tap zone is authored data, not a code constant** — it is exactly the "could the owner
 plausibly want this different after seeing it on screen?" case, so it lives on the trait and is set

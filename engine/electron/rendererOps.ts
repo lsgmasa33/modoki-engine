@@ -199,6 +199,107 @@ export function explainCaptureFailure(
     '(nothing to capture), "hidden" means the window is occluded, "stalled" means a real wedge.' + ctx;
 }
 
+/** The compositor could not produce a frame. A CLASS, not a message prefix (#994): the host route
+ *  has to tell this apart from an ordinary failure (a bad `maxSide`, an unwritable temp dir) to
+ *  give it a §5 code, and `relayFailureStatus`'s scar in `editorBackendRouter.ts` is exactly what
+ *  string-matching an error costs — a bare word in one op's prose eventually collides with
+ *  another's. `cause` keeps the raw `UnknownVizError` for anyone who wants it. */
+export class CaptureUnavailableError extends Error {
+  /** The window + renderer facts `explainCaptureFailure` was given. Carried STRUCTURALLY so the
+   *  refusal can branch on the cause instead of grepping the sentence — the same reason this is a
+   *  class and not a message prefix. */
+  readonly facts: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null };
+
+  constructor(
+    message: string,
+    facts: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null },
+    cause?: unknown,
+  ) {
+    super(message, { cause });
+    this.name = 'CaptureUnavailableError';
+    this.facts = facts;
+  }
+}
+
+/** Is this an ORDINARY, supported editor state — or a broken editor? (#994 close-out F2.)
+ *
+ *  ⚠️ This distinction is what keeps the live gate armed, and getting it wrong DISARMS it.
+ *  `NO_RENDERER` is in `test-live-tools.ts`'s `ENV_CODES` — "editor state, not tool health" — and
+ *  `modoki_capture_viewport` is non-mutating, so it is swept every run. Answering `NO_RENDERER` for
+ *  a CRASHED renderer or a lost GPU would turn a red gate green through a genuinely dead editor,
+ *  which is the one thing #994 must not do.
+ *
+ *  So it answers on POSITIVE evidence of a supported state, never by defaulting to one. Absence of
+ *  a known fault is not the same as a healthy editor: with no renderer facts at all the probe
+ *  itself failed, and `explainCaptureFailure` says so in as many words ("the renderer could not be
+ *  asked why"). "Could not look" is exactly `NOT_AVAILABLE_HERE`, and it is not environmental — so
+ *  an unknown cause reddens the sweep rather than being waved through. The two lists below mirror
+ *  `explainCaptureFailure`'s own branches, which already separate a fault from a supported state.
+ *
+ *  ⚠️ The FAULTS are checked FIRST, and the order matters: a destroyed window can still report a
+ *  stale `frameLoop: 'idle'` from the last successful probe, and reading that as "no viewport is
+ *  mounted" is precisely the green-through-a-dead-editor outcome. */
+function isOrdinaryState(f: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null }): boolean {
+  const w = f.window;
+  const s = f.surface;
+  // Faults — none of these self-recovers, and every one means the editor is broken, not busy.
+  if (w?.destroyed || w?.wcDestroyed || w?.crashed) return false;
+  if (s?.gpu?.deviceLost) return false;                        // explicitly "must be relaunched"
+  if (s?.frameLoop?.status === 'stalled') return false;        // a real wedge
+  if (s?.rendererGate?.status === 'failed') return false;      // "never self-recovers"
+  // Positive evidence of a supported state.
+  if (w?.minimized || w?.visible === false) return true;       // put it back on screen and retry
+  if (w && (w.width === 0 || w.height === 0)) return true;     // collapsed pane
+  const loop = s?.frameLoop?.status;
+  if (loop === 'idle' || loop === 'hidden' || loop === 'running') return true;
+  const gate = s?.rendererGate?.status;
+  if (gate === 'pending' || gate === 'ready') return true;
+  return false;                                                // could not look
+}
+
+/** The §5 refusal a failed capture answers with (#994).
+ *
+ *  It used to escape as a throw, which `backendServer.ts`'s catch-all turns into a **500** — read
+ *  by the MCP client as `NOT_AVAILABLE_HERE`, "could not look: the route is absent". For an
+ *  ordinary state (minimised, not visible, no viewport mounted) that is a lie about a healthy
+ *  editor, and `NO_RENDERER` — "nothing is rendering" — is what those actually are.
+ *
+ *  ⚠️ But NOT for every cause, and the first cut of this got that wrong by returning one code and
+ *  one options list for all five. Two things were broken by it, both caught in review:
+ *  ① a CRASHED renderer or a lost GPU would have been reported as `NO_RENDERER`, which the live
+ *  gate treats as environmental — a green sweep through a dead editor (see `isOrdinaryState`);
+ *  ② the options said "unminimise the window / open a panel / read the scene as data" while the
+ *  `error` in the same body said the editor must be RELAUNCHED. A refusal that lists an exit which
+ *  does not exist is worse than one that lists none — this module's own test says so.
+ *
+ *  ⚠️ `OCCLUDED` is not used for the minimised case, though it reads tempting. §5 defines it as
+ *  "the target is covered, so the input would land elsewhere" — an AIMING failure, about where a
+ *  tap goes. A minimised window is not mis-aimed; it is not rendering. One code, one reaction.
+ *
+ *  `error` is passed through whole rather than re-summarised: `explainCaptureFailure` is the thing
+ *  that knows which cause it was, and restating it here would be a second place to keep honest. */
+export function captureRefusalBody(e: CaptureUnavailableError): {
+  ok: false; code: 'NO_RENDERER' | 'NOT_AVAILABLE_HERE'; error: string; options: string[];
+} {
+  const broken = !isOrdinaryState(e.facts);
+  return {
+    ok: false,
+    code: broken ? 'NOT_AVAILABLE_HERE' : 'NO_RENDERER',
+    error: e.message,
+    options: broken
+      ? [
+        'relaunch the editor — a crashed renderer, a destroyed window and a lost GPU device do NOT self-recover, and the message above says which one this is',
+        'modoki_get_console_logs / modoki_diagnose before relaunching, if you want the cause on the record — a relaunch destroys it',
+        'read the scene as DATA instead — modoki_get_scene_state needs no renderer at all, and works from a different process than the one that died only if the backend is still up',
+      ]
+      : [
+        'restore/unminimise the editor window and bring it to the front, then retry',
+        'if no viewport is mounted, open the Scene or Game panel — or use modoki_render_scene, which renders offscreen and needs no mounted viewport',
+        'read the scene as DATA instead — modoki_get_scene_state / modoki_diagnose need no renderer at all',
+      ],
+  };
+}
+
 /** `webContents.capturePage()` asks Chromium's compositor (Viz) for a frame. When the
  *  compositor cannot produce one it rejects with a bare `UnknownVizError` — no window
  *  state, no page state, nothing pointing at WHY. That opaque string is what agents have
@@ -230,7 +331,9 @@ async function capturePageOrExplain(win: BrowserWindow, probe?: SurfaceProbe) {
     } catch { /* the window died mid-inspection — the raw cause below still stands */ }
     let surface: RenderSurfaceFacts | null = null;
     try { surface = (await probe?.()) ?? null; } catch { /* explanation loses a paragraph, not the error */ }
-    throw new Error(`capture_viewport failed: ${String(e)}. ${explainCaptureFailure(facts, surface)}`, { cause: e });
+    throw new CaptureUnavailableError(
+      `capture_viewport failed: ${String(e)}. ${explainCaptureFailure(facts, surface)}`,
+      { window: facts, surface }, e);
   }
 }
 

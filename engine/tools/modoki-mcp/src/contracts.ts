@@ -222,13 +222,33 @@ const DECLS: Record<string, Decl> = {
   // ── visual capture ──
   modoki_capture_viewport: {
     kind: 'read', method: 'POST', route: '/api/capture-viewport', requires: ['editor', 'electron'],
-    notes: 'FORCES a render, so it MASKS render-on-demand + stale-frame bugs. Use CDP for a true framebuffer.',
+    // ⚠️ This note said "FORCES a render, so it MASKS render-on-demand + stale-frame bugs" — the
+    // exact OPPOSITE of what this tool does, and the note that belongs on render_scene/-sequence
+    // below (found by #994's close-out sweep). `capturePage()` is a screenshot of the WINDOW, i.e.
+    // whatever each surface last drew, so it is the one capture tool that CAN show a stale frame —
+    // which is the entire reason the render-on-demand SceneView caveat exists. The tool's own
+    // description and CLAUDE.md § Debug Tools have both said so since the 2026-08-18 measurement;
+    // this line contradicted them from inside the contract table that is supposed to be the SSOT.
+    notes: 'Does NOT force a render — capturePage() returns whatever the window last drew, so an '
+      + 'unchanged capture is NOT evidence a change failed to render (the SceneView is '
+      + 'render-on-demand). Use modoki_render_scene to force one, or CDP for a true framebuffer. '
+      + 'Refuses NO_RENDERER (503) when the compositor cannot produce a frame — window minimised, '
+      + 'not visible, viewport unmounted, webContents destroyed (#994). That is the editor\'s state, '
+      + 'not a dead route: it used to escape as a bare throw and arrive as NOT_AVAILABLE_HERE.',
   },
   modoki_render_scene: {
     kind: 'read', method: 'POST', route: '/api/render-scene', requires: ['editor', 'renderer', 'scene'],
+    notes: 'FORCES a fresh render, so unlike capture_viewport it MASKS render-on-demand + '
+      + 'stale-frame bugs — the broken frame heals in the capture. Use CDP for a true framebuffer. '
+      + 'Refuses NO_RENDERER (503) when no scene renderer is registered; `surfaces` in '
+      + 'modoki_get_editor_state lists `game-3d` exactly when one is (#994).',
   },
   modoki_render_sequence: {
     kind: 'read', method: 'POST', route: '/api/render-sequence', requires: ['editor', 'renderer', 'scene'],
+    notes: 'FORCES a fresh render per frame, same masking caveat as render_scene. Refuses 409 '
+      + 'while the editor is STOPPED (every frame would be identical) and NO_RENDERER (503) with no '
+      + 'scene renderer registered — mid-sequence it reports `framesWritten`/`paths` for what did '
+      + 'land, rather than reading as either "rendered nothing" or "finished" (#994).',
   },
 
   // ── Enact: trusted input ──

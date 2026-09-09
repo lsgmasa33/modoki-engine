@@ -20,6 +20,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Pixi is mocked: a real Application needs a GPU. What matters is the wiring, not Pixi.
 const created: Array<{ destroyed: boolean; destroyArg: unknown }> = [];
+
+/** What `Application.destroy` was handed. Since #1000 that is an OPTIONS OBJECT, never the
+ *  boolean these tests originally read: the boolean form always trips
+ *  `GlobalResourceRegistry.release()` inside `AbstractRenderer.destroy`, clearing Pixi's
+ *  process-global pools out from under every other live surface, so every teardown now names
+ *  `removeView` and `releaseGlobalResources` separately
+ *  (`runtime/rendering/pixiGlobalResources.ts`). Cited by SYMBOL, not by line — a dependency's
+ *  line numbers move on every bump and nothing watches them (#966). */
+const removeViewOf = (arg: unknown) => (arg as { removeView?: boolean } | undefined)?.removeView;
+const releasesGlobalsOf = (arg: unknown) =>
+  (arg as { releaseGlobalResources?: boolean } | undefined)?.releaseGlobalResources;
   /** Process-monotonic, like Pixi's own. NEVER reset per test — see `uid` below. */
   let nextRendererUid = 0;
 /** Lets a test HOLD `Application.init()` open. The timeout/retry race lives entirely inside that
@@ -70,7 +81,9 @@ vi.mock('pixi.js', () => {
     async init() { if (initGate.hold) await initGate.hold; /* resolved = context acquired */ }
     destroy(arg: unknown) { this.rec.destroyed = true; this.rec.destroyArg = arg; }
   }
-  return { Application, Container };
+  // #1000: `teardownSlot` redeems a deferred global-pool release through this — see the note in
+  // canvas2DPool.test.ts's mock.
+  return { Application, Container, GlobalResourceRegistry: { release: () => {} } };
 });
 vi.mock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => false }));
 // Each registration records its own disposer-call count, so "the passthrough was actually
@@ -87,9 +100,16 @@ vi.mock('../../src/runtime/core/pointerBlockers', () => ({
 }));
 
 import { Canvas2DPool } from '../../src/runtime/rendering/canvas2DPool';
+import {
+  livePixiApplicationCount,
+  __resetPixiApplicationTrackingForTest,
+} from '../../src/runtime/rendering/pixiGlobalResources';
 
 let pool: Canvas2DPool;
-beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; pool = new Canvas2DPool(); });
+// The live-Application count is module state and outlives a test file, so a pool abandoned by an
+// earlier test would otherwise leave it permanently above zero and make every count assertion
+// below read a number nobody set.
+beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; __resetPixiApplicationTrackingForTest(); pool = new Canvas2DPool(); });
 afterEach(() => { vi.restoreAllMocks(); });
 
 /** Drive the event the browser fires. jsdom has no WebGL, so the listener is what we test. */
@@ -147,9 +167,17 @@ describe('canvas2DPool — GPU context loss', () => {
     expect(slot.canvas.isConnected, 'and it must take the old one\'s place in the DOM').toBe(
       canvasBefore.isConnected,
     );
-    // `destroy(false)` — `destroy(true)` (used elsewhere in the pool) would also destroy the
-    // canvas; here the old node is being replaced, not torn down under a live mount.
-    expect(created[madeBefore - 1].destroyArg, 'must not destroy via the view path').toBe(false);
+    // `removeView: false` — the default (`true`, what every other teardown in the pool takes)
+    // would also destroy the canvas; here the old node is being replaced, not torn down under a
+    // live mount.
+    expect(removeViewOf(created[madeBefore - 1].destroyArg), 'must not destroy via the view path').toBe(false);
+    // ⚠️ And it must not sweep Pixi's process-global pools either. A rebuild is NOT a terminal
+    // teardown: the Application is replaced immediately and `slot.container`'s whole subtree is
+    // deliberately kept alive across the swap, so "nothing else is bound" is false however the live
+    // count reads — and on the shipped-game shape (one Canvas2D surface, one Application) the count
+    // DOES read zero here, which is exactly when a real context-loss rebuild happens on device.
+    // The old bare `destroy(false)` could never release anything; this pins that it still cannot.
+    expect(releasesGlobalsOf(created[madeBefore - 1].destroyArg), 'a rebuild must never sweep the global pools').toBe(false);
     // Pixi's scene graph is renderer-agnostic; re-attaching it is what makes the content come
     // back without Scene2D rebuilding every display object.
     expect(slot.container, 'the scene graph must survive').toBe(containerBefore);
@@ -235,6 +263,41 @@ describe('canvas2DPool — GPU context loss', () => {
     expect(slot.app, 'precondition: a later Application owns the slot').not.toBe(superseded);
     expect(rec.destroyed, 'the superseded Application must not leak its GPU context').toBe(true);
     expect(slot.initialized, 'and it must not claim the slot came up').toBe(false);
+  });
+
+  // ⚠️ **The one line in this fix whose removal used to survive every test** (review finding F1).
+  // `initSlotApp`'s orphan bail-out passes `null` for the deregister, and that reads like an
+  // oversight — every sibling call hands over a real one. Spending `slot.releasePixiApp` there
+  // instead takes back a registration belonging to the LIVE successor: the count then sits below
+  // the number of live Applications, and the next teardown of any OTHER surface computes
+  // `liveApps === 0`, passes `releaseGlobalResources: true`, and sweeps Pixi's global pools while
+  // this surface's BindGroups are bound. #1000, reopened through its own fix, with `verify` green.
+  //
+  // Driven, not simulated: a real loss-triggered rebuild brings a SECOND Application up and
+  // registers it while the first init is still parked, and only then is the abandoned init let go.
+  it('an init orphaned by a rebuild must not spend the SUCCESSOR\'s registration (#1000)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    let releaseFirstInit!: () => void;
+    initGate.hold = new Promise<void>((r) => { releaseFirstInit = r; });
+    const slot = pool.allocate(21)!;
+    await vi.advanceTimersByTimeAsync(0);      // let initSlotApp actually REACH app.init()
+    const orphaned = slot.app;
+    expect(livePixiApplicationCount(), 'precondition: nothing has come up yet').toBe(0);
+
+    // A loss schedules a rebuild. Let the SECOND Application initialise normally, so it registers.
+    initGate.hold = null;
+    fireLost(slot.canvas);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(slot.app, 'precondition: a later Application owns the slot').not.toBe(orphaned);
+    expect(livePixiApplicationCount(), 'precondition: the successor is registered').toBe(1);
+
+    // …and only NOW does the abandoned init settle and hit the orphan bail-out.
+    releaseFirstInit();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(livePixiApplicationCount(), "the successor's registration must survive the orphan's destroy").toBe(1);
   });
 
   it('never drops a rebuild request in SILENCE', async () => {
@@ -417,7 +480,7 @@ describe('canvas2DPool.destroyPool — the boot race (#213 root cause)', () => {
 
     await slot.ready;                     // …and the late-arriving context must not leak
     expect(rec.destroyed, 'a disposed slot must not orphan its GPU context').toBe(true);
-    expect(rec.destroyArg).toBe(true);
+    expect(removeViewOf(rec.destroyArg)).toBe(true);
     expect(slot.initialized, 'and it must not report itself as usable').toBe(false);
   });
 
@@ -451,7 +514,7 @@ describe('canvas2DPool.destroyPool — the boot race (#213 root cause)', () => {
 
     expect(slot.destroyed, 'a kept slot must be destroyed once its last claim drops').toBe(true);
     expect(rec.destroyed, 'its Application must actually be torn down, not merely flagged').toBe(true);
-    expect(rec.destroyArg, 'the same full teardown the shrink/disposal paths use').toBe(true);
+    expect(removeViewOf(rec.destroyArg), 'the same full teardown the shrink/disposal paths use').toBe(true);
 
     // It must not have been quietly RECYCLED either — a slot this pool destroyed must not be
     // handed back for reuse. With only one slot ever created here, the old (buggy) reclaim-only
@@ -899,5 +962,108 @@ describe('canvas2DPool — slot-reused label is read at FIRE time, not attach ti
     // The #794 issue reference the shared module's generic catch message drops per-caller —
     // canvas2DPool restores it via the label itself (see canvas2DPool.ts).
     expect(msg).toMatch(/#794/);
+  });
+});
+
+// ── #1000: a wedge that is NOT a context-loss event must still reach the rebuild ──
+//
+// `slot.recovery` is a complete single-flight, bounded-backoff rebuild scheduler, and until #1000
+// the only things that could reach it were the three context-loss LISTENERS. `renderAll` DETECTED
+// a stuck renderer (30 consecutive throwing frames) and only `console.warn`ed — so a canvas wedged
+// by a batcher holding a destroyed texture source (#1000's `checkAndUpdateTexture` null) retried
+// the same dead renderer forever. The mechanism existed and could not fire, which is this repo's
+// dominant defect class.
+//
+// The mocked `renderer` here has no `render()` at all, so every frame throws — a wedge with no
+// loss event anywhere near it, which is exactly the case under test.
+describe('canvas2DPool — a stuck renderer reaches recovery (#1000)', () => {
+  /** Drive `n` throwing frames through a slot the pool considers renderable. */
+  const wedge = (slot: { canvas: HTMLCanvasElement }, n: number) => {
+    slot.canvas.width = 64; slot.canvas.height = 64;
+    for (let i = 0; i < n; i++) pool.renderAll();
+  };
+
+  it('rebuilds a canvas wedged with no context-loss event', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(31)!;
+    await slot.ready;
+    const madeBefore = created.length;
+    const canvasBefore = slot.canvas;
+
+    wedge(slot, 30);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(created.length, 'the wedged slot must have been rebuilt').toBe(madeBefore + 1);
+    expect(slot.canvas, 'onto a fresh canvas, like the loss path').not.toBe(canvasBefore);
+  });
+
+  it('does NOT rebuild before the threshold — a one-frame teardown race must stay silent', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(32)!;
+    await slot.ready;
+    const madeBefore = created.length;
+
+    wedge(slot, 3);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(created.length, 'a transient throw is swallowed by design').toBe(madeBefore);
+  });
+
+  // ⚠️ The reason the latch exists. `RendererRecovery.request()` sets `failures = 0` ("a fresh
+  // fault gets the full retry budget"), so asking once per stuck FRAME would reset the
+  // bounded-attempt budget on every frame and turn `maxAttempts` into an unbounded rebuild loop.
+  //
+  // ⚠️ **The frames must straddle the rebuild, and that is the whole design of this test.** A
+  // first draft wedged 200 frames and advanced the clock once — it passed with the latch DELETED,
+  // because every one of those 200 `request()` calls happened while the recovery timer was still
+  // pending, and `schedule()` coalesces on `timer !== null` all by itself. The latch is invisible
+  // until frames arrive AFTER a rebuild has completed, which is exactly when a real wedge keeps
+  // throwing. Mutation-checked in both shapes; only this one goes red.
+  it('asks exactly ONCE per episode — including frames after the rebuild has landed', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(33)!;
+    await slot.ready;
+    const madeBefore = created.length;
+
+    wedge(slot, 30);
+    await vi.advanceTimersByTimeAsync(2000);          // the rebuild lands
+    expect(created.length).toBe(madeBefore + 1);
+
+    // The rebuilt renderer is still wedged (this mock has no `render()` on any Application), so
+    // these frames throw too. Without the latch they request again and buy a second rebuild.
+    wedge(slot, 60);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(created.length, 'one rebuild per episode, not one per post-rebuild frame').toBe(madeBefore + 1);
+  });
+
+  it('a slot returned to the free pool starts a fresh episode', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(34)!;
+    await slot.ready;
+    wedge(slot, 30);
+    await vi.advanceTimersByTimeAsync(2000);
+    const afterFirst = created.length;
+
+    // Back to the free pool and out again: the latch must not survive, or the reused slot's own
+    // wedge would never be recovered.
+    pool.release(34);
+    // `release()` already ran `reclaimIfUnclaimed` synchronously (nothing holds a mount claim),
+    // which is the clear this asserts. This frame is just the pool settling; it is NOT what
+    // clears the latch, and an earlier comment here said it was.
+    pool.renderAll();
+    const reused = pool.allocate(35)!;
+    await reused.ready;
+    wedge(reused, 30);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(created.length, 'the reused slot gets its own rebuild').toBeGreaterThan(afterFirst);
   });
 });

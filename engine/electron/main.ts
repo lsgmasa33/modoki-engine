@@ -94,7 +94,7 @@ import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
 import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
-import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
+import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
 import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
@@ -1437,11 +1437,24 @@ app.whenReady().then(async () => {
       // The probe runs ONLY if the compositor refuses a frame — it is what lets the error say
       // "no viewport is mounted, nothing to capture" instead of blaming a wedged renderer for a
       // supported layout. Short timeout: a diagnostic must not out-wait the thing it explains.
-      const result = await captureViewport(mainWindow, {
-        ...opts,
-        probe: () => requestRenderer('editor-state', {}, 1500) as Promise<RenderSurfaceFacts | null>,
-      });
-      return { kind: 'json', body: result };
+      try {
+        const result = await captureViewport(mainWindow, {
+          ...opts,
+          probe: () => requestRenderer('editor-state', {}, 1500) as Promise<RenderSurfaceFacts | null>,
+        });
+        return { kind: 'json', body: result };
+      } catch (e) {
+        // A compositor that cannot produce a frame is a §5 NO_RENDERER refusal, not a transport
+        // failure (#994). Uncaught it reaches `backendServer.ts`'s catch-all as a 500, which the
+        // MCP client reads as NOT_AVAILABLE_HERE — "the route is absent" — for an ordinary editor
+        // state (window minimised, no viewport mounted). 503 matches the status this router's
+        // sibling envelopes already use for NO_RENDERER; the CODE is what the agent reacts to.
+        // Anything else still throws: an unwritable temp dir is not a renderer fact.
+        if (e instanceof CaptureUnavailableError) {
+          return { kind: 'json', status: 503, body: captureRefusalBody(e) };
+        }
+        throw e;
+      }
     }
     // ── Trusted input (`/api/input/*`), incl. selector-aware aiming. Extracted so the
     //    resolve-then-dispatch ordering is unit-testable. ──

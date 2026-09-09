@@ -8,7 +8,7 @@
  *  events, which is exactly what a synthetic `dispatchEvent` cannot faithfully reproduce. */
 
 import { test, expect } from '@playwright/test';
-import { gotoEditorWithScene, idByName, waitForFrames } from './helpers';
+import { gotoEditorWithScene, idByName, waitForFrames, stableBoundingBox } from './helpers';
 
 // Dedicated fixture: a Scrim with a click binding, a Panel child (itself interactive, so
 // UINode marks it a valid press origin), and a PanelChild with NO binding of its own. The press
@@ -37,8 +37,10 @@ const SWALLOW_SCENE = '/tests/e2e/fixtures/e2e-press-origin-swallow.scene.json';
 
 /** Boots the editor on `scene`, switches to the Game tab and presses Play — bindings are inert
  *  until PLAYING, so a test that skips this asserts nothing. */
-async function playScene(page: import('@playwright/test').Page, scene: string) {
-  await gotoEditorWithScene(page, scene, 'Scrim');
+async function playScene(page: import('@playwright/test').Page, scene: string, waitFor = 'Scrim') {
+  // `waitFor` is a parameter because it used to be the literal 'Scrim' — fine while every scene
+  // here had one, and a 30s timeout with a misleading stack the moment a fixture didn't.
+  await gotoEditorWithScene(page, scene, waitFor);
   await page.locator('.flexlayout__tab_button_content', { hasText: 'Game' }).first().click();
   await page.locator('[data-game-view-area]').waitFor({ state: 'visible', timeout: 10_000 });
   await page.getByTitle('Play (⌘P)').click();
@@ -224,4 +226,73 @@ test('a plain click on the scrim still fires its binding, with a swallowClicks p
   await waitForFrames(page);
 
   await expect(scrim).toHaveText('DISMISSED');
+});
+
+// ── #977: a minTapSize zone must LOSE to real content underneath it ──
+//
+// The unit tests in `pressOrigin.test.ts` pin the DECISION (`resolveTapZoneVeto`) against a stack
+// the test hands it. They cannot pin the WIRING, and the wiring is most of the risk: that the stack
+// really comes from the hit point, that the zone genuinely covers the neighbour at a real layout,
+// and that the replacement click reaches the neighbour's binding through React. jsdom has no
+// layout, so `document.elementsFromPoint` answers nothing there — only a real browser can produce
+// any of it. Same argument as this file's own header makes for `pressBelongsTo`.
+//
+// The fixture reproduces #973's geometry: a 20px control carrying `minTapSize: 48`, directly below
+// a 100px sibling, so the expander overhangs the sibling's bottom by 14px. One column has an
+// INTERACTIVE sibling (the zone must lose), the other a DECORATIVE one (the zone must win).
+const TAP_ZONE_SCENE = '/tests/e2e/fixtures/e2e-tap-zone-veto.scene.json';
+
+/** A point inside the arrow's 48px expander but vertically inside the sibling ABOVE it. */
+async function overlapPoint(
+  page: import('@playwright/test').Page,
+  arrow: number | null,
+  sibling: number | null,
+) {
+  const a = await stableBoundingBox(page.locator(`[data-entity-id="${arrow}"]`));
+  const s = await stableBoundingBox(page.locator(`[data-entity-id="${sibling}"]`));
+  const x = a.x + a.width / 2;                       // horizontally centred on the arrow
+  const y = Math.min(a.y - 3, s.y + s.height - 3);   // ~3px above the arrow: inside the pad, inside the sibling
+  expect(y, 'the probe point must lie inside the sibling, or this test proves nothing')
+    .toBeGreaterThan(s.y);
+  return { x, y };
+}
+
+test('a tap zone overhanging an INTERACTIVE sibling hands the press back to it (#977)', async ({ page }) => {
+  await playScene(page, TAP_ZONE_SCENE, 'Arrow');
+  const tileId = await idByName(page, 'Tile');
+  const arrowId = await idByName(page, 'Arrow');
+
+  const { x, y } = await overlapPoint(page, arrowId, tileId);
+  await page.mouse.click(x, y);
+  await waitForFrames(page, 3);
+
+  await expect(page.locator(`[data-entity-id="${tileId}"]`), 'the tile owns this pixel').toContainText('TILE-HIT');
+  await expect(page.locator(`[data-entity-id="${arrowId}"]`), 'and the arrow must not have fired').not.toContainText('ARROW-HIT');
+});
+
+// ⚠️ THE ACCEPT SIDE, and the assertion this change most needs. A zone overhanging DECORATION is
+// the normal, intended use of minTapSize — if the veto fires here, every enlarged tap target in
+// every project silently shrinks back to its artwork, which is a far worse regression than the
+// defect being fixed.
+test('a tap zone overhanging DECORATION still wins the press (#977)', async ({ page }) => {
+  await playScene(page, TAP_ZONE_SCENE, 'Arrow');
+  const decorId = await idByName(page, 'Decor');
+  const arrowId = await idByName(page, 'DecorArrow');
+
+  const { x, y } = await overlapPoint(page, arrowId, decorId);
+  await page.mouse.click(x, y);
+  await waitForFrames(page, 3);
+
+  await expect(page.locator(`[data-entity-id="${arrowId}"]`), 'the courtesy area still works over decoration').toContainText('DECORARROW-HIT');
+});
+
+test('a press on the control ITSELF is unaffected — a zone never vetoes its own host (#977)', async ({ page }) => {
+  await playScene(page, TAP_ZONE_SCENE, 'Arrow');
+  const arrowId = await idByName(page, 'Arrow');
+
+  const a = await stableBoundingBox(page.locator(`[data-entity-id="${arrowId}"]`));
+  await page.mouse.click(a.x + a.width / 2, a.y + a.height / 2);
+  await waitForFrames(page, 3);
+
+  await expect(page.locator(`[data-entity-id="${arrowId}"]`)).toContainText('ARROW-HIT');
 });

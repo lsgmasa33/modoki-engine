@@ -41,6 +41,7 @@ import {
   validateSceneData,
   loadManifestJson,
   renderSceneOffscreen,
+  hasSceneRenderer,
   journalEvents,
   clearJournal,
   setJournalEnabled,
@@ -622,9 +623,62 @@ registerAgentOp('scene-state', (params) => {
   const p = (params ?? {}) as SceneStateParams & { precision?: number };
   return roundFloats(dumpSceneState(p), resolvePrecision(p.precision));
 });
+/** The §5 refusal `render-scene` answers when no scene renderer is registered (#994).
+ *
+ *  Shape, not prose: `code` is what the MCP client reads back (`codeFromBody` in
+ *  `tools/modoki-mcp/src/context.ts` lets a body-supplied code beat the one derived from the HTTP
+ *  status) and what `test-live-tools.ts` classifies on — `NO_RENDERER` is already in its `ENV_CODES`,
+ *  so this needs no harness change. `error` carries the WHY in the caller's terms; `options` is the
+ *  field that turns a dead end into the next move.
+ *
+ *  ⚠️ WHAT THIS DELIBERATELY DOES NOT SAY. A first draft blamed an unselected Game TAB and told the
+ *  reader to check `gameView.panelMounted`. Both were wrong, and measuring beat repeating: on this
+ *  clone's editor (games/3d-test, 2026-09-09) `gameView.panelMounted` was **false** while
+ *  `surfaces` listed `game-3d` and `/api/render-scene` returned a frame. `panelMounted` is
+ *  `GameView.tsx`'s own mount flag — a different fact — so a refusal citing it would have sent the
+ *  reader to a field that does not answer this question. That is the exact defect this issue is
+ *  about, one layer up. (`modoki_render_scene`'s own tool description still carries the same claim;
+ *  recorded on #994, not fixed here — the true mount story was not established.)
+ *
+ *  What IS established, by exhaustive grep: `Scene3D.tsx` is the repo's ONLY caller of
+ *  `registerSceneRenderer`, and it registers the renderer and the `game-3d` bounds provider in one
+ *  effect, dropping both through the same teardown scope. So `surfaces` containing `game-3d` is the
+ *  observable for "a renderer is registered", and it is what the options point at. */
+export const NO_RENDERER_REFUSAL = Object.freeze({
+  ok: false as const,
+  code: 'NO_RENDERER' as const,
+  error:
+    'no scene renderer is registered, so there is nothing to render offscreen and nothing was '
+    + 'rendered. The runtime Scene3D layer is the only thing that registers one, and it is absent '
+    + 'when the project is built without the 3D renderer module (build.modules.render3d:false) or '
+    + 'sets disable3D, and before the app shell has mounted it. This is the editor\'s STATE — NOT a '
+    + 'missing route, NOT a wedged editor, and NOT a reason to relaunch.',
+  options: [
+    'modoki_get_editor_state — `surfaces` lists `game-3d` exactly when a scene renderer is registered; if it is missing, this refusal is why',
+    'if the 3D surface should be up but is not, modoki_diagnose and modoki_get_console_logs report a renderer that failed to come up',
+    'read the scene as DATA instead — modoki_get_scene_state / modoki_diagnose need no renderer at all',
+  ],
+  // FROZEN: one object is returned BY REFERENCE to every caller of this op, so an accidental
+  // mutation anywhere would rewrite the refusal for every future call. Nothing mutates it today
+  // (the router spreads rather than assigns) — freezing is what keeps that true.
+});
+
 // Deterministic offscreen frame → JPEG data URL. The backend decodes it to a temp
 // file so the agent gets a path, not an inline image.
-registerAgentOp('render-scene', (params) => renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts));
+//
+// The no-renderer case is a §5 REFUSAL, not a throw (#994). `renderSceneOffscreen` rejects with a
+// plain Error, and every route that relays this op turns a throw into a hard-coded 504 → the MCP
+// client's `NOT_AVAILABLE_HERE`, i.e. "could not look: the route is absent". That is the exact
+// inversion §5 exists to prevent: the route is present, the renderer answered, and it said no —
+// an ordinary editor state — a project built without the 3D renderer module, or a Game tab that has
+// never been opened this session — was reported to the agent as a dead tool, and to
+// `test:mcp:live` as a DEFECT.
+// This generalises the lesson already applied to the game-tool op 200 lines below (`:833`): a
+// state refusal names its own code, because the op is the only layer that knows it.
+registerAgentOp('render-scene', (params) => {
+  if (!hasSceneRenderer()) return NO_RENDERER_REFUSAL;
+  return renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts);
+});
 // Summary-first at the OP, never in `dumpConsoleLogs` — `diagnose` (below) reads that
 // producer directly for its error list, and a default tail there would silently drop errors
 // from `modoki_diagnose` with no failing test. The shared ring holds 1000 entries in the editor

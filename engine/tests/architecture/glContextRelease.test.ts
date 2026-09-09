@@ -26,6 +26,9 @@
  *  short-lived. The `ShaderPreview.tsx` Pixi `Application` gap named above is now covered by the
  *  sibling guard, `rendererLossHandling.test.ts` (#795) — RELEASE-on-teardown (this file) and
  *  DETECT-on-construction (that one) are different properties over the same construction sites.
+ *  A third joined them in #1000: `pixiApplicationTeardown.test.ts`, which pins that a Pixi
+ *  `Application` is never torn down with the boolean `destroy` form (it sweeps Pixi's
+ *  process-global pools for every live surface, not just its own).
  *
  *  The scan runs on comment-stripped source, so a `forceContextLoss` mentioned only in a comment
  *  (e.g. a stale TODO) cannot satisfy the pairing. */

@@ -4,7 +4,7 @@
  *  deliberate). */
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo, clearPressOrigin } from '../../src/runtime/ui/pressOrigin';
+import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, installPressOriginTracking, pressBelongsTo, clearPressOrigin, resolveTapZoneVeto } from '../../src/runtime/ui/pressOrigin';
 
 /** jsdom's PointerEvent support varies by version — fall back to a plain Event carrying a
  *  `target` when it's unavailable (matches the fallback other tests in this suite use).
@@ -192,5 +192,188 @@ describe('pressOrigin', () => {
     expect(pressBelongsTo(el1)).toBe(true);
 
     disposeDoc2();
+  });
+});
+
+// ── #977: a tap zone must LOSE to real content underneath it ──
+//
+// `UIElement.minTapSize` emits a transparent expander that sits at the PARENT's z-order among its
+// SIBLINGS, so it takes presses inside any overlap. The rule is that a MINIMUM courtesy area loses
+// to anything that would have handled the press itself, and wins everywhere else.
+//
+// ⚠️ **The decision is tested as a pure function, on purpose.** jsdom has no layout, so
+// `document.elementsFromPoint` answers nothing there — a test that drove the real DOM path would be
+// feeding the resolver a stack it invented and then asserting the invention. The wiring (that the
+// stack really comes from the hit point, and that the replacement click reaches the neighbour's
+// binding) needs a real browser and lives in `engine/tests/e2e/press-origin.spec.ts`.
+describe('resolveTapZoneVeto (#977)', () => {
+  /** `<root data-press-origin><host data-press-origin><zone data-tap-zone/></host><neighbour/></root>`
+   *
+   *  ⚠️ **The ROOT is interactive on purpose, and an earlier version of this helper left it plain.**
+   *  Every one of Court's 16 authored `minTapSize` controls is a `*Close` or pager button inside a
+   *  panel carrying `swallowClicks` — which `UINode.tsx` turns into `data-press-origin` — so a bare
+   *  root models a shape NO shipping scene has. With it, `closest` on a decorative neighbour
+   *  resolves to `null` and the accept-side cases pass under a correct implementation *and* under
+   *  the ancestor bug that deleted every pad. This one attribute is the difference. */
+  function build(neighbourInteractive: boolean, neighbourChild = false) {
+    const root = document.createElement('div');
+    root.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    const host = document.createElement('div');
+    host.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    const zone = document.createElement('div');
+    zone.setAttribute(UI_TAP_ZONE_ATTR, '');
+    host.appendChild(zone);
+    const neighbour = document.createElement('div');
+    if (neighbourInteractive) neighbour.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    const inner = document.createElement('span');
+    neighbour.appendChild(inner);
+    root.append(host, neighbour);
+    document.body.appendChild(root);
+    return { root, host, zone, neighbour, hit: neighbourChild ? inner : neighbour };
+  }
+
+  it('hands the press to an interactive neighbour under the point', () => {
+    const { zone, hit } = build(true);
+    expect(resolveTapZoneVeto([zone, hit], zone)).toBe(hit);
+  });
+
+  it('dispatches on the element the browser would have hit, not on its interactive ancestor', () => {
+    const { zone, hit, neighbour } = build(true, true);
+    // `hit` is a plain <span> inside the interactive neighbour. Returning the ANCESTOR would skip
+    // any handler bound between them, so the browser's own target is what gets handed back.
+    const got = resolveTapZoneVeto([zone, hit], zone);
+    expect(got).toBe(hit);
+    expect(got).not.toBe(neighbour);
+  });
+
+  // ⚠️ THE ACCEPT SIDE. A zone overhanging DECORATION is the normal, intended use of minTapSize —
+  // if this starts returning a veto, every enlarged tap target silently stops working, and that is
+  // a far worse regression than the one being fixed. Proving a guard rejects never proves it
+  // accepts.
+  it('keeps the press when the neighbour underneath is decorative', () => {
+    const { zone, hit } = build(false);
+    expect(resolveTapZoneVeto([zone, hit], zone)).toBeNull();
+  });
+
+  it('keeps the press over empty space — nothing under the point at all', () => {
+    const { zone } = build(false);
+    expect(resolveTapZoneVeto([zone], zone)).toBeNull();
+  });
+
+  it("never loses to its OWN host — a zone must not veto the control it belongs to", () => {
+    const { zone, host } = build(true);
+    // Inside the host's own box the first non-zone entry is the host itself.
+    expect(resolveTapZoneVeto([zone, host], zone)).toBeNull();
+  });
+
+  it('skips a SECOND overlapping zone rather than handing the press to its host', () => {
+    const { zone, hit } = build(true);
+    const other = document.createElement('div');
+    other.setAttribute(UI_TAP_ZONE_ATTR, '');
+    const otherHost = document.createElement('div');
+    otherHost.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    otherHost.appendChild(other);
+    document.body.appendChild(otherHost);
+    // Two zones stacked over one real control: zones are not handlers, so the real control wins.
+    expect(resolveTapZoneVeto([zone, other, hit], zone)).toBe(hit);
+  });
+
+  // ⚠️ The regression that matters most: with an interactive ANCESTOR (a dialog root, a
+  // swallowClicks panel) the owner resolves UP past the decorative container to that ancestor. It is
+  // not "someone else" — it would receive the click by bubbling anyway — so the zone must keep the
+  // press. Without this, every pad in the repo vetoed to its own panel root and was swallowed.
+  it('keeps the press when the owner underneath is an ANCESTOR of the host', () => {
+    const { zone, root } = build(false);
+    // `root` is interactive and contains the host; the decorative neighbour resolves to it.
+    const decorChild = document.createElement('span');
+    root.appendChild(decorChild);
+    expect(resolveTapZoneVeto([zone, decorChild], zone)).toBeNull();
+  });
+
+  it('stops at the first non-zone entry — it does not look PAST decoration for something interactive', () => {
+    const { zone, host } = build(false);
+    const decor = document.createElement('div');
+    const buried = document.createElement('div');
+    buried.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    document.body.append(decor, buried);
+    // The decoration was legitimately covering `buried`; handing the press past it would give the
+    // press to a control the user could not see or reach.
+    expect(resolveTapZoneVeto([zone, decor, buried], zone)).toBeNull();
+    expect(host).toBeTruthy();
+  });
+});
+
+// ── #977: the redirect must belong to the gesture that vetoed ──
+//
+// `resolveTapZoneVeto` above is the DECISION; this is the PLUMBING that spends it. jsdom has no
+// layout, so `document.elementsFromPoint` is stubbed — that fakes the BROWSER's hit test, not the
+// mechanism under test, which is whether the click is matched back to its own press.
+describe('tap-zone redirect is gesture-scoped (#977)', () => {
+  let dispose: () => void;
+  let zone: HTMLElement;
+  let neighbour: HTMLElement;
+  let elsewhere: HTMLElement;
+  let neighbourClicks: number;
+
+  beforeEach(() => {
+    const root = document.createElement('div');
+    root.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    const host = document.createElement('div');
+    host.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    zone = document.createElement('div');
+    zone.setAttribute(UI_TAP_ZONE_ATTR, '');
+    host.appendChild(zone);
+    neighbour = document.createElement('div');
+    neighbour.setAttribute(UI_PRESS_ORIGIN_ATTR, '');
+    elsewhere = document.createElement('div');
+    root.append(host, neighbour, elsewhere);
+    document.body.appendChild(root);
+
+    neighbourClicks = 0;
+    neighbour.addEventListener('click', () => { neighbourClicks++; });
+    (document as unknown as { elementsFromPoint: unknown }).elementsFromPoint = () => [zone, neighbour];
+    dispose = installPressOriginTracking(document);
+  });
+  // The stub is on `document` and outlives the test that set it — restore it, or the next suite
+  // appended below inherits a hit-test pointing at detached elements.
+  const realElementsFromPoint = (document as unknown as { elementsFromPoint?: unknown }).elementsFromPoint;
+  afterEach(() => {
+    dispose();
+    document.body.innerHTML = '';
+    (document as unknown as { elementsFromPoint: unknown }).elementsFromPoint = realElementsFromPoint;
+  });
+
+  const click = (el: Element) => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+  it('redirects when press AND release both land in the zone', () => {
+    firePointer('pointerdown', zone);
+    firePointer('pointerup', zone);
+    click(zone);
+    expect(neighbourClicks).toBe(1);
+  });
+
+  // ⚠️ The hazard this closes. Reading the veto alone hijacked ANY click while one was held: press
+  // in the overlap, drag away, release elsewhere — the browser fires click on the common ancestor,
+  // the redirect fired the neighbour's binding, and because the redirect nulls the press pair
+  // `pressBelongsTo` then failed OPEN. That is the drag #664 exists to reject, with its only gate
+  // removed.
+  it('does NOT redirect when the release landed outside the zone', () => {
+    firePointer('pointerdown', zone);
+    firePointer('pointerup', elsewhere);
+    click(elsewhere);
+    expect(neighbourClicks).toBe(0);
+  });
+
+  // ⚠️ **The cancel lands ON THE ZONE, and that is the whole point of this test.** A touch pointer
+  // takes implicit pointer capture on its `pointerdown` target, so `pointercancel` is dispatched
+  // there — not somewhere else. An earlier version of this test fired it at `elsewhere`, which is
+  // the release-mismatch path the test above already covers, so it went green while the real shape
+  // left a spendable veto for the next pointer-less click (a screen-reader activation, or any
+  // `element.click()`). Measured with a scratch probe before this was fixed: 1 redirect, expected 0.
+  it('does NOT let a CANCELLED touch gesture leave a veto for a later click', () => {
+    firePointer('pointerdown', zone);
+    firePointer('pointercancel', zone);   // implicit capture — the real browser shape
+    click(elsewhere);
+    expect(neighbourClicks).toBe(0);
   });
 });

@@ -114,8 +114,80 @@ export const UI_PRESS_ORIGIN_ATTR = 'data-press-origin';
 
 const INTERACTIVE_SEL = `[${UI_PRESS_ORIGIN_ATTR}]`;
 
+/** Marks the transparent expander `UIElement.minTapSize` emits (#948). Stamped by `UINode.tsx`;
+ *  read here, and nowhere else.
+ *
+ *  ⚠️ **A tap zone is a MINIMUM COURTESY AREA, not a claim.** `isolation: isolate` keeps the
+ *  expander off its own host's content, but it sits at the PARENT's z-order among its SIBLINGS — so
+ *  an expander overhanging a sibling that paints lower takes the press inside the overlap. Measured
+ *  in Court at 375x667 (#973): two of five level tiles lost their bottom `5.78px` to a pager arrow,
+ *  and `DailyMonthNext` took a `4.50 x 5.40px` corner of `DailyClose` — a dialog's only way out.
+ *  The rule this file implements is #977's: **a zone loses to anything that would have handled the
+ *  press itself, and wins everywhere else.** */
+export const UI_TAP_ZONE_ATTR = 'data-tap-zone';
+
+const TAP_ZONE_SEL = `[${UI_TAP_ZONE_ATTR}]`;
+
+/** Given the hit stack at a point (topmost first, as `document.elementsFromPoint` returns it) and
+ *  the tap zone that actually received the press, decide who should have got it.
+ *
+ *  Returns the element to hand the press to, or `null` when the zone keeps it.
+ *
+ *  Pure, and separated from the DOM plumbing on purpose: jsdom has no layout, so
+ *  `elementsFromPoint` answers nothing there and a test that drove the real path would be asserting
+ *  its own fake. This is the part with the decisions in it.
+ *
+ *  The rule, and the three cases it has to get right:
+ *  - **The FIRST non-zone entry decides, and the walk stops there.** That entry is what the browser
+ *    would have hit had the zone not been in the way, and looking PAST it would hand the press to
+ *    something a decorative element was legitimately covering.
+ *  - **A decorative neighbour is not a handler**, so the zone keeps the press — that is the normal,
+ *    intended use of `minTapSize` and it must not start missing.
+ *  - **The zone's own host keeps it too.** Inside the host's own box the first non-zone entry is the
+ *    host (or its content), and a zone must never lose to the control it belongs to. */
+export function resolveTapZoneVeto(stack: readonly Element[], zone: Element): Element | null {
+  const host = zone.closest(INTERACTIVE_SEL);
+  const first = stack.find((el) => !el.closest(TAP_ZONE_SEL));
+  if (!first) return null;
+  const owner = first.closest(INTERACTIVE_SEL);
+  if (!owner) return null;
+  // ⚠️ **An interactive ANCESTOR of the host is not "someone else", and missing this INVERTED the
+  // whole rule.** `closest` walks UP, so when the first non-zone hit is a plain container the owner
+  // resolves past it to the nearest interactive ancestor — which, inside any dialog, is the dialog
+  // root. Every one of Court's 16 authored zones is a `*Close` or pager button inside a panel that
+  // carries `swallowClicks` (and therefore `data-press-origin`), so without this line EVERY pad
+  // vetoed to its own panel root, whose handler is `stopPropagation(); return;` — deleting the
+  // courtesy area outright rather than narrowing it. `DailyClose` is 3.4vh (22.68px at 375x667)
+  // and would have been left at its artwork, under the 44pt floor `minTapSize: 48` exists to meet,
+  // as a dialog's only way out. Caught in review; both test layers modelled a neighbour with no
+  // interactive ancestor, a shape no shipping scene has, so both went green.
+  //
+  // An ancestor receives the click by BUBBLING anyway, so the host is the more specific handler and
+  // keeps it. The cases this rule is for are unaffected: `DailyMonthNext` -> `DailyClose`, the pager
+  // arrows -> the level tiles, `ChipFlyoutClose` -> `ChipSwatch_2` are all SIBLING controls, and a
+  // sibling does not contain the host.
+  // `contains` is INCLUSIVE, so this one test covers "it IS the host" as well as "it is an ancestor
+  // of the host" — one rule, one condition. An earlier revision also carried a separate
+  // `owner === host` check, which this subsumes.
+  if (host && owner.contains(host)) return null;
+  return first;
+}
+
 let downTarget: EventTarget | null = null;
 let upTarget: EventTarget | null = null;
+
+/** The element a tap-zone press was VETOED in favour of (#977), for the life of one gesture.
+ *
+ *  ⚠️ **Set at pointerdown, spent at click, and the two-step is forced rather than chosen.** The
+ *  obvious fix — drop `pointer-events` on the zone at pointerdown so the release re-hits the
+ *  neighbour — is WRONG: `click` fires on the nearest common ancestor of the down and up targets,
+ *  so a down on the zone and an up on the neighbour fires the click on their shared PARENT. That
+ *  loses the press instead of redirecting it. Leaving the zone hit-testable keeps down, up and
+ *  click all on the zone (exactly as today) and moves the redirect to click time, where the target
+ *  is ours to choose. */
+let vetoedFor: Element | null = null;
+/** The zone that press landed on, so the click can be matched back to the gesture that vetoed. */
+let vetoZone: Element | null = null;
 
 // A second, non-primary pointer (a resting finger landing or lifting while a button is held —
 // the everyday case is a two-finger release) must not overwrite the primary pointer's recorded
@@ -130,6 +202,22 @@ function onPointerDown(e: PointerEvent) {
   if (!e.isPrimary) return;
   downTarget = e.target;
   upTarget = null;
+  vetoedFor = null;
+  vetoZone = null;
+  const t = e.target;
+  // The `elementsFromPoint` walk runs ONLY when the press landed on a tap zone — every press
+  // elsewhere pays nothing. ⚠️ That is NOT the same as "rare": the expander is `zIndex: -1`, which
+  // is above the host's own BACKGROUND, so a press anywhere on a `minTapSize` control that is not
+  // covered by a child element targets the zone. For a background-image button with no element
+  // children that is every press on it. The walk is one hit-test and the veto almost always
+  // resolves to `null`; the cost is small, but an earlier comment here claimed it never ran.
+  if (t instanceof Element && t.closest(TAP_ZONE_SEL)) {
+    const zone = t.closest(TAP_ZONE_SEL)!;
+    const doc = zone.ownerDocument;
+    const stack = doc.elementsFromPoint?.(e.clientX, e.clientY) ?? [];
+    vetoedFor = resolveTapZoneVeto(stack, zone);
+    vetoZone = vetoedFor ? zone : null;
+  }
 }
 
 function onPointerUp(e: PointerEvent) {
@@ -137,8 +225,22 @@ function onPointerUp(e: PointerEvent) {
   upTarget = e.target;
 }
 
-// Same handler as pointerup — see the module doc's "Why pointercancel counts as a release".
-const onPointerCancel = onPointerUp;
+// Same as pointerup for the press/release PAIR — see the module doc's "Why pointercancel counts as
+// a release" — but NOT for the #977 veto.
+//
+// ⚠️ **A touch pointer takes IMPLICIT POINTER CAPTURE on its `pointerdown` target, so
+// `pointercancel` is dispatched AT THAT TARGET — the zone — not somewhere else.** The
+// release-matching gate below therefore PASSES for a cancelled gesture. An earlier revision claimed
+// the opposite in a comment, in a commit message, and in a test that fired `pointercancel` at an
+// unrelated element and so asserted nothing about it. Measured with a scratch probe: press on a pad,
+// let the browser reclaim the gesture as a scroll, and the veto survived for the next pointer-less
+// click (a screen-reader activation, or any `element.click()`) to spend — the exact stale-pair
+// hazard this module's header exists to prevent. A cancel is never the release of a TAP.
+function onPointerCancel(e: PointerEvent) {
+  onPointerUp(e);
+  vetoedFor = null;
+  vetoZone = null;
+}
 
 /** Clears the recorded press/release pair without consulting it. Any runtime handler that
  *  swallows a click via `e.stopPropagation()` WITHOUT calling `pressBelongsTo` must call this —
@@ -150,6 +252,7 @@ const onPointerCancel = onPointerUp;
 export function clearPressOrigin() {
   downTarget = null;
   upTarget = null;
+  vetoedFor = null;
 }
 
 /** Clears the pair after a click that reached NO consuming caller — a click on a non-interactive
@@ -167,6 +270,63 @@ export function clearPressOrigin() {
 function onClickSweep() {
   downTarget = null;
   upTarget = null;
+  vetoedFor = null;
+}
+
+/** CAPTURE phase, on the document: hand a vetoed tap-zone press to the element underneath (#977).
+ *
+ *  Capture on `document` is what makes this work at all — React attaches its own listeners to the
+ *  renderer root, which is BELOW document, so stopping propagation here means the zone's host never
+ *  sees the click and its bindings never run.
+ *
+ *  The replacement click is dispatched on the element the browser would have hit, so it bubbles
+ *  through exactly the handlers a press there would normally reach. `vetoedFor` is cleared BEFORE
+ *  the dispatch: the synthetic click re-enters this same listener, and without that it would veto
+ *  itself forever. The press/release pair is cleared too — it was recorded against the ZONE, so
+ *  leaving it would make `pressBelongsTo` fail CLOSED on the element now receiving the click.
+ *
+ *  ⚠️ This fixes a TAP and cannot fix a DRAG. The browser picks a finger-drag's scroll target at
+ *  pointerdown, before any of this runs, so a swipe STARTING inside the overlap still does not reach
+ *  a scroll container underneath. That bound is the owner's explicit call (2026-09-09) and is
+ *  recorded in docs/ui-system.md; it is not an oversight. */
+function onClickCapture(e: MouseEvent) {
+  const target = vetoedFor;
+  const zone = vetoZone;
+  vetoedFor = null;
+  vetoZone = null;
+  if (!target || !zone) return;
+  // ⚠️ **The RELEASE must have landed in the same zone, or this click is not that gesture.** Reading
+  // `vetoedFor` alone hijacked ANY click while a veto was held: press inside the overlap, drag away,
+  // release somewhere unrelated, and the browser's click (fired on the common ancestor) was
+  // redirected to the neighbour AND fired — because the redirect nulls the press pair, so
+  // `pressBelongsTo` then fails OPEN. That is exactly the drag #664 exists to reject, with its only
+  // gate removed. In the editor it crossed out of the game entirely: press on a GameView zone,
+  // release on a toolbar button, and the button's click died at this `stopPropagation` while the
+  // game's neighbour fired. Caught in review.
+  //
+  // ⚠️ This gate does NOT cover a CANCELLED gesture — `onPointerCancel` clears the veto itself, for
+  // the reason given there. An earlier revision claimed this line handled that too; it cannot,
+  // because a cancel lands on the zone.
+  //
+  // ⚠️ It also drops a redirect for a MOUSE press that drifts onto a child of the host before
+  // release (a nine-slice layer, a video layer, a Canvas2D child all cover the box). The press began
+  // on a pixel this rule says belongs to the neighbour, and the host's binding runs instead. That is
+  // a drag, so the pre-#977 outcome is defensible — but it is a consequence, not an oversight.
+  // Touch is immune: implicit capture pins the release to the zone.
+  const up = upTarget;
+  if (!(up instanceof Element) || up.closest(TAP_ZONE_SEL) !== zone) return;
+  if (!target.isConnected) return;   // the neighbour went away mid-gesture — drop it, don't guess
+  e.stopPropagation();
+  downTarget = null;
+  upTarget = null;
+  // ⚠️ `detail`, `buttons`, the modifier keys, `view` and `screenX/Y` are NOT carried over. No
+  // shipped consumer reads them (`UINode.tsx`'s `handleClick` reads none), but `detail: 0` means a
+  // redirected click can never take part in double-click detection — worth knowing before a handler
+  // starts depending on one.
+  target.dispatchEvent(new MouseEvent('click', {
+    bubbles: true, cancelable: true, composed: true,
+    clientX: e.clientX, clientY: e.clientY, button: e.button,
+  }));
 }
 
 /** Refcounted PER DOCUMENT — the listeners this module installs are registered on a specific
@@ -192,6 +352,11 @@ export function installPressOriginTracking(doc: Document): () => void {
     doc.addEventListener('pointerdown', onPointerDown, { capture: true, passive: true });
     doc.addEventListener('pointerup', onPointerUp, { capture: true, passive: true });
     doc.addEventListener('pointercancel', onPointerCancel, { capture: true, passive: true });
+    // CAPTURE, which is what puts this ahead of the bubble-phase sweep AND ahead of React's root
+    // listener — not the registration order, which is irrelevant between different phases on the
+    // same node. (An earlier comment here claimed the order was load-bearing; it is not, and saying
+    // so invites a later "cleanup" to preserve the wrong thing.)
+    doc.addEventListener('click', onClickCapture, { capture: true });
     doc.addEventListener('click', onClickSweep, { passive: true });
   }
   installCounts.set(doc, count + 1);
@@ -205,6 +370,7 @@ export function installPressOriginTracking(doc: Document): () => void {
       doc.removeEventListener('pointerdown', onPointerDown, { capture: true });
       doc.removeEventListener('pointerup', onPointerUp, { capture: true });
       doc.removeEventListener('pointercancel', onPointerCancel, { capture: true });
+      doc.removeEventListener('click', onClickCapture, { capture: true });
       doc.removeEventListener('click', onClickSweep);
     }
   };

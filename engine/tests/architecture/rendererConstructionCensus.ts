@@ -1,12 +1,14 @@
-/** Shared census helper for `glContextRelease.test.ts` and `rendererLossHandling.test.ts` (#795).
+/** Shared census helper for `glContextRelease.test.ts`, `rendererLossHandling.test.ts` (#795) and
+ *  `pixiApplicationTeardown.test.ts` (#1000).
  *
- *  Both guards walk the SAME editor+runtime source tree looking for renderer CONSTRUCTION sites,
- *  each pairing them with a different required companion call — `forceContextLoss` for release,
- *  an `attachRendererLossHandling`/`attachContextLossListeners`/`attachDeviceLostListener` call
- *  for loss DETECTION. Those are two different properties over the same corpus, kept as two
- *  separate test files on purpose (a red in one must not be ambiguous with the other) — but the
- *  walk-and-strip pass underneath them is identical, so it is factored out here rather than
- *  duplicated a second time. */
+ *  All three guards walk the SAME editor+runtime source tree looking for renderer CONSTRUCTION
+ *  sites, each pairing them with a different required companion call — `forceContextLoss` for
+ *  three's GL release, an `attachRendererLossHandling`/`attachContextLossListeners`/
+ *  `attachDeviceLostListener` call for loss DETECTION, and `destroyPixiApplication` (never
+ *  `app.destroy(<boolean>)`, which sweeps Pixi's process-global pools for every live surface) for
+ *  Pixi TEARDOWN. Those are three different properties over the same corpus, kept as separate test
+ *  files on purpose (a red in one must not be ambiguous with the others) — but the walk-and-strip
+ *  pass underneath them is identical, so it is factored out here rather than duplicated. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';

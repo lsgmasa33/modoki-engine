@@ -325,6 +325,26 @@ Rules:
   of truth while an editor is open".
 - **A no-op is a failure when the caller asked for a change.** `changed:0`, or a write whose keys
   the loader ignores, is `REFUSED_BY_OP` with the real field names — not `{ok:true, changed:1}` (V1).
+- **A STATE refusal is RETURNED with its code — it must never escape as a throw** (#994). This is
+  the emit-side half of "a refusal is not a transport failure" above, and without it that rule
+  cannot be kept: an op that throws has no way to name its code, because every relay route turns a
+  throw into a hard-coded **504** (a **500** on the Electron host), which the MCP client maps to
+  `NOT_AVAILABLE_HERE` — *"could not look: the route is absent"*. So `render-scene`'s plain
+  `Error('no scene renderer registered…')` told an agent to relaunch a perfectly healthy editor,
+  and told `test:mcp:live` a live route was a DEFECT. **The op is
+  the only layer that knows which failure this is**, so it returns `{ok:false, code, error,
+  options}` and the route relays it (`opRefusal`/`refusalStatus` in `editorBackendRouter.ts`).
+  Three riders:
+  - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
+    parameter as `{ok:false, reason}` at HTTP 200, where `isFailureBody` picks them up; only a
+    named code is a claim to know which §5 failure this is, and only that claim earns a status.
+  - **One code, one status.** `NO_RENDERER` → 503 everywhere; anything else the ops name is the op
+    answering, which is a 400 (`relayFailureStatus`'s own argument). The CODE is what the agent
+    reacts to — a body-supplied code beats the status-derived one (`codeFromBody`).
+  - **Classify structurally, never by message prefix.** The Electron capture path throws a
+    `CaptureUnavailableError` CLASS for exactly this reason; `relayFailureStatus`'s scar is what
+    string-matching an error costs — a bare word in one op's prose eventually collides with
+    another's.
 
 ## 6. Response budget: summary-first
 
@@ -566,9 +586,17 @@ The description is the tool's contract with the agent — it is read far more of
   undocumented param is one an agent ignores or guesses at. This started as F1 (25 undocumented params
   across 21 tools) and is now a guard in `mcpRegistry.test.ts`, so the count cannot creep back up.
 - **A documented default matches the code.** A wrong default is worse than none.
-- **Say what the tool does NOT do**, when that is the trap: `capture_viewport` FORCES a render and
-  therefore masks render-on-demand and stale-frame bugs — a caller debugging exactly that class
-  needs to know the instrument heals the symptom.
+- **Say what the tool does NOT do**, when that is the trap: `render_scene`/`render_sequence` FORCE a
+  render and therefore mask render-on-demand and stale-frame bugs — a caller debugging exactly that
+  class needs to know the instrument heals the symptom.
+  ⚠️ This bullet named **`capture_viewport`**, which is the tool that does the OPPOSITE: it is
+  `webContents.capturePage()`, a screenshot of whatever each surface last drew, so it is the one
+  capture that CAN hand back a stale frame. Corrected against [rendering.md](rendering.md)
+  § "The measurement protocol" (measured 2026-08-18: three successive captures byte-identical
+  through a real material change until a camera move re-armed the SceneView's dirty gate). Being
+  wrong *here* is the expensive kind — this is the rule's worked example, so it taught the
+  inversion to every reader learning the rule from it, and the same sentence is still copied
+  verbatim across ~10 `qa/cases/**` (filed as a class, not patched here).
 - **Name the verification.** A mutating tool's description names the read that confirms it.
 
 ## Decisions taken (the surface changes these rules implied)

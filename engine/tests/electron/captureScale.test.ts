@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { BrowserWindow } from 'electron';
-import { fitToMaxSide, captureViewport, explainCaptureFailure, normalizeJpegQuality, jpegSize } from '../../electron/rendererOps';
+import { fitToMaxSide, captureViewport, explainCaptureFailure, normalizeJpegQuality, jpegSize, CaptureUnavailableError, captureRefusalBody } from '../../electron/rendererOps';
 import { normalizeJpegQuality as runtimeNormalizeJpegQuality } from '@modoki/engine/runtime';
 import type { CaptureWindowFacts, SurfaceProbe } from '../../electron/rendererOps';
 
@@ -289,6 +289,106 @@ describe('captureViewport failure path', () => {
     const raw = new Error('UnknownVizError');
     const err = await captureViewport(failingWindow(raw)).catch((e: Error) => e);
     expect((err as Error & { cause?: unknown }).cause).toBe(raw);
+  });
+
+  // #994 — the host route has to tell a capture failure apart from an ordinary one (an unwritable
+  // temp dir) to give it a §5 code. A CLASS, not a message prefix: `relayFailureStatus`'s scar in
+  // editorBackendRouter.ts is what string-matching an error costs.
+  it('rejects with CaptureUnavailableError, so the route can classify it structurally', async () => {
+    const err = await captureViewport(failingWindow()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CaptureUnavailableError);
+  });
+
+  it('captureRefusalBody carries NO_RENDERER, the diagnosis verbatim, and REAL exits', async () => {
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle', refCount: 0 } }));
+    const err = await captureViewport(failingWindow(), { probe }).catch((e: unknown) => e);
+    const body = captureRefusalBody(err as CaptureUnavailableError);
+    // NOT_AVAILABLE_HERE is what this used to become (a bare throw → backendServer's 500), and it
+    // says "could not look: the route is absent" about a route that answered perfectly well.
+    expect(body.code).toBe('NO_RENDERER');
+    // The message already names WHICH cause it was; re-summarising it here would be a second place
+    // to keep honest, so it is passed through whole.
+    expect(body.error).toBe((err as Error).message);
+    expect(body.error).toMatch(/NOTHING IS RENDERING/);
+    expect(body.options.length).toBeGreaterThan(0);
+    // A refusal that lists an exit which does not exist is worse than one that lists none: the
+    // data read is the exit that always works, because it needs no renderer at all.
+    expect(body.options.join(' ')).toMatch(/get_scene_state/);
+  });
+
+  /** #994 close-out F2 — the code MUST branch on the cause, and this is the assertion that keeps
+   *  the live gate armed.
+   *
+   *  `NO_RENDERER` is in `test-live-tools.ts`'s ENV_CODES ("editor state, not tool health") and
+   *  `modoki_capture_viewport` is swept every run, so answering NO_RENDERER for a crashed renderer
+   *  would turn a red gate GREEN through a genuinely dead editor — the one thing #994 must not do.
+   *  The first cut of `captureRefusalBody` did exactly that: one code and one options list for all
+   *  five causes. */
+  const brokenWindow = (over: Record<string, unknown>) => ({
+    webContents: {
+      capturePage: vi.fn(async () => { throw new Error('UnknownVizError'); }),
+      getZoomFactor: () => 1,
+      isDestroyed: () => false,
+      isCrashed: () => false,
+      getURL: () => 'http://127.0.0.1:5173/#/editor',
+      ...(over.wc as Record<string, unknown> ?? {}),
+    },
+    isDestroyed: () => over.destroyed === true,
+    isVisible: () => true,
+    isMinimized: () => false,
+    isFocused: () => true,
+    getBounds: () => ({ x: 0, y: 0, width: 1600, height: 968 }),
+  } as unknown as BrowserWindow);
+
+  const bodyFor = async (win: BrowserWindow, probe?: SurfaceProbe) => {
+    const err = await captureViewport(win, probe ? { probe } : {}).catch((e: unknown) => e);
+    return captureRefusalBody(err as CaptureUnavailableError);
+  };
+
+  it('a CRASHED renderer is NOT environmental — NOT_AVAILABLE_HERE, and relaunch leads the options', async () => {
+    const body = await bodyFor(brokenWindow({ wc: { isCrashed: () => true } }));
+    expect(body.code).toBe('NOT_AVAILABLE_HERE');
+    expect(body.error).toMatch(/CRASHED/);
+    expect(body.options[0]).toMatch(/relaunch/i);
+    // The exits for a healthy-but-idle editor are wrong here and must not be offered.
+    expect(body.options.join(' ')).not.toMatch(/unminimise|open the Scene or Game panel/i);
+  });
+
+  it('a LOST GPU device is NOT environmental — it explicitly never self-recovers', async () => {
+    const probe = vi.fn<SurfaceProbe>(async () => ({ gpu: { deviceLost: true, reason: 'destroyed' } }));
+    const body = await bodyFor(brokenWindow({}), probe);
+    expect(body.code).toBe('NOT_AVAILABLE_HERE');
+    expect(body.options[0]).toMatch(/relaunch/i);
+  });
+
+  it('a STALLED frame loop is a real wedge, not editor state', async () => {
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'stalled' } }));
+    expect((await bodyFor(brokenWindow({}), probe)).code).toBe('NOT_AVAILABLE_HERE');
+  });
+
+  it('a MINIMISED window IS editor state — NO_RENDERER, and the options say how to undo it', async () => {
+    const win = { ...brokenWindow({}) } as unknown as BrowserWindow;
+    (win as unknown as { isMinimized: () => boolean }).isMinimized = () => true;
+    const body = await bodyFor(win, vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle' } })));
+    expect(body.code).toBe('NO_RENDERER');
+    expect(body.options.join(' ')).toMatch(/unminimise/i);
+  });
+
+  it('NO renderer facts at all is "could not look", not a supported state — the probe failing must not read as green', async () => {
+    // Absence of a known fault is not evidence of a healthy editor. `explainCaptureFailure` says
+    // as much ("the renderer could not be asked why"), and defaulting the unknown case to
+    // NO_RENDERER would make every un-probeable failure environmental.
+    const body = await bodyFor(brokenWindow({}));
+    expect(body.code).toBe('NOT_AVAILABLE_HERE');
+    expect(body.error).toMatch(/could not be asked why/);
+  });
+
+  it('a fault BEATS a stale supported-looking fact — order is load-bearing', async () => {
+    // A destroyed window can still carry `frameLoop:'idle'` from the last good probe. Reading that
+    // as "no viewport is mounted" is the green-through-a-dead-editor outcome.
+    const probe = vi.fn<SurfaceProbe>(async () => ({ frameLoop: { status: 'idle' } }));
+    const body = await bodyFor(brokenWindow({ destroyed: true }), probe);
+    expect(body.code).toBe('NOT_AVAILABLE_HERE');
   });
 });
 

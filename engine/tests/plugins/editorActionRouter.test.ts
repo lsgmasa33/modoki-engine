@@ -1568,11 +1568,70 @@ describe('/api/render-scene (S3.14 — the route had no test at all)', () => {
     expect('quality' in r.body).toBe(false);
   });
 
-  it('a renderer with no 3D surface mounted is a 504 carrying the reason, not an empty 200', async () => {
-    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no 3D view is mounted (open the Game panel)'); } });
-    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string } };
+  // ⚠️ REWRITTEN, not deleted (#994). This asserted `status === 504` under the title "a renderer
+  // with no 3D surface mounted is a 504 carrying the reason, not an empty 200" — and the fix turns
+  // that state into a 503 §5 envelope, so the assertion could not survive. It was rewritten rather
+  // than relaxed because the test's SUBJECT is "carrying the reason, not an empty 200": it exists
+  // to stop a silent success. A coded envelope carries strictly more reason than the 504 did (it
+  // adds `code` and `options`), so the assertion below is stronger, not weaker. The status literal
+  // was incidental to what the test was about — and `bd33e2e32`, which introduced it, shows it was
+  // describing an until-then untested route rather than pinning a contract.
+  it('a renderer with no 3D surface mounted answers the op\'s §5 refusal, not a 504 and not an empty 200', async () => {
+    const refusal = { ok: false, code: 'NO_RENDERER', error: 'no scene renderer is registered …', options: ['select the Game tab'] };
+    const ctx = makeCtx({ requestBrowser: async () => refusal });
+    const r = (await post('/api/render-scene', {}, ctx)) as
+      { status?: number; body: { ok?: boolean; code?: string; error?: string; options?: string[]; path?: string } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.error).toMatch(/no scene renderer/);
+    // `options` is the field that turns a dead end into the next move, and `httpFailure` in the MCP
+    // client only forwards it if the route does — dropping it here would lose it silently.
+    expect(r.body.options).toEqual(['select the Game tab']);
+    // Not an empty 200, and no phantom frame path: nothing was rendered.
+    expect(r.body.path).toBeUndefined();
+  });
+
+  it('a genuine RELAY failure is still a 504 — a throw is transport, an envelope is the op answering', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string; code?: string } };
     expect(r.status).toBe(504);
-    expect(r.body.error).toMatch(/no 3D view is mounted/);
+    expect(r.body.code).toBeUndefined();
+  });
+
+  /** #994 close-out F1 — the guard covers "no renderer registered"; a renderer that IS registered
+   *  and then FAILS still throws, and that throw was reaching the agent as NOT_AVAILABLE_HERE.
+   *
+   *  The real producer: `Scene3D`'s offscreen readback is wrapped in a 10s `withTimeout`, so a lost
+   *  GPU device or a stalled readback rejects with a `TimeoutError` whose message matches no
+   *  `isRelayTransportFailure` alternative. At a hard-coded 504 the agent was told "the route is
+   *  absent" and sent to relaunch a present route over a wedged GPU — the same inversion #994
+   *  fixes one case over, and the one case the new §5 rule was stated for and not kept. */
+  it('a render that FAILS with a renderer attached is the op answering (400), not a dead route (504)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('offscreen readback timed out after 10000ms'); } });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string } };
+    expect(r.status, 'a 504 here becomes NOT_AVAILABLE_HERE — "the route is absent" — about a live route').toBe(400);
+    expect(r.body.error).toMatch(/timed out/);
+    // ⚠️ 400 maps to REFUSED_BY_OP, which is NOT in the live gate's ENV_CODES — so a genuinely
+    // wedged GPU still reddens `test:mcp:live` instead of being waved through as editor state.
+  });
+
+  it('a §5 code OTHER than NO_RENDERER travels at 400 — the op answering, not a gateway failure', async () => {
+    // `refusalStatus`'s non-NO_RENDERER branch had no producer and no test; this exercises the rule
+    // rather than leaving it stated for a case nothing drives.
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, code: 'NOT_FOUND', error: 'nope' }) });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { code?: string } };
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('NOT_FOUND');
+  });
+
+  it('an ordinary {ok:false, reason} answer is NOT hijacked — only a CLOSED-SET code earns a status', async () => {
+    // The discriminator has to be narrow: dozens of ops report a bad parameter as `{ok:false,
+    // reason}` at HTTP 200, where the MCP client's `isFailureBody` picks them up. Treating those as
+    // §5 envelopes would change the status of a large, unrelated surface.
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, reason: 'nope', code: 'NOT_A_REAL_CODE', dataUrl: DATA_URL, width: 1, height: 1 }) });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { path?: string } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.path).toMatch(/modoki-render-.*\.jpg$/);
   });
 });
 
@@ -1624,6 +1683,60 @@ describe('render-sequence refuses a STOPPED editor at the ROUTE (review follow-u
       { status?: number; body: { paths?: unknown[] } };
     expect(r.status ?? 200).toBe(200);
     expect(r.body.paths).toHaveLength(2);
+  });
+
+  // #994 — the per-frame path reaches the SAME `render-scene` op, so it inverts the same way. It
+  // was LATENT rather than absent: a stopped editor is refused above before the loop is reached, so
+  // only a PLAYING editor with no 3D surface gets here. That is why the observed live run reddened
+  // on render_scene and not on this one, and why fixing the mechanism beats fixing the row that
+  // happened to print.
+  const refusing = (failAtFrame: number) => {
+    let frame = 0;
+    return makeCtx({
+      requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'editor-state') return { playState: 'playing', runMode: 'playing' };
+        if (frame++ >= failAtFrame) return { ok: false, code: 'NO_RENDERER', error: 'no scene renderer is registered …', options: ['select the Game tab'] };
+        return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+      }),
+    });
+  };
+
+  it('a per-frame NO_RENDERER is relayed as the envelope, not a 504', async () => {
+    const r = (await post('/api/render-sequence', { frames: 3, fps: 30 }, refusing(0))) as
+      { status?: number; body: { code?: string; framesWritten?: number; paths?: unknown[] } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.framesWritten).toBe(0);
+    expect(r.body.paths).toEqual([]);
+  });
+
+  it('a panel closed MID-sequence reports what was written — neither "rendered nothing" nor "finished"', async () => {
+    const r = (await post('/api/render-sequence', { frames: 4, fps: 60 }, refusing(2))) as
+      { status?: number; body: { code?: string; framesWritten?: number; paths?: string[]; tMs?: number[] } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.framesWritten).toBe(2);
+    expect(r.body.paths).toHaveLength(2);
+    // #994 close-out F5 — the timings of the frames that DID land come back too. This tool's own
+    // description says to time frames by `tMs[]` and NEVER by frameIndex × 1/fps, so dropping it
+    // leaves a caller holding 2 real frames and exactly the basis it was told not to use.
+    expect(r.body.tMs, 'tMs for the frames that landed').toHaveLength(2);
+  });
+
+  it('a mid-sequence THROW reports tMs too, and is the op answering when it is not transport', async () => {
+    let frame = 0;
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'editor-state') return { playState: 'playing', runMode: 'playing' };
+        if (frame++ >= 2) throw new Error('offscreen readback timed out after 10000ms');
+        return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+      }),
+    });
+    const r = (await post('/api/render-sequence', { frames: 4, fps: 60 }, ctx)) as
+      { status?: number; body: { framesWritten?: number; tMs?: number[] } };
+    expect(r.status).toBe(400);
+    expect(r.body.framesWritten).toBe(2);
+    expect(r.body.tMs).toHaveLength(2);
   });
 });
 
