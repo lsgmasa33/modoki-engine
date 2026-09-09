@@ -276,6 +276,53 @@ const BANNED_CANONICAL_COMPARE = new RegExp(
   + `|[!=]==\\s*(?:pathCaseKey\\s*\\(\\s*)?${CANONICALISER}\\s*\\(`,
 );
 
+/** "Am I the entry point?" decided by CONCATENATING a `file://` prefix onto `process.argv[1]` and
+ *  comparing that to `import.meta.url`. The fourth recipe this module exists to end, and the one
+ *  that fails most quietly: the guard is simply false, so the CLI block never runs — the script
+ *  prints NOTHING and exits 0. Nothing throws, and a caller reading the exit code sees success.
+ *
+ *  ⚠️ **It has bitten repeatedly, and never on the machine that wrote it.** The CENSUS of sites and
+ *  recipes is `engine/scripts/entryPoint.mjs`'s docblock (#910) and is not restated here — but two
+ *  members are worth naming because they are what makes this a shipping defect rather than a tidy:
+ *    - `releaseBranch.mjs` (#904) — all nine child-process cases red the moment `main` reached
+ *      `win`, and `--claim-label` returning an empty string is what `/grab-issue` interpolates
+ *      into `gh issue edit --add-label`.
+ *    - `generate-icons.mjs` — measured on `win` 2026-09-08: `vite-asset-scanner.ts` spawns it as a
+ *      native-build step with an absolute path, so on Windows the icon/splash step did nothing at
+ *      all **and reported success**. A silent no-op inside a shipping build path.
+ *
+ *  ⚠️ **`new URL(...).href` around it is NOT a fix, and is banned too.** It repairs the Windows
+ *  half by luck — the URL parser normalises the drive letter and the backslashes — while leaving
+ *  the symlink half broken: `import.meta.url` is the REALPATH's URL and `argv[1]` is not, so on
+ *  darwin, where `os.tmpdir()` is `/var` → `/private/var`, it still misses. Two halves, exactly as
+ *  `samePath` has. An `endsWith('name.mjs')` fallback is not a fix either — it is true for any
+ *  path ending in that name, which is a different question.
+ *
+ *  ⚠️ **The fix is the SHARED helper, not the inline recipe** — `#904` (this guard) and `#910` (the
+ *  helper) landed on two clones at once and fixed the same class two ways; #910's is the one that
+ *  stands:
+ *
+ *      import { isEntryPoint } from './entryPoint.mjs';
+ *      if (isEntryPoint(import.meta.url)) { …CLI… }
+ *
+ *  The inline `process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url))` that
+ *  `editorPorts.mjs` carried from #881 to #910 is not flagged by this pattern and is not *wrong*,
+ *  but it is no longer the house recipe: it case-FOLDS, and `entryPoint.mjs`'s docblock records why
+ *  folding is the wrong answer for module identity. Prescribe the helper.
+ *
+ *  ⚠️ **`clonePort.mjs` is deliberately NOT an offender and must not be "fixed" into one.** It
+ *  hand-rolls a realpath comparison because `clonePortCli.test.ts` COPIES it, alone, into a
+ *  directory with a space in the name — an import of a sibling module makes that copy unrunnable.
+ *  It compares realpaths rather than concatenating, so this pattern does not match it. */
+/*  ⚠️ **`file:\/\/\/?` — the THIRD SLASH is not optional decoration, it is the near-miss this guard
+ *  most needs to catch.** `entryPoint.mjs`'s docblock names *"it produces `file://C:/…` rather than
+ *  `file:///C:/…` on Windows"* as one of the template's three faults, so the cheapest wrong fix a
+ *  reader takes from that sentence is to add a slash — which repairs nothing (the percent-encoding
+ *  and symlink faults remain) and which the two-slash form of this regex waved through in silence.
+ *  Found by close-out review; the samples below pin both spellings. */
+const BANNED_ENTRYPOINT =
+  /file:\/\/\/?(?:\$\{\s*process\.argv\[1\]|["'`]\s*\+\s*process\.argv\[1\])/;
+
 const files = ROOTS.flatMap(sourceFiles);
 
 describe('same-directory comparisons go through pathIdentity (#869)', () => {
@@ -442,6 +489,65 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
       + '`canonicalWithMissingTail`. Do NOT fix this by removing the canonicalisation:\n'
       + offenders.join('\n'),
     ).toHaveLength(0);
+  });
+
+  it('no file decides run-as-main by concatenating file:// onto process.argv[1] (#904)', () => {
+    const offenders: string[] = [];
+    for (const rel of files) {
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
+      src.split('\n').forEach((line, i) => {
+        if (BANNED_ENTRYPOINT.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
+      });
+    }
+    expect(
+      offenders,
+      'argv[1] is a raw OS path; import.meta.url is a URL of the REALPATH. Concatenating the two\n'
+      + 'matches only by luck: it misses on Windows (backslashes, a drive letter), on any path\n'
+      + 'needing percent-encoding, and through a symlinked invocation. The guard is then simply\n'
+      + 'false, so the CLI prints NOTHING and exits 0 (#904; CI run 30695413747 before it).\n'
+      + "Use: isEntryPoint(import.meta.url) from engine/scripts/entryPoint.mjs (#910).\n"
+      + offenders.join('\n'),
+    ).toHaveLength(0);
+  });
+
+  /** Non-vacuity for the scan above, which unlike the other three has NO live instance left to
+   *  find — every one was fixed by the change that added it. So it is exercised against written
+   *  samples instead: a regex narrowed into never matching is exactly as green as a clean repo,
+   *  and this is the only thing that tells those two apart. The `ok` half matters as much as the
+   *  `banned` half — a guard that flagged the house fix would push the next fix the wrong way. */
+  it('the run-as-main scan detects every banned shape, and clears the correct one', () => {
+    const banned = [
+      // the template form, as it stood in five files before #904's sweep
+      'if (import.meta.url === `file://${process.argv[1]}`) await main();',
+      // the `new URL(...)` form — repairs Windows by luck, still misses a symlinked invocation
+      'if (import.meta.url === new URL(`file://${process.argv[1]}`).href) await main();',
+      // plain concatenation: the same defect without a template literal
+      "if (import.meta.url === 'file://' + process.argv[1]) await main();",
+      // ⚠️ the THREE-SLASH near-miss — the fix `entryPoint.mjs`'s own docblock invites, and the one
+      // the two-slash version of this regex let through. Still symlink- and encoding-broken.
+      'if (import.meta.url === `file:///${process.argv[1]}`) await main();',
+      'if (import.meta.url === new URL(`file:///${process.argv[1]}`).href) await main();',
+      "if (import.meta.url === 'file:///' + process.argv[1]) await main();",
+    ];
+    for (const line of banned) expect(BANNED_ENTRYPOINT.test(line), line).toBe(true);
+
+    // ⚠️ **Only the LAST of these actually discriminates, and that is stated rather than implied.**
+    // The first three contain no `file://` at all, so this regex could be narrowed to match nothing
+    // and they would still pass — they are DOCUMENTATION of the house recipe, kept because a reader
+    // arriving at a failure needs to see what the right shape looks like. The non-vacuity claim
+    // rests on the `banned` list above and on the separate scan-is-not-vacuous case, not on these.
+    const ok = [
+      // the house recipe since #910 — the shape this guard must never push anyone off
+      'if (isEntryPoint(import.meta.url)) await main();',
+      'const invokedDirectly = isEntryPoint(import.meta.url);',
+      // the helper's own body, and the inline #881 recipe it was promoted from
+      'return canonicalPath(fileURLToPath(moduleUrl)) === canonicalPath(process.argv[1]);',
+      // this one DOES contain the ban's subject matter without being the ban: a correctly-encoded
+      // URL built by the platform rather than concatenated. `games/court/tools/levelAudio.mjs`
+      // really uses it, and flagging it would push a game tool onto an import it may not have.
+      'if (import.meta.url === pathToFileURL(process.argv[1]).href) await main();',
+    ];
+    for (const line of ok) expect(BANNED_ENTRYPOINT.test(line), line).toBe(false);
   });
 
   /** Non-vacuity for ALL THREE scans, and the half that is easy to forget: a guard collecting offenders

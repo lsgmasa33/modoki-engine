@@ -401,6 +401,113 @@ repo path (the stagers' module-level `BIN_DIR`), a unit test would write into th
 end-to-end claim belongs to `verify:packaged` and stays open until a pack fixture exists. Say which
 half you covered.
 
+### Shape (D): the STUB or FAKE is more capable than the thing it stands in for
+
+Shapes (A)-(C) are about how many instances a suite builds, and which copy it runs. This one is
+about the **boundary** it replaces: a double that accepts inputs production rejects, or performs
+behaviour the real dependency lacks, lets the test explore a region **production cannot reach** —
+and everything asserted about that region is about the double.
+
+Two surfaces, one mechanism, and they are easy to read as unrelated:
+
+- **A stub that ACCEPTS more.** `editorActionRouter.test.ts` stubbed `resolveAssetPath` as the
+  identity function. Production resolves only paths under an asset root's `urlPrefix`, so a native
+  absolute path 404s and never reaches the staleness gate; through the identity stub it sailed
+  through. The fixtures duly built paths with `path.join(os.tmpdir(), …)` — a shape production never
+  produces — and the case was green on macOS (`/var/folders/…` survives the route's
+  `startsWith('/') ? p : '/' + p`) and red on Windows (`E:\…` becomes `/E:\…` and matches nothing).
+- **A fake that DOES more.** The mirror image, already in this repo's practice: a fake modelling
+  behaviour the real dependency does not have makes the guard defend the bug.
+
+⚠️ **The tempting fix is to widen PRODUCTION so the test's input works**, and it is wrong. Here that
+was one line — teach the normaliser about `path.isAbsolute` — measured as a **no-op on POSIX**, so
+it would have passed every check either platform could run and looked entirely safe. It would have
+widened production to serve a path production cannot produce. **Fix the double, not the subject.**
+
+**The rule: a double must be no more permissive, and no more capable, than what it replaces.** When
+one is, the honest question is not "why does this fail on platform X" but "what is this test
+actually exercising".
+
+⚠️ Windows merely EXPOSED this one, because that is where the two path spellings differ. Do not
+read it as a Windows lesson — `docs/windows.md` § Paths carries the platform instance and links
+here for the general shape.
+
+⚠️ **Not the same as Shape (E) below, and the remedies do not transfer.** (D) is a double that can
+DO more than production; (E) is two sides of a comparison that MOVE together. A test can have both,
+and making a double faithful does nothing for a dependent comparison.
+
+### Shape (E): the two sides of the comparison SHARE A SOURCE
+
+Shape (D) is about a double that can DO more than production. This one is narrower and commoner:
+both sides of an assertion derive from the same thing, so **a fault in that thing moves both and the
+comparison cannot express it**. Neither side need be unfaithful; they need only be dependent.
+
+**Trigger — apply this when the EXPECTATION is COMPUTED rather than WRITTEN.** A literal expectation
+cannot share a source with the subject; a computed one might, and that is the whole population. The
+test is mechanical and cheap, and it selects every instance below while excluding almost everything
+else in a suite. Do not run the procedure on every assertion — a bar people skip is worse than no
+bar, because the next reviewer assumes it was applied.
+
+Three instances, one mechanism (all 2026-09-09, all in one session, which is how the family was
+noticed):
+
+| instance | the shared source |
+|---|---|
+| `linkFixtureGuard`'s `${realTmp}-alias` | fixture and expectation built off the same base, so an unanchored `startsWith` passed under the very mutation the case existed to catch |
+| `cleanPackagedCacheLinkGuard`'s exemption case | script and fixture both call `appSupportRoot()`, so a WRONG platform rule moves both and the case stays green |
+| an `appSupportRoot` assertion authored through a bash heredoc | argument and expectation mangled identically by the transport (`'C:\\U…'` → `'C:\U…'`), so the case passed on a corrupted value |
+
+⚠️ **The mutation bar INVERTS here, and this is the useful part.** For an ordinary mechanism, mutate
+it and expect RED; a green is a test gap. For a shared source, **GREEN is the diagnostic** — it says
+the two sides moved together, so the comparison is blind to a fault in that source. The procedure:
+
+```
+0. confirm the mutation actually MOVES the shared value   <- else the green means nothing
+1. mutate the shared source
+2. RED   -> the two sides are independent; done
+   GREEN -> Shape (E): the comparison cannot see that source
+3. demand an INDEPENDENT pin elsewhere
+4. no such pin exists -> that is the gap
+```
+
+⚠️ **Step 0 is not optional, and the platform case makes it easy to skip.** A green also results when
+the mutation never changed the value the test uses — mutate `appSupportRoot`'s **darwin** branch while
+running on Windows and you get a worthless green, then go hunting for a pin against a source the test
+never consumes. It is this file's own positive-control rule aimed at the mutation. **The cheap form
+for a platform rule: mutate the branch you are standing on.** (Measured: mutating the *win32* branch
+on Windows, with `APPDATA` set by the fixture's sandbox, is a real green and real evidence.)
+
+**Step 3's independent pin, and where it must NOT come from.** Three forms that work — a literal that
+IS the specification (`packagedAppPaths.test.ts`'s per-platform `appSupportRoot` cases; legitimate
+for the same reason a golden file is), an anchor off a *different* base (the `path.sep`-anchored
+`startsWith`), or a **read-back** that observes what actually landed (author via argv, then read the
+file). ⚠️ It must not come from **the same generator**: a literal typed by the script that wrote the
+value, or a read-back through the same mangling transport, is the shared source with an extra step —
+and that is how a Shape (E) fix quietly becomes another Shape (E).
+
+**A fourth instance, and the purest — because nothing was TRANSFORMED.** A gate log showed
+`[FAIL]` on both lanes and `REAL_EXIT=0` beneath it, which reads exactly like a runner lying about
+its status. Two runs were writing to one file: an earlier run, killed for memory, whose children
+were still alive, and the real one. Both lines were **correct about their own run**; they were false
+only when read as one document. The other three instances each involved a mangled value —
+truncated, wrapped, collapsed — and can be dismissed as "be careful with pipes". This one has no
+transformation at all, which is why it is the version to cite.
+
+Its remedy is also the most reusable: **assert the artifact has exactly ONE summary.** That works
+because it does not check the values at all — it checks that **the reading has one source**, which
+is the property actually in question, and it generalises to any accumulating artifact two producers
+can reach. (A timestamp check is the tempting alternative and a worse one: it compares values that
+both producers can legitimately write.) Name each run's artifact uniquely and stamp the identity
+INSIDE it — `verify-<sha>-<time>.log`, with the sha written into the file — so a shared file is
+detectable rather than silently plausible.
+
+**The fix for Shape (E) is to make one side a written literal; the trigger for Shape (E) is that
+neither side is.**
+
+⚠️ Related to Shape (D) but **not** foldable into it: (D)'s remedy is *make the double faithful*,
+which does nothing here, where both sides may be perfectly faithful and merely dependent. A shape
+whose remedy applies to half its instances is worse than two shapes.
+
 ## Gotchas
 
 ⚠️ **`onWorldSwap` is a re-export, and that is what makes this invisible.** It is defined in

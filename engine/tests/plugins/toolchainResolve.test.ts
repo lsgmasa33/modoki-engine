@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { makeDirLink } from '../helpers/linkFixture';
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -1050,7 +1051,7 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
       const target = path.join(root, 'elsewhere')
       fs.mkdirSync(target, { recursive: true })
       fs.mkdirSync(path.join(tc, 'ruby'), { recursive: true })
-      fs.symlinkSync(target, path.join(tc, 'ruby', 'link'), 'junction')
+      makeDirLink(target, path.join(tc, 'ruby', 'link'))
       expect(shouldSweepProcesses(path.join(tc, 'ruby'), 'win32')).toBe(true)
     })
 

@@ -12,6 +12,7 @@ import {
   parseDevServerIdentity, classifyPortHolder, exitDisposition,
   probeDevServerPort, isProcessAlive, startDevServer, stopChild, type DevServerIdentity,
 } from '../../electron/devServer';
+import { makeDirLink } from '../helpers/linkFixture';
 
 let occupied: net.Server | null = null;
 
@@ -342,7 +343,7 @@ describe('#190 — proving the server on the port is OURS', () => {
         const real = path.join(base, 'modoki');
         fs.mkdirSync(real);
         const link = path.join(base, 'link');
-        fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+        makeDirLink(real, link);
         // The leaked server reports the path it was started with; we know ourselves by the link.
         const identity = { ...ours, repoRoot: real, ppid: 99999 };
         const v = classifyPortHolder({ state: 'modoki', identity }, { repoRoot: link, pid: OUR_EDITOR_PID }, deps(dead));

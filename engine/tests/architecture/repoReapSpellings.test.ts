@@ -21,20 +21,30 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { makeDirLink, canMakeDirLink, cloneRootSpellings, makeFixtureRoot } from '../helpers/linkFixture';
 
 const REAP = path.resolve(__dirname, '..', '..', 'scripts', 'lib', 'repo-reap.sh');
 
-/** Windows without Developer Mode / SeCreateSymbolicLinkPrivilege cannot create one at all. Skip
- *  rather than redden a leg for a privilege — the mechanism is unreachable there anyway, and the
- *  Windows spellings are their own issue (a junction, not a symlink). */
-const CAN_SYMLINK = (() => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'symcap-'));
-  try { fs.mkdirSync(path.join(d, 't')); fs.symlinkSync(path.join(d, 't'), path.join(d, 'l'), 'dir'); return true; }
-  catch { return false; }
-  finally { fs.rmSync(d, { recursive: true, force: true }); }
-})();
+/** ⚠️ **This suite now RUNS on Windows, and used to be red there** (#949/#958). Two changes, both
+ *  in `helpers/linkFixture.ts`:
+ *
+ *  1. The capability probe used to make a `'dir'` symlink, which needs a privilege on Windows —
+ *    so the note here read "the mechanism is unreachable there anyway". That was never true: a
+ *    junction reaches it and needs no privilege. `canMakeDirLink()` is therefore TRUE on win32,
+ *    and these cases execute rather than skipping.
+ *  2. Which is how the real defect surfaced. This file registered roots built from
+ *    `os.tmpdir()` — native `E:\…` — and `reap_alt_pattern`'s absolute-root precondition is
+ *    `case "$PHYS" in /*)`, a POSIX spelling of "is absolute". A native Windows path fails it, so
+ *    the whole second-spelling mechanism yielded NOTHING and two cases failed. The harness was
+ *    feeding the helper a shape no production caller can produce (`launch-editor.sh:29,34` and
+ *    `stop-editor.sh:25,29` both use bash `pwd`/`pwd -P`), so on Windows it went red AND proved
+ *    nothing. Roots now come from `cloneRootSpellings`, which runs those same two commands.
+ *
+ *  ⚠️ **Keep the two spellings apart at the boundary.** `marker()` is NATIVE and is what `sleeper`
+ *  puts in a process's argv; `shMarker()` is the SHELL spelling and is what goes into the script
+ *  text. Mixing them re-creates exactly the defect above, and on POSIX the two are identical so
+ *  nothing local would notice. */
 
 const kids: ChildProcess[] = [];
 const dirs: string[] = [];
@@ -44,8 +54,14 @@ afterEach(() => {
   for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
+/** ⚠️ **`makeFixtureRoot`, never a raw `os.tmpdir()` — this file has a THIRD spelling and it is the
+ *  easiest one to miss.** `os.tmpdir()` is not its own realpath on macOS (`/var` → `/private/var`),
+ *  so a fixture built on it hands `sleeper` the UNRESOLVED spelling in argv while
+ *  `cloneRootSpellings` reports `pwd -P`, which resolves the ancestor. The reap's second spelling
+ *  then names a path no process carries. Green on ubuntu and windows-latest, red on all five Mac
+ *  clones, and there was no macOS `check` leg to catch it (one was added 2026-09-09). */
 function tmp(prefix: string): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const d = makeFixtureRoot(prefix);
   dirs.push(d);
   return d;
 }
@@ -55,8 +71,20 @@ function symlinkedClone() {
   const real = path.join(root, 'modoki-qa');
   const link = path.join(root, 'clone-link');
   fs.mkdirSync(path.join(real, 'engine', 'electron', 'dist'), { recursive: true });
-  fs.symlinkSync(real, link, 'dir');
-  return { root, real, link, marker: (base: string) => path.join(base, 'engine/electron/dist/main.cjs') };
+  makeDirLink(real, link);
+  // The roots a REAL caller registers, derived by bash `pwd`/`pwd -P` from the link — the same
+  // two commands launch-editor.sh runs. `logical` keeps the link, `physical` resolves it.
+  const roots = cloneRootSpellings(link);
+  return {
+    root,
+    real,
+    link,
+    roots,
+    /** NATIVE — goes in a spawned process's argv, which is what the reap matches against. */
+    marker: (base: string) => path.join(base, 'engine/electron/dist/main.cjs'),
+    /** SHELL — goes in the script text handed to bash. */
+    shMarker: (base: string) => `${base}/engine/electron/dist/main.cjs`,
+  };
 }
 
 /** A live process whose argv literally contains `marker` — what `pkill -f` matches on. */
@@ -86,20 +114,20 @@ function sh(script: string, roots?: { logical: string; physical: string }): { st
   return { status: Number(/STATUS=(\d+)/.exec(r)?.[1] ?? -1), out: r.replace(/STATUS=\d+\s*$/, '') };
 }
 
-describe.skipIf(!CAN_SYMLINK)('repo-reap.sh matches a set of spellings (#913)', () => {
+describe.skipIf(!canMakeDirLink())('repo-reap.sh matches a set of spellings (#913)', () => {
   it('finds a process launched with the REAL path when asked about the LINK path', () => {
     const c = symlinkedClone();
     sleeper(c.marker(c.real));
-    expect(sh(`reap_repo_alive '${c.marker(c.link)}'`, { logical: c.link, physical: c.real }).status).toBe(0);
+    expect(sh(`reap_repo_alive '${c.shMarker(c.roots.logical)}'`, c.roots).status).toBe(0);
   });
 
   it('and REAPS it — not merely detects it', () => {
     const c = symlinkedClone();
     sleeper(c.marker(c.real));
-    expect(sh(`reap_repo_alive '${c.marker(c.link)}'`, { logical: c.link, physical: c.real }).status).toBe(0);
-    sh(`reap_repo_process '${c.marker(c.link)}'`, { logical: c.link, physical: c.real });
+    expect(sh(`reap_repo_alive '${c.shMarker(c.roots.logical)}'`, c.roots).status).toBe(0);
+    sh(`reap_repo_process '${c.shMarker(c.roots.logical)}'`, c.roots);
     execFileSync('bash', ['-c', 'sleep 0.5']);
-    expect(sh(`reap_repo_alive '${c.marker(c.link)}'`, { logical: c.link, physical: c.real }).status).not.toBe(0);
+    expect(sh(`reap_repo_alive '${c.shMarker(c.roots.logical)}'`, c.roots).status).not.toBe(0);
   });
 
   it('CONTROL: the un-symlinked case that already worked still works', () => {
@@ -107,13 +135,14 @@ describe.skipIf(!CAN_SYMLINK)('repo-reap.sh matches a set of spellings (#913)', 
     // case and break this one. Registering identical roots must change nothing.
     const c = symlinkedClone();
     sleeper(c.marker(c.real));
-    expect(sh(`reap_repo_alive '${c.marker(c.real)}'`, { logical: c.real, physical: c.real }).status).toBe(0);
+    const phys = c.roots.physical;
+    expect(sh(`reap_repo_alive '${c.shMarker(phys)}'`, { logical: phys, physical: phys }).status).toBe(0);
   });
 
   it('CONTROL: with no roots registered at all, the plain match still works', () => {
     const c = symlinkedClone();
     sleeper(c.marker(c.real));
-    expect(sh(`reap_repo_alive '${c.marker(c.real)}'`).status).toBe(0);
+    expect(sh(`reap_repo_alive '${c.shMarker(c.roots.physical)}'`).status).toBe(0);
   });
 
   it('CONTROL: a SIBLING clone whose name is a prefix is never matched (#69)', () => {
@@ -124,7 +153,7 @@ describe.skipIf(!CAN_SYMLINK)('repo-reap.sh matches a set of spellings (#913)', 
     const sibling = path.join(c.root, 'modoki-qa-2');
     fs.mkdirSync(path.join(sibling, 'engine', 'electron', 'dist'), { recursive: true });
     sleeper(c.marker(sibling));
-    expect(sh(`reap_repo_alive '${c.marker(c.link)}'`, { logical: c.link, physical: c.real }).status).not.toBe(0);
+    expect(sh(`reap_repo_alive '${c.shMarker(c.roots.logical)}'`, c.roots).status).not.toBe(0);
   });
 
   it('an EMPTY physical root yields NOTHING — not merely something different', () => {
@@ -133,12 +162,12 @@ describe.skipIf(!CAN_SYMLINK)('repo-reap.sh matches a set of spellings (#913)', 
     // every clone on the machine — and that string contains no temp root, so the old assertion
     // passed on the exact disaster it was named after. The property is that NOTHING is printed.
     const c = symlinkedClone();
-    expect(sh(`reap_alt_pattern '${c.marker(c.link)}'`, { logical: c.link, physical: '' }).out.trim()).toBe('');
+    expect(sh(`reap_alt_pattern '${c.shMarker(c.roots.logical)}'`, { logical: c.roots.logical, physical: '' }).out.trim()).toBe('');
   });
 
   it('a RELATIVE physical root yields nothing — it could not name an absolute process path', () => {
     const c = symlinkedClone();
-    expect(sh(`reap_alt_pattern '${c.marker(c.link)}'`, { logical: c.link, physical: 'relative/path' }).out.trim()).toBe('');
+    expect(sh(`reap_alt_pattern '${c.shMarker(c.roots.logical)}'`, { logical: c.roots.logical, physical: 'relative/path' }).out.trim()).toBe('');
   });
 
   it('CONTROL: a pattern that merely STARTS WITH the root gets no second spelling (#69)', () => {
@@ -148,12 +177,11 @@ describe.skipIf(!CAN_SYMLINK)('repo-reap.sh matches a set of spellings (#913)', 
     // not under it — a prefix-shaped guard rewrites it to `<physical>-2/…`, a real SIBLING CLONE's
     // path, and reaps that clone's editor.
     const c = symlinkedClone();
-    expect(sh(`reap_alt_pattern '${c.link}-2/engine/electron/dist/main.cjs'`,
-      { logical: c.link, physical: c.real }).out.trim()).toBe('');
+    expect(sh(`reap_alt_pattern '${c.roots.logical}-2/engine/electron/dist/main.cjs'`, c.roots).out.trim()).toBe('');
   });
 
   it('a pattern OUTSIDE the registered root gets no second spelling', () => {
     const c = symlinkedClone();
-    expect(sh(`reap_alt_pattern '/somewhere/else/main.cjs'`, { logical: c.link, physical: c.real }).out.trim()).toBe('');
+    expect(sh(`reap_alt_pattern '/somewhere/else/main.cjs'`, c.roots).out.trim()).toBe('');
   });
 });

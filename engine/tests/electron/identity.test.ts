@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, isWithin, type BackendIdentity } from '../../tools/shared/identity';
+import { makeDirLink } from '../helpers/linkFixture';
 
 const URL_ = 'http://127.0.0.1:5180';
 
@@ -206,7 +207,10 @@ describe('a symlinked clone spells one directory two ways (#913)', () => {
     other = path.join(tmpRoot, 'modoki-ai');
     fs.mkdirSync(real, { recursive: true });
     fs.mkdirSync(other, { recursive: true });
-    fs.symlinkSync(real, link, 'dir');
+    // ⚠️ #949's shape, unfiled — found by sweeping the class rather than by the ticket. A bare
+    // `'dir'` link in a `beforeAll` with no skip: on an unelevated Windows box this throws EPERM
+    // and every case in the describe ERRORS. A junction needs no privilege and resolves the same.
+    makeDirLink(real, link);
   });
 
   afterAll(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));

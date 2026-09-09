@@ -15,7 +15,7 @@ export interface ResolvedPackagedApp {
 export declare function resolvePackagedApp(outDir: string, name?: string): ResolvedPackagedApp;
 
 /** The executable inside an already-known app dir (`.app` bundle on macOS, unpacked dir elsewhere). */
-export declare function binInAppDir(appDir: string, name?: string): string;
+export declare function binInAppDir(appDir: string, name?: string, platform?: NodeJS.Platform): string;
 
 /** The packaged editor's userData dir — `<app support root>/<productName>`. */
 export declare function packagedUserData(): string;
@@ -53,3 +53,24 @@ export declare function decodeWinReap(stdout: string | undefined): ReapOutcome;
  *  platform when `appDir` is passed but empty/implausibly short: since the Windows branch became
  *  path-scoped too, an empty value would widen the match there just as it does on POSIX. */
 export declare function killPackaged(appDir?: string, name?: string): ReapOutcome;
+
+/** The OS "application support" root Electron puts userData dirs under.
+ *
+ *  ⚠️ Pure/platform-injectable, and the three branches do NOT read the same inputs: win32 honours
+ *  `APPDATA`, linux honours `XDG_CONFIG_HOME`, **darwin honours neither** and derives from `home`
+ *  alone. The parameters exist so that asymmetry is pinnable from any platform — the darwin branch
+ *  is the one no leg this repo runs would otherwise execute. */
+export declare function appSupportRoot(
+  platform?: NodeJS.Platform,
+  env?: NodeJS.ProcessEnv,
+  home?: string,
+): string;
+
+/** `engine/electron/userDataDir.ts`'s SHARED_DIR — the machine-level root the provisioned Build
+ *  Support toolchain lives under, shared by every clone rather than per-app. */
+export declare const SHARED_DIR: 'Modoki';
+
+/** Where `--toolchain` looks when `MODOKI_TOOLCHAIN_DIR` is unset. Exported so a TEST can build a
+ *  fixture at the real default instead of re-deriving it — `clean-packaged-cache.mjs` is a
+ *  top-level program and importing IT for the path would run the wipe. */
+export declare function defaultToolchainDir(): string;

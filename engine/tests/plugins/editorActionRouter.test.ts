@@ -3,7 +3,7 @@
  *  /api/import-file (request validation). These prove the routing/guard logic
  *  without a live renderer — requestBrowser is mocked. */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
@@ -418,18 +418,45 @@ describe('/api/import-file (F11: an unrecognized type is not a phantom success)'
  */
 describe('/api/validate-scene and /api/validate-prefab — stale-input disclosure', () => {
   let seq = 0;
+  /** ⚠️ **Returns an ASSET-URL path, not a native one, and that is load-bearing on Windows.**
+   *
+   *  This used to return `path.join(os.tmpdir(), …)`, which is `/var/folders/…` on macOS and
+   *  `E:\dev-temp\…` on Windows. The route keys its staleness gate on
+   *  `normalizeAssetUrl(requestedPath)`, whose first act is `startsWith('/') ? p : '/' + p` — so the
+   *  macOS spelling passed through unchanged and matched the held path, while the Windows one
+   *  became `/E:\dev-temp\…` and matched nothing. `staleInputs` came back `undefined` and the case
+   *  failed on Windows only.
+   *
+   *  ⚠️ It is the FIXTURE that was wrong, not the route. Production `resolveAssetPath` resolves
+   *  only paths under an asset root's `urlPrefix`, so a native absolute path never gets past the
+   *  404 and never reaches the gate — the shape only exists here, because `makeCtx`'s stub is
+   *  identity and lets through what production rejects. Fixing `normalizeAssetUrl` for it would
+   *  widen production code to serve a path production cannot produce.
+   *
+   *  So the fixture now speaks the vocabulary the route actually takes, and `resolveDir` maps it
+   *  onto the real temp file — the same shape the `/games/x/…` cases above already use. */
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'modoki-validate-'));
+  const resolveDir = (p: string) => path.join(dir, path.basename(p));
+  // Created once at collection, so it needs one teardown — otherwise every run leaves a
+  // `modoki-validate-*` directory behind. (The old fixture wrote loose files straight into
+  // os.tmpdir(), so this is not a regression in kind, but it is a whole directory per run.)
+  afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }); });
   const tempFile = (name: string, doc: unknown): string => {
-    const p = path.join(os.tmpdir(), `modoki-validate-${process.pid}-${seq++}-${name}`);
-    fs.writeFileSync(p, JSON.stringify(doc));
-    return p;
+    const url = `/assets/modoki-validate-${process.pid}-${seq++}-${name}`;
+    fs.writeFileSync(resolveDir(url), JSON.stringify(doc));
+    return url;
   };
   const scene = () => tempFile('s.scene.json', { entities: [] });
   const prefab = () => tempFile('p.prefab.json', { id: 'pf', version: 2, name: 'P', rootLocalId: 1, entities: [{ localId: 1, name: 'P', traits: {} }] });
   const held = (path: string, registry: string, detail: string) => [{ path, registry, detail }];
+  /** `makeCtx` with the asset resolver these fixtures need. The base stub is identity, which is
+   *  what let a native path reach the route at all — see `tempFile` above. */
+  const ctxFor = (over: Partial<BackendContext> = {}): BackendContext =>
+    makeCtx({ resolveAssetPath: resolveDir, ...over });
 
   it('validate-scene discloses, and still answers 200 with its warnings', async () => {
     const scenePath = scene();
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held('/assets/prefabs/Badge.prefab.json', 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
     }) });
 
@@ -449,7 +476,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // whole-image `sprite` sub-entry only when the SIDECAR types it `2d`/`ui`. So parking a Type
     // change from `2d` to `3d` deletes a guid the scene references, and the dangling-ref warning
     // appears at the human's next Cmd+S and not before. Under-disclosure, the dangerous direction.
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held('/assets/textures/logo.png', 'pendingMeta', 'unsaved import settings'),
     }) });
 
@@ -464,7 +491,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // times: this route parses one file and validates it alone, and `baseScene` is a top-level
     // scene field rather than a trait, so the ref walk never reaches it. Declaring it would
     // caveat EVERY validate call on EVERY scene for a park that moves nothing.
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held('/assets/scenes/Level-02.scene.json', 'pendingBaseScene', 'an unsaved baseScene ref'),
     }) });
 
@@ -488,7 +515,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // case — a path-scoped probe would report nothing here and look precise doing it. (It was
     // briefly byte-identical to the case above, which made it assert nothing the other did not.)
     const scenePath = scene();
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: [
         { path: '/assets/prefabs/Elsewhere.prefab.json', registry: 'liveScene', detail: 'unsaved live-world edits in the PREFAB open for editing' },
       ],
@@ -506,7 +533,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // error. A human dragging a Material slider must not make an unrelated, perfectly clean scene
     // report as stale — the agent then burns a turn on save_all, which writes their parked edits
     // to disk unasked, for a byte-identical answer.
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held('/assets/materials/rock.mat.json', 'dirtyAsset', 'an unsaved asset document'),
     }) });
 
@@ -521,7 +548,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // (see prefabEditUnsavedProbe.test.ts). A prefab is not an AssetSchemaType, so `dirtyAsset`
     // can never hold one — before that fix this disclosure could not fire at all.
     const prefabPath = prefab();
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held(prefabPath, 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
     }) });
 
@@ -537,7 +564,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
     // resolver, so nothing but this document can change its answer. Caveating a correct answer
     // because some particle is dirty trains readers to skip the field.
     const prefabPath = prefab();
-    const ctx = makeCtx({ requestBrowser: relay({
+    const ctx = ctxFor({ requestBrowser: relay({
       holds: held('/assets/particles/spark.particle.json', 'dirtyAsset', 'an unsaved asset document'),
     }) });
 
@@ -550,8 +577,8 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
   it('ACCEPT — a clean editor gets NO disclosure fields at all', async () => {
     // Absent, never `staleInputs: []`. A field present on every call is one readers learn to skip,
     // and then the call that matters is skipped too.
-    const sceneBody = ((await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, makeCtx())) as { body: Record<string, unknown> }).body;
-    const prefabBody = ((await get(`/api/validate-prefab?path=${encodeURIComponent(prefab())}`, makeCtx())) as { body: Record<string, unknown> }).body;
+    const sceneBody = ((await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctxFor())) as { body: Record<string, unknown> }).body;
+    const prefabBody = ((await get(`/api/validate-prefab?path=${encodeURIComponent(prefab())}`, ctxFor())) as { body: Record<string, unknown> }).body;
 
     for (const body of [sceneBody, prefabBody]) {
       expect('staleInputs' in body).toBe(false);
@@ -563,7 +590,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
   it('a renderer that did not answer is disclosed as UNKNOWN, not as clean', async () => {
     // The distinction the whole probe exists for. "Could not look" reported as "nothing is there"
     // is worse here than no disclosure, because the answer then reads as verified.
-    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer'); } });
+    const ctx = ctxFor({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer'); } });
 
     const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
       { body: { staleInputsUnknown?: { reason: string }; staleInputsNote?: string } };

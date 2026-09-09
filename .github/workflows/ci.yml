@@ -25,9 +25,29 @@
 # pre-publish safety scan covers SOURCE, not run output: a test that prints an env var or a
 # machine-specific absolute path publishes it for good. Keep that in mind when adding a step.
 #
+# ── AND WHY macos-14 (owner, 2026-09-09) ───────────────────────────────────────────────────────
+# Same economics — macOS runners are unbilled here too, the `package` job below already uses
+# macos-14, and it runs in PARALLEL so it costs no wall-clock. Added deliberately, not swept in.
+#
+# ⚠️ **What it buys is narrower than it looks, and the honest split matters.** A platform RULE —
+# pure logic that merely BRANCHES on the platform — needs no runner at all: make it injectable
+# (`platform`, `env`, `home`) and every leg pins every branch for free. `appSupportRoot` is the
+# worked example. What this leg buys is the other half: platform BEHAVIOUR, which no amount of
+# injection reaches — `/var` → `/private/var` aliasing, `rmSync` unlinking a dir symlink and
+# sparing the payload, mount-point traversal, whether `os.homedir()` honours `HOME`. The split,
+# and how to tell which one you are holding: docs/windows.md § "The same split decides what a test
+# can COVER".
+#
+# The measurement behind it, stated at its real size: over one full cross-platform assignment
+# (#883/#949/#955/#958, 2026-09-09) the platform was genuinely necessary TWICE. A macOS-only test
+# failure that day was found by hand and was a RULE, not behaviour — the darwin branch was
+# unreachable for want of a parameter, not for want of a Mac. So this leg is worth its zero cost;
+# it is not the fix for the class it superficially resembles, and it does not replace a second
+# READER, which caught considerably more that day than a second platform did.
+#
 # This is a SUBSET gate, not a replacement for the private one: no games/, no LFS. Anything
 # game-dependent still has to run in the private repo. What it does buy that nothing else does is
-# the Windows leg on every push, for free.
+# the Windows and macOS legs on every push, for free.
 
 name: CI
 
@@ -55,11 +75,11 @@ jobs:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      # Never cancel the other OS on one failure — when a change breaks exactly one platform,
-      # seeing BOTH results is the whole diagnostic signal.
+      # Never cancel the other legs on one failure — when a change breaks exactly one platform,
+      # seeing ALL THREE results is the whole diagnostic signal.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-14]
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # gate never launches Electron
     steps:

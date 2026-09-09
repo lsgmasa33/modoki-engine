@@ -37,6 +37,7 @@ import {
   checkReleaseState,
   claimLabelFor,
 } from '../../scripts/releaseBranch.mjs';
+import { makeDirLink } from '../helpers/linkFixture';
 
 const REPO = path.resolve(__dirname, '../../..');
 const CLI = path.join(REPO, 'engine/scripts/releaseBranch.mjs');
@@ -337,7 +338,7 @@ describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', (
       // 'junction' needs no elevation on win32; a bare 'dir' throws EPERM without
       // SeCreateSymbolicLinkPrivilege, reddening the lane for a machine privilege (came in from
       // main's 6d6cde177, which predates that convention being applied here).
-      fs.symlinkSync(REPO, link, process.platform === 'win32' ? 'junction' : 'dir');
+      makeDirLink(REPO, link);
       const viaLink = path.join(link, 'engine/scripts/releaseBranch.mjs');
       const r = spawnSync(process.execPath, [viaLink, '--branch-for', '0.7.0'], {
         encoding: 'utf8',

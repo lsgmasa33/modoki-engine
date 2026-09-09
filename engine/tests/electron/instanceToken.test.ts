@@ -13,6 +13,7 @@ import {
   rootKey,
   legacyRootKey,
 } from '../../electron/instanceToken';
+import { makeDirLink } from '../helpers/linkFixture';
 
 /**
  * C6 unit gate — the instance token (docs/connect-claude-code.md, C6).
@@ -183,7 +184,7 @@ describe('#899 — a symlinked project spelling is the SAME project', () => {
     real = path.join(base, 'court');
     fs.mkdirSync(real);
     link = path.join(base, 'link');
-    fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+    makeDirLink(real, link);
     ud = path.join(base, 'userdata');
   });
   afterEach(() => { _resetTokenCache(); fs.rmSync(base, { recursive: true, force: true }); });

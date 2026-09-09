@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { canonicalPath, samePath, pathCaseKey, isUnderOrSame } from '../../scripts/pathIdentity.mjs';
+import { makeDirLink } from '../helpers/linkFixture';
 
 const onWin = process.platform === 'win32';
 const CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin';
@@ -117,7 +118,7 @@ describe('samePath', () => {
       const link = path.join(root, 'link');
       fs.mkdirSync(real);
       try {
-        fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+        makeDirLink(real, link);
       } catch {
         return; // no symlink privilege (a locked-down CI box) — the other cases still cover us
       }
@@ -143,7 +144,7 @@ describe('samePath', () => {
         fs.mkdirSync(real);
         const link = path.join(base, 'link');
         try {
-          fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+          makeDirLink(real, link);
         } catch {
           // SKIP, never a silent return: unelevated Windows cannot make a link, and this is the
           // assertion the whole change exists for. A bare return would report a clean green.
@@ -228,7 +229,7 @@ describe('samePath', () => {
         const link = path.join(base, 'link');
         let linked = true;
         try {
-          fs.symlinkSync(real, link, 'junction');
+          makeDirLink(real, link);
         } catch {
           linked = false;
         }
@@ -454,7 +455,7 @@ describe('isUnderOrSame (#881)', () => {
       fs.mkdirSync(real, { recursive: true });
       const link = path.join(base, 'link');
       try {
-        fs.symlinkSync(real, link, 'dir');
+        makeDirLink(real, link);
       } catch {
         ctx.skip('cannot create a directory symlink here (needs a privilege this machine lacks)');
         return;
@@ -475,7 +476,7 @@ describe('isUnderOrSame (#881)', () => {
       fs.mkdirSync(path.join(real, 'assets'), { recursive: true });
       const link = path.join(base, 'link');
       try {
-        fs.symlinkSync(real, link, 'dir');
+        makeDirLink(real, link);
       } catch {
         // ⚠️ SKIP, never a silent `return`. This is the ONLY case here that discriminates
         // `.native` from `path.resolve`, and unelevated Windows cannot create a link — so a bare

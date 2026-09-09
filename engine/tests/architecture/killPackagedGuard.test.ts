@@ -17,6 +17,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { killPackaged, altPathSpelling, decodeWinReap, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
+import { makeDirLink } from '../helpers/linkFixture';
 
 vi.mock('node:child_process', () => {
   const execFileSyncMock = vi.fn();
@@ -128,7 +129,7 @@ describe.skipIf(process.platform === 'win32')('killPackaged matches BOTH spellin
     const app = path.join(real, 'mac-arm64', 'Modoki Editor.app');
     fs.mkdirSync(app, { recursive: true });
     const link = path.join(base, 'link');
-    fs.symlinkSync(real, link, 'dir');
+    makeDirLink(real, link);
     return { viaLink: path.join(link, 'mac-arm64', 'Modoki Editor.app'), viaReal: app };
   }
 
@@ -210,7 +211,7 @@ describe.skipIf(process.platform === 'win32')('killPackaged matches BOTH spellin
       const real = path.join(base, 'r2');
       fs.mkdirSync(real, { recursive: true });
       const link = path.join(base, 'l2');
-      fs.symlinkSync(real, link, 'dir');
+      makeDirLink(real, link);
       expect(altPathSpelling(link)).toBe(real);
     });
   });
@@ -259,7 +260,7 @@ describe.skipIf(process.platform === 'win32')('killPackaged reports its outcome 
     try {
       const real = path.join(base, 'real', 'mac-arm64', 'Modoki Editor.app');
       fs.mkdirSync(real, { recursive: true });
-      fs.symlinkSync(path.join(base, 'real'), path.join(base, 'link'), 'dir');
+      makeDirLink(path.join(base, 'real'), path.join(base, 'link'));
       let n = 0;
       vi.mocked(execFileSync).mockImplementation(() => {
         if (++n === 1) return undefined as never; // first spelling: killed

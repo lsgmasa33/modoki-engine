@@ -12,6 +12,7 @@ import {
   PACKAGED_DIR,
   DEV_DIR,
 } from '../../electron/userDataDir';
+import { makeDirLink } from '../helpers/linkFixture';
 
 /**
  * WHERE the editor keeps its state. Every property here was a real, measured bug:
@@ -173,7 +174,7 @@ describe('#899 — a symlinked spelling is the SAME clone', () => {
     real = path.join(base, 'modoki-qa');
     realFs.mkdirSync(real);
     link = path.join(base, 'link');
-    realFs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+    makeDirLink(real, link);
   });
   afterEach(() => { realFs.rmSync(base, { recursive: true, force: true }); });
 

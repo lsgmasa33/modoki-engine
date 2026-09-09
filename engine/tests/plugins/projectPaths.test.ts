@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { relativiseUnderProject, planDroppedFileDest } from '../../plugins/backend/projectPaths';
 import { canonicalPath } from '../../scripts/pathIdentity.mjs';
+import { makeDirLink, canMakeFileLink } from '../helpers/linkFixture';
 
 describe('relativiseUnderProject (#394)', () => {
   it('relativises a file inside the project', () => {
@@ -76,7 +77,18 @@ describe('relativiseUnderProject (#394)', () => {
       // A symlinked route to the SAME project — what a chooser navigating through an aliased
       // folder hands back. Without resolving the containing dir this reads as "outside", and the
       // absolute path lands in the tracked file.
-      fs.symlinkSync(path.join(tmp, 'real'), path.join(tmp, 'link'));
+      //
+      // ⚠️ #949: this was a bare `symlinkSync` with no `type`, in a `beforeAll` with no skip — so
+      // on a Windows box without Developer Mode it throws EPERM and all three cases below ERROR
+      // rather than skip. `makeDirLink` uses a junction there, which needs no privilege. Measured:
+      // all 17 cases in this file pass identically either way, because `relativiseUnderProject`
+      // resolves through `canonicalPath` → `realpathSync.native`, which treats the two reparse
+      // types the same.
+      //
+      // ⚠️ An earlier draft called this "the one site in the repo that named no type". It is not —
+      // the leaf case below is a second, and `connectClaude.test.ts` a third. Both are FILE links,
+      // which `makeDirLink` cannot serve.
+      makeDirLink(path.join(tmp, 'real'), path.join(tmp, 'link'));
     });
 
     afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -91,7 +103,13 @@ describe('relativiseUnderProject (#394)', () => {
         .toBe('art/icon.png');
     });
 
-    it('does NOT follow a symlink at the leaf out of the project', () => {
+    // ⚠️ **`skipIf`, not `makeDirLink`** — this is a FILE symlink, and there is no privilege-free
+    // equivalent for one (a junction is directory-only, and a hardlink has different identity
+    // semantics, which is exactly what this case is about). So unlike its neighbour eighteen lines
+    // up, this one genuinely has to skip on a machine without the privilege. Found by close-out
+    // review, which also caught that the neighbour's comment claimed to be the repo's only untyped
+    // `symlinkSync` — there are three, and this is one of them (#949).
+    it.skipIf(!canMakeFileLink())('does NOT follow a symlink at the leaf out of the project', () => {
       // The link lives inside the project, so the project-relative spelling is the right answer;
       // resolving the leaf would store the target's absolute path instead.
       fs.symlinkSync(path.join(tmp, 'outside', 'icon.png'), path.join(projectRoot, 'art', 'aliased.png'));

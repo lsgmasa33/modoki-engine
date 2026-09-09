@@ -22,7 +22,7 @@
  *  worker-clone launches landed on 5179, one (modoki-qa, 2026-08-25) with a live hub editor. */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
@@ -36,6 +36,7 @@ import {
   backendUrlForClone,
 } from '../../scripts/editorPorts.mjs';
 import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
+import { makeDirLink } from '../helpers/linkFixture';
 
 /** Mirrors `pathIdentity.mjs`'s own platform test. Asked of the module rather than re-derived,
  *  so this file cannot drift from the rule it is pinning. */
@@ -171,7 +172,7 @@ describe.skipIf(skip)('editorPorts.mjs is the one home for the clone → backend
         mkdirSync(real);
         const link = path.join(base, 'some-other-name');
         try {
-          symlinkSync(real, link, 'dir');
+          makeDirLink(real, link);
         } catch {
           // SKIP loudly, never a silent `return` — this is the only case that discriminates
           // `canonicalPath` from `path.resolve`, so a quiet pass here is a vacuous green on

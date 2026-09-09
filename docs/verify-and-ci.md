@@ -319,8 +319,8 @@ the engine suite) is `npm run verify` re-spelled, so only two things were lost:
 - **`typecheck:projects`** — the scoped per-project typecheck was reachable from nowhere else.
   Fixed in #967 by making it a leg of `verify`; see the section above.
 - **Nothing else — and in particular NOT Windows.** ⚠️ It is tempting to conclude the Windows
-  matrix died with this workflow. It did not: `oss/.github/workflows/ci.yml` runs the same
-  `[ubuntu-latest, windows-latest]` matrix on the PUBLIC mirror, free and automatic on every push
+  matrix died with this workflow. It did not: `oss/.github/workflows/ci.yml` runs an
+  `[ubuntu-latest, windows-latest, macos-14]` matrix on the PUBLIC mirror, free and automatic on every push
   to `main` (#96 — that file's header explains that Actions is unbilled on standard public-repo
   runners, windows-latest included, so the leg that costs ~47 billed minutes privately is free
   there). #847 is a `ci/main` run going red *on windows-latest*, i.e. direct evidence the leg
@@ -328,6 +328,31 @@ the engine suite) is `npm run verify` re-spelled, so only two things were lost:
   a game project's Windows behaviour — and `typecheck:projects`, which needs `games/` to have
   anything to check — is gated on no runner anywhere, only on someone running `verify` on the
   `win` clone ([windows.md](./windows.md)).
+
+  ⚠️ **That public `check (windows-latest)` leg is the only AUTOMATIC place a Windows red is
+  visible to anyone but the `win` clone** — the private `ci.yml` runs a `check (windows-latest)` of
+  its own over the same matrix, but it is `workflow_dispatch` and billed, so nothing fires it and
+  it is not a gate anyone waits on. A green
+  `verify` on a Mac says nothing about it, and — the trap that actually bit — a green `verify` on
+  `win` does not either, when the box differs from the runner. #958/#949 are the worked example:
+  `repoReapSpellings.test.ts` was red on that leg from the moment #913 landed, green on every Mac,
+  and its sibling `projectPaths.test.ts` was filed as reddening the same leg when it never did
+  (both the runner and the `win` box have the symlink privilege; a box without it has neither).
+  **So: read the leg, do not reason about it** — `gh run view <id> --repo lsgmasa33/modoki-engine
+  --log-failed`. A Windows claim argued from a Mac has been wrong here more often than right.
+
+  **`macos-14` joined that matrix on 2026-09-09** (owner), on the same economics: unbilled on a
+  public repo, already used by the `package` job, and running in parallel so it costs no
+  wall-clock. ⚠️ **Its value is narrower than it looks and the distinction is worth holding.** A
+  platform **RULE** — pure logic that merely branches on the platform — needs no runner: make it
+  injectable and every leg pins every branch for free (`appSupportRoot` is the worked example). The
+  leg buys the other half, platform **BEHAVIOUR**, which injection cannot reach: `/var` →
+  `/private/var` aliasing, `rmSync` unlinking a dir symlink and sparing the payload, mount-point
+  traversal. Measured over the assignment that prompted it (#883/#949/#955/#958): the platform was
+  genuinely necessary **twice**, and the macOS-only test failure found by hand that day was a RULE
+  — unreachable for want of a parameter, not for want of a Mac. Worth its zero cost; **not** a
+  substitute for a second reader, which caught considerably more. Full split:
+  [windows.md](./windows.md) § "The same split decides what a test can COVER".
 
 CI (`.github/workflows/ci.yml`) runs on a **matrix of `ubuntu-latest` + `windows-latest`**
 (`fail-fast: false`; lint is Linux-only, being OS-invariant), so CI is strictly broader than any

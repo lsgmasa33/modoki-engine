@@ -16,6 +16,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { makeDirLink } from '../helpers/linkFixture';
 
 const REPO = path.resolve(__dirname, '../../..');
 const SCRIPT = path.join(REPO, 'engine/scripts/stopDevServer.mjs');
@@ -66,7 +67,7 @@ describe('dev:stop matches the repo through any spelling of its root (#908)', ()
     const real = path.join(base, 'repo');
     fs.mkdirSync(real);
     const link = path.join(base, 'link');
-    fs.symlinkSync(real, link, 'junction'); // 'junction' needs no elevation on win32
+    makeDirLink(real, link);
 
     // Launched with the REAL spelling…
     const kid = fakeDevServer(real);

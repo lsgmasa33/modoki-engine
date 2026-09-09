@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeDirLink } from '../helpers/linkFixture';
 
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -50,7 +51,7 @@ beforeAll(() => {
     + 'process.stdout.write(isEntryPoint(import.meta.url) ? "RAN" : "IMPORTED");\n',
   );
   linkDir = path.join(base, 'link');
-  fs.symlinkSync(realDir, linkDir, 'junction'); // 'junction' needs no elevation on win32
+  makeDirLink(realDir, linkDir);
 });
 afterAll(() => { fs.rmSync(base, { recursive: true, force: true }); });
 

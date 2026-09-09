@@ -19,6 +19,7 @@ import {
   sameClone,
 } from '../../scripts/deviceClaimsStore.mjs';
 import type { DeviceClaim } from '../../scripts/deviceClaimsStore.d.mts';
+import { makeDirLink } from '../helpers/linkFixture';
 
 // (#865) Seeds must be FULLY QUALIFIED **for this platform**, so `path.resolve`, never a POSIX
 // literal. On win32 a bare `/clones/mine` is not qualified — `path.resolve` would re-root it onto
@@ -282,7 +283,7 @@ describe('#865 a linked checkout does not make this clone a stranger', () => {
     const link = path.join(linkDir, 'clone');
     let linked = false;
     try {
-      fs.symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir');
+      makeDirLink(real, link);
       linked = true;
     } catch { /* creating a link can need a privilege this machine lacks */ }
     try {
