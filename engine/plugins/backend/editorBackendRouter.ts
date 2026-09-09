@@ -2105,9 +2105,34 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `prefab not found: ${prefabPath}` }, 404);
       const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       const result = validatePrefabData(data);
+      // ── #889 phase 2: this validates the file on DISK. ──
+      // DISCLOSE, do not refuse (owner, 2026-09-09) — a read that refuses is worse than one that
+      // caveats, and this route backs the human's own prefab tooling. §8's "refuses when that work
+      // would be lost or OMITTED" licenses the softer half: a read omits nothing if it says what
+      // it could not see.
+      //
+      // ⚠️ PATH-SCOPED, unlike the two global stale-read routes and unlike `/api/validate-scene`
+      // below. `validatePrefabData` consults NO resolver — it reports the inert-size rule over this
+      // one document — so no other unsaved file can change its answer, and a global probe here
+      // would caveat a correct answer because an unrelated particle doc is dirty. A disclosure that
+      // fires on state it does not depend on is the field readers learn to skip.
+      //
+      // ⚠️ And it only became reachable in this same change. A prefab is not an `AssetSchemaType`,
+      // so `dirtyAsset` can never hold one; the ONLY registry that can is `liveScene`, via
+      // prefab-edit — which reported nothing at all until `dirtyWorldTarget` gave the prefab-edit
+      // world its own path. Scoped to a registry list this would have been an unreachable
+      // mechanism; ALL_UNSAVED_REGISTRIES costs nothing on a path ask (a path that no registry
+      // holds simply yields no row) and does not go stale if prefabs ever become parkable.
+      const prefabStale = await unsavedGate(ctx, [normalizeAssetUrl(prefabPath!)], {
+        registries: ALL_UNSAVED_REGISTRIES,
+      });
       // No `schemaApplied`/`schemaAvailable` here: this pass consults no trait schema, and
       // reporting those fields would imply type checks ran when none did.
-      return json({ path: prefabPath, warnings: result.warnings });
+      return json({
+        path: prefabPath,
+        warnings: result.warnings,
+        ...(staleInputDisclosure(prefabStale) ?? {}),
+      });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
     }
@@ -2121,7 +2146,48 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       const schema = ctx.getSchema();
       const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
-      return json({ path: scenePath, schemaApplied: result.schemaApplied, schemaAvailable: !!schema, warnings: result.warnings });
+      // ── #889 phase 2: DISCLOSE, do not refuse (owner, 2026-09-09) — see /api/validate-prefab. ──
+      //
+      // ⚠️ GLOBAL (any unsaved doc can matter, not just this path) but NOT all four registries,
+      // and the second half of that is a correction to what this comment said when it was written.
+      //
+      // It claimed `makeAssetResolver` meant "an unsaved asset document changes the verdict".
+      // It does not. `makeAssetResolver` is `makeAssetRefResolver(assets.map(a => a?.guid))` — a
+      // membership test over MANIFEST GUIDS (sceneValidation.ts) — and `validateSceneData` takes
+      // only `getPrefab` and `assetExists`; neither ever opens an asset document. So a parked
+      // material or particle cannot move a single warning, and declaring `dirtyAsset` here made
+      // this route caveat a provably correct answer every time a human touched a Material slider,
+      // sending an agent to `save_all` — which writes the human's parked edits to disk unasked —
+      // for a result that comes back byte-identical. That is exactly the trap the prefab twin's
+      // comment above names: a disclosure that fires on state it does not depend on is the field
+      // readers learn to skip. `pendingMeta` is out for the same reason: `.meta.json` is read by
+      // neither pass.
+      //
+      // ⚠️ **`pendingMeta` IS in, and reasoning from "which pass reads the file" is what got this
+      // wrong twice.** The passes do not read a `.meta.json` — but `assetExists` tests membership
+      // in the MANIFEST, and the manifest is DERIVED from the sidecar: `vite-asset-scanner.ts`
+      // resolves `textureType` from `meta` and emits the auto whole-image `type:'sprite'` sub-entry
+      // only for `2d`/`ui`. So a parked Inspector change of a texture's Type from `2d` to `3d`
+      // deletes a guid the scene references — the warning appears at the human's next Cmd+S and
+      // not before, which is exactly the "answered about the pre-edit graph" this disclosure is
+      // for. Narrowing this to exclude it was an UNDER-disclosure, the dangerous direction.
+      //
+      // ⚠️ **`pendingBaseScene` is OUT, by the same argument that ejected `dirtyAsset`.**
+      // `sceneValidation.ts` contains the string `baseScene` zero times: this route parses the file
+      // and validates it alone, resolving no chain, and `baseScene` is a top-level scene field
+      // rather than a trait, so the ref walk never sees it either. Declaring it would caveat every
+      // validate call on every scene for a park that cannot move one warning.
+      //
+      // `dirtyAsset` stays out: a parked asset DOCUMENT changes no manifest entry `assetExists`
+      // tests (the scanner keys the guid off the file, and no editor path parks a changed `id`).
+      const sceneStale = await unsavedGate(ctx, null, { registries: ['pendingMeta', 'liveScene'] });
+      return json({
+        path: scenePath,
+        schemaApplied: result.schemaApplied,
+        schemaAvailable: !!schema,
+        warnings: result.warnings,
+        ...(staleInputDisclosure(sceneStale) ?? {}),
+      });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
     }
@@ -2237,32 +2303,79 @@ async function describeUnresolvedAgainstLiveWorld(
       // `unsavedCauses` (#844) — additive on `get_editor_state`/`editor-state`, so an OLDER or
       // otherwise-mismatched renderer simply omits it; the refusal below falls back to the old
       // generic wording rather than crashing on a missing field.
-      type EditorStateProbe = {
-        playState?: string; unsavedChanges?: boolean; scenePath?: string;
-        // ⚠️ Every cause `unsavedChangeCauses()` returns must be declared here, or the refusal
-        // below cannot name it and falls through to a generic string that blames the wrong
-        // thing (#844). The two below were on the wire and undeclared, which is exactly how
-        // they went unnamed — the DATA arriving is not the same as the type admitting it.
-        unsavedCauses?: {
-          sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[];
-          pendingBaseScenes?: string[]; pendingImportSettings?: string[];
-        };
-      };
+      // ⚠️ **Two fields, and the shrink is the point.** This used to also declare `unsavedChanges`
+      // and a five-key `unsavedCauses`, because the unsaved-work refusal below read them directly —
+      // a SECOND copy of the cause list that drifted from `unsavedChangeCauses()` twice, each time
+      // producing a refusal that named the wrong cause. That refusal now goes through
+      // `unsavedGate`, so these fields are read by nothing, and a type that keeps declaring them
+      // would advertise an answer this route no longer consults. What is left is exactly what only
+      // `editor-state` can say: the Play state, and WHICH scene is live (for `canGoLive`).
+      type EditorStateProbe = { playState?: string; scenePath?: string };
       let st: EditorStateProbe | null = null;
-      let probeFailed = false;
+      /** Why the probe did not answer, when it did not.
+       *
+       *  ⚠️ **`absent` and `unknown` are different answers, and collapsing them is what made this
+       *  route diverge from `docs/mcp-tool-conventions.md` §8** ("the renderer did not answer" must
+       *  be a refusal). It used to be one boolean, `probeFailed`, because `requestBrowser` rejects
+       *  identically for a missing renderer and a busy one — so refusing on it would have broken
+       *  the genuinely headless edit that is this route's normal case, and the written rationale
+       *  chose to proceed with a warning. #889's classifier removes the dilemma: a TRANSPORT
+       *  failure that is not a timeout means no renderer exists at all, and anything else means one
+       *  may well be attached and simply did not answer.
+       *
+       *  Converged on §8 on the owner's ruling, 2026-09-09. The cost is real and was accepted: an
+       *  agent write that today succeeds quietly while the editor is mid-GLB-parse now comes back
+       *  as a 503 telling it to retry. The thing it buys is that the same write no longer
+       *  hot-reloads the scene out from under unsaved live work it could not see.
+       *
+       *  ⚠️ Same classifier pair as `unsavedGate`, deliberately not a second copy. */
+      let probeOutcome: 'answered' | 'absent' | 'unknown' = 'answered';
+      let probeReason = '';
       // 8s, not 2s (independent review, 2026-07-30). `requestBrowser` REJECTS on timeout, and this
       // catch treated that as "no editor connected — safe". But a renderer that is merely BUSY —
       // a GLB/KTX2 decode, a scene load, a long frame — misses 2s easily, and then `st` is null, so
-      // `st?.playState` and `st?.unsavedChanges` are both undefined and NEITHER the Play 409 below
-      // nor the unsaved-work 409 further down can fire. A busy editor silently downgraded to a
-      // file-direct write with both protections off.
+      // `st?.playState` is undefined and the Play 409 below cannot fire. A busy editor silently
+      // downgraded to a file-direct write with its protections off.
       //
-      // The two cases are genuinely indistinguishable here (`requestBrowser` rejects with the same
-      // timeout for a missing renderer and a slow one), and refusing outright would break the real
-      // headless/file-only use. So: give a busy renderer room to answer, and when it still does not,
-      // SAY the guards could not run rather than proceeding as though they had passed.
+      // ⚠️ That last sentence USED to end "the two cases are genuinely indistinguishable here, so
+      // give a busy renderer room to answer and, when it still does not, SAY the guards could not
+      // run rather than proceeding as though they had passed". They are no longer
+      // indistinguishable — see `probeOutcome` below — so the 8s budget is now about giving a busy
+      // renderer room to answer BEFORE it is refused, not about choosing whether to refuse.
       try { st = (await ctx.requestBrowser('editor-state', {}, 8000)) as EditorStateProbe; }
-      catch { probeFailed = true; /* no editor connected, OR one too busy to answer — see below */ }
+      catch (e) {
+        probeReason = e instanceof Error ? e.message : String(e);
+        probeOutcome = isRelayTransportFailure(probeReason) && !isRelayTimeout(probeReason)
+          ? 'absent' : 'unknown';
+      }
+      // ── §8: a renderer that MAY be attached and did not answer is a refusal. ──
+      // Placed here rather than beside the old warning further down because the write must not
+      // happen at all: down there `applyOps` has already run and the file write is the next
+      // statement. `canGoLive` requires `st`, so an unanswered probe is always the file-direct
+      // path — there is no live branch to fall through to.
+      //
+      // ⚠️ No `force`/`discardUnsaved` in the options list, because this route HAS neither (its
+      // unsaved-work 409 below says so in as many words). A refusal that lists an exit which does
+      // not exist is worse than one that lists none: the agent spends a turn discovering the
+      // parameter is ignored, and §5's whole point is that a refusal names REAL exits.
+      if (probeOutcome === 'unknown') {
+        return json({
+          ok: false,
+          changed: 0,
+          code: 'NO_RENDERER',
+          error: 'scene-mutate refused: an editor renderer may be attached and it did not answer '
+            + `the state probe within 8s (${probeReason}), so this could NOT rule out unsaved `
+            + 'live-world work or a running game. This route writes the scene FILE and the write '
+            + 'hot-reloads the scene, which would DISCARD any unsaved work — and "could not look" '
+            + 'is not "nothing is there".',
+          options: [
+            'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
+            'modoki_get_editor_state — if it answers, the renderer is alive and you can see what is pending',
+            'if a SECOND tab is open on the dev server it can answer first and win the race — close it and retry',
+            'modoki_save_all — flush any unsaved work first, so a later retry has nothing to lose',
+          ],
+        }, 503);
+      }
       if (st?.playState === 'playing' || st?.playState === 'paused') {
         return json({
           error: `game is ${st.playState} — stop the game (press Stop) before editing the scene; edits during Play are discarded on Stop`,
@@ -2372,36 +2485,65 @@ async function describeUnresolvedAgainstLiveWorld(
       // Mirrors the load_scene / new_scene `guardUnsaved` sibling (agentEditorOps.ts) — same
       // cause-naming shape, built from the same `unsavedChangeCauses()`. (F3) Moot when we just
       // went live above (that branch returned already) — this only guards the true file-direct case.
-      if (st?.unsavedChanges === true) {
-        // #844: name the ACTUAL cause(s) instead of a fixed string that always blamed
-        // create_entity/duplicate_entity/prefab — a dirty asset (e.g. a Material slider drag) sent
-        // an agent hunting entities it never created. Two differences from `guardUnsaved`: the
-        // consequence here is the FILE hot-reload destroying live work, not a world swap; and this
-        // route has no `discardUnsaved`/`force` escape hatch, so the only remedy is `modoki_save_all`.
-        const c = st.unsavedCauses;
-        const causes: string[] = [];
-        if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
-        if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
-        if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
-        // ⚠️ The two causes below were MISSING, and their absence reintroduced exactly the defect
-        // #844 fixed. With `pendingImportSettings` (or `pendingBaseScenes`) as the ONLY unsaved
-        // work, `causes` came out empty and the generic fallback fired — blaming
-        // create_entity/duplicate_entity/prefab and sending an agent to hunt live entities it
-        // never created. The fallback exists for an OLDER renderer that sends no `unsavedCauses`
-        // at all; a renderer that sends a cause this list does not know about is a different case
-        // and must not be answered with a confident wrong sentence.
-        //
-        // The renderer-side twin (`agentEditorOps.ts`'s guardUnsaved) was updated when each cause
-        // was added; this server-side copy was missed both times. Two copies of one cause list,
-        // which is why they drifted — worth collapsing if a third appears.
-        if (Array.isArray(c?.pendingBaseScenes) && c.pendingBaseScenes.length) causes.push(`${c.pendingBaseScenes.length} pending baseScene ref(s) awaiting a save: ${c.pendingBaseScenes.join(', ')}`);
-        if (Array.isArray(c?.pendingImportSettings) && c.pendingImportSettings.length) causes.push(`${c.pendingImportSettings.length} pending IMPORT-SETTINGS edit(s) (.meta.json) awaiting a save: ${c.pendingImportSettings.join(', ')}`);
-        const error = causes.length
-          ? `the editor has UNSAVED work — ${causes.join(' AND ')}. This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.`
-          // No `unsavedCauses` on the probe (an older/mismatched renderer) — fall back to the
-          // old generic wording rather than naming a cause list that doesn't exist.
-          : 'the editor has unsaved live changes (entities created via create_entity / duplicate_entity / prefab are not in the scene file yet). This route edits the FILE, and the write hot-reloads the scene — which would DISCARD that unsaved work. Run modoki_save_all first, then retry.';
-        return json({ ok: false, error, unsavedChanges: true }, 409);
+      // ⚠️ **The shared #889 probe, NOT a second reading of `editor-state.unsavedCauses`.**
+      // This block used to re-derive the cause list by hand from `st.unsavedCauses`, and its own
+      // comment recorded that the copy had already drifted TWICE — `pendingBaseScenes` and
+      // `pendingImportSettings` were both on the wire and unnamed here, so a refusal caused by
+      // either fell through to a generic sentence blaming create_entity/duplicate_entity/prefab
+      // and sent an agent hunting live entities it never made. That comment ended "worth
+      // collapsing if a third appears"; phase 2 collapses it instead of waiting for the third.
+      // `resolve-unsaved` derives its list from `unsavedChangeCauses()` under a type-level
+      // exhaustiveness check, so a sixth cause is now a compile error rather than a silent gap.
+      //
+      // ⚠️ Only asked when the renderer ANSWERED. `absent` means no renderer exists, and every
+      // registry is renderer-only module state — there is nothing to hold anything. Asking anyway
+      // would spend a relay round trip to be told what the first probe already established.
+      //
+      // ⚠️ GLOBAL (`null`), not scoped to this route's own scene path. The consequence is the disk
+      // write hot-reloading the world, which rebuilds it from the FILE — that discards a dirty
+      // material and a pending baseScene ref just as surely as it discards live entities, and
+      // none of those is keyed to the path being written.
+      const mutateUnsaved = probeOutcome === 'answered'
+        ? await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES })
+        : { kind: 'absent' } as UnsavedOutcome;
+      if (mutateUnsaved.kind === 'unknown') {
+        // The editor-state probe answered and this one did not — a renderer IS alive, so this is
+        // squarely §8's case and not the headless one.
+        return json({
+          ok: false,
+          changed: 0,
+          code: 'NO_RENDERER',
+          error: 'scene-mutate refused: the editor answered the state probe but did NOT answer the '
+            + `unsaved-work probe (${mutateUnsaved.reason}), so this could not rule out unsaved `
+            + 'work. This route writes the scene FILE and the write hot-reloads the scene, which '
+            + 'would DISCARD it.',
+          options: [
+            'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
+            'modoki_get_editor_state lists every kind under unsavedCauses',
+            'modoki_save_all — flush the work first, so a retry has nothing to lose',
+          ],
+        }, 503);
+      }
+      if (mutateUnsaved.kind === 'held') {
+        // ⚠️ No `force`/`discardUnsaved` named: this route HAS neither, and the old text said so
+        // deliberately ("the only remedy is modoki_save_all"). Listing an exit that does not exist
+        // costs the agent a turn to discover the parameter is ignored.
+        return json({
+          ok: false,
+          changed: 0,
+          code: 'REQUIRES_SAVE',
+          error: `the editor has UNSAVED work — ${describeHolds(mutateUnsaved.holds)}. This route `
+            + 'edits the FILE, and the write hot-reloads the scene — which would DISCARD that '
+            + 'unsaved work. Run modoki_save_all first, then retry.',
+          // `unsavedChanges` kept as the wire name earlier callers already branch on; `holds`
+          // carries what the boolean could not — which path, which registry, and why.
+          unsavedChanges: true,
+          holds: mutateUnsaved.holds,
+          options: [
+            'modoki_save_all — flush the work to disk, then repeat this call',
+            'modoki_get_editor_state lists every kind under unsavedCauses',
+          ],
+        }, 409);
       }
       const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
@@ -2416,15 +2558,27 @@ async function describeUnresolvedAgainstLiveWorld(
       const schema = ctx.getSchema();
       const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       const warnings = [...opWarnings, ...schemaWarnings, ...preflightWarnings];
-      // The probe never answered, so NEITHER guard above could run. Say so: the write proceeds
-      // (a genuinely headless edit is the normal case and must keep working), but the caller must
-      // not read a plain success as "the editor was checked and had nothing pending". A busy
-      // renderer looks exactly like an absent one from here.
-      if (probeFailed) {
+      // ── The `absent` case: no renderer EXISTS, so nothing can be in the way. ──
+      // This is the genuinely headless edit (curl, a build script, CI) and it must keep working —
+      // every registry the Play and unsaved-work guards consult is renderer-only module state.
+      // Still disclosed, because a caller must not read a plain success as "the editor was checked
+      // and had nothing pending"; it was not checked, it was established that there is nothing to
+      // check. The BUSY case no longer reaches here at all — it is the 503 above.
+      // ⚠️ Keyed off the UNSAVED probe alone. `probeOutcome === 'absent'` was in this condition too
+      // and is redundant — that case assigns `mutateUnsaved = {kind:'absent'}` above — but it also
+      // made the message wrong for the case it was added for: a renderer that ANSWERED
+      // `editor-state` and was gone by the second probe DID run the Play-state guard, against a
+      // real answer. Two situations, two sentences, rather than one that is false in one of them.
+      if (mutateUnsaved.kind === 'absent') {
         warnings.push(
-          'the editor did not answer the state probe within 8s, so this write could NOT be checked ' +
-          'against the Play state or unsaved live work. If an editor IS open, it was busy — verify ' +
-          'with modoki_get_editor_state that nothing was pending, or re-run once it is idle.',
+          probeOutcome === 'absent'
+            ? 'no editor renderer is attached (the relay transport reported none), so the '
+              + 'Play-state and unsaved-work guards did not run — there was no renderer holding '
+              + 'state for them to find. This is the normal headless path; the write went straight '
+              + 'to the file.'
+            : 'the editor answered the state probe and was GONE by the unsaved-work probe, so the '
+              + 'Play-state guard ran but the unsaved-work check did not. Nothing can be held with '
+              + 'no renderer, so this is safe — but it was not checked, it was ruled out.',
         );
       }
       // (The unknown-field guard that used to live here now runs PRE-FLIGHT, above the live/file
@@ -3399,6 +3553,49 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return json({ error: 'path outside allowed directories' }, 403);
+      // ── #889 phase 3: the dirty-asset gate. ──
+      //
+      // ⚠️ **`selfWrite` is the whole reason this route could not simply be gated**, and it is why
+      // it sat in KNOWN_GAPS rather than being fixed with the others. `flushDirtyAssets` POSTs
+      // HERE — this route is the only path from a parked document to disk — so a gate that refuses
+      // when `dirtyAsset` holds the path refuses the editor's own save and wedges the registry
+      // shut. That is #872's Sprite-Editor regression with a far bigger blast radius: not one
+      // panel, every parked document.
+      //
+      // The flag already existed and already means exactly the right thing: `flushDirtyAssets`
+      // sets it and a file-direct `write_asset` must not (its own docblock says so). It is an
+      // assertion about the CALLING PROCESS, not the document — a write issued from the renderer
+      // is never blind to the registry, because it IS the flush. Same reasoning, same shape, as
+      // `rendererWrite` on `/api/write-meta` one route over; the gate exists for the process that
+      // cannot see the registry.
+      //
+      // ⚠️ SCOPED to `dirtyAsset`. Only that registry can hold an `AssetSchemaType` document —
+      // `pendingMeta` holds the `.meta.json` sidecar, which is a different path, and the two scene
+      // registries hold scenes. Unscoped, this would refuse a material write because an unrelated
+      // scene has unsaved live edits.
+      //
+      // ⚠️ Placed ABOVE the CAS precondition on purpose: everything from `ifMatchRefusal` to
+      // `writeJsonAtomic` is synchronous, and that is what makes check-then-write atomic. An
+      // `await` in that span would open exactly the window the CAS exists to close.
+      const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
+      const writeGate = selfWrite
+        ? { kind: 'clear' } as UnsavedOutcome
+        : await unsavedGate(ctx, [normalizeAssetUrl(assetPath)], { registries: ['dirtyAsset'] });
+      const writeRefusal = (body as { discardUnsaved?: boolean } | null)?.discardUnsaved === true
+        ? null
+        : unsavedRefusal(writeGate, {
+          verb: 'write_asset',
+          consequence: 'destroys',
+          // ⚠️ Not a prediction — this is what the watcher already does, deliberately. An agent
+          // write is not fingerprinted as an editor write, so the change event reads as EXTERNAL
+          // and `dropParkedWriteFor` (agentBridge.ts) discards the parked document, on the stated
+          // grounds that "disk becomes the truth for that asset". The human's edit is gone, and
+          // today the only notice is a console.warn nobody is reading.
+          consequenceText: 'Writing now DESTROYS it: the editor holds a newer version of this '
+            + 'document that has not reached disk, and the file-change event this write raises '
+            + 'makes the editor drop it in favour of what you wrote.',
+        });
+      if (writeRefusal) return json(writeRefusal.body, writeRefusal.status);
       // Optional compare-and-swap precondition (#831), the same one `/api/write-file` carries and
       // through the same helper. `AtlasAssetView` is the caller that needs it: it serializes the
       // WHOLE document, nothing notifies it of a same-path content change, and since #831 its
@@ -3518,19 +3715,66 @@ async function describeUnresolvedAgainstLiveWorld(
       // whatever the human parked in the meantime — an edit made in the second after Cmd+S,
       // gone. A file-direct write_asset must NOT set this: there the cached def really is stale,
       // which is the whole reason the invalidation exists.
-      const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
+      // (`selfWrite` is read once, above the gate — see its comment there.)
       if (selfWrite) {
         const bytes = assetJsonBytes(out);
         ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
       }
       const outBytes = assetJsonBytes(out);
       writeJsonAtomic(abs, outBytes);
+      // ⚠️ **AFTER the write, and the order is the whole point** (the scar `/api/write-meta`
+      // carries). Riding along with the probe meant a write that then threw — a read-only file,
+      // ENOSPC — left the human's park destroyed with NOTHING written in its place. A failed write
+      // must cost nothing.
+      //
+      // ⚠️ Explicit, rather than leaning on the watcher's own `dropParkedWriteFor`. That path does
+      // fire for an external write and would usually reach the same end, but "usually" is not
+      // something to report as done: if it is debounced away or missed, the park survives and the
+      // human's next save_all flushes the OLD document straight over this write — #872's exact
+      // defect, reported as a clean success. Doing it here means the reply can say what was
+      // actually dropped instead of promising what probably will be.
+      const discardedParked = writeGate.kind === 'held'
+        ? ((await unsavedGate(ctx, [normalizeAssetUrl(assetPath)], { registries: ['dirtyAsset'], discard: ['dirtyAsset'] })
+          .catch((e) => ({ kind: 'unknown', reason: e instanceof Error ? e.message : String(e) }) as UnsavedOutcome)
+        ) as UnsavedOutcome)
+        : { kind: 'clear' } as UnsavedOutcome;
       // The sha256 of what now sits on disk, so a compare-and-swap caller can advance its own
       // baseline without re-fetching. It CANNOT compute this itself: the bytes are the server's
       // (`normalizeAssetData` + the id-preservation branch + `assetJsonBytes`' trailing newline),
       // and a client that reconstructs them is a second copy of that serialisation waiting to
       // drift — after which every subsequent write 409s against a baseline that was never right.
-      return json({ ok: true, saved: true, warnings, path: assetPath, sha256: crypto.createHash('sha256').update(outBytes).digest('hex') });
+      return json({
+        ok: true, saved: true, warnings, path: assetPath,
+        sha256: crypto.createHash('sha256').update(outBytes).digest('hex'),
+        // Present only when a park was in the way and the caller chose to proceed — never on a
+        // clean write, so it stays a signal rather than a field readers learn to skip.
+        ...(discardedParked.kind === 'held' && discardedParked.discarded.length
+          ? { discardedParked: discardedParked.discarded.map((h) => h.path) }
+          : {}),
+        // ⚠️ The discard's OWN outcome, reported rather than swallowed. `unknown` is the likely
+        // branch here, not the exotic one — the budget is short and a GLB parse eats it — and
+        // collapsing it to "nothing discarded" would let a SURVIVING park read as a clean
+        // overwrite, which is the defect this whole route now guards against.
+        // ⚠️ **`unknown` is in this condition, and leaving it out was a real hole** (close-out
+        // review). `discardUnsaved:true` bypasses the refusal for BOTH `held` and `unknown`, but
+        // the discard above only runs for `held` — so a caller who passed the flag while the
+        // renderer was busy got a bare `{ok:true, saved:true}`: no discard attempted, nothing
+        // said. If a park did exist it survives, and the human's next save_all flushes their
+        // older document straight over this write. #872's exact defect reported as a clean
+        // success, which is what this field exists to prevent.
+        ...((writeGate.kind === 'held' || writeGate.kind === 'unknown') && discardedParked.kind !== 'held'
+          ? { discardWarning: writeGate.kind === 'unknown'
+            ? 'the unsaved-work probe did not answer '
+              + `(${writeGate.reason}), so this write proceeded on discardUnsaved WITHOUT being `
+              + 'able to look. If a parked edit exists it was not discarded, and the editor may '
+              + 'flush its older copy over this write at the next save_all. Verify with '
+              + 'modoki_get_editor_state.'
+            : 'the parked document could not be confirmed discarded '
+              + `(${discardedParked.kind === 'unknown' ? discardedParked.reason : discardedParked.kind})`
+              + ' — the editor may still flush its older copy over this write at the next save_all. '
+              + 'Verify with modoki_get_editor_state.' }
+          : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

@@ -11,7 +11,18 @@ import PackageDescription
 // SEPARATE manifest) is consumed here as a local package dependency, not duplicated.
 let package = Package(
     name: "CapacitorModokiOta",
-    platforms: [.iOS(.v15)],
+    // ⚠️ `.macOS(.v12)` is METADATA, not a claim this builds on macOS — it cannot (`import
+    // Capacitor` has no macOS xcframework). It matches the floor declared by the `core` package
+    // this library depends on; without it SPM defaults this library to macOS 10.13 and the build
+    // fails with:
+    //   the library 'ModokiOtaPlugin' requires macos 10.13, but depends on the product
+    //   'ModokiOtaCore' which requires macos 12.0
+    // ⚠️ SCOPE, measured — an earlier version of this comment overstated it. SwiftPM validates
+    // platform floors only for the platform being BUILT FOR, so this breaks a HOST `swift build` /
+    // `swift test` of this package and does NOT affect an iOS build: with the floor removed,
+    // `swift build` fails as above while `swift build --triple arm64-apple-ios15.0` reports no
+    // platform error. It matters because host tooling is how the core is tested at all (#971).
+    platforms: [.iOS(.v15), .macOS(.v12)],
     products: [
         .library(name: "ModokiOtaPlugin", targets: ["ModokiOtaPlugin"]),
     ],

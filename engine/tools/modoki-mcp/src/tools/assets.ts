@@ -110,8 +110,15 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
         .describe('The asset type `data` conforms to; picks the validator applied before the write.'),
       data: z.record(z.any()).describe('The asset document IN FULL (see modoki_asset_schema for the shape). Fields you omit are DELETED — this is a replace, not a merge.'),
       replace: z.boolean().optional().describe('Acknowledge that this write DELETES top-level fields the existing file has. Without it, such a write is refused (409) and lists them.'),
+      discardUnsaved: z.boolean().optional().describe(
+        `${DISCARD_UNSAVED_BASE}. Here that work is a PARKED edit to this same asset document — a `
+        + 'panel edit the human has not saved. It is dropped before the write, so their older copy '
+        + 'cannot flush back over you at the next save_all.',
+      ),
     },
-    async ({ path, type, data, replace }) => postJson('/api/asset-write', { path, type, data, ...(replace ? { replace } : {}) },
+    async ({ path, type, data, replace, discardUnsaved }) => postJson(
+      '/api/asset-write',
+      { path, type, data, ...(replace ? { replace } : {}), ...(discardUnsaved ? { discardUnsaved: true } : {}) },
       undefined, `write the ${type} asset ${path} (FULL REPLACE)`),
   );
 

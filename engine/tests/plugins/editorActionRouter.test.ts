@@ -4,6 +4,7 @@
  *  without a live renderer — requestBrowser is mocked. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -23,7 +24,12 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     // Required by BackendContext: every write route fingerprints its own write so the
     // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
     markEditorWrite: () => {},
-    requestBrowser: async () => ({}),
+    // ⚠️ Default = a renderer that ANSWERS and holds nothing, which is what `async () => ({})`
+    // used to mean for the one op that existed. It is no longer expressible as a single object:
+    // `resolve-unsaved` needs a `covers` list, and a reply without one is correctly read as "the
+    // renderer could not answer" — so the old default silently turned every scene-mutate case into
+    // a 503. Cases that want a busy or absent renderer override this with a throwing stub.
+    requestBrowser: relay(),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},
   };
@@ -398,6 +404,175 @@ describe('/api/import-file (F11: an unrecognized type is not a phantom success)'
   });
 });
 
+/** #889 phase 2 — the two validators DISCLOSE the unsaved work they could not see.
+ *
+ *  ⚠️ **What `unsavedGateCoverage.test.ts` proves and what it cannot.** That guard is structural:
+ *  it reads the router source and asserts these routes CALL `unsavedGate` and declare registries a
+ *  superset of what their helpers can read. It cannot see whether the disclosure reaches the
+ *  response BODY — a route could gate correctly and drop the fields on the floor, which is exactly
+ *  the defect phase 1's own close-out found one route over (the wiring reached the MCP surface and
+ *  the human path threw it away). So the body is asserted here.
+ *
+ *  Owner ruling 2026-09-09: DISCLOSE, do not refuse. These answer 200 either way; a read that
+ *  refuses is worse than one that admits what it could not see.
+ */
+describe('/api/validate-scene and /api/validate-prefab — stale-input disclosure', () => {
+  let seq = 0;
+  const tempFile = (name: string, doc: unknown): string => {
+    const p = path.join(os.tmpdir(), `modoki-validate-${process.pid}-${seq++}-${name}`);
+    fs.writeFileSync(p, JSON.stringify(doc));
+    return p;
+  };
+  const scene = () => tempFile('s.scene.json', { entities: [] });
+  const prefab = () => tempFile('p.prefab.json', { id: 'pf', version: 2, name: 'P', rootLocalId: 1, entities: [{ localId: 1, name: 'P', traits: {} }] });
+  const held = (path: string, registry: string, detail: string) => [{ path, registry, detail }];
+
+  it('validate-scene discloses, and still answers 200 with its warnings', async () => {
+    const scenePath = scene();
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held('/assets/prefabs/Badge.prefab.json', 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scenePath)}`, ctx)) as
+      { status?: number; body: { warnings?: unknown[]; staleInputs?: Array<{ path: string }>; staleInputsNote?: string } };
+
+    expect(r.status ?? 200).toBe(200);
+    expect(Array.isArray(r.body.warnings), 'it still validates').toBe(true);
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/prefabs/Badge.prefab.json']);
+    expect(r.body.staleInputsNote).toMatch(/computed from the files on DISK/);
+  });
+
+  it('validate-scene DOES disclose parked import settings — the manifest is derived from them', async () => {
+    // ⚠️ The regression case. A first pass narrowed this route's ask by asking "which pass reads
+    // a .meta.json?" — neither does — and dropped `pendingMeta`. Wrong question: `assetExists`
+    // tests membership in the MANIFEST, and `vite-asset-scanner` emits a texture's auto
+    // whole-image `sprite` sub-entry only when the SIDECAR types it `2d`/`ui`. So parking a Type
+    // change from `2d` to `3d` deletes a guid the scene references, and the dangling-ref warning
+    // appears at the human's next Cmd+S and not before. Under-disclosure, the dangerous direction.
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held('/assets/textures/logo.png', 'pendingMeta', 'unsaved import settings'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: { staleInputs?: Array<{ path: string }> } };
+
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/textures/logo.png']);
+  });
+
+  it('validate-scene does NOT disclose a pending baseScene ref — it cannot change the verdict', async () => {
+    // The other half of the correction. `sceneValidation.ts` contains the string "baseScene" zero
+    // times: this route parses one file and validates it alone, and `baseScene` is a top-level
+    // scene field rather than a trait, so the ref walk never reaches it. Declaring it would
+    // caveat EVERY validate call on EVERY scene for a park that moves nothing.
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held('/assets/scenes/Level-02.scene.json', 'pendingBaseScene', 'an unsaved baseScene ref'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('validate-scene is GLOBAL — an unsaved PREFAB elsewhere changes its answer, so it is disclosed', async () => {
+    // ⚠️ **This case used to be fixtured on a `dirtyAsset` MATERIAL while its title said PREFAB**,
+    // and it passed — because the route asked for all four registries. It was pinning a
+    // false-positive disclosure as intended behaviour, and arguing the prefab-resolver case in a
+    // comment while asserting the asset one. `makeAssetResolver` is a membership test over
+    // manifest GUIDs; no parked asset document can move a warning.
+    //
+    // What the route really depends on is `makePrefabResolver`, and the only registry that can
+    // hold an unsaved prefab is `liveScene` (prefab-edit). GLOBAL still matters: the prefab is
+    // NOT this scene's path, so a path-scoped probe would report nothing and look precise.
+    // ⚠️ The fixture is a prefab that is NOT this scene's path, which is the whole point of the
+    // case — a path-scoped probe would report nothing here and look precise doing it. (It was
+    // briefly byte-identical to the case above, which made it assert nothing the other did not.)
+    const scenePath = scene();
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: [
+        { path: '/assets/prefabs/Elsewhere.prefab.json', registry: 'liveScene', detail: 'unsaved live-world edits in the PREFAB open for editing' },
+      ],
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scenePath)}`, ctx)) as
+      { body: { staleInputs?: Array<{ path: string }> } };
+
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/prefabs/Elsewhere.prefab.json']);
+    expect(r.body.staleInputs?.map((h) => h.path)).not.toContain(scenePath);
+  });
+
+  it('validate-scene does NOT disclose a parked ASSET document — it cannot change the verdict', async () => {
+    // The accept side of the narrowed scope, and the case that would have caught the original
+    // error. A human dragging a Material slider must not make an unrelated, perfectly clean scene
+    // report as stale — the agent then burns a turn on save_all, which writes their parked edits
+    // to disk unasked, for a byte-identical answer.
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held('/assets/materials/rock.mat.json', 'dirtyAsset', 'an unsaved asset document'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('validate-prefab is PATH-SCOPED — its own document is disclosed', async () => {
+    // Reachable only because `dirtyWorldTarget` gives the prefab-edit world the prefab's own path
+    // (see prefabEditUnsavedProbe.test.ts). A prefab is not an AssetSchemaType, so `dirtyAsset`
+    // can never hold one — before that fix this disclosure could not fire at all.
+    const prefabPath = prefab();
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held(prefabPath, 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
+    }) });
+
+    const r = (await get(`/api/validate-prefab?path=${encodeURIComponent(prefabPath)}`, ctx)) as
+      { status?: number; body: { warnings?: unknown[]; staleInputs?: Array<{ path: string }> } };
+
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual([prefabPath]);
+  });
+
+  it('validate-prefab does NOT disclose an unrelated document', async () => {
+    // The scope, and the reason it differs from validate-scene: `validatePrefabData` consults no
+    // resolver, so nothing but this document can change its answer. Caveating a correct answer
+    // because some particle is dirty trains readers to skip the field.
+    const prefabPath = prefab();
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: held('/assets/particles/spark.particle.json', 'dirtyAsset', 'an unsaved asset document'),
+    }) });
+
+    const r = (await get(`/api/validate-prefab?path=${encodeURIComponent(prefabPath)}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('ACCEPT — a clean editor gets NO disclosure fields at all', async () => {
+    // Absent, never `staleInputs: []`. A field present on every call is one readers learn to skip,
+    // and then the call that matters is skipped too.
+    const sceneBody = ((await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, makeCtx())) as { body: Record<string, unknown> }).body;
+    const prefabBody = ((await get(`/api/validate-prefab?path=${encodeURIComponent(prefab())}`, makeCtx())) as { body: Record<string, unknown> }).body;
+
+    for (const body of [sceneBody, prefabBody]) {
+      expect('staleInputs' in body).toBe(false);
+      expect('staleInputsNote' in body).toBe(false);
+      expect('staleInputsUnknown' in body).toBe(false);
+    }
+  });
+
+  it('a renderer that did not answer is disclosed as UNKNOWN, not as clean', async () => {
+    // The distinction the whole probe exists for. "Could not look" reported as "nothing is there"
+    // is worse here than no disclosure, because the answer then reads as verified.
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer'); } });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: { staleInputsUnknown?: { reason: string }; staleInputsNote?: string } };
+
+    expect(r.body.staleInputsUnknown?.reason).toMatch(/timed out/);
+    expect(r.body.staleInputsNote).toMatch(/could NOT be checked/);
+  });
+});
+
 describe('/api/scene-mutate (play-mode guard)', () => {
   // The mutate handler reads/writes a real scene file, so each case gets a temp
   // scene on disk. resolveAssetPath is identity (makeCtx default), so the abs
@@ -419,7 +594,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     it(`refuses with 409 while ${playState}, leaving the file untouched`, async () => {
       const scenePath = tempScene();
       const before = fs.readFileSync(scenePath, 'utf-8');
-      const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState })) });
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState } }) });
       const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { playState?: string } };
       expect(r.status).toBe(409);
       expect(r.body.playState).toBe(playState);
@@ -433,7 +608,11 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     // entities (create_entity / prefab) not yet saved. Refuse, like load_scene/new_scene guardUnsaved.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped', unsavedChanges: true })) });
+    // The hold rows are what `resolve-unsaved` really returns — path, registry and a human detail —
+    // rather than the bare `unsavedChanges: true` boolean this route used to read off editor-state.
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: [{ path: '/assets/scenes/main.scene.json', registry: 'liveScene', detail: 'unsaved live-world edits in the OPEN scene' }],
+    }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
     expect(r.status).toBe(409);
     expect(r.body.ok).toBe(false);
@@ -442,19 +621,123 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
   });
 
+  /** #889 phase 2 — §8 convergence: "the renderer did not answer" is a refusal.
+   *
+   *  ⚠️ **The behaviour these replace had NO test at all**, which is a large part of why the
+   *  divergence survived: the route caught every probe rejection into one `probeFailed` boolean,
+   *  wrote the file anyway and appended a warning, and nothing anywhere asserted on it. The
+   *  written rationale was real — a genuinely headless edit is this route's normal case — but it
+   *  rested on the two failures being indistinguishable, which `isRelayTransportFailure` +
+   *  `isRelayTimeout` had already stopped being true.
+   *
+   *  Both sides are pinned, and the pair is the point: a fix that refused everything would pass
+   *  the first two and break every headless caller, and that is exactly the trade the old code
+   *  declined to make. */
+  describe('a probe that does not answer (§8)', () => {
+    const busy = 'timed out waiting for the renderer — is the editor window open?';
+    const gone = 'no editor renderer window';
+
+    it('REFUSES 503 when a renderer may be attached and did not answer, leaving the file untouched', async () => {
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error(busy); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { ok: boolean; code?: string; error?: string; options?: string[] } };
+
+      expect(r.status).toBe(503);
+      expect(r.body.code).toBe('NO_RENDERER');
+      expect(r.body.error).toMatch(/could NOT rule out/);
+      // ⚠️ The options must not name an escape this route does not implement — it has neither
+      // `force` nor `discardUnsaved`, and an agent that spends a turn discovering the parameter is
+      // ignored is worse off than one told plainly to save.
+      expect(r.body.options?.join(' ')).not.toMatch(/force|discardUnsaved/);
+      expect(fs.readFileSync(scenePath, 'utf-8'), 'nothing was written').toBe(before);
+    });
+
+    it('treats an UNRECOGNISED probe error as unknown, not as absent', async () => {
+      // The conservative direction. A message the classifier does not know is not evidence that no
+      // renderer exists, and reading it that way is the fail-open in miniature.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error('something went sideways'); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number };
+      expect(r.status).toBe(503);
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+
+    it('PROCEEDS when no renderer exists at all — the headless path still works', async () => {
+      // The accept side, and the reason this is not simply "refuse on any probe failure". Every
+      // registry the guards consult is renderer-only module state; with no renderer there is
+      // nothing that could be in the way.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error(gone); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { ok: boolean; changed: number; warnings: string[] } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      // Disclosed, not silent: the guards did not run, and the caller must not read a plain
+      // success as "the editor was checked and had nothing pending".
+      expect(r.body.warnings.join(' ')).toMatch(/no editor renderer is attached/);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+
+    it('a renderer that DIES between the two probes still discloses that it did not check', async () => {
+      // Close-out review finding. `editor-state` answers, the window then closes, so the unsaved
+      // probe comes back `absent`. The headless disclosure was gated on the FIRST probe's outcome
+      // only, so this path wrote the file and said nothing at all about not having checked. Benign
+      // — nothing can be held with no renderer — but it was the one silent branch.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'resolve-unsaved') throw new Error('no editor renderer window');
+        return { playState: 'stopped' };
+      }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { body: { ok: boolean; changed: number; warnings: string[] } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      // ⚠️ Its OWN sentence, not the headless one. In this path the Play-state guard really did
+      // run, against a real answer — saying "the Play-state and unsaved-work guards did not run"
+      // would be false, which is the shape of defect this whole change keeps turning up.
+      expect(r.body.warnings.join(' ')).toMatch(/answered the state probe and was GONE/);
+      expect(r.body.warnings.join(' ')).not.toMatch(/no editor renderer is attached/);
+    });
+
+    it('REFUSES when the renderer answers the unsaved probe without covering what was asked', async () => {
+      // Version skew. A renderer that answers but does not implement a registry the caller asked
+      // about is indistinguishable from one reporting "all clear" unless `covers` is checked — and
+      // this route asks for all four, so an older tab reporting three must not read as clean.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string) => (
+        op === 'resolve-unsaved'
+          ? { ok: true, holds: [], discarded: [], covers: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene'] }
+          : { playState: 'stopped' }
+      )) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { code?: string; error?: string } };
+
+      expect(r.status).toBe(503);
+      expect(r.body.error).toMatch(/liveScene|older build/);
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+  });
+
   it('names the ACTUAL cause when the unsaved work is a dirty ASSET, not a fixed create_entity string (#844)', async () => {
     // Since #831 a Material slider drag parks a dirty asset the same way create_entity parks a
     // live-world edit — the fixed refusal string used to blame create_entity/duplicate_entity/
     // prefab regardless, sending an agent hunting entities it never created.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const ctx = makeCtx({
-      requestBrowser: vi.fn(async () => ({
-        playState: 'stopped',
-        unsavedChanges: true,
-        unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/x.mat.json'], dirtyScenes: [] },
-      })),
-    });
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: [{ path: '/assets/x.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' }],
+    }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
     expect(r.status).toBe(409);
     expect(r.body.unsavedChanges).toBe(true);
@@ -467,7 +750,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
 
   it('applies the mutate when the editor is stopped', async () => {
     const scenePath = tempScene();
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
     expect(r.body.ok).toBe(true);
     expect(r.body.changed).toBeGreaterThan(0);
@@ -525,7 +808,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
   // write path, that nothing read — and the wrong data besides (the pre-expansion file,
   // not the live world). Now opt-in.
   describe('scene echo', () => {
-    const stopped = () => makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const stopped = () => makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
 
     it('omits `scene` by default, even on a successful change', async () => {
       const scenePath = tempScene();
@@ -571,7 +854,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
   // had already been WRITTEN to disk before the call reported ok:false. ──
   describe('schema-aware field-typo guard', () => {
     const schema = { traits: { Transform: { category: 'component' as const, fields: { x: { type: 'number' as const }, y: { type: 'number' as const } } } } };
-    const stoppedWithSchema = () => makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })), getSchema: () => schema });
+    const stoppedWithSchema = () => makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }), getSchema: () => schema });
 
     it('fails ok:false when a setTrait writes an unknown field on a known trait', async () => {
       const scenePath = tempScene();
@@ -661,7 +944,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     it('cold start (no schema) stays warn-but-load — an unknown field is NOT failed', async () => {
       const scenePath = tempScene();
       const body = { path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { xx: 5 } }] };
-      const r = (await post('/api/scene-mutate', body, makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) }))) as { body: { ok: boolean } };
+      const r = (await post('/api/scene-mutate', body, makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) }))) as { body: { ok: boolean } };
       expect(r.body.ok).toBe(true); // getSchema() undefined → can't know it is a typo
     });
   });

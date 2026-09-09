@@ -2,6 +2,9 @@ import Foundation
 import Capacitor
 import StoreKit
 import os
+// #971: the classification pair lives in the nested ModokiIapCore package so `swift test` can
+// replay it on the host — this target cannot be host-built at all (`import Capacitor` above).
+import ModokiIapCore
 
 /// os_log channel for the purchase timing probes (#580). Appears in Xcode's console with no
 /// filtering, and is readable off a device with `device_native_logs subsystem:'com.modoki.iap'`
@@ -189,42 +192,20 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
     ///
     /// `SKError.paymentCancelled` is checked too: the StoreKit 1 error still surfaces through the
     /// StoreKit 2 API when the underlying purchase is serviced by the older stack.
+    /// ⚠️ Moved to `ModokiIapCore.IapClassification` (#971) — this is a delegation, not a second
+    /// implementation. Nothing in this repo compiles THIS file, so the logic lives where the
+    /// `ios/iap-core` leg can replay it against `test-vectors/iap-classification-vectors.json`.
     private func isCancellation(_ error: Error) -> Bool {
-        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
-        let ns = error as NSError
-        return ns.domain == SKErrorDomain && ns.code == SKError.Code.paymentCancelled.rawValue
+        IapClassification.isCancellation(error)
     }
 
     /// A stable, machine-readable classification for the journal — the thing `localizedDescription`
     /// cannot give. `"Request Canceled"` reads identically for a real cancel, an account/sandbox
     /// problem in `ASDErrorDomain`/`AMSErrorDomain`, and a network failure; these do not.
+    /// ⚠️ Moved to `ModokiIapCore.IapClassification` (#971) — a delegation, not a copy. See there
+    /// for why the `<domain>:<code>` default arm is load-bearing (#946's ASDErrorDomain faults).
     private func classify(_ error: Error) -> String {
-        if let skError = error as? StoreKitError {
-            switch skError {
-            case .unknown: return "storekit.unknown"
-            case .userCancelled: return "storekit.userCancelled"
-            case .networkError: return "storekit.networkError"
-            case .systemError: return "storekit.systemError"
-            case .notAvailableInStorefront: return "storekit.notAvailableInStorefront"
-            case .notEntitled: return "storekit.notEntitled"
-            @unknown default: return "storekit.unhandled"
-            }
-        }
-        if let purchaseError = error as? Product.PurchaseError {
-            switch purchaseError {
-            case .invalidQuantity: return "purchase.invalidQuantity"
-            case .productUnavailable: return "purchase.productUnavailable"
-            case .purchaseNotAllowed: return "purchase.purchaseNotAllowed"
-            case .ineligibleForOffer: return "purchase.ineligibleForOffer"
-            case .invalidOfferIdentifier: return "purchase.invalidOfferIdentifier"
-            case .invalidOfferPrice: return "purchase.invalidOfferPrice"
-            case .invalidOfferSignature: return "purchase.invalidOfferSignature"
-            case .missingOfferParameters: return "purchase.missingOfferParameters"
-            @unknown default: return "purchase.unhandled"
-            }
-        }
-        let ns = error as NSError
-        return "\(ns.domain):\(ns.code)"
+        IapClassification.classify(error)
     }
 
     /// The diagnostic payload the catch-all used to throw away: domain, code, and the chain of
@@ -354,7 +335,7 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                     // one case where "the player cancelled" is unambiguous; a THROWN error that
                     // merely looks like a cancel is the ambiguous one, and conflating them would
                     // throw away the distinction this field exists to record.
-                    call.resolve(["transaction": NSNull(), "cancelReason": "storekit.result.userCancelled"])
+                    call.resolve(["transaction": NSNull(), "cancelReason": IapClassification.resultCancelReason])
                 case .pending:
                     // Ask-to-Buy awaiting a guardian: no transaction exists yet. It arrives later
                     // as a re-delivery that unfinished() reports. Distinguished from a cancel so

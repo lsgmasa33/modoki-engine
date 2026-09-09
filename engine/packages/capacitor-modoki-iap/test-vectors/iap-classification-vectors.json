@@ -1,0 +1,83 @@
+{
+  "$comment": [
+    "THE PURCHASE-CLASSIFICATION CONTRACT (#971), replayed by three implementations:",
+    "  ios/iap-core      — ModokiIapCoreTests.swift, against the SHIPPING IapClassification.swift",
+    "  android/iap-core  — IapCoreSelfTest.java, against the SHIPPING IapCore.java",
+    "  npm test          — engine/tests/runtime/iapCancelVocabulary.test.ts, the JS ROUTING side",
+    "",
+    "The two natives prove they PRODUCE these strings; the TS test proves every string a native",
+    "can emit is ROUTED as a cancel rather than a failure. That split is the point: #946 was a",
+    "purchase the player CONFIRMED being recorded as `cancelled`, and #499 was a cancel reaching",
+    "`purchase_failed` analytics. Both are disagreements between producer and router, so testing",
+    "either side alone cannot see them.",
+    "",
+    "⚠️ `cancel` is NOT derivable from the classification string. `storekit.userCancelled` (a",
+    "THROWN StoreKitError) and `storekit.result.userCancelled` (the RESULT constant) are both",
+    "cancels and must stay distinguishable — #946 exists because they were conflated. And",
+    "ASDErrorDomain/AMSErrorDomain faults surface to the user as \"Request Canceled\" while NOT",
+    "being cancels; that is the case this file exists to pin."
+  ],
+  "version": 1,
+
+  "ios": {
+    "resultCancelReason": "storekit.result.userCancelled",
+    "classify": [
+      { "name": "thrown StoreKitError.userCancelled",       "input": { "kind": "storeKitError", "case": "userCancelled" },             "expect": "storekit.userCancelled",             "cancel": true },
+      { "name": "StoreKitError.unknown",                    "input": { "kind": "storeKitError", "case": "unknown" },                   "expect": "storekit.unknown",                   "cancel": false },
+      { "name": "StoreKitError.networkError",               "input": { "kind": "storeKitError", "case": "networkError" },              "expect": "storekit.networkError",              "cancel": false },
+      { "name": "StoreKitError.systemError",                "input": { "kind": "storeKitError", "case": "systemError" },               "expect": "storekit.systemError",               "cancel": false },
+      { "name": "StoreKitError.notAvailableInStorefront",   "input": { "kind": "storeKitError", "case": "notAvailableInStorefront" },  "expect": "storekit.notAvailableInStorefront",  "cancel": false },
+      { "name": "StoreKitError.notEntitled",                "input": { "kind": "storeKitError", "case": "notEntitled" },               "expect": "storekit.notEntitled",               "cancel": false },
+
+      { "name": "PurchaseError.invalidQuantity",            "input": { "kind": "purchaseError", "case": "invalidQuantity" },           "expect": "purchase.invalidQuantity",           "cancel": false },
+      { "name": "PurchaseError.productUnavailable",         "input": { "kind": "purchaseError", "case": "productUnavailable" },        "expect": "purchase.productUnavailable",        "cancel": false },
+      { "name": "PurchaseError.purchaseNotAllowed",         "input": { "kind": "purchaseError", "case": "purchaseNotAllowed" },        "expect": "purchase.purchaseNotAllowed",        "cancel": false },
+      { "name": "PurchaseError.ineligibleForOffer",         "input": { "kind": "purchaseError", "case": "ineligibleForOffer" },        "expect": "purchase.ineligibleForOffer",        "cancel": false },
+      { "name": "PurchaseError.invalidOfferIdentifier",     "input": { "kind": "purchaseError", "case": "invalidOfferIdentifier" },    "expect": "purchase.invalidOfferIdentifier",    "cancel": false },
+      { "name": "PurchaseError.invalidOfferPrice",          "input": { "kind": "purchaseError", "case": "invalidOfferPrice" },         "expect": "purchase.invalidOfferPrice",         "cancel": false },
+      { "name": "PurchaseError.invalidOfferSignature",      "input": { "kind": "purchaseError", "case": "invalidOfferSignature" },     "expect": "purchase.invalidOfferSignature",     "cancel": false },
+      { "name": "PurchaseError.missingOfferParameters",     "input": { "kind": "purchaseError", "case": "missingOfferParameters" },    "expect": "purchase.missingOfferParameters",    "cancel": false },
+
+      { "name": "SKError.paymentCancelled — StoreKit 1 cancel surfacing through the SK2 API",
+        "input": { "kind": "nsError", "domain": "SKErrorDomain", "code": 2 },
+        "expect": "SKErrorDomain:2", "cancel": true },
+      { "name": "SKErrorDomain, NOT the cancel code",
+        "input": { "kind": "nsError", "domain": "SKErrorDomain", "code": 0 },
+        "expect": "SKErrorDomain:0", "cancel": false },
+
+      { "name": "#946: ASDErrorDomain fault — reads as \"Request Canceled\", is NOT a cancel",
+        "input": { "kind": "nsError", "domain": "ASDErrorDomain", "code": 3038 },
+        "expect": "ASDErrorDomain:3038", "cancel": false },
+      { "name": "#946: AMSErrorDomain fault — same surface text, also NOT a cancel",
+        "input": { "kind": "nsError", "domain": "AMSErrorDomain", "code": 305 },
+        "expect": "AMSErrorDomain:305", "cancel": false },
+      { "name": "a plain network NSError is not a cancel",
+        "input": { "kind": "nsError", "domain": "NSURLErrorDomain", "code": -1009 },
+        "expect": "NSURLErrorDomain:-1009", "cancel": false }
+    ]
+  },
+
+  "android": {
+    "cancelReason": "play.userCanceled",
+    "rejectCodePrefix": "billing.",
+    "classify": [
+      { "name": "USER_CANCELED",        "responseCode": 1,  "cancel": true,  "rejectCode": null },
+      { "name": "OK",                   "responseCode": 0,  "cancel": false, "rejectCode": "billing.0" },
+      { "name": "SERVICE_DISCONNECTED", "responseCode": -1, "cancel": false, "rejectCode": "billing.-1" },
+      { "name": "SERVICE_UNAVAILABLE",  "responseCode": 2,  "cancel": false, "rejectCode": "billing.2" },
+      { "name": "BILLING_UNAVAILABLE",  "responseCode": 3,  "cancel": false, "rejectCode": "billing.3" },
+      { "name": "ITEM_UNAVAILABLE",     "responseCode": 4,  "cancel": false, "rejectCode": "billing.4" },
+      { "name": "DEVELOPER_ERROR",      "responseCode": 5,  "cancel": false, "rejectCode": "billing.5" },
+      { "name": "ERROR",                "responseCode": 6,  "cancel": false, "rejectCode": "billing.6" },
+      { "name": "ITEM_ALREADY_OWNED",   "responseCode": 7,  "cancel": false, "rejectCode": "billing.7" },
+      { "name": "ITEM_NOT_OWNED",       "responseCode": 8,  "cancel": false, "rejectCode": "billing.8" }
+    ]
+  },
+
+  "vocabulary": [
+    { "reason": "storekit.result.userCancelled", "platform": "ios",     "cancel": true },
+    { "reason": "storekit.userCancelled",        "platform": "ios",     "cancel": true },
+    { "reason": "SKErrorDomain:2",               "platform": "ios",     "cancel": true },
+    { "reason": "play.userCanceled",             "platform": "android", "cancel": true }
+  ]
+}

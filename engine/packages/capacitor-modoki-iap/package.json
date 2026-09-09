@@ -1,7 +1,7 @@
 {
   "name": "capacitor-modoki-iap",
   "version": "1.0.0",
-  "description": "Capacitor plugin for Modoki's in-app purchases — StoreKit 2 + Play Billing, with NO auto-finish (docs/iap.md, #196)",
+  "description": "Capacitor plugin for Modoki's in-app purchases \u2014 StoreKit 2 + Play Billing, with NO auto-finish (docs/iap.md, #196)",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",
@@ -11,6 +11,8 @@
     "android/build.gradle",
     "dist/",
     "ios/Sources/",
+    "iap-core/Sources/",
+    "iap-core/Package.swift",
     "Package.swift"
   ],
   "author": "",

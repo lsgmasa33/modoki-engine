@@ -45,9 +45,34 @@ describe('scrollViewStyle', () => {
     expect(scrollViewStyle(base({ snap: 'start', axis: 'both' }), 'scroll').scrollSnapType).toBe('both mandatory');
   });
 
-  it('always carries overscroll-behavior', () => {
-    expect(scrollViewStyle(base({ overscroll: 'contain' }), 'scroll').overscrollBehavior).toBe('contain');
-    expect(scrollViewStyle(base({ overscroll: 'none' }), 'scroll').overscrollBehavior).toBe('none');
+  // #964 — `overscroll-behavior` binds BOTH axes and the view is single-axis, so the shorthand
+  // also contained the axis the box cannot scroll. Confirmed on a Galaxy S22 over trusted touch:
+  // see `scrollViewStyle`'s own comment for the A/B.
+  it('carries overscroll-behavior on the SCROLLING axis only', () => {
+    const y = scrollViewStyle(base({ overscroll: 'contain', axis: 'y' }), 'scroll');
+    expect(y.overscrollBehaviorY).toBe('contain');
+    expect(y).not.toHaveProperty('overscrollBehaviorX');
+    expect(y, 'the both-axes shorthand is what caused #964').not.toHaveProperty('overscrollBehavior');
+
+    const x = scrollViewStyle(base({ overscroll: 'none', axis: 'x' }), 'scroll');
+    expect(x.overscrollBehaviorX).toBe('none');
+    expect(x).not.toHaveProperty('overscrollBehaviorY');
+
+    // 'both' is the one case where the shorthand is correct rather than incidental.
+    expect(scrollViewStyle(base({ overscroll: 'contain', axis: 'both' }), 'scroll').overscrollBehavior)
+      .toBe('contain');
+  });
+
+  // ⚠️ The regression, stated as the property rather than the emission: a box that CANNOT scroll an
+  // axis must not contain that axis, or every gesture on it is stranded instead of chaining to the
+  // ancestor that could serve it. This is exactly what wordweave's dictionary card hit — the
+  // definition (axis 'y') swallowed the horizontal swipe meant for its pager.
+  it('leaves the cross axis free to chain, since the box cannot scroll it anyway', () => {
+    const y = scrollViewStyle(base({ overscroll: 'contain', axis: 'y' }), 'scroll');
+    expect(y.overflowX, 'cross axis is pinned hidden — it genuinely cannot scroll').toBe('hidden');
+    expect(y.overscrollBehaviorX ?? y.overscrollBehavior,
+      'containing an axis the box cannot scroll strands every gesture that lands there')
+      .toBeUndefined();
   });
 
   it('hides the classic scrollbar when scrollbar is hidden', () => {
@@ -84,7 +109,7 @@ describe('scrollViewStyle', () => {
     // rule to keep in sync for no gain.
     const css = scrollViewStyle(base({ snap: 'start', axis: 'y', overscroll: 'contain', scrollbar: 'hidden' }), 'visible');
     expect(css.scrollSnapType).toBe('y mandatory');
-    expect(css.overscrollBehavior).toBe('contain');
+    expect(css.overscrollBehaviorY, 'axis-scoped since #964').toBe('contain');
     expect(css.scrollbarWidth).toBe('none');
   });
 

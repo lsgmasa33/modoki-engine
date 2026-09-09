@@ -22,6 +22,7 @@
  *  and keep today's behaviour. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -39,7 +40,7 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     firstRootDir: () => null,
     getManifest: () => ({ version: 2, assets: [] }) as Manifest,
     rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
-    requestBrowser: async () => ({}),
+    requestBrowser: relay(),
     getSchema: () => undefined,
     markEditorWrite: () => {},
     ssrLoadModule: async () => ({}),

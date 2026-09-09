@@ -7,6 +7,7 @@
  *  (file-direct, where there is no live world to hold the edit) is unchanged. */
 
 import { describe, it, expect, vi, afterAll } from 'vitest';
+import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -42,7 +43,7 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     // Required by BackendContext: every write route fingerprints its own write so the
     // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
     markEditorWrite: () => {},
-    requestBrowser: async () => ({}),
+    requestBrowser: relay(),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},
   };
@@ -120,7 +121,11 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
 
   it('scene-mutate: saved:true when something changed (the file WAS written)', async () => {
     const scenePath = tempScene();
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string, params?: unknown) => (
+      op === 'resolve-unsaved'
+        ? { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] }
+        : { playState: 'stopped' }
+    )) });
     const r = (await post('/api/scene-mutate', {
       path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 9 } }],
     }, ctx)) as { body: { ok: boolean; changed: number; saved?: boolean } };
@@ -130,7 +135,11 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
 
   it('scene-mutate: saved:false when nothing changed (a bad ref, nothing written)', async () => {
     const scenePath = tempScene();
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string, params?: unknown) => (
+      op === 'resolve-unsaved'
+        ? { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] }
+        : { playState: 'stopped' }
+    )) });
     const r = (await post('/api/scene-mutate', {
       path: scenePath, ops: [{ op: 'setTrait', entity: { id: 999 }, trait: 'Transform', fields: { x: 9 } }],
     }, ctx)) as { body: { changed: number; saved?: boolean } };
@@ -171,8 +180,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     // to fire save-all here, so `saved` was true and the scene reached disk on every mutate.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
       throw new Error(`unexpected op ${op} — a live apply must not save`);
     });
@@ -196,9 +211,15 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     // call silently wrote the file instead. Nothing failed loudly, which is why it survived.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       // The renderer's form: /@fs/<abs>. Different string, same file.
       if (op === 'editor-state') return { playState: 'stopped', scenePath: toFsUrl(scenePath), unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
       throw new Error(`unexpected op ${op}`);
     });
@@ -210,8 +231,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
 
   it('omits the save hint when nothing changed (no pending work to persist)', async () => {
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return { ok: true, changed: 0, errors: [], warnings: [], unresolved: [] };
       throw new Error(`unexpected op ${op}`);
     });
@@ -242,8 +269,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
   it('LIVE branch forwards `created` from apply-scene-ops', async () => {
     const scenePath = tempScene();
     const created = [{ op: 0, id: 42, guid: 'g-made', name: 'Made' }];
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created };
       throw new Error(`unexpected op ${op}`);
     });
@@ -257,8 +290,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     // Same rule as `applyOps`: an empty array would read as "the add produced nothing" rather than
     // "there were no adds in this batch".
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created: [] };
       throw new Error(`unexpected op ${op}`);
     });
@@ -271,8 +310,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     // the applier); the file side runs the real `applyOps`, so its receipt is genuine — including a
     // freshly minted guid, which is the field an agent actually needs.
     const liveScene = tempScene();
-    const liveBrowser = vi.fn(async (op: string) => {
+    const liveBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') {
         return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], created: [{ op: 0, id: 7, guid: 'g-live', name: 'Made' }] };
       }
@@ -283,8 +328,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     }).body;
 
     const fileScene = tempScene();
-    const fileBrowser = vi.fn(async (op: string) => {
+    const fileBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       throw new Error(`unexpected op ${op} — should have stayed file-direct`);
     });
     const fileBody = ((await post('/api/scene-mutate', addBox(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as {
@@ -303,8 +354,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
   it('does NOT go live when the requested scene is not the one currently loaded — stays file-direct', async () => {
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       throw new Error(`unexpected op ${op} — should have stayed file-direct`);
     });
     const ctx = makeCtx({ requestBrowser });
@@ -316,8 +373,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
 
   it('setBaseScene forces file-direct even when the scene matches the live one (no live equivalent)', async () => {
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       throw new Error(`unexpected op ${op} — setBaseScene must stay file-direct`);
     });
     const ctx = makeCtx({ requestBrowser });
@@ -329,8 +392,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
 
   it('unresolved refs from the live apply are reported, no live/file hint needed (already known to be missing live)', async () => {
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return {
         ok: false, changed: 0, errors: ['op[0] (setTrait): no LIVE entity matching {"id":999}'],
         warnings: [], unresolved: [{ id: 999 }],
@@ -348,8 +417,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
 
   it('a mid-call apply-scene-ops failure is a hard 500, not a silent file-direct retry', async () => {
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') throw new Error('renderer wedged mid-call');
       throw new Error(`unexpected op ${op}`);
     });
@@ -384,8 +459,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     it(`reports PARTIAL (never a retryable 500) when apply-scene-ops answers ${label}`, async () => {
       const scenePath = tempScene();
       const before = fs.readFileSync(scenePath, 'utf-8');
-      const requestBrowser = vi.fn(async (op: string) => {
+      const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
         if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
         if (op === 'apply-scene-ops') return reply;
         throw new Error(`unexpected op ${op}`);
       });
@@ -415,8 +496,14 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     // than an object), caught only on device. A correct reply that merely arrived as a string
     // must not be reported as an unreadable shape.
     const scenePath = tempScene();
-    const requestBrowser = vi.fn(async (op: string) => {
+    const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      // #889: the FILE-DIRECT path asks the shared unsaved probe before it writes; `covers` echoes
+      // the ask, because a reply without it is correctly read as "could not answer".
+      // ⚠️ Reached only on the FILE-DIRECT path — a live-branch case returns before the gate runs,
+      // and several cases in this file are each kind. One stub shape serves both rather than each
+      // case guessing; its presence is not evidence the gate ran in any particular case.
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
       if (op === 'apply-scene-ops') return JSON.stringify({ ok: true, changed: 1, errors: [], warnings: [], unresolved: [] });
       throw new Error(`unexpected op ${op}`);
     });

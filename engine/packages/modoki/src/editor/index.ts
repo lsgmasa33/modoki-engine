@@ -156,6 +156,9 @@ export { readUnusedStaleness, type UnusedStaleness } from './panels/assetOps';
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
 export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';
+// The PURE predicate, and the ground truth `isEditingPrefab`'s store flag only approximates.
+// Exported because a PROBE must not use the self-healing one — see its docblock (#889 close-out).
+export { isPrefabEditWorld, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';
 
 // QA-PHYS-0003: `/api/input/key` needs to know whether a key it is about to press will reach
 // ANYTHING — the editor keymap, or the running game past the input gate. Both answers live

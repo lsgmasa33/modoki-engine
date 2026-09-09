@@ -31,7 +31,7 @@ import {
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
-  isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
+  isEditingPrefab, isPrefabEditWorld, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
@@ -2697,6 +2697,11 @@ export function registerEditorAgentOps(): void {
   const ALL_REGISTRIES: readonly UnsavedRegistry[] =
     ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
 
+  /** Reported as the `path` of a dirty live world that has no file — a never-saved scene, or a
+   *  prefab-edit world whose guid resolves to no manifest entry. Deliberately NOT a path shape: a
+   *  path-scoped caller must not match it, and a reader must not mistake it for a file. */
+  const PATHLESS_DIRTY_WORLD = '(unsaved live world — no file on disk)';
+
   type UnsavedCauses = ReturnType<typeof unsavedChangeCauses>;
 
   /** Every cause `unsavedChangeCauses()` reports → the registry name it answers under.
@@ -2715,6 +2720,77 @@ export function registerEditorAgentOps(): void {
     dirtyScenes: 'liveScene',
   } as const satisfies Record<keyof UnsavedCauses, UnsavedRegistry>;
 
+  /** Where the dirty LIVE WORLD lives, as a path a Node route can match.
+   *
+   *  ⚠️ **Always a string.** This said "or `null` when it genuinely has no file yet" and no branch
+   *  ever returned one — each ends in a path or `PATHLESS_DIRTY_WORLD`, which is what the marker is
+   *  FOR. The prose made two guards below dead and invited a later `=== null` branch that cannot
+   *  fire. (Caught in close-out review — and the commit that claimed to fix it did not: its edit
+   *  script threw before writing, so the message described work that was not in the tree.)
+   *
+   *  ⚠️ **`getCurrentScenePath()` alone is NOT the answer, and taking it for one made this probe
+   *  report a FALSE CLEAR** (#889 phases 2+3). `sceneDirty` is the live world's edit-version
+   *  compared against its saved baseline — and TWO states hold that world with no scene path at
+   *  all: **prefab-edit** (`serialize.ts` nulls `_currentScenePath` on purpose, so a normal save
+   *  cannot target the prefab world) and a **new scene** that has never been written. Both leave
+   *  `sceneDirty` true, and the old code answered `[]` for a missing path — so the reply was
+   *  `holds: []` with `covers` listing all four registries, i.e. "I looked everywhere and nothing
+   *  is held" while the human's prefab edits sat in memory. That is the exact fail-open this whole
+   *  probe exists to close, one level in from where it was closed.
+   *
+   *  Measured 2026-09-09, before the fix: dirty world + `setCurrentScenePath(null)` → `holds: []`,
+   *  where the same world WITH a path reports one `liveScene` row.
+   *
+   *  The pathless case is reported under a MARKER rather than dropped, on the rule `dirtyScenes`
+   *  already follows for a guid that resolves to nothing: an unsaved new scene still changes what
+   *  `/api/unused-assets` computes (its entity refs are not in the graph, so its assets look like
+   *  orphans and the cleanup dialog pre-selects them), and silently omitting it would be "could not
+   *  look" reported as "nothing is there". */
+  const dirtyWorldTarget = (): { path: string; detail: string } => {
+    const scenePath = getCurrentScenePath();
+    if (scenePath) return { path: scenePath, detail: 'unsaved live-world edits in the OPEN scene' };
+    // ⚠️ `isPrefabEditWorld()`, NOT `isEditingPrefab()`. This op's header says every read is a
+    // PEEK — "an observer must not disarm the guard it observes" — and `isEditingPrefab()`
+    // SELF-HEALS a stale flag as a side effect (it calls `closePrefabEditor()`, clearing both
+    // `editingPrefab` and `prefabReturnScenePath`). `prefabEditWorld.ts` says so in as many words:
+    // "unsafe to call from a probe or a guard that must not mutate editor state" — and I called it
+    // from a probe anyway. It is also the GROUND TRUTH: the store flag can be set while a real
+    // scene is loaded, so the pure predicate is the more correct question as well as the safe one.
+    // Found in close-out review; no trigger was demonstrated, but the pure form costs nothing.
+    if (isPrefabEditWorld()) {
+      const editing = useEditorStore.getState().editingPrefab;
+      // ⚠️ The STORE's own `path` first — it is the asset-root path `openPrefabForEditing` was
+      // handed, i.e. the same spelling a Node route asks about, with no lookup to go stale. The
+      // manifest is the fallback for a store entry that somehow carries only a guid, and the guid
+      // itself is the last resort: reported UNDER THE GUID rather than dropped, the rule
+      // `dirtyScenes` already follows, because "could not translate it" is not "nothing is held".
+      const path = editing?.path ?? (editing?.guid ? getAssetEntry(editing.guid)?.path : undefined);
+      // ⚠️ THREE outcomes, not two, and the third only became reachable when this branch started
+      // asking the WORLD instead of the store flag. `serialize.ts` documents the state: an exit
+      // whose scene reload failed leaves the world synthetic with `editingPrefab` cleared. Then
+      // there is no guid either, and the old two-way detail claimed "reported by guid" when
+      // nothing had been. Say which of the three actually happened.
+      if (path) return { path, detail: 'unsaved live-world edits in the PREFAB open for editing' };
+      if (editing?.guid) {
+        return {
+          path: editing.guid,
+          detail: 'unsaved live-world edits in the PREFAB open for editing (reported by guid — it '
+            + 'resolves to no manifest entry)',
+        };
+      }
+      return {
+        path: PATHLESS_DIRTY_WORLD,
+        detail: 'unsaved live-world edits in a PREFAB-EDIT world whose editor flag is already '
+          + 'cleared — the prefab cannot be named, but the world is dirty and would be written',
+      };
+    }
+    return {
+      path: PATHLESS_DIRTY_WORLD,
+      detail: 'unsaved live-world edits in a scene that has never been saved (it has no file yet, '
+        + 'so no route can read it — but its entities are missing from every graph computed from disk)',
+    };
+  };
+
   /** Does this cause hold something for `path`? Returns a `detail` string, `''` for "held, nothing
    *  more to say", or `null` for "not held".
    *
@@ -2726,7 +2802,7 @@ export function registerEditorAgentOps(): void {
    *  too, or this does not compile. Mapping it in one table and forgetting the other would be a
    *  probe that names a registry it never actually inspects. */
   type CauseMatcher = (
-    path: string, causes: UnsavedCauses, ctx: { primaryScenePath: string | null | undefined },
+    path: string, causes: UnsavedCauses, ctx: { dirtyWorld: { path: string; detail: string } },
   ) => string | null;
   const CAUSE_HOLDS = {
     dirtyAssetPaths: (p, c) => (c.dirtyAssetPaths.includes(p) ? 'an unsaved asset document' : null),
@@ -2735,9 +2811,11 @@ export function registerEditorAgentOps(): void {
     // for "pending a CLEAR". The paths list flattens that correctly — presence IS pendingness —
     // which is why this asks the list and not the peek.
     pendingBaseScenes: (p, c) => (c.pendingBaseScenes.includes(p) ? 'an unsaved baseScene ref' : null),
+    // ⚠️ Matches the RESOLVED dirty-world path, not `getCurrentScenePath()` — in prefab-edit
+    // that is the prefab's own path, and asking about it is exactly what `/api/validate-prefab`
+    // does. Keyed off the same resolver as the global half so the two modes cannot disagree.
     sceneDirty: (p, c, x) => (
-      c.sceneDirty && x.primaryScenePath != null && x.primaryScenePath === p
-        ? 'unsaved live-world edits in the OPEN scene' : null),
+      c.sceneDirty && x.dirtyWorld.path === p ? x.dirtyWorld.detail : null),
     dirtyScenes: (p, c) => {
       // Path→guid, renderer-side, through the manifest the renderer already owns. A path that
       // resolves to no guid simply is not a scene this registry could be holding.
@@ -2771,7 +2849,8 @@ export function registerEditorAgentOps(): void {
    *  a scene has unsaved live edits, and silently omitting it would be "could not look" reported as
    *  "nothing is there" inside the very probe written to stop that. */
   const heldPathsFor = (
-    cause: keyof UnsavedCauses, causes: UnsavedCauses, primaryScenePath: string | null | undefined,
+    cause: keyof UnsavedCauses, causes: UnsavedCauses,
+    dirtyWorld: { path: string; detail: string },
   ): Array<[string, string]> => {
     switch (cause) {
       case 'dirtyAssetPaths':
@@ -2781,9 +2860,10 @@ export function registerEditorAgentOps(): void {
       case 'pendingBaseScenes':
         return causes.pendingBaseScenes.map((p) => [p, 'an unsaved baseScene ref']);
       case 'sceneDirty':
-        return causes.sceneDirty && primaryScenePath
-          ? [[primaryScenePath, 'unsaved live-world edits in the OPEN scene']]
-          : [];
+        // ⚠️ NO `&& path` term. That conjunction is what made prefab-edit and a never-saved scene
+        // report as CLEAR — `dirtyWorldTarget` always yields a path or the marker, so a dirty
+        // world is always one row.
+        return causes.sceneDirty ? [[dirtyWorld.path, dirtyWorld.detail]] : [];
       case 'dirtyScenes':
         return causes.dirtyScenes.map((guid) => {
           const path = getAssetEntry(guid)?.path;
@@ -2803,7 +2883,13 @@ export function registerEditorAgentOps(): void {
       ...c.dirtyAssetPaths.map((p) => `${p} (dirtyAsset)`),
       ...c.pendingImportSettings.map((p) => `${p} (pendingMeta)`),
       ...c.pendingBaseScenes.map((p) => `${p} (pendingBaseScene)`),
-      ...(c.sceneDirty ? [`${getCurrentScenePath() ?? '(the open scene)'} (liveScene)`] : []),
+      // ⚠️ Through `dirtyWorldTarget()`, not `getCurrentScenePath()` again. This line was the
+      // SIBLING of the bug that fix exists for (#889 phase 2 close-out sweep): it does not drop
+      // the row — the `??` fallback saves it — but in prefab-edit it labelled the held work "(the
+      // open scene)" when the truth is the prefab, so the reply and this error message described
+      // the same state differently. Two computations of one fact, which is #972's mechanism inside
+      // the file that fixed it.
+      ...(c.sceneDirty ? [`${dirtyWorldTarget().path} (liveScene)`] : []),
       ...c.dirtyScenes.map((g) => `${g} (liveScene, by guid)`),
     ];
     return parts.join(', ') || '(nothing)';
@@ -2895,7 +2981,9 @@ export function registerEditorAgentOps(): void {
     );
 
     const causes = unsavedChangeCauses();
-    const primaryScenePath = getCurrentScenePath();
+    // ⚠️ Resolved ONCE per call and shared by both modes: the global list and the per-path
+    // matchers must not answer differently about the same world.
+    const dirtyWorld = dirtyWorldTarget();
 
     const holds: Array<{ path: string; registry: UnsavedRegistry; detail?: string }> = [];
     const push = (path: string, registry: UnsavedRegistry, detail: string) => {
@@ -2909,7 +2997,7 @@ export function registerEditorAgentOps(): void {
         [keyof UnsavedCauses, UnsavedRegistry]
       >) {
         if (!asked.has(registry)) continue;
-        for (const [path, detail] of heldPathsFor(cause, causes, primaryScenePath)) push(path, registry, detail);
+        for (const [path, detail] of heldPathsFor(cause, causes, dirtyWorld)) push(path, registry, detail);
       }
     }
     for (const path of list) {
@@ -2922,7 +3010,7 @@ export function registerEditorAgentOps(): void {
         if (!asked.has(registry)) continue;
         // ⚠️ `!== null`, never truthiness — a matcher returns '' for "held, nothing more to say",
         // and an empty string is falsy. Branching on the value would silently drop those rows.
-        const detail = CAUSE_HOLDS[cause](path, causes, { primaryScenePath });
+        const detail = CAUSE_HOLDS[cause](path, causes, { dirtyWorld });
         if (detail !== null) push(path, registry, detail);
       }
     }

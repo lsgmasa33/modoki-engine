@@ -168,7 +168,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { ops: [{ op: 'addEntity', name: 'ContractProbe', parentId: 0 }] },
-    notes: 'Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first).',
+    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`.",
   },
   modoki_set_transform: {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
@@ -179,7 +179,7 @@ const DECLS: Record<string, Decl> = {
   modoki_validate_scene: {
     kind: 'read', method: 'GET', route: '/api/validate-scene', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/scenes/main.scene.json' },
-    notes: 'C7: reports findings in `warnings`; `ok:false` is an ANSWER (unhealthy scene), not a failed call.',
+    notes: "C7: reports findings in `warnings`; `ok:false` is an ANSWER (unhealthy scene), not a failed call. ⚠️ It validates the scene FILE ON DISK. When the editor holds unsaved work that could change the verdict it DISCLOSES rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, `staleInputsNote` carries both in one sentence — all ABSENT when clean, never an empty array, so their presence is the signal. Deliberately narrow, and narrow in a way you can predict: it fires for an unsaved PREFAB (its resolver reads prefab documents) and for parked IMPORT SETTINGS (the manifest it tests refs against is DERIVED from the sidecar — retyping a texture 2d->3d deletes a sprite guid the scene references). It does NOT fire for a parked material/particle document or a pending baseScene ref: neither can move a warning. modoki_save_all first for an answer about what you are looking at.",
   },
   modoki_list_traits: {
     kind: 'read', method: 'GET', route: '/api/trait-schema', filters: ['name'],
@@ -680,7 +680,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/asset-write',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', type: 'particle', data: {} },
-    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id.',
+    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that.',
   },
   modoki_delete_asset: {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
@@ -767,7 +767,7 @@ const DECLS: Record<string, Decl> = {
   modoki_validate_prefab: {
     kind: 'read', method: 'GET', route: '/api/validate-prefab', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/prefabs/probe.prefab.json' },
-    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement.",
+    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement. ⚠️ Reads the prefab FILE ON DISK and DISCLOSES when the editor holds it unsaved (#889): same `staleInputs`/`staleInputsUnknown`/`staleInputsNote` fields, absent when clean. PATH-SCOPED, unlike its scene sibling — this pass consults no resolver, so only THIS document being unsaved can change the answer, which in practice means the prefab is open in prefab-edit.",
   },
   modoki_unused_assets: {
     kind: 'read', method: 'GET', route: '/api/unused-assets', requires: ['project'],

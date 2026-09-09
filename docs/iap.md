@@ -594,14 +594,18 @@ sentence. The analytics split is about the funnel, not about the error identity 
 point, since a misclassified fault was previously counted as a player DECISION with nothing able to
 separate the two after the fact.
 
-⚠️ **NOT verified by any gate, and this is a real gap rather than an oversight.**
-`npm run test:native` (`engine/scripts/test-native.mjs`) has legs for `capacitor-game-debug` and
-`capacitor-modoki-ota` only — **`capacitor-modoki-iap` has none**, so nothing in this repo compiles
-that Swift or Java. The TS half is unit-tested (`iapFailurePaths.test.ts`,
-`analyticsPurchaseFunnel.test.ts`, with mutation checks); the native half is verifiable only on
-device, and only on the next occurrence. **A green gate does not mean the iOS change works.**
-Whether that plugin should gain a `test:native` leg — extracting a pure classification core the way
-`OtaCore` is replayed against shared vectors — is open follow-up, deliberately not bundled here.
+⚠️ **Partly gated since #971 — but NOT the part that would settle run 5.** When this was written
+`npm run test:native` had legs for `capacitor-game-debug` and `capacitor-modoki-ota` only, and
+nothing in this repo compiled iap's Swift or Java at all. `ios/iap-core` and `android/iap-core` now
+replay the classification against shared vectors (§ 8), so the *rule* — that an ASD/AMS fault
+classifies as NOT a cancel while `storekit.userCancelled` does — is pinned in both languages and
+mutation-checked.
+
+What that still does **not** give you: the legs prove the CORE, not that `IapPlugin.swift` calls it
+correctly on a live purchase, and not the plugin classes themselves (nothing compiles those yet).
+The TS half is unit-tested (`iapFailurePaths.test.ts`, `analyticsPurchaseFunnel.test.ts`, with
+mutation checks). So the answer to run 5 is unchanged: **verifiable only on device, and only on the
+next occurrence.** A green gate still does not mean the iOS change works end-to-end.
 
 Reproduce, unchanged: `court.shopOpen`, `court.storeBuyCoins300`, leave Apple's sheet untouched past
 90 s, then tap **Purchase**.
@@ -771,6 +775,66 @@ walkable on the phone with no rebuild.
 `acknowledge()` is never withheld — risking the player's actual money to test something else is a
 bad trade. The harness has its own tests, which is not ceremony: a silently-inert instrument is
 worse than none, because a device run would then "pass" having interrupted nothing.
+
+### The NATIVE halves are gated too, since #971 — and were not before
+
+Until #971, **nothing in this repo compiled `capacitor-modoki-iap`'s Swift or Java.** Not
+`npm run verify` (vitest cannot), not `npm run test:native` (it had no iap leg), not either CI leg.
+`npm run typecheck` covered the TS definitions and stopped there. So #946 changed the iOS
+`purchase()` catch arm and the Android `purchasesUpdated` listener and shipped both on a green gate
+that could not have caught a mistake in either.
+
+Two legs now close that, on the OTA model — a dependency-free core extracted from the shipping
+plugin, replayed against shared vectors, rather than a port living inside a test file:
+
+| leg | runs | replays |
+|---|---|---|
+| `ios/iap-core` | `swift test` on the host, no device or iOS SDK | `ModokiIapCore.IapClassification` — the REAL `StoreKitError` / `Product.PurchaseError` switches |
+| `android/iap-core` | bare `javac` + `java`, no gradle | `IapCore.java` — the Play response-code half |
+
+Both against `capacitor-modoki-iap/test-vectors/iap-classification-vectors.json` (19 iOS + 10
+Android vectors), whose JS end is `iapCancelVocabulary.test.ts`.
+
+⚠️ **The exclusion is CAPACITOR, not platform frameworks.** `import Capacitor` has no macOS
+xcframework, so the plugin target cannot be host-built at all — that is why a nested package exists.
+⚠️ **iap's is `iap-core/`, deliberately not `core/`:** SwiftPM derives a path-dependency's identity
+from the DIRECTORY BASENAME, and `capacitor-modoki-ota` already uses `core/`, so two plugins nesting
+`core/` in one app graph collide — surfacing as `product 'ModokiIapCore' … not found in package
+'core'`, which names the wrong thing entirely. Name the next one after its plugin too. StoreKit *does* ship on macOS 12+, so the core keeps the real enum switches instead of
+re-typing them into the test. That is what makes these legs stronger than `ios/lease-parity`, which
+tests a port of its spec (`engine/scripts/test-native.mjs`'s header keeps the per-leg ledger).
+
+⚠️ **Three things a green run still does NOT prove**, and they are the honest limits:
+
+1. **That the plugin CALLS the core correctly on a real purchase.** The extraction is a behavioural
+   native change; the legs prove the core, not the call site. Only a real cancelled purchase on
+   device shows that — which for #946's ambiguous case may be weeks away.
+2. **That `IapCore.RESPONSE_USER_CANCELED` still equals Play's own constant.** Checking that needs
+   the billing library, which would make the leg unrunnable, and **nothing checks it.** A `static`
+   comparison against `BillingResponseCode.USER_CANCELED` was written and then removed: both sides
+   are compile-time constants, so javac folds the comparison away and the shipped `<clinit>` was a
+   bare `return` — a guard that could not fire, this repo's dominant defect class. Had it fired it
+   would have thrown during plugin registration and failed app LAUNCH for everyone, which is worse
+   than the mislabelled analytics event it guarded. A hand-edit of the value IS caught by the
+   `android/iap-core` leg; an upstream renumbering is caught by nothing, accepted because it is a
+   wire-protocol constant that has never moved.
+3. **That the plugin CLASSES compile.** These legs compile the *cores*. `IapPlugin.swift` and
+   `ModokiIapPlugin.java` are still compiled by nothing in this repo, so a missing `@PluginMethod`
+   or a Swift error in the Capacitor-facing half remains invisible — the gap that let a stray
+   `@PluginMethod` sit on a private helper until #971 read the file. Closing it needs an
+   `xcodebuild`/gradle leg, which is a materially heavier gate and a separate decision.
+
+**What the extraction surfaced immediately**, none of it reachable by any prior gate: an SPM
+platform-floor mismatch (the library defaulted to macOS 10.13 and would not build against the
+core's 12) — ⚠️ **scoped correctly on the second pass: that breaks a HOST `swift build`/`swift test`
+of the package, NOT an iOS build**, since SwiftPM validates floors only for the platform being built
+for; measured both ways, and the same latent mismatch was then found and fixed in
+`capacitor-modoki-ota`; a `cancelReason` doc in
+`types.ts` that named `'ASDErrorDomain:…'` as a possible value when an ASD fault is not a
+cancellation at all and takes the failed path; and a compiler warning that
+`StoreKitError.unsupported` and `Product.PurchaseError.paymentMethodBindingConfigurationRequired`
+fall into `@unknown default` — left as-is deliberately, since naming a case an older Xcode lacks is
+a minimum-toolchain decision, but now VISIBLE.
 
 ---
 

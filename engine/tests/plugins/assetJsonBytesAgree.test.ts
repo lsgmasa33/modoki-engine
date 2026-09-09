@@ -20,6 +20,7 @@
  *  views' parked edits flush through — had no such cover at all. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -38,6 +39,7 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     firstRootDir: () => null,
     getManifest: () => ({ version: 2, assets: [] }) as Manifest,
     rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
+    requestBrowser: relay(),
     getSchema: () => undefined,
     markEditorWrite: () => {},
     ssrLoadModule: async () => ({}),

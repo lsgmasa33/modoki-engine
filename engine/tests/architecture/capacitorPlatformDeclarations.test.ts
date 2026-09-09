@@ -267,6 +267,53 @@ describe('capacitor plugin platform declarations', () => {
     }
     expect(missing, `files[] promises a file the package does not ship: ${missing.join(', ')}`).toEqual([]);
   });
+
+  /** The MIRROR of the check above, and the direction that actually ships a broken tarball (#971).
+   *
+   *  A plugin manifest may declare a nested local package — `.package(path: "iap-core")` — to hold
+   *  logic that host tooling can test (`import Capacitor` has no macOS xcframework, so the plugin
+   *  target itself cannot be host-built). That nested directory is a BUILD INPUT for every consumer:
+   *  drop it from `files[]` and the published tarball carries a `Package.swift` pointing at nothing.
+   *
+   *  ⚠️ Nothing else catches that. `npm run verify`, `npm run test:native` and both CI legs all run
+   *  against the REPO, where the directory is present; the first thing to fail is a game's iOS build,
+   *  long after the tarball is vendored. Until this test the invariant was held by a comment in
+   *  Package.swift asking the next author to remember. */
+  it('every nested .package(path:) a plugin declares is shipped in files[]', () => {
+    const offenders: string[] = [];
+    for (const p of pkgs) {
+      const manifest = path.join(p.dir, 'Package.swift');
+      if (!fs.existsSync(manifest)) continue;
+      // ⚠️ Strip comments FIRST — this file's own four `a name only in a comment` tests exist
+      // because a commented-out declaration must not count as declared, and the reverse is just
+      // as wrong: `// .package(path: "legacy-core")` would otherwise be reported as unshipped.
+      const src = stripSwiftComments(fs.readFileSync(manifest, 'utf8'));
+      // ⚠️ `path:` is NOT always the first argument. `.package(name: "X", path: "Y")` is legal and
+      // is the spelling Capacitor's own generated CapApp-SPM manifests use — the very form this
+      // file pins further down. An earlier version of this guard anchored on `.package(\s*path:`
+      // and was mutation-proven BLIND to that spelling: renaming the call and deleting both
+      // files[] entries left the suite fully green. Match the call, then find `path:` inside it.
+      for (const call of src.matchAll(/\.package\(([^)]*)\)/g)) {
+        const pathArg = call[1].match(/(?:^|,)\s*path:\s*"([^"]+)"/);
+        if (!pathArg) continue;                       // a url: dependency — not our business
+        const dep = pathArg[1].replace(/^\.\//, '').replace(/\/$/, '');
+        // A path dep is a DIRECTORY containing a Package.swift; both it and the sources under it
+        // must ship. `files[]` may name the directory (with or without a trailing slash — npm
+        // accepts both and ships the whole tree either way) or the concrete entries.
+        const needed = [`${dep}/Package.swift`, `${dep}/Sources/`];
+        for (const n of needed) {
+          const covered = p.files.some((f: string) => {
+            const e = f.replace(/^\.\//, '');
+            if (e === n) return true;
+            if (e === dep || e === `${dep}/`) return true;   // the whole directory is shipped
+            return e.endsWith('/') && n.startsWith(e);        // a covering prefix
+          });
+          if (!covered) offenders.push(`${p.name}: .package(path: "${dep}") but files[] omits ${n}`);
+        }
+      }
+    }
+    expect(offenders, `a nested SPM path-dependency is not shipped:\n  ${offenders.join('\n  ')}`).toEqual([]);
+  });
 });
 
 /** ----------------------------------------------------------------------------------------------

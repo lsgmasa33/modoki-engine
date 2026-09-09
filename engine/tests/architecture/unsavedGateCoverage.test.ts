@@ -47,7 +47,7 @@ const ROUTER = 'engine/plugins/backend/editorBackendRouter.ts';
  *  This nets routes that legitimately do not care (`/api/read-file` serving bytes). That is the
  *  intended trade: `EXEMPT` is the honest home for those, and a declaration a reader can check
  *  beats a trigger tuned until nothing inconvenient matches. */
-const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|computeUnused|computeRefEdges)\s*\(/;
+const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync)\s*\(/;
 
 /** The registries each trigger symbol's INPUTS can live in.
  *
@@ -71,6 +71,42 @@ const HELPER_REGISTRIES: Record<string, readonly string[]> = {
   // gated or exempt. Narrowing this by guessing at the filename would be a trigger tuned to
   // pass.
   readFileSync: [],
+  // ⚠️ Added in phase 2 so the two validators are checked rather than merely counted. Both routes
+  // trigger on `readFileSync` too, and that maps to `[]` — so without these rows the superset
+  // check is VACUOUS for them and the guard degrades to "does the word unsavedGate appear",
+  // which is the presence test #889 already found insufficient once.
+  //
+  // ⚠️ **Got wrong TWICE, in both directions, so the reasoning is written out.** It first said
+  // `['dirtyAsset', 'pendingBaseScene', 'liveScene']` "for the same reason as computeUnused" —
+  // false: computeUnused really does read material documents for refs, while `makeAssetResolver`
+  // is a membership test over manifest GUIDs and `validateSceneData` takes only `getPrefab` +
+  // `assetExists`. The correction then over-swung and dropped `pendingMeta` too, which was an
+  // UNDER-declaration and hence the dangerous direction.
+  //
+  // The question is NOT "which pass reads that file" — it is "can that park change what these
+  // two resolvers ANSWER":
+  //   • `pendingMeta` — YES, through the manifest. `vite-asset-scanner` resolves a texture's
+  //     `textureType` from the sidecar and emits the auto whole-image `sprite` sub-entry only for
+  //     `2d`/`ui`, so a parked Type change deletes a guid the scene references.
+  //   • `liveScene`  — YES. `makePrefabResolver` reads prefab documents, and prefab-edit is the
+  //     only registry state that can hold an unsaved prefab.
+  //   • `pendingBaseScene` — NO. `sceneValidation.ts` contains "baseScene" zero times.
+  //   • `dirtyAsset` — NO. A parked asset document changes no manifest entry `assetExists` tests.
+  validateSceneData: ['pendingMeta', 'liveScene'],
+  // The prefab pass consults NO resolver — one document, the inert-size rule. The only registry
+  // that can hold a `.prefab.json` is `liveScene`, via prefab-edit (a prefab is not an
+  // `AssetSchemaType`, so `dirtyAsset` never holds one).
+  validatePrefabData: ['liveScene'],
+  // ⚠️ Added in phase 3 to close a PROSE-ONLY gap. `docs/mcp-persistence.md` named
+  // /api/write-file, /api/move-file and /api/delete-asset in its list of routes that touch content
+  // the editor can hold — but they matched NO trigger, so this guard never classified them and
+  // that doc list read as a ledger the guard keeps when for those three it was prose. All three
+  // turn out to be exempt, and the point is that they are now exempt ON THE RECORD rather than
+  // merely unexamined. The difference shows up the day one of them grows a branch.
+  moveToTrash: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+  moveAssetFile: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+  // Same argument as readFileSync: a raw write says nothing about WHAT was written.
+  writeFileSync: [],
 };
 
 /** The `registries: [...]` a route DECLARES on its `unsavedGate` call.
@@ -116,6 +152,16 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   '/api/layout': { reason: 'reads editor WINDOW layouts from the user profile — chrome state, not project content, and not under any asset root.' },
   '/api/layout-delete': { reason: 'same store as /api/layout.' },
   '/api/ota/keys': { reason: 'reads the OTA signing keypair from the user profile. Not project content and never opened in a panel.' },
+  // ── One of the three `docs/mcp-persistence.md` named and this guard could not previously see
+  //    (#889 phase 3). Its two siblings are in KNOWN_GAPS below — they repair MOST of what they
+  //    touch, and "most" is a gap, not an exemption. ──
+  '/api/write-file': { reason:
+    'renderer-only. It has NO entry in engine/tools/modoki-mcp/src/contracts.ts, so no agent tool '
+    + 'reaches it; its callers are the editor OWN saves (postWriteFile — saveScene, '
+    + 'writePrefabFile), and it fingerprints EVERY write through markEditorWrite, which is the '
+    + 'same assertion selfWrite makes on /api/asset-write: a write issued from the renderer is '
+    + 'never blind to the registry. VOID the day it gains an MCP contract — it would then need '
+    + 'asset-write selfWrite split, because the renderer half must not be gated.', },
   '/api/import-file': { reason:
     'it REFUSES an existing destination before writing anything, so no park can be keyed to the '
     + 'path it creates. Its optional re-import runs through `/api/reimport`\'s own handler on that '
@@ -129,37 +175,37 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
  *  ticket". Folding them into one table is how a documented gap becomes a licence — the next reader
  *  finds the route listed in something called EXEMPT and concludes it was considered and cleared.
  *
- *  Each entry MUST name an issue, asserted below. #889 phase 1 covers `/api/duplicate-asset`,
- *  `/api/unused-assets` and `/api/find-references`; these are its phases 2 and 3. */
+ *  Each entry MUST name an issue, asserted below.
+ *
+ *  Every route #889 filed is now gated: phase 1 took `/api/duplicate-asset`, `/api/unused-assets`
+ *  and `/api/find-references`; phase 2 the two validators (DISCLOSE, owner 2026-09-09 — they answer
+ *  200 with a caveat rather than refusing); phase 3 `/api/scene-mutate` and `/api/asset-write`.
+ *
+ *  ⚠️ **What remains is a DIFFERENT defect, found by making these two routes visible to this guard
+ *  at all.** They were about to be exempted on the grounds that they repair the registries
+ *  themselves — which is true for `dirtyAsset` and `pendingMeta` and FALSE for `pendingBaseScene`:
+ *  `assetEditorBindings.ts` does not mention that registry anywhere. "Repairs most of what it
+ *  touches" is a gap, not an exemption, and writing it as one is how a defect starts reading as a
+ *  decision — which is the exact thing the two-table split exists to prevent. */
 const KNOWN_GAPS: Record<string, { issue: string; reason: string }> = {
-  '/api/validate-scene': {
-    issue: '#889',
-    reason: 'validates the DISK copy while the live world holds edits — an agent that just ran '
-      + 'mutate_scene gets a clean bill of health for the pre-edit file. Deferred because the '
-      + 'better answer may be to validate the parked/live document rather than caveat the disk '
-      + 'one, and that is a product call, not a mechanical widening.',
+  '/api/move-file': {
+    issue: '#972',
+    reason: 'applyMovesInRenderer → applyAssetPathMoves → applyMovesToParkedAssets remaps the park '
+      + 'for `dirtyAsset` and `pendingMeta` and NOT `pendingBaseScene` — that registry is not '
+      + 'referenced in assetEditorBindings.ts at all. So a moved `.scene.json` strands its parked '
+      + 'baseScene edit on a dead path and it never flushes: the human edited a baseScene ref, '
+      + 'renamed the scene, and the edit is silently gone at the next save_all. '
+      + '⚠️ Filed under #972 rather than #889 because the MECHANISM is #972\'s: a consumer '
+      + 'hand-enumerating the registries instead of deriving them from unsavedChangeCauses(). '
+      + 'Gating this route would be the wrong fix — it would refuse a rename because the file '
+      + 'being renamed has unsaved edits, which is the case the repair exists to carry across. '
+      + 'The fix is to finish the repair.',
   },
-  '/api/validate-prefab': {
-    issue: '#889',
-    reason: 'same shape as /api/validate-scene, on the prefab-edit world.',
-  },
-  '/api/asset-write': {
-    issue: '#889',
-    reason: 'reads disk for THREE decisions (ifMatch, prevText, prevDoc) while dirtyAssets may '
-      + 'hold newer bytes, so the dropped-field guard and id-preservation measure against a stale '
-      + 'baseline. ⚠️ NOT a mechanical fix: flushDirtyAssets POSTs to this route, so a naive gate '
-      + "refuses the editor's own save and deadlocks the only path from a park to disk — #872's "
-      + 'Sprite-Editor regression with a worse blast radius. Partly mitigated today by the CAS '
-      + 'ifMatch and the watcher\'s dropParkedWriteFor.',
-  },
-  '/api/scene-mutate': {
-    issue: '#889',
-    reason: 'ALREADY GATED, by a different mechanism with the OPPOSITE fail policy: it probes '
-      + 'editor-state at 8s and refuses on unsaved work, but FAILS OPEN on a dead probe, appending '
-      + 'a warning instead (a written rationale: "a genuinely headless edit is the normal case and '
-      + 'must keep working"). docs/mcp-tool-conventions.md §8 says a renderer that did not answer '
-      + 'must be a refusal, so this is a divergence on the record rather than an accident — and '
-      + 'converging it is an owner decision, not a mechanical one.',
+  '/api/delete-asset': {
+    issue: '#972',
+    reason: 'the same seam as /api/move-file with `to: null` (unbindDeletedAssetEditors), and the '
+      + 'same missing registry: a deleted scene leaves its parked baseScene edit behind. Same '
+      + 'argument against gating — a file must be deletable while it is being edited.',
   },
 };
 

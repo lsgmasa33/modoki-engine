@@ -24,15 +24,16 @@
  *    refusal-only test);
  *  - probe and discard are ONE call, so nothing can land in between.
  *
- *  ⚠️ **`liveScene` is covered for the BASE half only.** `markSceneDirty(guid)` is drivable from
- *  here; the primary scene's term needs a live world and an edit-version bump, which this suite has
- *  no honest way to produce. That gap is stated rather than faked — a stub that pretended to be a
- *  dirty primary scene would be a fake modelling behaviour nothing has, and the assertion built on
- *  it would defend the fake. The primary half is pinned by the type-level exhaustiveness check and
- *  by `editor/pendingMeta.test.ts`'s own coverage of `unsavedChangeCauses`.
+ *  ⚠️ **The primary-scene term IS drivable, and this header used to say it was not.** `sceneDirty`
+ *  reads exactly two numbers — `getEditVersion() !== _savedAtEditVersion` — so moving the BASELINE
+ *  with the exported `markSceneSaved(v)` reaches the identical observable state a real edit
+ *  reaches, without pretending to hold a live world. Nothing is faked: no stub claims to be a
+ *  dirty scene, and every assertion below reads the same two numbers production reads. Believing
+ *  otherwise cost real coverage — the `sceneDirty` row was the one term with no runtime test, and
+ *  it is where #889's phase-2 false clear was hiding.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
@@ -49,6 +50,10 @@ import {
 import {
   markSceneDirty, clearAllSceneDirty,
 } from '../../packages/modoki/src/editor/scene/sceneDirty';
+import {
+  setCurrentScenePath, markSceneSaved, unsavedChangeCauses,
+} from '../../packages/modoki/src/editor/scene/serialize';
+import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
 
 /** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
  *
@@ -65,6 +70,11 @@ const parkAsPanel = (p: string, doc: Record<string, unknown>, ifMatch?: string) 
   parkMetaEdit(p, stampMetaReadPath(doc, p), ifMatch);
 
 
+// `setCurrentScenePath(path)` persists the last-scene key, and this suite's jsdom exposes no
+// localStorage. Same stub the other editor suites use — it restores a global the browser really
+// has rather than inventing behaviour.
+vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
+
 registerEditorAgentOps();
 
 type Hold = { path: string; registry: string; detail?: string };
@@ -78,6 +88,11 @@ const discardAssetEdits = (params: unknown) => runAgentOp('discard-asset-edits',
 
 const TEX = '/assets/textures/rock.png';
 const MODEL = '/assets/models/hero.glb';
+const OPEN_SCENE = '/assets/scenes/main.scene.json';
+/** The marker the op reports for a dirty world with no file — kept as a literal here on purpose:
+ *  it is a WIRE value a Node route can read, so a test importing the constant would follow a
+ *  rename silently and prove nothing about the string that actually travels. */
+const PATHLESS = '(unsaved live world — no file on disk)';
 
 // BOTH resets, and `clearMetaBaselines` is NOT optional despite the read-failed flag it used to
 // also clear being gone (#880). `clearPendingMeta` empties `pending` only, so without the second
@@ -89,6 +104,10 @@ const reset = () => {
   // show up as a `holds` row nobody parked, in a registry the failing test never mentions.
   clearPendingMeta(); clearMetaBaselines();
   clearDirtyAssets(); clearPendingBaseScenes(); clearAllSceneDirty();
+  // The sixth thing to reset: the primary-scene term is MODULE state in serialize.ts, not a
+  // registry with a clear function. Left dirty it leaks into every later case as a `liveScene` row
+  // nobody set — which reads as the very false-positive these cases exist to distinguish from.
+  setCurrentScenePath(null); markSceneSaved(getEditVersion());
 };
 beforeEach(reset);
 afterEach(reset);
@@ -107,12 +126,15 @@ describe('resolve-unsaved — the probe', () => {
 
   it('covers ALL FIVE causes, each under the registry name Node expects', async () => {
     // ⚠️ The runtime half of the derivation. The type-level `satisfies` makes a NEW cause a
-    // compile error; this makes an EXISTING cause silently going unreported a red test. Four of
-    // the five are drivable from here — see the file header for why the primary-scene term is not.
+    // compile error; this makes an EXISTING cause silently going unreported a red test. All FIVE
+    // are driven here — the primary-scene term included, which this suite wrongly believed it
+    // could not reach.
     parkAsPanel(TEX, { id: 'tex-guid' });                                    // pendingMeta
     markAssetDirty('/a.mat.json', 'material', { id: 'm' });                  // dirtyAsset
     markBaseSceneEdit('/lvl.scene.json', '/base.scene.json');                // pendingBaseScene
     markSceneDirty('scene-guid-1');                                          // liveScene (a BASE)
+    setCurrentScenePath(OPEN_SCENE);                                         // liveScene (PRIMARY)
+    markSceneSaved(getEditVersion() - 1);
 
     const r = await resolve({});   // global mode — no `paths`
 
@@ -121,8 +143,65 @@ describe('resolve-unsaved — the probe', () => {
     expect(pathsIn(r, 'pendingBaseScene')).toEqual(['/lvl.scene.json']);
     // The guid resolves to no manifest entry in this suite, so it is reported UNDER THE GUID
     // rather than dropped — "could not look" must not be reported as "nothing is there", least of
-    // all inside the probe written to stop that.
-    expect(pathsIn(r, 'liveScene')).toEqual(['scene-guid-1']);
+    // all inside the probe written to stop that. The PRIMARY scene rides the same registry, so
+    // both rows land here; asserted as a set because the two causes are independent.
+    expect(pathsIn(r, 'liveScene').sort()).toEqual([OPEN_SCENE, 'scene-guid-1'].sort());
+  });
+
+  /** #889 phase 2 — the dirty world with NO scene path.
+   *
+   *  ⚠️ **The control is not decoration.** "holds is empty" is the same observation whether the
+   *  probe missed the state or the probe is simply dead in this suite, and only a positive case in
+   *  the same file separates them. Before the fix the pair read: control → one `liveScene` row,
+   *  pathless → `[]` with `covers` naming all four registries. That second reply is a FALSE CLEAR,
+   *  not an `unknown` — the Node gate reads it as "asked and answered, nothing held" and proceeds.
+   *
+   *  Two production states reach it: prefab-edit (`serialize.ts` nulls `_currentScenePath` so an
+   *  ordinary save cannot target the prefab world) and a scene never yet written. The prefab half
+   *  needs a prefab-edit WORLD and lives in `prefabEditUnsavedProbe.test.ts`; what is pinned here
+   *  is the conjunction itself. */
+  describe('a dirty live world with no scene path', () => {
+    it('CONTROL — with a path, the primary scene is reported', async () => {
+      setCurrentScenePath(OPEN_SCENE);
+      markSceneSaved(getEditVersion() - 1);
+      expect(unsavedChangeCauses().sceneDirty, 'the tracker is dirty').toBe(true);
+
+      const r = await resolve({});
+      expect(pathsIn(r, 'liveScene')).toEqual([OPEN_SCENE]);
+    });
+
+    it('reports the world under a MARKER rather than reporting nothing', async () => {
+      setCurrentScenePath(null);
+      markSceneSaved(getEditVersion() - 1);
+      expect(unsavedChangeCauses().sceneDirty, 'same dirty tracker, no path').toBe(true);
+
+      const r = await resolve({});
+      // The row that used to be dropped. Its DETAIL is asserted too: a marker path with the
+      // "OPEN scene" wording would send a reader to a scene that is not what is dirty.
+      expect(pathsIn(r, 'liveScene')).toEqual([PATHLESS]);
+      expect((r.holds ?? [])[0]?.detail).toMatch(/never been saved/);
+      expect(r.covers, 'still a full answer, not an unknown').toEqual(
+        ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+      );
+    });
+
+    it('a CLEAN world with no path is still clean — the marker is not unconditional', async () => {
+      // The accept side. A fix that emitted the marker whenever the path was missing would pass
+      // the case above and report unsaved work on every headless call for the rest of time.
+      setCurrentScenePath(null);
+      markSceneSaved(getEditVersion());
+      expect(unsavedChangeCauses().sceneDirty).toBe(false);
+
+      expect(pathsIn(await resolve({}), 'liveScene')).toEqual([]);
+    });
+
+    it('a path-scoped ask does NOT match the marker', async () => {
+      // A marker is not a file, so a route asking about its own path must not be refused by it.
+      setCurrentScenePath(null);
+      markSceneSaved(getEditVersion() - 1);
+
+      expect(pathsIn(await resolve({ paths: [OPEN_SCENE] }), 'liveScene')).toEqual([]);
+    });
   });
 
   it('GLOBAL MODE (`paths` omitted) is not the same as an empty list', async () => {

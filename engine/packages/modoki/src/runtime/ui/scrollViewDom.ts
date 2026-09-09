@@ -30,12 +30,32 @@ export interface ScrollViewNodeData {
  *  authoring a `UIScrollView` and forgetting `overflow`, which the docs told you was a no-op.
  *
  *  The pin's whole justification (the measured scrollbar theft below) only exists for a box that
- *  scrolls, so gating it costs nothing. `scrollSnapType`/`overscrollBehavior`/`scrollbarWidth`
+ *  scrolls, so gating it costs nothing. `scrollSnapType`/`overscroll-behavior`/`scrollbarWidth`
  *  stay unconditional: none of them changes how `overflow` computes, so on a non-scrolling box
- *  they are inert rather than harmful. */
+ *  they are inert rather than harmful. ⚠️ **Unconditional is not the same as both-axes** — the
+ *  overscroll write is scoped to `axis` (#964); see its own comment in the body. */
 export function scrollViewStyle(s: ScrollViewNodeData, overflow: string): Record<string, string> {
   const css: Record<string, string> = {};
-  css.overscrollBehavior = s.overscroll === 'auto' ? 'auto' : s.overscroll;
+  // ⚠️ **Per AXIS, never the shorthand (#964) — this is #743's defect wearing a second symptom.**
+  // `overscroll-behavior` binds BOTH axes, and the view it comes from is single-axis, so
+  // `overscroll: 'contain'` on an `axis: 'y'` view also contained the axis the box **cannot scroll
+  // at all** (the cross-axis pin below sets its `overflow-x: hidden`). A horizontal gesture landing
+  // there was therefore swallowed by a box that could not serve it and never chained to the
+  // ancestor that could.
+  //
+  // Measured on a Galaxy S22 over trusted CDP touch, one property the only difference: with
+  // `overscroll-behavior-x: contain` an identical 150px drag on wordweave's dictionary card moved
+  // its pager 0px; relaxed to `auto`, the same drag paged it by exactly one entry (scrollLeft
+  // 12299 → 12048.67). The touches arrived and nothing called `preventDefault` — the gesture was
+  // accepted by the compositor and had nowhere to go.
+  //
+  // Containment is only ever meaningful on an axis that scrolls, so scoping it to `axis` costs
+  // nothing on the scrolling axis and gives the cross axis back its normal chaining. `'both'`
+  // keeps the shorthand, which is then correct rather than incidental.
+  const overscroll = s.overscroll === 'auto' ? 'auto' : s.overscroll;
+  if (s.axis === 'both') css.overscrollBehavior = overscroll;
+  else if (s.axis === 'x') css.overscrollBehaviorX = overscroll;
+  else css.overscrollBehaviorY = overscroll;
   // `scrollbar-width: none` is the standards property (Chromium 121+, Safari 18.2+); older
   // WebKit uses overlay scrollbars, which steal no space, so there is nothing to hide there.
   // Do NOT attempt `::-webkit-scrollbar` — these are inline styles and cannot carry a

@@ -1949,9 +1949,17 @@ describe('UIScrollView inert-trait DEV warning (#743)', () => {
   it('a hidden box still gets the motion fields it can actually honour', () => {
     // The corollary of the test above: these are emitted above `scrollViewStyle`'s early return
     // and genuinely apply to a scroll container, which is why calling them inert was wrong.
+    //
+    // ⚠️ **`overscroll-behavior-X`, not the shorthand, since #964.** The old expectation here was
+    // not merely renamed — it was asserting the DEFECT. The shorthand binds BOTH axes, so an
+    // `axis: 'x'` view also contained its y axis, which it cannot scroll, stranding every vertical
+    // gesture that landed on it instead of chaining to an ancestor. Confirmed on a Galaxy S22.
+    // What this case is actually about — a hidden box still gets the axis-independent motion
+    // fields — is unchanged; only the property that carries it is now correct.
     const el = renderNode(makeNode({ guid: 'sv-hidden-2', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start', overscroll: 'contain' }) }));
     expect(styleAttr(el)).toMatch(/scroll-snap-type:\s*x mandatory/);
-    expect(styleAttr(el)).toMatch(/overscroll-behavior:\s*contain/);
+    expect(styleAttr(el)).toMatch(/overscroll-behavior-x:\s*contain/);
+    expect(styleAttr(el), 'the cross axis must stay free to chain').not.toMatch(/overscroll-behavior-y/);
   });
 
   it('the cross-axis pin still fires on a box that actually scrolls', () => {

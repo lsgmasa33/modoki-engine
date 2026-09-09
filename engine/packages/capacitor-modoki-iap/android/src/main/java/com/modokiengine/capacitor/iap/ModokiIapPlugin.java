@@ -236,7 +236,7 @@ public class ModokiIapPlugin extends Plugin {
             + " parkedCall=" + (awaitingPurchase != null));
         PluginCall call = awaitingPurchase;
 
-        if (code == BillingClient.BillingResponseCode.USER_CANCELED) {
+        if (IapCore.isCancellation(code)) {
             if (call != null) {
                 unpark(call);
                 JSObject r = new JSObject();
@@ -248,7 +248,7 @@ public class ModokiIapPlugin extends Plugin {
                 // emitted anyway so a journal entry means the same thing on both platforms, and so
                 // that a cancel with NO reason attached identifies an older build rather than
                 // silently reading as Android.
-                r.put("cancelReason", "play.userCanceled");
+                r.put("cancelReason", IapCore.CANCEL_REASON);
                 call.resolve(r);
             }
             return;
@@ -457,7 +457,6 @@ public class ModokiIapPlugin extends Plugin {
         });
     }
 
-    @PluginMethod
     /**
      * Reject with a DIAGNOSIS, not just prose (#499).
      *
@@ -478,7 +477,7 @@ public class ModokiIapPlugin extends Plugin {
         detail.put("description", result.getDebugMessage());
         JSObject data = new JSObject();
         data.put("storeError", detail);
-        call.reject(message + " (code " + code + ")", "billing." + code, null, data);
+        call.reject(message + " (code " + code + ")", IapCore.rejectCode(code), null, data);
     }
 
     /** ⚠️ `@PluginMethod` is what puts this in `PluginHandle`'s method index — without it the

@@ -26,6 +26,15 @@
  * Per leg, and they differ — do not read one green summary as one claim:
  *   - OTA (both legs) test the SHIPPING code: OtaCore.swift / OtaCore.java are the real
  *     implementations, replayed against the shared vectors.
+ *   - IAP (both legs, #971) test the SHIPPING code too: ModokiIapCore.IapClassification and
+ *     IapCore.java are the real implementations, replayed against
+ *     test-vectors/iap-classification-vectors.json. Before this the plugin's Swift and Java were
+ *     compiled by NOTHING in this repo — not verify, not this gate, not CI — so #946 landed native
+ *     changes on a green gate that could not have caught a mistake in them. Two caveats a green
+ *     run does NOT cover: IapCore.RESPONSE_USER_CANCELED matching Play's own constant (that needs
+ *     the billing library, and NOTHING checks it — a static comparison was tried and removed, see
+ *     IapCore's header), and that the plugin still CALLS the core correctly on a real purchase —
+ *     only a device cancel shows that.
  *   - The lease legs test PORTS of the spec that live inside the test files, while
  *     GameDebugPlugin keeps its own lease state behind a platform timer. Closing that gap means
  *     extracting a pure LeaseCore into the shipping sources — a behavioural native change needing
@@ -96,6 +105,7 @@ function run(name, cmd, args, opts = {}) {
 // One table, so adding a native suite is a row rather than another bespoke block — and so the
 // summary can name every leg that exists, including the ones this machine could not run.
 const otaDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-ota');
+const iapDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-iap');
 
 // The ios/ota-core leg's OtaZipTests.swift cross-checks OtaZip against a REAL zip built by the
 // Node writer (engine/scripts/ota/zip.mjs) — that fixture used to be a hand-typed /tmp file
@@ -136,6 +146,10 @@ const SWIFT_LEGS = [
     // stand in for a real result.
     requiresFixture: true,
   },
+  // #971. Like ota-core this drives the SHIPPING classification (ModokiIapCore), not a port of it
+  // living in the test — see IapClassification.swift's header for why importing StoreKit is fine
+  // here while importing Capacitor is not.
+  { name: 'ios/iap-core', packagePath: path.join(iapDir, 'iap-core') },
 ];
 
 for (const leg of SWIFT_LEGS) {
@@ -223,32 +237,61 @@ if (!gradle) {
 }
 
 // ── Android: the OTA self-test (javac + java, no gradle at all) ─────────────────────────
-// OtaCoreSelfTest is a `main()` that exits non-zero on a failed scenario — it needs only java.*
-// plus a test-only MinimalJson, and it compiles the SHIPPING OtaCore.java. That is why it is a
-// bare javac/java leg rather than a second gradle harness.
-{
-  const name = 'android/ota-core';
-  const sources = [
-    'android/src/main/java/com/modokiengine/capacitor/ota/OtaCore.java',
-    'android/src/test/java/com/modokiengine/capacitor/ota/MinimalJson.java',
-    'android/src/test/java/com/modokiengine/capacitor/ota/OtaCoreSelfTest.java',
-  ].map((rel) => path.join(otaDir, rel));
+/** `javac` + `java` legs: a self-test `main()` that exits non-zero, compiled from a list of
+ *  SHIPPING sources plus its test-only helpers. A row rather than a bespoke block, for the same
+ *  reason SWIFT_LEGS is a table.
+ *
+ *  ⚠️ Both cores are dependency-free — no `android.*`, no vendor SDK — and that is LOAD-BEARING,
+ *  not tidiness: it is the only reason these can be bare javac/java runs instead of gradle
+ *  harnesses. Add one Android import to either core and its leg stops being runnable at all.
+ *
+ *  Each leg compiles the SHIPPING core (OtaCore.java / IapCore.java), so a green run is a claim
+ *  about the code that ships — unlike `android/lease-parity`, which tests a port. The one part of
+ *  IapCore's contract this cannot reach is its `RESPONSE_USER_CANCELED` matching Play's own
+ *  constant, which needs the billing library. ⚠️ NOTHING checks it — a static comparison was
+ *  written and removed because javac folds it away (see IapCore's header). A hand-edit of the
+ *  value IS caught here; an upstream renumbering is caught nowhere.
+ */
+const JAVA_LEGS = [
+  {
+    name: 'android/ota-core',
+    dir: otaDir,
+    mainClass: 'com.modokiengine.capacitor.ota.OtaCoreSelfTest',
+    sources: [
+      'android/src/main/java/com/modokiengine/capacitor/ota/OtaCore.java',
+      'android/src/test/java/com/modokiengine/capacitor/ota/MinimalJson.java',
+      'android/src/test/java/com/modokiengine/capacitor/ota/OtaCoreSelfTest.java',
+    ],
+  },
+  {
+    name: 'android/iap-core',
+    dir: iapDir,
+    mainClass: 'com.modokiengine.capacitor.iap.IapCoreSelfTest',
+    sources: [
+      'android/src/main/java/com/modokiengine/capacitor/iap/IapCore.java',
+      'android/src/test/java/com/modokiengine/capacitor/iap/MinimalJson.java',
+      'android/src/test/java/com/modokiengine/capacitor/iap/IapCoreSelfTest.java',
+    ],
+  },
+];
+
+for (const leg of JAVA_LEGS) {
+  const sources = leg.sources.map((rel) => path.join(leg.dir, rel));
   const missing = sources.filter((f) => !fs.existsSync(f));
   if (!has(javaBin('javac')) && !has('javac')) {
-    skip(name, 'no javac — no provisioned JDK and none on PATH');
+    skip(leg.name, 'no javac — no provisioned JDK and none on PATH');
   } else if (missing.length) {
-    skip(name, `missing source(s): ${missing.map((f) => path.relative(repoRoot, f)).join(', ')}`);
+    skip(leg.name, `missing source(s): ${missing.map((f) => path.relative(repoRoot, f)).join(', ')}`);
   } else {
     // A fresh classes dir per run: a leftover .class from an older source would let this pass
     // against code that no longer exists.
-    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-selftest-'));
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-java-selftest-'));
     try {
       const cc = spawnable ? spawnable(javaBin('javac'), ['-d', outDir, ...sources]) : { command: javaBin('javac'), args: ['-d', outDir, ...sources], shell: false };
-      const c = spawnSync(cc.command, cc.args, { cwd: otaDir, stdio: 'inherit', shell: cc.shell, env: javaEnv });
-      if (c.error || c.status !== 0) { record(name, 1); }
-      // The self-test resolves its vectors from the PACKAGE ROOT, so cwd matters.
-      else run(name, javaBin('java'), ['-cp', outDir, 'com.modokiengine.capacitor.ota.OtaCoreSelfTest'],
-        { cwd: otaDir, env: javaEnv });
+      const c = spawnSync(cc.command, cc.args, { cwd: leg.dir, stdio: 'inherit', shell: cc.shell, env: javaEnv });
+      if (c.error || c.status !== 0) { record(leg.name, 1); }
+      // The self-tests resolve their vectors from the PACKAGE ROOT, so cwd matters.
+      else run(leg.name, javaBin('java'), ['-cp', outDir, leg.mainClass], { cwd: leg.dir, env: javaEnv });
     } finally {
       fs.rmSync(outDir, { recursive: true, force: true });
     }

@@ -198,6 +198,28 @@ reopen it.
   **Reopens when a second game grows a settings SCREEN or an ad cooldown** — a product decision, not
   an extraction. Start with settings when it does: the legacy-field migration is the part that is
   genuinely painful to re-derive.
+
+  ⚠️ **REOPENED AND RE-RULED, 2026-09-09 (#918, `work-ai`) — VERDICT: accept two copies.** The
+  condition above was met: wordweave grew `runtime/settings.ts` and a settings SCREEN. ⚠️ **The
+  measurement this deferral rested on is now FALSE and must not be re-quoted** — "no audio subsystem
+  at all, `audio|music|sfx|sound` at 0 and 0" stopped being true when `2040d02ed` landed
+  `runtime/audio.ts` and `runtime/haptics.ts` (#920/#922), an hour after #918 was even filed.
+
+  The re-ruling, on what the second implementation actually looked like:
+  - **The shared part is ~15 lines**: clamp-to-range, per-field fallback, normalise-on-read. The
+    divergent part is the whole field set plus Court's legacy `soundOn` branch, which wordweave has
+    no equivalent of and never will. Extracting the mechanism means describing the field set as
+    data, which is more machinery than the duplication costs — #661's original finding
+    ("mechanism generalizes, field set does not") survived contact with the second consumer intact.
+  - **The envelope did NOT need extracting, because it was written on the FIRST try.** Wordweave's
+    document is enveloped from day one specifically so #679 registers a group rather than migrates a
+    format. That removes the expensive half this entry warned about, rather than sharing it.
+  - ⚠️ **The extraction candidate that actually emerged is a different one**: the **0..1 ↔ 0..100
+    conversion** between a settings document and the engine mixer store. Both games now own a copy,
+    it is pure, it has no field set to generalise, and it belongs with the mixer that *defines* the
+    scale (`runtime/actions/audioControls.ts`) rather than with either game. That is a far better
+    ratio than the module this row was about — file it as its own ticket if a third consumer
+    appears, or when someone gets the direction wrong once.
 - **A store SCREEN — deferred on assessment (#659, closed 2026-09-04).** `games/court/runtime/storeUi.ts`
   is 581 lines / 228 code, and splits ~18% catalog-agnostic / ~42% generic mechanism wearing a
   Court-shaped type / ~40% copy and catalog. Its two DIRECT imports are siblings — no

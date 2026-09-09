@@ -108,8 +108,12 @@ function extractJavaCodeLines(src: string): string[] {
  *  immediately above `public void <name>(PluginCall call)` (after comments are stripped) — this
  *  is exactly the annotation `PluginHandle.indexMethods` reads, and exactly what `products()` was
  *  missing. Deliberately requires the `public void ...(PluginCall call)` shape so a private
- *  helper (e.g. `rejectWithBilling`, which is mis-preceded by a stray `@PluginMethod` in the
- *  source today) is never counted, whether or not it happens to sit under that annotation. */
+ *  helper is never counted, whether or not it happens to sit under that annotation.
+ *
+ *  ⚠️ That shape restriction is NOT hypothetical, and do not relax it because the example is gone:
+ *  `rejectWithBilling` (a private helper) really was mis-preceded by a stray `@PluginMethod` until
+ *  `2d711ee05` removed it — found by reading, since nothing in this repo compiles that Java (#971,
+ *  #981). The restriction is what kept this guard correct while the source was wrong. */
 function extractAndroidPluginMethodNames(src: string): string[] {
   const codeLines = extractJavaCodeLines(src);
   const names: string[] = [];
