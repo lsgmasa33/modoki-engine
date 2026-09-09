@@ -4105,6 +4105,106 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 
 The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
 
+## Gotcha: on three r185 an MRT pass is set up against the BLOOM pass's render target (why three is pinned)
+
+⚠️ **`MRTNode.setup()` (three) resolves its declared output names against
+`builder.renderer.getRenderTarget()` — whatever target is bound at BUILD time.** A name that does not
+match a texture on that target resolves to index `-1`.
+
+**On r185 that setup also runs while `UnrealBloomPass`'s internal blur targets are bound** — observed
+four times in one run, against `h0`, `h1`, `h3`, `h4` (⚠️ **`h2` did not appear**, and that is
+unexplained: either a build did not happen for that mip or the log was short). Each carries one
+texture named `UnrealBloomPass.hN`, so **every** declared output misses, `members` is empty, and
+`OutputStructNode` emits `struct OutputType {}` — *"structures must have at least one member"* →
+`Fragment module is invalid` → pipeline creation fails → **black screen**, plus `writeMask is invalid`.
+
+**r184 never runs the setup against those targets**, and that is the whole behavioural difference —
+the new `-1` guard alone does not explain it, because r184's `members[-1] = …` also leaves `length` at
+0 and would fail identically *if it ever ran there*. Tracked as #956; three is pinned at 0.184.0.
+
+⚠️ **The r185 hunk changes THREE things, not one** — quoting only the guard misleads:
+
+```diff
+-			members[ index ] = vec4( outputNodes[ name ] );
++			// Ignore if the output exists in the MRT but has never been used.
++			if ( index === - 1 ) continue;
++			const type = builder.getOutputType( index );
++			members[ index ] = outputNodes[ name ].convert( type );
+```
+
+The guard is **not gratuitous** — `getOutputType( index )` does `renderTarget.textures[ index ].type`
+and would throw on `-1`, so the guard is required by the line under it. And the member **type**
+changed from always-`vec4` to one derived from the target's format. Do not read "the guard is the
+difference" as "the guard is the bug".
+
+### ⚠️ When this can fire at all — NOT unconditionally
+
+`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao`, and `lineColor` only
+for `npr`; `PostFXStack.ts` calls `setMRT` **only when `targets.length > 1`**. So a project with
+neither NPR nor AO has a single `output` target, **no `MRTNode` is ever built, and this bug cannot
+fire**. AO-only gives two outputs and the same shape with two misses. A future session asking "can we
+lift the r185 ceiling for this project?" must check that gate first — the pin is not unconditional.
+
+### ⚠️ An unresolved question — do not treat the `[output]` row as settled
+
+The device log also carries one `rtTextures=[output] outputs=[output|normal|lineColor] membersLen=1`
+row, on **both** versions, which was written up as the benign "declared but unread" case (below).
+**That explanation may not hold.** `PostFXStack.ts` consumes `normal`/`lineColor` **eagerly in the
+constructor**, gated on the same condition that declares them — so for any pass whose MRT declares
+three, its own target should already hold three textures by build time and `membersLen` should be 3.
+A row showing one texture named `output` may therefore be a **fifth foreign-target build**, i.e. part
+of the bug rather than benign.
+
+**This is unresolved.** The log prints texture *names*, and two different targets whose single texture
+is named `output` are indistinguishable in it. **Next measurement: add `renderTarget.uuid` to the log
+line** (`tools-scratch/three-r185-mrt/instrumentation/`) — one field, one run, and it separates the
+two hypotheses. #1007 was closed as not-a-defect on the benign reading; if this resolves the other
+way, that closure needs revisiting.
+
+⚠️ **Also undisclosed so far, and material:** this engine runs its own precompile session that
+**stubs `renderer.render` and saves/restores `setMRT`/`setRenderTarget`**
+(`postfx/precompileSession.ts`). Any claim that the foreign-target binding is purely three's must
+account for that first — it is also a cheaper repro axis than the ones tried below.
+
+### The benign case — a `-1` on its own is NOT a bug
+
+The pass allocates exactly the outputs the graph **consumes**, so an unread `normal`/`lineColor`
+legitimately has no texture and skipping it is the documented intent. Measured on both versions,
+one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which prints
+`renderTarget.textures` directly):
+
+| consumed | `renderTarget.textures` |
+|---|---|
+| `output` | `[output]` |
+| `output` + `normal` | `[output\|normal]` |
+| `output` + `normal` + `lineColor` | `[output\|normal\|lineColor]` |
+
+What makes a `-1` real is a miss for a name a LIVE stage is reading — the bloom-target case above,
+and possibly the `[output]` row per the open question.
+
+**Two things a future session should not re-derive** (both tested and disproved during #956):
+- It is **not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
+  `createRenderPipelineAsync()`. WebKit snapshots the descriptor synchronously; verified with a
+  standalone WebGPU page, no three.js involved.
+- It is **not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes
+  nothing.
+
+**Measuring it is cheap — do not reach for a device build.** It reproduces from a plain
+`--target web` build served over LAN and opened in **iPad Safari**, and intermittently (~1 in 20
+loads) in **macOS Safari**. ⚠️ Three traps: Safari caches `index.html` across builds, so serve with
+`Cache-Control: no-store` or you will silently compare the wrong bundle; the failure is
+**self-healing** in Safari — `frameDriver`'s watchdog re-arms the rAF chain and the app paints a few
+seconds later, so a screenshot taken late reads as a pass (the packaged app does not recover, because
+the readiness ceiling reveals the game first); and a `fetch`-based console collector **drops lines**
+under rapid logging, so read the page's own log for anything high-volume.
+
+⚠️ **Reproducing the bloom-target case MINIMALLY is unsolved.** A standalone page with the same MRT
+shape plus `bloom()` does not produce it, with or without effect-graph churn, mid-sequence material
+creation, `BloomNode.setResolutionScale(2)` (note: that is bloom's own internal scale, **new in
+r185** — not the engine's NPR `superSampleScale`, which scales the scene pass), a `setLayers` split,
+or a GTAO stage. So far it needs the full app. That gap, and the un-identified r185 change behind it,
+are what stand between us and an upstream report — `tools-scratch/three-r185-mrt/`.
+
 ## Bloom Post-Process
 
 A reusable whole-scene HDR bloom, added for `demos/particle-demo`'s dark-VFX showreel but not
