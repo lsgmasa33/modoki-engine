@@ -360,6 +360,94 @@ classifies as a non-asset with or without the clause. Measured by passing a bare
 clause does not match and getting `null` anyway. The clause stays as belt-and-braces; the claim that
 it is load-bearing does not.
 
+## 4b. A document-supplied KEY is not a safe object key — normalize at the boundary (#912)
+
+Everything above is about a document's FIELDS. This section is about its **keys** — a product id, a
+transaction id, a date string — and it is a different failure, with a different fix.
+
+**A key read out of a document can collide with `Object.prototype`.** `JSON.parse` makes `__proto__`
+an ordinary own enumerable key, so a stored or synced document really can carry one, and the other
+seven member names (`constructor`, `toString`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`,
+`propertyIsEnumerable`, `toLocaleString`) become ordinary own keys the moment they are assigned.
+Two silent shapes follow:
+
+| shape | what happens |
+|---|---|
+| `bag[k] = v` | for `k === '__proto__'` this hits `Object.prototype`'s SETTER: no own key is created, the value is lost, and the prototype is replaced by document data |
+| `k in bag` | true for **all 8** names even when the key is absent, so the test takes the wrong arm — and where that arm indexes the other operand, it throws |
+
+### ⚠️ The lesson is about the FIX SHAPE, not the bug
+
+#813 fixed this the obvious way: a `putOwn()` helper (`Object.defineProperty`) called at each copy
+site. **It took four review rounds, each found more sites, and round four found that the sweep had
+fixed producers while leaving consumers on the same defect** — including a `putOwn` that was inert
+because the next hop still dropped the key. Fourteen sites later, ~14 were still live.
+
+**N sites failing one way is a missing abstraction, not a longer to-do list.** The fix that ended it
+was one line at the READ BOUNDARY: `emptyDocMap()` (`games/court/runtime/saveSync.ts`) starts every
+document-keyed bag with a **null prototype**, which fixes both shapes at once — an assignment creates
+a real own key, and `in` answers about the bag. Most remaining plain-assignment sites then needed no
+edit at all, because they became correct where they stood.
+
+⚠️ **"Needed no edit" is true only where the ACCUMULATOR is a doc map, and the close-out review found
+two sites where it is not.** `mergeDailyProgress` and `mergeDailyPurchased` build their accumulator
+with a **spread** (`{ ...A.purchased }`), which is key-safe but yields an ORDINARY prototype whatever
+the source was — so converting the readers did not reach them. Worse, converting the readers made
+their loss **newly reachable**: before, a prototype-named receipt was dropped at the read boundary and
+could never leave the device; after, it survives, uploads, and can arrive on the server side of a
+conflict merge, where these two dropped it and the `merge:false` push destroyed the server copy too.
+⚠️ **How much is lost depends on the VALUE, and the first write-up of this got it wrong** — it said
+"all 8 names" from a test that used a made-up receipt value. `__proto__` is always lost. The other
+seven reach a `mine < id` compare against an inherited function that stringifies to
+`"function toString() { [native code] }"`, so they survive whenever the value sorts before that —
+which every lowercase-hex GUID level id does. In normal play the loss is `__proto__` alone; an empty
+levelId (producible, and stored as `''`) loses all 8. **A measurement taken with an invented value is
+a measurement of the invention** — this is the second unmeasured claim this section has had to
+correct, after #813's.
+
+**The lesson generalises: a boundary fix converts the places data ENTERS, and a spread-built
+accumulator downstream is a second entry point.** Sweep for `{ ...x }` accumulators over
+document-supplied keys as well as for `{}` ones.
+
+### ⚠️ Two things that must stay true for that to be safe, and both were MEASURED
+
+**Neither was taken on trust — #813 rejected the null-prototype shape on an argument nobody had
+tested, and that inherited rejection is what kept the class alive for four rounds.**
+
+1. **Nothing null-prototyped reaches storage.** `JSON.parse(JSON.stringify(x))` and
+   `structuredClone(x)` both keep `__proto__`/`constructor` as own keys AND return an ordinary
+   prototype — so the PlayerPrefs leg and the Capacitor-bridge leg to
+   `FirebaseFirestore.setDocument` are both clean. `{ ...bag }` converts explicitly if a boundary
+   ever needs it.
+2. **Nothing calls a method ON a bag.** A null prototype genuinely breaks `bag.hasOwnProperty(...)`.
+   Court makes **zero** such calls — every site already uses `Object.prototype.hasOwnProperty.call`.
+   ⚠️ **That convention is the load-bearing part: a new direct method call on a bag is what would
+   break this**, and it will fail loudly rather than silently, which is the right way round.
+
+### Three sites still needed a hand fix, and the reason generalises
+
+A null prototype on OUR bag cannot help when the object arrives **from a caller**. Court's two
+`k in next.entitlements/passes` tests and `reconcileDailySpend`'s `key in known` all read a
+caller-supplied object, so they use `Object.prototype.hasOwnProperty.call(...)`, which is correct for
+either prototype. **Ask where the object came from before deciding which of the two fixes applies.**
+
+⚠️ **An empty early-return is a bag too.** All four of Court's normalizers returned a plain `{}` for
+a missing document; a caller doing `k in normalizeX(undefined)` inherits the same 8 names off it.
+
+### Realistic exposure, so nobody over-invests
+
+A real key named `__proto__` means a hostile or corrupted document, not ordinary play. It is worth
+the ticket because `games/court/tests/cloudFormatPreservation.test.ts`'s **T5 states an explicit
+guarantee** that an unreadable entry survives both sync legs, and these were the key shapes for
+which it did not hold — plus the `k in` shape was a live **crash** in shipped Court for every
+`Object.prototype` name until #813.
+
+Covered by `games/court/tests/docMapBoundary.test.ts` (the boundary, all 8 names) and T5d in
+`cloudFormatPreservation.test.ts` (the upload leg). ⚠️ **The two are not interchangeable, and a
+mutation check is what established that:** `nestEntryMap` runs only on the sync path, so a local
+read/write case asserting on it stays green with the mechanism deleted. That trap is the reason T5d
+lives beside the guarantee rather than with the rest of the boundary cases.
+
 ## 5. Adding a new versioned document
 
 1. Declare a named exported constant in the module that owns the format. Never a literal.

@@ -1230,9 +1230,36 @@ one that decides where the field is safe to author.** `isolation` puts the expan
 presses inside the overlap. That is inherent to growing a hit area in place. **`minTapSize` is
 therefore an authoring decision about a specific layout, not a value that is safe everywhere**: use
 it on a control with clearance, and fix the spacing instead on one packed against an interactive
-neighbour. #948's close-out computed `LevelPagePrev`/`LevelPageNext` overhanging the scrollable
-`LevelScroll` beneath them by `24 − 0.028 × viewportHeight` px (~5.3px at 667) — **computed from the
-scene graph and CSS paint order, not observed.**
+neighbour.
+
+**#973 OBSERVED it, twice, on the shipped Court scene** (#948's close-out only computed it). Driven
+with `document.elementsFromPoint` on the live DOM: at 375x667 the level-select pager arrows took the
+bottom **5.78 px** of two level tiles, so a tap meant for a level paged the list instead.
+
+⚠️ **The worst case is the SHORTEST screen, not the smallest control** — the pad is a fixed px and
+the layout is `vh`, so the shortfall is `24 − 0.028 × H`. It was still stealing on a 360x800
+Android, which the issue's own first estimate had written off. **Court's two instances, the
+per-device table and the authored fix live in
+[games/court/menu.md](../games/court/menu.md) § "The arrows' 48px tap pads"** — this doc owns the
+MECHANISM, that one owns the INSTANCES.
+
+**Lowering the number is not a fix** — 44 still overlaps by ~3.3 px, because the defect is the
+adjacency.
+
+⚠️ **Do not try to catch this class by reading the scene JSON.** A guard that modelled flexbox from
+the authored data was wrong 3 times out of 5, and the live probe is what caught it. Two reasons, both
+load-bearing:
+
+- **Paint order is half the mechanism.** A neighbour LATER in tree order paints ABOVE the expander
+  and wins the press. Court's `BrushFlyoutClose` overhangs its option rows by 12.75 px into a 6 px
+  gap and is completely harmless for exactly this reason.
+- **An anchored host is not in the flow at all.** `ChipFlyoutClose` carries a `UIAnchor`, so it is
+  absolutely positioned and an authored `marginTop` on it is **inert** — measured: live ECS
+  `marginTop: 6`, computed DOM `margin-top: 0px`. A model that assumes flow reasons about a box that
+  is not there.
+
+A sound static check is a layout engine. **Verify a new `minTapSize` with the live probe** (recipe in
+#973), not by reading the scene.
 
 The #664 press-origin gate needs no special handling: `pressBelongsTo` resolves a press through
 `closest('[data-press-origin]')`, and the expander is a descendant of the marked element.

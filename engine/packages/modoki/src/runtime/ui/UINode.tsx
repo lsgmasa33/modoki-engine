@@ -1305,10 +1305,23 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // AUTHORING decision about a specific layout, not a value that is safe everywhere. Author it on
   // a control with clearance; a control packed against an interactive neighbour needs the spacing
   // fixed instead. Caught in #948's close-out review, on `LevelPagePrev`/`LevelPageNext`, whose
-  // 48px zones are computed to overhang the scrollable `LevelScroll` beneath them by
-  // `24 - 0.028*viewportHeight` px — ~5.3px at 667 — where a tap meant for a level tile would page
-  // the list instead. COMPUTED from the scene graph and CSS paint order, **not observed**: see the
-  // issue for the `document.elementFromPoint` recipe that would settle it.
+  // 48px zones overhang the scrollable `LevelScroll` beneath them by `24 - 0.028*viewportHeight` px.
+  //
+  // ⚠️ **OBSERVED, not merely computed** (#973, 2026-09-09). Driven with `document.elementsFromPoint`
+  // on the live DOM: at 375x667 a press in the bottom 5.78px of two of the five visible level tiles
+  // resolved to the ARROW, and `DailyMonthNext` took a 4.50 x 5.40px corner of `DailyClose` — a
+  // dialog's only way out. Also measured **2.03px and still stealing at 360x800**, so this is not
+  // an iPhone-8-only effect; clean at 430x932. Fixed by authored clearance (`marginTop` on both
+  // pager rows), NOT by lowering the number — 44 would still overlap by ~3.3px, because the defect
+  // is the adjacency.
+  //
+  // ⚠️ **Two things that make a static check of this UNSOUND, both learned the hard way in #973:**
+  // paint order is half the mechanism (a neighbour LATER in tree order paints above the zone and
+  // wins the press, so `BrushFlyoutClose`'s downward overhang is harmless), and an anchored host is
+  // not in the flow at all (`ChipFlyoutClose` carries a `UIAnchor`, so its authored `marginTop` is
+  // INERT — live ECS `marginTop: 6`, computed DOM `margin-top: 0px`). A scene-JSON model that
+  // ignores either is wrong in both directions. Verify a new `minTapSize` with the probe, not by
+  // reading the scene.
   //
   // The press-origin gate (#664) needs no change: `pressBelongsTo` resolves a press through
   // `closest('[data-press-origin]')`, and the expander is a DESCENDANT of the marked element, so
