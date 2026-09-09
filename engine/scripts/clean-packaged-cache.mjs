@@ -38,6 +38,8 @@ import { productName, killPackaged, REAP_ERROR, appSupportRoot, defaultToolchain
 import { samePath } from './pathIdentity.mjs';
 // The ONE 'would a recursive delete misreport this subtree?' walk (#990/#989/#1004).
 import { findDeleteBoundaries, describeBoundary } from './deleteBoundary.mjs';
+// The ONE 'does this look like a toolchain root?' check, shared with toolchain/index.ts (#1005).
+import { toolchainRootRefusal, describeToolchainRootRefusal } from './toolchainRoot.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..', '..');
@@ -133,6 +135,20 @@ function targets() {
       seen.add(resolved);
       list.push({
         p: resolved,
+        // ⚠️ Flagged because the CONTENTS check below applies to these and to NOTHING else (#1005).
+        // The other candidates (userData, the Chromium cache, the install dir) are not toolchain
+        // roots at all, so asking "does this look like a toolchain?" of them would be a category
+        // error — a userData dir legitimately holds anything.
+        //
+        // ⚠️ The flag is on BOTH entries in this block, `defaultToolchainDir()` included, and that
+        // is deliberate even though only the override is a user-supplied free path. The question
+        // the check asks is "is this a toolchain root?", which is fair to ask of the default too —
+        // it can hold a stale or foreign tree — and with MODOKI_TOOLCHAIN_DIR unset the default is
+        // the ONLY toolchain candidate, so scoping the flag to the override would switch the guard
+        // off entirely in the commonest configuration. (An earlier version of this comment
+        // justified the flag by "a user-supplied free path", which was not true of the code it
+        // annotated — close-out review.)
+        toolchainRoot: true,
         reason: 'provisioned JDK/Android SDK/toktx/msdf-atlas-gen — MULTI-GB RE-DOWNLOAD'
           + (!samePath(resolved, dflt) ? ' [MODOKI_TOOLCHAIN_DIR]' : ''),
       });
@@ -184,6 +200,39 @@ function ejectStaleVolumes() {
 // this do", and the honest answer under a link is "report success and delete almost nothing".
 // Verified before changing the contract: the only invocation in the repo is the flagless
 // `clean:packaged-cache` script in `package.json`, so no caller passes it.
+// ⚠️ **The gap this closes is the SECOND half of #1005, and it was an asymmetry, not an oversight.**
+// `uninstallAll()` guarded its toolchain delete (by the wrong property — the NAME — which is what
+// #1005 reports); this script guarded its identical delete by NOTHING. `deleteBoundary.mjs`'s own
+// comment records the shape: a filesystem root handed in as MODOKI_TOOLCHAIN_DIR was covered at the
+// toolchain site because `basename !== 'toolchain'` happened to reject it, and "nothing covered the
+// cache-cleaner one". Roots are handled now (the walk reports them as a mount), but the ordinary
+// case never was: MODOKI_TOOLCHAIN_DIR pointed at a home directory or a repo root is a plain,
+// self-contained directory, so no boundary exists and this script would recursively delete it and
+// report success.
+//
+// It runs BEFORE the boundary refusal deliberately: this is the cheaper and more certain answer
+// (one `readdir`, no walk), and a human who has aimed the variable at the wrong place should be
+// told THAT rather than a link diagnostic about a directory they never meant to hand over.
+const notToolchains = targets()
+  .filter((t) => t.toolchainRoot)
+  .map((t) => ({ ...t, refusal: toolchainRootRefusal(t.p) }))
+  .filter((t) => t.refusal !== null);
+if (notToolchains.length > 0) {
+  console.error(
+    `[clean-packaged-cache] REFUSING to run: ${notToolchains.length} toolchain candidate(s) are not`
+    + '\n  a Modoki toolchain root. This script deletes them RECURSIVELY, so it stops rather than'
+    + '\n  act on a directory that is probably not ours.',
+  );
+  // ⚠️ One shared wording with `uninstallAll`, so the two delete sites cannot describe the same
+  // refusal two ways — and so neither can drift into telling a user to hand-delete the directory
+  // it has just refused to touch. `deleteBoundary.mjs` records what that costs (#883's remedy text
+  // "lost a user their provision AND left them still blocked").
+  for (const { p, refusal } of notToolchains) {
+    console.error(`\n  ${describeToolchainRootRefusal(p, refusal)}`);
+  }
+  process.exit(1);
+}
+
 const linked = linkedTargets();
 if (linked.length > 0) {
   // ⚠️ The header must not claim more than every entry establishes. It used to say "are links",

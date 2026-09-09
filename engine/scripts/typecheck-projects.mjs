@@ -55,10 +55,17 @@
  *  full sweep.
  *
  *  ⚠️ **FAILS TOWARD SWEEPING EVERYTHING.** git unavailable, unparseable, or a
- *  degenerate `merge-base === HEAD` range (true of any fresh checkout of `main`) all
- *  mean "cannot tell", and that maps to `--all`. A detector that cannot answer must
- *  never be indistinguishable from one answering "nothing changed" — same contract,
- *  and same reasoning, as `courtTouched()` in `courtAuthored.mjs`.
+ *  degenerate `merge-base === HEAD` range (true of any checkout sitting AT
+ *  `origin/main`, which a fast-forward merge produces) all mean "cannot tell", and
+ *  that maps to `--all`. A detector that cannot answer must never be
+ *  indistinguishable from one answering "nothing changed" — same contract, and same
+ *  reasoning, as `courtTouched()` in `courtAuthored.mjs`.
+ *
+ *  ⚠️ **The two are told apart in the REPORT (#826).** They map to the same action, so
+ *  the split buys nothing operationally — it buys the reader a true sentence. The
+ *  degenerate range is not a failure and is the commonest position on the fleet, and
+ *  a line reading "git could not answer" over a git that answered fine cost a session
+ *  a turn of the owner's attention on the Court copy of this same code.
  *
  *  ── Other properties ───────────────────────────────────────────────────────────
  *
@@ -161,25 +168,29 @@ function changedPaths() {
   const pathspec = ['games', 'demos', ...MACHINERY_PATHS];
 
   const dirty = git('diff', '--name-only', '--no-renames', '-z', 'HEAD', '--', ...pathspec);
-  if (dirty === null) return null;
+  if (dirty === null) return 'git-failed';
 
   const untracked = git('ls-files', '--others', '--exclude-standard', '-z', '--', ...pathspec);
-  if (untracked === null) return null;
+  if (untracked === null) return 'git-failed';
 
   const base = git('merge-base', 'HEAD', 'origin/main');
-  if (base === null) return null;
+  if (base === null) return 'git-failed';
 
   // ⚠️ A branch with NO commits of its own cannot be asked what it changed, and answering
   // "nothing" there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD`
   // on any checkout of `main` itself. That is the degenerate case, not a negative answer,
   // so it maps to "could not tell" and therefore to a FULL sweep.
+  //
+  // ⚠️ **#826: it returns WHICH, not a bare `null`.** The direction is unchanged — this still
+  // sweeps ALL — but the printed reason used to offer the reader three candidate causes and no
+  // way to tell them apart, on a line that fires for every clone sitting at `origin/main`.
   const head = git('rev-parse', 'HEAD');
-  if (head === null) return null;
-  if (base.trim() === head.trim()) return null;
+  if (head === null) return 'git-failed';
+  if (base.trim() === head.trim()) return 'no-own-commits';
 
   const committed = git('log', '--first-parent', '--no-merges', '--format=', '--name-only',
     '--no-renames', '-z', `${base.trim()}..HEAD`, '--', ...pathspec);
-  if (committed === null) return null;
+  if (committed === null) return 'git-failed';
 
   return [...zsplit(dirty), ...zsplit(untracked), ...zsplit(committed)];
 }
@@ -188,8 +199,14 @@ function changedPaths() {
  *  means "sweep everything". */
 function selectTouched(all) {
   const paths = changedPaths();
-  if (paths === null) {
-    return { projects: null, reason: 'git could not answer (no repo, no origin/main, or a degenerate range) — sweeping ALL' };
+  if (!Array.isArray(paths)) {
+    // ⚠️ `Array.isArray`, not `=== null`: `changedPaths` returns a REASON string now, and a string
+    // is truthy — a `=== null` check here would read a "cannot tell" as a real answer and then
+    // treat the string's characters as paths.
+    const why = paths === 'no-own-commits'
+      ? 'HEAD has no commits beyond origin/main'
+      : 'git could not answer (no repo, or no origin/main)';
+    return { projects: null, reason: `${why} — sweeping ALL` };
   }
 
   const machinery = paths.filter((p) => MACHINERY_PATHS.includes(p));

@@ -534,6 +534,21 @@ load-bearing and commented as such).
   run. The property that separates them is whether the link's target **escapes the subtree**; a
   `.bin` shim points inside. **The accept side is the load-bearing half of this guard.**
 
+- **A fourth axis the walk deliberately does NOT cover: "is this OURS to delete at all?"** (#1005).
+  `findDeleteBoundaries` answers *"would a recursive delete MISREPORT this subtree?"*. A home
+  directory or a repo root handed in as `MODOKI_TOOLCHAIN_DIR` is a perfectly ordinary,
+  self-contained tree — no boundary exists, the walk is happy, and the delete would remove it
+  **accurately**. That is a different question and it needs a different check, so
+  `engine/scripts/toolchainRoot.mjs` asks it by CONTENTS (the top-level entries the toolchain owns)
+  at both delete sites. Neither check subsumes the other; both run.
+
+  ⚠️ **The guard it replaced asked about the NAME** — `basename(dir) !== 'toolchain'` — which
+  rejected every renamed `MODOKI_TOOLCHAIN_DIR` (so "Remove all tools" was dead on this clone, whose
+  override is `E:\dev-cache\modoki-toolchain`) while accepting any unrelated directory that happened
+  to be named `toolchain`. And the identity test that looks right — `samePath` against
+  `process.env.MODOKI_TOOLCHAIN_DIR` — is **vacuous**, because the only production caller passes
+  exactly that value in. Full reasoning: [editor-toolchain.md](editor-toolchain.md) § Removing tools.
+
 - ⚠️ **libuv discriminates a reparse point by its substitute-name FORM, not its tag — so a volume
   mount point is NOT a symlink to `lstat`, and a junction is.** Both carry
   `IO_REPARSE_TAG_MOUNT_POINT`, so reasoning from the tag gives the wrong answer, and that was the

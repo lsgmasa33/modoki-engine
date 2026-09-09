@@ -107,6 +107,49 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
     expect(watchedIn(SWEEP_GATE)).toEqual(watchedIn(AUTHORED));
   });
 
+  it('the two copies bind the SAME reason to the SAME arm (#826)', () => {
+    // `sweepGate.ts`'s keep-in-sync banner names four things the copies must agree on, and one is
+    // "the degenerate `merge-base === HEAD` arm". #826 changed what that arm RETURNS in both —
+    // from a bare `null` shared with real git failures to `'no-own-commits'` — and nothing checked
+    // the pair.
+    //
+    // ⚠️ **This asserts ARM -> REASON, not the SET of reasons, and the difference is the whole
+    // guard.** A first version collected every `return '<literal>'` in the body and compared the
+    // set; review showed that passes with the two literals SWAPPED — attach `'git-failed'` to the
+    // degenerate arm and `'no-own-commits'` to the dirty-tree failure and #826 is restored
+    // verbatim, with this test and both of Court's own suites green (they only ever exercise
+    // reason -> sentence, never arm -> reason).
+    //
+    // Read as SOURCE rather than by calling either function: `courtTouched` shells out to git
+    // against whatever repo the suite happens to be running in, so its ANSWER is a fact about this
+    // checkout, not about the code. `readScannedSource` strips comments from the file under
+    // inspection, so a literal named only in prose cannot satisfy any of these.
+    const DEGENERATE = /if \(base\.trim\(\) === git\('rev-parse', 'HEAD'\)\?\.trim\(\)\) return '([^']+)';/;
+    const DIRTY_FAILED = /const dirty = git\('status'[^\n]*\n\s*if \(dirty === null\) return '([^']+)';/;
+    const BASE_FAILED = /const base = git\('merge-base', 'HEAD', 'origin\/main'\);\n\s*if \(base === null\) return '([^']+)';/;
+
+    for (const file of [SWEEP_GATE, AUTHORED]) {
+      const code = readScannedSource(file).code;
+      const rel = path.relative(REPO, file);
+      const arm = (re: RegExp, what: string): string => {
+        const m = re.exec(code);
+        expect(m, `${rel}: could not find the ${what} arm — renamed or reshaped? This guard cannot `
+          + 'vouch for an arm it cannot read, and a silently unreadable arm is how #826 survived.')
+          .not.toBeNull();
+        return m![1];
+      };
+
+      expect(arm(DEGENERATE, 'degenerate merge-base === HEAD'),
+        `${rel}: the degenerate range is NOT a failure — git answered, HEAD merely has no commits `
+        + 'of its own. Reporting it as one is #826, and it is the message the hub prints after '
+        + 'every push and a worker after every fast-forward merge.').toBe('no-own-commits');
+      expect(arm(DIRTY_FAILED, 'failed git status'),
+        `${rel}: a failed git status IS a real failure`).toBe('git-failed');
+      expect(arm(BASE_FAILED, 'failed merge-base'),
+        `${rel}: a failed merge-base IS a real failure`).toBe('git-failed');
+    }
+  });
+
   it('every engine barrel Court\'s tests import has SOME watched coverage', () => {
     const watched = watchedIn(AUTHORED);
     const exempt = new Map(COVERAGE_EXEMPT.map((e) => [e.barrel, e.reason]));

@@ -209,8 +209,24 @@ export function findDeleteBoundaries(root, fsi = NODE_FS) {
     // walked in.** That is the one path this guard most obviously should not be silent about: a
     // root IS a volume, so `MODOKI_TOOLCHAIN_DIR=D:\` reaching `clean-packaged-cache.mjs` as a
     // candidate would have been reported clean and then recursively deleted. Report it as a mount
-    // and stop. (`uninstallAll`'s `basename !== 'toolchain'` guard happens to cover the toolchain
-    // site; nothing covered the cache-cleaner one.)
+    // and stop.
+    //
+    // ⚠️ **Both delete sites now ALSO have their own "is this ours?" check, and this parenthetical
+    // used to name one that no longer exists** (#1005 close-out). It read: "`uninstallAll`'s
+    // `basename !== 'toolchain'` guard happens to cover the toolchain site; nothing covered the
+    // cache-cleaner one." That guard is gone — it asked about the NAME, which rejected every
+    // renamed `MODOKI_TOOLCHAIN_DIR` — and the cache cleaner is no longer uncovered either. Both
+    // now call `toolchainRoot.mjs`'s `toolchainRootRefusal`, which asks about CONTENTS.
+    // That check and this one are independent and BOTH run, answering different questions: this
+    // walk asks "would a recursive delete MISREPORT this subtree?", the other asks "is this a
+    // toolchain at all?".
+    //
+    // ⚠️ **Neither can be dropped on the grounds that the other exists, and a drive root is the
+    // case that shows it.** Measured on this clone: the contents check DOES catch a populated root
+    // (`E:\` -> 5 foreign entries, `C:\` -> 26), so for the ordinary case the two overlap. But it
+    // catches it for a reason that is incidental — the root happens to have children we do not own
+    // — and an EMPTY volume handed in as `MODOKI_TOOLCHAIN_DIR` yields no foreign entries at all
+    // and sails straight through it. This mount check is the only thing that stops that one.
     add(root, 'mount', realRoot, null);
     return out;
   }

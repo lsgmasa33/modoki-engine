@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 import { makeDirLink } from '../helpers/linkFixture';
+import { TOOLCHAIN_OWNED_ENTRIES } from '../../scripts/toolchainRoot.mjs';
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -1063,11 +1064,119 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     })
   })
 
-  it('uninstallAll REFUSES a path not named "toolchain" (safety guard)', () => {
-    const notTc = path.join(root, 'important-stuff')
-    fs.mkdirSync(notTc)
-    expect(() => uninstallAll(notTc)).toThrow(/refusing/i)
-    expect(fs.existsSync(notTc)).toBe(true) // untouched
+  // #1005 — the guard used to be `basename(dir) !== 'toolchain'`, which asks about the NAME where
+  // the property it needs is the CONTENTS. It was wrong in BOTH directions: it rejected every
+  // legitimate `MODOKI_TOOLCHAIN_DIR` whose basename differs (the reported symptom — measured on the
+  // `win` clone, whose override is named `modoki-toolchain`), and it ACCEPTED any unrelated
+  // directory that happened to be named `toolchain`.
+  //
+  // ⚠️ The obvious replacement — `samePath(dir, process.env.MODOKI_TOOLCHAIN_DIR)` — is VACUOUS and
+  // was deliberately not taken: the only production caller (`editorBackendRouter.ts`'s
+  // `/api/toolchain/uninstall`) sets `tc = process.env.MODOKI_TOOLCHAIN_DIR`, so that check compares
+  // the value with itself and can never fail. What the guard is left protecting, once
+  // `forceRemoveDir`'s boundary walk has taken links/mounts/drive-roots (#883/#990/#1004), is
+  // exactly one case: an ordinary, self-contained directory that is not a toolchain. So it asks
+  // about the contents.
+  describe('uninstallAll guards by CONTENTS, not by name (#1005)', () => {
+    const ownedLayout = (dir: string) => {
+      fs.mkdirSync(path.join(dir, 'node'), { recursive: true })
+      fs.mkdirSync(path.join(dir, 'jdk'), { recursive: true })
+      fs.mkdirSync(path.join(dir, 'npm-tools'), { recursive: true })
+      fs.writeFileSync(path.join(dir, 'settings.json'), '{}')
+    }
+
+    // ⚠️ THE ACCEPT SIDE — the symptom this issue actually reports. Proving a guard REJECTS never
+    // proves it ACCEPTS, and the old guard passed every rejection test in this file while being
+    // completely dead for the one configuration the owner actually runs.
+    it('ACCEPTS a toolchain root whose basename is not "toolchain" (the reported symptom)', () => {
+      const override = path.join(root, 'modoki-toolchain') // the `win` clone's actual shape
+      ownedLayout(override)
+      expect(() => uninstallAll(override)).not.toThrow()
+      expect(fs.existsSync(override)).toBe(false)
+    })
+
+    it('REFUSES a directory that is not a toolchain, and NAMES what it found', () => {
+      const home = path.join(root, 'home-ish')
+      fs.mkdirSync(path.join(home, 'Documents'), { recursive: true })
+      fs.mkdirSync(path.join(home, 'node'), { recursive: true }) // one owned entry is not enough
+      expect(() => uninstallAll(home)).toThrow(/Documents/)
+      expect(fs.existsSync(path.join(home, 'Documents'))).toBe(true) // untouched
+    })
+
+    // The direction the OLD guard got backwards: it passed this, because the name matched.
+    it('REFUSES a dir NAMED "toolchain" that holds foreign entries', () => {
+      const decoy = path.join(root, 'toolchain-decoy', 'toolchain')
+      fs.mkdirSync(path.join(decoy, 'Pictures'), { recursive: true })
+      expect(() => uninstallAll(decoy)).toThrow(/Pictures/)
+      expect(fs.existsSync(path.join(decoy, 'Pictures'))).toBe(true)
+    })
+
+    it('accepts an EMPTY dir — nothing to orphan, and uninstallAll is idempotent', () => {
+      const empty = path.join(root, 'empty-tc')
+      fs.mkdirSync(empty)
+      expect(() => uninstallAll(empty)).not.toThrow()
+    })
+
+    // OS bookkeeping files are not "foreign" — a toolchain root that Explorer or Finder has looked
+    // at must not become un-removable.
+    it('ignores OS junk (.DS_Store / Thumbs.db / desktop.ini)', () => {
+      const tcj = path.join(root, 'tc-junk')
+      ownedLayout(tcj)
+      for (const f of ['.DS_Store', 'Thumbs.db', 'desktop.ini']) fs.writeFileSync(path.join(tcj, f), 'x')
+      expect(() => uninstallAll(tcj)).not.toThrow()
+      expect(fs.existsSync(tcj)).toBe(false)
+    })
+
+    // ⚠️ **The mirror, guarded by DERIVATION rather than by a literal** (#1005). The owned-entry set
+    // lives in `scripts/toolchainRoot.mjs` because `clean-packaged-cache.mjs` is plain-node `.mjs`
+    // and cannot import this typed map; that makes it a second place naming the same directories.
+    // This does NOT compare two hand-written lists — it enumerates `TOOL_IDS` and calls the REAL
+    // `toolOwnedDirs`, so adding a tool with a new top-level dir turns this red. Without it the
+    // drift is SILENT and lands the worst way round: the guard starts refusing a real toolchain
+    // root, i.e. it re-creates exactly the defect it was written to fix.
+    it('TOOLCHAIN_OWNED_ENTRIES covers every dir toolOwnedDirs can return, for every TOOL_ID', () => {
+      const fromTs = new Set(
+        TOOL_IDS.flatMap((id) => toolOwnedDirs(id, path.join(root, 'tc'))).map((d) => path.basename(d)),
+      )
+      expect(fromTs.size).toBeGreaterThan(0) // the enumeration itself must not be empty
+      const missing = [...fromTs].filter((n) => !TOOLCHAIN_OWNED_ENTRIES.has(n))
+      expect(missing).toEqual([])
+    })
+
+    // The two entries no `toolOwnedDirs` row returns, so the check above cannot see them. Both are
+    // DERIVED from a real code path, not typed in here.
+    //
+    // ⚠️ The npm-tools half was previously `basename(dirname(npmToolBin(...)))`, which lands on
+    // `.bin` — so it asserted `has('.bin') === false`, trivially true and about nothing, and the
+    // literal `'npm-tools'` beside it was the only thing named. NOTHING made it fail: renaming
+    // `npmToolsDir` to `npm-cli` left both assertions green while every real toolchain root grew an
+    // unowned `npm-cli` entry, so `uninstallAll` would refuse a genuine root — #1005 re-created,
+    // silently, by the test written to prevent exactly that. Caught by close-out review.
+    // `npmToolBin` is `<tc>/npm-tools/node_modules/.bin/<name>`, so it takes THREE dirnames.
+    it('also covers npm-tools and settings.json, which no ToolId owns', () => {
+      const tcRoot = path.join(root, 'tc')
+      const npmToolsFromRealPath = path.basename(
+        path.dirname(path.dirname(path.dirname(npmToolBin(tcRoot, 'gltfpack')))),
+      )
+      expect(npmToolsFromRealPath).not.toBe('.bin') // the bug this replaces, pinned
+      expect(TOOLCHAIN_OWNED_ENTRIES.has(npmToolsFromRealPath)).toBe(true)
+
+      // settings.json: drive the real writer and read back where it landed.
+      const tcs = path.join(root, 'tc-settings')
+      fs.mkdirSync(tcs, { recursive: true })
+      const prev = process.env.MODOKI_TOOLCHAIN_DIR
+      process.env.MODOKI_TOOLCHAIN_DIR = tcs
+      try {
+        writeToolchainSettings({ allowSystemToolchain: true })
+        const written = fs.readdirSync(tcs)
+        expect(written).toContain('settings.json')
+        for (const n of written) expect(TOOLCHAIN_OWNED_ENTRIES.has(n)).toBe(true)
+      } finally {
+        if (prev === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
+        else process.env.MODOKI_TOOLCHAIN_DIR = prev
+        resetToolchainCache()
+      }
+    })
   })
 
   // #1004 — forceRemoveDir had NO link pre-flight, so a junctioned tool dir was unlinked, the
@@ -1093,17 +1202,27 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
       expect(fs.existsSync(path.join(tc, 'android-sdk'))).toBe(true) // the link is left ALONE
     })
 
-    it('uninstallAll refuses when the toolchain dir ITSELF is a link — the basename guard passes it', () => {
-      // ⚠️ The link is NAMED `toolchain`, so `basename !== 'toolchain'` is satisfied. That guard
-      // asks a question about the NAME; this one is about the DATA, and the measured failure went
-      // straight through the first to reach the second.
+    it('uninstallAll refuses when the toolchain dir ITSELF is a link — the CONTENTS guard passes it', () => {
+      // ⚠️ Two guards, in order, and this case exists to prove the SECOND one fires. The contents
+      // guard (#1005) runs first and is satisfied here — `readdir` follows the link, so it sees the
+      // target's toolchain-shaped layout and says yes. The link is then caught by `forceRemoveDir`'s
+      // boundary walk, which asks the different question: would a recursive delete misreport?
+      //
+      // ⚠️ **The payload MUST be toolchain-shaped, and this test is how we learned it.** It used to
+      // be a bare `<payload>/big.bin`, which the contents guard correctly calls a foreign entry — so
+      // the moment #1005 landed, this case reddened with the WRONG refusal and stopped exercising
+      // #1004's link mechanism at all. A flat payload silently converts this into a test of the
+      // other guard. (Title updated too: it used to say "the basename guard passes it", naming a
+      // guard that no longer exists.)
       const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-un2-'))
       try {
-        const payload = payloadIn(base)
+        const payload = path.join(base, 'PAYLOAD')
+        fs.mkdirSync(path.join(payload, 'node'), { recursive: true })
+        fs.writeFileSync(path.join(payload, 'node', 'big.bin'), 'x'.repeat(512))
         const link = path.join(base, 'toolchain')
         makeDirLink(payload, link)
         expect(() => uninstallAll(link)).toThrow(/not self-contained/i)
-        expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+        expect(fs.existsSync(path.join(payload, 'node', 'big.bin'))).toBe(true)
       } finally { fs.rmSync(base, { recursive: true, force: true }) }
     })
 

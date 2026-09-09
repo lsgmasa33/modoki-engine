@@ -166,13 +166,20 @@ describe('the scoped-typecheck project selection', () => {
   });
 
   it('FAILS SAFE toward sweeping everything on a DEGENERATE range', () => {
-    // `merge-base(HEAD, origin/main) === HEAD` is true of any fresh checkout of `main`. The branch
-    // has no commits of its own, so it CANNOT be asked what it changed — and answering "nothing"
-    // there is this gate's worst failure, indistinguishable from a clean branch.
+    // `merge-base(HEAD, origin/main) === HEAD` is true of any checkout sitting AT `origin/main` —
+    // a fresh clone, the hub after a push, and any worker whose merge of main fast-forwarded. The
+    // branch has no commits of its own, so it CANNOT be asked what it changed — and answering
+    // "nothing" there is this gate's worst failure, indistinguishable from a clean branch.
     const dir = makeRepo();
     const { out } = select(dir);
     expect(out).toContain('sweeping ALL');
     for (const p of ['games/alpha', 'games/beta', 'demos/gamma']) expect(out).toContain(p);
+
+    // ⚠️ #826: and it must say WHICH. git answered perfectly well here; the old line offered the
+    // reader three candidate causes ("no repo, no origin/main, or a degenerate range") and no way
+    // to tell them apart, on the position most clones are in most of the time.
+    expect(out).toContain('HEAD has no commits beyond origin/main');
+    expect(out, 'git ANSWERED — do not report a failure').not.toContain('git could not answer');
   });
 
   it('FAILS SAFE toward sweeping everything when there is no git repo at all', () => {
@@ -193,6 +200,12 @@ describe('the scoped-typecheck project selection', () => {
     }
     const { out } = select(dir);
     expect(out).toContain('sweeping ALL');
+    // ⚠️ #826's OTHER side, and it is what makes the degenerate assertion above mean something: a
+    // REAL failure must still report as one. Asserting only that the degenerate case says "no
+    // commits" would pass with both arms returning that string, which would be the same defect
+    // pointing the other way.
+    expect(out).toContain('git could not answer');
+    expect(out).not.toContain('HEAD has no commits beyond origin/main');
     expect(out).toContain('games/alpha');
     expect(out).toContain('games/beta');
   });

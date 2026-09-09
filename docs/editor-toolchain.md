@@ -250,6 +250,96 @@ MODOKI_NO_AUTOUPDATE=1 MODOKI_TOOLCHAIN_DIR=<tmp> \
 then attach a CDP client (Node's global `WebSocket` works with no extra dependency). To force a
 clean reinstall of one provisioned tool: `rm -rf "~/Library/Application Support/Modoki Editor/toolchain/<sub>"`.
 
+### Removing tools — and why the safety guard asks about CONTENTS, not the NAME
+
+`POST /api/toolchain/uninstall {id}` removes one provisioned tool; `{id:'all'}` calls `uninstallAll()`,
+which deletes the **entire** toolchain root (settings.json included) — Build Support's "Remove all
+tools". Both go through `forceRemoveDir`, so both refuse rather than misreport when a recursive delete
+would not do what it says: a link at the root, a link nested below it, a mount, or a filesystem root
+(`findDeleteBoundaries`, see [build.md](build.md) and #883/#989/#990/#1004).
+
+`uninstallAll()` carries **one more** guard on top of that walk, and #1005 is the story of it asking
+the wrong question. It used to be:
+
+```ts
+if (path.basename(toolchainDir) !== 'toolchain') throw …   // WRONG — do not restore this
+```
+
+That is a question about the **name**, and the property it needed was the **contents**. It was wrong in
+both directions at once:
+
+- it **rejected** every legitimate `MODOKI_TOOLCHAIN_DIR` whose basename is not literally `toolchain`.
+  Nothing constrains the override to that name — this doc, [windows.md](windows.md) and
+  [build.md](build.md) all describe it as a free path — so on any machine that redirects it (the `win`
+  clone's is named `modoki-toolchain`) **"Remove all tools" threw on every click and the feature was
+  simply dead**;
+- it **accepted** any unrelated directory that happened to be named `toolchain`, which is the direction
+  a safety guard is supposedly there for.
+
+⚠️ **The obvious replacement is vacuous — do not reach for it.** Comparing the argument against
+`process.env.MODOKI_TOOLCHAIN_DIR` looks like the right identity test, but `uninstallAll()`'s only
+production caller is the `/api/toolchain/uninstall` route, which passes **exactly that value** in. The
+check would compare the value with itself and could never fire. A guard that cannot fire is worse than
+the wrong guard it replaces, because it reads as protection.
+
+**What the guard is left protecting is narrow, and that is what makes a contents test sufficient.**
+Once the boundary walk has taken the links, the mounts and the drive roots, **two** cases remain that
+it cannot see:
+
+1. **an ordinary, self-contained directory that is simply not a toolchain** — `MODOKI_TOOLCHAIN_DIR`
+   aimed at a home directory or a repo root. Nothing about such a tree is malformed; a recursive
+   delete would remove it accurately and report success;
+2. **a plain file.** ⚠️ This one is easy to miss and was: `findDeleteBoundaries` bails at
+   `if (!rootStat.isDirectory()) return out` because a file has no subtree, so nothing downstream
+   objects and `rmSync(file, {recursive:true, force:true})` deletes it. The first version of this
+   guard accepted it too — `readdirSync` throws `ENOTDIR`, the `catch` returned "no foreign
+   entries", and that meant accept. Measured: `unexpectedEntries = []`, `boundaries = []`, file
+   gone. The `basename` guard being replaced happened to REJECT this, so the rewrite briefly traded
+   a false-reject class for a false-**accept** class on a destructive path. Found by close-out
+   review, not by either caller's tests — which is why the predicate now has a direct table test
+   (`engine/tests/architecture/toolchainRoot.test.ts`).
+
+So the guard asks `toolchainRootRefusal(dir)` (`engine/scripts/toolchainRoot.mjs`), which returns
+`null` when the directory may be removed, or a reason: `not-a-directory`, or `foreign` with the
+top-level entries the toolchain does not own — `node`, `jdk`, `android-sdk`, `cocoapods-gems`,
+`ruby`, `wda`, `go-ios`, `npm-tools`, `settings.json`, ignoring OS junk like `.DS_Store`. A
+`describeToolchainRootRefusal(dir, r)` beside it renders the message, mirroring
+`findDeleteBoundaries`/`describeBoundary` — the two refusal kinds carry different remedies and must
+not share a sentence. ⚠️ **The message never tells the user to delete the subject**: the realistic
+subject is their home directory, and `deleteBoundary.mjs` already records what a careless remedy
+line cost here (#883's text "lost a user their provision AND left them still blocked").
+
+An **empty** dir is accepted — nothing to orphan, and `uninstallAll` is idempotent. **Absent** and
+**unreadable** are accepted too: absence is not evidence of a foreign directory, and the unreadable
+case belongs to `findDeleteBoundaries`, which refuses the run rather than naming a foreign entry
+nobody could have seen.
+
+⚠️ **The owned-entry set is a code constant describing disk written by a possibly-different editor
+version.** `adoptLegacyToolchain` renames an older editor's whole toolchain root in, and an older
+clone's `clean:packaged-cache` can run against a newer provision. The mirror test guards drift
+*within* one tree only; cross-version drift surfaces as "refuses a real toolchain root" and aborts
+the run. Inherent to asking about contents at all — the remedy is to add the new entry to the set,
+not to loosen the check.
+
+**Two callers, one predicate.** `clean-packaged-cache.mjs --toolchain` deletes the same directory
+recursively and had **no** such check at all — the asymmetry that let this class live. It has one now,
+scoped to the toolchain candidates only (the script's other candidates — packaged userData, the
+Chromium cache, the install dir — are paths it derives itself, not a user-supplied free path).
+
+⚠️ **The predicate lives in `engine/scripts/toolchainRoot.mjs`, not in `engine/toolchain/index.ts`,**
+because the cache cleaner is plain-node `.mjs` and cannot import a `.ts`; the dependency already runs
+that way (`index.ts` imports `deleteBoundary.mjs` and `pathIdentity.mjs`). That puts the owned-entry
+set in a second place, mirroring `toolOwnedDirs()`. It is **not** trusted to stay in step by hand:
+`toolchainResolve.test.ts` enumerates `TOOL_IDS`, calls the real `toolOwnedDirs`, and asserts every
+basename it can return appears in the set — so **adding a tool with a new top-level directory turns
+that test red**. Without it the drift is silent and lands the worst way round: the guard would start
+refusing a real toolchain root, re-creating the exact defect above.
+
+⚠️ **A fixture for either delete site must be toolchain-SHAPED.** `cleanPackagedCacheLinkGuard.test.ts`
+built its payloads as a bare `<payload>/big.bin`; a contents check correctly calls that a foreign
+entry, so three link cases stopped reaching the code they exist to test the moment this guard landed.
+Payloads are `<payload>/node/big.bin` now.
+
 ## How a build consumes the toolchain
 
 `/api/build` (Android/iOS) does two toolchain things:

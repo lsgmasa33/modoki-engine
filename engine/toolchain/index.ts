@@ -28,6 +28,7 @@ import path from 'node:path'
 // these does. (`nodeProvision.ts`'s docblock is about npm PACKAGE specifiers — a different case.)
 import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs'
 import { altPathSpelling } from '../scripts/pathIdentity.mjs'
+import { toolchainRootRefusal, describeToolchainRootRefusal } from '../scripts/toolchainRoot.mjs'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
@@ -1388,7 +1389,10 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
 /** The userData dir(s) a provisioned tool owns — removed to uninstall it. (The npm-CLI model tools
  *  share `npm-tools/`, so they're uninstalled per-package via npm, not by removing a dir — see
  *  uninstall(). `cocoapods` owns both its gems AND the portable Ruby it was installed on.) */
-function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
+/** Exported ONLY so `toolchainResolve.test.ts` can enumerate the real map and assert that
+ *  `TOOLCHAIN_OWNED_ENTRIES` in `scripts/toolchainRoot.mjs` still mirrors it (#1005). That mirror
+ *  exists because the cache cleaner is plain-node `.mjs` and cannot import this typed map. */
+export function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
   switch (id) {
     case 'npm': return [path.join(toolchainDir, 'node')]
     case 'java': return [path.join(toolchainDir, 'jdk')]
@@ -1640,14 +1644,34 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
 }
 
 /** Remove the ENTIRE toolchain folder — a hard reset. Everything (including settings.json) is wiped;
- *  Node re-provisions eagerly on next launch, the rest via Build Support. Guarded to only ever delete
- *  a dir literally named `toolchain` (the userData toolchain root), never an arbitrary path. */
+ *  Node re-provisions eagerly on next launch, the rest via Build Support.
+ *
+ *  Guarded by what the directory CONTAINS, never by what it is named (#1005). The previous guard was
+ *  `basename(toolchainDir) !== 'toolchain'`, which asked about the name and was wrong in both
+ *  directions: it rejected every legitimate `MODOKI_TOOLCHAIN_DIR` whose basename differs — so on the
+ *  `win` clone, whose override is named `modoki-toolchain`, "Remove all tools" threw on every click and
+ *  the feature was simply dead — while accepting any unrelated directory that happened to be named
+ *  `toolchain`. See `scripts/toolchainRoot.mjs` for why the obvious `samePath(dir, env)` replacement
+ *  is vacuous at this function's only caller. */
 export function uninstallAll(toolchainDir: string): void {
-  if (path.basename(toolchainDir) !== 'toolchain') {
-    throw new Error(`refusing to delete ${toolchainDir} — not a 'toolchain' dir`)
+  const refusal = toolchainRootRefusal(toolchainDir)
+  if (refusal) throw new Error(describeToolchainRootRefusal(toolchainDir, refusal))
+  // ⚠️ `finally`, for the same reason `uninstall()` above has one (#1004 close-out) — and this
+  // function was missed by that sweep. `forceRemoveDir` can throw EBUSY/EPERM/ENOTEMPTY AFTER
+  // `rmSync` has already removed part of the tree: a Gradle daemon holding
+  // `<tc>/jdk/.../bin/java.exe` takes out `node/`, `npm-tools/` and `settings.json` first, and an
+  // unguarded `resetToolchainCache()` then never runs — leaving `detect()` answering from a cache
+  // that describes a tree which is now half gone.
+  //
+  // Bound, because it was checked rather than assumed: `toolchainStatus()` calls
+  // `resetToolchainCache()` unconditionally on entry, so Build Support self-heals on its next poll.
+  // The stale window is any `detect`/`resolve`/`preflight` in the same process before that. Lower
+  // impact than in `uninstall()`; identical mechanism.
+  try {
+    forceRemoveDir(toolchainDir)
+  } finally {
+    resetToolchainCache()
   }
-  forceRemoveDir(toolchainDir)
-  resetToolchainCache()
 }
 
 /** Ensure the shared userData `npm-tools` package exists, and `npm install <specPkg>` into it. Runs

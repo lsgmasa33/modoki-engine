@@ -730,9 +730,13 @@ export default defineConfig(({ command }) => {
       // re-measured since, so treat 43s as un-refreshed rather than current.
       //
       // Same predicate as those gates (`courtAuthored.mjs`, one implementation, two consumers) and
-      // the same fail-safe direction: `courtTouched()` returns `null` when git cannot answer, and
-      // only an explicit `false` excludes. So a broken detector runs the tests rather than silently
+      // the same fail-safe direction: `courtTouched()` returns a REASON STRING when git cannot
+      // answer (`'git-failed'` or `'no-own-commits'` since #826, `null` before it), and only an
+      // explicit `false` excludes. So a broken detector runs the tests rather than silently
       // dropping them — the failure mode that makes a gate worse than no gate.
+      // ⚠️ **`=== false`, never `!courtTouched()`** — a reason string is TRUTHY, so a truthiness
+      // test would silently stop excluding anything, and `=== null` would silently start including
+      // everything. The comparison below is load-bearing, not a style choice.
       //
       // `MODOKI_COURT_TESTS=1` forces them back in (and any Court env override implies it, so
       // `MODOKI_COURT_SWEEPS=1` on a non-Court clone still works rather than mysteriously running

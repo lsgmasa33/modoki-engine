@@ -18,6 +18,13 @@
  *  state. `--dry-run` is also the sharper test of the contract: the guard is specified to exit
  *  non-zero even there, because the honest answer to "what would this do" is "report success and
  *  delete almost nothing".
+ *
+ *  ⚠️ **Every payload here is TOOLCHAIN-SHAPED (`<payload>/node/big.bin`, never `<payload>/big.bin`)
+ *  and must stay that way.** After #1005 the script also refuses a toolchain candidate whose
+ *  top-level entries it does not own, and a bare `big.bin` at the root is exactly such an entry —
+ *  so a flat payload makes the #1005 guard fire FIRST and these link cases never reach the code
+ *  they are testing. Three of them failed that way when the guard landed. The nesting costs one
+ *  `mkdirSync` and makes the fixture representative of what MODOKI_TOOLCHAIN_DIR actually points at.
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -82,6 +89,15 @@ function sandboxEnv(sandbox: string, toolchainDir?: string): NodeJS.ProcessEnv {
 function defaultToolchainDirUnder(sandbox: string): string {
   const mod = pathToFileURL(path.resolve(__dirname, '../../scripts/packagedAppPaths.mjs')).href;
   const code = `import(${JSON.stringify(mod)}).then((m) => process.stdout.write(m.defaultToolchainDir()))`;
+  return execFileSync('node', ['-e', code], { encoding: 'utf8', env: sandboxEnv(sandbox) }).trim();
+}
+
+/** The script's OWN `appSupportRoot()`, evaluated INSIDE the sandbox — same shape and same reason
+ *  as `defaultToolchainDirUnder` above: it reads a different env var per platform (and none at all
+ *  on darwin), so computing it in this process, or hardcoding it, is wrong on some platform. */
+function appSupportRootUnder(sandbox: string): string {
+  const mod = pathToFileURL(path.resolve(__dirname, '../../scripts/packagedAppPaths.mjs')).href;
+  const code = `import(${JSON.stringify(mod)}).then((m) => process.stdout.write(m.appSupportRoot()))`;
   return execFileSync('node', ['-e', code], { encoding: 'utf8', env: sandboxEnv(sandbox) }).trim();
 }
 
@@ -151,7 +167,8 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       const real = path.join(base, 'toolchain-real');
       const link = path.join(base, 'toolchain-link');
       fs.mkdirSync(real);
-      fs.writeFileSync(path.join(real, 'big.bin'), 'payload');
+      fs.mkdirSync(path.join(real, 'node'), { recursive: true });
+      fs.writeFileSync(path.join(real, 'node', 'big.bin'), 'payload');
       makeDirLink(real, link);
 
       const { out, status } = run(link, base);
@@ -246,7 +263,8 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       const dflt = defaultToolchainDirUnder(base);
       const link = path.join(base, 'toolchain-link');
       fs.mkdirSync(payload, { recursive: true });
-      fs.writeFileSync(path.join(payload, 'big.bin'), 'payload');
+      fs.mkdirSync(path.join(payload, 'node'), { recursive: true });
+      fs.writeFileSync(path.join(payload, 'node', 'big.bin'), 'payload');
       fs.mkdirSync(path.dirname(dflt), { recursive: true });
       makeDirLink(payload, dflt);   // the DEFAULT location is a link to the payload
       makeDirLink(payload, link);   // and so is the override
@@ -276,7 +294,8 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       const real = path.join(base, 'REAL');
       const dflt = defaultToolchainDirUnder(base);
       fs.mkdirSync(real, { recursive: true });
-      fs.writeFileSync(path.join(real, 'big.bin'), 'payload');
+      fs.mkdirSync(path.join(real, 'node'), { recursive: true });
+      fs.writeFileSync(path.join(real, 'node', 'big.bin'), 'payload');
       fs.mkdirSync(path.dirname(dflt), { recursive: true });
       makeDirLink(real, dflt);      // the DEFAULT is a link to the override's real directory
 
@@ -286,7 +305,7 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       // case 1 — it reads like extra rigour and can never fail independently.
       const first = runForReal(real, base);
       expect(first.status, `the real run failed:\n${first.out}`).toBe(0);
-      expect(fs.existsSync(path.join(real, 'big.bin')), 'the payload should be gone').toBe(false);
+      expect(fs.existsSync(path.join(real, 'node', 'big.bin')), 'the payload should be gone').toBe(false);
       expect(
         fs.lstatSync(dflt, { throwIfNoEntry: false }),
         'the link that pointed at the deleted payload is still on disk — it will refuse forever',
@@ -326,7 +345,8 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       fs.mkdirSync(path.dirname(dflt), { recursive: true });
       const link = path.join(base, 'toolchain-link');
       fs.mkdirSync(dflt, { recursive: true });
-      fs.writeFileSync(path.join(dflt, 'big.bin'), 'payload');
+      fs.mkdirSync(path.join(dflt, 'node'), { recursive: true });
+      fs.writeFileSync(path.join(dflt, 'node', 'big.bin'), 'payload');
       makeDirLink(dflt, link);
 
       const { out, status } = run(link, base);
@@ -338,6 +358,121 @@ describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target
       // actually removes the payload, which is why the first is safe to pass.
       expect(out).toContain(`would remove ${link}`);
       expect(out).toContain(`would remove ${dflt}`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/** The SECOND half of #1005: this script deletes `MODOKI_TOOLCHAIN_DIR` recursively and, unlike
+ *  `uninstallAll()`, asked NOTHING about it first.
+ *
+ *  ⚠️ **This is not the link/mount guard above, and neither one subsumes the other.**
+ *  `findDeleteBoundaries` answers "would a recursive delete MISREPORT this subtree?" — a link, a
+ *  mount, a drive root. A home directory or a repo root is a perfectly ordinary, self-contained
+ *  tree: no boundary exists, the walk is happy, and the script would delete it and report success.
+ *  The question this guard asks is the other one — "is this OURS to delete at all?"
+ *
+ *  ⚠️ **No links here on purpose, so it runs unconditionally** — unlike the suite above it needs no
+ *  `canMakeDirLink()`, and it must stay that way: the defect has nothing to do with link support and
+ *  a `skipIf` would silently drop this cover on any machine without Developer Mode.
+ */
+describe('clean-packaged-cache refuses a toolchain candidate that is not a toolchain (#1005)', () => {
+  it('REFUSES a directory holding foreign entries, names them, and removes nothing', () => {
+    const base = makeFixtureRoot('cpc-nottc-');
+    try {
+      const homeish = path.join(base, 'home-ish');
+      fs.mkdirSync(path.join(homeish, 'Documents'), { recursive: true });
+      fs.mkdirSync(path.join(homeish, 'Desktop'), { recursive: true });
+      fs.mkdirSync(path.join(homeish, 'node'), { recursive: true }); // one owned entry is not enough
+
+      const { out, status } = run(homeish, base);
+
+      expect(out, 'a packaged editor is running on this machine — quit it and re-run').not.toMatch(RUNNING);
+      expect(status).toBe(1);
+      expect(out).toContain('REFUSING to run');
+      expect(out).toContain('Documents');
+      expect(out).toContain('Desktop');
+      // ⚠️ The refusal must not reach the delete loop at all — a guard that prints and then removes
+      // is the exact failure shape #883 was.
+      expect(out).not.toContain('would remove');
+      expect(fs.existsSync(path.join(homeish, 'Documents'))).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  // ⚠️ THE ACCEPT SIDE. Proving the refusal fires says nothing about whether a real toolchain still
+  // gets cleaned — and a guard that refuses everything would pass the case above.
+  it('ACCEPTS a toolchain-shaped root whose basename is not "toolchain"', () => {
+    const base = makeFixtureRoot('cpc-realtc-');
+    try {
+      const tc = path.join(base, 'modoki-toolchain'); // the `win` clone's actual shape
+      fs.mkdirSync(path.join(tc, 'node'), { recursive: true });
+      fs.mkdirSync(path.join(tc, 'jdk'), { recursive: true });
+      fs.writeFileSync(path.join(tc, 'settings.json'), '{}');
+
+      const { out, status } = run(tc, base);
+
+      expect(out, 'a packaged editor is running on this machine — quit it and re-run').not.toMatch(RUNNING);
+      expect(status).toBe(0);
+      expect(out).not.toContain('REFUSING to run');
+      expect(out).toContain(`would remove ${tc}`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('ACCEPTS an empty toolchain dir, and one that does not exist', () => {
+    const base = makeFixtureRoot('cpc-emptytc-');
+    try {
+      const empty = path.join(base, 'empty-tc');
+      fs.mkdirSync(empty, { recursive: true });
+      expect(run(empty, base).status).toBe(0);
+
+      // Absent: `readdir` throws, and absence is not evidence of a foreign directory.
+      expect(run(path.join(base, 'no-such-dir'), base).status).toBe(0);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  /** ⚠️ **THE SCOPING, covered by a POSITIVE CONTROL rather than by a count.**
+   *
+   *  The check must apply to the toolchain candidates and to NOTHING else: the others (packaged
+   *  userData, the Chromium cache, the install dir) are paths the script derives itself, not a
+   *  user-supplied free path, so asking "does this look like a toolchain?" of them is a category
+   *  error — and would refuse a run over a userData dir that legitimately holds anything at all.
+   *
+   *  The first version of this cover asserted the refusal named `1 toolchain candidate(s)`. **That
+   *  could not fail**: removing the `toolchainRoot` filter left it green, because in the hermetic
+   *  sandbox the other candidates do not exist, so `readdir` throws for them and they contribute
+   *  nothing either way. Caught by mutation-checking the filter. What discriminates is building a
+   *  non-toolchain candidate that DOES exist and DOES hold foreign entries, then proving the run
+   *  ignores it — with the "would remove" line as the control that it really was on the list, so
+   *  this cannot pass by the candidate being absent again. */
+  it('applies to TOOLCHAIN candidates only — a foreign-looking userData dir is not its business', () => {
+    const base = makeFixtureRoot('cpc-scope-');
+    try {
+      const tc = path.join(base, 'modoki-toolchain');
+      fs.mkdirSync(path.join(tc, 'node'), { recursive: true });
+
+      // A NON-toolchain candidate, holding exactly what would trip the guard if it were in scope.
+      // `<appSupportRoot>/modoki-app` is the "legacy pre-rename userData" entry — a literal in
+      // `targets()` on every platform, so this is derived, not guessed.
+      const legacyUserData = path.join(appSupportRootUnder(base), 'modoki-app');
+      fs.mkdirSync(path.join(legacyUserData, 'Documents'), { recursive: true });
+      fs.mkdirSync(path.join(legacyUserData, 'Desktop'), { recursive: true });
+
+      const { out, status } = run(tc, base);
+
+      expect(out, 'a packaged editor is running on this machine — quit it and re-run').not.toMatch(RUNNING);
+      // The control: it really is a candidate. Without this the case passes when it is absent —
+      // which is precisely how the version this replaced managed to survive its own mutation.
+      expect(out, 'the non-toolchain candidate was not on the list, so this proves nothing')
+        .toContain(`would remove ${legacyUserData}`);
+      expect(status).toBe(0);
+      expect(out).not.toContain('REFUSING to run');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

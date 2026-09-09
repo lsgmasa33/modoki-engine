@@ -251,8 +251,16 @@ machinery itself, so touching `engine/tsconfig.app.json`, `scopedTsconfig.mjs`, 
 `projectRoots.mjs` escalates to a full sweep.
 
 ⚠️ **Selection FAILS TOWARD SWEEPING EVERYTHING.** No git, no `origin/main`, or a degenerate
-`merge-base === HEAD` range (true of any fresh checkout of `main`) all mean *cannot tell*, and
-that maps to `--all`. Same contract, and the same reasoning, as `courtTouched()` in
+`merge-base === HEAD` range all mean *cannot tell*, and that maps to `--all`.
+
+⚠️ **Those are TWO different facts and the report says which (#826).** The degenerate range is not
+a failure — git answered fine, HEAD merely has nothing beyond `origin/main` — and it is the
+commonest position on the fleet, not a rarity: any checkout sitting AT `origin/main`, which a
+fast-forward merge produces, plus the hub after every push and a freshly cut `release_*` branch.
+Collapsing it into "git could not answer" was a false statement on the line a human reads before a
+long run, and it cost a session a turn of the owner's attention. `selectTouched` now prints
+`HEAD has no commits beyond origin/main — sweeping ALL` for it and keeps the original wording for a
+real failure. **Which projects get checked is unchanged** — only the sentence. Same contract, and the same reasoning, as `courtTouched()` in
 `courtAuthored.mjs`: a detector that cannot answer must never be indistinguishable from one
 answering "nothing changed". The committed half of the diff is `--first-parent --no-merges`, so
 merging someone else's game work does not make the hub re-check it — CLAUDE.md's "merging is not

@@ -117,27 +117,42 @@ export function authoredInRange(run, base) {
 }
 
 /**
- * Does this working tree or branch author anything Court's tests depend on? `null` = cannot tell.
+ * Does this working tree or branch author anything Court's tests depend on?
  *
- * ⚠️ **FAILS TOWARD RUNNING.** git unavailable, unparseable, or a degenerate range all return
- * `null`, and every consumer maps `null` to "run". A detector that cannot answer must never be
- * indistinguishable from one answering "nothing changed" — that conflation is how a gate rots.
+ * `true`/`false` are answers. Anything else is "cannot tell", and since #826 it SAYS WHICH:
+ * `'git-failed'` (git unavailable, unparseable, or no `origin/main`) or `'no-own-commits'` (the
+ * degenerate `merge-base === HEAD` range — git answered fine, HEAD just has nothing beyond
+ * `origin/main`).
+ *
+ * ⚠️ **FAILS TOWARD RUNNING, and the split does not change that.** Every consumer must run unless
+ * it sees an explicit `false`. Written as `courtTouched() === false` and never as a truthiness
+ * test: a reason string is TRUTHY, so `!courtTouched()` would silently stop excluding anything,
+ * and `courtTouched() === null` would silently start including everything. A detector that cannot
+ * answer must never be indistinguishable from one answering "nothing changed" — that conflation is
+ * how a gate rots.
+ *
+ * ⚠️ **KEEP IN SYNC with `games/court/tests/sweepGate.ts`** — the two copies must agree on the
+ * degenerate arm, and #826 changed what it returns in both. The parity of `WATCHED` is guarded by
+ * `engine/tests/architecture/courtSweepScope.test.ts`; this arm is guarded by that file too.
  */
 export function courtTouched() {
   // Uncommitted work first — the common case for the session actually editing Court. Deliberately
   // NOT first-parent-aware: a dirty tree is by definition this session's own doing.
   const dirty = git('status', '--porcelain', '--', ...WATCHED);
-  if (dirty === null) return null;
+  if (dirty === null) return 'git-failed';
   if (dirty.trim() !== '') return true;
 
   const base = git('merge-base', 'HEAD', 'origin/main');
-  if (base === null) return null;
+  if (base === null) return 'git-failed';
 
   // ⚠️ A branch with NO commits of its own cannot be asked what it changed, and answering "nothing"
   // there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD` on any checkout of
   // `main` itself, which is EVERY CI run. That is the degenerate case, not a negative answer, so it
   // maps to "could not tell" and therefore to RUN.
-  if (base.trim() === git('rev-parse', 'HEAD')?.trim()) return null;
+  // ⚠️ #826: `'no-own-commits'`, not `null`. Same fail-safe direction, honest about the cause —
+  // a caller that reports this as a git FAILURE is making a false statement, which is what the
+  // Court sweep banner did on every hub push and every fast-forward worker merge.
+  if (base.trim() === git('rev-parse', 'HEAD')?.trim()) return 'no-own-commits';
 
-  return authoredInRange(git, base.trim());
+  return authoredInRange(git, base.trim()) ?? 'git-failed';
 }

@@ -13,6 +13,11 @@ export declare function authoredInRange(
   base: string,
 ): boolean | null;
 
-/** Does this tree/branch author anything Court's tests depend on? `null` = cannot tell, and every
- *  consumer must map `null` to "run". */
-export declare function courtTouched(): boolean | null;
+/** Why a probe could not answer with a boolean (#826). `'no-own-commits'` is the degenerate
+ *  `merge-base === HEAD` range — git ANSWERED; HEAD just has nothing beyond `origin/main`. */
+export type ScopeUnknown = 'git-failed' | 'no-own-commits';
+
+/** Does this tree/branch author anything Court's tests depend on? A `ScopeUnknown` means "cannot
+ *  tell", and every consumer must map it to "run" — test `=== false`, never truthiness (a reason
+ *  string is truthy). */
+export declare function courtTouched(): boolean | ScopeUnknown;
