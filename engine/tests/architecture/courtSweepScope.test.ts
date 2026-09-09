@@ -45,6 +45,7 @@ const REPO = path.resolve(__dirname, '../../..');
 const PKG_DIR = 'engine/packages/modoki';
 const AUTHORED = path.join(REPO, 'engine/scripts/courtAuthored.mjs');
 const SWEEP_GATE = path.join(REPO, 'games/court/tests/sweepGate.ts');
+const CHANGED_LEVELS = path.join(REPO, 'games/court/tests/changedLevels.ts');
 
 /** Barrels whose lack of `WATCHED` coverage is deliberate, each with the reason it is safe.
  *  A ledger, not an off-switch: every entry must still be a barrel Court actually imports (asserted
@@ -107,46 +108,64 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
     expect(watchedIn(SWEEP_GATE)).toEqual(watchedIn(AUTHORED));
   });
 
-  it('the two copies bind the SAME reason to the SAME arm (#826)', () => {
-    // `sweepGate.ts`'s keep-in-sync banner names four things the copies must agree on, and one is
-    // "the degenerate `merge-base === HEAD` arm". #826 changed what that arm RETURNS in both —
-    // from a bare `null` shared with real git failures to `'no-own-commits'` — and nothing checked
-    // the pair.
+  it('every #826 site binds the SAME reason to the SAME arm', () => {
+    // ⚠️ **This asserts ARM -> REASON, not the SET of reasons, and the difference is the guard.**
+    // A first version collected every `return '<literal>'` in the body and compared the set; that
+    // passes with the two literals SWAPPED — attach `'git-failed'` to the degenerate arm and
+    // `'no-own-commits'` to the dirty-tree failure and #826 is restored verbatim, with every one of
+    // Court's own suites green (they exercise reason -> sentence, never arm -> reason).
     //
-    // ⚠️ **This asserts ARM -> REASON, not the SET of reasons, and the difference is the whole
-    // guard.** A first version collected every `return '<literal>'` in the body and compared the
-    // set; review showed that passes with the two literals SWAPPED — attach `'git-failed'` to the
-    // degenerate arm and `'no-own-commits'` to the dirty-tree failure and #826 is restored
-    // verbatim, with this test and both of Court's own suites green (they only ever exercise
-    // reason -> sentence, never arm -> reason).
+    // ⚠️ **THREE files, not two.** A second version read only the two `courtTouched` copies — and
+    // `changedLevels.ts` is the site that actually RENDERS the sentence, the one the release-version
+    // skill now quotes. Swapping its literals restored #826 in the one place a human reads, with
+    // this guard green. That is the same defect this whole family is about: a guard whose scope
+    // claim is wider than its reach. `typecheck-projects.mjs` is the fourth site and is covered
+    // end-to-end by `typecheckProjectsSelection.test.ts`, which drives the real CLI against a temp
+    // repo that genuinely produces `origin/main === HEAD` — a stronger test than this one, so it is
+    // deliberately not duplicated here.
     //
-    // Read as SOURCE rather than by calling either function: `courtTouched` shells out to git
-    // against whatever repo the suite happens to be running in, so its ANSWER is a fact about this
-    // checkout, not about the code. `readScannedSource` strips comments from the file under
-    // inspection, so a literal named only in prose cannot satisfy any of these.
-    const DEGENERATE = /if \(base\.trim\(\) === git\('rev-parse', 'HEAD'\)\?\.trim\(\)\) return '([^']+)';/;
-    const DIRTY_FAILED = /const dirty = git\('status'[^\n]*\n\s*if \(dirty === null\) return '([^']+)';/;
-    const BASE_FAILED = /const base = git\('merge-base', 'HEAD', 'origin\/main'\);\n\s*if \(base === null\) return '([^']+)';/;
+    // Read as SOURCE rather than by calling anything: these functions shell out to git against
+    // whatever repo the suite runs in, so their ANSWER is a fact about this checkout, not the code.
+    // `readScannedSource` blanks comment CONTENT while preserving structure, so a prose copy of a
+    // literal cannot satisfy a match, and `\n\s*` still spans an interleaved comment.
+    const DEGENERATE = /if \(base\.trim\(\) === git\('rev-parse', 'HEAD'\)\?\.trim\(\)\) return '([^']+)';/g;
+    const DIRTY_FAILED = /const dirty = git\('status'[^\n]*\n\s*if \(dirty === null\) return '([^']+)';/g;
+    const BASE_FAILED = /const base = git\('merge-base', 'HEAD', 'origin\/main'\);\n\s*if \(base === null\) return '([^']+)';/g;
+    // The FOURTH arm, which the first version of this guard missed even though the same commit's
+    // test-cost.md edit newly enumerated it. Different shape per file: a `??` fallback in the two
+    // `courtTouched` copies, an `if` on the diff in `changedLevels`.
+    const AUTHORED_FALLBACK = /return authoredInRange\(git, base\.trim\(\)\) \?\? '([^']+)';/g;
+    const COMMITTED_FAILED = /const committed = git\('diff'[^\n]*\n\s*if \(committed === null\) return '([^']+)';/g;
 
-    for (const file of [SWEEP_GATE, AUTHORED]) {
+    const SITES = [
+      { file: SWEEP_GATE, fourth: AUTHORED_FALLBACK, fourthName: 'authoredInRange fallback' },
+      { file: AUTHORED, fourth: AUTHORED_FALLBACK, fourthName: 'authoredInRange fallback' },
+      { file: CHANGED_LEVELS, fourth: COMMITTED_FAILED, fourthName: 'failed git diff' },
+    ];
+
+    for (const { file, fourth, fourthName } of SITES) {
       const code = readScannedSource(file).code;
       const rel = path.relative(REPO, file);
       const arm = (re: RegExp, what: string): string => {
-        const m = re.exec(code);
-        expect(m, `${rel}: could not find the ${what} arm — renamed or reshaped? This guard cannot `
-          + 'vouch for an arm it cannot read, and a silently unreadable arm is how #826 survived.')
-          .not.toBeNull();
-        return m![1];
+        const all = [...code.matchAll(re)];
+        // ⚠️ Exactly one, not "the first" — two functions in one file each carrying this arm would
+        // make a `.exec` silently vouch for whichever came first and ignore the other.
+        expect(all.length, `${rel}: expected exactly ONE ${what} arm, found ${all.length}. Renamed, `
+          + 'reshaped, or duplicated? This guard cannot vouch for an arm it cannot read, and a '
+          + 'silently unreadable arm is how #826 survived in the first place.').toBe(1);
+        return all[0][1];
       };
 
       expect(arm(DEGENERATE, 'degenerate merge-base === HEAD'),
         `${rel}: the degenerate range is NOT a failure — git answered, HEAD merely has no commits `
-        + 'of its own. Reporting it as one is #826, and it is the message the hub prints after '
-        + 'every push and a worker after every fast-forward merge.').toBe('no-own-commits');
+        + 'of its own. Reporting it as one is #826, and it is the message the hub prints after every '
+        + 'push and a worker after every fast-forward merge.').toBe('no-own-commits');
       expect(arm(DIRTY_FAILED, 'failed git status'),
         `${rel}: a failed git status IS a real failure`).toBe('git-failed');
       expect(arm(BASE_FAILED, 'failed merge-base'),
         `${rel}: a failed merge-base IS a real failure`).toBe('git-failed');
+      expect(arm(fourth, fourthName),
+        `${rel}: the ${fourthName} arm is a real failure, not the degenerate range`).toBe('git-failed');
     }
   });
 
