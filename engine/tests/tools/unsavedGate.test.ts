@@ -86,6 +86,156 @@ describe('unsaved-work gate: naming the ACTUAL cause (#844)', () => {
     expect(why).not.toMatch(/create_entity/);
   });
 
+  for (const [cause, needle] of [
+    ['pendingBaseScenes', '/assets/scenes/child.scene.json'],
+    ['pendingImportSettings', '/assets/tex.png'],
+  ] as const) {
+    it(`modoki_build names ${cause} — it was DROPPED at the wire type and blamed create_entity (#972 P5)`, async () => {
+      // The wire type here declared three of the five causes the renderer sends, so these two fell
+      // through to the generic wording and the agent was told to look for entities it never
+      // created. #844's defect, surviving one layer out.
+      surface = loadSurface((req) =>
+        req.path.startsWith('/api/editor-state') ? {
+          status: 200,
+          body: {
+            unsavedChanges: true,
+            unsavedCauses: {
+              sceneDirty: false, dirtyAssetPaths: [], dirtyScenes: [],
+              pendingBaseScenes: [], pendingImportSettings: [], [cause]: [needle],
+            },
+          },
+        } : undefined);
+      const r = await surface.call('modoki_build', { platform: 'web' });
+      expect(refusedForSave(surface, r as never)).toBe(true);
+      const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+      expect(why).toContain(needle);
+      expect(why, 'the generic create_entity wording is the WRONG cause for this').not.toMatch(/create_entity/);
+    });
+  }
+
+  for (const [cause, wrongShape] of [
+    ['dirtyAssetPaths', true],
+    ['dirtyScenes', true],
+    ['sceneDirty', ['/a.mat.json']],
+  ] as const) {
+    it(`DEGRADES when ${cause} arrives with the other TYPE — a mismatched pair must not throw`, async () => {
+      // ⚠️ Found in close-out review of my own fix. Phrasing each cause with its own describer let
+      // a value of the WRONG shape reach it: `dirtyAssetPaths: true` called a list describer with a
+      // boolean and threw `v.join is not a function`, which escaped `unsavedChangesWarning()` and
+      // handed the agent a raw TypeError instead of the REQUIRES_SAVE envelope that carries
+      // `force:true` as its exit.
+      //
+      // This is not a hypothetical input. This bundle and the renderer version INDEPENDENTLY —
+      // the file's own comments call a mismatched pair the normal case — so a cause that changes
+      // representation is exactly the traffic this seam exists to survive. Degrade, never throw.
+      surface = loadSurface((req) =>
+        req.path.startsWith('/api/editor-state') ? {
+          status: 200,
+          body: { unsavedChanges: true, unsavedCauses: { [cause]: wrongShape } },
+        } : undefined);
+      const r = await surface.call('modoki_build', { platform: 'web' });
+      expect(refusedForSave(surface, r as never), 'it must still REFUSE — a shape it cannot phrase '
+        + 'is not evidence the editor is clean').toBe(true);
+      const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+      expect(why, 'and it must still name the cause, humanized').toMatch(/dirty asset paths|dirty scenes|scene dirty/);
+    });
+  }
+
+  it('a cause key that collides with Object.prototype still degrades to a humanized label', async () => {
+    // ⚠️ **What this actually pins, stated honestly.** An earlier version of this test claimed to
+    // cover the `hasOwn` lookup guard, and a mutation check disproved that: reverting `hasOwn` to a
+    // bare `CAUSE_PHRASES[key]` leaves every test green, because `CAUSE_PHRASES['constructor']` is
+    // `Object`, whose `.shape` is `undefined`, so the shape check already routes prototype keys to
+    // the fallback. `hasOwn` is belt-and-braces and is kept as such — it is NOT what this test
+    // falsifies. What this DOES pin is the outcome: a prototype-named cause is reported as an
+    // ordinary humanized cause and never renders a function or "[object …]".
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: { unsavedChanges: true, unsavedCauses: { constructor: ['/weird.json'], toString: true } },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    // The load-bearing assertion is this one — it is the only one of the four that distinguishes
+    // the fixed code from the broken code (the other two pass under both hypotheses, which the
+    // mutation check also showed).
+    expect(why, 'a prototype method must not be invoked as a describer').not.toContain('[object');
+    expect(why, 'and the cause is still NAMED, humanized like any unknown key').toContain('constructor');
+    expect(why).toContain('/weird.json');
+  });
+
+  it('a NULL cause value is reported as unphrasable, not silently dropped', async () => {
+    // "I cannot describe this" and "there is nothing here" are different answers, and only one of
+    // them is safe to act on.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: { unsavedChanges: true, unsavedCauses: { weirdCause: null } },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toContain('weird cause');
+  });
+
+  it('a path containing DOUBLE SPACES survives verbatim — it is a legal filename', async () => {
+    // The first version of this phrasing ran `.replace(/ {2,}/g,' ')` over the whole assembled
+    // string, values included, so an agent was told to save a path that does not exist.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: {
+          unsavedChanges: true,
+          unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/my  art.mat.json'], dirtyScenes: [] },
+        },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toContain('/assets/my  art.mat.json');
+  });
+
+  it('the dirtyScenes sentence labels its values as GUIDs, not as paths', async () => {
+    // The garbled-template defect: a shared `${n} ${noun}(s) ${tail}: ${values}` template produced
+    // "…still only in memory(s) — …write them: g1", putting guids in the exact position where all
+    // four sibling causes put PATHS. An agent reads `g1` as a file.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: {
+          unsavedChanges: true,
+          unsavedCauses: { sceneDirty: false, dirtyAssetPaths: [], dirtyScenes: ['g1'] },
+        },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toContain('(guid(s): g1)');
+    expect(why, 'the mangled plural must be gone').not.toContain('memory(s)');
+    expect(why, 'and guids must not trail in the position paths occupy').not.toMatch(/write them: g1/);
+  });
+
+  it('names a cause this bundle has never heard of, rather than falling through (#972 P5)', async () => {
+    // The reason this consumer enumerates instead of naming: the MCP bundle and the renderer
+    // version independently, so a NEWER renderer sending a sixth cause is exactly as likely as an
+    // older one sending four. A hand-listed wire type drops the new one silently — a runtime
+    // problem no compiler on this side can see. The humanized fallback is what makes a cause
+    // readable the day it ships, with no edit here.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: {
+          unsavedChanges: true,
+          unsavedCauses: { sceneDirty: false, pendingProjectSettings: ['/project.config.json'] },
+        },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toContain('/project.config.json');
+    expect(why, 'camelCase should be humanized for the reader').toContain('pending project settings');
+    expect(why).not.toMatch(/create_entity/);
+  });
+
   it('modoki_build falls back to the old generic wording when the renderer omits unsavedCauses', async () => {
     // An older/mismatched renderer answers `unsavedChanges:true` with no `unsavedCauses` field —
     // this must still refuse (unknown-cause is not "clean"), just without naming a cause list

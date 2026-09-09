@@ -4,6 +4,8 @@
  *  pixiShaderBuilder.ts` needs these with no network dependency — `loaders/shaderSchema.ts`
  *  keeps only `fetchShaderManifest` (the actual network fetch) and re-exports everything here. */
 
+import { emptyDocMap, hasDocKey } from './docKeys';
+
 export type ShaderParamType = 'float' | 'color' | 'bool' | 'vec2' | 'vec3' | 'vec4' | 'texture';
 
 /** The known param types — used to surface a typo'd `type` at manifest-load time
@@ -130,9 +132,20 @@ export function mergeParamDefaults(
   schema: ShaderParamSchema,
   values: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+  // `emptyDocMap()` for the bag we build, `hasDocKey` for the one handed in (#986): `key` is a
+  // manifest-declared uniform name and `values` is the material's stored params from JSON, so
+  // `values['constructor']` reads a FUNCTION rather than `undefined`.
+  //
+  // ⚠️ **This pair is DEFENCE, not a fix for an observable defect — do not write a test claiming
+  // otherwise.** Mutation-checked 2026-09-09: reverting either half changes NO output, because
+  // `coerceParamValue` type-checks every branch (`typeof v === 'number'`, `Array.isArray(v)`) and
+  // falls back to the schema default, so a function is sanitised to exactly what the correct read
+  // produces. Two tests were written for it and both stayed green with the fix reverted; they were
+  // deleted rather than banked. It stops being unobservable the moment `coerceParamValue` grows a
+  // pass-through branch, which is why it is kept.
+  const out: Record<string, unknown> = emptyDocMap();
   for (const [key, param] of Object.entries(schema)) {
-    out[key] = coerceParamValue(param, values?.[key]);
+    out[key] = coerceParamValue(param, values && hasDocKey(values, key) ? values[key] : undefined);
   }
   return out;
 }

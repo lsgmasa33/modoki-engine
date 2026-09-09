@@ -21,6 +21,7 @@ import {
 // The bank parser, NOT `traits/UIEntries` itself — that module calls `trait({...})` at import
 // time and this one is deliberately dependency-light (see module docs above).
 import { parseEntryPrefabs } from '../traits/entryPrefabBank';
+import { hasDocKey } from '../core/docKeys';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
  *  these fields must be a GUID or an external URL — never a project-internal
@@ -770,7 +771,12 @@ export function validateSceneData(
       // Field-level type checks (only when a schema is available).
       if (traitSchema) {
         for (const [field, value] of Object.entries(fields)) {
-          const hint = traitSchema.fields[field];
+          // ⚠️ `hasDocKey` (#986): `field` comes from the scene file, `traitSchema.fields` is a
+          // code-declared object. `traitSchema.fields['toString']` returns a FUNCTION, so `hint`
+          // was truthy, the "unknown field" warning below was skipped, and `!hint.type` then
+          // swallowed it silently. The VALIDATOR — the layer whose whole job is catching this —
+          // was the one blinded by it.
+          const hint = hasDocKey(traitSchema.fields, field) ? traitSchema.fields[field] : undefined;
           if (!hint) {
             warnings.push(`${label}.${traitName}: unknown field '${field}'`);
             continue;

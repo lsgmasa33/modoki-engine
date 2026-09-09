@@ -17,6 +17,7 @@
  *  implemented twice diverges). */
 
 import {
+  hasDocKey,
   getAllEntities,
   getAllTraits,
   readTraitDataFull,
@@ -100,7 +101,12 @@ function knownFieldsOf(meta: TraitMeta): Set<string> | null {
 function wrongType(meta: TraitMeta, field: string, value: unknown): string | null {
   const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
   if (!schema || typeof schema !== 'object') return null;
-  if (!(field in schema)) return null;
+  // `hasDocKey` (#986): `field` is caller-supplied over the device-debug protocol and `schema` is
+  // koota's plain-object trait schema — so `'toString' in schema` was TRUE for every trait, and
+  // `typeof schema['toString']` is `'function'`, which falls through the primitive check below and
+  // skips the type gate entirely. The direct analogue of what `isPersistentTraitField` already
+  // fixes on the loader side.
+  if (!hasDocKey(schema, field)) return null;
   const expected = typeof schema[field];
   if (expected !== 'number' && expected !== 'boolean' && expected !== 'string') return null;
   const got = typeof value;

@@ -13,7 +13,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { toastForSave, sceneNeedsWriting, type SaveOutcome } from '@modoki/engine/editor';
+import {
+  toastForSave, sceneNeedsWriting, type SaveOutcome, type UnsavedCauses,
+} from '@modoki/engine/editor';
 
 const noAssets = { saved: [], failed: [] };
 const scene = (o: Partial<SaveOutcome> & { scene: SaveOutcome['scene'] }): SaveOutcome =>
@@ -151,22 +153,111 @@ describe('toastForSave — a failed asset write is never styled as benign', () =
  *  the preview is only worth it when the scene actually has something to write — otherwise every
  *  save while animating would reload the world and rewrite the scene file for no content. */
 describe('sceneNeedsWriting — whether a save is worth interrupting a preview for', () => {
+  /** A complete causes object with nothing dirty. Every case below starts here and turns ONE term
+   *  on, so each says what it means.
+   *
+   *  ⚠️ Spelled in full on purpose (#972 P3). These cases used to pass `{ sceneDirty, dirtyScenes }`
+   *  and nothing else — legal, because the parameter was typed as exactly that pair, and a
+   *  structural subtype of the real causes object is assignable to it. That is what let the
+   *  function read two of five causes while looking correct, and it is why a parked base-scene ref
+   *  could not make a save happen. The parameter is the whole `UnsavedCauses` now, so a cause added
+   *  to the table makes THIS object fail to compile until the suite decides what it means here. */
+  const clean = (): UnsavedCauses => ({
+    sceneDirty: false, dirtyAssetPaths: [], dirtyScenes: [], pendingBaseScenes: [], pendingImportSettings: [],
+  });
+
   it('is false while only ASSET docs are dirty (authoring a clip touches no scene)', () => {
-    expect(sceneNeedsWriting({ sceneDirty: false, dirtyScenes: [] })).toBe(false);
+    expect(sceneNeedsWriting({ ...clean(), dirtyAssetPaths: ['/a.particle.json'] })).toBe(false);
   });
 
   it('is true when the live world has unsaved scene edits', () => {
-    expect(sceneNeedsWriting({ sceneDirty: true, dirtyScenes: [] })).toBe(true);
+    expect(sceneNeedsWriting({ ...clean(), sceneDirty: true })).toBe(true);
   });
 
   it('counts a dirty BASE scene — skipping the scene half would strand it', () => {
     // saveAll writes dirty bases after the primary; treating "the primary is clean" as "nothing to
     // write" would leave a base edit in memory only, which is the failure the #259 flush had.
-    expect(sceneNeedsWriting({ sceneDirty: false, dirtyScenes: ['/assets/scenes/base.json'] })).toBe(true);
+    expect(sceneNeedsWriting({ ...clean(), dirtyScenes: ['/assets/scenes/base.json'] })).toBe(true);
+  });
+
+  it('is FALSE for parked work that writes no scene — those have their own flush', () => {
+    // The other half of #972 P3, and the reason this is a derivation rather than a longer hand
+    // list: a pending base-scene ref or import-setting edit must NOT cycle the preview, because
+    // exiting and re-entering buys a flicker and a scene rewrite for work the scene write does not
+    // carry. `runSaveAll.test.ts` covers the consequence — the fast path flushes them instead.
+    expect(sceneNeedsWriting({ ...clean(), pendingBaseScenes: ['/scenes/child.scene.json'] })).toBe(false);
+    expect(sceneNeedsWriting({ ...clean(), pendingImportSettings: ['/assets/tex.png'] })).toBe(false);
   });
 });
 
 describe('toastForSave — the assets-only save (preview held, scene clean)', () => {
+  it('NAMES base-scene refs it wrote — "Nothing to save" was a lie the human acts on (#972)', () => {
+    // The exact scenario P12 exists for: a timeline preview is live and the only unsaved work is a
+    // parked base-scene ref, so the fast path runs, writes it, and reports `target:'assets'`.
+    // `toastForSave` counted `assets.saved` alone, so the human was told "Nothing to save" about a
+    // write that had just landed. The failure suffix already named base-scene FAILURES; their
+    // successes were the one outcome nothing reported.
+    const t = toastForSave({
+      assets: { saved: [], failed: [] },
+      baseScenes: { saved: ['/scenes/child.scene.json'], failed: [] },
+      target: 'assets',
+    });
+    expect(t.text).toContain('1 base-scene ref saved');
+    expect(t.text, 'the write landed — this must not read as a no-op').not.toContain('Nothing to save');
+    expect(t.kind).toBe('success');
+  });
+
+  it('names import-settings edits it wrote, with their own noun', () => {
+    // Same hole, same fix: "asset" names an ASSET_SCHEMA_TYPES document, and a human told
+    // "1 asset saved" for a `.meta.json` sidecar looks in the Assets panel instead of the Inspector.
+    const t = toastForSave({
+      assets: { saved: [], failed: [] },
+      importSettings: { saved: ['/assets/tex.png'], failed: [] },
+      target: 'assets',
+    });
+    expect(t.text).toContain('1 import-setting edit saved');
+    expect(t.text).not.toContain('Nothing to save');
+  });
+
+  it('still says "Nothing to save" when nothing of ANY kind was written', () => {
+    // The negative half — otherwise the fix above could be "always claim something saved".
+    const t = toastForSave({ assets: { saved: [], failed: [] }, target: 'assets' });
+    expect(t.text).toContain('Nothing to save');
+    expect(t.kind).toBe('info');
+  });
+
+  it('a CANCELLED scene save still names a base-scene ref that DID land', () => {
+    // The sixth `n ?` gate, missed in the first pass and found by re-reading the emitted branches
+    // rather than trusting the grep that had just reported five. A cancelled Save-As over a
+    // successful base-scene write said "Save cancelled — nothing written" — the same class of lie
+    // as the assets branch, in the branch where the human is most likely to believe it.
+    const t = toastForSave({
+      assets: { saved: [], failed: [] },
+      baseScenes: { saved: ['/scenes/child.scene.json'], failed: [] },
+      target: 'scene',
+      scene: { saved: false, path: null, reason: 'cancelled' },
+    });
+    expect(t.text).toContain('1 base-scene ref saved');
+    // ⚠️ The assertion is on the WHOLE-MESSAGE form, not the phrase. The message correctly ends
+    // "…the scene save was cancelled, nothing written for it" — "it" is the scene, and that is
+    // true. What must not appear is the bare `Save cancelled — nothing written`, which is the
+    // branch taken when nothing landed at all. (My first version of this test asserted the phrase
+    // and failed on a correct message.)
+    expect(t.text).not.toContain('Save cancelled — nothing written');
+  });
+
+  it('names every kind together when a save wrote all three', () => {
+    const t = toastForSave({
+      assets: { saved: ['/a.anim.json'], failed: [] },
+      baseScenes: { saved: ['/scenes/child.scene.json'], failed: [] },
+      importSettings: { saved: ['/assets/tex.png'], failed: [] },
+      target: 'assets',
+    });
+    expect(t.text).toContain('1 asset saved');
+    expect(t.text).toContain('1 base-scene ref saved');
+    expect(t.text).toContain('1 import-setting edit saved');
+  });
+
   it('reports just the assets, with no warning about a scene nobody asked to save', () => {
     const t = toastForSave({ assets: { saved: ['/a.anim.json'], failed: [] }, target: 'assets' });
     expect(t.kind).toBe('success');

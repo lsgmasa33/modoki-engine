@@ -750,6 +750,61 @@ describe('/api/unused-assets DISCLOSES unsaved work rather than refusing (#889 B
   });
 });
 
+/** The 200 exit — the branch the whole disclosure exists for, and the one nothing covered.
+ *
+ *  ⚠️ **Found by mutation in #972's close-out review: deleting the disclosure from the SUCCESS
+ *  exit left 4157 tests green.** Every find-references test above targets `'no-such-guid'` or omits
+ *  the target, so all of them land on 404/400. The success path is where a "0 references" verdict
+ *  gets computed past a human's unsaved edit — and that verdict is the input to a DELETE — so it is
+ *  precisely the branch that must not go quiet.
+ *
+ *  This is also the seam #972 P4 depends on: `FindReferencesDialog` now renders
+ *  `staleInputsNote` and derives nothing itself, so if the route stops sending it on a successful
+ *  scan the banner silently stops appearing and the dialog has no fallback. The architecture guard
+ *  greps the `.tsx`; only this can see the route. */
+describe('/api/find-references DISCLOSES on the SUCCESS path too (#972 P4)', () => {
+  /** A shaker whose enumeration contains one real file, so a `/`-shaped target RESOLVES and the
+   *  route reaches its 200 exit instead of the 404 every other test here lands on. */
+  const withResolvableTarget = (renderer: RendererStub): BackendContext => ({
+    ...withShaker(renderer),
+    computeRefEdges: () => ({
+      edges: [], entities: [], guidIndex: new Map(), guidOrigin: new Map(),
+      allFiles: ['/known.mat.json'], seeds: [], warnings: [],
+    }),
+  });
+
+  it('a 200 answer carries the disclosure when the editor holds unsaved work', async () => {
+    const res = await get('/api/find-references', withResolvableTarget(rendererHoldingDirtyAsset),
+      new URLSearchParams({ target: '/known.mat.json' }));
+    expect(res.status ?? 200, 'the target must RESOLVE — otherwise this is the 404 test again').toBe(200);
+    expect(res.body.staleInputs, 'a successful scan past unsaved work must say so').toEqual([
+      { path: '/a.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' },
+    ]);
+    expect(String(res.body.staleInputsNote)).toMatch(/on DISK|does not reflect/);
+    expect(String(res.body.staleInputsNote), 'and the remedy').toMatch(/save/i);
+  });
+
+  it('ACCEPT SIDE: a 200 answer on a CLEAN editor carries none', async () => {
+    // Without this the test above passes for a route that attaches the disclosure unconditionally,
+    // which would put a permanent "this may be stale" banner on every clean scan and train the
+    // reader to ignore it.
+    const res = await get('/api/find-references', withResolvableTarget(rendererWithParks([])),
+      new URLSearchParams({ target: '/known.mat.json' }));
+    expect(res.status ?? 200).toBe(200);
+    expect('staleInputs' in res.body).toBe(false);
+    expect('staleInputsNote' in res.body).toBe(false);
+  });
+
+  it('a 200 answer says so when the renderer could NOT be asked', async () => {
+    // "Could not look" is not "nothing is there" — the same rule the 404 branch already carries.
+    const res = await get('/api/find-references', withResolvableTarget(rendererSilent),
+      new URLSearchParams({ target: '/known.mat.json' }));
+    expect(res.status ?? 200).toBe(200);
+    expect(res.body.staleInputsUnknown, 'an unreachable probe must not read as clean').toBeDefined();
+    expect(String(res.body.staleInputsNote)).toMatch(/could NOT be checked|stale/i);
+  });
+});
+
 describe('the disclosure survives the branches that DROP an answer (#889 close-out review)', () => {
   it('find-references 404 carries the disclosure — the branch where it is most load-bearing', () => {
     // ⚠️ Found by review: `staleness` was awaited and then dropped on exactly this branch. An

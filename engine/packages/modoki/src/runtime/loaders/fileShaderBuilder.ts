@@ -25,6 +25,7 @@
  *  'normalView_1'" on every compile. */
 
 import * as THREE from 'three';
+import { hasDocKey } from '../core/docKeys';
 import { NodeMaterial } from 'three/webgpu';
 import { wgslFn, glslFn, vec2, vec3, vec4, uv, normalView, normalWorld, positionView, positionWorld, time, texture } from 'three/tsl';
 import { nprFragmentOutput } from '../rendering/npr/NPRPostProcess';
@@ -149,10 +150,17 @@ export async function buildFileShaderMaterial(
   const values = (data.params as Record<string, unknown>) ?? {};
   const ownedTextures: THREE.Texture[] = [];
   for (const [key, param] of Object.entries(manifest.params)) {
+    // ⚠️ `hasDocKey` on the READ (#986). `values` is the material's stored params, parsed from
+    // JSON, and `key` is a manifest-declared uniform name — so `values['constructor']` hands a
+    // FUNCTION to coerceParamValue/paramNode instead of `undefined`, defeating the schema default.
+    // The WRITE side (`inputs[key]`) is deliberately NOT converted to a null-prototype bag: this
+    // object is handed to the TSL shader function, and `__proto__` is not a reachable uniform name
+    // (WGSL reserves leading `__`), so crossing that library boundary would buy nothing.
+    const raw = hasDocKey(values, key) ? values[key] : undefined;
     if (param.type === 'texture') {
-      inputs[key] = await textureNode(coerceParamValue(param, values[key]) as string, ownedTextures);
+      inputs[key] = await textureNode(coerceParamValue(param, raw) as string, ownedTextures);
     } else {
-      inputs[key] = paramNode(param, values[key]);
+      inputs[key] = paramNode(param, raw);
     }
   }
 

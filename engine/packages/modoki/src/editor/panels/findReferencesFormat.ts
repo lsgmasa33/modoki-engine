@@ -52,6 +52,18 @@ export interface FindReferencesResultLike {
   reachable: boolean;
   warnings: string[];
   unresolvedRefsFromTarget: { via: string; guid: string }[];
+  /** The MANDATORY unsaved-work disclosure, when the route had one to make (#889). Built server-side
+   *  by `staleInputDisclosure` from the same `resolve-unsaved` probe that carries the type-level
+   *  exhaustiveness check, so it names EVERY kind of unsaved work — which is precisely why the
+   *  dialog renders this instead of re-deriving the answer client-side (#972 P4). Absent when the
+   *  editor was clean, so presence IS the signal. */
+  staleInputs?: Array<{ path: string; registry: string; detail?: string }>;
+  /** The probe could not be reached, which is NOT the same as "nothing is pending" — the answer may
+   *  be computed from stale files and nobody can say. */
+  staleInputsUnknown?: { reason: string };
+  /** The ready-made sentence for either case. Rendered verbatim: it is derived from the same probe
+   *  that computed the result, so it cannot disagree with it. */
+  staleInputsNote?: string;
 }
 
 /** Short human label for an implicit-edge origin. `'own'` is an ordinary authored

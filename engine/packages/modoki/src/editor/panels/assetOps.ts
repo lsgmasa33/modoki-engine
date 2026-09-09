@@ -504,10 +504,13 @@ export async function createPrefabFromEntity(
  *  reached agents through the MCP surface while the HUMAN path — the one that actually deletes —
  *  dropped it. A field nobody reads is the same as a field nobody sends.
  *
- *  Why the dialog reads the RESPONSE rather than polling `unsavedChangeCauses()` itself, as
- *  `FindReferencesDialog` does: the server's answer is derived from the same probe that computed
- *  the orphan list, so it cannot disagree with it — and that dialog's own client-side check is a
- *  hand-list of two of the five causes (#972). */
+ *  Why the dialog reads the RESPONSE rather than polling `unsavedChangeCauses()` itself: the
+ *  server's answer is derived from the same probe that computed the orphan list, so it cannot
+ *  disagree with it, and that probe carries the type-level exhaustiveness check a client-side
+ *  hand-list cannot. `FindReferencesDialog` was the counter-example — a hand-list of two of the
+ *  five causes — and #972 moved it onto the same `staleInputsNote`. Rule and rationale:
+ *  `docs/mcp-persistence.md` § "The cause table is the SCHEMA"; guarded by
+ *  `tests/architecture/staleDisclosureIsServerDerived.test.ts`. */
 export interface UnusedStaleness {
   /** What the scan could not see. Non-empty when known; absent when the renderer could not be asked. */
   readonly inputs: ReadonlyArray<{ path: string; registry: string; detail?: string }>;

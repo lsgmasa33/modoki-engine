@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { hasDocKey } from '../../runtime/core/docKeys';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -25,7 +26,7 @@ import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loa
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
-import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
+import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -124,7 +125,10 @@ export function captureNestedSceneDelta(
     const rowTraits = rowOverrides?.[lid];
     for (const [traitName, fields] of Object.entries(traits)) {
       const rowFields = rowTraits?.[traitName];
-      if (rowFields) for (const f of Object.keys(fields)) if (f in rowFields) delete fields[f];
+      // `hasDocKey` (#986): `f` and `rowFields` both derive from scene/prefab JSON, so a
+      // prototype-named field tested TRUE against any rowFields object and was wrongly
+      // deleted from the serialized output.
+      if (rowFields) for (const f of Object.keys(fields)) if (hasDocKey(rowFields, f)) delete fields[f];
       if (Object.keys(fields).length === 0) delete traits[traitName];
     }
     if (Object.keys(traits).length === 0) delete all[lid];
@@ -793,41 +797,213 @@ export function markSceneSaved(atEditVersion?: number): void {
  *  this flag before writing a `.ts` that force-reloads the editor) would then discard the
  *  human's work believing there was none. */
 export function hasUnsavedChanges(): boolean {
-  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0
-    || hasPendingBaseScenes() || hasPendingMeta();
+  // Derived from CAUSE_SPECS, NOT a hand-written OR — see the table's own comment for why that
+  // matters. Iterates the pre-built list so this allocates nothing: it is called on hot paths and
+  // from a 1s poll in FindReferencesDialog, and `Object.values()` per call would be a new array
+  // every time. Short-circuits on the first dirty cause, exactly as the old OR did.
+  for (const spec of CAUSE_SPEC_LIST) if (spec.has()) return true;
+  return false;
 }
 
-/** WHICH kind of unsaved work exists — the three independent causes above, told apart.
+/** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
+ *  it is keyed by, and which half of a save writes it — are documented on `CAUSE_SPECS` below,
+ *  which this derives from; they are not re-listed here.
  *
- *  S3.11: the load_scene / new_scene refusal built one fixed string blaming
- *  create_entity/duplicate_entity/prefab, so an agent whose only pending work was a dirty
- *  particle/anim/timeline doc went looking for live entities it had never created. A refusal that
- *  names the wrong cause is worse than a generic one — it sends the reader somewhere specific and
- *  wrong. All three causes are cleared by the same `save_all`, but the caller has to be told what
+ *  S3.11 is why the distinction exists at all: the load_scene / new_scene refusal built one fixed
+ *  string blaming create_entity/duplicate_entity/prefab, so an agent whose only pending work was a
+ *  dirty particle/anim/timeline doc went looking for live entities it had never created. A refusal
+ *  that names the wrong cause is worse than a generic one — it sends the reader somewhere specific
+ *  and wrong. Every cause is cleared by the same `save_all`, but the caller has to be told what
  *  `force:true` would DISCARD.
  *
- *  `dirtyScenes` is the third cause (see `hasUnsavedChanges`): non-primary loaded scenes
- *  whose edits are still only in memory — typically a base whose write failed in a
- *  partial `saveAll`. It must be reported, or a refusal triggered by it alone would name
- *  no cause at all. */
-export function unsavedChangeCauses(): {
-  sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[]; pendingBaseScenes: string[];
-  pendingImportSettings: string[];
-} {
-  return {
-    sceneDirty: getEditVersion() !== _savedAtEditVersion,
-    dirtyAssetPaths: getDirtyAssetPaths(),
-    dirtyScenes: [...dirtySceneGuidsSnapshot()],
-    // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is
-    // NOT the open one. It is neither a live-world edit nor an asset document, so without its own
-    // row a refusal triggered by it alone would name no cause at all — the S3.11 failure again.
-    pendingBaseScenes: getPendingBaseScenePaths(),
-    // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
-    // instead of written immediately. Named for what a human reads in a banner ("unsaved import
-    // settings") — matching the Inspector section's own label — not for the sidecar's file
-    // extension, which means nothing to the reader of that banner.
-    pendingImportSettings: getPendingMetaPaths(),
+ *  ⚠️ **Every read is a PEEK** — this reads the registries and records nothing, so a probe can call
+ *  it without disarming the guard it is observing. */
+export function unsavedChangeCauses(): UnsavedCauses {
+  // Derived from the ONE table below. The cast is confined to this loop: `Object.entries` cannot
+  // express "key K gets exactly CAUSE_SPECS[K]['read']'s return type", so the per-key correlation
+  // is re-asserted at the boundary. `UnsavedCauses` itself IS derived from the table, so the
+  // signature cannot drift from what this actually returns even though the body is untyped.
+  const out: Record<string, boolean | string[]> = {};
+  for (const [key, spec] of CAUSE_SPEC_ENTRIES) out[key] = spec.read();
+  return out as UnsavedCauses;
+}
+
+/** One kind of unsaved work, as DATA rather than as five expressions spread across the repo.
+ *
+ *  ⚠️ **This table is the SCHEMA, and `UnsavedCauses` is derived FROM it — not the other way
+ *  round.** That inversion is the whole point (#972). Before it, `unsavedChangeCauses()` published
+ *  a VALUE and no schema: consumers that needed to act per-cause (test it, gate on it, name it,
+ *  flush it, remap it across a rename) had nowhere to ask "what are the causes, and what is each
+ *  one like", so TEN sites re-stated the population by hand — and TypeScript checked none of them,
+ *  because a hand-written subset of a wider object is a legal structural subtype. Three of those
+ *  ten were already under-reporting when the table landed. Adding a cause here now turns every
+ *  downstream `satisfies Record<keyof UnsavedCauses, …>` red until it is mapped.
+ *
+ *  ⚠️ **Never widen `UnsavedCauses` to `Record<string, …>`.** Every one of those exhaustiveness
+ *  checks silently degrades to nothing the moment `keyof` stops being a finite union — nothing
+ *  goes red, and the class is back. Guarded by a type-level assertion in
+ *  `tests/editor/unsavedCauseTable.test.ts` (a `tsc` guard: vitest erases types, so that test
+ *  cannot catch it at runtime).
+ *
+ *  Field notes:
+ *  - `has` is the CHEAP predicate and `read` the reporting one, kept separate on purpose:
+ *    exhaustiveness comes from the table, cheapness from `has`. Deriving the boolean from `read`
+ *    would allocate three arrays and spread a Set on every `hasUnsavedChanges()` call.
+ *  - `keying` says what a cause is addressed BY, which is what decides whether a file rename can
+ *    strand it. Only `'path'` causes need remapping when a file moves.
+ *  - `writtenBy` says which half of a save writes it: the scene write itself, or a parked-work
+ *    flush that runs before or after that write.
+ *  - The REGISTRY NAME is deliberately absent — that axis is cross-zone (a renderer union, a Node
+ *    union, `ALL_REGISTRIES`, `ALL_UNSAVED_REGISTRIES`, `HELPER_REGISTRIES`) and
+ *    `tests/architecture/unsavedGateCoverage.test.ts` already pins all six spellings by parsing
+ *    source. A copy here would be a SEVENTH spelling that guard does not read. */
+interface CauseSpec {
+  /** Allocation-free "is this cause dirty right now". */
+  readonly has: () => boolean;
+  /** The reportable value — a boolean for a pathless cause, else the keys it holds. */
+  readonly read: () => boolean | string[];
+  /** What the cause is addressed by. `'path'` is the one that a file move can strand. */
+  readonly keying: 'none' | 'guid' | 'path';
+  /** Which half of a save writes it, and — for parked work — HOW.
+   *
+   *  `'scene-write'` means the scene file itself carries it. Otherwise the cause is parked work
+   *  with its own flush, and `run` is that flush. Carrying the function here rather than naming it
+   *  at each save site is what makes a flush impossible to forget: `flushParked(phase)` runs
+   *  whatever the table declares for that phase, so a new flushing cause is written by every save
+   *  path the day it is added. (#972 P12 — the preview fast path spelled the set by hand and got
+   *  two of three, so Cmd+S under a timeline preview reported success and never wrote the parked
+   *  base-scene ref.)
+   *
+   *  ⚠️ The PHASE is load-bearing, not cosmetic. `after-scene` exists because `/api/scene-mutate`
+   *  refuses while `hasUnsavedChanges()` is true and those entries are part of that report — run
+   *  before the scene write and every mutation 409s against the very save trying to persist it. */
+  readonly writtenBy: 'scene-write' | {
+    readonly flush: FlushPhase;
+    readonly run: () => Promise<{ saved: string[]; failed: Array<{ path: string; error: string }> }>;
   };
+  /** Human phrasing. `bool` for a plain boolean cause; `noun` for one reported as a list
+   *  ("N <noun>(s)"). Consumed by the refusal messages, so it reads as prose, not as a field name. */
+  readonly label: { readonly bool?: string; readonly noun?: string };
+}
+
+const CAUSE_SPECS = {
+  // The PRIMARY live world, compared against its saved baseline. Pathless and in no registry
+  // module at all — which is why a probe that enumerates REGISTRIES is vacuous for the open scene
+  // (docs/mcp-persistence.md). ⚠️ Name collision worth knowing: this cause is `sceneDirty`, while
+  // the MODULE `sceneDirty.ts` supplies `dirtyScenes` below.
+  sceneDirty: {
+    has: () => getEditVersion() !== _savedAtEditVersion,
+    read: () => getEditVersion() !== _savedAtEditVersion,
+    keying: 'none',
+    writtenBy: 'scene-write',
+    label: { bool: 'unsaved scene changes' },
+  },
+  // A 'manual'-mode edit to an ASSET_SCHEMA_TYPES doc, parked instead of autosaved (#259/#831).
+  dirtyAssetPaths: {
+    has: hasDirtyAssets,
+    read: getDirtyAssetPaths,
+    keying: 'path',
+    writtenBy: { flush: 'before-scene', run: flushDirtyAssets },
+    label: { noun: 'unsaved asset edit' },
+  },
+  // Non-primary loaded scenes whose edits are still only in memory — typically a base whose write
+  // failed in a partial `saveAll` (which keeps its dirty flag by design, so a later save retries).
+  // Keyed by GUID, so a file rename cannot strand it.
+  dirtyScenes: {
+    has: hasDirtyScenes,
+    read: () => [...dirtySceneGuidsSnapshot()],
+    keying: 'guid',
+    writtenBy: 'scene-write',
+    label: { noun: 'unsaved edit in another loaded scene' },
+  },
+  // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is NOT
+  // the open one. Neither a live-world edit nor an asset document, so without its own row a
+  // refusal triggered by it alone would name no cause at all — the S3.11 failure again.
+  // ⚠️ Flushed AFTER the scene write, and that ordering is load-bearing — see `saveAll`.
+  pendingBaseScenes: {
+    has: hasPendingBaseScenes,
+    read: getPendingBaseScenePaths,
+    keying: 'path',
+    writtenBy: { flush: 'after-scene', run: flushPendingBaseScenes },
+    label: { noun: 'pending base-scene reference' },
+  },
+  // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
+  // instead of written immediately. Named for what a human reads in a banner ("unsaved import
+  // settings") — matching the Inspector section's own label — not for the sidecar's file
+  // extension, which means nothing to the reader of that banner.
+  pendingImportSettings: {
+    has: hasPendingMeta,
+    read: getPendingMetaPaths,
+    keying: 'path',
+    writtenBy: { flush: 'before-scene', run: flushPendingMeta },
+    label: { noun: 'pending import-setting edit' },
+  },
+} as const satisfies Record<string, CauseSpec>;
+
+/** Pre-built so `hasUnsavedChanges()` allocates nothing per call. */
+const CAUSE_SPEC_LIST: readonly CauseSpec[] = Object.values(CAUSE_SPECS);
+const CAUSE_SPEC_ENTRIES: readonly (readonly [string, CauseSpec])[] = Object.entries(CAUSE_SPECS);
+
+/** WHICH kinds of unsaved work exist, told apart — derived from `CAUSE_SPECS`.
+ *
+ *  ⚠️ **Derived, so it cannot drift from the table.** Adding a cause to `CAUSE_SPECS` widens this
+ *  type, which is what makes every `satisfies Record<keyof UnsavedCauses, …>` in the repo go red. */
+export type UnsavedCauses = { [K in keyof typeof CAUSE_SPECS]: ReturnType<(typeof CAUSE_SPECS)[K]['read']> };
+
+/** The causes addressed BY PATH — the ones a file move or delete can strand on a dead key.
+ *
+ *  Exported as a TYPE and not as implementations on purpose: `serialize.ts` cannot import
+ *  `panels/assetEditorBindings.ts` without a cycle, so the move repair binds its own handlers
+ *  under `satisfies Record<PathKeyedCause, …>`. Exhaustiveness travels by type; code stays in its
+ *  layer. (#972 P11 — the repair covered two of these three, so a renamed `.scene.json` stranded
+ *  its parked baseScene edit and it never flushed.) */
+export type PathKeyedCause = {
+  [K in keyof typeof CAUSE_SPECS]: (typeof CAUSE_SPECS)[K]['keying'] extends 'path' ? K : never
+}[keyof typeof CAUSE_SPECS];
+
+/** The causes written by the SCENE write itself, rather than by a parked-work flush. */
+export type SceneWrittenCause = {
+  [K in keyof typeof CAUSE_SPECS]: (typeof CAUSE_SPECS)[K]['writtenBy'] extends 'scene-write' ? K : never
+}[keyof typeof CAUSE_SPECS];
+
+/** When a parked-work flush runs, relative to the scene write. See `CauseSpec.writtenBy`. */
+export type FlushPhase = 'before-scene' | 'after-scene';
+
+/** What `flushParked(phase)` returns: exactly the causes declared for THAT phase, each under its
+ *  own cause name and carrying that flush's own result type.
+ *
+ *  Derived, so a save site cannot pick up a flush the table does not declare, and cannot MISS one
+ *  it does. That is the whole of the P12 fix: the set is no longer spelled at each site. */
+export type ParkedFlushResults<P extends FlushPhase> = {
+  [K in keyof typeof CAUSE_SPECS as (typeof CAUSE_SPECS)[K]['writtenBy'] extends { readonly flush: P }
+    ? K : never]:
+  (typeof CAUSE_SPECS)[K]['writtenBy'] extends { readonly run: () => Promise<infer R> } ? R : never
+};
+
+/** Run every parked-work flush the table declares for `phase`, in table order.
+ *
+ *  ⚠️ **The two phases are not interchangeable** — `after-scene` exists because those entries are
+ *  part of the `hasUnsavedChanges()` report that `/api/scene-mutate` refuses on. Callers must run
+ *  `before-scene` ahead of the scene write and `after-scene` behind it; a caller that needs only
+ *  one phase (the preview fast path, which writes no scene) still gets every cause in it.
+ *
+ *  Within a phase the order is the table's own and carries no constraint: the two `before-scene`
+ *  causes are independent (#845 — `/api/write-meta` has no unsaved-work refusal, so it has none of
+ *  the base-scene flush's ordering requirement). */
+export async function flushParked<P extends FlushPhase>(phase: P): Promise<ParkedFlushResults<P>> {
+  const out: Record<string, unknown> = {};
+  for (const [key, spec] of CAUSE_SPEC_ENTRIES) {
+    const w = spec.writtenBy;
+    if (w === 'scene-write' || w.flush !== phase) continue;
+    out[key] = await w.run();
+  }
+  return out as ParkedFlushResults<P>;
+}
+
+/** Read-only view of the table, for the derivations that live outside this module (the flush
+ *  runner, the label-driven refusal messages). Not a mutable handle — callers derive, never edit. */
+export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
+  return CAUSE_SPECS;
 }
 
 export interface SaveResult {
@@ -1324,11 +1500,9 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // scrub/preview, in a prefab-edit world, with no path, with the Save-As dialog cancelled, or
   // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
   // four of those five are "the human pressed Cmd+S and nothing saved their edit".
-  const assets = await flushDirtyAssets();
-  // Alongside the asset flush — not before or after it in any load-bearing sense (#845). Unlike
-  // `/api/scene-mutate`, `/api/write-meta` carries no unsaved-work refusal, so this flush has none
-  // of `flushPendingBaseScenes`' "must run last" constraint below. See `pendingMeta.ts`'s header.
-  const importSettings = await flushPendingMeta();
+  // Both `before-scene` causes, derived from the table rather than named here (#972 P12) — the
+  // set used to be spelled by hand at three save sites and one of the three was short by one.
+  const { dirtyAssetPaths: assets, pendingImportSettings: importSettings } = await flushParked('before-scene');
   const withAssets = <T extends SaveResult>(r: T): T => ({
     ...r,
     ...(assets.saved.length || assets.failed.length ? { assets } : {}),
@@ -1339,11 +1513,13 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // and these entries are themselves part of that report. Run before the scene write and every
   // mutation 409s against the very save trying to persist it. See `pendingBaseScene.ts`'s header;
   // the take-first half of the same problem lives there.
-  // ⚠️ Declared AFTER `saveScene` on purpose — the textual order is what
-  // `tests/architecture/baseSceneEditIsManual.test.ts` reads, and it is the only place the
-  // "flush LAST" requirement is written down where a refactor will trip over it.
+  // ⚠️ The "flush LAST" requirement is now carried as DATA — `pendingBaseScenes`' spec declares
+  // `writtenBy: {flush:'after-scene'}`, and `flushParked` runs the phases in that order. It used
+  // to live in this function's textual layout, which `tests/architecture/baseSceneEditIsManual.ts`
+  // read as a regex over source; that test now asserts the phase tag instead, which is the same
+  // rule stated where a refactor cannot silently move it.
   const withBaseScenes = async (): Promise<{ baseScenes?: SaveResult['baseScenes'] }> => {
-    const r = await flushPendingBaseScenes();
+    const { pendingBaseScenes: r } = await flushParked('after-scene');
     return r.saved.length || r.failed.length ? { baseScenes: r } : {};
   };
   // A refused primary does NOT skip this, for the same reason the asset flush runs unconditionally

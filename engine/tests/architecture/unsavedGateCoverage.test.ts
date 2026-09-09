@@ -135,6 +135,24 @@ function declaredRegistries(body: string): string[] {
  *  without it, a route that later needs gating for one registry and not another has to be either
  *  wholly exempt or wholly gated, which is how a narrow exemption rots into a blanket one. */
 const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }> = {
+  // ── The two move/delete routes. FULLY exempt (no `registries`), because the reasoning is total
+  //    rather than per-registry — and note they can never satisfy `gapsNowGated`, since the
+  //    correct implementation of these routes calls no gate at all. ──
+  '/api/move-file': { reason:
+    'GATING IT WOULD BE WRONG: the gate would refuse a rename BECAUSE the file being renamed has '
+    + 'unsaved edits, which is precisely the case the repair exists to carry across. A file must '
+    + 'stay renameable while it is being edited. Instead the route REPAIRS every path-keyed '
+    + 'registry, and does so by DERIVATION — `PARKED_MOVE_REPAIRS` (assetEditorBindings.ts) '
+    + '`satisfies Record<PathKeyedCause, ...>`, where `PathKeyedCause` is the `keying:\'path\'` '
+    + 'slice of `CAUSE_SPECS` — so a fourth path-keyed registry cannot compile without a repair. '
+    + '⚠️ VOID if that repair stops being derived: "it repairs them" was true of the hand-written '
+    + 'version too, right up until it was two of three (#972) and nothing said so.', },
+  '/api/delete-asset': { reason:
+    'the same seam as /api/move-file with `to: null` (unbindDeletedAssetEditors), exempt on the '
+    + 'same three grounds: a file must be deletable while it is being edited, the repair covers '
+    + 'every path-keyed registry by derivation, and the exemption is void if that stops being '
+    + 'true. Its drops are REPORTED, never silent (#898) — destroying pending work is exactly the '
+    + 'thing that must reach the human.', },
   '/api/read-meta': { registries: ['pendingMeta'], reason:
     "the EDITOR'S OWN disk read — `readMetaPreferringPark` calls it FROM the renderer, so probing "
     + 'the renderer back would be circular for every real caller it has. It is also the read whose '
@@ -188,27 +206,13 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
  *  touches" is a gap, not an exemption, and writing it as one is how a defect starts reading as a
  *  decision — which is the exact thing the two-table split exists to prevent. */
 const KNOWN_GAPS: Record<string, { issue: string; reason: string }> = {
-  '/api/move-file': {
-    issue: '#972',
-    reason: 'applyMovesInRenderer → applyAssetPathMoves → applyMovesToParkedAssets remaps the park '
-      + 'for `dirtyAsset` and `pendingMeta` and NOT `pendingBaseScene` — that registry is not '
-      + 'referenced in assetEditorBindings.ts at all. So a moved `.scene.json` strands its parked '
-      + 'baseScene edit on a dead path and it never flushes: the human edited a baseScene ref, '
-      + 'renamed the scene, and the edit is silently gone at the next save_all. '
-      + '⚠️ Filed under #972 rather than #889 because the MECHANISM is #972\'s: a consumer '
-      + 'hand-enumerating the registries instead of deriving them from unsavedChangeCauses(). '
-      + 'Gating this route would be the wrong fix — it would refuse a rename because the file '
-      + 'being renamed has unsaved edits, which is the case the repair exists to carry across. '
-      + 'The fix is to finish the repair.',
-  },
-  '/api/delete-asset': {
-    issue: '#972',
-    reason: 'the same seam as /api/move-file with `to: null` (unbindDeletedAssetEditors), and the '
-      + 'same missing registry: a deleted scene leaves its parked baseScene edit behind. Same '
-      + 'argument against gating — a file must be deletable while it is being edited.',
-  },
+  // Empty, and deliberately KEPT rather than deleted along with its last entries. The two that
+  // lived here (`/api/move-file`, `/api/delete-asset`, both #972) are now EXEMPT above: the repair
+  // they were waiting on is complete and DERIVED. The table stays because the split between "we
+  // considered this and it cannot apply" and "it can apply, we know, here is the ticket" is what
+  // stops a documented gap from reading as a decision — and the next gap needs somewhere honest to
+  // go on the day it is found, not a reason to widen EXEMPT.
 };
-
 function routeBlocks(src: string): Array<{ route: string; body: string }> {
   // The router is one long `if (urlPath === '…')` chain, so each block runs from its own test to
   // the next one. Crude, and it does not need to be clever: a route that stops matching this shape

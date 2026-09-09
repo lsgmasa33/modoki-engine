@@ -468,6 +468,99 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *
    *  So: unreachable → null (no editor). Answered-and-clean → null. Anything else → refuse, naming
    *  the uncertainty. Every caller already offers `force:true` for a deliberate override. */
+  /** Agent-facing phrasing per cause: the whole sentence, built from that cause's own value.
+   *
+   *  ⚠️ **A FUNCTION per cause, not a noun + a template.** The first version of this was
+   *  `${n} ${noun}(s) ${tail}: ${values}`, and `dirtyScenes` does not fit that shape — its noun
+   *  ends in a word the `(s)` cannot follow and its values are GUIDs that must be labelled as
+   *  such. It produced `1 non-primary loaded scene(s) with edits still only in memory(s) — a
+   *  previous save_all may have failed to write them: g1`: a mangled plural, and guids sitting in
+   *  the exact position where every sibling cause puts PATHS, so an agent reads `g1` as a file.
+   *  A shared template across sentences that are not the same shape is the same mistake this
+   *  whole change is about, one level down. (Found in close-out review.)
+   *
+   *  NOT a gate and not the source of truth for what can appear — `describeUnsavedCauses` phrases
+   *  a key that is missing from here. A readability layer, exactly as `CAUSE_LABELS` is in
+   *  `app/debug/hmrStaleness.ts`. */
+  /** ⚠️ A DISCRIMINATED UNION, not `{shape, say: (v: never) => string}`.
+   *
+   *  `(value: never) => string` accepts every unary function by contravariance, so the first
+   *  version of this let `{shape:'list', say:(v: boolean) => …}` compile clean — two hand-maintained
+   *  facts sitting next to each other, and a future entry declaring the wrong one would reintroduce
+   *  the exact `v.join is not a function` TypeError this table exists to prevent. Under the union a
+   *  mismatched entry is TS2322 at the literal. It also removes the two `as` casts at the call
+   *  sites: narrowing on `phrase.shape` types `say` correctly on its own. (Close-out review, round
+   *  three — rounds one and two both shipped a version of this that did not check.) */
+  type CausePhrase =
+    | { readonly shape: 'list'; readonly say: (v: string[]) => string }
+    | { readonly shape: 'bool'; readonly say: (v: boolean) => string };
+
+  const CAUSE_PHRASES: Record<string, CausePhrase> = {
+    sceneDirty: { shape: 'bool', say: () =>
+      'LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)' },
+    dirtyAssetPaths: { shape: 'list', say: (v: string[]) =>
+      `${v.length} pending ASSET edit(s) awaiting a save: ${v.join(', ')}` },
+    dirtyScenes: { shape: 'list', say: (v: string[]) =>
+      `${v.length} non-primary loaded scene(s) with edits still only in memory `
+      + `(guid(s): ${v.join(', ')}) — a previous save_all may have failed to write them` },
+    pendingBaseScenes: { shape: 'list', say: (v: string[]) =>
+      `${v.length} pending base-scene ref(s) awaiting a save: ${v.join(', ')}` },
+    pendingImportSettings: { shape: 'list', say: (v: string[]) =>
+      `${v.length} pending import-setting edit(s) awaiting a save: ${v.join(', ')}` },
+  };
+
+  /** camelCase -> "camel case", the fallback label for a cause this bundle has never heard of.
+   *
+   *  It exists so a cause added to the renderer's `CAUSE_SPECS` is NAMED here the day it ships,
+   *  with no edit in this process — which matters more across this seam than anywhere else,
+   *  because the MCP bundle and the renderer version independently and a mismatched pair is the
+   *  normal case, not the exception. */
+  function humanizeCauseKey(key: string): string {
+    return key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+  }
+
+  /** Every ACTIVE cause the renderer reported, phrased for an agent.
+   *
+   *  Enumerates whatever keys arrive rather than the ones this bundle knows (#972 P5). Values are
+   *  `boolean | string[]` by convention; anything else — including `null`/`undefined` — is
+   *  reported as present-but-unphrasable rather than dropped, because "I cannot describe this" and
+   *  "there is nothing here" are different answers and only one of them is safe to act on. */
+  function describeUnsavedCauses(causes: Record<string, unknown> | undefined): string[] {
+    if (!causes || typeof causes !== 'object') return [];
+    const out: string[] = [];
+    for (const [key, value] of Object.entries(causes)) {
+      // ⚠️ **`hasOwn`, and the SHAPE is checked before the describer runs.** Both guards are here
+      // because of the same seam: this bundle and the renderer version independently, so what
+      // arrives is untrusted in both its keys and its types.
+      //   - Without `hasOwn`, a renderer key named `constructor` or `toString` picks a function off
+      //     the prototype chain and pushes a non-string into a `string[]`.
+      //   - Without the shape check, a cause that arrives with the OTHER type — `dirtyAssetPaths:
+      //     true` from a renderer that changed its representation — called a list describer with a
+      //     boolean and threw `v.join is not a function`, escaping `unsavedChangesWarning()` and
+      //     handing the agent a raw TypeError instead of the REQUIRES_SAVE envelope that carries
+      //     `force:true` as its exit. A mismatched pair is the NORMAL case across this seam, so it
+      //     must degrade, never throw. (Both found in close-out review of my own fix.)
+      const phrase = Object.prototype.hasOwnProperty.call(CAUSE_PHRASES, key)
+        ? CAUSE_PHRASES[key] : undefined;
+      if (Array.isArray(value)) {
+        if (!value.length) continue;
+        // No whitespace normalisation on the assembled string: it would rewrite the VALUES too,
+        // and `/assets/my  art.png` is a legal filename. Each phrase is spaced correctly at source.
+        out.push(phrase?.shape === 'list'
+          ? phrase.say(value as string[])
+          : `${value.length} ${humanizeCauseKey(key)}(s): ${value.join(', ')}`);
+      } else if (typeof value === 'boolean') {
+        if (!value) continue;
+        out.push(phrase?.shape === 'bool'
+          ? phrase.say(value)
+          : humanizeCauseKey(key));
+      } else {
+        out.push(`${humanizeCauseKey(key)} (reported as ${JSON.stringify(value) ?? String(value)})`);
+      }
+    }
+    return out;
+  }
+
   async function unsavedChangesWarning(): Promise<string | null> {
     let status: number;
     let body: unknown;
@@ -496,7 +589,17 @@ export function createToolContext(config: { backend: string; token?: string }): 
     }
     const st = body as {
       unsavedChanges?: unknown; scenePath?: unknown;
-      unsavedCauses?: { sceneDirty?: unknown; dirtyAssetPaths?: unknown; dirtyScenes?: unknown };
+      // ⚠️ STRUCTURAL, not a hand-listed set of causes (#972 P5). This declared exactly
+      // `sceneDirty`, `dirtyAssetPaths` and `dirtyScenes` — three of the five the renderer
+      // actually sends — so a session whose only unsaved work was a pending baseScene ref or a
+      // parked import-settings edit fell through to the generic wording below and was told to go
+      // look for entities it never created. That is #844's defect, surviving in this layer.
+      //
+      // Enumerated rather than named because this is a WIRE boundary in a SEPARATE BUNDLE: this
+      // process cannot import `CAUSE_SPECS`, and a newer renderer sending a sixth cause is exactly
+      // as likely as an older one sending four. A hand type drops the new one silently, which is a
+      // runtime problem no compiler here can see. Same reasoning as `app/debug/hmrStaleness.ts`.
+      unsavedCauses?: Record<string, unknown>;
     };
     if (st.unsavedChanges === false) return null; // answered, and clean
     if (st.unsavedChanges !== true) {
@@ -511,11 +614,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // additive on `/api/editor-state` (agentEditorOps.ts's `readEditorState`), so an older/
     // mismatched renderer simply omits it — fall back to the old generic wording rather than
     // naming a cause list that isn't there.
-    const c = st.unsavedCauses;
-    const causes: string[] = [];
-    if (c?.sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
-    if (Array.isArray(c?.dirtyAssetPaths) && c.dirtyAssetPaths.length) causes.push(`${c.dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${c.dirtyAssetPaths.join(', ')}`);
-    if (Array.isArray(c?.dirtyScenes) && c.dirtyScenes.length) causes.push(`${c.dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${c.dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
+    const causes = describeUnsavedCauses(st.unsavedCauses);
     if (causes.length) {
       return (
         `the editor has UNSAVED work — ${causes.join(' AND ')} — and a build reads the scene FILE, ` +

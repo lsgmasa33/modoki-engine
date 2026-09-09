@@ -69,6 +69,17 @@ export function dirtySceneGuidsSnapshot(): ReadonlySet<string> {
   return new Set(dirtySceneGuids);
 }
 
+/** Is ANY base scene dirty? The allocation-free form of `dirtySceneGuidsSnapshot().size > 0`.
+ *
+ *  Exists for `hasUnsavedChanges()` (serialize.ts), which is called on hot paths and from a 1s
+ *  poll in `FindReferencesDialog` — the snapshot copies the whole Set to answer a question that
+ *  needs no copy. Every other cause already had a cheap predicate (`hasDirtyAssets`,
+ *  `hasPendingMeta`, `hasPendingBaseScenes`); this was the one that did not, and it is why
+ *  `hasUnsavedChanges()` could not be derived from the cause table without getting slower. */
+export function hasDirtyScenes(): boolean {
+  return dirtySceneGuids.size > 0;
+}
+
 export function isSceneDirty(guid: string): boolean {
   return dirtySceneGuids.has(guid);
 }

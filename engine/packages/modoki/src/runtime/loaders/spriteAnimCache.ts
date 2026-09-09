@@ -18,6 +18,7 @@
  */
 
 import { isGuid, registerAsset } from './assetManifest';
+import { emptyDocMap } from '../core/docKeys';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
@@ -78,7 +79,12 @@ function normalizeClip(raw: unknown): SpriteClip {
  *  `.spriteanim.json` on the first save (`xukhAP0gWNnD9MFRHb0P`). Mirrors
  *  `normalizeAnimationClip` / `normalizeTimeline`. */
 export function normalizeSpriteAnim(json: Partial<SpriteAnimDef> | undefined): SpriteAnimDef {
-  const clips: Record<string, SpriteClip> = {};
+  // `emptyDocMap()` (#986) — clip names come straight out of the `.spriteanim.json`. This one
+  // bag also fixes the two READS downstream (`getSpriteAnim(...)?.clips[name]` in
+  // `resolveSpriteClip`/`spriteAnimHasClip`), where `SpriteAnimator.clip: "toString"` authored in
+  // a scene made `spriteAnimHasClip` answer TRUE and `resolveSpriteClip` hand back a FUNCTION
+  // typed as a SpriteClip.
+  const clips: Record<string, SpriteClip> = emptyDocMap();
   const src = json?.clips;
   if (src && typeof src === 'object' && !Array.isArray(src)) {
     for (const [name, clip] of Object.entries(src)) clips[name] = normalizeClip(clip);

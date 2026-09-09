@@ -35,7 +35,7 @@ import {
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets, flushDirtyAssets,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
@@ -56,6 +56,7 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
+  causeSpecs, flushParked,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
@@ -243,16 +244,29 @@ function describeAnimationView() {
 
 function readEditorState() {
   const s = useEditorStore.getState();
+  // ⚠️ ONE reading of the unsaved-work state, projected into every field below (#972 P10). This
+  // used to call `hasUnsavedChanges()` twice, `getDirtyAssetPaths()` twice,
+  // `getPendingBaseScenePaths()` twice AND `unsavedChangeCauses()` once — four probes of one fact
+  // inside the function whose whole job is REPORTING that fact, which is #972's mechanism at its
+  // most literal. The registries are read between the calls by nothing here, so the old form was
+  // not wrong; it was simply two answers where one was needed, and two answers can drift.
+  //
+  // The top-level `dirtyAssetPaths`/`pendingBaseScenes` fields STAY (they are not folded into
+  // `unsavedCauses`): `modoki_persistence`'s tool text points agents at them, and removing them
+  // would be a wire break for no benefit. Same bytes on the wire as before, one computation behind
+  // them. `unsavedChanges` is derived from the same table, so it cannot disagree with `unsavedCauses`.
+  const _causes = unsavedChangeCauses();
+  const _unsavedAny = hasUnsavedChanges();
   return {
     scenePath: getCurrentScenePath(),
     // Live-world work not on disk. Anything reading the scene FILE (set_transform,
     // mutate_scene, build) is looking at a DIFFERENT world while this is true. (C7)
     // Also true while a dirty asset (below) is pending — see hasUnsavedChanges()'s own comment.
-    unsavedChanges: hasUnsavedChanges(),
+    unsavedChanges: _unsavedAny,
     // Pending 'manual'-mode writes to any ASSET_SCHEMA_TYPES doc (mcp-persistence.md
     // Phase 3) — omitted when empty (nothing pending has nothing to show). A dirty asset an
     // agent can't SEE is the same silent-loss trap `unsavedChanges` already exists to close.
-    ...(getDirtyAssetPaths().length ? { dirtyAssetPaths: getDirtyAssetPaths() } : {}),
+    ...(_causes.dirtyAssetPaths.length ? { dirtyAssetPaths: _causes.dirtyAssetPaths } : {}),
     // #844 — ADDITIVE, alongside `unsavedChanges`/`dirtyAssetPaths` above, never replacing them:
     // `modoki_persistence`'s tool text points agents at `dirtyAssetPaths` for wire compatibility,
     // and `guardUnsaved` (load-scene/new-scene, below) already has its own cause-naming logic. This
@@ -261,12 +275,12 @@ function readEditorState() {
     // cause (editorBackendRouter.ts's `/api/scene-mutate` guard, and modoki_build's
     // `unsavedChangesWarning`) — both read `get_editor_state` and had no cause to name until now.
     // Omitted when clean, matching `dirtyAssetPaths`'s omit-when-empty convention above.
-    ...(hasUnsavedChanges() ? { unsavedCauses: unsavedChangeCauses() } : {}),
+    ...(_unsavedAny ? { unsavedCauses: _causes } : {}),
     // Pending `baseScene` refs set in the Scene inspector on a scene the editor has NOT loaded
     // (#831) — omitted when empty, same rule. Reported separately from `dirtyAssetPaths` because
     // they are a different KIND of pending write (a single-field scene mutation, not a document)
     // and `discard_asset_edits` does not reach them.
-    ...(getPendingBaseScenePaths().length ? { pendingBaseScenes: getPendingBaseScenePaths() } : {}),
+    ...(_causes.pendingBaseScenes.length ? { pendingBaseScenes: _causes.pendingBaseScenes } : {}),
     playState: getPlayState(),
     runMode: getRunMode(),   // 'stopped' | 'scrub' | 'preview' | 'playing' (preview-mode-refactor)
     advancing: isAdvancing(), // false = a frozen frame (Play paused, or a paused preview)
@@ -1527,32 +1541,95 @@ export function registerEditorAgentOps(): void {
   // The OLD name is still honoured on the wire: these ops are reachable by modoki_eval and the
   // curl API, where there is no strict schema to turn a stale spelling into a refusal. At the TOOL
   // boundary it IS refused by name (§1), which is where a caller actually learns.
+  /** One agent-facing sentence per cause, or `null` when that cause is clean.
+   *
+   *  ⚠️ **`satisfies Record<keyof UnsavedCauses, …>` is the load-bearing part (#972 P2).** These
+   *  used to be five hand-written `if` pushes over a five-name destructure, so a sixth cause left
+   *  the refusal with an EMPTY list — `"load-scene: the editor has UNSAVED work — ."` — which is
+   *  S3.11's exact failure (a refusal naming the wrong cause, or none) one population later. Now a
+   *  sixth cause cannot compile until it has a sentence.
+   *
+   *  ⚠️ These are NOT `CAUSE_SPECS[k].label`, and the difference is deliberate. Those labels are
+   *  short human phrases for a BANNER read under a 5s countdown; these are for an AGENT deciding
+   *  what `discardUnsaved:true` would destroy, so they name the ops that produce the work and list
+   *  the actual paths. Same population, different audience — the table carries the population, each
+   *  consumer carries its own phrasing, and `satisfies` is what keeps the two in step. */
+  const CAUSE_REFUSALS = {
+    sceneDirty: (v) => (v
+      ? 'LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)'
+      : null),
+    dirtyAssetPaths: (v) => (v.length
+      ? `${v.length} pending ASSET edit(s) awaiting a save: ${v.join(', ')}` : null),
+    // A non-primary loaded scene still dirty (a base whose write failed in a partial save_all).
+    // Without it a refusal driven by this alone would name no cause.
+    dirtyScenes: (v) => (v.length
+      ? `${v.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${v.join(', ')}) — a previous save_all may have failed to write them`
+      : null),
+    // #831: a `baseScene` ref set in the Scene inspector on a scene the editor has not loaded.
+    // Neither a live-world edit nor an asset document, so before this row a refusal driven by it
+    // alone named no cause at all.
+    pendingBaseScenes: (v) => (v.length
+      ? `${v.length} pending base-scene ref(s) awaiting a save: ${v.join(', ')}` : null),
+    // #845: an Inspector import-settings edit (a `.meta.json` field) parked instead of written
+    // immediately. Same reasoning as the row above.
+    pendingImportSettings: (v) => (v.length
+      ? `${v.length} pending import-setting edit(s) awaiting a save: ${v.join(', ')}` : null),
+  } as const satisfies { [K in keyof UnsavedCauses]: (v: UnsavedCauses[K]) => string | null };
+
   const guardUnsaved = (op: string, discardUnsaved: boolean | undefined) => {
     if (discardUnsaved || !hasUnsavedChanges()) return;
-    // S3.11 — name the ACTUAL cause. `hasUnsavedChanges()` has two independent ones, and the
-    // fixed string blamed only the first: an agent whose pending work was a dirty
-    // particle/anim/timeline doc was sent looking for live entities it had never created. Both
-    // clear with save_all; the difference is what `discardUnsaved:true` would discard.
-    const { sceneDirty, dirtyAssetPaths, dirtyScenes, pendingBaseScenes, pendingImportSettings } = unsavedChangeCauses();
-    const causes: string[] = [];
-    if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
-    if (dirtyAssetPaths.length) causes.push(`${dirtyAssetPaths.length} pending ASSET edit(s) awaiting a save: ${dirtyAssetPaths.join(', ')}`);
-    // Third cause: a non-primary loaded scene still dirty (a base whose write failed in a
-    // partial save_all). Without it a refusal driven by this alone would name no cause.
-    if (dirtyScenes.length) causes.push(`${dirtyScenes.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${dirtyScenes.join(', ')}) — a previous save_all may have failed to write them`);
-    // Fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene the editor has
-    // not loaded. It is neither a live-world edit nor an asset document, so before this row a
-    // refusal driven by it alone named no cause at all — S3.11's failure, one population later.
-    if (pendingBaseScenes.length) causes.push(`${pendingBaseScenes.length} pending base-scene ref(s) awaiting a save: ${pendingBaseScenes.join(', ')}`);
-    // Fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked instead
-    // of written immediately. Same S3.11 reasoning as the fourth cause — it is neither a live-world
-    // edit nor an ASSET_SCHEMA_TYPES document, so without its own row a refusal driven by it alone
-    // would name no cause at all.
-    if (pendingImportSettings.length) causes.push(`${pendingImportSettings.length} pending import-setting edit(s) awaiting a save: ${pendingImportSettings.join(', ')}`);
+    // S3.11 — name the ACTUAL cause. The refusal used to build one fixed string blaming
+    // create_entity/duplicate_entity/prefab, so an agent whose pending work was a dirty
+    // particle/anim/timeline doc was sent looking for live entities it had never created. Every
+    // cause clears with save_all; the difference is what `discardUnsaved:true` would discard.
+    const c = unsavedChangeCauses();
+    const causes = (Object.keys(CAUSE_REFUSALS) as (keyof UnsavedCauses)[])
+      .map((k) => (CAUSE_REFUSALS[k] as (v: UnsavedCauses[typeof k]) => string | null)(c[k]))
+      .filter((m): m is string => m !== null);
+    // ⚠️ The CONSEQUENCE clause is a cause-shaped claim too, and it was the last hand-branch here
+    // (found by close-out's own sweep of #972's pattern). It read
+    // `sceneDirty ? … : 'the pending asset writes would be lost'`, so a refusal driven ONLY by a
+    // pending base-scene ref or a parked import-settings edit told the caller its ASSET writes were
+    // at risk — naming the wrong KIND of work, which is S3.11 again in the one sentence the fix
+    // above did not touch. The non-scene branch now points at the list rather than guessing a kind.
+    // ⚠️ **`discardUnsaved:true` does NOT drop parked work, and saying it does is a false
+    // instruction — the worst outcome on this surface (§0).** `guardUnsaved` is a pure gate
+    // (`if (discardUnsaved || !hasUnsavedChanges()) return;`) and nothing downstream discards:
+    // `clearDirtyAssets`/`clearPendingMeta`/`clearPendingBaseScenes` have ZERO production callers,
+    // so the parked registries are path-keyed module state that SURVIVES every world swap. An
+    // agent told otherwise passes `discardUnsaved:true`, believes it abandoned the edit, and the
+    // next gated op refuses for the identical cause with the identical advice — a loop.
+    //
+    // Three rounds of close-out review got the NOUN right and left the VERB wrong: "the pending
+    // asset writes" (wrong kind), then "the parked work" (wrong kind), then "the work named above"
+    // (right kind, still not true of what the remedy does). So the sentence is now split by what
+    // the swap actually destroys, and each half names an exit that exists.
+    const liveHalf = c.sceneDirty || c.dirtyScenes.length > 0;
+    const parkedHalf = (Object.entries(causeSpecs()) as Array<[keyof UnsavedCauses, { writtenBy: unknown }]>)
+      .some(([cause, spec]) => {
+        if (spec.writtenBy === 'scene-write') return false;
+        const v = c[cause];
+        return Array.isArray(v) ? v.length > 0 : Boolean(v);
+      });
+    const consequence = liveHalf
+      ? ' The live-world scene edits would be DESTROYED (gone from the world, the file, and the undo stack).'
+      : '';
+    // The parked half is the honest surprise: it is why this refusal exists at all for a
+    // parked-only cause, and it is the opposite of "would be lost".
+    const survives = parkedHalf
+      ? ' The parked entries are keyed by PATH and SURVIVE the swap — they stay pending either way.'
+      : '';
+    const remedy = ' Run modoki_save_all to write all of it.'
+      + (liveHalf ? ' `discardUnsaved:true` deliberately discards the LIVE-WORLD edits.' : '')
+      + (parkedHalf
+        ? ' ⚠️ `discardUnsaved:true` does NOT drop the parked entries — use'
+          + ' modoki_discard_asset_edits (parked asset documents),'
+          + ' modoki_write_asset_meta {discardUnsaved:true} (the import-settings park for the path it writes),'
+          + ' or modoki_persistence {op:"resolve-unsaved"} (discard by registry).'
+        : '');
     throw new Error(
-      `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
-      `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
-      `. Run modoki_save_all first, or pass discardUnsaved:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
+      `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world.`
+      + `${consequence}${survives}${remedy}`,
     );
   };
   registerAgentOp('load-scene', async (params) => {
@@ -1638,9 +1715,22 @@ export function registerEditorAgentOps(): void {
       // `saveAll`, which is where the flush lives. Then refuse the SCENE half, naming what did
       // happen: an error that hides completed work is as misleading as a success that hides a
       // failure.
-      const flushed = await flushDirtyAssets();
-      const note = flushed.saved.length
-        ? ` (${flushed.saved.length} parked asset doc(s) WERE written: ${flushed.saved.join(', ')})`
+      // ⚠️ EVERY parked flush, derived — this branch was the FIFTH save site spelling the set by
+      // hand, and it was short by two (#972 P12's own defect, found in close-out round three).
+      // `flushDirtyAssets()` alone left a parked import-settings edit and a pending base-scene ref
+      // unwritten here, while a human pressing Cmd+S in the same state wrote all three
+      // (`saveCommand.ts` was migrated in P12; its guard scans that file only, so nothing saw this).
+      // Both phases run back to back because this branch writes no scene — same shape as the
+      // preview fast path.
+      const before = await flushParked('before-scene');
+      const after = await flushParked('after-scene');
+      const flushedAll = [
+        ...before.dirtyAssetPaths.saved.map((pth) => `asset ${pth}`),
+        ...before.pendingImportSettings.saved.map((pth) => `import settings for ${pth}`),
+        ...after.pendingBaseScenes.saved.map((pth) => `base-scene ref on ${pth}`),
+      ];
+      const note = flushedAll.length
+        ? ` (${flushedAll.length} parked item(s) WERE written: ${flushedAll.join(', ')})`
         : '';
       throw new Error(
         'save-all: the editor is in PREFAB-EDIT mode — its world is a synthetic prefab scene, ' +
@@ -1661,10 +1751,17 @@ export function registerEditorAgentOps(): void {
     // — since #831 — pending base-scene refs (`r.baseScenes.failed`), which `/api/scene-mutate`
     // can refuse on its own run-mode or unsaved-work guard and which are then RE-PARKED. The
     // third was added with the field and not with the check, which is how the second one got here.
+    //
+    // ⚠️ **And it happened a FOURTH time** (#972 close-out review): `importSettings.failed` (#845)
+    // was added to `SaveResult` and to the TOAST, and never to this check — so a rejected
+    // `.meta.json` write returned `{ok:true}` to an agent while the edit stayed parked. The comment
+    // above narrated this exact mechanism about the third channel while the fourth was already
+    // missing from the line below it. Reading a warning is not the same as applying it.
     const sceneFails = (r.failed ?? []).map((f) => `scene ${f.path} (${f.reason})`);
     const assetFails = (r.assets?.failed ?? []).map((f) => `asset ${f.path} (${f.error})`);
     const baseSceneFails = (r.baseScenes?.failed ?? []).map((f) => `base-scene ref on ${f.path} (${f.error})`);
-    const allFails = [...sceneFails, ...assetFails, ...baseSceneFails];
+    const metaFails = (r.importSettings?.failed ?? []).map((f) => `import settings for ${f.path} (${f.error})`);
+    const allFails = [...sceneFails, ...assetFails, ...baseSceneFails, ...metaFails];
     if (allFails.length) {
       throw new Error(
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
@@ -1673,6 +1770,19 @@ export function registerEditorAgentOps(): void {
         `WITHOUT them. Fix the cause and call save_all again.`,
       );
     }
+    // Every parked item this save DID write, for the exits below. ⚠️ Named at ALL of them, not
+    // just the terminal throw: `playing` and `needs-path` each reported only `r.assets.saved` (or
+    // nothing), so an agent read them as "nothing was saved" and re-parked work already on disk —
+    // which is the reason the `playing` branch's own comment gives for having a note at all, then
+    // applied to one channel of three. (Close-out round three.)
+    const landed = [
+      ...(r.assets?.saved ?? []).map((pth) => `asset ${pth}`),
+      ...(r.importSettings?.saved ?? []).map((pth) => `import settings for ${pth}`),
+      ...(r.baseScenes?.saved ?? []).map((pth) => `base-scene ref on ${pth}`),
+    ];
+    const landedNote = landed.length
+      ? ` ${landed.length} parked item(s) DID land and are on disk: ${landed.join(', ')}.`
+      : '';
     if (r.saved) {
       return {
         ok: true, scenePath: r.path,
@@ -1684,23 +1794,39 @@ export function registerEditorAgentOps(): void {
         // Same promise for the base-scene refs: `setBaseScene` through the Inspector answers
         // "parked, not written", and this is where that is squared.
         ...(r.baseScenes?.saved.length ? { savedBaseScenes: r.baseScenes.saved } : {}),
+        // …and for parked import-settings edits (#845), the fourth channel — reported for the same
+        // reason as the two above, and missing for the same reason they each once were.
+        ...(r.importSettings?.saved.length ? { savedImportSettings: r.importSettings.saved } : {}),
       };
     }
     if (r.reason === 'needs-path') {
       throw new Error(
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
-        'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.scene.json" }.',
+        'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.scene.json" }.'
+        + landedNote,
       );
     }
     if (r.reason === 'playing') {
       // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent
       // reads this as "nothing was saved" and re-parks work that is already on disk.
-      const note = r.assets?.saved.length
-        ? ` The ${r.assets.saved.length} parked asset doc(s) WERE written (${r.assets.saved.join(', ')}) — those are authored documents and are not affected by run mode.`
+      // ⚠️ All three channels, not just asset docs. `flushPendingMeta` carries no run-mode refusal
+      // (unlike `/api/scene-mutate`), so an import-settings edit really does land while the editor
+      // is playing — and this note existed precisely so an agent would not re-park what is already
+      // on disk.
+      const note = landed.length
+        ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}) — those are authored documents and are not affected by run mode.`
         : '';
       throw new Error(`save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
     }
-    throw new Error(`save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — NOTHING was written to disk.`);
+    // ⚠️ "NOTHING was written" was a claim about the WHOLE save, and a failed scene write does not
+    // undo the parked flushes — so with anything in `landed` it was a real write reported as a
+    // no-op, the same defect the toast had. ("before it" is deliberately NOT said: the base-scene
+    // flush is `writtenBy:{flush:'after-scene'}` and runs AFTER the scene write, so two of the
+    // three lists land on the far side of it.)
+    throw new Error(
+      `save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
+      + (landed.length ? landedNote : ' Nothing was written.'),
+    );
   });
 
   /** The counterpart to `save-all` for PARKED ASSET WRITES: drop them instead of persisting them.
@@ -1736,12 +1862,39 @@ export function registerEditorAgentOps(): void {
     // deliver — §0 ranks a false success as the worst outcome on this surface. Reporting, NOT
     // discarding: widening what this op destroys would be a blast-radius change nobody asked for,
     // and `modoki_write_asset_meta {discardUnsaved:true}` is the named exit for a park.
+    // ⚠️ Every other PARKED cause, derived — not a hand-read of `pendingMeta` alone (#972). The
+    // report named parked import settings and said nothing about pending baseScene refs, so
+    // `all:true` implied a clean slate while leaving a whole registry pending and unmentioned.
+    // A sixth PARKED cause is disclosed the day it is added; a sixth `scene-write` one is not, and
+    // deliberately so — see the filter below. (The first version of this comment claimed "every
+    // cause this op does not own", which the filter directly beneath it had already stopped being
+    // true.)
     const parkedMeta = getPendingMetaPaths();
+    const parkedBaseScenes = getPendingBaseScenePaths();
+    const after = unsavedChangeCauses();
+    const leftBehind = (Object.entries(causeSpecs()) as Array<[keyof UnsavedCauses, { label: { bool?: string; noun?: string }; writtenBy: unknown }]>)
+      // PARKED work only — the registries this op could be mistaken for owning. A live-world scene
+      // edit (`writtenBy: 'scene-write'`) is a different KIND of pending work, is already reported
+      // by `unsavedChanges`, and is not discardable here at all — naming it would fire on nearly
+      // every call (an agent edit leaves `sceneDirty` true) and, worse, the advice below would be
+      // pointing at an exit that REFUSES it: `resolve-unsaved` excludes `liveScene` from
+      // `DiscardableRegistry` and throws. Listing an exit that does not exist costs the agent a
+      // turn, which is the failure the router calls out in as many words. (Close-out review.)
+      .filter(([cause, spec]) => cause !== 'dirtyAssetPaths' && spec.writtenBy !== 'scene-write')
+      .map(([cause, spec]) => {
+        const v = after[cause];
+        const n = Array.isArray(v) ? v.length : (v ? 1 : 0);
+        if (!n) return null;
+        const what = spec.label.noun ? `${n} ${spec.label.noun}(s)` : spec.label.bool;
+        return Array.isArray(v) ? `${what} — ${v.join(', ')}` : what;
+      })
+      .filter((m): m is string => m !== null);
     return {
       ok: true,
       ...r,
       remaining: getDirtyAssetPaths(),
       ...(parkedMeta.length ? { remainingImportSettings: parkedMeta } : {}),
+      ...(parkedBaseScenes.length ? { remainingBaseScenes: parkedBaseScenes } : {}),
       // Say plainly what was NOT undone. The parked write is gone; the value the editor is showing
       // is not, and an agent that reads the def back and sees its own edit must not conclude the
       // discard failed.
@@ -1750,11 +1903,12 @@ export function registerEditorAgentOps(): void {
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
           + 'def first if you need the value reverted too.'
         : 'Nothing was pending, so nothing changed.')
-        + (parkedMeta.length
-          ? ` NOT covered by this call: ${parkedMeta.length} parked import-settings edit(s) (.meta.json) `
-            + `are STILL pending — ${parkedMeta.join(', ')}. They live in a separate registry; `
-            + 'modoki_save_all flushes them, or modoki_write_asset_meta {discardUnsaved:true} drops '
-            + 'the one for the path it writes.'
+        + (leftBehind.length
+          ? ` NOT covered by this call — this op owns the dirty-ASSET registry only, and these `
+            + `parked edits are STILL pending: ${leftBehind.join('; ')}. modoki_save_all writes `
+            + 'them; modoki_write_asset_meta {discardUnsaved:true} drops the import-settings park '
+            + 'for the path it writes, and modoki_persistence {op:"resolve-unsaved"} can discard '
+            + 'these registries by name.'
           : ''),
     };
   });
@@ -2878,20 +3032,18 @@ export function registerEditorAgentOps(): void {
   /** For the argument-error message only — what is held right now, so a caller that mis-shaped its
    *  params still learns whether anything was in the way. */
   const describeHeldNow = (): string => {
+    // ⚠️ Built from `heldPathsFor` + `CAUSE_REGISTRY`, NOT a hand list of the five causes (#972 P9).
+    // It was one — sitting twelve lines below the `satisfies` tables that exist to forbid exactly
+    // that, written by the pass that had just fixed an instance of it. Two computations of one
+    // fact: the reply and this error message could describe the same state differently, and once
+    // did (in prefab-edit the reply named the prefab while this said "the open scene"). Reusing the
+    // resolver means a sixth cause reaches this message the day it is mapped, and means the two can
+    // no longer disagree.
     const c = unsavedChangeCauses();
-    const parts = [
-      ...c.dirtyAssetPaths.map((p) => `${p} (dirtyAsset)`),
-      ...c.pendingImportSettings.map((p) => `${p} (pendingMeta)`),
-      ...c.pendingBaseScenes.map((p) => `${p} (pendingBaseScene)`),
-      // ⚠️ Through `dirtyWorldTarget()`, not `getCurrentScenePath()` again. This line was the
-      // SIBLING of the bug that fix exists for (#889 phase 2 close-out sweep): it does not drop
-      // the row — the `??` fallback saves it — but in prefab-edit it labelled the held work "(the
-      // open scene)" when the truth is the prefab, so the reply and this error message described
-      // the same state differently. Two computations of one fact, which is #972's mechanism inside
-      // the file that fixed it.
-      ...(c.sceneDirty ? [`${dirtyWorldTarget().path} (liveScene)`] : []),
-      ...c.dirtyScenes.map((g) => `${g} (liveScene, by guid)`),
-    ];
+    const dirtyWorld = dirtyWorldTarget();
+    const parts = (Object.keys(CAUSE_REGISTRY) as (keyof UnsavedCauses)[])
+      .flatMap((cause) => heldPathsFor(cause, c, dirtyWorld)
+        .map(([path]) => `${path} (${CAUSE_REGISTRY[cause]})`));
     return parts.join(', ') || '(nothing)';
   };
 

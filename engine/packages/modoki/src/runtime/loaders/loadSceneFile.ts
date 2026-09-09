@@ -8,6 +8,7 @@ import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, g
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
+import { emptyDocMap } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { classifyFormatVersion } from '../core/formatVersion';
@@ -484,14 +485,19 @@ export function mergeOverrideMaps(
   a: Record<number, Record<string, Record<string, unknown>>> | undefined,
   b: Record<number, Record<string, Record<string, unknown>>>,
 ): Record<number, Record<string, Record<string, unknown>>> {
+  // ⚠️ The OUTER bag is keyed by localId (a number — safe). The INNER bags are keyed by TRAIT
+  // NAME read verbatim out of scene/prefab JSON, so they are `emptyDocMap()` (#986): a trait
+  // named `__proto__` would otherwise hit the setter and vanish, and the `out[k][t] ?? {}` read
+  // below would hand `Object.prototype`'s own members back as if they were authored overrides.
+  // Making the bag null-prototyped fixes BOTH the write and that read, in place.
   const out: Record<number, Record<string, Record<string, unknown>>> = {};
   for (const [lid, traits] of Object.entries(a ?? {})) {
-    out[Number(lid)] = {};
+    out[Number(lid)] = emptyDocMap();
     for (const [t, fields] of Object.entries(traits)) out[Number(lid)][t] = { ...fields };
   }
   for (const [lid, traits] of Object.entries(b)) {
     const k = Number(lid);
-    out[k] ??= {};
+    out[k] ??= emptyDocMap();
     for (const [t, fields] of Object.entries(traits)) out[k][t] = { ...(out[k][t] ?? {}), ...fields };
   }
   return out;
@@ -520,7 +526,9 @@ export function descendNestedOverrides(
   let forward: NestedOverridePaths | undefined;
   for (const [key, map] of Object.entries(paths)) {
     if (key === prefix) direct = map;
-    else if (key.startsWith(prefix + '.')) (forward ??= {})[key.slice(prefix.length + 1)] = map;
+    // `emptyDocMap()` (#986): the key is a dot-joined localId chain taken from the file, so a
+    // crafted `"3.__proto__"` would assign through the setter and lose the map silently.
+    else if (key.startsWith(prefix + '.')) (forward ??= emptyDocMap())[key.slice(prefix.length + 1)] = map;
   }
   return { direct, forward };
 }
@@ -534,7 +542,11 @@ export function mergeNestedOverridePaths(
 ): NestedOverridePaths | undefined {
   if (!a) return b;
   if (!b) return a;
-  const out: NestedOverridePaths = {};
+  // `emptyDocMap()` (#986). Both halves matter here: the writes are document-keyed, and the
+  // `out[k] ?` on the next line is a READ — against a plain object it is truthy for `toString`,
+  // which would pass `Object.prototype.toString` (a FUNCTION) into mergeOverrideMaps as an
+  // override map for it to `Object.entries`-walk.
+  const out: NestedOverridePaths = emptyDocMap();
   for (const [k, m] of Object.entries(a)) out[k] = m;
   for (const [k, m] of Object.entries(b)) out[k] = out[k] ? mergeOverrideMaps(out[k], m) : m;
   return out;
@@ -1737,7 +1749,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       // PrefabInstance (managed by the spawn), Transform (in rootTf), and
       // EntityAttributes (name/parentId come from the prefab + placement — applying
       // it wholesale would clobber the spawned root with the placeholder's file ids).
-      const rootExtraTraits: Record<string, unknown> = {};
+      // `emptyDocMap()` (#986) — `name` is a trait name straight out of the scene file, and this
+      // bag is then applied to the spawned prefab root, so a lost key is a lost authored trait.
+      const rootExtraTraits: Record<string, unknown> = emptyDocMap();
       for (const [name, data] of Object.entries(entry.traits)) {
         if (name === 'PrefabInstance' || name === 'Transform' || name === 'EntityAttributes') continue;
         rootExtraTraits[name] = data;

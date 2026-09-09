@@ -1,6 +1,7 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
@@ -425,7 +426,11 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     if (match) {
       // Preserve user-added traits the import doesn't emit (Animator, BoneAttachment…).
       for (const [tname, tdata] of Object.entries(match.traits)) {
-        if (!(tname in traits)) traits[tname] = tdata;
+        // ⚠️ `hasDocKey`/`putOwn` (#986). `tname` is a trait name from the EXISTING prefab JSON and
+        // `traits` is a spread of the fresh one, so a trait named after an Object.prototype member
+        // read as already-present and the user's preserved trait was DROPPED on re-import — a
+        // silent data loss, which is what this loop exists to prevent.
+        if (!hasDocKey(traits, tname)) putOwn(traits, tname, tdata);
       }
     }
     return { ...pe, localId: freshRemap.get(pe.localId)!, traits };

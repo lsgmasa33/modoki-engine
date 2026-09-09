@@ -22,11 +22,54 @@ let authoredEdits = false;
 type TestHandler = { owner: 'animation'; suspend: () => Promise<void>; resume: () => void; isLive?: () => boolean };
 let handler: TestHandler | null = null;
 
-vi.mock('../../packages/modoki/src/editor/scene/serialize', () => ({
-  saveAll: vi.fn(async () => { log.push('saveScene'); return { saved: true, path: '/s.json', reason: 'ok' }; }),
-  unsavedChangeCauses: () => ({ sceneDirty, dirtyAssetPaths: [], dirtyScenes: [], pendingBaseScenes: [] }),
-}));
-vi.mock('../../packages/modoki/src/editor/scene/dirtyAssets', () => ({
+// ⚠️ **PARTIAL, via `importOriginal` — and that is not a style choice (#972).** This mock used to
+// be a whole-module replacement listing `unsavedChangeCauses` by hand with FOUR of the five causes
+// (`pendingImportSettings` was missing), which is the shape `docs/falsifiable-tests.md` calls a
+// test that cannot fail: the suite built its own idea of the population, so a cause added to the
+// real table changed nothing here and no assertion could notice. It also broke outright the moment
+// `saveCommand.ts` imported one more symbol — an explicit-export-list mock fails at BINDING, not
+// at an assertion, so the error names the import rather than the staleness.
+//
+// The causes object is now the REAL one with only `sceneDirty` overridden, so its key set is
+// derived and can never fall behind the table. `causeSpecs`/`flushParked` are real too: they are
+// the mechanism under test in the ordering assertions, not collaborators to stub.
+vi.mock('../../packages/modoki/src/editor/scene/serialize', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/serialize')>();
+  return {
+    ...actual,
+    saveAll: vi.fn(async () => { log.push('saveScene'); return { saved: true, path: '/s.json', reason: 'ok' }; }),
+    // The real reader over the real (empty, in this suite) registries, with the one term this
+    // suite drives layered on top.
+    unsavedChangeCauses: () => ({ ...actual.unsavedChangeCauses(), sceneDirty }),
+  };
+});
+// Partial for the same reason as `dirtyAssets` below it: the cause table reads
+// `hasPendingBaseScenes`/`getPendingBaseScenePaths` from here.
+//
+// Logging this flush is what lets the fast-path test below see #972 P12 at all — before the fix
+// that branch never called it, and nothing in this suite could tell.
+vi.mock('../../packages/modoki/src/editor/scene/pendingBaseScene', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/pendingBaseScene')>();
+  return {
+    ...actual,
+    // ⚠️ Reports what is ACTUALLY parked, and takes it out — a faithful stand-in for the real
+    // flush minus the backend, not a canned answer. An earlier version of this returned a fixed
+    // path off a test flag, and a mutation check caught it: removing the `writtenBy` filter from
+    // `sceneNeedsWriting` left every test green, because no test had put anything in the registry
+    // for that filter to be wrong about. A stub that answers without consulting the state under
+    // test cannot fail (docs/falsifiable-tests.md).
+    flushPendingBaseScenes: vi.fn(async () => {
+      log.push('flushBaseScenes');
+      const saved = actual.getPendingBaseScenePaths();
+      actual.clearPendingBaseScenes();
+      return { saved, failed: [] };
+    }),
+  };
+});
+// Partial for the same reason: `serialize.ts` imports `hasDirtyAssets`/`getDirtyAssetPaths` from
+// here to build the cause table, and an explicit-list mock would bind them to `undefined`.
+vi.mock('../../packages/modoki/src/editor/scene/dirtyAssets', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../packages/modoki/src/editor/scene/dirtyAssets')>()),
   flushDirtyAssets: vi.fn(async () => { log.push('flushAssets'); return { saved: ['/a.anim.json'], failed: [] }; }),
 }));
 vi.mock('../../packages/modoki/src/editor/scene/prefabEdit', () => ({
@@ -55,6 +98,14 @@ vi.mock('../../packages/modoki/src/editor/scene/timelinePreview', async (importO
   };
 });
 
+import {
+  markBaseSceneEdit, clearPendingBaseScenes,
+} from '../../packages/modoki/src/editor/scene/pendingBaseScene';
+
+/** A scene whose `baseScene` ref is parked — authored on a scene the editor never loaded, which is
+ *  why it is flushed rather than written by the scene write. */
+const PARKED_SCENE = '/scenes/child.scene.json';
+
 const { runSaveAll } = await import('../../packages/modoki/src/editor/scene/saveCommand');
 
 function makeHandler(tag = 'A', live = true) {
@@ -67,7 +118,10 @@ function makeHandler(tag = 'A', live = true) {
   return h;
 }
 
-beforeEach(() => { log.length = 0; sceneDirty = false; sessionHeld = false; authoredEdits = false; handler = null; });
+beforeEach(() => {
+  log.length = 0; sceneDirty = false; sessionHeld = false; authoredEdits = false;
+  handler = null; clearPendingBaseScenes();
+});
 
 describe('runSaveAll inside a preview envelope', () => {
   it('skips the scene half entirely when the scene has nothing to write', async () => {
@@ -75,8 +129,41 @@ describe('runSaveAll inside a preview envelope', () => {
     const out = await runSaveAll();
 
     expect(out.target).toBe('assets');
-    expect(log).toEqual(['flushAssets']);            // no suspend, no scene write
+    // ⚠️ `flushBaseScenes` is here BECAUSE of #972 P12. This branch used to flush parked asset
+    // docs and import settings and stop, so a session holding only a parked base-scene ref got
+    // `{target:'assets'}` reporting success while the ref was never written. Still no suspend
+    // and no scene write — that is what makes it the fast path.
+    expect(log).toEqual(['flushAssets', 'flushBaseScenes']);
     expect(handler!.suspend).not.toHaveBeenCalled(); // the preview is NOT interrupted
+  });
+
+  it('REPORTS the base-scene refs it wrote on the fast path, so the toast can name them (#972 P12)', async () => {
+    // The regression in full. A parked base-scene ref does not make the scene half need writing
+    // (`baseScene` is authored on a scene the editor never loaded — `writtenBy` is a flush, not
+    // `'scene-write'`), so this branch is exactly the one such a ref takes. Before the fix the
+    // work was silently dropped AND unreported; the outcome must now carry it, because
+    // `toastForSave` is what tells the human their Cmd+S did something.
+    sessionHeld = true; handler = makeHandler();
+    markBaseSceneEdit(PARKED_SCENE, 'some-base-guid');   // a REAL parked ref, in the real registry
+    const out = await runSaveAll();
+
+    expect(out.target).toBe('assets');
+    expect(out.baseScenes).toEqual({ saved: [PARKED_SCENE], failed: [] });
+    expect(log).toContain('flushBaseScenes');
+    expect(log).not.toContain('saveScene');
+  });
+
+  it('a parked base-scene ref does NOT make the scene half need writing', async () => {
+    // The gate half of the same defect (#972 P3): `sceneNeedsWriting()` decides whether the
+    // preview is interrupted, and it used to be typed against a two-field structural subtype of
+    // the causes object — so it could not have seen this cause even if it wanted to. Interrupting
+    // a preview to write a scene with nothing to write is churn and a flicker; NOT interrupting it
+    // and also not flushing was the data loss. The right answer is fast path AND flush.
+    sessionHeld = true; handler = makeHandler();
+    markBaseSceneEdit(PARKED_SCENE, 'some-base-guid');   // a REAL parked ref, in the real registry
+    await runSaveAll();
+    expect(handler!.suspend, 'the preview must not be cycled for parked work that writes no scene')
+      .not.toHaveBeenCalled();
   });
 
   it('suspends BEFORE the scene is written, then resumes', async () => {

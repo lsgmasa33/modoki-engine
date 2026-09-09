@@ -137,7 +137,11 @@ export { ensureGuid, entityRef, type EntityRef } from './undo/entityRef';
 export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
-export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
+export {
+  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked,
+  type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
+  type FlushPhase, type ParkedFlushResults,
+} from './scene/serialize';
 // The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
 export { runSaveAll, toastForSave, sceneNeedsWriting, type SaveOutcome } from './scene/saveCommand';
 // #901 — the wording a modal editor shows when Save does not write. Exported for its unit test:

@@ -31,6 +31,7 @@
 
 import { isDebugMenuEnabled } from './debugMenuRegistry';
 import { notifyListeners } from '../core/notifyListeners';
+import { hasDocKey } from '../core/docKeys';
 
 /** A parameter's declared type. Deliberately a SMALL closed set.
  *
@@ -183,12 +184,21 @@ export function validateAgentToolArgs(
   const params = def.params ?? {};
   const declared = Object.keys(params);
   for (const key of Object.keys(args)) {
-    if (!(key in params)) {
+    // ⚠️ `hasDocKey`, NOT `key in params` (#986). `key` is caller-supplied — it arrives over the
+    // agent bridge as JSON — while `params` is a plain object literal on the tool definition. So
+    // `'toString' in params` is TRUE for every tool, and an arg by that name sailed past this
+    // check and was then never type-checked by the loop below, because `Object.entries(params)`
+    // does not yield it. That defeats the promise the docblock above makes, across the whole
+    // `modoki_*` surface: the unrecognised key was silently accepted, not rejected.
+    if (!hasDocKey(params, key)) {
       return `'${key}' is not a parameter of ${def.name}. It accepts: ${declared.length ? declared.join(', ') : '(no parameters)'}.`;
     }
   }
   for (const [key, spec] of Object.entries(params)) {
-    const value = args[key];
+    // The mirror of the above on the ACCEPT side: `args` is the caller's bag, so a declared
+    // param named after an Object.prototype member would read a FUNCTION out of it rather than
+    // `undefined`, skip the `required` arm, and then fail its type check with a confusing message.
+    const value = hasDocKey(args, key) ? args[key] : undefined;
     if (value === undefined) {
       if (spec.required) return `${def.name} requires '${key}' (${spec.type}).`;
       continue;

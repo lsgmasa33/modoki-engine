@@ -43,6 +43,10 @@ import {
 import {
   getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline, stampMetaReadPath,
 } from '../scene/pendingMeta';
+import {
+  getPendingBaseScenePaths, peekBaseSceneEdit, markBaseSceneEdit, discardPendingBaseScenes,
+} from '../scene/pendingBaseScene';
+import type { PathKeyedCause } from '../scene/serialize';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 
@@ -159,8 +163,8 @@ export function resolveBindingMoves<T extends { readonly label: string }>(
  *  next save. That discard is reported (never silent) for the same reason `discardDirtyAssets`
  *  and `dropParkedWriteFor` are — it destroys pending work.
  *
- *  Exported for tests; `applyAssetPathMoves` is the only production caller. */
-export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
+ *  One of the three repairs `applyMovesToParkedAssets` runs; exported for tests. */
+export function applyMovesToParkedDocs(moves: Iterable<PathMove>): string[] {
   const list = [...moves];
   // PLAN, then apply — the same two-phase shape as `resolveBindingMoves` above, and for a reason
   // that is not stylistic: applying in-loop writes the moved doc back into the registry, so a
@@ -206,7 +210,6 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
       notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
     }
   }
-  notes.push(...applyMovesToParkedMeta(list));
   return notes;
 }
 
@@ -284,6 +287,80 @@ export function applyMovesToParkedMeta(moves: Iterable<PathMove>): string[] {
       notes.push(`moved the unsaved import-settings edit parked for ${from} → ${to}`);
     }
   }
+  return notes;
+}
+
+/** The same rule for PARKED `baseScene` REFS (#831) — a move carries the edit, a delete drops it.
+ *
+ *  ⚠️ **This registry was MISSING from the repair until #972, and the loss was silent.** The
+ *  sibling docblock above says "the two registries must move together"; there were three, and this
+ *  one was referenced nowhere in this file. So: park a `baseScene` ref on a scene the editor has
+ *  not loaded, rename or delete that scene, and the park stayed keyed to the dead path — it never
+ *  flushed, and the next `save_all` reported success with the edit gone. Reachable from
+ *  `modoki_move_asset` and `modoki_delete_asset` as well as the Project panel.
+ *
+ *  ⚠️ **`peekBaseSceneEdit` is TRI-STATE and the middle state is load-bearing.** `undefined` means
+ *  nothing is parked; `null` means a parked edit that CLEARS the ref. Testing `if (ref)` would drop
+ *  the clear on the floor and leave the old base attached after the move — so the test is
+ *  `!== undefined`, and `null` is carried through as a value.
+ *
+ *  No CAS baseline to carry, unlike both siblings: `markBaseSceneEdit` takes none. The ref itself
+ *  is a GUID, which removes the other half of the problem — moving the BASE scene cannot strand
+ *  anything, because the parked value does not name a path. Only moving the scene the ref sits ON
+ *  matters, and that is exactly what this repair keys on.
+ *
+ *  One of the three repairs `applyMovesToParkedAssets` runs; exported for tests. */
+export function applyMovesToParkedBaseScenes(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  // PLAN then apply, for the same chained-move reason spelled out in the siblings above.
+  const planned: { from: string; to: string | null; ref: string | null | undefined }[] = [];
+  for (const path of getPendingBaseScenePaths()) {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;
+      if (to !== path) planned.push({ from: path, to, ref: peekBaseSceneEdit(path) });
+      break;
+    }
+  }
+  const notes: string[] = [];
+  for (const { from } of planned) discardPendingBaseScenes([from]);
+  for (const { from, to, ref } of planned) {
+    if (to === null) {
+      notes.push(`dropped the unsaved baseScene ref parked for ${from} (its scene was deleted)`);
+    } else if (ref !== undefined) {
+      markBaseSceneEdit(to, ref);
+      notes.push(`moved the unsaved baseScene ref parked for ${from} → ${to}`);
+    }
+  }
+  return notes;
+}
+
+/** Every PATH-KEYED registry's move repair, keyed by the cause it belongs to.
+ *
+ *  ⚠️ **`satisfies Record<PathKeyedCause, …>` is the load-bearing part.** `PathKeyedCause` is
+ *  derived from `CAUSE_SPECS` (serialize.ts) as the causes with `keying: 'path'` — the ones a
+ *  rename or delete can strand on a dead key. Declare a fourth such cause and this table fails to
+ *  compile until it has a repair, which is the only thing standing between a new registry and the
+ *  silent loss #972 describes: this repair covered two of three for months, and the missing one
+ *  had no test, no type error and no runtime complaint.
+ *
+ *  A cause with `keying: 'none'` or `'guid'` is deliberately absent — the live world has no path to
+ *  remap, and a scene guid does not change when its file moves. */
+const PARKED_MOVE_REPAIRS = {
+  dirtyAssetPaths: applyMovesToParkedDocs,
+  pendingImportSettings: applyMovesToParkedMeta,
+  pendingBaseScenes: applyMovesToParkedBaseScenes,
+} as const satisfies Record<PathKeyedCause, (moves: Iterable<PathMove>) => string[]>;
+
+/** Apply `moves` to EVERY path-keyed registry, and report what each one did.
+ *
+ *  The one entry point — `applyAssetPathMoves` is its only production caller. It used to be the
+ *  dirty-asset repair with the sidecar one chained onto its tail, which is how the third registry
+ *  came to be missed: there was no place that named the set, so nothing could be short. */
+export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  const notes: string[] = [];
+  for (const repair of Object.values(PARKED_MOVE_REPAIRS)) notes.push(...repair(list));
   return notes;
 }
 
@@ -380,6 +457,16 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   notes.push(...applyMovesToSelection(list));
   // …and the folder-tree sets. Same argument again: three of thirteen sites remapped them by hand.
   remapFolderSets(list);
+  // ⚠️ **Reported HERE, by the pass that did the work (#898).** The notes used to be logged at the
+  // panel call sites — `logBindingChanges(applyAssetPathMoves(...))` — and #867 then moved the
+  // repair to `/api/move-file`, which runs it FIRST from the backend. `applyMove` matches on
+  // `from`, so by the time the panel's own call ran nothing was at `from` any more: it returned
+  // `[]` and logged nothing. The notes reached an AGENT caller through the HTTP response's
+  // `repaired` field and a human never saw them, including the ones that say a human's unsaved
+  // edit was dropped. Logging where they are PRODUCED means whichever pass actually repairs
+  // something is the one that says so, and the second pass has nothing to report because it did
+  // nothing — which is correct rather than merely quiet.
+  for (const n of notes) console.log(`[Assets] ${n}`);
   return notes;
 }
 

@@ -178,7 +178,10 @@ const defaultDirtyProbe: DirtyProbe = async () => {
  *  is the singular noun for a cause reported as a list of paths ("N <noun>(s)"). */
 interface CauseLabel { readonly bool?: string; readonly noun?: string }
 
-const CAUSE_LABELS: Record<string, CauseLabel> = {
+// Exported ONLY so `tests/architecture/causeLabelsAgree.test.ts` can compare it against
+// `CAUSE_SPECS[k].label` — these phrases are duplicated across a zone boundary this module must
+// not import statically, so a test is the only thing that can stop them drifting.
+export const CAUSE_LABELS: Record<string, CauseLabel> = {
   sceneDirty: { bool: 'unsaved scene changes' },
   dirtyAssetPaths: { noun: 'unsaved asset edit' },
   dirtyScenes: { noun: 'unsaved edit in another loaded scene' },

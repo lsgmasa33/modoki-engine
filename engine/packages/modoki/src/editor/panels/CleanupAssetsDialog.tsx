@@ -31,10 +31,13 @@ interface UnusedResponse {
    *  reached agents through the MCP surface while the HUMAN path — the one that actually deletes —
    *  threw it away. Absent when the editor is clean, never an empty array, so presence IS the signal.
    *
-   *  ⚠️ Read from the RESPONSE rather than re-polled client-side. `FindReferencesDialog` grows its
-   *  own banner from `unsavedChangeCauses()` and checks only `sceneDirty || dirtyAssetPaths` — a
-   *  hand-list that misses three of the five causes (#972). The server's note is derived from the
-   *  same probe that computed this very answer, so it cannot disagree with it. */
+   *  ⚠️ Read from the RESPONSE rather than re-polled client-side, and that is the rule rather than
+   *  this dialog's preference: the server's note is derived from the same probe that computed this
+   *  very answer, so it cannot disagree with it, and that probe carries the type-level
+   *  exhaustiveness check that a client-side hand-list cannot. `FindReferencesDialog` was the
+   *  counter-example — it grew its own banner from `unsavedChangeCauses()` and checked
+   *  `sceneDirty || dirtyAssetPaths`, missing three of the five causes — and #972 moved it onto
+   *  this same `staleInputsNote`. */
   staleInputs?: Array<{ path: string; registry: string; detail?: string }>;
   staleInputsUnknown?: { reason: string };
   staleInputsNote?: string;

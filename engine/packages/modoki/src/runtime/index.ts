@@ -16,6 +16,11 @@ export {
   collectUnknownFields, mergeUnknownFields,
   type FormatVerdict, type UnreadableReason, type ClassifyOptions,
 } from './core/formatVersion';
+// #986's two primitives, next to formatVersion because they answer the same question one layer
+// down: `collectUnknownFields` already builds ITS bag with a null prototype, and these are how
+// every other document-keyed bag in the engine says the same thing. Exported so a GAME can use the
+// one vocabulary instead of hand-rolling a third (see docKeys.ts § NAMING).
+export { emptyDocMap, hasDocKey, putOwn } from './core/docKeys';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';

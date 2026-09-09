@@ -56,6 +56,7 @@ import {
   type ShaderParam, type ShaderParamType, type ShaderManifest, type ShaderParamSchema,
 } from '../core/shaderSchema';
 import { assetPlumbing } from '../core/assetPlumbing';
+import { hasDocKey } from '../core/docKeys';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -472,7 +473,13 @@ export function makePixiShaderInstance(program: PixiShaderProgram, texture: Text
     resources.matUniforms = new UniformGroup(buildUniformValues(program, values) as any);
   }
   for (const [key] of program.textureParams) {
-    const t = extraTextures?.[key] ?? Texture.WHITE;
+    // ⚠️ `hasDocKey` on the READ (#986): `extraTextures` is a caller-supplied bag and `key` a
+    // manifest-declared param name, so `extraTextures['toString']` would bind a FUNCTION where a
+    // Texture is expected — and the `?? Texture.WHITE` fallback cannot catch it, because a
+    // function is not nullish. `resources` itself stays an ordinary object: it is handed to
+    // PixiJS's Shader constructor, and a null prototype across that boundary is untested risk for
+    // no gain (a uniform cannot be named `__proto__` in WGSL).
+    const t = (extraTextures && hasDocKey(extraTextures, key) ? extraTextures[key] : undefined) ?? Texture.WHITE;
     resources[key] = t.source;
     resources[`${key}Smp`] = t.source.style;
   }

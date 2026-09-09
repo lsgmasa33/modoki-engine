@@ -19,6 +19,10 @@
  */
 
 import fs from 'fs';
+// The GRANULAR subpath, never the `@modoki/engine/runtime` barrel: this is a Node-side Vite
+// backend and the barrel drags the browser runtime (DOM lib, three, pixi) into its tsconfig.
+// Same reason formatVersion and notifyListeners have their own export entries.
+import { hasDocKey } from '@modoki/engine/runtime/core/docKeys';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
@@ -96,7 +100,10 @@ function detectFieldTypos(
     if (!ts) continue; // unknown trait → warn-but-load, not a hard error
     const real = Object.keys(ts.fields);
     for (const f of Object.keys(op.fields)) {
-      if (f in ts.fields) continue;
+      // `hasDocKey` (#986): `f` comes from the request body's `op.fields` and `ts.fields` is a
+      // code-declared trait schema, so a field named `toString` was accepted as REAL and never
+      // reached the `bad` typo list this loop exists to build.
+      if (hasDocKey(ts.fields, f)) continue;
       const key = `${op.trait}.${f}`;
       if (bad.includes(key)) continue;
       bad.push(key);

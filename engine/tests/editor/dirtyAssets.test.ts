@@ -229,6 +229,60 @@ describe('save_all flushes the dirty-asset registry alongside the scene write', 
     clearPendingBaseScenes();
   });
 
+  // The FOURTH partial-failure channel (#845's `importSettings`), added as a FIELD without a check
+  // exactly as the second and third were — the comment above `allFails` narrated that mechanism
+  // about the third while the fourth was already missing from the line below it. Found in #972's
+  // close-out; a rejected `.meta.json` write returned `{ok:true}` while the edit stayed parked.
+  it('the save_all AGENT OP fails when a parked IMPORT-SETTINGS write was rejected', async () => {
+    const { parkMetaEdit, stampMetaReadPath, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths } =
+      await import('../../packages/modoki/src/editor/scene/pendingMeta');
+    clearPendingMeta(); clearMetaBaselines();
+    setCurrentScenePath('/assets/scenes/dirty-meta-fail.json');
+    markSceneSaved();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/write-meta')) {
+        return { ok: false, status: 500, json: async () => ({ ok: false, error: 'disk full' }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    parkMetaEdit('/assets/tex.png', stampMetaReadPath({ maxSize: 1024 }, '/assets/tex.png'));
+
+    await expect(runAgentOp('save-all', {}))
+      .rejects.toThrow(/PARTIALLY failed[\s\S]*import settings for \/assets\/tex\.png/);
+    expect(getPendingMetaPaths(), 'a rejected sidecar write must stay pending')
+      .toEqual(['/assets/tex.png']);
+    clearPendingMeta(); clearMetaBaselines();
+  });
+
+  // "A real write reported as a no-op" — the toast had it, and so did FOUR exits of this op.
+  it('a FAILED scene save still names the parked items that DID land', async () => {
+    setCurrentScenePath('/assets/scenes/dirty-scene-writefail.json');
+    markSceneSaved();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      // The ASSET write lands; the SCENE write does not.
+      if (url.includes('/api/write-file')) {
+        return { ok: false, status: 500, json: async () => ({ ok: false, error: 'disk full' }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    // Parked directly rather than through `particle-set`: this test is about the save-all EXIT,
+    // not about how the entry got there, and the op needs the effect in the live cache first.
+    markAssetDirty('/assets/fx/landed.particle.json', 'particle',
+      { emitter: { shape: 'point' }, particle: { lifetime: 1 } }, 'agent');
+    expect(getDirtyAssetPaths(), 'non-vacuity: the entry must really be parked')
+      .toEqual(['/assets/fx/landed.particle.json']);
+
+    // ⚠️ The negative half is the point: the old message said "NOTHING was written to disk" while
+    // the parked flush had already landed, so an agent re-parked work that was on disk.
+    let msg = '';
+    try { await runAgentOp('save-all', {}); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toMatch(/DID land and are on disk[\s\S]*landed\.particle\.json/);
+    expect(msg, 'a real write must not be reported as a no-op').not.toMatch(/Nothing was written/);
+    expect(getDirtyAssetPaths(), 'and it really did leave the registry').toEqual([]);
+  });
+
   it('the save_all AGENT OP still reports success when everything lands', async () => {
     stubFetch();
     setCurrentScenePath('/assets/scenes/dirty-op-ok.json');

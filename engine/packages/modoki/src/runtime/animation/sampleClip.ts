@@ -12,6 +12,7 @@ import type { World } from 'koota';
 // and 2D deform all use it too, so it is not an animation detail. Imported, NOT re-exported:
 // one source of truth per symbol, so nobody has to wonder which path is canonical.
 import { buildEntityIndex, resolveTrackTarget, type Ent, type EntityIndex } from '../core/ecs/entityIndex';
+import { emptyDocMap, hasDocKey, putOwn } from '../core/docKeys';
 import { getTraitByName, type TraitMeta } from '../core/ecs/traitRegistry';
 import { markUIDirty } from '../core/uiDirty';
 import { evalTrackValue } from './curveEval';
@@ -80,7 +81,12 @@ export function applyClipAtTime(
     if (!meta || meta.category === 'tag') continue;
     if (!entity.has(meta.trait)) continue;
 
-    const options = track.type === 'enum' ? meta.fields[track.field]?.options : undefined;
+    // `hasDocKey` (#986): `track.field` is a field name from the `.anim.json`, `meta.fields` a
+    // code-declared schema — so `meta.fields['toString']` is a FUNCTION, `?.options` on it is
+    // `undefined`, and an enum track named that silently took the non-enum path instead of the
+    // `continue` two lines down.
+    const fieldMeta = hasDocKey(meta.fields, track.field) ? meta.fields[track.field] : undefined;
+    const options = track.type === 'enum' ? fieldMeta?.options : undefined;
     // A dynamic-enum field (no static option list) can't be safely decoded from an
     // index — skip rather than write a raw number into a string field.
     if (track.type === 'enum' && !options) continue;
@@ -88,7 +94,8 @@ export function applyClipAtTime(
 
     const wkey = targetId * _WRITE_KEY_STRIDE + traitNumericId(meta);
     let w = writes.get(wkey);
-    if (!w) { w = { entity, meta, patch: {} }; writes.set(wkey, w); }
+    // `emptyDocMap()` (#986) — `patch` is keyed by clip field names straight from the file.
+    if (!w) { w = { entity, meta, patch: emptyDocMap() }; writes.set(wkey, w); }
     w.patch[track.field] = value;
     applied++;
   }
@@ -110,7 +117,17 @@ export function applyClipAtTime(
     let changed = false;
     for (const [f, v] of Object.entries(w.patch)) {
       if (f.includes('.')) { next = setPath(next, f, v); changed = true; }
-      else { next[f] = v; if (!Object.is(current[f], v)) changed = true; }
+      // ⚠️ `putOwn`/`hasDocKey`, not `next[f] = v` / `current[f]` (#986). `next` is a spread of
+      // the LIVE trait object and is handed straight to koota's `entity.set`, so it must keep
+      // an ordinary prototype — which rules out emptyDocMap here. `putOwn` DEFINES the key, so
+      // a field named `__proto__` becomes a real own key instead of replacing the prototype of
+      // an object about to be stored in the ECS. The `current[f]` read is the same bug on the
+      // compare side: it returns a FUNCTION for a prototype member name, so `changed` was
+      // always true and the held-pose short-circuit above it never fired.
+      else {
+        putOwn(next, f, v);
+        if (!Object.is(hasDocKey(current, f) ? current[f] : undefined, v)) changed = true;
+      }
     }
     if (!changed) continue;
     w.entity.set(w.meta.trait, next);

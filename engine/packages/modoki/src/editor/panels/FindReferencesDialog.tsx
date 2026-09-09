@@ -18,7 +18,7 @@ import { useEditorStore } from '../store/editorStore';
 import { backendFetch } from '../backend/editorBackend';
 import { selectedAssetTypeFor } from './AssetRefField';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
-import { unsavedChangeCauses } from '../scene/serialize';
+import { hasUnsavedChanges } from '../scene/serialize';
 import { formatChainStep, originBadge, type FindReferencesResultLike, type RefHitLike, type RefNodeLike } from './findReferencesFormat';
 
 const btn = (extra?: React.CSSProperties): React.CSSProperties => ({
@@ -31,14 +31,6 @@ const rowStyle: React.CSSProperties = {
   padding: '6px 10px', borderBottom: '1px solid #2a2a3a', fontSize: 11, cursor: 'pointer',
 };
 
-/** Name the pending asset docs in the staleness banner, capped so a long dirty list does not
- *  blow out the dialog: first 3 by name, then "and N more". */
-function describeDirtyAssetPaths(paths: string[]): string {
-  const shown = paths.slice(0, 3).join(', ');
-  const rest = paths.length - 3;
-  return rest > 0 ? `${shown} and ${rest} more` : shown;
-}
-
 export default function FindReferencesDialog() {
   const info = useEditorStore((s) => s.findReferencesTarget);
   const close = useEditorStore((s) => s.closeFindReferences);
@@ -48,7 +40,15 @@ export default function FindReferencesDialog() {
   const [data, setData] = useState<FindReferencesResultLike | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [causes, setCauses] = useState<ReturnType<typeof unsavedChangeCauses> | null>(null);
+  /** Has unsaved work appeared SINCE the scan? A boolean, not an enumeration of causes.
+   *
+   *  ⚠️ The banner's content comes from the SERVER (`staleInputsNote`), not from here (#972 P4).
+   *  This used to hold `unsavedChangeCauses()` and the banner was built from `sceneDirty ||
+   *  dirtyAssetPaths` — two of the five causes — so a user holding only a parked import-settings
+   *  edit, a pending baseScene ref, or a dirty non-primary scene got NO banner at all, in the one
+   *  feature whose whole purpose is not lying about what references what. The route already
+   *  discloses all of it, derived from the probe that carries the exhaustiveness check. */
+  const [unsavedNow, setUnsavedNow] = useState(false);
   // Why a result row did nothing when clicked. A dead click is its own small lie:
   // the user cannot tell "this row is not clickable" from "the editor ignored me".
   const [navNote, setNavNote] = useState<string | null>(null);
@@ -70,7 +70,7 @@ export default function FindReferencesDialog() {
     // Read live, not disk: a target the user just wired up but hasn't saved yet
     // would otherwise read as "0 references" — the exact wrong "unreferenced"
     // verdict this whole feature exists to prevent (see the CLAUDE.md invariant).
-    setCauses(unsavedChangeCauses());
+    setUnsavedNow(hasUnsavedChanges());
     setNavNote(null);
     try {
       const res = await backendFetch(`/api/find-references?target=${encodeURIComponent(t)}`);
@@ -94,7 +94,7 @@ export default function FindReferencesDialog() {
   // is a handful of cheap comparisons (serialize.ts), not a scan.
   useEffect(() => {
     if (!target) return;
-    const id = setInterval(() => setCauses(unsavedChangeCauses()), 1000);
+    const id = setInterval(() => setUnsavedNow(hasUnsavedChanges()), 1000);
     return () => clearInterval(id);
   }, [target]);
 
@@ -172,16 +172,25 @@ export default function FindReferencesDialog() {
           (a derived sprite, a slice, an atlas member).
         </div>
 
-        {causes && (causes.sceneDirty || causes.dirtyAssetPaths.length > 0) && (
+        {data?.staleInputsNote && (
           <div data-testid="find-references-stale" style={{ color: '#e0a030', fontSize: 11, marginBottom: 10, padding: '6px 8px', border: '1px solid #7a5a20', borderRadius: 4, background: '#2a2410' }}>
-            ⚠ This scan reads FILES ON DISK.
-            {causes.sceneDirty && (
-              ' There are unsaved live-world edits — a reference you just wired up (or removed) may not show here yet.'
-            )}
-            {causes.dirtyAssetPaths.length > 0 && (
-              ` The scan could not see refs inside ${describeDirtyAssetPaths(causes.dirtyAssetPaths)}.`
-            )}
+            ⚠ This scan reads FILES ON DISK. {data.staleInputsNote}
             {' '}Save, then re-open this dialog.
+          </div>
+        )}
+
+        {/* Work that appeared AFTER the scan. The note above is a fact about the scan and cannot
+            know about it — a user who reads a clean result, edits, and looks back would otherwise
+            be trusting an answer that has since gone stale. Only shown when the scan itself
+            disclosed nothing, because when it did, that banner already says to re-open.
+            ⚠️ Gated on `!loading && data` too: `unsavedNow` is sampled at scan START, so without
+            that this claimed work had "appeared since this scan ran" while the scan was still in
+            flight and before any result existed — a sentence that was false in its most common
+            firing. (Close-out review.) */}
+        {unsavedNow && !loading && data && !data.staleInputsNote && (
+          <div data-testid="find-references-drift" style={{ color: '#e0a030', fontSize: 11, marginBottom: 10, padding: '6px 8px', border: '1px solid #7a5a20', borderRadius: 4, background: '#2a2410' }}>
+            ⚠ Unsaved work has appeared since this scan ran, so this answer may no longer be
+            accurate. Save, then re-open this dialog.
           </div>
         )}
 

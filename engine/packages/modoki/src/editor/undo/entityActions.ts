@@ -2,6 +2,7 @@
  *  Wraps runtime entityUtils with undo/redo tracking. */
 
 import * as THREE from 'three';
+import { emptyDocMap, hasDocKey } from '../../runtime/core/docKeys';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { reparentRefusal } from '../../runtime/core/ecs/hierarchy';
@@ -307,8 +308,11 @@ export function pasteTraitValuesWithUndo(entityIds: number[], meta: TraitMeta, v
   if (targets.length === 0) return;
   writeTraitFieldsPerEntityWithUndo(targets, meta, (oldFull) => {
     if (!oldFull) return {};
-    const patch: Record<string, unknown> = {};
-    for (const key of Object.keys(oldFull)) if (key in values) patch[key] = values[key];
+    // `emptyDocMap()`/`hasDocKey` (#986): `oldFull`'s keys come from readTraitDataFull, whose AoS
+    // fallback enumerates a live trait object populated from scene JSON, and `values` is the
+    // clipboard bag — so a prototype-named key both tested present and pasted a FUNCTION.
+    const patch: Record<string, unknown> = emptyDocMap();
+    for (const key of Object.keys(oldFull)) if (hasDocKey(values, key)) patch[key] = values[key];
     return cloneTraitValues(patch);
   }, `Paste ${meta.name} Values`);
 }

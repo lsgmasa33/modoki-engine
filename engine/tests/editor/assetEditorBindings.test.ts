@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // one call site, and widening the public surface for a test is a cost with no buyer.
 import {
   resolveBindingMoves, ASSET_EDITOR_BINDINGS, applyMovesToParkedAssets,
-  applyAssetPathMoves, applyMovesToSelection,
+  applyAssetPathMoves, applyMovesToSelection, unbindDeletedAssetEditors,
 } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { applyMove, planFilesDropMoves } from '../../packages/modoki/src/editor/utils/assetPaths';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
@@ -28,6 +28,10 @@ import {
   peekMetaBaseline,
   stampMetaReadPath,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
+import {
+  markBaseSceneEdit, clearPendingBaseScenes, getPendingBaseScenePaths, peekBaseSceneEdit,
+} from '../../packages/modoki/src/editor/scene/pendingBaseScene';
+import { causeSpecs } from '../../packages/modoki/src/editor/scene/serialize';
 
 /** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
  *
@@ -704,5 +708,133 @@ describe('resolveBindingMoves keeps a bound editor\'s NAME fresh (#867 review)',
       [{ from: '/assets/anim', to: '/assets/clips', prefix: true, name: 'clips' }],
     );
     expect(change.name).toBeUndefined();
+  });
+});
+
+/** The registry the repair FORGOT (#972 P11).
+ *
+ *  `applyMovesToParkedAssets` remapped `dirtyAsset` and `pendingMeta` and not `pendingBaseScene` —
+ *  that registry was not referenced in `assetEditorBindings.ts` at all. So a `.scene.json` with a
+ *  parked `baseScene` ref, renamed or deleted, stranded the edit on a dead path: it never flushed,
+ *  and the next `save_all` reported success with the human's edit gone. Reachable from the Project
+ *  panel, `modoki_move_asset` and `modoki_delete_asset`.
+ *
+ *  ⚠️ Gating those routes on unsaved work would be the WRONG fix and is recorded as such in
+ *  `unsavedGateCoverage.test.ts` — it would refuse a rename BECAUSE the file being renamed has
+ *  unsaved edits, which is the case the repair exists to carry across. */
+describe('applyMovesToParkedAssets — parked baseScene refs (#972 P11)', () => {
+  const CHILD = '/assets/scenes/child.scene.json';
+  const RENAMED = '/assets/scenes/renamed.scene.json';
+  const ASSET_DOC = '/assets/mats/m.mat.json';
+  const ASSET_DOC_MOVED = '/assets/mats/moved.mat.json';
+  beforeEach(() => { clearPendingBaseScenes(); clearDirtyAssets(); clearPendingMeta(); clearMetaBaselines(); });
+  afterEach(() => { clearPendingBaseScenes(); clearDirtyAssets(); clearPendingMeta(); clearMetaBaselines(); });
+
+  it('MOVES the parked ref with a renamed scene, keeping the unsaved edit', () => {
+    markBaseSceneEdit(CHILD, 'base-guid-1');
+    const notes = applyMovesToParkedAssets([{ from: CHILD, to: RENAMED }]);
+
+    expect(getPendingBaseScenePaths()).toEqual([RENAMED]);
+    expect(peekBaseSceneEdit(RENAMED)).toBe('base-guid-1');
+    expect(peekBaseSceneEdit(CHILD)).toBeUndefined();
+    expect(notes.join(' ')).toContain(RENAMED);
+  });
+
+  it('DROPS the parked ref for a deleted scene — a save must not resurrect it', () => {
+    markBaseSceneEdit(CHILD, 'base-guid-1');
+    const notes = applyMovesToParkedAssets([{ from: CHILD, to: null }]);
+
+    expect(getPendingBaseScenePaths()).toEqual([]);
+    expect(notes.join(' ')).toContain(CHILD); // never silent: this destroys pending work
+  });
+
+  it('carries a parked CLEAR across the move — `null` is an edit, not an absence', () => {
+    // `peekBaseSceneEdit` is tri-state: `undefined` = nothing parked, `null` = a parked edit that
+    // REMOVES the ref. A repair testing `if (ref)` drops the clear and leaves the old base
+    // attached after the rename — the human's edit silently reverted rather than merely lost.
+    markBaseSceneEdit(CHILD, null);
+    applyMovesToParkedAssets([{ from: CHILD, to: RENAMED }]);
+
+    expect(getPendingBaseScenePaths()).toEqual([RENAMED]);
+    expect(peekBaseSceneEdit(RENAMED)).toBeNull();
+  });
+
+  it('follows a FOLDER move, like the other two registries', () => {
+    markBaseSceneEdit(CHILD, 'base-guid-1');
+    applyMovesToParkedAssets([{ from: '/assets/scenes', to: '/assets/levels', prefix: true }]);
+    expect(getPendingBaseScenePaths()).toEqual(['/assets/levels/child.scene.json']);
+  });
+
+  it('all THREE path-keyed registries move together in one call', () => {
+    // The invariant the docblock claimed while covering two of three. One move, three registries,
+    // and the count is derived from the cause table rather than written as `3` — so a fourth
+    // path-keyed cause makes this fail instead of quietly asserting a stale number.
+    const pathKeyed = Object.entries(causeSpecs()).filter(([, spec]) => spec.keying === 'path');
+    expect(pathKeyed.length, 'the path-keyed set changed — this test asserts every member moves')
+      .toBeGreaterThanOrEqual(3);
+
+    // A `.scene.json` is not an ASSET_SCHEMA_TYPES doc, so the dirty-asset half is parked on a
+    // real asset type at the SAME path prefix — the point is that one move call reaches all
+    // three registries, not that one file is in all three at once.
+    markAssetDirty(ASSET_DOC, 'material', { a: 1 }, 'panel');
+    parkMetaEdit(CHILD, stampMetaReadPath({ maxSize: 2048 }, CHILD));
+    markBaseSceneEdit(CHILD, 'base-guid-1');
+
+    applyMovesToParkedAssets([
+      { from: CHILD, to: RENAMED },
+      { from: ASSET_DOC, to: ASSET_DOC_MOVED },
+    ]);
+
+    expect(getDirtyAssetPaths()).toEqual([ASSET_DOC_MOVED]);
+    expect(getPendingMetaPaths()).toEqual([RENAMED]);
+    expect(getPendingBaseScenePaths()).toEqual([RENAMED]);
+  });
+});
+
+/** The repair REPORTS what it did, from the pass that did it (#898).
+ *
+ *  `applyAssetPathMoves`' notes are the only account a human gets of a repair that moved — or
+ *  DROPPED — their unsaved work. They used to be logged at the panel call sites; #867 then moved
+ *  the repair to `/api/move-file`, which runs it first from the backend. `applyMove` matches on
+ *  `from`, so the panel's own second call found nothing at `from`, returned `[]`, and logged
+ *  nothing. The notes still reached an AGENT through the response's `repaired` field, so the seam
+ *  looked healthy from every automated angle while the human path went silent. */
+describe('applyAssetPathMoves reports its own repairs (#898)', () => {
+  const SRC = '/assets/anim/idle.anim.json';
+  const DST = '/assets/anim/idle2.anim.json';
+  let logged: string[];
+  let spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logged = [];
+    clearDirtyAssets(); clearPendingBaseScenes();
+    spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logged.push(a.join(' ')); });
+  });
+  afterEach(() => { spy.mockRestore(); clearDirtyAssets(); clearPendingBaseScenes(); });
+
+  it('logs a moved parked edit', () => {
+    markAssetDirty(SRC, 'animation', { duration: 3 }, 'panel');
+    applyAssetPathMoves([{ from: SRC, to: DST }]);
+    expect(logged.join('\n')).toContain(SRC);
+    expect(logged.join('\n')).toContain(DST);
+  });
+
+  it('logs a DROPPED parked edit — the case where a human loses work', () => {
+    markAssetDirty(SRC, 'animation', { duration: 3 }, 'panel');
+    unbindDeletedAssetEditors([SRC]);
+    expect(logged.join('\n')).toMatch(/dropped .*idle\.anim\.json/);
+  });
+
+  it('logs the base-scene repair too — the registry that had no reporting because it had no repair', () => {
+    markBaseSceneEdit('/assets/scenes/child.scene.json', 'base-guid-1');
+    applyAssetPathMoves([{ from: '/assets/scenes/child.scene.json', to: '/assets/scenes/moved.scene.json' }]);
+    expect(logged.join('\n')).toContain('moved.scene.json');
+  });
+
+  it('says NOTHING when the move touched nothing — silence must mean "no repair", not "not reported"', () => {
+    // The other half of #898: a second pass over an already-repaired move is genuinely a no-op, and
+    // must stay quiet. If this ever logs, the notes have started describing work that did not happen.
+    applyAssetPathMoves([{ from: '/assets/nothing/here.json', to: '/assets/nothing/there.json' }]);
+    expect(logged).toEqual([]);
   });
 });

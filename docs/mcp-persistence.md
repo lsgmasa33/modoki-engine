@@ -910,18 +910,92 @@ registry module at all.
 A probe assembled by enumerating registry modules is therefore **vacuous for the open scene**, and
 nothing goes red.
 
-So the probe does not enumerate modules. **`unsavedChangeCauses()` (`serialize.ts`) is already the
-single-source-of-truth total**, and `resolve-unsaved` derives its registry list from it: two tables
-`satisfies Record<keyof UnsavedCauses, …>`, so adding a sixth cause is a **compile error in three
-places** until it is mapped. A hand-written list here would be `CLAUDE.md`'s "hand-maintained list
-of fields we read", and it would already have been wrong by one.
+So the probe does not enumerate modules. **`unsavedChangeCauses()` (`serialize.ts`) is the
+single-source-of-truth total**, and `resolve-unsaved` derives its registry list from it. A
+hand-written list here would be `CLAUDE.md`'s "hand-maintained list of fields we read", and it would
+already have been wrong by one.
 
-| Registry name (the wire vocabulary) | Cause it answers for | Keyed by |
+| Registry name (the wire vocabulary) | Cause it answers for | Keyed by | Written by |
+|---|---|---|---|
+| `dirtyAsset` | `dirtyAssetPaths` | asset-root URL (`path`) | flush, **before** the scene write |
+| `pendingMeta` | `pendingImportSettings` | asset-root URL (`path`) | flush, **before** the scene write |
+| `pendingBaseScene` | `pendingBaseScenes` | asset-root URL (`path`) | flush, **after** the scene write |
+| `liveScene` | `sceneDirty` (the PRIMARY — a boolean) **and** `dirtyScenes` (the BASES — guids) | resolved renderer-side (`none` / `guid`) | the scene write itself |
+
+### The cause table is the SCHEMA, not just the value (#972)
+
+`unsavedChangeCauses()` used to publish a **value** and no **schema**. Consumers that must act
+*per cause* — test it, gate on it, name it, flush it, remap it across a rename — had nowhere to ask
+*"what are the causes, and what is each one like"*, so **ten sites re-stated the population by
+hand**, and TypeScript checked none of them: a hand-written subset of a wider object is a legal
+structural subtype. Three of the ten were already under-reporting when this was found, one of them
+losing a human's edit on Cmd+S.
+
+**`CAUSE_SPECS` (`serialize.ts`) is now the root, and the cause TYPE is derived from it** — the
+inversion is the point. Each cause declares a cheap `has`, a reporting `read`, a `keying`
+(`'none' | 'guid' | 'path'`), a `writtenBy`, and a human `label`. Three subsets are derived from it
+and must never be re-listed:
+
+| Derived from | Consumed by | What a missing member costs |
 |---|---|---|
-| `dirtyAsset` | `dirtyAssetPaths` | asset-root URL |
-| `pendingMeta` | `pendingImportSettings` | asset-root URL |
-| `pendingBaseScene` | `pendingBaseScenes` | asset-root URL |
-| `liveScene` | `sceneDirty` (the PRIMARY — a boolean) **and** `dirtyScenes` (the BASES — guids) | resolved renderer-side |
+| `keying: 'path'` → `PathKeyedCause` | the move repair (`PARKED_MOVE_REPAIRS`) | a rename strands the edit on a dead path; it never flushes |
+| `writtenBy: {flush}` → `flushParked(phase)` | all three save sites | Cmd+S reports success and never writes it |
+| `writtenBy: 'scene-write'` → `sceneNeedsWriting()` | the preview-envelope decision | a preview is cycled for nothing, or not cycled when it should be |
+
+⚠️ **`hasUnsavedChanges()` is DERIVED, not merely guarded**, and that distinction is load-bearing:
+every refusal in the repo gates on that boolean, so a cause it cannot see is not unsaved work
+*anywhere*, whatever the consumers do. `has` stays a first-class field so the derivation is still
+allocation-free — it is called on hot paths and from a 1 Hz poll.
+
+⚠️ **Never widen `UnsavedCauses` to `Record<string, …>`.** Every `satisfies Record<keyof
+UnsavedCauses, …>` in the repo silently stops checking anything the moment `keyof` stops being a
+finite union. Guarded by a type-level assertion in `tests/editor/unsavedCauseTable.test.ts`.
+
+#### Which failure mode a consumer gets, and why it is not one rule
+
+> **Inside the module boundary → exhaustive derivation (fail to COMPILE).
+> Across a zone or wire boundary → structural enumeration (fail READABLY).**
+
+Across a wire, a *newer* renderer sending a sixth cause is exactly as likely as an older one sending
+four, and a hand-written type drops the new one **silently**. That is a runtime problem no compiler
+on the receiving side can see, so only structural enumeration survives it. `app/debug/hmrStaleness.ts`
+and `engine/tools/modoki-mcp/src/context.ts` are the two CORRECT instances — both type the causes
+loosely and humanize an unknown key. **Do not "tidy" either into a table.**
+
+Measured, adding a sixth cause to `CAUSE_SPECS` and to nothing else: **9 compile errors across 9
+sites**, 2 runtime test failures (the backstop for vitest, which erases types), and the two
+degrading consumers stay green and NAME the new cause. That both halves behave differently is the
+check — not that everything goes red.
+
+⚠️ **A `.tsx` dialog showing an unsaved-work caveat renders the route's `staleInputsNote`; it does
+not re-derive the causes.** The server's note comes from the same probe that computed the result, so
+it cannot disagree with it, and that probe carries the exhaustiveness check. A boolean
+`hasUnsavedChanges()` poll for drift *after* the scan is fine and is a different question. Guarded by
+`tests/architecture/staleDisclosureIsServerDerived.test.ts`.
+
+#### The accepted residue
+
+`SaveResult`'s three flush fields (`assets`, `importSettings`, `baseScenes`) are still named by hand:
+they carry deliberately different shapes and collapsing them is a wire change. So a sixth *flushing*
+cause can no longer be **forgotten** — it reaches disk — but it can be left **unnamed in the report**,
+i.e. the work is saved and the toast does not mention it. Stated rather than pretended away.
+
+#### Why `/api/move-file` and `/api/delete-asset` are EXEMPT rather than gated
+
+Gating them would refuse a rename *because* the file being renamed has unsaved edits — precisely the
+case the repair exists to carry across. A file must stay renameable while it is being edited. They
+instead repair every path-keyed registry, **by derivation**, and the exemption in
+`tests/architecture/unsavedGateCoverage.test.ts` is void if that stops being true. "It repairs them"
+was true of the hand-written version too, right up until it was two of three and nothing said so.
+
+#### Incident: Cmd+S under a timeline preview flushed 2 of 3 (#972 P12)
+
+`runSaveAllOnce`'s preview fast path called `flushDirtyAssets` + `flushPendingMeta` and stopped, and
+its gate `sceneNeedsWriting()` was typed against a two-field structural subtype of the causes object
+— so it could not see a pending base-scene ref at all. With a preview live and *only* such a ref
+parked, Cmd+S took the fast path, returned `{target:'assets'}` reporting success, and the edit was
+never written. No refusal, no toast, no error. The flush set was spelled by hand at three save sites
+and one of the three was short.
 
 **The guid/path mismatch is reconciled in the RENDERER, and that is not an implementation detail.**
 Node holds the manifest and *could* map path→guid — but only the renderer knows which scenes are

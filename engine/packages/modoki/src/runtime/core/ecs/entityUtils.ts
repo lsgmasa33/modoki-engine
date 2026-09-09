@@ -16,6 +16,7 @@ import { compareSiblings } from './entityOrder';
 // this file's `setStructureCallback` wiring below just to reach it.
 import { addDirtyListener, fireDirtyListeners } from '../renderDirty';
 import { notifyListeners } from '../notifyListeners';
+import { emptyDocMap } from '../docKeys';
 export { addDirtyListener, fireDirtyListeners };
 
 // Structure-dirty subscriber set — notifies Hierarchy, Console, etc. when
@@ -157,7 +158,11 @@ export function readTraitDataFull(entityId: number, meta: TraitMeta): Record<str
   const data = entity.get(meta.trait) as Record<string, unknown>;
   const schema = (meta.trait as { schema?: unknown }).schema;
   const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
-  const result: Record<string, unknown> = {};
+  // `emptyDocMap()` (#986). The AoS fallback on the line above enumerates `Object.keys(data)` — a
+  // live trait object populated from scene JSON — so these keys are document-derived on the NORMAL
+  // path, not only in some edge case, and this bag is handed to the Inspector and the component
+  // clipboard.
+  const result: Record<string, unknown> = emptyDocMap();
   for (const key of keys) result[key] = data[key];
   return result;
 }
@@ -174,7 +179,9 @@ export function cloneTraitValues(values: Record<string, unknown>): Record<string
   try {
     return structuredClone(values);
   } catch {
-    const out: Record<string, unknown> = {};
+    // `emptyDocMap()` (#986) — the same key space as readTraitDataFull's result, which is what
+    // this usually clones.
+    const out: Record<string, unknown> = emptyDocMap();
     for (const [k, v] of Object.entries(values)) {
       try { out[k] = structuredClone(v); } catch { out[k] = v; }
     }

@@ -201,14 +201,6 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
   };
 }
 
-/** Report what an asset move/delete did to the open asset editors (#186). Silent when it
- *  touched none, which is almost always — but a binding that silently repoints or closes is
- *  how the original bug stayed invisible, so the one case that matters says so. Shared with
- *  Assets.tsx's own forward-path call sites (rescan/drop/paste) so there is one definition. */
-export function logBindingChanges(notes: string[]): void {
-  for (const n of notes) console.log(`[Assets] ${n}`);
-}
-
 /** Build the undo/redo for a single-asset rename (Assets.tsx `handleRename`, #308). The
  *  forward rename already happened by the time this is pushed; `undo`/`redo` each move the
  *  file back/forward and only remap the asset-editor binding when the move actually landed —
@@ -229,7 +221,7 @@ export function makeRenameUndo(params: {
     undo: async () => {
       const { ok, status } = await moveFileToStatus(toPath, originalPath);
       if (ok) {
-        logBindingChanges(applyAssetPathMoves([{ from: toPath, to: originalPath, name: originalName }]));
+        applyAssetPathMoves([{ from: toPath, to: originalPath, name: originalName }]);
       } else {
         reportUndoFailure({
           direction: 'Undo', label, userFixable: status === COLLISION_STATUS,
@@ -241,7 +233,7 @@ export function makeRenameUndo(params: {
     redo: async () => {
       const { ok, status } = await moveFileToStatus(originalPath, toPath);
       if (ok) {
-        logBindingChanges(applyAssetPathMoves([{ from: originalPath, to: toPath, name: newName }]));
+        applyAssetPathMoves([{ from: originalPath, to: toPath, name: newName }]);
       } else {
         reportUndoFailure({
           direction: 'Redo', label, userFixable: status === COLLISION_STATUS,
@@ -343,7 +335,7 @@ export function makeFolderRenameUndo(params: {
       const { ok, status } = await moveFileToStatus(newPath, oldPath);
       if (ok) {
         // (`expanded`/`pendingFolders` are remapped by applyAssetPathMoves itself now — #867.)
-        logBindingChanges(applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]));
+        applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]);
       } else {
         reportUndoFailure({
           direction: 'Undo', label, userFixable: status === COLLISION_STATUS,
@@ -355,7 +347,7 @@ export function makeFolderRenameUndo(params: {
     redo: async () => {
       const { ok, status } = await moveFileToStatus(oldPath, newPath);
       if (ok) {
-        logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
+        applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]);
       } else {
         reportUndoFailure({
           direction: 'Redo', label, userFixable: status === COLLISION_STATUS,
@@ -420,8 +412,8 @@ export function makePasteUndo(params: {
           }
         }
       }
-      if (op === 'cut') logBindingChanges(applyAssetPathMoves(back));
-      else logBindingChanges(unbindDeletedAssetEditors(deletedCopies));
+      if (op === 'cut') applyAssetPathMoves(back);
+      else unbindDeletedAssetEditors(deletedCopies);
       if (failed.length > 0) {
         reportUndoFailure({
           direction: 'Undo', label, userFixable: collision,
@@ -445,7 +437,7 @@ export function makePasteUndo(params: {
           if (ok) undone.delete(to); else failed.push(`${from} → ${to}`);
         }
       }
-      if (op === 'cut') logBindingChanges(applyAssetPathMoves(fwd));
+      if (op === 'cut') applyAssetPathMoves(fwd);
       if (failed.length > 0) {
         reportUndoFailure({
           direction: 'Redo', label, userFixable: collision,
@@ -491,7 +483,7 @@ export function makeFilesDropUndo(params: {
         if (ok) { back.push({ from: m.to, to: m.from, prefix: m.prefix }); undone.add(m.to); }
         else { failed.push(`${m.to} → ${m.from}`); if (status === COLLISION_STATUS) collision = true; }
       }
-      logBindingChanges(applyAssetPathMoves(back));
+      applyAssetPathMoves(back);
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Undo', label, userFixable: collision, detail: `not moved back: ${failed.join(', ')}` });
       }
@@ -507,7 +499,7 @@ export function makeFilesDropUndo(params: {
         if (ok) { fwd.push({ from: m.from, to: m.to, prefix: m.prefix }); undone.delete(m.to); }
         else { failed.push(`${m.from} → ${m.to}`); if (status === COLLISION_STATUS) collision = true; }
       }
-      logBindingChanges(applyAssetPathMoves(fwd));
+      applyAssetPathMoves(fwd);
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, userFixable: collision, detail: `not moved: ${failed.join(', ')}` });
       }
@@ -574,7 +566,7 @@ export function makeFileImportUndo(params: {
         const ok = await deleteAssetFile(f.path);
         if (ok) deleted.push(f.path); else failed.push(f.path);
       }
-      logBindingChanges(unbindDeletedAssetEditors(deleted));
+      unbindDeletedAssetEditors(deleted);
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed: ${failed.join(', ')}` });
       }

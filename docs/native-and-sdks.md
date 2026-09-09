@@ -53,6 +53,57 @@ build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to co
 podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
 `"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
 green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
+⚠️ **Since #981 this is no longer only a comment** — `npm run test:native` compiles the class and
+`ios/class/capacitor-litert-lm` FAILS on every run with the exact error above. That red is
+deliberate and tracked as #991; it is left standing rather than marked expected-to-fail.
+
+### Compiling the plugin CLASSES — two integration shapes (#981)
+
+Until #981 **nothing in this repo compiled a Capacitor plugin class.** `npm run verify` is vitest;
+`test:native`'s `SWIFT_LEGS`/`JAVA_LEGS` compile the extracted, dependency-free *cores*
+(`OtaCore`, `IapCore`). The `CAPPlugin` subclass Capacitor actually dispatches into was built by
+nothing — which is why both known defects of that kind were found by *reading*: `@PluginMethod` on a
+private helper in `ModokiIapPlugin.java` (#971), and a **missing** `@PluginMethod` on `products()`
+that broke every Android shelf call from that plugin's first commit.
+
+`npm run test:native` now carries an `ios/class/<plugin>` leg per package. Measured 2026-09-09 on
+the reference Mac, warm SPM cache: **4–18 s each, ~59 s for all eight, and 56 s for the entire
+gate.** Cold, each package pays its SPM fetch once (AppsFlyer, AppLovin and Adjust are real network
+artifacts); the numbers above are steady-state.
+
+⚠️ **The obvious design — one `xcodebuild -scheme` per package — is wrong, and measurably.** It
+reports a false FAILURE on `capacitor-modoki-ota` (`cannot find type 'OtaState' in scope`) against
+code that ships and works. Two integration shapes exist and **the leg must match the package's own**:
+
+| shape | who | what the leg builds |
+|---|---|---|
+| `spm` | 6 of 8 — appsflyer, game-debug, litert-lm, modoki-iap, both applovin-max copies, adjust | the package's declared product, as `Package.swift` links it |
+| `flat` | `capacitor-modoki-ota` | a **synthesised** single-target package holding plugin + core sources together |
+
+The `flat` shape exists because `OtaPlugin.swift` deliberately carries **no `import
+ModokiOtaCore`**: it ships as loose pbxproj file references compiled directly into the consuming
+app's target, so the core's types are already in scope — and its `Package.swift` header says the
+manifest is there "for package resolution/documentation … NOT how it's actually linked into an app".
+Building the declared product tests a shape nothing ships.
+
+⚠️ **`iap` and `ota` made opposite choices for the identical problem** (`import ModokiIapCore` vs.
+flat compilation) and nothing records why. The gate models both rather than editing a
+device-verified shipping path to make a test tidier (owner, 2026-09-09). Converging them would make
+`ota` a plain `spm` row.
+
+**Two things the table does not contain, on purpose.** The package set is discovered by **globbing**
+`engine/packages/capacitor-*` and `<PROJECT_ROOT_DIRS>/*/packages/capacitor-*`, never listed — #981's
+own hand-written enumeration missed `games/3d-test/packages/capacitor-applovin-max`, a second copy of
+court's. And the xcodebuild **scheme is read from `Package.swift`'s `name:`**, which is what a
+package's scheme actually is (measured: not the product name). `nativePluginLegCoverage.test.ts`
+enforces the coverage in both directions during `npm run verify`, so a new plugin package fails until
+somebody decides its shape.
+
+⚠️ **What a green `ios/class/*` leg does NOT prove.** It compiles: the Swift parses, resolves its
+imports and type-checks against the real Capacitor headers. **No test runs**, so it says nothing
+about behaviour — and it says nothing about the **Android** plugin classes, which are still compiled
+by nothing (#992; the blocker is `android.jar` plus the Capacitor AAR's `classes.jar` on a harness
+that is deliberately plain-JVM).
 
 ### The SceneDelegate trap — a silently dead iOS debug bridge (#368)
 

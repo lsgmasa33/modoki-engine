@@ -39,6 +39,10 @@
  *     GameDebugPlugin keeps its own lease state behind a platform timer. Closing that gap means
  *     extracting a pure LeaseCore into the shipping sources — a behavioural native change needing
  *     device verification, out of scope for #376 and recorded in both test headers.
+ *   - The `ios/class/*` legs (#981) COMPILE each plugin class, which nothing did before: they
+ *     prove the Swift parses, resolves its imports and type-checks against the real Capacitor
+ *     headers. They prove NOTHING about behaviour — no test runs — and they say nothing about the
+ *     ANDROID plugin classes, which stay uncompiled by anything (see nativePluginLegs.mjs).
  */
 
 import fs from 'node:fs';
@@ -49,6 +53,7 @@ import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
 import { buildZip } from './ota/zip.mjs';
+import { PLUGIN_CLASS_LEGS, schemeFor, legLabel } from './nativePluginLegs.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pluginDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-game-debug');
@@ -181,6 +186,107 @@ for (const leg of SWIFT_LEGS) {
   else run(leg.name, 'swift', ['test', '--package-path', leg.packagePath], leg.env ? { env: { ...process.env, ...leg.env() } } : {});
 }
 
+// ── iOS: the plugin CLASS legs (#981) ───────────────────────────────────────────────────
+/** The legs above compile the extracted CORES. NONE of them compiles a plugin CLASS — the
+ *  `CAPPlugin` subclass Capacitor dispatches into — which is exactly where the annotation-level
+ *  defects live (#971 found `@PluginMethod` on a private helper; a MISSING one on `products()`
+ *  broke every Android shelf call from that plugin's first commit). The table, the two integration
+ *  shapes and why the shapes cannot be collapsed: engine/scripts/nativePluginLegs.mjs.
+ *
+ *  ⚠️ A FRESH derivedDataPath per leg, for the same reason JAVA_LEGS uses a fresh classes dir: a
+ *  leftover build product would let this pass against code that no longer compiles. The SPM
+ *  *fetch* cache is global and unaffected, which is why the whole set is ~60s warm rather than
+ *  minutes. */
+for (const leg of PLUGIN_CLASS_LEGS) {
+  const name = `ios/class/${legLabel(leg.dir)}`;
+  const dir = path.join(repoRoot, leg.dir);
+  if (process.platform !== 'darwin') { skip(name, `xcodebuild needs macOS (this is ${process.platform})`); continue; }
+  if (!has('xcodebuild')) { skip(name, 'no `xcodebuild` on PATH — install Xcode'); continue; }
+  if (!fs.existsSync(path.join(dir, 'Package.swift'))) { skip(name, `no package at ${leg.dir}`); continue; }
+
+  let buildDir = dir;
+  let scheme = schemeFor(dir);
+  let tempRoot = null;
+
+  if (leg.shape === 'flat') {
+    // Synthesise the module the consuming APP actually compiles: plugin + core sources together,
+    // no import between them. Building the package's own declared product instead reports a false
+    // FAILURE here (`cannot find type 'OtaState' in scope`) on code that ships and works.
+    const missing = (leg.flatSources ?? []).filter((rel) => !fs.existsSync(path.join(dir, rel)));
+    if (!leg.flatSources?.length) { skip(name, 'flat leg declares no flatSources — misconfigured row'); continue; }
+    if (missing.length) { skip(name, `flat source(s) missing: ${missing.join(', ')}`); continue; }
+
+    // Reuse the REAL manifest's capacitor-swift-pm pin rather than writing a second one that can
+    // drift. ⚠️ If the package declares any OTHER remote dependency, a synthesised single-target
+    // package would not carry it — so SKIP loudly instead of building something that is not what
+    // ships. Only `ota` is flat today and it declares exactly the one.
+    const manifestSrc = fs.readFileSync(path.join(dir, 'Package.swift'), 'utf8');
+    const remotes = [...manifestSrc.matchAll(/\.package\(\s*url:\s*"([^"]+)"[^)]*?from:\s*"([^"]+)"/g)];
+    const capacitor = remotes.find(([, url]) => url.includes('capacitor-swift-pm'));
+    if (!capacitor) { skip(name, 'flat leg: no capacitor-swift-pm dependency found in the real manifest'); continue; }
+    if (remotes.length > 1) {
+      skip(name, `flat leg: package declares ${remotes.length} remote dependencies and a synthesised single-target package would carry only capacitor-swift-pm — extend the synthesiser before trusting this leg`);
+      continue;
+    }
+
+    // ⚠️ The synthesis FLATTENS by basename into one directory, so two sources sharing a basename
+    // (a plausible `Plugin/Util.swift` + `Core/Util.swift` pairing) would silently overwrite each
+    // other and the leg would compile a SMALLER set than the app does — and still report PASS. No
+    // collision today; this is what stops the day there is one from being invisible.
+    const bases = leg.flatSources.map((rel) => path.basename(rel));
+    if (new Set(bases).size !== bases.length) {
+      skip(name, `flat leg: two flatSources share a basename (${bases.join(', ')}) and the synthesis flattens into one directory — they would overwrite each other`);
+      continue;
+    }
+
+    scheme = `Flat${path.basename(leg.dir).replace(/[^A-Za-z0-9]/g, '')}`;
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-flat-plugin-'));
+    const srcDir = path.join(tempRoot, 'Sources', 'Flat');
+    fs.mkdirSync(srcDir, { recursive: true });
+    for (const rel of leg.flatSources) fs.copyFileSync(path.join(dir, rel), path.join(srcDir, path.basename(rel)));
+    fs.writeFileSync(path.join(tempRoot, 'Package.swift'), [
+      '// swift-tools-version: 5.9',
+      '// GENERATED by engine/scripts/test-native.mjs — models the flat app-target compilation.',
+      'import PackageDescription',
+      `let package = Package(`,
+      `    name: "${scheme}",`,
+      '    platforms: [.iOS(.v15)],',
+      '    products: [.library(name: "Flat", targets: ["Flat"])],',
+      `    dependencies: [.package(url: "${capacitor[1]}", from: "${capacitor[2]}")],`,
+      '    targets: [.target(name: "Flat", dependencies: [',
+      '        .product(name: "Capacitor", package: "capacitor-swift-pm"),',
+      '        .product(name: "Cordova", package: "capacitor-swift-pm"),',
+      '    ], path: "Sources/Flat")]',
+      ')',
+      '',
+    ].join('\n'));
+    buildDir = tempRoot;
+  }
+
+  if (!scheme) { skip(name, `could not read the package name from ${leg.dir}/Package.swift — that name IS the xcodebuild scheme`); continue; }
+
+  const derived = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-plugin-class-dd-'));
+  try {
+    run(name, 'xcodebuild', ['-scheme', scheme, '-destination', 'generic/platform=iOS', '-derivedDataPath', derived, 'build'], { cwd: buildDir });
+    // A leg that CANNOT pass yet (see `knownFail` in nativePluginLegs.mjs). Two rewrites, and the
+    // second is the one that keeps this honest:
+    //   FAIL -> KNOWN-FAIL, off the exit code, so the gate keeps a GREEN BASELINE and a later FAIL
+    //           still means "a change broke something" rather than "read the summary carefully".
+    //   PASS -> FAIL, because the marker is now STALE. That is what makes this expire by itself
+    //           instead of becoming a standing exemption nobody revisits.
+    if (leg.knownFail) {
+      const r = results[results.length - 1];
+      if (r?.name === name) {
+        if (r.status === 'FAIL') { r.status = 'KNOWN-FAIL'; r.reason = `known failure, tracked as ${leg.knownFail}`; }
+        else if (r.status === 'PASS') { r.status = 'FAIL'; r.reason = `PASSED while marked knownFail ${leg.knownFail} — the defect is fixed, so DELETE the knownFail marker in nativePluginLegs.mjs`; }
+      }
+    }
+  } finally {
+    fs.rmSync(derived, { recursive: true, force: true });
+    if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 /** JAVA_HOME from the SAME resolver the editor and the CLI build use — never a fresh probe, and
  *  never `/usr/libexec/java_home -v 21`, which on this machine returns a JDK 25 path with exit 0
  *  (see print-toolchain-env.mjs). */
@@ -305,7 +411,12 @@ for (const r of results) {
 }
 const failed = results.filter((r) => r.status === 'FAIL');
 const skipped = results.filter((r) => r.status === 'SKIP');
+const known = results.filter((r) => r.status === 'KNOWN-FAIL');
 if (skipped.length && !requireAll) {
   console.log(`\n${skipped.length} leg(s) SKIPPED — this run did NOT check them. Re-run with --require-all to treat that as a failure.`);
 }
-process.exit(failed.length || (requireAll && skipped.length) ? 1 : 0);
+if (known.length) {
+  console.log(`\n${known.length} leg(s) are KNOWN failures and did NOT fail this run: ${known.map((r) => `${r.name} (${r.reason})`).join(', ')}.`);
+  console.log('They are off the exit code ON PURPOSE, so a FAIL here means a change broke something. --require-all counts them as failures.');
+}
+process.exit(failed.length || (requireAll && (skipped.length || known.length)) ? 1 : 0);

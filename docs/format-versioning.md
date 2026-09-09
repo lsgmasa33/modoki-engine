@@ -448,6 +448,53 @@ mutation check is what established that:** `nestEntryMap` runs only on the sync 
 read/write case asserting on it stays green with the mechanism deleted. That trap is the reason T5d
 lives beside the guarantee rather than with the rest of the boundary cases.
 
+### 4b-bis. The ENGINE instance, and its two primitives (#986)
+
+§ 4b above is Court's telling of this. The engine had **~18** of the same sites, and #986 fixed 15 of
+them behind two exported primitives — so a game no longer has to hand-roll a third vocabulary:
+
+```ts
+import { emptyDocMap, hasDocKey, putOwn } from '@modoki/engine/runtime'
+```
+
+| primitive | when | why |
+|---|---|---|
+| `emptyDocMap<T>()` | the bag is **ours** to build | `Object.create(null)`, so every downstream `bag[k]` / `k in bag` becomes correct **where it stands**, with no edit |
+| `hasDocKey(bag, k)` | the bag **arrives** — a caller's argument, a code-declared table, an `Object.fromEntries` result | a null prototype cannot help there; this is the `hasOwnProperty.call` form |
+| `putOwn(bag, k, v)` | the bag must stay **ordinary** but takes a document key | `defineProperty` DEFINES rather than sets, so `__proto__` round-trips *without* replacing the prototype |
+
+`emptyDocMap` takes Court's name deliberately (§ 4b). A game imports neither the engine's internals
+nor another game, so the two cannot literally share code — but one vocabulary across the repo beats
+two accurate-but-different names.
+
+**`putOwn` is the primitive § 4b did not need and the engine did.** Several engine bags cross into a
+**third-party library** — koota's `entity.set`, a TSL shader function, PixiJS's `Shader`
+constructor — where a null prototype is untested risk for no gain. `putOwn` fixes the write while
+leaving the object ordinary. Node-side callers import the granular
+`@modoki/engine/runtime/core/docKeys` subpath, never the barrel, which drags the browser runtime
+into a Node tsconfig.
+
+⚠️ **Three of the 18 are NOT this mechanism and were split out as #993** — vocab-table lookups
+(`WRAP[s.wrapS]`, `SHAPE[...]`, `COLLIDER[...]`) where the table is a code literal, fixing the guard
+alone still lets the prototype value flow, and one has no guard at all so "fixing" it means choosing
+a fallback. Bending them to fit would have been a forced family.
+
+⚠️ **One #986 guard is deliberately UNTESTED, and the mutation check is why.** `mergeParamDefaults`'
+read guard changes no output: `coerceParamValue` type-checks every branch and falls back to the
+schema default, so a prototype-read function is sanitised to exactly what a correct read produces.
+Two tests were written for it and **both stayed green with the fix reverted**; they were deleted
+rather than banked, and the call site says so. Keeping a passing assertion over an unreachable
+mechanism is the shape [docs/falsifiable-tests.md](falsifiable-tests.md) exists to stop.
+
+**What makes the engine conversion safe is checkable, not assumed:** a direct `bag.hasOwnProperty(k)`
+is the one thing a null prototype breaks, and a sweep of `engine/packages/modoki/src`, `engine/app`
+and `engine/plugins` finds **zero** — the same `.call`-form convention that made § 4b safe in Court.
+⚠️ **A new direct method call on a doc map is what would break this.**
+
+Covered by `engine/packages/modoki/tests/runtime/docKeys.test.ts` (34 cases). ⚠️ **Almost every case
+uses one of the OTHER SEVEN names, not `__proto__`** — only `__proto__` goes through a setter, so a
+`__proto__`-only suite stays green against the entire read half, which is most of these sites.
+
 ## 5. Adding a new versioned document
 
 1. Declare a named exported constant in the module that owns the format. Never a literal.
